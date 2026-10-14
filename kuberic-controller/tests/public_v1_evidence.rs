@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kuberic_controller::cluster_api::PublicV1Scope;
 use kuberic_controller::evaluator::test_bridge::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
     PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1OperationApi,
@@ -182,11 +183,11 @@ async fn reconcile_to_effect(
     report: &PublicV1AgentReport,
 ) -> Result<(), String> {
     assert_eq!(
-        reconcile_public_v1_consumer(state, report).await?,
+        reconcile_public_v1_consumer(state, &test_scope(), report).await?,
         PublicV1ReconciliationOutcome::EvidencePersisted
     );
     assert_eq!(
-        reconcile_public_v1_consumer(state, report).await?,
+        reconcile_public_v1_consumer(state, &test_scope(), report).await?,
         PublicV1ReconciliationOutcome::EffectApplied
     );
     Ok(())
@@ -217,12 +218,14 @@ struct DispatchProbe {
 impl PublicV1OperationApi for DispatchProbe {
     async fn observe_public_v1_operation(
         &self,
+        _scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
         Ok(self.observed.lock().unwrap().clone())
     }
 
     async fn dispatch_public_v1_operation(
         &self,
+        _scope: &PublicV1Scope,
         _expected: &PublicV1AcceptedTransitionStatus,
         _command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -232,9 +235,18 @@ impl PublicV1OperationApi for DispatchProbe {
 
     async fn observe_public_v1_operation_report(
         &self,
+        _scope: &PublicV1Scope,
         _expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String> {
         Err("dispatch probe does not publish runtime reports".into())
+    }
+}
+
+fn test_scope() -> PublicV1Scope {
+    PublicV1Scope {
+        namespace: "kuberic-system".into(),
+        name: "resource-1".into(),
+        resource_uid: ResourceUid::new("resource-1"),
     }
 }
 
@@ -416,7 +428,7 @@ async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_pro
                 intent,
             }));
 
-            let error = execute_public_v1_operation(&probe, &expected, command)
+            let error = execute_public_v1_operation(&probe, &test_scope(), &expected, command)
                 .await
                 .unwrap_err();
             assert!(error.contains("target differs from accepted source incarnation"));
@@ -491,7 +503,9 @@ async fn lost_accept_response_is_atomically_idempotent() {
 
     reconcile_to_effect(&state, &report).await.unwrap();
     assert_eq!(
-        reconcile_public_v1_consumer(&state, &report).await.unwrap(),
+        reconcile_public_v1_consumer(&state, &test_scope(), &report)
+            .await
+            .unwrap(),
         PublicV1ReconciliationOutcome::EffectApplied
     );
     assert_eq!(state.effects().len(), 1);
@@ -517,15 +531,16 @@ async fn concurrent_accept_reconciliation_commits_one_exact_effect() {
         ),
     ));
     assert_eq!(
-        reconcile_public_v1_consumer(state.as_ref(), report.as_ref())
+        reconcile_public_v1_consumer(state.as_ref(), &test_scope(), report.as_ref())
             .await
             .unwrap(),
         PublicV1ReconciliationOutcome::EvidencePersisted
     );
 
+    let scope = test_scope();
     let (first, second) = tokio::join!(
-        reconcile_public_v1_consumer(state.as_ref(), report.as_ref()),
-        reconcile_public_v1_consumer(state.as_ref(), report.as_ref()),
+        reconcile_public_v1_consumer(state.as_ref(), &scope, report.as_ref()),
+        reconcile_public_v1_consumer(state.as_ref(), &scope, report.as_ref()),
     );
     assert_eq!(first.unwrap(), PublicV1ReconciliationOutcome::EffectApplied);
     assert_eq!(
@@ -561,7 +576,9 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         );
 
         reconcile_to_effect(&state, &report).await.unwrap();
-        reconcile_public_v1_consumer(&state, &report).await.unwrap();
+        reconcile_public_v1_consumer(&state, &test_scope(), &report)
+            .await
+            .unwrap();
 
         assert_eq!(state.effects().len(), 1);
         assert!(matches!(
@@ -639,7 +656,9 @@ async fn lost_local_provider_replacement_response_is_idempotent_and_replaces_sou
     );
 
     reconcile_to_effect(&state, &report).await.unwrap();
-    reconcile_public_v1_consumer(&state, &report).await.unwrap();
+    reconcile_public_v1_consumer(&state, &test_scope(), &report)
+        .await
+        .unwrap();
 
     assert_eq!(state.effects().len(), 1);
     assert!(matches!(
@@ -693,11 +712,13 @@ async fn consumer_reconciliation_rejects_stale_resource_versions_and_proof_free_
         ),
     );
     assert_eq!(
-        reconcile_public_v1_consumer(&stale, &report).await.unwrap(),
+        reconcile_public_v1_consumer(&stale, &test_scope(), &report)
+            .await
+            .unwrap(),
         PublicV1ReconciliationOutcome::EvidencePersisted
     );
     assert!(
-        reconcile_public_v1_consumer(&stale, &report)
+        reconcile_public_v1_consumer(&stale, &test_scope(), &report)
             .await
             .unwrap_err()
             .contains("stale public-v1 evidence resource version")
@@ -725,11 +746,11 @@ async fn consumer_reconciliation_rejects_stale_resource_versions_and_proof_free_
         ],
     )
     .unwrap();
-    reconcile_public_v1_consumer(&proof_free, &report)
+    reconcile_public_v1_consumer(&proof_free, &test_scope(), &report)
         .await
         .unwrap();
     assert!(
-        reconcile_public_v1_consumer(&proof_free, &report)
+        reconcile_public_v1_consumer(&proof_free, &test_scope(), &report)
             .await
             .unwrap_err()
             .contains("lacks accepted proof")
@@ -760,7 +781,7 @@ async fn consumer_reconciliation_rejects_predecessor_reports_and_substituted_aut
         ),
     );
     assert!(
-        reconcile_public_v1_consumer(&state, &predecessor)
+        reconcile_public_v1_consumer(&state, &test_scope(), &predecessor)
             .await
             .unwrap_err()
             .contains("accepted transition authority")
@@ -770,7 +791,7 @@ async fn consumer_reconciliation_rejects_predecessor_reports_and_substituted_aut
     substituted.completed_operations[0].current_configuration_id =
         Some(ConfigurationId::new("substituted"));
     assert!(
-        reconcile_public_v1_consumer(&state, &substituted)
+        reconcile_public_v1_consumer(&state, &test_scope(), &substituted)
             .await
             .unwrap_err()
             .contains("frozen accepted transition authority")
@@ -799,7 +820,7 @@ async fn consumer_reconciliation_waits_without_manufacturing_proof() {
     );
 
     assert_eq!(
-        reconcile_public_v1_consumer(&state, &empty_report)
+        reconcile_public_v1_consumer(&state, &test_scope(), &empty_report)
             .await
             .unwrap(),
         PublicV1ReconciliationOutcome::Waiting
@@ -835,7 +856,7 @@ async fn persisted_completion_must_remain_exact_on_later_reconciliation() {
     changed.revision += 1;
 
     assert!(
-        reconcile_public_v1_consumer(&state, &report(&accepted, changed))
+        reconcile_public_v1_consumer(&state, &test_scope(), &report(&accepted, changed))
             .await
             .is_err()
     );

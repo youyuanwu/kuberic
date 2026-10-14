@@ -1,3 +1,4 @@
+use kuberic_controller::cluster_api::PublicV1Scope;
 use kuberic_controller::evaluator::test_bridge::{
     PublicV1ElectionStatus, PublicV1HistoryApi, compare_public_v1_election_progress,
     compare_public_v1_election_reports, ensure_public_v1_bootstrap_history,
@@ -343,12 +344,16 @@ struct HistoryApi {
 
 #[async_trait::async_trait]
 impl PublicV1HistoryApi for HistoryApi {
-    async fn observe_public_v1_status(&self) -> Result<Option<PublicV1AcceptedStatus>, String> {
+    async fn observe_public_v1_status(
+        &self,
+        _scope: &PublicV1Scope,
+    ) -> Result<Option<PublicV1AcceptedStatus>, String> {
         Ok(self.status.lock().unwrap().clone())
     }
 
     async fn persist_public_v1_status(
         &self,
+        _scope: &PublicV1Scope,
         expected: Option<&PublicV1AcceptedStatus>,
         next: &PublicV1AcceptedStatus,
     ) -> Result<(), String> {
@@ -362,6 +367,7 @@ impl PublicV1HistoryApi for HistoryApi {
 
     async fn dispatch_public_v1_history(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -380,6 +386,14 @@ impl PublicV1HistoryApi for HistoryApi {
             .unwrap()
             .push(ProtocolCommand::PublicV1History(command.clone()));
         Ok(())
+    }
+}
+
+fn test_scope() -> PublicV1Scope {
+    PublicV1Scope {
+        namespace: "kuberic-system".into(),
+        name: "resource-1".into(),
+        resource_uid: ResourceUid::new("resource-1"),
     }
 }
 
@@ -415,6 +429,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
 
     execute_public_v1_history(
         &api,
+        &test_scope(),
         plan_public_v1_bootstrap_history(None, &resource_uid, &identity, storage.clone()).unwrap(),
     )
     .await
@@ -422,6 +437,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
     let accepted = api.status.lock().unwrap().clone().unwrap();
     execute_public_v1_history(
         &api,
+        &test_scope(),
         plan_public_v1_bootstrap_history(
             Some(accepted.clone()),
             &resource_uid,
@@ -517,6 +533,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
 
     execute_public_v1_history(
         &api,
+        &test_scope(),
         plan_public_v1_data_loss_recovery(
             &accepted,
             &initial_report,
@@ -532,6 +549,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
     let invalidated = api.status.lock().unwrap().clone().unwrap();
     execute_public_v1_history(
         &api,
+        &test_scope(),
         plan_public_v1_data_loss_recovery(
             &invalidated,
             &initial_report,
@@ -644,6 +662,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         .unwrap();
     execute_public_v1_history(
         &api,
+        &test_scope(),
         plan_public_v1_recovery_report(&invalidated, &contained_report).unwrap(),
     )
     .await
@@ -734,6 +753,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
     );
     execute_public_v1_history(
         &api,
+        &test_scope(),
         plan_public_v1_data_loss_recovery(
             &contained,
             &replacement_report,
@@ -753,6 +773,7 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
     );
     execute_public_v1_history(
         &api,
+        &test_scope(),
         plan_public_v1_data_loss_recovery(
             &renewed,
             &replacement_report,

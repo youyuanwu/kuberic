@@ -170,40 +170,6 @@ fn configuration(
     }
 }
 
-pub(crate) async fn abort(
-    registry: &Arc<PartitionOperationRegistry>,
-    store: Arc<dyn AgentStore>,
-    intent: PublicOperationIntent,
-    mut callbacks: PublicLifecycleCallbacks,
-) -> Result<()> {
-    intent
-        .validate()
-        .map_err(|message| HostError::CommandRejected(message.into()))?;
-    callbacks.validate_intent_capabilities(&intent)?;
-    if intent.program != Some(PublicOperationProgram::Abort) {
-        return Err(HostError::CommandRejected(
-            "synchronous abort requires exact abort input".into(),
-        ));
-    }
-    let operation = registry.admit(intent.clone()).await?;
-    let should_abort = !matches!(
-        operation.snapshot().stage,
-        PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-    );
-    registry.fence();
-    callbacks.aborted = registry.abort_guard();
-    if should_abort {
-        callbacks.abort_once();
-    }
-    let owner = registry.clone();
-    registry.own_control_task(async move {
-        if let Err(error) = launch(&owner, store, intent, callbacks).await {
-            tracing::warn!(%error, "aborted preview requires durable containment");
-        }
-    });
-    Ok(())
-}
-
 pub(super) async fn execute(
     store: Arc<dyn AgentStore>,
     intent: PublicOperationIntent,

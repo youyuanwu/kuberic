@@ -10,7 +10,7 @@ readme = "README.md"
 
 [features]
 default = ["host"]
-host = ["dep:rusqlite", "dep:serde_json", "dep:tokio-stream", "dep:tracing"]
+host = ["dep:rusqlite", "dep:tokio-stream", "dep:tracing"]
 testing = ["host"]
 
 [dependencies]
@@ -22,7 +22,7 @@ prost.workspace = true
 rusqlite = { workspace = true, optional = true }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

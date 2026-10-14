@@ -1,3 +1,4 @@
+use super::PublicV1Scope;
 use crate::evaluator::public_v1_evidence::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
     PublicV1ResourceAuthority,
@@ -194,22 +195,26 @@ impl PublicV1EvidenceState {
 pub trait PublicV1EvidenceApi: Send + Sync {
     async fn observe_public_v1_evidence_status(
         &self,
+        scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String>;
 
     async fn persist_public_v1_evidence_status(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         next: &PublicV1AcceptedStatus,
     ) -> Result<(), String>;
 
     async fn accept_public_v1_completion(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &PublicV1OperationCompletion,
     ) -> Result<(), String>;
 
     async fn retire_public_v1_incarnation(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,
@@ -217,6 +222,7 @@ pub trait PublicV1EvidenceApi: Send + Sync {
 
     async fn provision_public_v1_replacement(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,
@@ -228,12 +234,14 @@ pub trait PublicV1EvidenceApi: Send + Sync {
 impl PublicV1EvidenceApi for PublicV1EvidenceState {
     async fn observe_public_v1_evidence_status(
         &self,
+        _scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
         Ok(Some(self.transition()))
     }
 
     async fn persist_public_v1_evidence_status(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         next: &PublicV1AcceptedStatus,
     ) -> Result<(), String> {
@@ -256,6 +264,7 @@ impl PublicV1EvidenceApi for PublicV1EvidenceState {
 
     async fn accept_public_v1_completion(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &PublicV1OperationCompletion,
     ) -> Result<(), String> {
@@ -285,6 +294,7 @@ impl PublicV1EvidenceApi for PublicV1EvidenceState {
 
     async fn retire_public_v1_incarnation(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,
@@ -333,6 +343,7 @@ impl PublicV1EvidenceApi for PublicV1EvidenceState {
 
     async fn provision_public_v1_replacement(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,

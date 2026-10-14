@@ -852,7 +852,7 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 
 #[tokio::test]
 async fn public_v1_schema11_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 11);
+    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 12);
     let root = test_root("schema11-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicOperationPreviewIdentity::public_v1(42);

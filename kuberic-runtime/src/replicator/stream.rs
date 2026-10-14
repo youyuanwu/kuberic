@@ -2,7 +2,7 @@ use crate::protocol::types::OperationId;
 use bytes::Bytes;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-use crate::application::{DurableApplicationProgress, Lsn, Operation};
+use crate::application::{DurableApplicationProgress, Lsn};
 use crate::{Result, RuntimeError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,43 +168,5 @@ impl ServiceStreams {
             .await
             .take()
             .ok_or_else(|| RuntimeError::Application("copy stream already taken".into()))
-    }
-
-    pub(crate) async fn replication(
-        &self,
-        operation: Operation,
-    ) -> Result<DurableApplicationProgress> {
-        self.replication_tx
-            .send(
-                OperationMetadata::Replication {
-                    lsn: operation.lsn,
-                    committed_lsn: operation.committed_lsn,
-                },
-                operation.data,
-            )
-            .await
-    }
-
-    pub(crate) async fn enqueue_replication(
-        &self,
-        operation: Operation,
-    ) -> Result<OperationCompletion> {
-        self.replication_tx
-            .enqueue(
-                OperationMetadata::Replication {
-                    lsn: operation.lsn,
-                    committed_lsn: operation.committed_lsn,
-                },
-                operation.data,
-            )
-            .await
-    }
-
-    pub(crate) async fn copy(
-        &self,
-        metadata: OperationMetadata,
-        data: Bytes,
-    ) -> Result<DurableApplicationProgress> {
-        self.copy_tx.send(metadata, data).await
     }
 }

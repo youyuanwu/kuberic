@@ -20,20 +20,20 @@ use kuberic_runtime::protocol::validation::{
     validate_report_internal, validate_snapshot, validate_transition_relationship,
 };
 
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 mod faults;
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 pub(crate) mod public_lifecycle;
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 pub(crate) mod public_v1_evidence;
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 pub(crate) mod public_v1_history;
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 pub(crate) mod public_v1_session_renewal;
 mod replacement_cleanup;
 mod scale_up;
 mod secondary_scale_down;
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 #[doc(hidden)]
 pub mod test_bridge;
 
@@ -47,7 +47,7 @@ pub struct EvaluationConfig {
     pub stable_resync_seconds: u64,
     pub wait_requeue_seconds: u64,
     pub unsafe_requeue_seconds: u64,
-    #[cfg(feature = "runtime-test-bridge")]
+    #[cfg(feature = "public-v1")]
     pub public_operation_preview:
         Option<kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity>,
 }
@@ -61,7 +61,7 @@ impl Default for EvaluationConfig {
             stable_resync_seconds: 30,
             wait_requeue_seconds: 5,
             unsafe_requeue_seconds: 30,
-            #[cfg(feature = "runtime-test-bridge")]
+            #[cfg(feature = "public-v1")]
             public_operation_preview: None,
         }
     }
@@ -69,7 +69,7 @@ impl Default for EvaluationConfig {
 
 /// Validates one snapshot and returns the next safe reconciliation outcome.
 pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
-    #[cfg(feature = "runtime-test-bridge")]
+    #[cfg(feature = "public-v1")]
     if let Some(plan) = faults::evaluate(snapshot, config) {
         return plan;
     }

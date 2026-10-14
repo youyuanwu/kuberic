@@ -17,7 +17,7 @@ use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL};
 use crate::observation::{RawAgentObservation, RawObservation};
 use crate::{ControllerError, Result};
 
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 pub(crate) fn normalize_public_service_location(
     config: &crate::evaluator::test_bridge::PublicOperationPreviewEvaluationConfig,
     authority: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
@@ -61,7 +61,7 @@ pub(crate) fn normalize_public_service_location(
     Ok(Some(location.clone()))
 }
 
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 pub fn normalize_public_v1_service_location(
     config: &crate::evaluator::test_bridge::PublicOperationPreviewEvaluationConfig,
     authority: &kuberic_runtime::protocol::public_operations::PublicOperationIntent,
@@ -480,7 +480,11 @@ fn normalize_agent(
                 }
             }
         }
-        #[cfg(feature = "runtime-test-bridge")]
+        RawAgentObservation::PublicV1Report(_) => AgentObservation::Invalid {
+            message: "public-v1 reports require public-v1 reconciliation".to_string(),
+            uninitialized_report: None,
+        },
+        #[cfg(feature = "public-v1")]
         RawAgentObservation::PreviewReport(report) => {
             if report.resource_uid != *resource_uid {
                 return AgentObservation::Invalid {

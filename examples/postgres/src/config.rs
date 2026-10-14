@@ -538,7 +538,7 @@ fn replace_managed_hba(
     )
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
 

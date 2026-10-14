@@ -114,43 +114,13 @@ message GetAgentStatusRequest {
 message AgentStatusReport {
   uint32 protocol_version = 1;
   string resource_uid = 2;
-  ReplicaIdentity identity = 3;
   string process_session_id = 4;
-  uint64 report_sequence = 5;
-  ReplicaRole role = 6;
-  AccessStatus write_status = 7;
-  Epoch epoch = 8;
-  Configuration previous_configuration = 9;
-  Configuration current_configuration = 10;
-  int64 current_progress = 11;
-  int64 committed_lsn = 12;
-  optional int64 catch_up_capability = 13;
   AgentStorageState storage_state = 14;
   string pod_uid = 15;
   string pvc_uid = 16;
   string storage_error = 17;
   bool healthy = 18;
   int64 replica_id = 19;
-  AccessStatus read_status = 20;
-  int64 current_configuration_quorum_progress = 21;
-  optional int64 catch_up_boundary = 22;
-  bool catch_up_complete = 23;
-  optional int64 deactivated_lsn = 24;
-  repeated LoadMetric load_metrics = 25;
-  FaultType reported_fault = 26;
-  string pending_operation_id = 27;
-  string retained_operation_id = 28;
-  repeated BuildStatus builds = 29;
-  Epoch deactivation_epoch = 30;
-  optional int64 verified_replication_lsn = 31;
-  SwitchoverHandoff prepared_switchover = 32;
-  SecondaryRemovalPreparation prepared_secondary_removal = 33;
-  SecondaryRemovalEvidence secondary_removal_evidence = 34;
-  ReplicaRetirementReport retired_replica = 35;
-  SecondaryScaleDownCleanup accepted_secondary_removal = 36;
-  ScaleUpIntent scale_up_intent = 37;
-  EnsureConfigurationCommand pending_configuration = 38;
-  string replication_address = 39;
   PublicV1AgentStatus public_v1 = 40;
 }
 
@@ -662,6 +632,14 @@ message EnsureReplicaBuildCommand {
   reserved 9;
 }
 
+message PublicV1HistoryCommand {
+  bytes canonical_json = 1;
+}
+
+message PublicV1OperationCommand {
+  bytes canonical_json = 1;
+}
+
 message ExecuteCommandRequest {
   uint32 protocol_version = 1;
   string resource_uid = 2;
@@ -675,6 +653,8 @@ message ExecuteCommandRequest {
     PrepareSecondaryRemovalCommand prepare_secondary_removal = 14;
     RetireReplicaCommand retire_replica = 15;
     AcceptSecondaryRemovalCommitCommand accept_secondary_removal_commit = 16;
+    PublicV1HistoryCommand public_v1_history = 17;
+    PublicV1OperationCommand public_v1_operation = 18;
   }
 }
 

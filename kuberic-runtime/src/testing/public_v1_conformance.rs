@@ -118,53 +118,91 @@ fn terminate_process_tree(child: &mut std::process::Child) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FutureObligation {
-    None,
-    Phase6Engine,
-    Phase7Cutover,
-}
-
 #[derive(Clone, Copy)]
 struct Gate {
     id: &'static str,
     name: &'static str,
     owner: &'static str,
-    strict_scenarios: &'static [&'static str],
     postgres_scenarios: &'static [&'static str],
-    preview_scenarios: &'static [&'static str],
+    replacement_scenarios: &'static [&'static str],
     expected: &'static str,
     eligibility: fn(),
-    future: FutureObligation,
 }
 
 const PUBLIC_LIFECYCLE: &str = include_str!("../host/public_lifecycle.rs");
 const REPLICATOR: &str = include_str!("../replicator/mod.rs");
-const AUTHORITY: &str = include_str!("../authority.rs");
-const HOST_SERVICE: &str = include_str!("../host/service.rs");
+const HOST_PROCESS: &str = include_str!("../host/process.rs");
+const SQLITE_STORE: &str = include_str!("../host/sqlite_store.rs");
+const STATELESS: &str = include_str!("../replicator/stateless/mod.rs");
 
 fn contract_gate() {}
 
-fn ksf_09() {
-    assert!(REPLICATOR.contains("struct ManagedReplicatorCapabilities"));
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementOwnershipInventory {
+    pub factories: Vec<&'static str>,
+    pub host_attachments: Vec<&'static str>,
+    pub grpc_services: Vec<&'static str>,
+    pub report_branches: Vec<&'static str>,
+    pub store_tables: Vec<&'static str>,
+    pub startup_tasks: Vec<&'static str>,
+}
+
+pub fn replacement_ownership_inventory() -> ReplacementOwnershipInventory {
+    assert!(!REPLICATOR.contains("LegacyManaged"));
+    assert!(!REPLICATOR.contains("pub struct DefaultReplicator {"));
+    assert!(REPLICATOR.contains("stateless::StatelessReplicatorFactory::new"));
     assert!(!PUBLIC_LIFECYCLE.contains("ManagedReplicatorCapabilities"));
-}
-
-fn ksf_10() {
-    assert!(HOST_SERVICE.contains("replication_listener"));
-}
-
-fn ksf_16() {
-    for owner in [
-        "trait ReplicationProgressStore",
-        "trait BuildAuthorityStore",
-        "trait BuildProgressStore",
+    assert!(HOST_PROCESS.contains("agent.serve_control_only("));
+    assert!(!HOST_PROCESS.contains("run_outbound("));
+    assert!(!HOST_PROCESS.contains("run_peer_discovery("));
+    assert!(STATELESS.contains(
+        "impl proto::replication_data_server::ReplicationData for PreviewReplicationService"
+    ));
+    assert!(SQLITE_STORE.contains("PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION"));
+    assert!(SQLITE_STORE.contains("CREATE TABLE agent_state"));
+    for removed in [
+        "CREATE TABLE replica_authority",
+        "CREATE TABLE runtime_lifecycle",
+        "CREATE TABLE replication_progress",
+        "CREATE TABLE local_writes",
+        "CREATE TABLE build_authority",
+        "CREATE TABLE build_progress",
     ] {
-        assert!(
-            AUTHORITY.contains(owner),
-            "legacy continuation owner unexpectedly absent: {owner}"
-        );
+        assert!(!SQLITE_STORE.contains(removed), "{removed} survived");
     }
+    ReplacementOwnershipInventory {
+        factories: vec!["stateless-public-v1"],
+        host_attachments: vec!["replicator", "primary-replicator", "state-provider"],
+        grpc_services: vec!["agent-control", "replica-peer", "stateless-replication"],
+        report_branches: vec!["public-v1"],
+        store_tables: vec!["agent_state"],
+        startup_tasks: vec!["agent-control", "public-operation-recovery"],
+    }
+}
+
+pub fn validate_replacement_ownership_inventory(
+    inventory: &ReplacementOwnershipInventory,
+) -> Result<(), String> {
+    let expected = ReplacementOwnershipInventory {
+        factories: vec!["stateless-public-v1"],
+        host_attachments: vec!["replicator", "primary-replicator", "state-provider"],
+        grpc_services: vec!["agent-control", "replica-peer", "stateless-replication"],
+        report_branches: vec!["public-v1"],
+        store_tables: vec!["agent_state"],
+        startup_tasks: vec!["agent-control", "public-operation-recovery"],
+    };
+    if inventory == &expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "replacement ownership inventory changed: expected {expected:?}, observed {inventory:?}"
+        ))
+    }
+}
+
+fn replacement_ownership_gate() {
+    let inventory = replacement_ownership_inventory();
+    validate_replacement_ownership_inventory(&inventory).unwrap();
 }
 
 const GATES: [Gate; 16] = [
@@ -172,236 +210,184 @@ const GATES: [Gate; 16] = [
         id: "KSF-01",
         name: "primary_configuration_follows_primary_role",
         owner: "lifecycle",
-        strict_scenarios: &[
-            "strict_trace_fixture_covers_the_public_callback_inventory_and_primary_guard",
-        ],
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
-        preview_scenarios: &["static_preview_is_store_free_access_gated_and_durable_before_ack"],
+        replacement_scenarios: &[
+            "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+        ],
         expected: "primary role completes before primary configuration",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-02",
         name: "authorized_data_loss_false_true_error_ambiguity",
         owner: "recovery",
-        strict_scenarios: &[
-            "public_v1_history_admission_gates_all_data_loss_outcomes",
-            "public_v1_data_loss_replay_uses_attached_capability",
-        ],
         postgres_scenarios: &[],
-        preview_scenarios: &["hosted_preview_authorized_data_loss_maps_only_the_effective_outcome"],
+        replacement_scenarios: &[
+            "hosted_preview_authorized_data_loss_maps_only_the_effective_outcome",
+        ],
         expected: "logical authorization distinguishes every callback outcome",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-03",
         name: "same_role_secondary_receives_new_epoch",
         owner: "lifecycle",
-        strict_scenarios: &["public_v1_session_renewal_requires_higher_epoch"],
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "same-role epoch renewal fences predecessor traffic",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-04",
         name: "configuration_contains_only_remote_active_members",
         owner: "configuration",
-        strict_scenarios: &[
-            "public_v1_values_distinguishes_invalid_lsn",
-            "public_v1_swap_captures_specific_quorum_capability",
-            "public_v1_role_and_epoch_transitions_persist_current_authority",
-        ],
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "configuration contains only exact ready remote peers",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-05",
         name: "build_uses_invalid_target_progress_and_exact_attempt",
         owner: "build",
-        strict_scenarios: &[
-            "public_v1_values_distinguishes_invalid_lsn",
-            "build_rejects_targets_present_in_lifecycle_or_swap_topology",
-        ],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion",
         ],
         expected: "build target is idle, outside PC/CC, and has invalid progress",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-06",
         name: "build_is_cancelled_and_drained_before_remove",
         owner: "build",
-        strict_scenarios: &["exact_build_is_cancelled_and_drained_before_removal_and_successor"],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
-        preview_scenarios: &[
-            "exact_build_is_cancelled_and_drained_before_removal_and_successor",
+        replacement_scenarios: &[
+            "hung_build_peer_is_bounded_and_drained_before_successor_close",
             "hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_completion",
             "hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session",
         ],
         expected: "build root and descendants drain before removal",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-07",
         name: "swap_uses_captured_specific_quorum_capability",
         owner: "swap",
-        strict_scenarios: &[
-            "public_v1_swap_captures_specific_quorum_capability",
-            "public_operation_replay_swap_install_cuts_never_wait_on_stale_topology",
-        ],
         postgres_scenarios: &[],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "specific quorum and fallback are captured replay inputs",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-08",
         name: "progress_is_role_correct_and_history_scoped",
         owner: "progress",
-        strict_scenarios: &[
-            "public_v1_history_partition_seed_is_shared",
-            "public_v1_history_admission_gates_all_data_loss_outcomes",
-            "public_v1_schema11_build_ambiguity_requires_retirement",
-        ],
         postgres_scenarios: &["public_v1_postgres_data_loss_history_and_replay"],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "public_v1_history_partition_seed_is_shared",
             "ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress",
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "numeric progress is comparable only inside one history",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-09",
         name: "replacement_bundle_has_no_managed_capability",
         owner: "construction",
-        strict_scenarios: &["public_v1_source_uses_no_native_evidence"],
         postgres_scenarios: &[],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "production_config_has_no_preview_selector_and_stateless_source_has_no_legacy_store_or_auth",
         ],
-        expected: "current legacy-bearing artifact is production ineligible",
-        eligibility: ksf_09,
-        future: FutureObligation::Phase7Cutover,
+        expected: "stateless Public V1 is the sole built-in default",
+        eligibility: replacement_ownership_gate,
     },
     Gate {
         id: "KSF-10",
         name: "replicator_open_owns_endpoint_lifetime",
         owner: "transport",
-        strict_scenarios: &["public_lifecycle_owns_replicator_endpoint_until_close_and_abort"],
         postgres_scenarios: &[],
-        preview_scenarios: &["preview_open_owns_registration_listener_and_writer_exactly_once"],
+        replacement_scenarios: &["preview_open_owns_registration_listener_and_writer_exactly_once"],
         expected: "public endpoint lifetime follows Replicator lifecycle",
-        eligibility: ksf_10,
-        future: FutureObligation::Phase7Cutover,
+        eligibility: replacement_ownership_gate,
     },
     Gate {
         id: "KSF-11",
         name: "role_address_is_published_and_cleared",
         owner: "reporting",
-        strict_scenarios: &["public_v1_role_address_runtime_to_controller_publish_replace_clear"],
         postgres_scenarios: &[],
-        preview_scenarios: &["hosted_preview_role_address_publishes_replaces_and_clears"],
+        replacement_scenarios: &["hosted_preview_role_address_publishes_replaces_and_clears"],
         expected: "exact role completion publishes and clears address",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-12",
         name: "supersession_cancels_and_drains_public_callbacks",
         owner: "operation",
-        strict_scenarios: &[
-            "every_non_build_public_callback_is_independently_cancellable",
-            "callback_cancellation_cross_product_has_exact_root_end_and_descendant_drain",
-        ],
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "hosted_preview_supersession_cancels_build_root_and_drains_descendant_before_close",
         ],
         expected: "supersession contains callback roots and descendants",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-13",
         name: "transient_fault_restarts_or_drops_exact_incarnation",
         owner: "fault",
-        strict_scenarios: &["public_fault_reporting_closes_access_and_location_before_returning"],
         postgres_scenarios: &[],
-        preview_scenarios: &[
-            "public_fault_reporting_closes_access_and_location_before_returning",
+        replacement_scenarios: &[
             "hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement",
             "hosted_preview_rebuild_retires_and_restarts_fresh_replacement",
             "hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_completion",
         ],
         expected: "fault closes access and targets one exact incarnation",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-14",
         name: "contained_close_failure_completes_outer_close",
         owner: "close",
-        strict_scenarios: &["contained_close_failures_preserve_typed_diagnostics_and_order"],
         postgres_scenarios: &["public_v1_postgres_contained_close"],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "hosted_preview_contained_close_restarts_without_replaying_interrupted_children",
         ],
         expected: "child diagnostics do not change normalized outer close",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-15",
         name: "callback_replay_follows_declared_disposition",
         owner: "replay",
-        strict_scenarios: &[
-            "public_operation_replay_matrix_converges_each_repeatable_program_family",
-            "public_v1_replay_preserves_declared_disposition",
-        ],
         postgres_scenarios: &[],
-        preview_scenarios: &[
+        replacement_scenarios: &[
             "hosted_preview_contained_close_restarts_without_replaying_interrupted_children",
-            "durable_build_application_never_reinvokes_the_build_callback",
-            "public_operation_replay_matrix_converges_each_repeatable_program_family",
-            "public_v1_history_admission_gates_all_data_loss_outcomes",
-            "public_v1_replay_preserves_declared_disposition",
+            "public_v1_schema11_failed_build_containment_survives_reopen",
+            "public_v1_schema11_rebuild_then_cancellation_survives_reopen",
+            "public_v1_history_data_loss_attempt_renews_higher_epoch",
+            "public_v1_data_loss_renewal_requires_exact_replay_capability",
             "public_v1_schema11_build_ambiguity_requires_retirement",
         ],
         expected: "journal replay preserves ambiguity and capability policy",
         eligibility: contract_gate,
-        future: FutureObligation::None,
     },
     Gate {
         id: "KSF-16",
         name: "cutover_artifact_contains_no_legacy_continuation_owner",
         owner: "cutover",
-        strict_scenarios: &[],
         postgres_scenarios: &[],
-        preview_scenarios: &[],
+        replacement_scenarios: &[
+            "replication_ingress_accepts_only_exact_current_primary_in_three_replica_set",
+        ],
         expected: "current artifact inventories and rejects legacy continuation owners",
-        eligibility: ksf_16,
-        future: FutureObligation::Phase7Cutover,
+        eligibility: replacement_ownership_gate,
     },
 ];
 
@@ -415,7 +401,6 @@ fn workspace_root() -> PathBuf {
 fn scenario_filter(scenarios: fn(&Gate) -> &'static [&'static str]) -> String {
     GATES
         .iter()
-        .filter(|gate| gate.id != "KSF-16")
         .flat_map(|gate| scenarios(gate).iter())
         .map(|scenario| format!("test({scenario})"))
         .collect::<Vec<_>>()
@@ -455,11 +440,11 @@ fn run_scenarios(
         .unwrap_or_else(|error| panic!("{error}"));
     assert!(
         list.status.success(),
-        "strict Public V1 conformance inventory failed: {}",
+        "replacement Public V1 conformance inventory failed: {}",
         String::from_utf8_lossy(&list.stderr)
     );
     let inventory = String::from_utf8(list.stdout).expect("nextest inventory is UTF-8");
-    for gate in GATES.iter().filter(|gate| gate.id != "KSF-16") {
+    for gate in &GATES {
         for scenario in scenarios(gate) {
             assert!(
                 inventory.contains(scenario),
@@ -565,10 +550,7 @@ mod bounded_process_tests {
 
 pub fn assert_public_v1_conformance_subject(subject: &str) {
     assert!(
-        matches!(
-            subject,
-            "strict-custom" | "postgresql" | "built-in-preview" | "strict-custom+built-in-preview"
-        ),
+        matches!(subject, "postgresql" | "built-in-replacement"),
         "unknown Public V1 conformance subject: {subject}"
     );
     for (index, gate) in GATES.iter().enumerate() {
@@ -580,61 +562,33 @@ pub fn assert_public_v1_conformance_subject(subject: &str) {
             "{} has no expected public result",
             gate.id
         );
-        (gate.eligibility)();
-        if subject == "postgresql" && !gate.postgres_scenarios.is_empty() {
-            assert!(
-                gate.future != FutureObligation::Phase7Cutover,
-                "{} has invalid PostgreSQL applicability",
-                gate.id
-            );
-        }
-    }
-
-    for id in ["KSF-09", "KSF-10", "KSF-16"] {
-        let gate = GATES.iter().find(|gate| gate.id == id).unwrap();
-        assert_eq!(
-            gate.future,
-            FutureObligation::Phase7Cutover,
-            "{id} must remain an executable negative cutover guard"
+        assert!(
+            !gate.replacement_scenarios.is_empty(),
+            "{} has no built-in replacement scenario",
+            gate.id
         );
+        (gate.eligibility)();
     }
-    assert!(
-        !GATES
-            .iter()
-            .any(|gate| gate.future == FutureObligation::Phase6Engine)
-    );
 }
 
 pub fn execute_public_v1_conformance_subject(subject: &str) {
     assert_public_v1_conformance_subject(subject);
+    assert_eq!(
+        subject, "built-in-replacement",
+        "only the built-in replacement subject has an executable nested gate"
+    );
     let deadline = Instant::now() + CONFORMANCE_TIMEOUT;
-    let subjects = if subject == "strict-custom+built-in-preview" {
-        &["strict-custom", "built-in-preview"][..]
-    } else {
-        std::slice::from_ref(&subject)
-    };
-    for selected in subjects {
-        if *selected == "strict-custom" {
-            run_scenarios(
-                "strict-custom",
-                &["kuberic-runtime"],
-                |gate| gate.strict_scenarios,
-                deadline,
-            );
-        } else if *selected == "built-in-preview" {
-            run_scenarios(
-                "built-in-preview",
-                &["kuberic-runtime", "kuberic-controller"],
-                |gate| gate.preview_scenarios,
-                deadline,
-            );
-        }
-    }
+    run_scenarios(
+        "built-in-replacement",
+        &["kuberic-runtime", "kuberic-controller"],
+        |gate| gate.replacement_scenarios,
+        deadline,
+    );
 }
 
 pub fn assert_public_v1_conformance_gate(subject: &str, id: &str, scenario: &str) {
     assert!(
-        matches!(subject, "strict-custom" | "postgresql" | "built-in-preview"),
+        matches!(subject, "postgresql" | "built-in-replacement"),
         "unknown Public V1 conformance subject: {subject}"
     );
     let gate = GATES
@@ -643,8 +597,8 @@ pub fn assert_public_v1_conformance_gate(subject: &str, id: &str, scenario: &str
         .unwrap_or_else(|| panic!("unknown Public V1 conformance gate: {id}"));
     let scenarios = match subject {
         "postgresql" => gate.postgres_scenarios,
-        "built-in-preview" => gate.preview_scenarios,
-        _ => gate.strict_scenarios,
+        "built-in-replacement" => gate.replacement_scenarios,
+        _ => unreachable!("validated Public V1 conformance subject"),
     };
     assert!(
         scenarios.contains(&scenario),
@@ -655,7 +609,7 @@ pub fn assert_public_v1_conformance_gate(subject: &str, id: &str, scenario: &str
 
 pub fn assert_public_v1_conformance_not_applicable(subject: &str, id: &str) {
     assert!(
-        matches!(subject, "strict-custom" | "postgresql" | "built-in-preview"),
+        matches!(subject, "postgresql" | "built-in-replacement"),
         "unknown Public V1 conformance subject: {subject}"
     );
     let gate = GATES
@@ -664,8 +618,8 @@ pub fn assert_public_v1_conformance_not_applicable(subject: &str, id: &str) {
         .unwrap_or_else(|| panic!("unknown Public V1 conformance gate: {id}"));
     let scenarios = match subject {
         "postgresql" => gate.postgres_scenarios,
-        "built-in-preview" => gate.preview_scenarios,
-        _ => gate.strict_scenarios,
+        "built-in-replacement" => gate.replacement_scenarios,
+        _ => unreachable!("validated Public V1 conformance subject"),
     };
     assert!(
         scenarios.is_empty(),

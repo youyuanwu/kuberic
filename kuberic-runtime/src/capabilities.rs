@@ -1,4 +1,3 @@
-#[cfg(feature = "testing")]
 use crate::protocol::types::ReplicatorCreationId;
 
 #[derive(Debug, Clone, Copy)]
@@ -21,7 +20,6 @@ impl ReplicatorCreationIdentity {
         Self(uuid::Uuid::new_v4())
     }
 
-    #[cfg(feature = "testing")]
     pub(crate) fn to_public_id(self) -> ReplicatorCreationId {
         ReplicatorCreationId::new(self.0.to_string())
     }

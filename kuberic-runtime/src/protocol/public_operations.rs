@@ -760,7 +760,6 @@ pub struct PublicBuildInput {
 }
 
 impl PublicBuildInput {
-    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn same_attempt_as(&self, other: &Self) -> bool {
         self.attempt == other.attempt
             && self.epoch == other.epoch
@@ -833,7 +832,6 @@ impl PublicOperationProgram {
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn validate_history(
         &self,
         expected_history: &HistoryContext,

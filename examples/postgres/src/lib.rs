@@ -20,8 +20,8 @@ pub mod proto {
     tonic::include_proto!("pgdata.v2");
 }
 
-#[cfg(feature = "testing")]
-pub mod testing;
+#[cfg(all(test, feature = "testing"))]
+mod testing;
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {

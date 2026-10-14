@@ -14,9 +14,9 @@ use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
     PublicBuildInput, PublicCatchUpMode, PublicLifecycleInput, PublicLifecycleRecipe,
-    PublicLifecycleReport, PublicOperationIntent, PublicOperationPreviewIdentity,
-    PublicOperationProgram, PublicProgress, PublicV1AgentReport, PublicV1CallKind,
-    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildRequired, ServiceLocation,
+    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram, PublicProgress,
+    PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
+    ReplicaRebuildRequired, ServiceLocation,
 };
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, ProcessSessionId, ReplicaRole, ReplicatorCreationId,
@@ -27,8 +27,7 @@ use crate::replicator::{
 
 #[path = "public_lifecycle_program.rs"]
 mod program;
-#[allow(unused_imports)]
-pub(crate) use program::{abort, operation_instructions, repeatable, replayable};
+pub(crate) use program::{operation_instructions, repeatable, replayable};
 
 type ApplicationControlMatch = Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>;
 
@@ -569,87 +568,6 @@ pub(super) fn enrich_remote_rebuild(
         operation: captured_operation(identity, intent, build.epoch),
         build: Box::new(build),
     })
-}
-
-pub(crate) async fn report(
-    store: &dyn AgentStore,
-    identity: &PublicOperationPreviewIdentity,
-    session: &ProcessSessionId,
-) -> Result<PublicLifecycleReport> {
-    let state = store.load_state().await?;
-    let preview = state.public_operation_preview.ok_or_else(|| {
-        HostError::CommandRejected("preview report requires preview store".into())
-    })?;
-    if &preview.identity != identity {
-        return Err(HostError::IdentityMismatch(
-            "preview report identity changed".into(),
-        ));
-    }
-    let record = preview
-        .current_operation
-        .as_ref()
-        .and_then(|id| preview.operations.get(id));
-    let mut report = PublicLifecycleReport {
-        preview: identity.clone(),
-        binding: preview.binding.clone(),
-        resource_uid: state.identity.resource_uid.clone(),
-        replica: state.identity.local_identity,
-        process_session_id: session.clone(),
-        process_id: std::process::id(),
-        revision: preview
-            .operations
-            .values()
-            .map(|record| record.intent.revision)
-            .max()
-            .unwrap_or(0),
-        operation_id: record.map(|record| record.intent.operation_id.clone()),
-        role: ReplicaRole::None,
-        write_access: false,
-        service_location: None,
-    };
-    let Some(record) = record else {
-        return Ok(report);
-    };
-    let Some(input) = &record.intent.lifecycle else {
-        return Ok(report);
-    };
-    if &record.intent.process_session_id != session
-        || record.stage != PublicOperationStage::Completed
-        || record.superseded_by.is_some()
-        || record.disposition != Some(PublicOperationDisposition::Succeeded)
-        || !preview.history_barriers.is_empty()
-        || preview.writes_revoked
-        || preview.terminal
-        || !complete(record)
-    {
-        return Ok(report);
-    }
-    report.revision = record.intent.revision;
-    report.role = if input.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
-        ReplicaRole::ActiveSecondary
-    } else {
-        ReplicaRole::Primary
-    };
-    report.write_access = report.role == ReplicaRole::Primary;
-    if report.write_access {
-        report.service_location = record.lifecycle.outcomes.iter().rev().find_map(|outcome| {
-            if let PublicInstructionOutcome::ApplicationRole(Some(address)) = outcome {
-                (!address.is_empty()).then(|| ServiceLocation {
-                    preview: identity.clone(),
-                    resource_uid: state.identity.resource_uid.clone(),
-                    operation_id: record.intent.operation_id.clone(),
-                    replica: report.replica.clone(),
-                    process_session_id: session.clone(),
-                    epoch: input.epoch,
-                    revision: record.intent.revision,
-                    address: address.clone(),
-                })
-            } else {
-                None
-            }
-        });
-    }
-    Ok(report)
 }
 
 pub(crate) struct PublicV1ReportProjection {

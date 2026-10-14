@@ -180,7 +180,7 @@ fn public_v1_history_data_loss_attempt_renews_higher_epoch() {
 
 #[tokio::test]
 async fn public_v1_history_store_uses_the_current_exact_schema() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 11);
+    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 12);
     let directory = tempfile::tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let preview = PublicOperationPreviewIdentity::public_v1(42);
@@ -226,11 +226,19 @@ async fn public_v1_history_store_uses_the_current_exact_schema() {
     drop(reopened);
 
     let connection = rusqlite::Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 10).unwrap();
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(tables, vec!["agent_state"]);
+    connection.pragma_update(None, "user_version", 11).unwrap();
     drop(connection);
     assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
 
-    for rejected_version in [6, 7, 8, 9] {
+    for rejected_version in [6, 7, 11] {
         let directory = tempfile::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         let store = SqliteStore::create_public_v1(
@@ -259,4 +267,27 @@ async fn public_v1_history_store_uses_the_current_exact_schema() {
         drop(connection);
         assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
     }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    drop(
+        SqliteStore::create_public_v1(
+            &path,
+            preview.clone(),
+            StorageIdentity {
+                schema_version: SCHEMA_VERSION,
+                resource_uid,
+                pod_uid: PodUid::new("pod-1"),
+                pvc_uid: PvcUid::new("pvc-1"),
+                initialization_id: InitializationId::new("partial-initialization"),
+                local_identity: local,
+                effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+            },
+        )
+        .unwrap(),
+    );
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute("DELETE FROM agent_state", []).unwrap();
+    drop(connection);
+    assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
 }

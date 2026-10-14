@@ -1,4 +1,6 @@
 use kube::CustomResource;
+use kuberic_runtime::protocol::command::PublicV1OperationCommand;
+use kuberic_runtime::protocol::public_operations::PublicV1SessionRenewalStatus;
 use kuberic_runtime::protocol::public_operations::{PublicV1AcceptedStatus, StatePersistence};
 use kuberic_runtime::protocol::types::AcceptedStatus;
 use schemars::JsonSchema;
@@ -63,7 +65,59 @@ pub struct KubericSetStatus {
     #[serde(flatten)]
     pub authority: AcceptedStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
     pub public_v1_authority: Option<PublicV1AcceptedStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub public_v1_session_renewal: Option<PublicV1SessionRenewalStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub public_v1_transition:
+        Option<crate::evaluator::public_v1_evidence::PublicV1AcceptedTransitionStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub public_v1_operation: Option<PublicV1OperationCommand>,
+}
+
+impl KubericSetStatus {
+    pub fn validate_public_v1(&self) -> Result<(), String> {
+        if self.authority != AcceptedStatus::default() {
+            return Err("legacy controller authority is not valid public-v1 input".into());
+        }
+        if let Some(accepted) = &self.public_v1_authority {
+            accepted.validate_evidence().map_err(str::to_owned)?;
+        }
+        if let Some(renewal) = &self.public_v1_session_renewal {
+            renewal.validate().map_err(str::to_owned)?;
+            if self.public_v1_authority.as_ref().is_none_or(|accepted| {
+                accepted.history != renewal.required.history
+                    || accepted.history.resource_uid != renewal.required.resource_uid
+            }) {
+                return Err("public-v1 session renewal lacks exact accepted history".into());
+            }
+        }
+        if let Some(transition) = &self.public_v1_transition {
+            transition.validate()?;
+            if self.public_v1_authority.as_ref() != Some(&transition.evidence) {
+                return Err("public-v1 transition evidence differs from accepted history".into());
+            }
+            let operation = self
+                .public_v1_operation
+                .as_ref()
+                .ok_or_else(|| "public-v1 transition lacks its operation command".to_string())?;
+            operation.validate().map_err(str::to_owned)?;
+            if !crate::cluster_api::public_v1_operations::operation_matches_transition(
+                transition,
+                &operation.intent,
+            ) || operation.target != transition.intent.source.storage_incarnation.replica
+            {
+                return Err("public-v1 operation differs from accepted transition".into());
+            }
+        } else if self.public_v1_operation.is_some() {
+            return Err("public-v1 operation lacks accepted transition authority".into());
+        }
+        Ok(())
+    }
 }
 
 const fn default_failover_delay_seconds() -> u64 {

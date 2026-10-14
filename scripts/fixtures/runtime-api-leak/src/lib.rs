@@ -2,19 +2,16 @@
 
 use std::sync::Arc;
 
+use kuberic_runtime::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
+use kuberic_runtime::host::{
+    command, hosting, operation, operation_recovery, provisioning, public_build_store,
+    public_lifecycle, service, session, sqlite_store, state, store, transport,
+};
 use kuberic_runtime::replicator::{
-    PrimaryReplicator, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
-    ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration, StateReplicator,
+    PartitionAccessView, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
+    ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
     StatefulServicePartition,
 };
-use kuberic_runtime::authority::AdmittedAuthority;
-use kuberic_runtime::host::hosting::{
-    BuildRuntime, OutboundRuntime, PeerDiscoveryRuntime, ReportRuntime,
-};
-use kuberic_runtime::host::hosting::lifecycle::{
-    LifecycleWiring, RecoveryRuntime, TopologyRuntime,
-};
-use kuberic_runtime::host::hosting::custom::ReplicatorLifecycleRegistration;
 
 pub fn extract_attachment(
     interfaces: &ReplicatorInterfaces,
@@ -30,22 +27,11 @@ pub fn infer_host_token(
     let _ = StatefulServicePartition::new(Default::default(), registration, context);
 }
 
-pub fn assemble_split_bundle(
-    control: Arc<dyn Replicator>,
-    state: Arc<dyn StateReplicator>,
-    primary: Arc<dyn PrimaryReplicator>,
-) {
+pub fn assemble_split_bundle(control: Arc<dyn Replicator>) {
     let _ = ReplicatorInterfaces {
         replicator: control,
-        state_replicator: Some(state),
-        primary_replicator: Some(primary),
-    };
-}
-
-pub fn forge_attachment(control: Arc<dyn Replicator>, primary: Arc<dyn PrimaryReplicator>) {
-    let _ = ReplicatorAttachment {
-        replicator: control,
-        primary_replicator: Some(primary),
+        state_replicator: None,
+        primary_replicator: None,
     };
 }
 
@@ -53,8 +39,5 @@ pub fn disarm_bundle_guard(attachment: &ReplicatorAttachment) {
     attachment.disarm();
 }
 
-pub fn inspect_host_dependencies(context: &ReplicatorFactoryContext) {
-    let _ = &context.default_dependencies;
-}
-
-pub fn obtain_authority(_: AdmittedAuthority) {}
+pub fn forge_access(_: Arc<dyn PartitionAccessView>) {}
+pub fn forge_identity(_: ReplicatorCreationIdentity, _: RuntimeHostToken) {}

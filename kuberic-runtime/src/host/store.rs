@@ -1,54 +1,21 @@
-//! Narrow agent store operations.
+//! Public V1 agent store operations.
 
-use crate::effects::{RuntimeEffect, RuntimeEffectResult};
-use crate::protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::public_operations::DataLossRenewalDecision;
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-use crate::protocol::public_operations::{
-    PublicFaultAction, RestartActionRecord, RestartActionStage,
-};
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::public_operations::{PublicInboundBuildAuthority, PublicInboundBuildReceipt};
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::public_operations::{PublicOperationIntent, PublicV1SessionRenewalStatus};
-use crate::protocol::types::{FaultType, LoadMetric, OperationId};
-#[cfg(any(test, feature = "testing"))]
-use crate::protocol::types::{
-    HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
-};
 use async_trait::async_trait;
 
-use crate::authority::AdmittedAuthority;
 use crate::host::Result;
-#[cfg(test)]
-use crate::host::state::RetainedResult;
 use crate::host::state::{
-    AgentState, CoordinatorStage, ReconfigurationRecord, RetainedCommandResult, StorageIdentity,
+    AgentState, PublicOperationDisposition, PublicOperationRecord, PublicOperationStage,
+    StorageIdentity,
 };
-#[cfg(any(test, feature = "testing"))]
-use crate::host::state::{PublicOperationDisposition, PublicOperationRecord, PublicOperationStage};
+use crate::protocol::public_operations::{
+    DataLossRenewalDecision, PublicInboundBuildAuthority, PublicInboundBuildReceipt,
+    PublicOperationIntent, PublicV1SessionRenewalStatus,
+};
+use crate::protocol::types::{
+    FaultType, HistoryContext, HistoryInitializationId, LoadMetric, OperationId,
+    ReplicaStorageIncarnationContext,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BeginEffect {
-    Execute(RuntimeEffect),
-    Pending(RuntimeEffect),
-    Applied {
-        effect: RuntimeEffect,
-        result: Box<RuntimeEffectResult>,
-    },
-    Completed(Box<RuntimeEffectResult>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BeginConfiguration {
-    Execute(ReconfigurationRecord),
-    Pending(ReconfigurationRecord),
-    Superseded(ReconfigurationRecord),
-    Completed(RetainedCommandResult),
-}
-
-#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BeginPublicOperation {
     Ready(PublicOperationRecord),
@@ -57,7 +24,6 @@ pub(crate) enum BeginPublicOperation {
     Completed(PublicOperationRecord),
 }
 
-#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RenewPublicDataLossAttempt {
     pub(crate) decision: DataLossRenewalDecision,
@@ -65,7 +31,6 @@ pub(crate) struct RenewPublicDataLossAttempt {
     pub(crate) successor: Option<PublicOperationRecord>,
 }
 
-#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicInboundBuildAdmission {
     Current,
@@ -78,55 +43,7 @@ pub(crate) trait AgentStore: Send + Sync {
 
     async fn load_state(&self) -> Result<AgentState>;
 
-    async fn load_admitted_authority(&self) -> Result<Option<AdmittedAuthority>>;
-
     async fn complete_application_initialization(&self) -> Result<()>;
-
-    async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect>;
-
-    async fn mark_effect_applied(
-        &self,
-        effect: &RuntimeEffect,
-        result: &RuntimeEffectResult,
-    ) -> Result<()>;
-
-    async fn complete_effect(&self, result: &RuntimeEffectResult) -> Result<()>;
-
-    async fn cancel_effect(&self, effect: &RuntimeEffect) -> Result<()>;
-
-    async fn begin_configuration(
-        &self,
-        command: &EnsureConfiguration,
-    ) -> Result<BeginConfiguration>;
-
-    async fn journal_build(&self, command: &EnsureReplicaBuild) -> Result<EnsureReplicaBuild>;
-
-    async fn abandon_build(&self, command: &EnsureReplicaBuild) -> Result<()>;
-
-    async fn advance_configuration(
-        &self,
-        operation_id: &OperationId,
-        expected: CoordinatorStage,
-        next: CoordinatorStage,
-        observed_lsn: Option<i64>,
-    ) -> Result<ReconfigurationRecord>;
-
-    async fn complete_configuration(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<RetainedCommandResult>;
-
-    #[cfg(test)]
-    async fn retained_result(&self) -> Result<Option<RetainedResult>>;
-
-    #[cfg(test)]
-    async fn set_reconfiguration(&self, data: Option<String>) -> Result<()>;
-
-    #[cfg(test)]
-    async fn clear_reconfiguration(&self) -> Result<()>;
-
-    #[cfg(test)]
-    async fn migrate_schema(&self, expected_version: u32, target_version: u32) -> Result<()>;
 
     async fn record_partition_reports(
         &self,
@@ -134,7 +51,6 @@ pub(crate) trait AgentStore: Send + Sync {
         reported_fault: Option<FaultType>,
     ) -> Result<()>;
 
-    #[cfg(any(test, feature = "testing"))]
     async fn initialize_public_v1_history(
         &self,
         _initialization_id: &HistoryInitializationId,
@@ -142,11 +58,10 @@ pub(crate) trait AgentStore: Send + Sync {
         _storage: &ReplicaStorageIncarnationContext,
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
-            "public-v1 history is not enabled for this store".into(),
+            "Public V1 history is not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn begin_public_operation(
         &self,
         _intent: &PublicOperationIntent,
@@ -154,32 +69,29 @@ pub(crate) trait AgentStore: Send + Sync {
         _superseded: &[OperationId],
     ) -> Result<BeginPublicOperation> {
         Err(crate::host::HostError::CommandRejected(
-            "public-operation preview is not enabled for this store".into(),
+            "Public V1 operations are not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn renew_public_v1_data_loss_attempt(
         &self,
         _intent: &PublicOperationIntent,
     ) -> Result<RenewPublicDataLossAttempt> {
         Err(crate::host::HostError::CommandRejected(
-            "public-v1 data-loss renewal is not enabled for this store".into(),
+            "Public V1 data-loss renewal is not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn persist_public_v1_session_renewal(
         &self,
         _expected: Option<&PublicV1SessionRenewalStatus>,
         _next: &PublicV1SessionRenewalStatus,
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
-            "public-v1 session renewal is not enabled for this store".into(),
+            "Public V1 session renewal is not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn advance_public_operation(
         &self,
         _operation_id: &OperationId,
@@ -190,29 +102,26 @@ pub(crate) trait AgentStore: Send + Sync {
         _disposition: Option<PublicOperationDisposition>,
     ) -> Result<PublicOperationRecord> {
         Err(crate::host::HostError::CommandRejected(
-            "public-operation preview is not enabled for this store".into(),
+            "Public V1 operations are not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn attach_public_operation(
         &self,
         _intent: &PublicOperationIntent,
         _owner: &OperationId,
     ) -> Result<PublicOperationRecord> {
         Err(crate::host::HostError::CommandRejected(
-            "public-operation preview is not enabled for this store".into(),
+            "Public V1 operations are not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn public_operation_records(&self) -> Result<Vec<PublicOperationRecord>> {
         Err(crate::host::HostError::CommandRejected(
-            "public-operation preview is not enabled for this store".into(),
+            "Public V1 operations are not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn public_instruction(
         &self,
         _intent: &PublicOperationIntent,
@@ -221,31 +130,28 @@ pub(crate) trait AgentStore: Send + Sync {
         _outcome: Option<crate::host::state::PublicInstructionOutcome>,
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
-            "public-operation preview is not enabled for this store".into(),
+            "Public V1 operations are not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn classify_public_v1_inbound_build_authority(
         &self,
         _authority: &PublicInboundBuildAuthority,
     ) -> Result<PublicInboundBuildAdmission> {
         Err(crate::host::HostError::CommandRejected(
-            "public-v1 inbound build authority is not enabled for this store".into(),
+            "Public V1 inbound build authority is not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn install_public_v1_inbound_build_authority(
         &self,
         _authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
-            "public-v1 inbound build authority is not enabled for this store".into(),
+            "Public V1 inbound build authority is not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn public_v1_inbound_build_authority(
         &self,
         _build_id: &OperationId,
@@ -253,7 +159,6 @@ pub(crate) trait AgentStore: Send + Sync {
         Ok(None)
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn public_v1_terminal_inbound_build_receipt(
         &self,
         _build_id: &OperationId,
@@ -261,14 +166,12 @@ pub(crate) trait AgentStore: Send + Sync {
         Ok(None)
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn revoke_public_v1_inbound_build_authority(&self) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
-            "public-v1 inbound build authority is not enabled for this store".into(),
+            "Public V1 inbound build authority is not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn public_v1_outbound_build_authority(
         &self,
         _build_id: &OperationId,
@@ -277,54 +180,19 @@ pub(crate) trait AgentStore: Send + Sync {
         Ok(None)
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn complete_public_v1_inbound_build(
         &self,
         _receipt: &PublicInboundBuildReceipt,
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
-            "public-v1 inbound build authority is not enabled for this store".into(),
+            "Public V1 inbound build authority is not enabled for this store".into(),
         ))
     }
 
-    #[cfg(any(test, feature = "testing"))]
     async fn public_v1_storage_is_retired(
         &self,
         _storage: &ReplicaStorageIncarnationContext,
     ) -> Result<bool> {
         Ok(false)
-    }
-
-    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
-    #[allow(dead_code)]
-    async fn begin_restart_action(
-        &self,
-        _action: &PublicFaultAction,
-    ) -> Result<RestartActionRecord> {
-        Err(crate::host::HostError::CommandRejected(
-            "public-operation preview is not enabled for this store".into(),
-        ))
-    }
-
-    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
-    #[allow(dead_code)]
-    async fn advance_restart_action(
-        &self,
-        _action: &PublicFaultAction,
-        _expected: RestartActionStage,
-        _next: RestartActionStage,
-        _successor_session: Option<&crate::protocol::types::ProcessSessionId>,
-        _successor_process_id: Option<u32>,
-        _launch_nonce: Option<&str>,
-    ) -> Result<RestartActionRecord> {
-        Err(crate::host::HostError::CommandRejected(
-            "public-operation preview is not enabled for this store".into(),
-        ))
-    }
-
-    #[cfg(all(feature = "testing", kuberic_workspace_tests))]
-    #[allow(dead_code)]
-    async fn restart_action(&self) -> Result<Option<RestartActionRecord>> {
-        Ok(None)
     }
 }

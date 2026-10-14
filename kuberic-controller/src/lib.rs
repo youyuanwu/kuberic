@@ -24,7 +24,7 @@ pub mod executor;
 pub mod normalize;
 pub mod observation;
 pub mod plan;
-#[cfg(feature = "runtime-test-bridge")]
+#[cfg(feature = "public-v1")]
 mod public_v1_reconciliation;
 pub mod reconciler;
 
@@ -35,6 +35,8 @@ pub use plan::{Plan, UnsafeReason, WaitReason};
 
 #[derive(Debug, Parser)]
 struct Config {
+    #[arg(long, env = "KUBERIC_INSTALLATION_NAMESPACE")]
+    installation_namespace: String,
     #[arg(long, env = "KUBERIC_AGENT_BEARER_TOKEN")]
     agent_bearer_token: String,
     #[arg(long, env = "KUBERIC_STABLE_RESYNC_SECONDS", default_value_t = 30)]
@@ -69,14 +71,16 @@ struct Config {
 pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let config = Config::parse();
+    validate_installation_namespace(&config.installation_namespace)?;
     let client = kube::Client::try_default().await?;
     let agents = Arc::new(cluster_api::GrpcAgentApi::new(Duration::from_secs(
         config.rpc_deadline_seconds,
     )));
-    let api = Arc::new(cluster_api::KubeClusterApi::new(
+    let api = Arc::new(cluster_api::KubeClusterApi::new_namespaced(
         client.clone(),
         agents,
         config.agent_bearer_token,
+        config.installation_namespace.clone(),
     )?);
     let reconciler = Arc::new(reconciler::Reconciler::new(
         api,
@@ -86,11 +90,12 @@ pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error
             config.unsafe_requeue_seconds,
         ),
     ));
-    let sets = Api::<crd::KubericSet>::all(client.clone());
-    let pods = Api::<Pod>::all(client.clone());
-    let pvcs = Api::<PersistentVolumeClaim>::all(client.clone());
-    let services = Api::<Service>::all(client.clone());
-    let secrets = Api::<Secret>::all(client);
+    let namespace = config.installation_namespace;
+    let sets = Api::<crd::KubericSet>::namespaced(client.clone(), &namespace);
+    let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
+    let pvcs = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace);
+    let services = Api::<Service>::namespaced(client.clone(), &namespace);
+    let secrets = Api::<Secret>::namespaced(client, &namespace);
     Controller::new(sets, watcher::Config::default())
         .owns(pods, watcher::Config::default())
         .owns(pvcs, watcher::Config::default())
@@ -122,6 +127,29 @@ pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+fn validate_installation_namespace(namespace: &str) -> std::result::Result<(), ControllerError> {
+    let valid = !namespace.is_empty()
+        && namespace.len() <= 63
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && namespace
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && namespace
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if valid {
+        Ok(())
+    } else {
+        Err(ControllerError::Observation(
+            "KUBERIC_INSTALLATION_NAMESPACE must be a valid DNS label".to_string(),
+        ))
+    }
+}
+
 pub fn production_evaluation_config(
     stable_resync_seconds: u64,
     wait_requeue_seconds: u64,
@@ -134,13 +162,27 @@ pub fn production_evaluation_config(
         stable_resync_seconds,
         wait_requeue_seconds,
         unsafe_requeue_seconds,
-        #[cfg(feature = "runtime-test-bridge")]
-        public_operation_preview: None,
+        #[cfg(feature = "public-v1")]
+        public_operation_preview: Some(
+            kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity::public_v1(
+                1,
+            ),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installation_namespace_requires_one_valid_dns_label() {
+        for namespace in ["default", "kuberic-system", "ns1"] {
+            super::validate_installation_namespace(namespace).unwrap();
+        }
+        for namespace in ["", "-bad", "bad-", "Bad", "two.labels"] {
+            assert!(super::validate_installation_namespace(namespace).is_err());
+        }
+    }
+
     #[test]
     fn production_enables_only_completed_membership_gates() {
         let config = super::production_evaluation_config(31, 7, 13);
@@ -153,5 +195,12 @@ mod tests {
         assert_eq!(config.stable_resync_seconds, 31);
         assert_eq!(config.wait_requeue_seconds, 7);
         assert_eq!(config.unsafe_requeue_seconds, 13);
+        assert_eq!(
+            config.public_operation_preview,
+            Some(
+                kuberic_runtime::protocol::public_operations::PublicOperationPreviewIdentity::
+                    public_v1(1)
+            )
+        );
     }
 }

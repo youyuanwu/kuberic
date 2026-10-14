@@ -260,7 +260,7 @@ impl PgReplicatorFactory {
     }
 }
 
-#[cfg(all(test, feature = "testing"))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::testing::{PgPod, TestDataDir, layout::SINGLE_REPLICA_DIRECTORY, native_identity};

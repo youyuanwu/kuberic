@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use kuberic_controller::cluster_api::PublicV1Scope;
 use kuberic_controller::evaluator::test_bridge::{
     PublicV1SessionRenewalApi, PublicV1SessionRenewalPlan, accept_public_v1_session_access_closed,
     accept_public_v1_session_epoch_updated, accept_public_v1_session_renewal,
@@ -32,12 +33,14 @@ struct FakeApi {
 impl PublicV1SessionRenewalApi for FakeApi {
     async fn observe_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1SessionRenewalStatus>, String> {
         Ok(self.status.lock().unwrap().clone())
     }
 
     async fn persist_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: Option<&PublicV1SessionRenewalStatus>,
         next: &PublicV1SessionRenewalStatus,
     ) -> Result<(), String> {
@@ -51,6 +54,7 @@ impl PublicV1SessionRenewalApi for FakeApi {
 
     async fn dispatch_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1SessionRenewalStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -59,6 +63,14 @@ impl PublicV1SessionRenewalApi for FakeApi {
         }
         self.dispatched.lock().unwrap().push(command.clone());
         Ok(())
+    }
+}
+
+fn test_scope() -> PublicV1Scope {
+    PublicV1Scope {
+        namespace: "kuberic-system".into(),
+        name: "resource-1".into(),
+        resource_uid: ResourceUid::new("resource-1"),
     }
 }
 
@@ -219,7 +231,7 @@ async fn public_v1_session_renewal_is_conditionally_accepted() {
     let report = replacement_report(&required);
     let plan = accept_public_v1_session_renewal(None, required.clone(), Some(&report)).unwrap();
     let api = FakeApi::default();
-    execute_public_v1_session_renewal(&api, plan.clone())
+    execute_public_v1_session_renewal(&api, &test_scope(), plan.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -237,7 +249,7 @@ async fn public_v1_session_renewal_is_conditionally_accepted() {
         ..Default::default()
     };
     assert!(
-        execute_public_v1_session_renewal(&stale, plan)
+        execute_public_v1_session_renewal(&stale, &test_scope(), plan)
             .await
             .is_err()
     );

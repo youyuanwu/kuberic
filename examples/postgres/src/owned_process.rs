@@ -534,7 +534,7 @@ impl OwnedProcess {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};

@@ -18,7 +18,7 @@ default-filter = 'not package(=postgres-replicated) and not binary(=kubernetes_c
 
 [profile.build-only]
 inherits = "ci"
-default-filter = 'binary_id(=kuberic-runtime::public_api_privacy) or (binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios))'
+default-filter = 'binary_id(=kuberic-runtime::public_api_privacy) or (binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_built_in_replacement_scenarios))'
 test-threads = 1
 
 [profile.postgres]
@@ -34,11 +34,6 @@ test-threads = 1
 [profile.dex-live]
 inherits = "ci"
 default-filter = 'binary(=kubernetes_checkpoint_real)'
-test-threads = 1
-
-[profile.helper]
-inherits = "ci"
-default-filter = '(binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)) or binary_id(=kuberic-controller::model) or binary_id(=postgres-replicated::native_durable) or binary_id(=postgres-replicated::validation_oracles)'
 test-threads = 1
 
 [test-groups]
@@ -61,7 +56,7 @@ slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 
 [[profile.default.overrides]]
-filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
+filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_built_in_replacement_scenarios)'
 slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 
@@ -69,11 +64,6 @@ test-group = 'process-boundaries'
 filter = 'binary_id(=kuberic-runtime) and test(=host::sqlite_store::tests::terminal_inbound_build_receipt_reopens_for_exact_replay_only)'
 slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
-
-[[profile.default.overrides]]
-filter = 'binary_id(=kuberic-runtime) and test(/^host::tests::(crash_boundaries|recovery)::/)'
-test-group = 'process-boundaries'
-threads-required = 4
 
 [[profile.default.overrides]]
 filter = 'package(=kuberic-level-tests) and test(/^level_triggered_k8s::(adversarial_restart_partition_and_healing_preserve_single_writer|bootstrap_reaches_three_member_topology_and_quorum_write|failover_fences_old_primary_and_preserves_committed_data|planned_switchover(_adversarial)?|quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change|replacement_preserves_quorum_write_and_retires_old_incarnation|scale_down(_non_contiguous|_adversarial_(historical|reachable|unreachable|absent_pod))?|scale_up(_multi|_adversarial_(cancellation|pre_admission_failover|post_admission_recovery|non_contiguous_restore))?)$/)'

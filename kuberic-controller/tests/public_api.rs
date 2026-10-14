@@ -1,19 +1,11 @@
-use std::collections::BTreeMap;
 use std::process::Command;
 
 use kube::CustomResourceExt;
 use kuberic_controller::control::{WireError, proto};
-use kuberic_controller::crd::{KubericSet, KubericSetSpec, KubericSetStatus};
-use kuberic_controller::normalize::normalize;
-use kuberic_controller::observation::RawObservation;
+use kuberic_controller::crd::{KubericSet, KubericSetStatus};
+use kuberic_controller::default_main;
 use kuberic_controller::protocol::PROTOCOL_VERSION;
-use kuberic_controller::protocol::command::KubernetesChange;
-use kuberic_controller::protocol::observation::ObservationSnapshot;
 use kuberic_controller::protocol::types::AcceptedStatus;
-use kuberic_controller::protocol::validation::validate_snapshot;
-use kuberic_controller::{
-    EvaluationConfig, Plan, default_main, evaluate, production_evaluation_config,
-};
 use serde_json::json;
 
 #[test]
@@ -25,47 +17,6 @@ fn controller_exports_default_main() {
     }
 
     assert_future(default_main());
-}
-
-#[test]
-fn controller_exports_observation_and_evaluation_contracts() {
-    let mut set = KubericSet::new(
-        "db",
-        KubericSetSpec {
-            replicas: 1,
-            image: "example/db:latest".into(),
-            failover_delay_seconds: 30,
-            switchover: None,
-            preview_lifecycle: None,
-        },
-    );
-    set.metadata.uid = Some("set-uid".into());
-    set.metadata.resource_version = Some("1".into());
-    set.metadata.generation = Some(1);
-    set.status = Some(KubericSetStatus {
-        authority: AcceptedStatus::default(),
-        public_v1_authority: None,
-    });
-    let raw = RawObservation {
-        set,
-        pods: Vec::new(),
-        pvcs: Vec::new(),
-        services: Vec::new(),
-        secrets: Vec::new(),
-        agents: BTreeMap::new(),
-        exact_resources: Vec::new(),
-        failures: Vec::new(),
-        now_unix_seconds: 100,
-    };
-    let snapshot: ObservationSnapshot = normalize(raw, BTreeMap::new()).unwrap();
-    validate_snapshot(&snapshot).unwrap();
-    let config: EvaluationConfig = production_evaluation_config(31, 7, 13);
-    assert_eq!(config.supported_protocol_version, PROTOCOL_VERSION);
-    assert!(matches!(
-        evaluate(&snapshot, &config),
-        Plan::Apply { changes }
-            if changes == vec![KubernetesChange::EnsureReplicaSupport]
-    ));
 }
 
 #[test]

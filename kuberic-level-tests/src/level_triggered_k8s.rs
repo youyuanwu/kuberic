@@ -104,7 +104,7 @@ fn set_status(kubeconfig: &str, context: &str) -> Result<serde_json::Value> {
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "kubericset",
             "kvstore2",
@@ -139,7 +139,7 @@ fn pod_for_replica(kubeconfig: &str, context: &str, replica_id: i64) -> Result<S
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             "-l",
@@ -168,7 +168,7 @@ fn stop_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Res
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             &pod,
@@ -226,7 +226,7 @@ fn kill_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Res
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             &pod,
@@ -302,7 +302,7 @@ fn suspend_replica_process(
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             &pod,
@@ -382,7 +382,7 @@ fn partition_replica_traffic(
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             &pod,
@@ -443,7 +443,7 @@ fn put_from_replica(
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             &pod,
             "--",
@@ -477,7 +477,7 @@ fn replica_diagnostics(
         context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             &pod,
             "--",
@@ -519,7 +519,7 @@ impl KubeWatch {
                 ])
                 .args([
                     "-n",
-                    "default",
+                    "kuberic-system",
                     "get",
                     resource,
                     name,
@@ -634,7 +634,13 @@ impl DirectClient {
                     "--context",
                     &cluster.context,
                 ])
-                .args(["-n", "default", "port-forward", "--address=127.0.0.1", pod])
+                .args([
+                    "-n",
+                    "kuberic-system",
+                    "port-forward",
+                    "--address=127.0.0.1",
+                    pod,
+                ])
                 .arg(port_mapping)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -922,7 +928,7 @@ impl SwitchoverCluster {
     fn status(&self) -> Result<Value> {
         Ok(serde_json::from_str(&self.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "kubericset",
             "kvstore2",
@@ -964,7 +970,7 @@ impl SwitchoverCluster {
     fn pod(&self, identity: &Value) -> Result<String> {
         let pods: Value = serde_json::from_str(&self.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pods",
             "-l",
@@ -986,7 +992,7 @@ impl SwitchoverCluster {
         let pod = self.pod(identity)?;
         Ok(serde_json::from_str(&self.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             &pod,
             "--",
@@ -1009,7 +1015,7 @@ impl SwitchoverCluster {
             "{}",
             self.kubectl(&[
                 "-n",
-                "default",
+                "kuberic-system",
                 "logs",
                 &pod,
                 "--all-containers",
@@ -1021,7 +1027,7 @@ impl SwitchoverCluster {
                 .args([
                     "delete",
                     "--raw",
-                    &format!("/api/v1/namespaces/default/pods/{pod}"),
+                    &format!("/api/v1/namespaces/kuberic-system/pods/{pod}"),
                     "-f",
                     "-",
                 ])
@@ -1254,7 +1260,7 @@ fn routed_service_client_pod(
         deadline,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "service",
             "kvstore2-write",
@@ -1275,7 +1281,7 @@ fn routed_service_client_pod(
         deadline,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "endpoints",
             "kvstore2-write",
@@ -1321,7 +1327,7 @@ fn routed_service_client_pod(
         deadline,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pods",
             "-l",
@@ -1363,7 +1369,7 @@ fn assert_routed_service_write(
             deadline,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "exec",
                 &pod,
                 "--",
@@ -1409,7 +1415,7 @@ fn assert_routed_service_read(
             deadline,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "exec",
                 &pod,
                 "--",
@@ -1666,7 +1672,7 @@ impl<'a> SwitchoverCase<'a> {
 
     fn submit(&self) -> Result<()> {
         self.cluster.kubectl(&[
-            "-n", "default", "patch", "kubericset", "kvstore2", "--type=merge", "-p",
+            "-n", "kuberic-system", "patch", "kubericset", "kvstore2", "--type=merge", "-p",
             &json!({"spec":{"switchover":{"requestId":self.request,"targetReplicaId":self.target["replicaId"]}}}).to_string(),
         ])?;
         Ok(())
@@ -1811,7 +1817,7 @@ impl<'a> SwitchoverCase<'a> {
                 };
                 let service: Value = serde_json::from_str(&self.cluster.kubectl(&[
                     "-n",
-                    "default",
+                    "kuberic-system",
                     "get",
                     "service",
                     "kvstore2-write",
@@ -1920,7 +1926,7 @@ impl<'a> SwitchoverCase<'a> {
         let key = format!("{}-service", self.request);
         self.cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             &pod,
             "--",
@@ -2038,7 +2044,7 @@ impl ScaleResource {
     fn get(&self, cluster: &SwitchoverCluster) -> Result<Option<Value>> {
         let output = cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             self.kind,
             self.name(),
@@ -2194,7 +2200,7 @@ fn record_cleanup_deletions(
 fn scale_resources(cluster: &SwitchoverCluster, member: &Value) -> Result<Vec<ScaleResource>> {
     let pod: Value = serde_json::from_str(&cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "get",
         "pod",
         &cluster.pod(member)?,
@@ -2208,12 +2214,23 @@ fn scale_resources(cluster: &SwitchoverCluster, member: &Value) -> Result<Vec<Sc
         .filter_map(|v| v["persistentVolumeClaim"]["claimName"].as_str())
         .collect::<Vec<_>>();
     ensure!(claims.len() == 1, "ambiguous mounted storage");
-    let pvc = serde_json::from_str(
-        &cluster.kubectl(&["-n", "default", "get", "pvc", claims[0], "-o", "json"])?,
-    )?;
-    let services: Value = serde_json::from_str(
-        &cluster.kubectl(&["-n", "default", "get", "services", "-o", "json"])?,
-    )?;
+    let pvc = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "kuberic-system",
+        "get",
+        "pvc",
+        claims[0],
+        "-o",
+        "json",
+    ])?)?;
+    let services: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "kuberic-system",
+        "get",
+        "services",
+        "-o",
+        "json",
+    ])?)?;
     let endpoints = services["items"]
         .as_array()
         .context("services")?
@@ -2281,7 +2298,7 @@ fn reset_scale_set_with_delay(
 ) -> Result<()> {
     cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "delete",
         "kubericset",
         "kvstore2",
@@ -2293,7 +2310,7 @@ fn reset_scale_set_with_delay(
     loop {
         let objects: Value = serde_json::from_str(&cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod,pvc,service",
             "-l",
@@ -2314,7 +2331,7 @@ fn reset_scale_set_with_delay(
         "apiVersion":"operator.kuberic.io/v1alpha1", "kind":"KubericSet",
         "metadata":{
             "name":"kvstore2",
-            "namespace":"default",
+            "namespace":"kuberic-system",
             "annotations":{"testing.kuberic.io/live-copy-gate":"enabled"}
         },
         "spec":{"replicas":count,"image":"localhost/kvstore2:level-triggered-v1",
@@ -2487,7 +2504,7 @@ impl<'a> ScaleCase<'a> {
     fn submit(&self, count: usize) -> Result<()> {
         self.cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "patch",
             "kubericset",
             "kvstore2",
@@ -2849,7 +2866,7 @@ impl ControlForward {
                     "--context",
                     &cluster.context,
                     "-n",
-                    "default",
+                    "kuberic-system",
                     "port-forward",
                     "--address=127.0.0.1",
                     pod,
@@ -2953,9 +2970,14 @@ struct LiveStepper {
 
 impl LiveStepper {
     fn new(cluster: &SwitchoverCluster) -> Result<Self> {
-        let pods: Value = serde_json::from_str(
-            &cluster.kubectl(&["-n", "default", "get", "pods", "-o", "json"])?,
-        )?;
+        let pods: Value = serde_json::from_str(&cluster.kubectl(&[
+            "-n",
+            "kuberic-system",
+            "get",
+            "pods",
+            "-o",
+            "json",
+        ])?)?;
         let mut endpoints = std::collections::BTreeMap::new();
         for pod in pods["items"].as_array().context("Pod list")? {
             if let (Some(ip), Some(name)) = (
@@ -2996,7 +3018,7 @@ impl LiveStepper {
                 self.agents.clone(),
                 std::env::var("KUBERIC_AGENT_BEARER_TOKEN").context("live agent token")?,
             )?;
-            let raw = api.observe("default", "kvstore2").await?;
+            let raw = api.observe("kuberic-system", "kvstore2").await?;
             let snapshot =
                 kuberic_controller::normalize::normalize(raw.clone(), Default::default())?;
             let plan = kuberic_controller::evaluator::evaluate(
@@ -3044,7 +3066,7 @@ impl LiveStepper {
                 self.agents.clone(),
                 std::env::var("KUBERIC_AGENT_BEARER_TOKEN").context("live agent token")?,
             )?;
-            let raw = api.observe("default", "kvstore2").await?;
+            let raw = api.observe("kuberic-system", "kvstore2").await?;
             Ok(kuberic_controller::normalize::normalize(
                 raw,
                 Default::default(),
@@ -3384,7 +3406,7 @@ fn scale_down_adversarial_case(case_kind: ScaleDownAdversarialCase) -> Result<()
                         if Some(*id) == target["replicaId"].as_i64() {
                             cluster.kubectl(&[
                                 "-n",
-                                "default",
+                                "kuberic-system",
                                 "label",
                                 resource.kind,
                                 resource.name(),
@@ -3472,7 +3494,7 @@ fn scale_down_adversarial_case(case_kind: ScaleDownAdversarialCase) -> Result<()
                     .context("frozen endpoint")?;
                 let replacement = json!({
                     "apiVersion":"v1","kind":"Service",
-                    "metadata":{"name":endpoint.name(),"namespace":"default",
+                    "metadata":{"name":endpoint.name(),"namespace":"kuberic-system",
                         "ownerReferences":endpoint.object["metadata"]["ownerReferences"]},
                     "spec":{"ports":[{"name":"unrelated","port":12345}],"selector":{"unrelated":"replacement"}}
                 });
@@ -3834,7 +3856,7 @@ impl CollectionWatch {
                     "--context",
                     &cluster.context,
                     "-n",
-                    "default",
+                    "kuberic-system",
                     "get",
                     resource,
                     "-l",
@@ -4302,7 +4324,7 @@ impl LiveCopyGateCleanup {
         self.cluster
             .kubectl(&[
                 "-n",
-                "default",
+                "kuberic-system",
                 "exec",
                 &pod,
                 "--",
@@ -4332,7 +4354,7 @@ impl CopyGateCleanup for LiveCopyGateCleanup {
             self.cluster
                 .kubectl(&[
                     "-n",
-                    "default",
+                    "kuberic-system",
                     "exec",
                     &pod,
                     "--",
@@ -4639,21 +4661,38 @@ fn exact_replica_resources(
     replica_id: i64,
 ) -> Result<Vec<ScaleResource>> {
     let pod_name = pod_for_replica(&cluster.kubeconfig, &cluster.context, replica_id)?;
-    let pod: Value = serde_json::from_str(
-        &cluster.kubectl(&["-n", "default", "get", "pod", &pod_name, "-o", "json"])?,
-    )?;
+    let pod: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "kuberic-system",
+        "get",
+        "pod",
+        &pod_name,
+        "-o",
+        "json",
+    ])?)?;
     let pvc_name = pod["spec"]["volumes"]
         .as_array()
         .context("candidate volumes")?
         .iter()
         .find_map(|volume| volume["persistentVolumeClaim"]["claimName"].as_str())
         .context("candidate PVC name")?;
-    let pvc: Value = serde_json::from_str(
-        &cluster.kubectl(&["-n", "default", "get", "pvc", pvc_name, "-o", "json"])?,
-    )?;
-    let services: Value = serde_json::from_str(
-        &cluster.kubectl(&["-n", "default", "get", "services", "-o", "json"])?,
-    )?;
+    let pvc: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "kuberic-system",
+        "get",
+        "pvc",
+        pvc_name,
+        "-o",
+        "json",
+    ])?)?;
+    let services: Value = serde_json::from_str(&cluster.kubectl(&[
+        "-n",
+        "kuberic-system",
+        "get",
+        "services",
+        "-o",
+        "json",
+    ])?)?;
     let endpoint = services["items"]
         .as_array()
         .context("Service list")?
@@ -4746,7 +4785,7 @@ impl<'a> ScaleUpCase<'a> {
     fn submit(&self, count: usize) -> Result<()> {
         self.cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "patch",
             "kubericset",
             "kvstore2",
@@ -5079,7 +5118,7 @@ impl<'a> ScaleUpCase<'a> {
         );
         let service: Value = serde_json::from_str(&self.cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "service",
             "kvstore2-write",
@@ -5830,7 +5869,7 @@ fn wait_controller_ready(cluster: &SwitchoverCluster, deadline: Instant) -> Resu
 fn patch_replicas(cluster: &SwitchoverCluster, count: usize) -> Result<()> {
     cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "patch",
         "kubericset",
         "kvstore2",
@@ -5920,7 +5959,7 @@ fn verify_acknowledged(
         .context("accepted primary")?;
     let service: Value = serde_json::from_str(&cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "get",
         "service",
         "kvstore2-write",
@@ -5972,7 +6011,7 @@ fn create_same_name_endpoint(
         "kind":"Service",
         "metadata":{
             "name":original.name(),
-            "namespace":"default",
+            "namespace":"kuberic-system",
             "ownerReferences":original.object["metadata"]["ownerReferences"],
             "labels":{"kuberic-test":"same-name-resource-fence"}
         },
@@ -6001,7 +6040,7 @@ fn create_same_name_endpoint(
     );
     Ok(serde_json::from_str(&cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "get",
         "service",
         original.name(),
@@ -6122,7 +6161,7 @@ fn scale_up_cancellation_failure_and_retry(
     let replacement = replacement.context("same-name endpoint race was not exercised")?;
     let live: Value = serde_json::from_str(&cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "get",
         "service",
         endpoint.name(),
@@ -6135,7 +6174,7 @@ fn scale_up_cancellation_failure_and_retry(
     );
     cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "delete",
         "service",
         endpoint.name(),
@@ -6411,7 +6450,7 @@ fn scale_up_pre_admission_failover(cluster: &SwitchoverCluster) -> Result<Vec<(S
         let routed = cluster
             .kubectl(&[
                 "-n",
-                "default",
+                "kuberic-system",
                 "get",
                 "service",
                 "kvstore2-write",
@@ -6827,7 +6866,7 @@ fn scale_up_post_admission_recovery_and_replacement(
         topology_primary_id(&failed_over).context("post-replacement failover primary")?;
     let routed: Value = serde_json::from_str(&cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "get",
         "service",
         "kvstore2-write",
@@ -6851,7 +6890,7 @@ fn scale_up_post_admission_recovery_and_replacement(
     let recovered_member = exact_member(&recovered, recovered_primary)?;
     let routed: Value = serde_json::from_str(&cluster.kubectl(&[
         "-n",
-        "default",
+        "kuberic-system",
         "get",
         "service",
         "kvstore2-write",
@@ -6911,7 +6950,7 @@ fn scale_down_then_restore_non_contiguous(cluster: &SwitchoverCluster) -> Result
         );
         cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "patch",
             "kubericset",
             "kvstore2",
@@ -6934,7 +6973,7 @@ fn scale_down_then_restore_non_contiguous(cluster: &SwitchoverCluster) -> Result
         }
         cluster.kubectl(&[
             "-n",
-            "default",
+            "kuberic-system",
             "patch",
             "kubericset",
             "kvstore2",
@@ -7776,7 +7815,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
             &context,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "get",
                 "kubericset",
                 "kvstore2",
@@ -7802,7 +7841,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
                 &context,
                 &[
                     "-n",
-                    "default",
+                    "kuberic-system",
                     "get",
                     "pod",
                     "-l",
@@ -7817,7 +7856,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
                     &context,
                     &[
                         "-n",
-                        "default",
+                        "kuberic-system",
                         "exec",
                         primary.trim(),
                         "--",
@@ -7846,7 +7885,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "delete",
             "service/kvstore2-peer",
             "secret/kvstore2-agent-credentials",
@@ -7858,14 +7897,14 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         let peer = kubectl(
             &kubeconfig,
             &context,
-            &["-n", "default", "get", "service", "kvstore2-peer"],
+            &["-n", "kuberic-system", "get", "service", "kvstore2-peer"],
         );
         let credentials = kubectl(
             &kubeconfig,
             &context,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "get",
                 "secret",
                 "kvstore2-agent-credentials",
@@ -7909,7 +7948,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             "-l",
@@ -7923,7 +7962,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             secondary.trim(),
             "--",
@@ -7938,7 +7977,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             secondary.trim(),
@@ -7986,7 +8025,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
             &context,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "exec",
                 secondary.trim(),
                 "--",
@@ -8016,7 +8055,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             "-l",
@@ -8032,7 +8071,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
             &context,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "exec",
                 pod.trim(),
                 "--",
@@ -8060,7 +8099,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
             "--context",
             &context,
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             pod.trim(),
             "--",
@@ -8080,7 +8119,7 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             pod.trim(),
             "--",
@@ -8108,7 +8147,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             &context,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "get",
                 "kubericset",
                 "kvstore2",
@@ -8145,7 +8184,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             "-l",
@@ -8161,7 +8200,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             "--context",
             &context,
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             primary.trim(),
             "--",
@@ -8182,7 +8221,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             "-l",
@@ -8196,7 +8235,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "delete",
             "pod",
             secondary.trim(),
@@ -8212,7 +8251,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             &context,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "get",
                 "kubericset",
                 "kvstore2",
@@ -8250,7 +8289,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         let old_pvc = kubectl(
             &kubeconfig,
             &context,
-            &["-n", "default", "get", "pvc", "kvstore2-2-data"],
+            &["-n", "kuberic-system", "get", "pvc", "kvstore2-2-data"],
         );
         if old_pvc.is_err() {
             break;
@@ -8266,7 +8305,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             "-l",
@@ -8282,7 +8321,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             "--context",
             &context,
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             primary.trim(),
             "--",
@@ -8303,7 +8342,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             "-l",
@@ -8317,7 +8356,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             replacement.trim(),
             "--",
@@ -8332,7 +8371,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "get",
             "pod",
             replacement.trim(),
@@ -8374,7 +8413,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             &context,
             &[
                 "-n",
-                "default",
+                "kuberic-system",
                 "exec",
                 replacement.trim(),
                 "--",
@@ -8404,7 +8443,7 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             "--context",
             &context,
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             primary.trim(),
             "--",
@@ -8491,7 +8530,7 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             &pod,
             "--",
@@ -8747,7 +8786,7 @@ fn adversarial_restart_partition_and_healing_preserve_single_writer() -> Result<
         &context,
         &[
             "-n",
-            "default",
+            "kuberic-system",
             "exec",
             &pod,
             "--",

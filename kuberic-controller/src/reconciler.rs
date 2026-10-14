@@ -2,31 +2,32 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::evaluator::{EvaluationConfig, evaluate};
-use kuberic_runtime::protocol::observation::{ReplicaObservationKey, ReportWatermark};
+use crate::evaluator::EvaluationConfig;
+use kube::ResourceExt;
+use kuberic_runtime::protocol::types::ResourceUid;
 use tokio::sync::Mutex;
 
-use crate::cluster_api::ClusterApi;
-use crate::executor::{ExecutionKind, ExecutionOutcome, execute_plan};
-use crate::normalize::{normalize, report_watermarks};
+use crate::cluster_api::{ProductionClusterApi, PublicV1Scope};
+use crate::evaluator::public_v1_history::{
+    PublicV1HistoryPlan, plan_bootstrap_history, plan_recovery_report,
+};
+use crate::evaluator::public_v1_session_renewal::plan_session_renewal;
+use crate::executor::ExecutionKind;
+use crate::observation::RawAgentObservation;
 use crate::{ControllerError, Result};
 
-type Watermarks = BTreeMap<ReplicaObservationKey, ReportWatermark>;
-
 pub struct Reconciler {
-    api: Arc<dyn ClusterApi>,
+    api: Arc<dyn ProductionClusterApi>,
     evaluation: EvaluationConfig,
     locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
-    watermarks: Mutex<BTreeMap<String, Watermarks>>,
 }
 
 impl Reconciler {
-    pub fn new(api: Arc<dyn ClusterApi>, evaluation: EvaluationConfig) -> Self {
+    pub fn new(api: Arc<dyn ProductionClusterApi>, evaluation: EvaluationConfig) -> Self {
         Self {
             api,
             evaluation,
             locks: Mutex::new(BTreeMap::new()),
-            watermarks: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -41,77 +42,146 @@ impl Reconciler {
         };
         let _guard = lock.lock().await;
         let raw = self.api.observe(namespace, name).await?;
-        let previous = self
-            .watermarks
-            .lock()
-            .await
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        let snapshot = normalize(raw.clone(), previous.clone())?;
-        let next_watermarks = merge_watermarks(previous, report_watermarks(&snapshot));
-        self.watermarks
-            .lock()
-            .await
-            .insert(key.clone(), next_watermarks);
-        let plan = evaluate(&snapshot, &self.evaluation);
-        let outcome = match execute_plan(self.api.as_ref(), &raw, &snapshot, plan).await {
-            Ok(outcome) => outcome,
-            Err(ControllerError::ObservationStale) => {
-                return Ok(ReconcileAction {
-                    requeue_after: Duration::ZERO,
-                    kind: ReconcileKind::ObservationStale,
-                });
-            }
-            Err(ControllerError::AgentUnavailable(message)) => {
-                if snapshot
-                    .status
-                    .transition
-                    .as_ref()
-                    .is_some_and(|transition| {
-                        transition.kind
-                            == kuberic_runtime::protocol::types::TransitionKind::PlannedSwitchover
-                    })
-                {
-                    let status = snapshot.status.clone().with_condition(kuberic_runtime::protocol::types::StatusCondition {
-                        type_: "Progressing".to_string(),
-                        status: kuberic_runtime::protocol::types::ConditionStatus::True,
-                        reason: "SwitchoverReobservationRequired".to_string(),
-                        message: format!("Re-observe exact process-session authority; dispatch is not completion evidence: {message}"),
-                    });
-                    match self.api.replace_status(&raw, &status).await {
-                        Ok(()) => {}
-                        Err(ControllerError::ObservationStale) => {
-                            return Ok(ReconcileAction {
-                                requeue_after: Duration::ZERO,
-                                kind: ReconcileKind::ObservationStale,
-                            });
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                return Ok(ReconcileAction {
-                    requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
-                    kind: ReconcileKind::Waiting,
-                });
-            }
-            Err(error) => return Err(error),
+        let resource_uid = raw
+            .set
+            .uid()
+            .map(ResourceUid::new)
+            .ok_or_else(|| ControllerError::Observation("KubericSet has no UID".into()))?;
+        let scope = PublicV1Scope {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            resource_uid: resource_uid.clone(),
         };
-        Ok(action(outcome))
+        let accepted = self
+            .api
+            .observe_public_v1_status(&scope)
+            .await
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+        let reports = raw
+            .agents
+            .values()
+            .filter_map(|observation| match observation {
+                RawAgentObservation::PublicV1Report(report) => Some((**report).clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if raw.agents.values().any(|observation| {
+            matches!(
+                observation,
+                RawAgentObservation::Report(_) | RawAgentObservation::PreviewReport(_)
+            )
+        }) {
+            return Err(ControllerError::InvalidAgentEvidence(
+                "legacy agent observation reached public-v1 reconciliation".into(),
+            ));
+        }
+        let status = raw.set.status.as_ref();
+        if let Some(renewal) = status.and_then(|status| status.public_v1_session_renewal.as_ref()) {
+            let unreachable = Vec::new();
+            let plan = plan_session_renewal(renewal, &unreachable)
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            crate::executor::execute_public_v1_session_renewal(self.api.as_ref(), &scope, plan)
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            });
+        }
+        if status
+            .and_then(|status| status.public_v1_transition.as_ref())
+            .is_some()
+        {
+            let command = status
+                .and_then(|status| status.public_v1_operation.clone())
+                .ok_or_else(|| {
+                    ControllerError::InvalidAgentEvidence(
+                        "public-v1 transition lacks its operation command".into(),
+                    )
+                })?;
+            crate::public_v1_reconciliation::reconcile_public_v1_operation(
+                self.api.as_ref(),
+                &scope,
+                kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(Box::new(
+                    command,
+                )),
+            )
+            .await
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            });
+        }
+        let Some(report) = reports
+            .iter()
+            .find(|report| report.resource_uid == resource_uid)
+        else {
+            return Ok(ReconcileAction {
+                requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
+                kind: ReconcileKind::Waiting,
+            });
+        };
+        if let Some(accepted) = accepted.as_ref()
+            && report.identity == accepted.identity
+            && report.history == accepted.history
+            && report.data_loss_recovery.is_some()
+        {
+            let plan = plan_recovery_report(accepted, report)
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            crate::executor::execute_public_v1_history(self.api.as_ref(), &scope, plan)
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Applied,
+            });
+        }
+        if accepted.as_ref().is_some_and(|accepted| {
+            report.identity == accepted.identity && report.history == accepted.history
+        }) {
+            return Ok(ReconcileAction {
+                requeue_after: Duration::from_secs(self.evaluation.stable_resync_seconds),
+                kind: ReconcileKind::Stable,
+            });
+        }
+        let identity = accepted
+            .as_ref()
+            .map(|accepted| accepted.identity.clone())
+            .unwrap_or_else(|| report.identity.clone());
+        if report.identity != identity {
+            return Err(ControllerError::InvalidAgentEvidence(
+                "public-v1 report identity differs from accepted history".into(),
+            ));
+        }
+        let plan = plan_bootstrap_history(
+            accepted,
+            &resource_uid,
+            &identity,
+            report.storage_incarnation.clone(),
+        )
+        .map_err(ControllerError::InvalidAgentEvidence)?;
+        let kind = match plan_kind_for_history(&plan) {
+            ExecutionKind::Applied => ReconcileKind::Applied,
+            ExecutionKind::Stable => ReconcileKind::Stable,
+            _ => ReconcileKind::Executed,
+        };
+        crate::executor::execute_public_v1_history(self.api.as_ref(), &scope, plan)
+            .await
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+        Ok(ReconcileAction {
+            requeue_after: Duration::ZERO,
+            kind,
+        })
     }
 }
 
-fn merge_watermarks(mut previous: Watermarks, observed: Watermarks) -> Watermarks {
-    for (key, watermark) in observed {
-        let replace = previous.get(&key).is_none_or(|existing| {
-            existing.process_session_id != watermark.process_session_id
-                || watermark.report_sequence > existing.report_sequence
-        });
-        if replace {
-            previous.insert(key, watermark);
-        }
+fn plan_kind_for_history(plan: &PublicV1HistoryPlan) -> ExecutionKind {
+    match plan {
+        PublicV1HistoryPlan::PersistStatus { .. } => ExecutionKind::Applied,
+        PublicV1HistoryPlan::Dispatch { .. } => ExecutionKind::Executed,
+        PublicV1HistoryPlan::Stable => ExecutionKind::Stable,
     }
-    previous
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,17 +198,4 @@ pub enum ReconcileKind {
 pub struct ReconcileAction {
     pub requeue_after: Duration,
     pub kind: ReconcileKind,
-}
-
-fn action(outcome: ExecutionOutcome) -> ReconcileAction {
-    ReconcileAction {
-        requeue_after: outcome.requeue_after,
-        kind: match outcome.kind {
-            ExecutionKind::Stable => ReconcileKind::Stable,
-            ExecutionKind::Applied => ReconcileKind::Applied,
-            ExecutionKind::Executed => ReconcileKind::Executed,
-            ExecutionKind::Waiting => ReconcileKind::Waiting,
-            ExecutionKind::Unsafe => ReconcileKind::Unsafe,
-        },
-    }
 }

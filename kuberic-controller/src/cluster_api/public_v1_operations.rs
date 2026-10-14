@@ -14,7 +14,8 @@ use kuberic_runtime::protocol::public_operations::{
 use kuberic_runtime::protocol::types::{OperationId, ReplicaIdentity};
 
 use super::{
-    PublicV1EvidenceApi, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1SessionRenewalApi,
+    PublicV1EvidenceApi, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1Scope,
+    PublicV1SessionRenewalApi,
 };
 use crate::evaluator::public_v1_evidence::{
     PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
@@ -24,16 +25,19 @@ use crate::evaluator::public_v1_evidence::{
 pub trait PublicV1OperationApi: Send + Sync {
     async fn observe_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String>;
 
     async fn dispatch_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String>;
 
     async fn observe_public_v1_operation_report(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String>;
 }
@@ -502,23 +506,28 @@ impl HostedPublicV1Adapter {
 impl PublicV1OperationApi for HostedPublicV1Adapter {
     async fn observe_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
-        self.evidence.observe_public_v1_evidence_status().await
+        self.evidence.observe_public_v1_evidence_status(scope).await
     }
 
     async fn dispatch_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
         if self
             .evidence
-            .observe_public_v1_evidence_status()
+            .observe_public_v1_evidence_status(scope)
             .await?
             .as_ref()
             != Some(expected)
         {
             return Err("stale hosted public-v1 operation authority".into());
+        }
+        if scope.resource_uid != expected.evidence.history.resource_uid {
+            return Err("hosted public-v1 operation scope differs from authority".into());
         }
         let ProtocolCommand::PublicV1Operation(operation) = command else {
             return Err("hosted public-v1 adapter received another operation command".into());
@@ -723,6 +732,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
 
     async fn observe_public_v1_operation_report(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String> {
         self.report(&expected.intent.source.storage_incarnation.replica)
@@ -732,12 +742,16 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
 
 #[async_trait::async_trait]
 impl PublicV1HistoryApi for HostedPublicV1Adapter {
-    async fn observe_public_v1_status(&self) -> Result<Option<PublicV1AcceptedStatus>, String> {
+    async fn observe_public_v1_status(
+        &self,
+        _scope: &PublicV1Scope,
+    ) -> Result<Option<PublicV1AcceptedStatus>, String> {
         Ok(self.history.lock().unwrap().clone())
     }
 
     async fn persist_public_v1_status(
         &self,
+        _scope: &PublicV1Scope,
         expected: Option<&PublicV1AcceptedStatus>,
         next: &PublicV1AcceptedStatus,
     ) -> Result<(), String> {
@@ -752,6 +766,7 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
 
     async fn dispatch_public_v1_history(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -797,12 +812,14 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
 impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
     async fn observe_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1SessionRenewalStatus>, String> {
         Ok(self.renewal.lock().unwrap().clone())
     }
 
     async fn persist_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: Option<&PublicV1SessionRenewalStatus>,
         next: &PublicV1SessionRenewalStatus,
     ) -> Result<(), String> {
@@ -821,6 +838,7 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
 
     async fn dispatch_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1SessionRenewalStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -870,50 +888,55 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
 impl PublicV1EvidenceApi for HostedPublicV1Adapter {
     async fn observe_public_v1_evidence_status(
         &self,
+        scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
-        self.evidence.observe_public_v1_evidence_status().await
+        self.evidence.observe_public_v1_evidence_status(scope).await
     }
 
     async fn persist_public_v1_evidence_status(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         next: &PublicV1AcceptedStatus,
     ) -> Result<(), String> {
         self.evidence
-            .persist_public_v1_evidence_status(expected, next)
+            .persist_public_v1_evidence_status(scope, expected, next)
             .await
     }
 
     async fn accept_public_v1_completion(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
     ) -> Result<(), String> {
         self.evidence
-            .accept_public_v1_completion(expected, completion)
+            .accept_public_v1_completion(scope, expected, completion)
             .await
     }
 
     async fn retire_public_v1_incarnation(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,
     ) -> Result<(), String> {
         self.evidence
-            .retire_public_v1_incarnation(expected, completion, target)
+            .retire_public_v1_incarnation(scope, expected, completion, target)
             .await
     }
 
     async fn provision_public_v1_replacement(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,
         rebuild: &kuberic_runtime::protocol::public_operations::CanonicalReplicaRebuildRequired,
     ) -> Result<(), String> {
         self.evidence
-            .provision_public_v1_replacement(expected, completion, target, rebuild)
+            .provision_public_v1_replacement(scope, expected, completion, target, rebuild)
             .await
     }
 }

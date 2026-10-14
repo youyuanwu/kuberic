@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
+use kuberic_controller::cluster_api::PublicV1Scope;
 use kuberic_controller::evaluator::test_bridge::{
     HostedPreviewReplica, HostedPublicV1Adapter, PreviewTransition,
     PublicOperationPreviewEvaluationConfig, PublicV1AcceptedTransitionIntent,
@@ -56,8 +57,8 @@ use kuberic_runtime::replicator::stateless::{
     StatelessReplicatorFactory, testing_pause_inbound_build_after_classification,
 };
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorFactoryContext,
-    ReplicatorInterfaces, ReplicatorSettings, StateReplicator, StatefulServicePartition,
+    Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
+    ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
 use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
@@ -68,6 +69,14 @@ use tokio::sync::{Notify, RwLock};
 use tonic::Request;
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
+
+fn test_scope(resource_uid: &ResourceUid) -> PublicV1Scope {
+    PublicV1Scope {
+        namespace: "kuberic-system".into(),
+        name: resource_uid.to_string(),
+        resource_uid: resource_uid.clone(),
+    }
+}
 
 fn test_root(name: &str) -> PathBuf {
     let root = std::env::current_dir()
@@ -130,12 +139,13 @@ impl proto::replication_data_server::ReplicationData for HungBuildService {
 
 async fn drive_session_renewal(
     adapter: &HostedPublicV1Adapter,
+    resource_uid: &ResourceUid,
     unreachable: &[ProcessSessionId],
     retire_unreachable: bool,
 ) {
     loop {
         let accepted = adapter
-            .observe_public_v1_session_renewal()
+            .observe_public_v1_session_renewal(&test_scope(resource_uid))
             .await
             .unwrap()
             .unwrap();
@@ -153,11 +163,15 @@ async fn drive_session_renewal(
                 )
                 .unwrap();
                 adapter
-                    .persist_public_v1_session_renewal(Some(&accepted), &next)
+                    .persist_public_v1_session_renewal(
+                        &test_scope(resource_uid),
+                        Some(&accepted),
+                        &next,
+                    )
                     .await
                     .unwrap();
             }
-            plan => execute_public_v1_session_renewal(adapter, plan)
+            plan => execute_public_v1_session_renewal(adapter, &test_scope(resource_uid), plan)
                 .await
                 .unwrap(),
         }
@@ -589,7 +603,6 @@ struct PreviewApplication {
     #[allow(clippy::disallowed_types)]
     primary: RwLock<Option<Arc<dyn kuberic_runtime::replicator::PrimaryReplicator>>>,
     partition: RwLock<Option<StatefulServicePartition>>,
-    legacy_factory: bool,
     fail_first_creation: AtomicBool,
     opens: AtomicU64,
     factory_calls: Arc<AtomicU64>,
@@ -611,7 +624,6 @@ impl PreviewApplication {
             state_replicator: RwLock::new(None),
             primary: RwLock::new(None),
             partition: RwLock::new(None),
-            legacy_factory: false,
             fail_first_creation: AtomicBool::new(false),
             opens: AtomicU64::new(0),
             factory_calls: Arc::new(AtomicU64::new(0)),
@@ -622,13 +634,6 @@ impl PreviewApplication {
             abort_calls: AtomicU64::new(0),
             replicator_released_before_application_close: AtomicBool::new(false),
             lifecycle_events: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn legacy(storage: Arc<MemoryState>, replication_address: String) -> Self {
-        Self {
-            legacy_factory: true,
-            ..Self::new(storage, replication_address)
         }
     }
 
@@ -744,14 +749,10 @@ impl StatefulServiceReplica for PreviewApplication {
                 ));
             }
         }
-        let factory: Arc<dyn ReplicatorFactory> = if self.legacy_factory {
-            Arc::new(DefaultReplicatorFactory::new(self.storage.clone()))
-        } else {
-            Arc::new(CountingStatelessFactory {
-                storage: self.storage.clone(),
-                calls: self.factory_calls.clone(),
-            })
-        };
+        let factory: Arc<dyn ReplicatorFactory> = Arc::new(CountingStatelessFactory {
+            storage: self.storage.clone(),
+            calls: self.factory_calls.clone(),
+        });
         let interfaces = context
             .partition
             .with_factory(factory)
@@ -759,7 +760,7 @@ impl StatefulServiceReplica for PreviewApplication {
                 Some(self.storage.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: !self.legacy_factory,
+                    public_v1: true,
                 }),
             )
             .await?;
@@ -1266,6 +1267,7 @@ async fn preview_open_owns_registration_listener_and_writer_exactly_once() {
             ))
             .await
             .unwrap();
+        assert_eq!(handle.stateless_preview_provider_writer_count(), 0);
         drop(std::net::TcpListener::bind(replication_address).unwrap());
         running.shutdown();
         running.wait().await.unwrap();
@@ -1796,7 +1798,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
 
 #[tokio::test]
 async fn replication_ingress_accepts_only_exact_current_primary_in_three_replica_set() {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    tokio::time::timeout(Duration::from_secs(270), async {
         let resource_uid = ResourceUid::new("three-replica-ingress");
         let preview = PublicOperationPreviewIdentity::public_v1(76);
         let primary =
@@ -1918,6 +1920,43 @@ async fn replication_ingress_accepts_only_exact_current_primary_in_three_replica
             receiver.state.operations.lock().unwrap()[0].data.as_ref(),
             b"primary-origin"
         );
+
+        let baseline = receiver
+            .handle()
+            .stateless_preview_raw_retained_task_cardinality()
+            .unwrap();
+        for _ in 0..2 {
+            stream::iter(0..1_000)
+                .map(|_| {
+                    let mut client = client.clone();
+                    async move {
+                        let mut response = client
+                            .replicate(Request::new(stream::empty::<proto::ReplicationItem>()))
+                            .await
+                            .unwrap()
+                            .into_inner();
+                        assert!(response.next().await.is_none());
+                    }
+                })
+                .buffer_unordered(32)
+                .collect::<Vec<_>>()
+                .await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if receiver
+                        .handle()
+                        .stateless_preview_raw_retained_task_cardinality()
+                        .unwrap()
+                        == baseline
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("completed inbound RPC tasks were retained");
+        }
 
         let mut primary = primary;
         let mut receiver = receiver;
@@ -2171,7 +2210,7 @@ async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close(
 }
 
 #[tokio::test]
-async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
+async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("static");
         let resource_uid = ResourceUid::new("preview-resource");
@@ -2422,82 +2461,6 @@ async fn static_preview_is_store_free_access_gated_and_durable_before_ack() {
         running.shutdown();
         running.wait().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
-
-        let root = test_root("factory-mismatch");
-        let resource_uid = ResourceUid::new("preview-factory-mismatch");
-        let preview = PublicOperationPreviewIdentity::public_v1(3);
-        let binding = PreviewLifecycleBinding {
-            preview: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let database = SqliteStore::metadata_database_path(&root);
-        drop(
-            SqliteStore::create_public_v1(
-                &database,
-                preview.clone(),
-                store_identity(resource_uid.clone()),
-            )
-            .unwrap(),
-        );
-        let replication_address = free_address();
-        let mut running = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("preview-pod-uid"),
-                pvc_uid: PvcUid::new("preview-pvc-uid"),
-                data_root: root.clone(),
-                control_address: free_address(),
-                replication_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            Arc::new(PreviewApplication::legacy(
-                Arc::new(MemoryState::default()),
-                format!("http://{replication_address}"),
-            )),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_stateless_preview(binding)
-        .start()
-        .await
-        .unwrap();
-        let handle = running.handle();
-        let generation = PublicProtocolGeneration::new(3);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        handle
-            .initialize_stateless_preview_history(
-                &initialization,
-                &history,
-                &storage_incarnation(replica()),
-            )
-            .await
-            .unwrap();
-        assert!(
-            handle
-                .execute_stateless_preview(intent(
-                    &preview,
-                    handle.process_session_id(),
-                    1,
-                    "factory-mismatch",
-                    PublicOperationProgram::Open {
-                        replica: replica(),
-                        existing: true,
-                    },
-                ))
-                .await
-                .is_err(),
-            "crossed preview/managed factory selection must fail"
-        );
-        std::net::TcpListener::bind(replication_address).unwrap();
-        running.shutdown();
-        running.wait().await.unwrap();
-        std::fs::remove_dir_all(root).unwrap();
     })
     .await
     .unwrap();
@@ -2710,7 +2673,7 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
 }
 
 #[tokio::test]
-async fn preview_initialization_creates_exact_bound_schema11_before_open() {
+async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("fresh-schema11");
         let resource_uid = ResourceUid::new("preview-fresh-schema11");
@@ -2825,7 +2788,7 @@ async fn preview_initialization_creates_exact_bound_schema11_before_open() {
         let schema: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(schema, 11);
+        assert_eq!(schema, 12);
         drop(connection);
         drop(SqliteStore::open_public_v1(&database, &preview).unwrap());
         running.shutdown();
@@ -3055,6 +3018,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
 
             execute_public_v1_history(
                 &adapter,
+                &test_scope(&resource_uid),
                 plan_public_v1_data_loss_recovery(
                     &accepted,
                     &before,
@@ -3067,7 +3031,11 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
             )
             .await
             .unwrap();
-            let invalidated = adapter.observe_public_v1_status().await.unwrap().unwrap();
+            let invalidated = adapter
+                .observe_public_v1_status(&test_scope(&resource_uid))
+                .await
+                .unwrap()
+                .unwrap();
             match outcome {
                 Outcome::Unchanged => {}
                 Outcome::Changed => replica.state.change_on_data_loss(),
@@ -3078,6 +3046,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
             }
             let dispatched = execute_public_v1_history(
                 &adapter,
+                &test_scope(&resource_uid),
                 plan_public_v1_data_loss_recovery(
                     &invalidated,
                     &before,
@@ -3138,6 +3107,7 @@ async fn hosted_preview_authorized_data_loss_maps_only_the_effective_outcome() {
             if !matches!(outcome, Outcome::Unchanged | Outcome::Changed) {
                 execute_public_v1_history(
                     &adapter,
+                    &test_scope(&resource_uid),
                     plan_public_v1_recovery_report(&invalidated, &report).unwrap(),
                 )
                 .await
@@ -3380,6 +3350,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
         );
         PublicV1EvidenceApi::persist_public_v1_evidence_status(
             &evidence,
+            &test_scope(&resource_uid),
             &transition,
             &persisted_evidence,
         )
@@ -3388,6 +3359,7 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
         let persisted_transition = evidence.transition();
         PublicV1EvidenceApi::retire_public_v1_incarnation(
             &evidence,
+            &test_scope(&resource_uid),
             &persisted_transition,
             &completion,
             persisted_transition.intent.target.as_ref().unwrap(),
@@ -4036,6 +4008,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             }));
         let error = PublicV1OperationApi::dispatch_public_v1_operation(
             &adapter,
+            &test_scope(&resource_uid),
             &transition,
             &wrong_target,
         )
@@ -4058,7 +4031,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         adapter.cut_after_hosted_suboperations(3);
         assert!(
-            execute_public_v1_operation(&adapter, &transition, command.clone())
+            execute_public_v1_operation(&adapter, &test_scope(&resource_uid), &transition, command.clone())
                 .await
                 .unwrap_err()
                 .contains("injected cut after hosted suboperation completion")
@@ -4094,7 +4067,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             evidence.clone(),
         )
         .unwrap();
-        execute_public_v1_operation(&adapter, &transition, command)
+        execute_public_v1_operation(&adapter, &test_scope(&resource_uid), &transition, command)
             .await
             .unwrap();
         assert_eq!(
@@ -4107,14 +4080,14 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         );
         let switchover_report = adapter.report(&primary_identity).await.unwrap();
         assert_eq!(
-            reconcile_public_v1_consumer(&adapter, &switchover_report)
+            reconcile_public_v1_consumer(&adapter, &test_scope(&resource_uid), &switchover_report)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
-            reconcile_public_v1_consumer(&adapter, &switchover_report)
+            reconcile_public_v1_consumer(&adapter, &test_scope(&resource_uid), &switchover_report)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
@@ -4355,6 +4328,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             .unwrap();
         execute_public_v1_session_renewal(
             &primary_renewal,
+            &test_scope(&resource_uid),
             accept_public_v1_session_renewal(
                 None,
                 ProcessSessionRenewalRequired {
@@ -4379,6 +4353,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         .unwrap();
         drive_session_renewal(
             &primary_renewal,
+            &resource_uid,
             std::slice::from_ref(&secondary_predecessor.process_session_id),
             true,
         )
@@ -4416,6 +4391,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             .unwrap();
         execute_public_v1_session_renewal(
             &secondary_renewal,
+            &test_scope(&resource_uid),
             accept_public_v1_session_renewal(
                 None,
                 ProcessSessionRenewalRequired {
@@ -4440,7 +4416,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
         .unwrap();
         loop {
             let accepted = secondary_renewal
-                .observe_public_v1_session_renewal()
+                .observe_public_v1_session_renewal(&test_scope(&resource_uid))
                 .await
                 .unwrap()
                 .unwrap();
@@ -4466,14 +4442,14 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
             if is_epoch_dispatch {
                 secondary_renewal.cut_after_hosted_suboperations(1);
                 assert!(
-                    execute_public_v1_session_renewal(&secondary_renewal, plan.clone())
+                    execute_public_v1_session_renewal(&secondary_renewal, &test_scope(&resource_uid), plan.clone())
                         .await
                         .unwrap_err()
                         .contains("injected cut after hosted suboperation completion")
                 );
                 assert_eq!(
                     secondary_renewal
-                        .observe_public_v1_session_renewal()
+                        .observe_public_v1_session_renewal(&test_scope(&resource_uid))
                         .await
                         .unwrap(),
                     Some(accepted.clone())
@@ -4492,7 +4468,7 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                     evidence.clone(),
                 )
                 .unwrap();
-                execute_public_v1_session_renewal(&secondary_renewal, plan)
+                execute_public_v1_session_renewal(&secondary_renewal, &test_scope(&resource_uid), plan)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -4503,10 +4479,10 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                     Some(durable_barrier),
                     "adapter recreation changed the durable renewal barrier intent"
                 );
-                drive_session_renewal(&secondary_renewal, &[], false).await;
+                drive_session_renewal(&secondary_renewal, &resource_uid, &[], false).await;
                 break;
             }
-            execute_public_v1_session_renewal(&secondary_renewal, plan)
+            execute_public_v1_session_renewal(&secondary_renewal, &test_scope(&resource_uid), plan)
                 .await
                 .unwrap();
         }
@@ -4630,14 +4606,14 @@ async fn hosted_preview_switchover_dispatches_exact_intent_and_accepts_matching_
                 intent: failover_intent,
             }));
         assert_eq!(
-            reconcile_public_v1_operation(&restart_adapter, failover_command.clone())
+            reconcile_public_v1_operation(&restart_adapter, &test_scope(&resource_uid), failover_command.clone())
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
-            reconcile_public_v1_operation(&restart_adapter, failover_command)
+            reconcile_public_v1_operation(&restart_adapter, &test_scope(&resource_uid), failover_command)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
@@ -5298,12 +5274,14 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
                 intent: build_intent,
             }));
         let copy_entered = source_state.copy_entered.notified();
+        let build_scope = test_scope(&resource_uid);
         let mut build = tokio::spawn({
             let build_adapter = build_adapter.clone();
             let build_transition = build_transition.clone();
             async move {
                 execute_public_v1_operation(
                     build_adapter.as_ref(),
+                    &build_scope,
                     &build_transition,
                     build_command,
                 )
@@ -5394,14 +5372,14 @@ async fn hosted_preview_build_dispatches_exact_attempt_and_waits_for_matching_co
         build.await.unwrap().unwrap();
         let build_report = build_adapter.report(&source_identity).await.unwrap();
         assert_eq!(
-            reconcile_public_v1_consumer(build_adapter.as_ref(), &build_report)
+            reconcile_public_v1_consumer(build_adapter.as_ref(), &test_scope(&resource_uid), &build_report)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
-            reconcile_public_v1_consumer(build_adapter.as_ref(), &build_report)
+            reconcile_public_v1_consumer(build_adapter.as_ref(), &test_scope(&resource_uid), &build_report)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
@@ -6373,12 +6351,14 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
             )
             .unwrap(),
         );
+        let removal_scope = test_scope(&resource_uid);
         let removal = tokio::spawn({
             let adapter = adapter.clone();
             let transition = transition.clone();
             async move {
                 execute_public_v1_operation(
                     adapter.as_ref(),
+                    &removal_scope,
                     &transition,
                     ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
                         target: transition.intent.source.storage_incarnation.replica.clone(),
@@ -6411,14 +6391,14 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         );
         let report = adapter.report(&source.identity).await.unwrap();
         assert_eq!(
-            reconcile_public_v1_consumer(adapter.as_ref(), &report)
+            reconcile_public_v1_consumer(adapter.as_ref(), &test_scope(&resource_uid), &report)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
                 EvidencePersisted
         );
         assert_eq!(
-            reconcile_public_v1_consumer(adapter.as_ref(), &report)
+            reconcile_public_v1_consumer(adapter.as_ref(), &test_scope(&resource_uid), &report)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
@@ -6690,6 +6670,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         .unwrap();
         let build_error = execute_public_v1_operation(
             &build_adapter,
+            &test_scope(&resource_uid),
             &build_transition,
             ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
                 target: source.identity.clone(),
@@ -6699,7 +6680,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         .await
         .unwrap_err();
         let rebuild_report = build_adapter.report(&source.identity).await.unwrap();
-        let rebuild_outcome = reconcile_public_v1_consumer(&build_adapter, &rebuild_report)
+        let rebuild_outcome = reconcile_public_v1_consumer(&build_adapter, &test_scope(&resource_uid), &rebuild_report)
             .await
             .unwrap();
         assert_eq!(
@@ -6709,7 +6690,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
             "build error: {build_error}; unexpected rebuild report: {rebuild_report:#?}"
         );
         assert_eq!(
-            reconcile_public_v1_consumer(&build_adapter, &rebuild_report)
+            reconcile_public_v1_consumer(&build_adapter, &test_scope(&resource_uid), &rebuild_report)
                 .await
                 .unwrap(),
             kuberic_controller::evaluator::test_bridge::PublicV1ReconciliationOutcome::
@@ -6793,6 +6774,7 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         .unwrap();
         execute_public_v1_operation(
             &removal_adapter,
+            &test_scope(&resource_uid),
             &removal_transition,
             ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
                 target: source.identity.clone(),
@@ -6802,10 +6784,10 @@ async fn hosted_preview_rebuild_retires_and_restarts_fresh_replacement() {
         .await
         .unwrap();
         let removal_report = removal_adapter.report(&source.identity).await.unwrap();
-        reconcile_public_v1_consumer(&removal_adapter, &removal_report)
+        reconcile_public_v1_consumer(&removal_adapter, &test_scope(&resource_uid), &removal_report)
             .await
             .unwrap();
-        reconcile_public_v1_consumer(&removal_adapter, &removal_report)
+        reconcile_public_v1_consumer(&removal_adapter, &test_scope(&resource_uid), &removal_report)
             .await
             .unwrap();
         let retired = removal_evidence

@@ -17,7 +17,8 @@ pub enum RawAgentObservation {
         message: String,
     },
     Report(Box<proto::AgentStatusReport>),
-    #[cfg(feature = "runtime-test-bridge")]
+    PublicV1Report(Box<kuberic_runtime::protocol::public_operations::PublicV1AgentReport>),
+    #[cfg(feature = "public-v1")]
     PreviewReport(Box<kuberic_runtime::protocol::observation::AgentReport>),
 }
 

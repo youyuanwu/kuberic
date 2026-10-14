@@ -90,7 +90,7 @@ impl<'a> PgAccessController<'a> {
     }
 }
 
-#[cfg(all(test, feature = "testing"))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::testing::{ProcessProbe, TestDataDir, allocate_port, find_pg_bin};

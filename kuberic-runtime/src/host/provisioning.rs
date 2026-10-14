@@ -1,8 +1,5 @@
 //! Authorized fresh-store provisioning.
 
-#[cfg(test)]
-use std::path::Path;
-
 use crate::protocol::command::InitializeAgentStore;
 use crate::protocol::types::{
     PodUid, ProvisioningIntent, PvcUid, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
@@ -24,25 +21,6 @@ pub(crate) enum InitializationAuthority<'a> {
     Bootstrap(&'a TransitionIntent),
     Replacement(&'a ProvisioningIntent),
     ScaleUp(&'a ProvisioningIntent),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) enum StorePresence {
-    FreshUninitialized,
-    Established,
-    UnsafeMissingEstablished,
-}
-
-#[cfg(test)]
-pub(crate) fn inspect_store(path: &Path, established_required: bool) -> StorePresence {
-    if path.is_file() {
-        StorePresence::Established
-    } else if established_required {
-        StorePresence::UnsafeMissingEstablished
-    } else {
-        StorePresence::FreshUninitialized
-    }
 }
 
 pub(crate) fn authorize_initialization(

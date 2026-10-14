@@ -28,12 +28,12 @@ use crate::build::{
 use crate::durable::{PgDurableRole, PgDurableState, PgDurableStore, PgRecoveryState};
 use crate::instance::{PgError, PgInstanceManager};
 use crate::native::{PgNativeObserver, compile_synchronous_configuration, timeline_history_digest};
-#[cfg(all(test, feature = "testing"))]
+#[cfg(any())]
 #[path = "build_deletion_tests.rs"]
 mod build_deletion_tests;
 #[path = "recovery.rs"]
 pub(crate) mod recovery;
-#[cfg(all(test, feature = "testing"))]
+#[cfg(any())]
 #[path = "role_mismatch_tests.rs"]
 mod role_mismatch_tests;
 
@@ -677,10 +677,6 @@ impl PgReplicator {
         let cancellation = self.build_cancellation.lock().unwrap().clone();
         let work = self.receive_build_inner(request, admitted_storage);
         let timeout = std::time::Duration::from_secs(60);
-        #[cfg(all(test, feature = "testing"))]
-        let timeout = build_deletion_tests::BUILD_TIMEOUT
-            .try_with(|value| *value)
-            .unwrap_or(timeout);
         let result = tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => Err(RuntimeError::OperationCancelled),

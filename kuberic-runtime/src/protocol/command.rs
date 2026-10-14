@@ -1,8 +1,8 @@
 //! Fenced protocol commands and declarative Kubernetes changes.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "testing")]
 use crate::protocol::public_operations::{
     PublicOperationIntent, PublicOperationPreviewIdentity, PublicSessionEpochBarrierStage,
     PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1SessionRenewalStatus,
@@ -13,7 +13,6 @@ use crate::protocol::types::{
     ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverPreparationId,
     SwitchoverRequestId,
 };
-#[cfg(feature = "testing")]
 use crate::protocol::types::{
     HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
     derive_bootstrap_history,
@@ -164,21 +163,18 @@ pub struct AcceptSecondaryRemovalCommit {
     pub local_recovery: bool,
 }
 
-#[cfg(feature = "testing")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestartReplicaProcess {
     pub action: crate::protocol::public_operations::PublicFaultAction,
 }
 
-#[cfg(feature = "testing")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DropReplicaIncarnation {
     pub action: crate::protocol::public_operations::PublicFaultAction,
 }
 
-#[cfg(feature = "testing")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PublicV1HistoryCommand {
@@ -194,7 +190,6 @@ pub enum PublicV1HistoryCommand {
     SessionRenewal(Box<PublicV1SessionRenewalCommand>),
 }
 
-#[cfg(feature = "testing")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PublicV1SessionRenewalCommand {
@@ -218,7 +213,6 @@ pub enum PublicV1SessionRenewalCommand {
     },
 }
 
-#[cfg(feature = "testing")]
 impl PublicV1SessionRenewalCommand {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.accepted().validate()?;
@@ -294,6 +288,7 @@ impl PublicV1SessionRenewalCommand {
                     .expect("validated session-renewal replacement")
                     .identity
             }
+
             Self::InstallFreshConfiguration {
                 accepted: _,
                 configuration,
@@ -309,7 +304,6 @@ impl PublicV1SessionRenewalCommand {
     }
 }
 
-#[cfg(feature = "testing")]
 impl PublicV1HistoryCommand {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
@@ -381,6 +375,15 @@ impl PublicV1HistoryCommand {
         }
     }
 
+    pub fn resource_uid(&self) -> &ResourceUid {
+        match self {
+            Self::Initialize { accepted, .. } | Self::Recover { accepted, .. } => {
+                &accepted.history.resource_uid
+            }
+            Self::SessionRenewal(command) => &command.accepted().required.resource_uid,
+        }
+    }
+
     pub fn initialization(
         &self,
     ) -> Option<(
@@ -401,15 +404,13 @@ impl PublicV1HistoryCommand {
     }
 }
 
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1OperationCommand {
     pub target: ReplicaIdentity,
     pub intent: PublicOperationIntent,
 }
 
-#[cfg(feature = "testing")]
 impl PublicV1OperationCommand {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.intent.validate()?;
@@ -442,13 +443,9 @@ pub enum ProtocolCommand {
     PrepareSecondaryRemoval(Box<PrepareSecondaryRemoval>),
     RetireReplica(Box<RetireReplica>),
     AcceptSecondaryRemovalCommit(Box<AcceptSecondaryRemovalCommit>),
-    #[cfg(feature = "testing")]
     RestartReplicaProcess(Box<RestartReplicaProcess>),
-    #[cfg(feature = "testing")]
     DropReplicaIncarnation(Box<DropReplicaIncarnation>),
-    #[cfg(feature = "testing")]
     PublicV1History(Box<PublicV1HistoryCommand>),
-    #[cfg(feature = "testing")]
     PublicV1Operation(Box<PublicV1OperationCommand>),
 }
 
@@ -462,7 +459,6 @@ impl ProtocolCommand {
             | Self::AcceptSecondaryRemovalCommit(_)
             | Self::EnsureConfiguration(_)
             | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
-            #[cfg(feature = "testing")]
             Self::RestartReplicaProcess(_)
             | Self::DropReplicaIncarnation(_)
             | Self::PublicV1History(_)

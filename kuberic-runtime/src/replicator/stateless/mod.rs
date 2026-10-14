@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -150,6 +151,10 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
             .install_preview_inbound_build_authority(authority)
             .await
     }
+
+    fn raw_retained_task_cardinality(&self) -> (usize, usize) {
+        self.raw_retained_task_cardinality()
+    }
 }
 
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -257,6 +262,75 @@ struct ListenerOwner {
     task: tokio::task::JoinHandle<Result<()>>,
 }
 
+#[derive(Clone)]
+struct TaskRegistry {
+    inner: Arc<TaskRegistryInner>,
+}
+
+struct TaskRegistryInner {
+    next_id: AtomicU64,
+    tasks: StdMutex<BTreeMap<u64, tokio::task::AbortHandle>>,
+}
+
+impl TaskRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(TaskRegistryInner {
+                next_id: AtomicU64::new(1),
+                tasks: StdMutex::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let inner = self.inner.clone();
+        let (start, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started.await;
+            let output = future.await;
+            inner
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            output
+        });
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, task.abort_handle());
+        let _ = start.send(());
+        task
+    }
+
+    fn abort_all(&self) {
+        for task in self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .split_off(&0)
+            .into_values()
+        {
+            task.abort();
+        }
+    }
+
+    fn raw_len(&self) -> usize {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
 struct CallbackContainmentGuard {
     engine: Arc<StatelessReplicator>,
 }
@@ -321,14 +395,21 @@ pub struct StatelessReplicator {
     provider_effect_gate: Mutex<()>,
     inbound_build_admission_gate: Mutex<()>,
     listener: StdMutex<Option<ListenerOwner>>,
-    descendants: StdMutex<Vec<tokio::task::AbortHandle>>,
-    inbound_descendants: StdMutex<Vec<tokio::task::AbortHandle>>,
+    descendants: TaskRegistry,
+    inbound_descendants: TaskRegistry,
     callback_containment: watch::Sender<bool>,
     active_callbacks: std::sync::atomic::AtomicUsize,
     self_ref: OnceLock<Weak<StatelessReplicator>>,
 }
 
 impl StatelessReplicator {
+    fn raw_retained_task_cardinality(&self) -> (usize, usize) {
+        (
+            self.descendants.raw_len(),
+            self.inbound_descendants.raw_len(),
+        )
+    }
+
     fn new(
         identity: ReplicaIdentity,
         process_session: ProcessSessionId,
@@ -368,8 +449,8 @@ impl StatelessReplicator {
             provider_effect_gate: Mutex::new(()),
             inbound_build_admission_gate: Mutex::new(()),
             listener: StdMutex::new(None),
-            descendants: StdMutex::new(Vec::new()),
-            inbound_descendants: StdMutex::new(Vec::new()),
+            descendants: TaskRegistry::new(),
+            inbound_descendants: TaskRegistry::new(),
             callback_containment,
             active_callbacks: std::sync::atomic::AtomicUsize::new(0),
             self_ref: OnceLock::new(),
@@ -575,14 +656,7 @@ impl StatelessReplicator {
     }
 
     fn cancel_inbound_effects(&self) {
-        for descendant in self
-            .inbound_descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain(..)
-        {
-            descendant.abort();
-        }
+        self.inbound_descendants.abort_all();
     }
 
     async fn revoke_inbound_effects(&self) -> Result<()> {
@@ -1966,14 +2040,7 @@ impl StatelessReplicator {
             owner.shutdown.send_replace(true);
             owner.task.abort();
         }
-        for descendant in self
-            .descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain(..)
-        {
-            descendant.abort();
-        }
+        self.descendants.abort_all();
         self.cancel_inbound_effects();
     }
 
@@ -2175,6 +2242,7 @@ impl Replicator for StatelessReplicator {
 
     async fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
+        self.context.release_provider_writer();
         #[cfg(feature = "testing")]
         notify_inbound_build_boundary_waiting();
         let _admission = self.inbound_build_admission_gate.lock().await;
@@ -2214,6 +2282,7 @@ impl Replicator for StatelessReplicator {
 
     fn abort(&self) {
         self.closed.store(true, Ordering::Release);
+        self.context.release_provider_writer();
         self.revoke_generation();
         self.streams.shutdown();
         self.abort_listener();
@@ -2654,15 +2723,11 @@ impl StateReplicator for StatelessReplicator {
             let authority = authority.clone();
             let operation = operation.clone();
             let peer = peer.clone();
-            let task = tokio::spawn(async move {
+            self.descendants.spawn(async move {
                 let _ = engine
                     .send_replication(&authority, &peer, &operation, lsn)
                     .await;
             });
-            self.descendants
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(task.abort_handle());
         }
         if !self
             .exact_authority_is_current(&authority, generation, ReplicaRole::Primary)
@@ -2726,7 +2791,7 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
         let mut incoming = request.into_inner();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();
-        let task = tokio::spawn(async move {
+        engine.inbound_descendants.spawn(async move {
             while let Some(item) = incoming.next().await {
                 let result = match item {
                     Ok(item) => task_engine.accept_replication(item).await,
@@ -2737,11 +2802,6 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
                 }
             }
         });
-        engine
-            .inbound_descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(task.abort_handle());
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
@@ -2756,7 +2816,7 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
         let mut incoming = request.into_inner();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();
-        let task = tokio::spawn(async move {
+        engine.inbound_descendants.spawn(async move {
             while let Some(item) = incoming.next().await {
                 let result = match item {
                     Ok(item) => task_engine.accept_copy(item).await,
@@ -2767,11 +2827,6 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
                 }
             }
         });
-        engine
-            .inbound_descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(task.abort_handle());
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 }
@@ -2791,5 +2846,39 @@ fn runtime_status(error: RuntimeError) -> Status {
             Status::cancelled(error.to_string())
         }
         _ => Status::failed_precondition(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod task_registry_tests {
+    use super::TaskRegistry;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn completed_and_aborted_tasks_leave_no_retained_entries() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let registry = TaskRegistry::new();
+            for _ in 0..2 {
+                let tasks = (0..1_000)
+                    .map(|_| registry.spawn(async {}))
+                    .collect::<Vec<_>>();
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                assert_eq!(registry.raw_len(), 0);
+            }
+
+            let tasks = (0..32)
+                .map(|_| registry.spawn(std::future::pending::<()>()))
+                .collect::<Vec<_>>();
+            assert_eq!(registry.raw_len(), tasks.len());
+            registry.abort_all();
+            assert_eq!(registry.raw_len(), 0);
+            for task in tasks {
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+        })
+        .await
+        .unwrap();
     }
 }

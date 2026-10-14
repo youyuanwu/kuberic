@@ -256,8 +256,7 @@ fn scale_up_candidate_identity(
     }
 }
 
-fn replacement_candidate(raw: &RawObservation, target: &ReplicaIdentity, epoch: Epoch) -> bool {
-    use kuberic_runtime::control::proto;
+fn replacement_candidate(raw: &RawObservation, target: &ReplicaIdentity, _epoch: Epoch) -> bool {
     if !raw
         .pods
         .iter()
@@ -271,13 +270,12 @@ fn replacement_candidate(raw: &RawObservation, target: &ReplicaIdentity, epoch: 
     )) else {
         return false;
     };
-    report.reported_fault == proto::FaultType::Permanent as i32
-        || (report.role != proto::ReplicaRole::Primary as i32
-            && report.write_status != proto::AccessStatus::Granted as i32
-            && report.epoch.as_ref().is_some_and(|e| {
-                (e.data_loss_number, e.configuration_number)
-                    < (epoch.data_loss_number, epoch.configuration_number)
-            }))
+    kuberic_runtime::control::normalize_public_v1_agent_status_report((**report).clone()).is_ok_and(
+        |report| {
+            report.role != kuberic_runtime::protocol::types::ReplicaRole::Primary
+                && report.write_status != kuberic_runtime::protocol::types::AccessStatus::Granted
+        },
+    )
 }
 
 fn candidate(raw: &RawObservation, target: &ReplicaIdentity) -> Option<ReplicaCleanupIdentity> {

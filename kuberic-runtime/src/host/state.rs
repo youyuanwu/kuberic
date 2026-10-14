@@ -1,30 +1,24 @@
-//! Durable replica-agent state.
+//! Durable Public V1 replica-agent state.
 
-use crate::authority::{DurableBuildProgress, RetiredAuthority};
-use crate::effects::{RecordedEffect, RuntimeEffect, RuntimeEffectResult};
-use crate::host::public_build_store::PublicV1BuildRecord;
-use crate::protocol::command::EnsureConfiguration;
-use crate::protocol::command::EnsureReplicaBuild;
-use crate::protocol::public_operations::{
-    DataLossAuthorization, PublicDataLossRecoveryStatus, PublicOperationIntent,
-    PublicOperationPreviewIdentity, PublicV1SessionRenewalStatus,
-};
-use crate::protocol::public_operations::{PreviewLifecycleBinding, RestartActionRecord};
-use crate::protocol::types::{
-    AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
-    HistoryContext, HistoryInitializationId, InitializationId, LoadMetric, OperationId, PodUid,
-    ProvisioningIntent, PvcUid, ReplicaIdentity, ReplicaRole, ReplicaStorageIncarnationContext,
-    ResourceUid, ScaleUpConfigurationEvidence, SecondaryRemovalEvidence,
-    SecondaryRemovalPreparation, SecondaryScaleDownCleanup, SwitchoverHandoff,
-};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-// Schema 6 stores action-specific effect outcomes and reject broad schema-5 results.
+use serde::{Deserialize, Serialize};
+
+use crate::host::public_build_store::PublicV1BuildRecord;
+use crate::protocol::public_operations::{
+    DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
+    PublicOperationIntent, PublicOperationPreviewIdentity, PublicV1SessionRenewalStatus,
+};
+use crate::protocol::types::{
+    EffectivePolicy, FaultType, HistoryContext, HistoryInitializationId, InitializationId,
+    LoadMetric, OperationId, PodUid, PvcUid, ReplicaIdentity, ReplicaStorageIncarnationContext,
+    ResourceUid,
+};
+
 pub(crate) const SCHEMA_VERSION: u32 = 6;
-pub(crate) const PUBLIC_OPERATION_PREVIEW_SCHEMA_VERSION: u32 = 7;
 pub(crate) const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 = 11;
+pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,50 +30,6 @@ pub(crate) struct StorageIdentity {
     pub(crate) initialization_id: InitializationId,
     pub(crate) local_identity: ReplicaIdentity,
     pub(crate) effective_policy: EffectivePolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct DeactivationState {
-    pub(crate) epoch: Epoch,
-    pub(crate) deactivated_lsn: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum EffectStage {
-    IntentCommitted,
-    EffectApplied,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PendingEffect {
-    pub(crate) effect: RuntimeEffect,
-    pub(crate) stage: EffectStage,
-    pub(crate) applied_result: Option<Box<RuntimeEffectResult>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RetainedResult {
-    pub(crate) operation_id: OperationId,
-    #[serde(flatten)]
-    pub(crate) record: RecordedEffect,
-}
-
-impl std::ops::Deref for RetainedResult {
-    type Target = RecordedEffect;
-
-    fn deref(&self) -> &Self::Target {
-        &self.record
-    }
-}
-
-impl std::ops::DerefMut for RetainedResult {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.record
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,8 +161,6 @@ pub(crate) struct PublicOperationPreviewState {
     pub(crate) identity: PublicOperationPreviewIdentity,
     #[serde(default)]
     pub(crate) binding: Option<PreviewLifecycleBinding>,
-    #[serde(default)]
-    pub(crate) restart_action: Option<RestartActionRecord>,
     pub(crate) operations: BTreeMap<OperationId, PublicOperationRecord>,
     #[serde(default)]
     pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
@@ -257,12 +205,17 @@ pub(crate) struct PublicOperationPreviewState {
 }
 
 impl PublicOperationPreviewState {
-    #[allow(dead_code)]
-    pub(crate) fn new(identity: PublicOperationPreviewIdentity) -> Self {
+    pub(crate) fn new_bound(binding: PreviewLifecycleBinding) -> Self {
+        Self::from_parts(binding.preview.clone(), Some(binding))
+    }
+
+    fn from_parts(
+        identity: PublicOperationPreviewIdentity,
+        binding: Option<PreviewLifecycleBinding>,
+    ) -> Self {
         Self {
             identity,
-            binding: None,
-            restart_action: None,
+            binding,
             operations: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
             history_initialization_id: None,
@@ -284,82 +237,6 @@ impl PublicOperationPreviewState {
             terminal: false,
         }
     }
-
-    pub(crate) fn new_bound(binding: PreviewLifecycleBinding) -> Self {
-        Self {
-            identity: binding.preview.clone(),
-            binding: Some(binding),
-            restart_action: None,
-            operations: BTreeMap::new(),
-            history_barriers: BTreeMap::new(),
-            history_initialization_id: None,
-            history: None,
-            storage_incarnation: None,
-            data_loss_authorization: None,
-            data_loss_recovery: None,
-            session_renewal: None,
-            current_operation: None,
-            current_topology_operation: None,
-            active_builds: BTreeMap::new(),
-            build_records: BTreeMap::new(),
-            absent_builds: BTreeSet::new(),
-            current_inbound_build_authority: None,
-            inbound_build_generation: 0,
-            terminal_inbound_build_receipts: BTreeMap::new(),
-            retired_storage_incarnations: Vec::new(),
-            writes_revoked: false,
-            terminal: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum CoordinatorStage {
-    AdmitAuthority,
-    FailoverPrefix,
-    Demote,
-    GetLsn,
-    Catchup,
-    Deactivate,
-    ReplicatorRole,
-    Epoch,
-    ApplicationRole,
-    Activate,
-    RetireBuild,
-    Complete,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ReconfigurationRecord {
-    pub(crate) command: EnsureConfiguration,
-    pub(crate) stage: CoordinatorStage,
-    pub(crate) observed_lsn: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RetainedCommandResult {
-    pub(crate) command: EnsureConfiguration,
-    pub(crate) role: ReplicaRole,
-    pub(crate) epoch: Epoch,
-}
-
-fn initial_effect_sequence() -> u64 {
-    1
-}
-
-fn denied_access() -> AccessStatus {
-    AccessStatus::NotPrimary
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PreparationRetirement {
-    pub(crate) starting_configuration_id: ConfigurationId,
-    pub(crate) starting_epoch: Epoch,
-    pub(crate) generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,57 +252,11 @@ pub(crate) struct AgentState {
     pub(crate) identity: StorageIdentity,
     #[serde(default)]
     pub(crate) public_operation_preview: Option<PublicOperationPreviewState>,
-    #[serde(default)]
     pub(crate) application_storage: Option<ApplicationStorageBinding>,
-    #[serde(default)]
-    pub(crate) scale_up_initialization: Option<ProvisioningIntent>,
-    pub(crate) admitted_policy: Option<EffectivePolicy>,
-    pub(crate) previous_policy: Option<EffectivePolicy>,
-    pub(crate) prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
-    pub(crate) secondary_removal_evidence: Option<SecondaryRemovalEvidence>,
-    pub(crate) accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
-    pub(crate) retired_authority: Option<RetiredAuthority>,
-    pub(crate) removal_effects: BTreeMap<OperationId, RetainedResult>,
-    pub(crate) removal_commands: BTreeMap<OperationId, RetainedCommandResult>,
-    pub(crate) highest_epoch: Epoch,
-    pub(crate) previous_configuration: Option<ConfigurationDescriptor>,
-    pub(crate) current_configuration: Option<ConfigurationDescriptor>,
-    pub(crate) role: ReplicaRole,
-    #[serde(default = "denied_access")]
-    pub(crate) read_status: AccessStatus,
-    pub(crate) write_status: AccessStatus,
-    pub(crate) deactivation: Option<DeactivationState>,
-    pub(crate) reconfiguration_data: Option<String>,
-    #[serde(default)]
-    pub(crate) reconfiguration: Option<ReconfigurationRecord>,
-    #[serde(default)]
-    pub(crate) retained_command: Option<RetainedCommandResult>,
-    #[serde(default)]
-    pub(crate) completed_scale_up: Option<Box<RetainedCommandResult>>,
-    #[serde(default)]
-    pub(crate) scale_up_evidence: Option<Box<ScaleUpConfigurationEvidence>>,
-    #[serde(default)]
-    pub(crate) build_commands: BTreeMap<OperationId, EnsureReplicaBuild>,
-    #[serde(default)]
-    pub(crate) build_progress: BTreeMap<OperationId, DurableBuildProgress>,
-    #[serde(default)]
-    pub(crate) retired_builds: BTreeSet<OperationId>,
-    #[serde(default)]
-    pub(crate) abandoned_builds: BTreeSet<OperationId>,
-    #[serde(default = "initial_effect_sequence")]
-    pub(crate) next_effect_sequence: u64,
     #[serde(default)]
     pub(crate) load_metrics: Vec<LoadMetric>,
     #[serde(default)]
     pub(crate) reported_fault: Option<FaultType>,
-    pub(crate) pending_effect: Option<PendingEffect>,
-    pub(crate) retained_result: Option<RetainedResult>,
-    #[serde(default)]
-    pub(crate) prepared_switchover: Option<SwitchoverHandoff>,
-    #[serde(default)]
-    pub(crate) retired_switchover: Option<SwitchoverHandoff>,
-    #[serde(default)]
-    pub(crate) preparation_retirement: Option<PreparationRetirement>,
 }
 
 impl AgentState {
@@ -434,55 +265,8 @@ impl AgentState {
             identity,
             public_operation_preview: None,
             application_storage: None,
-            scale_up_initialization: None,
-            admitted_policy: None,
-            previous_policy: None,
-            prepared_secondary_removal: None,
-            secondary_removal_evidence: None,
-            accepted_secondary_removal: None,
-            retired_authority: None,
-            removal_effects: BTreeMap::new(),
-            removal_commands: BTreeMap::new(),
-            highest_epoch: Epoch::default(),
-            previous_configuration: None,
-            current_configuration: None,
-            role: ReplicaRole::None,
-            read_status: AccessStatus::NotPrimary,
-            write_status: AccessStatus::NotPrimary,
-            deactivation: None,
-            reconfiguration_data: None,
-            reconfiguration: None,
-            retained_command: None,
-            completed_scale_up: None,
-            scale_up_evidence: None,
-            build_commands: BTreeMap::new(),
-            build_progress: BTreeMap::new(),
-            retired_builds: BTreeSet::new(),
-            abandoned_builds: BTreeSet::new(),
-            next_effect_sequence: 1,
             load_metrics: Vec::new(),
             reported_fault: None,
-            pending_effect: None,
-            retained_result: None,
-            prepared_switchover: None,
-            retired_switchover: None,
-            preparation_retirement: None,
         }
-    }
-
-    pub(crate) fn removal_pending(&self) -> bool {
-        self.prepared_secondary_removal.is_some()
-            || self.pending_effect.as_ref().is_some_and(|p| {
-                matches!(
-                    p.effect.action,
-                    crate::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                        | crate::effects::RuntimeEffectAction::RetireReplica(_)
-                )
-            })
-            || self.secondary_removal_evidence.as_ref().is_some_and(|e| {
-                self.accepted_secondary_removal
-                    .as_ref()
-                    .is_none_or(|c| &c.evidence != e)
-            })
     }
 }

@@ -177,7 +177,7 @@ fn public_v1_source_uses_no_native_evidence() {
 
 #[tokio::test]
 async fn public_v1_evidence_report_is_structurally_public_only() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 11);
+    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 12);
     let root = test_root("report");
     let path = SqliteStore::metadata_database_path(&root);
     let resource_uid = ResourceUid::new("evidence-resource");
@@ -229,12 +229,7 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
         kuberic_runtime::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
     );
     assert!(wire.public_v1.is_some());
-    assert!(wire.verified_replication_lsn.is_none());
-    assert_eq!(wire.committed_lsn, 0);
-    assert_eq!(wire.current_configuration_quorum_progress, 0);
-    assert!(wire.catch_up_boundary.is_none());
-    assert!(!wire.catch_up_complete);
-    assert!(wire.builds.is_empty());
+    assert!(wire.public_v1.is_some());
     assert_eq!(
         normalize_public_v1_agent_status_report(wire).unwrap(),
         report

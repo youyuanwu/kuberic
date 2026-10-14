@@ -7,8 +7,11 @@ use kuberic_runtime::protocol::types::{
     ConfigurationId, HistoryContext, OperationId, ProcessSessionId,
     ReplicaStorageIncarnationContext,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub enum PublicV1EvidenceConsumer {
     Failover,
     Switchover,
@@ -20,7 +23,8 @@ pub enum PublicV1EvidenceConsumer {
     SessionRenewal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicV1ResourceAuthority {
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub resource_version: String,
@@ -36,7 +40,8 @@ impl PublicV1ResourceAuthority {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicV1AcceptedTransitionIntent {
     pub consumer: PublicV1EvidenceConsumer,
     pub operation_id: OperationId,
@@ -91,7 +96,8 @@ impl PublicV1AcceptedTransitionIntent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicV1AcceptedTransitionStatus {
     pub resource_version: String,
     pub evidence: PublicV1AcceptedStatus,

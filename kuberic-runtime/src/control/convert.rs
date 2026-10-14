@@ -4,11 +4,9 @@ use std::collections::BTreeSet;
 
 use crate::protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
-    ProtocolCommand,
+    ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
 };
-use crate::protocol::observation::{
-    AgentBuildReport, AgentObservation, AgentReport, UninitializedAgentObservation,
-};
+use crate::protocol::observation::{AgentObservation, UninitializedAgentObservation};
 use crate::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
@@ -111,6 +109,60 @@ pub struct ExecuteEnvelope {
     pub command: ProtocolCommand,
 }
 
+pub fn public_v1_history_command_to_proto(
+    command: &PublicV1HistoryCommand,
+) -> Result<proto::PublicV1HistoryCommand, WireError> {
+    command
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(proto::PublicV1HistoryCommand {
+        canonical_json: serde_json::to_vec(command)
+            .map_err(|error| WireError::InvalidAuthority(error.to_string()))?,
+    })
+}
+
+pub fn public_v1_operation_command_to_proto(
+    command: &PublicV1OperationCommand,
+) -> Result<proto::PublicV1OperationCommand, WireError> {
+    command
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(proto::PublicV1OperationCommand {
+        canonical_json: serde_json::to_vec(command)
+            .map_err(|error| WireError::InvalidAuthority(error.to_string()))?,
+    })
+}
+
+fn public_v1_history_command_from_proto(
+    command: proto::PublicV1HistoryCommand,
+) -> Result<PublicV1HistoryCommand, WireError> {
+    if command.canonical_json.is_empty() {
+        return Err(WireError::MissingField("public_v1_history.canonical_json"));
+    }
+    let command: PublicV1HistoryCommand = serde_json::from_slice(&command.canonical_json)
+        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+    command
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(command)
+}
+
+fn public_v1_operation_command_from_proto(
+    command: proto::PublicV1OperationCommand,
+) -> Result<PublicV1OperationCommand, WireError> {
+    if command.canonical_json.is_empty() {
+        return Err(WireError::MissingField(
+            "public_v1_operation.canonical_json",
+        ));
+    }
+    let command: PublicV1OperationCommand = serde_json::from_slice(&command.canonical_json)
+        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+    command
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(command)
+}
+
 pub fn configuration_command_to_proto(
     command: EnsureConfiguration,
 ) -> proto::EnsureConfigurationCommand {
@@ -182,8 +234,7 @@ pub fn validate_agent_status_report(report: &proto::AgentStatusReport) -> Result
     normalize_agent_status_report(report.clone()).map(|_| ())
 }
 
-/// Normalizes the dormant protocol-11 report branch without making it a
-/// production report accepted by `normalize_agent_status_report`.
+/// Normalizes the production Public V1 report branch.
 pub fn normalize_public_v1_agent_status_report(
     report: proto::AgentStatusReport,
 ) -> Result<PublicV1AgentReport, WireError> {
@@ -195,7 +246,7 @@ pub fn normalize_public_v1_agent_status_report(
             observed: report.protocol_version,
         });
     }
-    if legacy_status_fields_present(&report) {
+    if outer_initialization_fields_present(&report) {
         return Err(WireError::InvalidAuthority(
             "public-v1 status cannot carry legacy or native evidence".into(),
         ));
@@ -732,45 +783,15 @@ fn public_v1_recovery_to_proto(
     }
 }
 
-fn legacy_status_fields_present(report: &proto::AgentStatusReport) -> bool {
+fn outer_initialization_fields_present(report: &proto::AgentStatusReport) -> bool {
     !report.resource_uid.is_empty()
-        || report.identity.is_some()
         || !report.process_session_id.is_empty()
-        || report.report_sequence != 0
-        || report.role != proto::ReplicaRole::Unknown as i32
-        || report.write_status != proto::AccessStatus::Unknown as i32
-        || report.epoch.is_some()
-        || report.previous_configuration.is_some()
-        || report.current_configuration.is_some()
-        || report.current_progress != 0
-        || report.committed_lsn != 0
-        || report.catch_up_capability.is_some()
         || report.storage_state != proto::AgentStorageState::Unknown as i32
         || !report.pod_uid.is_empty()
         || !report.pvc_uid.is_empty()
         || !report.storage_error.is_empty()
         || report.healthy
         || report.replica_id != 0
-        || report.read_status != proto::AccessStatus::Unknown as i32
-        || report.current_configuration_quorum_progress != 0
-        || report.catch_up_boundary.is_some()
-        || report.catch_up_complete
-        || report.deactivated_lsn.is_some()
-        || !report.load_metrics.is_empty()
-        || report.reported_fault != proto::FaultType::Unknown as i32
-        || !report.pending_operation_id.is_empty()
-        || !report.retained_operation_id.is_empty()
-        || !report.builds.is_empty()
-        || report.deactivation_epoch.is_some()
-        || report.verified_replication_lsn.is_some()
-        || report.prepared_switchover.is_some()
-        || report.prepared_secondary_removal.is_some()
-        || report.secondary_removal_evidence.is_some()
-        || report.retired_replica.is_some()
-        || report.accepted_secondary_removal.is_some()
-        || report.scale_up_intent.is_some()
-        || report.pending_configuration.is_some()
-        || !report.replication_address.is_empty()
 }
 
 fn replay_from_proto(value: i32) -> Result<PublicOperationReplayDisposition, WireError> {
@@ -1309,6 +1330,60 @@ pub fn normalize_agent_status_report(
     report: proto::AgentStatusReport,
 ) -> Result<AgentObservation, WireError> {
     ensure_supported_version(report.protocol_version)?;
+    if report.resource_uid.is_empty() {
+        return Err(WireError::MissingField("agent_status.resource_uid"));
+    }
+    if report.process_session_id.is_empty() {
+        return Err(WireError::MissingField("agent_status.process_session_id"));
+    }
+    let storage_state = proto::AgentStorageState::try_from(report.storage_state).map_err(|_| {
+        WireError::InvalidEnum {
+            field: "agent_status.storage_state",
+            value: report.storage_state,
+        }
+    })?;
+    match storage_state {
+        proto::AgentStorageState::Uninitialized => {
+            if report.public_v1.is_some()
+                || report.replica_id <= 0
+                || report.pod_uid.is_empty()
+                || report.pvc_uid.is_empty()
+            {
+                return Err(WireError::InvalidAuthority(
+                    "uninitialized status contains invalid replacement authority".into(),
+                ));
+            }
+            Ok(AgentObservation::Uninitialized(
+                UninitializedAgentObservation {
+                    protocol_version: report.protocol_version,
+                    resource_uid: ResourceUid::new(report.resource_uid),
+                    replica_id: ReplicaId::new(report.replica_id),
+                    pod_uid: PodUid::new(report.pod_uid),
+                    pvc_uid: PvcUid::new(report.pvc_uid),
+                    process_session_id: ProcessSessionId::new(report.process_session_id),
+                    report_sequence: 0,
+                },
+            ))
+        }
+        proto::AgentStorageState::Initialized => Err(WireError::InvalidAuthority(
+            "initialized status must use Public V1 normalization".into(),
+        )),
+        proto::AgentStorageState::Unsafe => Ok(AgentObservation::Invalid {
+            message: report.storage_error,
+            uninitialized_report: None,
+        }),
+        proto::AgentStorageState::Unknown => Err(WireError::InvalidEnum {
+            field: "agent_status.storage_state",
+            value: report.storage_state,
+        }),
+    }
+}
+
+#[cfg(any())]
+pub fn normalize_agent_status_report(
+    report: proto::AgentStatusReport,
+) -> Result<AgentObservation, WireError> {
+    ensure_supported_version(report.protocol_version)?;
     if report.public_v1.is_some() {
         return Err(WireError::InvalidAuthority(
             "legacy status cannot carry a public-v1 report branch".into(),
@@ -1525,18 +1600,6 @@ pub fn normalize_agent_status_report(
                 .current_configuration
                 .map(ConfigurationDescriptor::try_from)
                 .transpose()?;
-            validate_report_configurations(
-                epoch,
-                previous_configuration.as_ref(),
-                current_configuration.as_ref(),
-                role,
-                read_status,
-                write_status,
-                ReportConfigurationEvidence {
-                    secondary_removal: report.secondary_removal_evidence.is_some(),
-                    scale_up: report.scale_up_intent.is_some(),
-                },
-            )?;
             let pending_configuration = report
                 .pending_configuration
                 .map(|command| {
@@ -1664,6 +1727,43 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
     }
 
     match command {
+        proto::execute_command_request::Command::PublicV1History(command) => {
+            let command = public_v1_history_command_from_proto(command.clone())?;
+            let target = command.target();
+            let envelope_target: ReplicaIdentity = request
+                .target
+                .clone()
+                .ok_or(WireError::MissingField("execute.target"))?
+                .try_into()?;
+            if target != &envelope_target {
+                return Err(WireError::InvalidAuthority(
+                    "public-v1 history target differs from envelope".into(),
+                ));
+            }
+            if command.resource_uid().as_str() != request.resource_uid {
+                return Err(WireError::InvalidAuthority(
+                    "public-v1 history resource differs from envelope".into(),
+                ));
+            }
+            Ok(())
+        }
+        proto::execute_command_request::Command::PublicV1Operation(command) => {
+            let command = public_v1_operation_command_from_proto(command.clone())?;
+            let envelope_target: ReplicaIdentity = request
+                .target
+                .clone()
+                .ok_or(WireError::MissingField("execute.target"))?
+                .try_into()?;
+            if command.target != envelope_target
+                || command.intent.process_session_id.as_str() != request.expected_process_session_id
+                || command.intent.preview.protocol_version != request.protocol_version
+            {
+                return Err(WireError::InvalidAuthority(
+                    "public-v1 operation differs from its envelope fences".into(),
+                ));
+            }
+            Ok(())
+        }
         proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(command) => {
             let command: crate::protocol::command::AcceptSecondaryRemovalCommit =
                 (**command).clone().try_into()?;
@@ -2246,6 +2346,16 @@ pub fn normalize_execute_request(
         .command
         .ok_or(WireError::MissingField("execute.command"))?
     {
+        proto::execute_command_request::Command::PublicV1History(command) => {
+            ProtocolCommand::PublicV1History(Box::new(public_v1_history_command_from_proto(
+                command,
+            )?))
+        }
+        proto::execute_command_request::Command::PublicV1Operation(command) => {
+            ProtocolCommand::PublicV1Operation(Box::new(public_v1_operation_command_from_proto(
+                command,
+            )?))
+        }
         proto::execute_command_request::Command::PrepareSecondaryRemoval(command) => {
             ProtocolCommand::PrepareSecondaryRemoval(Box::new((*command).try_into()?))
         }
@@ -3012,75 +3122,6 @@ pub(crate) fn access_status_from_proto(
         proto::AccessStatus::NotPrimary => Ok(AccessStatus::NotPrimary),
         proto::AccessStatus::NoWriteQuorum => Ok(AccessStatus::NoWriteQuorum),
     }
-}
-
-#[derive(Clone, Copy)]
-struct ReportConfigurationEvidence {
-    secondary_removal: bool,
-    scale_up: bool,
-}
-
-fn validate_report_configurations(
-    epoch: Epoch,
-    previous: Option<&ConfigurationDescriptor>,
-    current: Option<&ConfigurationDescriptor>,
-    role: ReplicaRole,
-    read_status: AccessStatus,
-    write_status: AccessStatus,
-    evidence: ReportConfigurationEvidence,
-) -> Result<(), WireError> {
-    if previous.is_some() && current.is_none() {
-        return Err(WireError::InvalidAuthority(
-            "report has Previous Configuration without Current Configuration".to_string(),
-        ));
-    }
-    if let Some(current) = current
-        && current.epoch != epoch
-    {
-        return Err(WireError::InvalidAuthority(
-            "report epoch differs from Current Configuration".to_string(),
-        ));
-    }
-    if let (Some(previous), Some(current)) = (previous, current) {
-        let previous_ids = previous
-            .members
-            .iter()
-            .map(|member| member.identity.replica_id)
-            .collect::<BTreeSet<_>>();
-        let current_ids = current
-            .members
-            .iter()
-            .map(|member| member.identity.replica_id)
-            .collect::<BTreeSet<_>>();
-        if previous.epoch.data_loss_number != current.epoch.data_loss_number
-            || previous.epoch.configuration_number >= current.epoch.configuration_number
-            || (!evidence.secondary_removal
-                && !evidence.scale_up
-                && (previous_ids != current_ids || previous.write_quorum != current.write_quorum))
-        {
-            return Err(WireError::InvalidAuthority(
-                "report PC/CC relationship is invalid".to_string(),
-            ));
-        }
-    }
-    if role == ReplicaRole::Primary && current.is_none() {
-        return Err(WireError::InvalidAuthority(
-            "Primary report has no Current Configuration".to_string(),
-        ));
-    }
-    if write_status == AccessStatus::Granted && role != ReplicaRole::Primary {
-        return Err(WireError::InvalidAuthority(
-            "granted WriteStatus requires Primary role".to_string(),
-        ));
-    }
-    if read_status == AccessStatus::Granted
-        && !matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
-    {
-        return Err(WireError::InvalidAuthority(
-            "granted ReadStatus requires Primary or Active Secondary role".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_policy(policy: &proto::EffectivePolicy) -> Result<(), WireError> {

@@ -9,12 +9,16 @@ pub enum PublicV1ReconciliationOutcome {
     EffectApplied,
 }
 
-pub async fn reconcile_public_v1_consumer(
-    api: &dyn PublicV1EvidenceApi,
+pub async fn reconcile_public_v1_consumer<A>(
+    api: &A,
+    scope: &crate::cluster_api::PublicV1Scope,
     report: &PublicV1AgentReport,
-) -> Result<PublicV1ReconciliationOutcome, String> {
+) -> Result<PublicV1ReconciliationOutcome, String>
+where
+    A: PublicV1EvidenceApi + ?Sized,
+{
     let accepted = api
-        .observe_public_v1_evidence_status()
+        .observe_public_v1_evidence_status(scope)
         .await?
         .ok_or_else(|| "public-v1 consumer lacks accepted transition status".to_string())?;
     let plan = plan_public_v1_evidence(&accepted, report)?;
@@ -29,22 +33,25 @@ pub async fn reconcile_public_v1_consumer(
             PublicV1ReconciliationOutcome::EffectApplied
         }
     };
-    crate::executor::execute_public_v1_evidence(api, plan).await?;
+    crate::executor::execute_public_v1_evidence(api, scope, plan).await?;
     Ok(outcome)
 }
 
 pub async fn reconcile_public_v1_operation<A>(
     api: &A,
+    scope: &crate::cluster_api::PublicV1Scope,
     command: kuberic_runtime::protocol::command::ProtocolCommand,
 ) -> Result<PublicV1ReconciliationOutcome, String>
 where
-    A: crate::cluster_api::PublicV1OperationApi + PublicV1EvidenceApi,
+    A: crate::cluster_api::PublicV1OperationApi + PublicV1EvidenceApi + ?Sized,
 {
     let expected = api
-        .observe_public_v1_operation()
+        .observe_public_v1_operation(scope)
         .await?
         .ok_or_else(|| "public-v1 operation lacks accepted transition status".to_string())?;
-    crate::executor::execute_public_v1_operation(api, &expected, command).await?;
-    let report = api.observe_public_v1_operation_report(&expected).await?;
-    reconcile_public_v1_consumer(api, &report).await
+    crate::executor::execute_public_v1_operation(api, scope, &expected, command).await?;
+    let report = api
+        .observe_public_v1_operation_report(scope, &expected)
+        .await?;
+    reconcile_public_v1_consumer(api, scope, &report).await
 }

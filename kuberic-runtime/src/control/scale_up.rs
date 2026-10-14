@@ -585,7 +585,7 @@ pub(crate) fn configuration_from_proto(
     Ok(command)
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
 

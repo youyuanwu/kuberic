@@ -85,16 +85,6 @@ impl PartitionOperation {
         *self.cut.lock().await = cut;
     }
 
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) async fn crash_root(&self) {
-        if let Some(task) = self.task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        self.needs_recovery
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
     pub(crate) async fn track_containment(
         &self,
         witness: watch::Receiver<bool>,
@@ -1148,27 +1138,6 @@ impl PartitionOperationRegistry {
         }
     }
 
-    pub(crate) async fn complete_containment(
-        &self,
-        operation_id: &OperationId,
-    ) -> Result<PublicOperationRecord> {
-        let operation = self
-            .state
-            .lock()
-            .await
-            .operations
-            .get(operation_id)
-            .cloned()
-            .ok_or_else(|| {
-                HostError::CommandRejected(format!(
-                    "public operation {operation_id} is not registered"
-                ))
-            })?;
-        let completed = operation.complete_containment().await?;
-        self.refresh_waiters().await?;
-        Ok(completed)
-    }
-
     pub(crate) async fn recover_unowned(&self) -> Result<Vec<PublicOperationRecord>> {
         let _admission = self.admission.lock().await;
         self.load_durable_records().await?;
@@ -1242,18 +1211,6 @@ impl PartitionOperationRegistry {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    }
-
-    pub(crate) async fn operation(
-        &self,
-        operation_id: &OperationId,
-    ) -> Option<Arc<PartitionOperation>> {
-        self.state
-            .lock()
-            .await
-            .operations
-            .get(operation_id)
-            .cloned()
     }
 
     async fn load_durable_records(&self) -> Result<()> {

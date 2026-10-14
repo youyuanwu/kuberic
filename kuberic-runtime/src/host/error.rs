@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 use crate::RuntimeError;
-use crate::error::ContractError;
 
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -35,14 +34,6 @@ pub enum HostError {
     Io(#[from] std::io::Error),
     #[error("runtime error: {0}")]
     Runtime(#[from] RuntimeError),
-    #[error("internal contract error: {0}")]
-    Contract(String),
-}
-
-impl From<ContractError> for HostError {
-    fn from(error: ContractError) -> Self {
-        Self::Contract(error.to_string())
-    }
 }
 
 pub type Result<T> = std::result::Result<T, HostError>;

@@ -1,26 +1,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::authority::{BuildAuthorityStore, BuildProgressStore, LocalWriteJournal};
 use crate::host::store::AgentStore;
-use crate::protocol::command::{
-    EnsureReplicaBuild, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
-};
+use crate::protocol::command::{PublicV1HistoryCommand, PublicV1SessionRenewalCommand};
 use crate::protocol::public_operations::{
     DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
     PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport, PublicV1OperationResult,
     PublicV1SessionRenewalStatus, StatePersistence,
 };
 use crate::protocol::types::{
-    AccessStatus, BuildAuthority, ConfigurationDescriptor, Epoch, OperationId,
-    ProcessSessionEndpoint, ProcessSessionId, ReplicaRole,
+    AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionEndpoint,
+    ProcessSessionId, ReplicaRole,
 };
 use crate::protocol::types::{
     HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
 };
 
-use super::authority::{DurableBuildProgress, DurableLocalWrite};
-use super::effects::{RuntimeEffect, RuntimeEffectResult};
 use super::state::{AgentState, StorageIdentity};
 
 pub struct SqliteStore {
@@ -28,6 +23,8 @@ pub struct SqliteStore {
 }
 
 pub const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 =
+    crate::host::state::PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION;
+pub const PHASE6_PUBLIC_V1_SCHEMA_VERSION: u32 =
     crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -827,56 +824,5 @@ impl SqliteStore {
             },
         )
         .await
-    }
-
-    pub async fn journal_build(
-        &self,
-        command: &EnsureReplicaBuild,
-    ) -> crate::host::Result<EnsureReplicaBuild> {
-        self.inner.journal_build(command).await
-    }
-
-    pub async fn load_local_writes(&self) -> crate::host::Result<Vec<DurableLocalWrite>> {
-        Ok(super::convert(self.inner.load_local_writes().await?))
-    }
-
-    pub async fn load_local_write(
-        &self,
-        id: &OperationId,
-    ) -> crate::host::Result<Option<DurableLocalWrite>> {
-        Ok(super::convert(self.inner.load_local_write(id).await?))
-    }
-
-    pub async fn load_build(
-        &self,
-        id: &OperationId,
-    ) -> crate::host::Result<Option<BuildAuthority>> {
-        Ok(self.inner.load_build(id).await?)
-    }
-
-    pub async fn load_build_progress(
-        &self,
-        id: &OperationId,
-    ) -> crate::host::Result<Option<DurableBuildProgress>> {
-        Ok(super::convert(self.inner.load_build_progress(id).await?))
-    }
-
-    pub async fn begin_effect(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
-        self.inner.begin_effect(&super::convert(effect)).await?;
-        Ok(())
-    }
-
-    pub async fn mark_effect_applied(
-        &self,
-        effect: &RuntimeEffect,
-        result: &super::effects::RuntimeEffectResult,
-    ) -> crate::host::Result<()> {
-        self.inner
-            .mark_effect_applied(&super::convert(effect), &super::convert(result))
-            .await
-    }
-
-    pub async fn complete_effect(&self, result: &RuntimeEffectResult) -> crate::host::Result<()> {
-        self.inner.complete_effect(&super::convert(result)).await
     }
 }

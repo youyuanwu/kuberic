@@ -46,22 +46,6 @@ where
     let _ = <KubernetesDnsResolver as ReplicaEndpointResolver>::control_endpoint;
 }
 
-fn isolated_fixture<A>(
-    identity: kuberic_runtime::protocol::types::ReplicaIdentity,
-    application: Arc<A>,
-    store: Arc<kuberic_runtime::testing::sqlite_store::SqliteStore>,
-) where
-    A: kuberic_runtime::StatefulServiceReplica + 'static,
-{
-    let fixture = kuberic_runtime::testing::hosting::PodRuntime::new(
-        identity,
-        application,
-        store,
-    );
-    let _ = fixture.snapshot();
-    let _ = kuberic_runtime::testing::InProcessTransport::new();
-}
-
 async fn observe_host(replica: &mut RunningReplica, handle: ReplicaHandle) {
     let _: ReplicaHandle = replica.handle();
     let _ = replica.shutdown_signal();

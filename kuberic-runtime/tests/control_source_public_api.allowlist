@@ -20,6 +20,8 @@ public-path documented enum crate::control::convert::WireError
 public-path documented enum crate::protocol::command::EffectClass
 public-path documented enum crate::protocol::command::KubernetesChange
 public-path documented enum crate::protocol::command::ProtocolCommand
+public-path documented enum crate::protocol::command::PublicV1HistoryCommand
+public-path documented enum crate::protocol::command::PublicV1SessionRenewalCommand
 public-path documented enum crate::protocol::command::SafetyChange
 public-path documented enum crate::protocol::command::ScaleDownResource
 public-path documented enum crate::protocol::observation::AgentObservation
@@ -88,6 +90,7 @@ public-path documented field crate::protocol::command::AcceptSecondaryRemovalCom
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::local_recovery: bool
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::operation_id: OperationId
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::target: ReplicaIdentity
+public-path documented field crate::protocol::command::DropReplicaIncarnation::action: crate :: protocol :: public_operations :: PublicFaultAction
 public-path documented field crate::protocol::command::EnsureConfiguration::current_configuration: ConfigurationDescriptor
 public-path documented field crate::protocol::command::EnsureConfiguration::current_epoch: Epoch
 public-path documented field crate::protocol::command::EnsureConfiguration::current_only: bool
@@ -139,6 +142,9 @@ public-path documented field crate::protocol::command::PrepareSwitchover::prepar
 public-path documented field crate::protocol::command::PrepareSwitchover::request_id: SwitchoverRequestId
 public-path documented field crate::protocol::command::PrepareSwitchover::source: ReplicaIdentity
 public-path documented field crate::protocol::command::PrepareSwitchover::target: ReplicaIdentity
+public-path documented field crate::protocol::command::PublicV1OperationCommand::intent: PublicOperationIntent
+public-path documented field crate::protocol::command::PublicV1OperationCommand::target: ReplicaIdentity
+public-path documented field crate::protocol::command::RestartReplicaProcess::action: crate :: protocol :: public_operations :: PublicFaultAction
 public-path documented field crate::protocol::command::RetireReplica::committed: crate :: protocol :: types :: SecondaryScaleDownCleanup
 public-path documented field crate::protocol::command::RetireReplica::expected_agent_generation: AgentGeneration
 public-path documented field crate::protocol::command::RetireReplica::expected_instance_id: ReplicaInstanceId
@@ -494,6 +500,8 @@ public-path documented fn crate::control::convert::fn normalize_public_v1_agent_
 public-path documented fn crate::control::convert::fn normalize_replication_ack (ack : proto :: ReplicationAck ,) -> Result < ReplicationAcknowledgement , WireError >
 public-path documented fn crate::control::convert::fn normalize_replication_item (item : proto :: ReplicationItem ,) -> Result < ReplicationEnvelope , WireError >
 public-path documented fn crate::control::convert::fn public_v1_agent_status_to_proto (report : & PublicV1AgentReport) -> proto :: AgentStatusReport
+public-path documented fn crate::control::convert::fn public_v1_history_command_to_proto (command : & PublicV1HistoryCommand ,) -> Result < proto :: PublicV1HistoryCommand , WireError >
+public-path documented fn crate::control::convert::fn public_v1_operation_command_to_proto (command : & PublicV1OperationCommand ,) -> Result < proto :: PublicV1OperationCommand , WireError >
 public-path documented fn crate::control::convert::fn validate_agent_status_report (report : & proto :: AgentStatusReport) -> Result < () , WireError >
 public-path documented fn crate::control::convert::fn validate_copy_ack (ack : & proto :: CopyAck) -> Result < () , WireError >
 public-path documented fn crate::control::convert::fn validate_copy_item (item : & proto :: CopyItem) -> Result < () , WireError >
@@ -520,6 +528,15 @@ public-path documented fn crate::protocol::validation::fn validate_status (statu
 public-path documented fn crate::protocol::validation::fn validate_transition_relationship (kind : TransitionKind , previous : Option < & ConfigurationDescriptor > , current : & ConfigurationDescriptor , policy : & EffectivePolicy ,) -> Result < () , ValidationError >
 public-path documented impl crate::protocol::command::EnsureConfiguration::fn is_switchover_restoration (& self) -> bool
 public-path documented impl crate::protocol::command::ProtocolCommand::fn effect_class (& self) -> EffectClass
+public-path documented impl crate::protocol::command::PublicV1HistoryCommand::fn accepted (& self) -> Option < & PublicV1AcceptedStatus >
+public-path documented impl crate::protocol::command::PublicV1HistoryCommand::fn initialization (& self ,) -> Option < (& HistoryInitializationId , & HistoryContext , & ReplicaStorageIncarnationContext ,) >
+public-path documented impl crate::protocol::command::PublicV1HistoryCommand::fn resource_uid (& self) -> & ResourceUid
+public-path documented impl crate::protocol::command::PublicV1HistoryCommand::fn target (& self) -> & ReplicaIdentity
+public-path documented impl crate::protocol::command::PublicV1HistoryCommand::fn validate (& self) -> Result < () , & 'static str >
+public-path documented impl crate::protocol::command::PublicV1OperationCommand::fn validate (& self) -> Result < () , & 'static str >
+public-path documented impl crate::protocol::command::PublicV1SessionRenewalCommand::fn accepted (& self) -> & PublicV1SessionRenewalStatus
+public-path documented impl crate::protocol::command::PublicV1SessionRenewalCommand::fn target (& self) -> & ReplicaIdentity
+public-path documented impl crate::protocol::command::PublicV1SessionRenewalCommand::fn validate (& self) -> Result < () , & 'static str >
 public-path documented impl crate::protocol::observation::KubernetesReplicaObservation::fn has_exact_scaffolding (& self) -> bool
 public-path documented impl crate::protocol::observation::ObservationSnapshot::fn has_complete_scaffolding (& self) -> bool
 public-path documented impl crate::protocol::observation::ObservationSnapshot::fn intended_replica_ids (& self) -> Vec < ReplicaId >
@@ -592,11 +609,14 @@ public-path documented struct crate::control::convert::ExecuteEnvelope
 public-path documented struct crate::control::convert::ReplicationAcknowledgement
 public-path documented struct crate::control::convert::ReplicationEnvelope
 public-path documented struct crate::protocol::command::AcceptSecondaryRemovalCommit
+public-path documented struct crate::protocol::command::DropReplicaIncarnation
 public-path documented struct crate::protocol::command::EnsureConfiguration
 public-path documented struct crate::protocol::command::EnsureReplicaBuild
 public-path documented struct crate::protocol::command::InitializeAgentStore
 public-path documented struct crate::protocol::command::PrepareSecondaryRemoval
 public-path documented struct crate::protocol::command::PrepareSwitchover
+public-path documented struct crate::protocol::command::PublicV1OperationCommand
+public-path documented struct crate::protocol::command::RestartReplicaProcess
 public-path documented struct crate::protocol::command::RetireReplica
 public-path documented struct crate::protocol::observation::AgentBuildReport
 public-path documented struct crate::protocol::observation::AgentReport
@@ -656,7 +676,7 @@ public-path documented struct crate::protocol::types::StatusCondition
 public-path documented struct crate::protocol::types::SwitchoverHandoff
 public-path documented struct crate::protocol::types::SwitchoverPreparationId
 public-path documented struct crate::protocol::types::TransitionIntent
-public-path documented use crate::control::convert :: { CopyAcknowledgement , CopyEnvelope , ExecuteEnvelope , ReplicationAcknowledgement , ReplicationEnvelope , WireError , configuration_command_to_proto , ensure_supported_version , normalize_agent_status_report , normalize_copy_ack , normalize_copy_item , normalize_execute_request , normalize_public_v1_agent_status_report , normalize_replication_ack , normalize_replication_item , public_v1_agent_status_to_proto , validate_agent_status_report , validate_copy_ack , validate_copy_item , validate_execute_request , validate_replication_ack , validate_replication_item , }
+public-path documented use crate::control::convert :: { CopyAcknowledgement , CopyEnvelope , ExecuteEnvelope , ReplicationAcknowledgement , ReplicationEnvelope , WireError , configuration_command_to_proto , ensure_supported_version , normalize_agent_status_report , normalize_copy_ack , normalize_copy_item , normalize_execute_request , normalize_public_v1_agent_status_report , normalize_replication_ack , normalize_replication_item , public_v1_agent_status_to_proto , public_v1_history_command_to_proto , public_v1_operation_command_to_proto , validate_agent_status_report , validate_copy_ack , validate_copy_item , validate_execute_request , validate_replication_ack , validate_replication_item , }
 public-path documented use crate::protocol::validation::scale_down :: *
 public-path documented use crate::protocol::validation::scale_up :: *
 public-path documented variant crate::control::convert::WireError::InvalidAuthority((String))
@@ -689,6 +709,13 @@ public-path documented variant crate::protocol::command::ProtocolCommand::Public
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1Operation((Box < PublicV1OperationCommand >))
 public-path documented variant crate::protocol::command::ProtocolCommand::RestartReplicaProcess((Box < RestartReplicaProcess >))
 public-path documented variant crate::protocol::command::ProtocolCommand::RetireReplica((Box < RetireReplica >))
+public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Initialize { { preview : PublicOperationPreviewIdentity , accepted : PublicV1AcceptedStatus , storage : ReplicaStorageIncarnationContext , } }
+public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Recover { { accepted : PublicV1AcceptedStatus , intent : Box < PublicOperationIntent > , } }
+public-path documented variant crate::protocol::command::PublicV1HistoryCommand::SessionRenewal((Box < PublicV1SessionRenewalCommand >))
+public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::CloseAccessAndIngress { { accepted : PublicV1SessionRenewalStatus , } }
+public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::InstallFreshConfiguration { { accepted : PublicV1SessionRenewalStatus , configuration : ConfigurationDescriptor , } }
+public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::ReplayReplacementRole { { accepted : PublicV1SessionRenewalStatus , process_session_id : crate :: protocol :: types :: ProcessSessionId , epoch : Epoch , role : crate :: protocol :: types :: ReplicaRole , } }
+public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::UpdateEpochBarrier { { accepted : PublicV1SessionRenewalStatus , survivor : crate :: protocol :: types :: ProcessSessionEndpoint , epoch : Epoch , } }
 public-path documented variant crate::protocol::command::SafetyChange::RemoveWriteRouting
 public-path documented variant crate::protocol::command::ScaleDownResource::Endpoint
 public-path documented variant crate::protocol::command::ScaleDownResource::Pod
