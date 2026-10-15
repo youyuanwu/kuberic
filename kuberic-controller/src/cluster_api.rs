@@ -2334,7 +2334,11 @@ where
         match observation.agents.get(&key) {
             Some(RawAgentObservation::PublicV1Report(report))
                 if report.replica == *identity
-                    && report.process_session_id == expected.intent.process_session_id =>
+                    && (report.process_session_id == expected.intent.process_session_id
+                        || report
+                            .completed_operations
+                            .iter()
+                            .any(|completion| expected.intent.matches(completion))) =>
             {
                 Ok((**report).clone())
             }

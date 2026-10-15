@@ -866,6 +866,45 @@ async fn persisted_completion_must_remain_exact_on_later_reconciliation() {
     assert!(state.effects().is_empty());
 }
 
+#[tokio::test]
+async fn restarted_report_can_persist_exact_predecessor_completion() {
+    let accepted = accepted();
+    let completion = completion(
+        &accepted,
+        "predecessor-completion",
+        PublicV1CallKind::Role,
+        PublicV1OperationResult::Succeeded,
+    );
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::Topology,
+            &completion,
+            None,
+        ),
+    );
+    let mut restarted = report(&accepted, completion.clone());
+    restarted.process_session_id = ProcessSessionId::new("successor-session");
+
+    assert_eq!(
+        reconcile_public_v1_consumer(&state, &test_scope(), &restarted)
+            .await
+            .unwrap(),
+        PublicV1ReconciliationOutcome::EvidencePersisted
+    );
+    assert!(
+        state
+            .transition()
+            .evidence
+            .completed_operations
+            .iter()
+            .any(|accepted| {
+                accepted == &PublicV1AcceptedOperationCompletion::from_completion(&completion)
+            })
+    );
+}
+
 #[test]
 fn persisted_completion_plans_every_terminal_effect_without_a_live_report() {
     let cases = [

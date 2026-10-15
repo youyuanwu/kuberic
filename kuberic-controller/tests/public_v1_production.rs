@@ -1401,3 +1401,109 @@ async fn production_reconciler_completes_persisted_evidence_after_session_change
     .await
     .expect("persisted completion replay exceeded 270 seconds");
 }
+
+#[tokio::test]
+async fn production_reconciler_accepts_terminal_predecessor_evidence_after_status_conflict() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(1)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..80 {
+            reconciler.reconcile("default", "sample").await.unwrap();
+            if api
+                .observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_transition.is_some())
+            {
+                break;
+            }
+        }
+        reconciler.reconcile("default", "sample").await.unwrap();
+        let mut observed = api.observation().await;
+        let operation_id = {
+            let status = observed.set.status.as_mut().expect("status");
+            let mut transition = status
+                .public_v1_transition
+                .as_ref()
+                .expect("pending transition")
+                .transition()
+                .unwrap();
+            let operation_id = transition.intent.operation_id.clone();
+            assert!(
+                transition
+                    .evidence
+                    .completed_operations
+                    .iter()
+                    .any(|completion| completion.operation_id == operation_id)
+            );
+            transition
+                .evidence
+                .completed_operations
+                .retain(|completion| completion.operation_id != operation_id);
+            status.public_v1_transition = Some(
+                kuberic_controller::crd::PublicV1TransitionState::from_transition(&transition)
+                    .unwrap(),
+            );
+            let mut authority = status
+                .public_v1_authority
+                .as_ref()
+                .expect("authority")
+                .authority()
+                .unwrap();
+            authority
+                .completed_operations
+                .retain(|completion| completion.operation_id != operation_id);
+            status.public_v1_authority = Some(
+                kuberic_controller::crd::PublicV1AuthorityStatus::from_authority(&authority)
+                    .unwrap(),
+            );
+            operation_id
+        };
+        let report = observed
+            .agents
+            .values_mut()
+            .find_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report) => Some(report.as_mut()),
+                _ => None,
+            })
+            .expect("terminal predecessor report");
+        assert!(
+            report
+                .completed_operations
+                .iter()
+                .any(|completion| completion.operation_id == operation_id)
+        );
+        report.process_session_id =
+            kuberic_runtime::protocol::types::ProcessSessionId::new("successor-session");
+        report.replicator_creation_id =
+            kuberic_runtime::protocol::types::ReplicatorCreationId::new("successor-creation");
+        api.set_observation(observed).await;
+
+        let executes_before = api
+            .effects()
+            .await
+            .iter()
+            .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+            .count();
+        reconciler.reconcile("default", "sample").await.unwrap();
+        reconciler.reconcile("default", "sample").await.unwrap();
+        let executes_after = api
+            .effects()
+            .await
+            .iter()
+            .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+            .count();
+        assert_eq!(executes_after, executes_before);
+        let observed = api.observation().await;
+        let status = observed.set.status.as_ref().expect("status");
+        assert!(status.public_v1_transition.is_none());
+        assert!(status.public_v1_operation.is_none());
+    })
+    .await
+    .expect("terminal predecessor evidence reconciliation exceeded 270 seconds");
+}

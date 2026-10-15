@@ -2292,15 +2292,14 @@ impl PublicV1OperationCompletion {
         report_identity: &PublicV1Identity,
         report_resource_uid: &ResourceUid,
         report_replica: &ReplicaIdentity,
-        report_session: &ProcessSessionId,
+        _report_session: &ProcessSessionId,
     ) -> Result<(), &'static str> {
         self.validate_for_status(report_identity, &self.history)?;
-        if &self.process_session_id != report_session
-            || self.history.resource_uid != *report_resource_uid
+        if self.history.resource_uid != *report_resource_uid
             || self.storage_incarnation.replica != *report_replica
         {
             return Err(
-                "public-v1 operation completion differs from its report history, storage, or session",
+                "public-v1 operation completion differs from its report history or storage",
             );
         }
         match &self.result {
@@ -2316,7 +2315,7 @@ impl PublicV1OperationCompletion {
                 report_identity,
                 report_resource_uid,
                 report_replica,
-                report_session,
+                &self.process_session_id,
             )?,
             _ => {}
         }

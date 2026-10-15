@@ -176,20 +176,20 @@ pub fn plan_public_v1_evidence(
     accepted.validate()?;
     report.validate().map_err(str::to_owned)?;
     let intent = &accepted.intent;
+    let completion = report
+        .completed_operations
+        .iter()
+        .find(|completion| completion.operation_id == intent.operation_id);
     if report.identity != accepted.evidence.identity
         || report.resource_uid != accepted.evidence.history.resource_uid
         || report.history != accepted.evidence.history
         || report.history != intent.history
         || report.storage_incarnation != intent.source.storage_incarnation
-        || report.process_session_id != intent.process_session_id
+        || (report.process_session_id != intent.process_session_id && completion.is_none())
     {
         return Err("public-v1 report differs from accepted transition authority".into());
     }
-    let Some(completion) = report
-        .completed_operations
-        .iter()
-        .find(|completion| completion.operation_id == intent.operation_id)
-    else {
+    let Some(completion) = completion else {
         return Ok(PublicV1EvidencePlan::Wait);
     };
     if !intent.matches(completion) {

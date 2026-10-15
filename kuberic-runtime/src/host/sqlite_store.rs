@@ -684,7 +684,10 @@ impl AgentStore for SqliteStore {
                 && preview
                     .operations
                     .values()
-                    .any(|record| record.intent.process_session_id != intent.process_session_id)
+                    .any(|record| {
+                        record.stage != PublicOperationStage::Completed
+                            && record.intent.process_session_id != intent.process_session_id
+                    })
             {
                 let renewal_authorized = preview.session_renewal.as_ref().is_some_and(|renewal| {
                     let replacement_matches =
@@ -974,6 +977,7 @@ impl AgentStore for SqliteStore {
                 }
                 if preview.operations.values().any(|record| {
                     record.intent.lifecycle.is_some()
+                        && record.stage != PublicOperationStage::Completed
                         && record.intent.process_session_id != intent.process_session_id
                 }) {
                     return Err(crate::host::HostError::IdentityMismatch(
