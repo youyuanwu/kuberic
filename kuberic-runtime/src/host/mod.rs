@@ -31,6 +31,19 @@ pub use process::{
 };
 pub use transport::{KubernetesDnsResolver, ReplicaEndpointResolver};
 
+pub(crate) fn session_renewal_supersedes_local_journal(
+    next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    previous: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+) -> bool {
+    next.required != previous.required
+        && next.required.resource_uid == previous.required.resource_uid
+        && next.required.history.resource_uid == previous.required.history.resource_uid
+        && next.required.history.protocol_generation
+            == previous.required.history.protocol_generation
+        && next.required.history.data_loss_number >= previous.required.history.data_loss_number
+        && next.required.previous_epoch >= previous.required.renewal_epoch
+}
+
 #[cfg(test)]
 mod tests {
     pub(crate) fn tempdir() -> std::io::Result<tempfile::TempDir> {

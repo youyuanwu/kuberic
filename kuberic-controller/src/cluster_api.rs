@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,11 +15,14 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client, Resource, ResourceExt};
 use kuberic_runtime::control::proto;
-use kuberic_runtime::protocol::command::{InitializeAgentStore, ProtocolCommand};
+use kuberic_runtime::protocol::command::{
+    InitializeAgentStore, ProtocolCommand, PublicV1OperationCommand,
+};
 use kuberic_runtime::protocol::observation::ReplicaObservationKey;
 use kuberic_runtime::protocol::public_operations::{
-    CanonicalReplicaRebuildRequired, PublicBuildAttemptReference, PublicInboundBuildAuthority,
-    PublicOperationProgram, PublicV1AcceptedStatus, PublicV1AgentReport,
+    CanonicalReplicaRebuildRequired, PublicBuildAttemptReference, PublicConfiguration,
+    PublicInboundBuildAuthority, PublicOperationClass, PublicOperationIntent,
+    PublicOperationProgram, PublicReplicaDescriptor, PublicV1AcceptedStatus, PublicV1AgentReport,
     PublicV1OperationCompletion, PublicV1OperationResult, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
@@ -40,6 +44,7 @@ use crate::crd::{
 use crate::evaluator::public_v1_evidence::{
     PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
 };
+use crate::evaluator::public_v1_topology::PublicV1TopologyReplica;
 use crate::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
 use crate::{ControllerError, Result};
 
@@ -366,6 +371,10 @@ where
         let services = list_or_failure(services_result, "services", &mut failures);
         let secrets = list_or_failure(secrets_result, "secrets", &mut failures);
         let resource_uid = ResourceUid::new(uid);
+        let now_unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| ControllerError::Observation(error.to_string()))?
+            .as_secs() as i64;
         let mut raw = RawObservation {
             set,
             pods,
@@ -374,10 +383,7 @@ where
             secrets,
             failures,
             agents: BTreeMap::new(),
-            now_unix_seconds: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| ControllerError::Observation(error.to_string()))?
-                .as_secs() as i64,
+            now_unix_seconds,
         };
         let agent_requests = raw
             .pods
@@ -390,6 +396,9 @@ where
                     .ok()
                     .filter(|value| *value > 0)
                     .map(ReplicaId::new)?;
+                if !should_observe_replica(&raw.set, raw.now_unix_seconds, replica_id) {
+                    return None;
+                }
                 Some((replica_id, pod.clone()))
             })
             .map(|(replica_id, pod)| {
@@ -752,10 +761,43 @@ where
                 "Execute response omitted its resulting observation".to_string(),
             )
         })?;
-        kuberic_runtime::control::normalize_public_v1_agent_status_report(report)
-            .map(|_| ())
-            .map_err(|error| ControllerError::InvalidAgentEvidence(error.to_string()))
+        validate_execute_observation(command, report)
     }
+}
+
+fn unavailable_primary_after_delay(set: &KubericSet, now_unix_seconds: i64) -> Option<ReplicaId> {
+    let topology = set.status.as_ref()?.public_v1_topology.as_ref()?;
+    let primary = topology.unavailable_primary_id?;
+    let since = topology.unavailable_since_unix_seconds?;
+    let delay = i64::try_from(set.spec.failover_delay_seconds).unwrap_or(i64::MAX);
+    (now_unix_seconds.saturating_sub(since) >= delay).then_some(primary)
+}
+
+fn should_observe_replica(set: &KubericSet, now_unix_seconds: i64, replica_id: ReplicaId) -> bool {
+    unavailable_primary_after_delay(set, now_unix_seconds) != Some(replica_id)
+}
+
+fn validate_execute_observation(
+    command: &ProtocolCommand,
+    report: proto::AgentStatusReport,
+) -> Result<()> {
+    if let ProtocolCommand::InitializeAgentStore(initialization) = command {
+        let report = kuberic_runtime::control::normalize_uninitialized_agent_status_report(report)
+            .map_err(|error| ControllerError::InvalidAgentEvidence(error.to_string()))?;
+        if report.resource_uid != initialization.resource_uid
+            || report.replica_id != initialization.local_replica_id
+            || report.pod_uid != initialization.expected_pod_uid
+            || report.pvc_uid != initialization.expected_pvc_uid
+        {
+            return Err(ControllerError::InvalidAgentEvidence(
+                "InitializeAgentStore response differs from the accepted target".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    kuberic_runtime::control::normalize_public_v1_agent_status_report(report)
+        .map(|_| ())
+        .map_err(|error| ControllerError::InvalidAgentEvidence(error.to_string()))
 }
 
 fn observed_process_session(
@@ -1714,6 +1756,63 @@ where
         Ok(observation)
     }
 
+    async fn observe_public_v1_status_scope(
+        &self,
+        scope: &PublicV1Scope,
+    ) -> std::result::Result<RawObservation, String> {
+        self.require_installation_namespace(&scope.namespace)
+            .map_err(|error| error.to_string())?;
+        let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), &scope.namespace);
+        let set = sets
+            .get(&scope.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        if set.uid().as_deref() != Some(scope.resource_uid.as_str()) {
+            return Err("public-v1 scope no longer identifies the observed resource".into());
+        }
+        validate_public_v1_controller_status(set.status.as_ref())?;
+        Ok(RawObservation {
+            set,
+            pods: Vec::new(),
+            pvcs: Vec::new(),
+            services: Vec::new(),
+            secrets: Vec::new(),
+            agents: BTreeMap::new(),
+            failures: Vec::new(),
+            now_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_secs() as i64,
+        })
+    }
+
+    async fn observe_public_v1_target_scope(
+        &self,
+        scope: &PublicV1Scope,
+        identity: &ReplicaIdentity,
+    ) -> std::result::Result<RawObservation, String> {
+        let mut observation = self.observe_public_v1_status_scope(scope).await?;
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &scope.namespace);
+        let selector = format!(
+            "{SET_UID_LABEL}={},{}={}",
+            scope.resource_uid, REPLICA_ID_LABEL, identity.replica_id
+        );
+        let pod = pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|pod| pod.uid().as_deref() == Some(identity.instance_id.as_str()))
+            .ok_or_else(|| "exact public-v1 operation target Pod is unavailable".to_string())?;
+        let key = ReplicaObservationKey::new(identity.replica_id, identity.instance_id.clone());
+        let report = self
+            .observe_agent(&pod, &scope.resource_uid, identity.replica_id)
+            .await;
+        observation.pods.push(pod);
+        observation.agents.insert(key, report);
+        Ok(observation)
+    }
+
     async fn replace_public_v1_status(
         &self,
         observation: &RawObservation,
@@ -1739,8 +1838,10 @@ where
         scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
     ) -> std::result::Result<(), String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
-        if normalized_transition(&observation)?.as_ref() != Some(expected) {
+        let observation = self.observe_public_v1_status_scope(scope).await?;
+        if !normalized_transition(&observation)?.is_some_and(|current| {
+            current.evidence == expected.evidence && current.intent == expected.intent
+        }) {
             return Err("stale public-v1 transition completion".into());
         }
         let mut status = observation.set.status.clone().unwrap_or_default();
@@ -1864,6 +1965,200 @@ fn renewed_topology_sessions(
         .collect()
 }
 
+fn renewal_topology_replicas(
+    observation: &RawObservation,
+    renewal: &PublicV1SessionRenewalStatus,
+) -> std::result::Result<Vec<PublicV1TopologyReplica>, String> {
+    renewal
+        .required
+        .fresh_configuration
+        .members
+        .iter()
+        .map(|member| {
+            let endpoint = renewal
+                .required
+                .replacement
+                .iter()
+                .chain(renewal.required.surviving_sessions.iter())
+                .find(|endpoint| endpoint.identity == member.identity)
+                .ok_or_else(|| {
+                    "session-renewal configuration lacks an accepted endpoint".to_string()
+                })?;
+            let report = observation
+                .agents
+                .values()
+                .find_map(|agent| match agent {
+                    RawAgentObservation::PublicV1Report(report)
+                        if report.replica == endpoint.identity
+                            && report.storage_incarnation == endpoint.storage_incarnation
+                            && report.process_session_id == endpoint.process_session_id
+                            && report.replicator_creation_id == endpoint.replicator_creation_id =>
+                    {
+                        Some(report.as_ref())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    "session-renewal configuration lacks its exact agent report".to_string()
+                })?;
+            observation
+                .services
+                .iter()
+                .find(|service| {
+                    service.spec.as_ref().is_some_and(|spec| {
+                        spec.selector.as_ref().is_some_and(|selector| {
+                            selector
+                                .get(INSTANCE_LABEL)
+                                .is_some_and(|value| value == member.identity.instance_id.as_str())
+                        }) && spec.ports.as_ref().is_some_and(|ports| {
+                            ports
+                                .iter()
+                                .any(|port| port.name.as_deref() == Some("replication"))
+                        })
+                    })
+                })
+                .ok_or_else(|| {
+                    "session-renewal configuration lacks a replication Service".to_string()
+                })?;
+            let pod_ip = observation
+                .pods
+                .iter()
+                .find(|pod| pod.uid().as_deref() == Some(member.identity.instance_id.as_str()))
+                .and_then(|pod| pod.status.as_ref())
+                .and_then(|status| status.pod_ip.as_deref())
+                .ok_or_else(|| {
+                    "session-renewal configuration lacks a replica Pod address".to_string()
+                })?
+                .parse::<IpAddr>()
+                .map_err(|_| {
+                    "session-renewal configuration has an invalid replica Pod address".to_string()
+                })?;
+            Ok(PublicV1TopologyReplica {
+                report: report.clone(),
+                replication_address: format!(
+                    "http://{}",
+                    SocketAddr::new(pod_ip, REPLICATION_PORT as u16)
+                ),
+            })
+        })
+        .collect()
+}
+
+fn renewal_public_configuration(
+    local: &ReplicaIdentity,
+    replicas: &[PublicV1TopologyReplica],
+    configuration: &ConfigurationDescriptor,
+) -> std::result::Result<PublicConfiguration, String> {
+    let peers = replicas
+        .iter()
+        .filter(|replica| replica.report.replica != *local)
+        .map(|replica| PublicReplicaDescriptor {
+            build_id: OperationId::default(),
+            identity: replica.report.replica.clone(),
+            replication_address: replica.replication_address.clone(),
+            process_session_id: replica.report.process_session_id.clone(),
+            storage_incarnation: Some(replica.report.storage_incarnation.clone()),
+            role: configuration
+                .members
+                .iter()
+                .find(|member| member.identity == replica.report.replica)
+                .map(|member| member.role)
+                .expect("renewal replica is configured"),
+            current_progress: replica.report.progress.last,
+            catch_up_capability: replica.report.progress.first,
+            must_catchup: false,
+        })
+        .collect();
+    let configuration = PublicConfiguration {
+        current: configuration.clone(),
+        previous: None,
+        replicas: peers,
+    };
+    configuration.validate().map_err(str::to_owned)?;
+    Ok(configuration)
+}
+
+fn renewal_configuration_commands(
+    authority: &PublicV1AcceptedStatus,
+    renewal: &PublicV1SessionRenewalStatus,
+    replicas: &[PublicV1TopologyReplica],
+) -> std::result::Result<Vec<ProtocolCommand>, String> {
+    let configuration = &renewal.required.fresh_configuration;
+    let mut members = configuration.members.iter().collect::<Vec<_>>();
+    members.sort_by_key(|member| member.role == ReplicaRole::Primary);
+    let mut commands = Vec::with_capacity(members.len());
+    for member in members {
+        let replica = replicas
+            .iter()
+            .find(|replica| replica.report.replica == member.identity)
+            .ok_or_else(|| {
+                "session-renewal configuration lacks a local replica report".to_string()
+            })?;
+        let next_revision = replica
+            .report
+            .completed_operations
+            .iter()
+            .map(|completion| completion.revision)
+            .chain(
+                authority
+                    .completed_operations
+                    .iter()
+                    .filter(|completion| completion.storage_incarnation.replica == member.identity)
+                    .map(|completion| completion.revision),
+            )
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "session-renewal configuration revision overflow".to_string())?;
+        let program = PublicOperationProgram::Configuration(renewal_public_configuration(
+            &member.identity,
+            replicas,
+            configuration,
+        )?);
+        let operation_id = OperationId::new(format!(
+            "{}-configuration-{}",
+            renewal.required.operation_id, member.identity.replica_id
+        ));
+        let digest = program.digest();
+        let revision = if let Some(completion) =
+            replica
+                .report
+                .completed_operations
+                .iter()
+                .find(|completion| {
+                    completion.operation_id == operation_id
+                        && completion.process_session_id == replica.report.process_session_id
+                        && completion.input_digest == digest
+                        && completion.replay_disposition == program.replay_disposition()
+                        && completion.history == authority.history
+                        && completion.storage_incarnation == replica.report.storage_incarnation
+                        && completion.result == PublicV1OperationResult::Succeeded
+                }) {
+            completion.revision
+        } else {
+            next_revision
+        };
+        let intent = PublicOperationIntent {
+            identity: authority.identity.clone(),
+            operation_id,
+            revision,
+            process_session_id: replica.report.process_session_id.clone(),
+            class: PublicOperationClass::Authority,
+            input_digest: digest,
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
+        };
+        let command = PublicV1OperationCommand {
+            target: member.identity.clone(),
+            intent,
+        };
+        command.validate().map_err(str::to_owned)?;
+        commands.push(ProtocolCommand::PublicV1Operation(Box::new(command)));
+    }
+    Ok(commands)
+}
+
 fn accepted_public_v1_status(
     status: Option<&KubericSetStatus>,
 ) -> std::result::Result<Option<PublicV1AcceptedStatus>, String> {
@@ -1934,7 +2229,7 @@ where
         &self,
         scope: &PublicV1Scope,
     ) -> std::result::Result<Option<PublicV1AcceptedStatus>, String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         accepted_public_v1_status(observation.set.status.as_ref())
     }
 
@@ -1948,7 +2243,7 @@ where
         if next.history.resource_uid != scope.resource_uid {
             return Err("public-v1 history differs from resource scope".into());
         }
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         let mut status = observation.set.status.clone().unwrap_or_default();
         if accepted_public_v1_status(Some(&status))?.as_ref() != expected {
             return Err("stale public-v1 accepted history".into());
@@ -2059,9 +2354,6 @@ where
         if accepted_public_v1_renewal(observation.set.status.as_ref())?.as_ref() != Some(expected) {
             return Err("stale public-v1 session-renewal dispatch".into());
         }
-        self.execute_command(&observation, command)
-            .await
-            .map_err(|error| error.to_string())?;
         let ProtocolCommand::PublicV1History(public_command) = command else {
             return Err("session renewal received another command".into());
         };
@@ -2071,6 +2363,28 @@ where
         else {
             return Err("session renewal received a history command".into());
         };
+        let installs_configuration = matches!(
+            renewal_command.as_ref(),
+            kuberic_runtime::protocol::command::PublicV1SessionRenewalCommand::
+                InstallFreshConfiguration { .. }
+        );
+        if installs_configuration {
+            let authority = accepted_public_v1_status(observation.set.status.as_ref())?
+                .ok_or_else(|| "session renewal lacks accepted public-v1 authority".to_string())?;
+            let replicas = renewal_topology_replicas(&observation, expected)?;
+            for configuration_command in
+                renewal_configuration_commands(&authority, expected, &replicas)?
+            {
+                self.execute_command(&observation, &configuration_command)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        if !installs_configuration {
+            self.execute_command(&observation, command)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let next = match renewal_command.as_ref() {
             kuberic_runtime::protocol::command::PublicV1SessionRenewalCommand::CloseAccessAndIngress {
                 accepted,
@@ -2107,7 +2421,7 @@ where
         &self,
         scope: &PublicV1Scope,
     ) -> std::result::Result<Option<ConfigurationDescriptor>, String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         observation
             .set
             .status
@@ -2152,7 +2466,7 @@ where
         expected: &kuberic_runtime::protocol::types::ConfigurationId,
         unavailable: Option<(ReplicaId, i64)>,
     ) -> std::result::Result<(), String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         let mut status = observation.set.status.clone().unwrap_or_default();
         let topology = status
             .public_v1_topology
@@ -2255,7 +2569,7 @@ where
         {
             return Err("public-v1 operation differs from proposed transition".into());
         }
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         let mut status = observation.set.status.clone().unwrap_or_default();
         if accepted_public_v1_status(Some(&status))?.as_ref() != Some(expected_authority)
             || status.public_v1_transition.is_some()
@@ -2281,11 +2595,30 @@ where
         revoke_inbound_build_authority(self, &observation, expected, command).await
     }
 
+    async fn supersede_public_v1_operation(
+        &self,
+        scope: &PublicV1Scope,
+        expected: &PublicV1AcceptedTransitionStatus,
+        command: &ProtocolCommand,
+    ) -> std::result::Result<(), String> {
+        let observation = self.observe_public_v1_scope(scope).await?;
+        if !normalized_transition(&observation)?.is_some_and(|current| {
+            current.evidence == expected.evidence && current.intent == expected.intent
+        }) {
+            return Err("stale public-v1 operation supersession".into());
+        }
+        revoke_inbound_build_authority(self, &observation, expected, command).await?;
+        let mut status = observation.set.status.clone().unwrap_or_default();
+        status.public_v1_transition = None;
+        status.public_v1_operation = None;
+        self.replace_public_v1_status(&observation, status).await
+    }
+
     async fn observe_public_v1_operation(
         &self,
         scope: &PublicV1Scope,
     ) -> std::result::Result<Option<PublicV1AcceptedTransitionStatus>, String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         normalized_transition(&observation)
     }
 
@@ -2295,7 +2628,21 @@ where
         expected: &PublicV1AcceptedTransitionStatus,
         command: &ProtocolCommand,
     ) -> std::result::Result<(), String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let operation = match command {
+            ProtocolCommand::PublicV1Operation(operation) => Some(operation.as_ref()),
+            _ => None,
+        };
+        let observation = if operation.is_some_and(|operation| {
+            matches!(
+                operation.intent.program,
+                Some(PublicOperationProgram::Build(_))
+            )
+        }) {
+            self.observe_public_v1_scope(scope).await?
+        } else {
+            let (target, _) = command_target(command);
+            self.observe_public_v1_target_scope(scope, &target).await?
+        };
         if normalized_transition(&observation)?.as_ref() != Some(expected) {
             return Err("stale public-v1 operation dispatch".into());
         }
@@ -2325,21 +2672,14 @@ where
         scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
     ) -> std::result::Result<PublicV1AgentReport, String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let identity = &expected.intent.source.storage_incarnation.replica;
+        let observation = self.observe_public_v1_target_scope(scope, identity).await?;
         if normalized_transition(&observation)?.as_ref() != Some(expected) {
             return Err("stale public-v1 operation report authority".into());
         }
-        let identity = &expected.intent.source.storage_incarnation.replica;
         let key = ReplicaObservationKey::new(identity.replica_id, identity.instance_id.clone());
         match observation.agents.get(&key) {
-            Some(RawAgentObservation::PublicV1Report(report))
-                if report.replica == *identity
-                    && (report.process_session_id == expected.intent.process_session_id
-                        || report
-                            .completed_operations
-                            .iter()
-                            .any(|completion| expected.intent.matches(completion))) =>
-            {
+            Some(RawAgentObservation::PublicV1Report(report)) if report.replica == *identity => {
                 Ok((**report).clone())
             }
             _ => Err("exact public-v1 operation report is unavailable".into()),
@@ -2368,7 +2708,7 @@ where
         if !next.is_evidence_successor_of(&expected.evidence) {
             return Err("public-v1 evidence persistence is not monotonic".into());
         }
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         if normalized_transition(&observation)?.as_ref() != Some(expected) {
             return Err("stale public-v1 evidence persistence".into());
         }
@@ -2400,7 +2740,7 @@ where
         if completion.result != PublicV1OperationResult::Succeeded {
             return Err("public-v1 acceptance requires successful completion".into());
         }
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_status_scope(scope).await?;
         if let Some(operation) = observation
             .set
             .status
@@ -2424,8 +2764,11 @@ where
                 }
             }
             let authority = inbound_build_authority(expected, &operation, build)?;
+            let target_observation = self
+                .observe_public_v1_target_scope(scope, &build.replica)
+                .await?;
             self.execute_command(
-                &observation,
+                &target_observation,
                 &ProtocolCommand::PublicV1History(Box::new(
                     kuberic_runtime::protocol::command::PublicV1HistoryCommand::
                         RevokeInboundBuildAuthority {
@@ -3420,11 +3763,15 @@ impl ClusterApi for InMemoryClusterApi {
                                 epoch,
                                 role,
                             } => {
-                                report.role = *role;
-                                report.progress.role = match role {
+                                report.role = if *role == ReplicaRole::IdleSecondary {
+                                    ReplicaRole::None
+                                } else {
+                                    *role
+                                };
+                                report.progress.role = match report.role {
                                     ReplicaRole::Primary => kuberic_runtime::protocol::public_operations::PublicProgressRole::Primary,
-                                    ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary => kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary,
-                                    ReplicaRole::None => kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery,
+                                    ReplicaRole::ActiveSecondary => kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary,
+                                    ReplicaRole::IdleSecondary | ReplicaRole::None => kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery,
                                 };
                                 report.read_status =
                                     kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
@@ -3433,7 +3780,11 @@ impl ClusterApi for InMemoryClusterApi {
                                 report.service_location = None;
                                 let _ = epoch;
                             }
-                            kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(configuration) => {
+                            kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(configuration)
+                            | kuberic_runtime::protocol::public_operations::PublicOperationProgram::CatchUp {
+                                configuration,
+                                ..
+                            } => {
                                 if report.role == ReplicaRole::Primary {
                                     report.read_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
                                     report.write_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
@@ -4153,6 +4504,27 @@ impl PublicV1OperationApi for InMemoryClusterApi {
             .map_err(|error| error.to_string())
     }
 
+    async fn supersede_public_v1_operation(
+        &self,
+        scope: &PublicV1Scope,
+        expected: &PublicV1AcceptedTransitionStatus,
+        _command: &ProtocolCommand,
+    ) -> std::result::Result<(), String> {
+        let mut state = self.state.lock().await;
+        validate_in_memory_public_v1_scope(&state.observation, scope)?;
+        if !normalized_transition(&state.observation)?.is_some_and(|current| {
+            current.evidence == expected.evidence && current.intent == expected.intent
+        }) {
+            return Err("stale in-memory public-v1 operation supersession".into());
+        }
+        let status = state.observation.set.status.get_or_insert_default();
+        status.public_v1_transition = None;
+        status.public_v1_operation = None;
+        advance_in_memory_resource_version(&mut state);
+        state.effects.push(EffectRecord::ReplaceStatus);
+        Ok(())
+    }
+
     async fn observe_public_v1_operation_report(
         &self,
         scope: &PublicV1Scope,
@@ -4320,6 +4692,302 @@ pub use public_v1_evidence::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuberic_runtime::protocol::public_operations::{
+        ProcessSessionRenewalRequired, PublicProgress, PublicProgressRole,
+        PublicSessionEpochBarrierStage, PublicV1Extensions, PublicV1Identity,
+        PublicV1SessionRenewalStatus,
+    };
+    use kuberic_runtime::protocol::types::{
+        AccessStatus, AgentGeneration, ConfigurationId, ConfigurationMember, Epoch,
+        ProcessSessionId, ProcessSessionRenewalReason, PublicProtocolGeneration,
+        ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId,
+        StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
+    };
+
+    fn renewal_endpoint(id: i64, session: &str, role: ReplicaRole) -> ProcessSessionEndpoint {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{id}")),
+        };
+        ProcessSessionEndpoint {
+            storage_incarnation: ReplicaStorageIncarnationContext {
+                replica: identity.clone(),
+                storage: ReplicaStorageIdentity::Persistent {
+                    pod_uid: PodUid::new(format!("pod-{id}")),
+                    pvc_uid: PvcUid::new(format!("pvc-{id}")),
+                },
+                storage_generation: StorageGeneration::new(format!("storage-{id}")),
+            },
+            identity,
+            process_session_id: ProcessSessionId::new(session),
+            replicator_creation_id: ReplicatorCreationId::new(format!("creation-{session}")),
+            role,
+        }
+    }
+
+    fn renewal_replica(
+        identity: PublicV1Identity,
+        history: &kuberic_runtime::protocol::types::HistoryContext,
+        endpoint: &ProcessSessionEndpoint,
+        report_role: ReplicaRole,
+    ) -> PublicV1TopologyReplica {
+        PublicV1TopologyReplica {
+            report: PublicV1AgentReport {
+                identity,
+                resource_uid: history.resource_uid.clone(),
+                replica: endpoint.identity.clone(),
+                process_session_id: endpoint.process_session_id.clone(),
+                replicator_creation_id: endpoint.replicator_creation_id.clone(),
+                report_sequence: 1,
+                role: report_role,
+                read_status: AccessStatus::NotPrimary,
+                write_status: AccessStatus::NotPrimary,
+                history: history.clone(),
+                storage_incarnation: endpoint.storage_incarnation.clone(),
+                progress: PublicProgress {
+                    role: PublicProgressRole::Recovery,
+                    first: 0,
+                    last: 0,
+                },
+                service_location: None,
+                data_loss_recovery: None,
+                completed_operations: Vec::new(),
+                extensions: PublicV1Extensions::default(),
+            },
+            replication_address: format!("http://10.0.0.{}:50052", endpoint.identity.replica_id),
+        }
+    }
+
+    #[test]
+    fn unavailable_primary_is_observed_until_failover_delay_elapses() {
+        let mut set = KubericSet::new(
+            "sample",
+            crate::crd::KubericSetSpec {
+                replicas: 3,
+                image: "example".into(),
+                failover_delay_seconds: 10,
+                switchover: None,
+            },
+        );
+        set.status = Some(KubericSetStatus {
+            public_v1_topology: Some(PublicV1TopologyState {
+                configuration_id: ConfigurationId::new("configuration"),
+                epoch: Epoch::new(0, 1),
+                primary_id: ReplicaId::new(1),
+                member_count: 3,
+                sessions: Vec::new(),
+                unavailable_primary_id: Some(ReplicaId::new(1)),
+                unavailable_since_unix_seconds: Some(100),
+                canonical_configuration_json: "{}".into(),
+            }),
+            ..Default::default()
+        });
+
+        assert!(should_observe_replica(&set, 109, ReplicaId::new(1)));
+        assert!(!should_observe_replica(&set, 110, ReplicaId::new(1)));
+        assert!(should_observe_replica(&set, 110, ReplicaId::new(2)));
+        assert!(should_observe_replica(&set, 110, ReplicaId::new(3)));
+    }
+
+    #[test]
+    fn renewal_configuration_uses_exact_sessions_and_configures_primary_last() {
+        let resource_uid = ResourceUid::new("resource-renewal-configuration");
+        let generation = PublicProtocolGeneration::new(1);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        let primary = renewal_endpoint(1, "primary", ReplicaRole::Primary);
+        let predecessor = renewal_endpoint(2, "secondary-old", ReplicaRole::ActiveSecondary);
+        let mut replacement = predecessor.clone();
+        replacement.process_session_id = ProcessSessionId::new("secondary-new");
+        replacement.replicator_creation_id = ReplicatorCreationId::new("creation-secondary-new");
+        replacement.role = ReplicaRole::None;
+        let secondary = renewal_endpoint(3, "secondary-3", ReplicaRole::ActiveSecondary);
+        let epoch = Epoch::new(0, 2);
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            primary.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: primary.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: replacement.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: secondary.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        let required = ProcessSessionRenewalRequired {
+            operation_id: OperationId::new("renewal-configuration"),
+            reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
+            resource_uid,
+            history: history.clone(),
+            previous_epoch: Epoch::new(0, 1),
+            renewal_epoch: epoch,
+            predecessor,
+            replacement: Some(replacement.clone()),
+            surviving_sessions: vec![primary.clone(), secondary.clone()],
+            fresh_configuration: configuration,
+            predecessor_contained: true,
+            data_loss: None,
+        };
+        let barriers = PublicV1SessionRenewalStatus::required(required)
+            .unwrap()
+            .close_access()
+            .unwrap()
+            .freeze_surviving_set()
+            .unwrap()
+            .begin_epoch_barriers()
+            .unwrap();
+        assert!(
+            barriers
+                .barriers
+                .iter()
+                .all(|barrier| { barrier.stage == PublicSessionEpochBarrierStage::Pending })
+        );
+        let barriers = barriers
+            .record_epoch_updated(&primary, epoch)
+            .unwrap()
+            .record_epoch_updated(&secondary, epoch)
+            .unwrap();
+        let renewal = barriers
+            .finish_epoch_barriers()
+            .unwrap()
+            .replay_replacement_role(
+                &replacement.process_session_id,
+                epoch,
+                ReplicaRole::ActiveSecondary,
+            )
+            .unwrap();
+        let authority = PublicV1AcceptedStatus {
+            identity: PublicV1Identity::new(generation.value()),
+            history_initialization_id: initialization,
+            history: history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: PublicV1Extensions::default(),
+        };
+        let replicas = vec![
+            renewal_replica(
+                authority.identity.clone(),
+                &history,
+                &primary,
+                ReplicaRole::Primary,
+            ),
+            renewal_replica(
+                authority.identity.clone(),
+                &history,
+                &replacement,
+                ReplicaRole::None,
+            ),
+            renewal_replica(
+                authority.identity.clone(),
+                &history,
+                &secondary,
+                ReplicaRole::ActiveSecondary,
+            ),
+        ];
+
+        let commands = renewal_configuration_commands(&authority, &renewal, &replicas).unwrap();
+
+        let targets = commands
+            .iter()
+            .map(|command| match command {
+                ProtocolCommand::PublicV1Operation(operation) => operation.target.replica_id,
+                _ => panic!("expected configuration operation"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            vec![
+                replacement.identity.replica_id,
+                secondary.identity.replica_id,
+                primary.identity.replica_id,
+            ]
+        );
+        for command in commands {
+            let ProtocolCommand::PublicV1Operation(operation) = command else {
+                panic!("expected configuration operation");
+            };
+            let Some(PublicOperationProgram::Configuration(configuration)) =
+                operation.intent.program.as_ref()
+            else {
+                panic!("expected configuration operation");
+            };
+            assert_eq!(configuration.replicas.len(), 2);
+            assert!(configuration.replicas.iter().all(|replica| {
+                replicas.iter().any(|expected| {
+                    expected.report.replica == replica.identity
+                        && expected.report.process_session_id == replica.process_session_id
+                        && expected.replication_address == replica.replication_address
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn initialization_execute_accepts_only_the_exact_fresh_observation() {
+        let resource_uid = ResourceUid::new("resource-init-response");
+        let replica_id = ReplicaId::new(2);
+        let pod_uid = PodUid::new("pod-init-response");
+        let pvc_uid = PvcUid::new("pvc-init-response");
+        let initialization_id =
+            derive_initialization_id(&resource_uid, replica_id, &pod_uid, &pvc_uid);
+        let identity = ReplicaIdentity {
+            replica_id,
+            instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+            agent_generation: derive_agent_generation(&initialization_id),
+        };
+        let command = ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {
+            initialization_id,
+            resource_uid: resource_uid.clone(),
+            local_replica_id: replica_id,
+            expected_instance_id: identity.instance_id,
+            expected_pod_uid: pod_uid.clone(),
+            expected_pvc_uid: pvc_uid.clone(),
+            assigned_agent_generation: identity.agent_generation,
+            effective_policy: EffectivePolicy::fixed(3, 30).unwrap(),
+            bootstrap_configuration: ConfigurationDescriptor::new(
+                Epoch::new(0, 1),
+                ReplicaId::new(1),
+                vec![ConfigurationMember {
+                    identity: ReplicaIdentity {
+                        replica_id: ReplicaId::new(1),
+                        instance_id: ReplicaInstanceId::new("primary-pod"),
+                        agent_generation: kuberic_runtime::protocol::types::AgentGeneration::new(
+                            "primary-generation",
+                        ),
+                    },
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            provisioning: None,
+        }));
+        let exact = proto::AgentStatusReport {
+            protocol_version:
+                kuberic_runtime::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
+            resource_uid: resource_uid.to_string(),
+            process_session_id: "fresh-process".into(),
+            storage_state: proto::AgentStorageState::Uninitialized as i32,
+            pod_uid: pod_uid.to_string(),
+            pvc_uid: pvc_uid.to_string(),
+            healthy: true,
+            replica_id: replica_id.value(),
+            ..Default::default()
+        };
+        validate_execute_observation(&command, exact.clone()).unwrap();
+
+        let mut wrong = exact;
+        wrong.pvc_uid = "other-pvc".into();
+        assert!(validate_execute_observation(&command, wrong).is_err());
+    }
 
     #[test]
     fn production_kubernetes_api_requires_one_exact_namespace() {

@@ -97,6 +97,17 @@ struct ReplacementProcessHandle {
 impl ReplicaHandle {
     pub async fn diagnostics(&self) -> Result<ReplicaDiagnostics> {
         let state = self.store.load_state().await?;
+        let blocking = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| {
+                let operation_id = preview.current_operation.as_ref()?;
+                let record = preview.operations.get(operation_id)?;
+                Some(format!(
+                    "{:?}/{:?}",
+                    record.stage, record.lifecycle.in_flight
+                ))
+            });
         let (
             _open,
             _replication_address,
@@ -144,7 +155,7 @@ impl ReplicaHandle {
                 .public_v1_operation_state
                 .as_ref()
                 .and_then(|preview| preview.current_operation.as_ref().map(ToString::to_string)),
-            blocking: None,
+            blocking,
             builds: Vec::new(),
         })
     }

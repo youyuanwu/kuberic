@@ -389,6 +389,103 @@ pub(crate) struct AgentService<S> {
         Arc<Mutex<Option<crate::host::operation_recovery::PartitionOperationRuntime>>>,
 }
 
+pub(crate) async fn align_session_renewal(
+    store: &dyn crate::host::store::AgentStore,
+    mut current: crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    accepted: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+) -> Result<crate::protocol::public_operations::PublicV1SessionRenewalStatus> {
+    use crate::protocol::public_operations::{
+        PublicSessionEpochBarrierStage, PublicSessionRenewalStage,
+    };
+
+    if current.required != accepted.required {
+        return Err(crate::host::HostError::StaleEffectCompletion(
+            "Public V1 session renewal changed required authority".into(),
+        ));
+    }
+    for _ in 0..32 {
+        if &current == accepted {
+            return Ok(current);
+        }
+        let next = match current.stage {
+            PublicSessionRenewalStage::Required => current.close_access(),
+            PublicSessionRenewalStage::AccessClosed => current.freeze_surviving_set(),
+            PublicSessionRenewalStage::SurvivingSetFrozen => current.begin_epoch_barriers(),
+            PublicSessionRenewalStage::EpochBarriersPending => {
+                if let Some(barrier) = current.barriers.iter().find(|barrier| {
+                    barrier.stage == PublicSessionEpochBarrierStage::Pending
+                        && accepted
+                            .barriers
+                            .iter()
+                            .find(|accepted| accepted.survivor == barrier.survivor)
+                            .is_some_and(|accepted| {
+                                accepted.stage != PublicSessionEpochBarrierStage::Pending
+                            })
+                }) {
+                    let accepted_barrier = accepted
+                        .barriers
+                        .iter()
+                        .find(|accepted| accepted.survivor == barrier.survivor)
+                        .expect("selected accepted barrier");
+                    match accepted_barrier.stage {
+                        PublicSessionEpochBarrierStage::Updated => current.record_epoch_updated(
+                            &barrier.survivor,
+                            current.required.renewal_epoch,
+                        ),
+                        PublicSessionEpochBarrierStage::Excluded => current.exclude_survivor(
+                            &barrier.survivor,
+                            accepted_barrier
+                                .retirement_operation_id
+                                .clone()
+                                .expect("validated excluded barrier"),
+                        ),
+                        PublicSessionEpochBarrierStage::Pending => unreachable!(),
+                    }
+                } else {
+                    current.finish_epoch_barriers()
+                }
+            }
+            PublicSessionRenewalStage::ReplacementRolePending => {
+                let replacement = current
+                    .required
+                    .replacement
+                    .as_ref()
+                    .expect("validated replacement stage");
+                current.replay_replacement_role(
+                    &replacement.process_session_id,
+                    current.required.renewal_epoch,
+                    current.required.predecessor.role,
+                )
+            }
+            PublicSessionRenewalStage::ConfigurationPending => {
+                current.install_fresh_configuration(&current.required.fresh_configuration)
+            }
+            PublicSessionRenewalStage::Authorized | PublicSessionRenewalStage::Retired => {
+                return Err(crate::host::HostError::StaleEffectCompletion(
+                    "Public V1 session renewal regressed accepted state".into(),
+                ));
+            }
+        }
+        .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        store
+            .persist_public_v1_session_renewal(Some(&current), &next)
+            .await?;
+        current = next;
+    }
+    Err(crate::host::HostError::CommandRejected(
+        "Public V1 session renewal exceeded bounded local replay".into(),
+    ))
+}
+
+async fn replay_role_at_epoch(
+    replicator: &dyn crate::replicator::Replicator,
+    epoch: crate::protocol::types::Epoch,
+    role: crate::protocol::types::ReplicaRole,
+) -> crate::Result<()> {
+    replicator.update_epoch(epoch).await?;
+    replicator.change_role(epoch, role).await
+}
+
 impl<S> Clone for AgentService<S> {
     fn clone(&self) -> Self {
         Self {
@@ -573,6 +670,9 @@ where
                 terminal.disposition
             )));
         }
+        registry
+            .release_session_renewal_fence(&operation.intent())
+            .await?;
         if open_program {
             self.runtime.complete_replacement_open().await;
             if self
@@ -664,26 +764,23 @@ where
             .public_v1_operation_state
             .and_then(|preview| preview.session_renewal);
         let current = match current {
-            Some(current) => current,
-            None if accepted.stage
-                == crate::protocol::public_operations::PublicSessionRenewalStage::Required =>
+            Some(current)
+                if crate::host::session_renewal_supersedes_local_journal(accepted, &current) =>
             {
+                self.store
+                    .persist_public_v1_session_renewal(Some(&current), accepted)
+                    .await?;
+                accepted.clone()
+            }
+            Some(current) => align_session_renewal(self.store.as_ref(), current, accepted).await?,
+            None => {
                 self.store
                     .persist_public_v1_session_renewal(None, accepted)
                     .await?;
                 accepted.clone()
             }
-            None => {
-                return Err(crate::host::HostError::CommandRejected(
-                    "Public V1 session renewal is not durable".into(),
-                ));
-            }
         };
-        if &current != accepted {
-            return Err(crate::host::HostError::StaleEffectCompletion(
-                "Public V1 session renewal command changed accepted state".into(),
-            ));
-        }
+        debug_assert_eq!(&current, accepted);
         let callbacks = self.runtime.public_lifecycle_callbacks()?;
         let next = match &command {
             PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. } => {
@@ -697,7 +794,8 @@ where
                 survivor, epoch, ..
             } => {
                 if survivor.identity == self.store.load_state().await?.identity.local_identity {
-                    callbacks.replicator.update_epoch(*epoch).await?;
+                    replay_role_at_epoch(callbacks.replicator.as_ref(), *epoch, survivor.role)
+                        .await?;
                 }
                 accepted.record_epoch_updated(survivor, *epoch)
             }
@@ -707,14 +805,10 @@ where
                 role,
                 ..
             } => {
-                callbacks.replicator.change_role(*epoch, *role).await?;
+                replay_role_at_epoch(callbacks.replicator.as_ref(), *epoch, *role).await?;
                 accepted.replay_replacement_role(process_session_id, *epoch, *role)
             }
             PublicV1SessionRenewalCommand::InstallFreshConfiguration { configuration, .. } => {
-                callbacks
-                    .primary
-                    .update_current_replica_set_configuration(configuration.clone().into())
-                    .await?;
                 accepted.install_fresh_configuration(configuration)
             }
         }
@@ -913,6 +1007,8 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
     use crate::application::{OpenContext, RoleChange, StatefulServiceReplica};
     use crate::protocol::command::{
         InitializeAgentStore, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
@@ -929,6 +1025,47 @@ mod tests {
         derive_agent_generation, derive_initialization_id,
     };
     use crate::replicator::Replicator;
+
+    #[derive(Default)]
+    struct RenewalReplicator {
+        calls: StdMutex<Vec<(&'static str, Epoch, Option<ReplicaRole>)>>,
+        updated_epoch: StdMutex<Option<Epoch>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Replicator for RenewalReplicator {
+        async fn open(&self) -> crate::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> crate::Result<()> {
+            if *self.updated_epoch.lock().unwrap() != Some(epoch) {
+                return Err(crate::RuntimeError::ReconfigurationPending);
+            }
+            self.calls.lock().unwrap().push(("role", epoch, Some(role)));
+            Ok(())
+        }
+
+        async fn update_epoch(&self, epoch: Epoch) -> crate::Result<()> {
+            *self.updated_epoch.lock().unwrap() = Some(epoch);
+            self.calls.lock().unwrap().push(("epoch", epoch, None));
+            Ok(())
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn abort(&self) {}
+
+        async fn current_progress(&self) -> crate::Result<i64> {
+            Ok(0)
+        }
+
+        async fn catch_up_capability(&self) -> crate::Result<i64> {
+            Ok(0)
+        }
+    }
 
     struct RenewalApplication;
 
@@ -950,6 +1087,24 @@ mod tests {
         }
 
         fn abort(&self) {}
+    }
+
+    #[tokio::test]
+    async fn role_replay_updates_epoch_before_role() {
+        let replicator = RenewalReplicator::default();
+        let epoch = Epoch::new(0, 2);
+
+        replay_role_at_epoch(&replicator, epoch, ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *replicator.calls.lock().unwrap(),
+            vec![
+                ("epoch", epoch, None),
+                ("role", epoch, Some(ReplicaRole::ActiveSecondary)),
+            ]
+        );
     }
 
     #[tokio::test]

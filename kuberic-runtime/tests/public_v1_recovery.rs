@@ -2764,7 +2764,7 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
             }],
             1,
         );
-        client
+        let initialization_response = client
             .execute(authorized(proto::ExecuteCommandRequest {
                 protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                 resource_uid: resource_uid.to_string(),
@@ -2793,9 +2793,35 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
                 ),
             }))
             .await
-            .unwrap();
+            .unwrap()
+            .into_inner();
+        kuberic_runtime::control::normalize_uninitialized_agent_status_report(
+            initialization_response
+                .observation
+                .expect("initialization response observation"),
+        )
+        .unwrap();
         drop(client);
         let mut running = host.await.unwrap().unwrap();
+        let mut established = proto::agent_control_client::AgentControlClient::connect(format!(
+            "http://{control_address}"
+        ))
+        .await
+        .unwrap();
+        let report = established
+            .get_status(authorized(proto::GetAgentStatusRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: resource_uid.to_string(),
+                replica_id: 1,
+                expected_instance_id: "fresh-pod".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let report =
+            kuberic_runtime::control::normalize_public_v1_agent_status_report(report).unwrap();
+        assert_eq!(report.replica, identity);
+        assert_eq!(report.role, ReplicaRole::None);
         let database = SqliteStore::metadata_database_path(&root);
         let connection = rusqlite::Connection::open(&database).unwrap();
         let schema: u32 = connection
@@ -5193,6 +5219,8 @@ async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_
             "stale or exact admission reset B into a provider progress mutation"
         );
         source_state.block_copy();
+        let terminal_authority =
+            build_authority("preview-build-attempt", 4, "preview-build-attempt");
         let build_program = PublicOperationProgram::Build(build_input.clone());
         let build_intent = intent(
             &preview,
@@ -5383,6 +5411,14 @@ async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_
         );
         source_state.release_copy.notify_waiters();
         build.await.unwrap().unwrap();
+        target_handle
+            .revoke_public_v1_inbound_build_authority(&terminal_authority)
+            .await
+            .unwrap();
+        target_handle
+            .revoke_public_v1_inbound_build_authority(&terminal_authority)
+            .await
+            .unwrap();
         let build_report = build_adapter.report(&source_identity).await.unwrap();
         assert_eq!(
             reconcile_public_v1_consumer(build_adapter.as_ref(), &test_scope(&resource_uid), &build_report)

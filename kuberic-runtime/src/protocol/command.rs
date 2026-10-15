@@ -211,6 +211,25 @@ pub enum PublicV1SessionRenewalCommand {
 }
 
 impl PublicV1SessionRenewalCommand {
+    fn configuration_journal_endpoint<'a>(
+        accepted: &'a PublicV1SessionRenewalStatus,
+        configuration: &ConfigurationDescriptor,
+    ) -> &'a crate::protocol::types::ProcessSessionEndpoint {
+        accepted.required.replacement.as_ref().unwrap_or_else(|| {
+            let primary = configuration
+                .members
+                .iter()
+                .find(|member| member.identity.replica_id == configuration.primary_id)
+                .expect("validated fresh configuration primary");
+            accepted
+                .required
+                .surviving_sessions
+                .iter()
+                .find(|endpoint| endpoint.identity == primary.identity)
+                .expect("validated fresh configuration primary endpoint")
+        })
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         self.accepted().validate()?;
         match self {
@@ -287,16 +306,9 @@ impl PublicV1SessionRenewalCommand {
             }
 
             Self::InstallFreshConfiguration {
-                accepted: _,
+                accepted,
                 configuration,
-            } => {
-                &configuration
-                    .members
-                    .iter()
-                    .find(|member| member.identity.replica_id == configuration.primary_id)
-                    .expect("validated fresh configuration primary")
-                    .identity
-            }
+            } => &Self::configuration_journal_endpoint(accepted, configuration).identity,
         }
     }
 
@@ -316,20 +328,7 @@ impl PublicV1SessionRenewalCommand {
             Self::InstallFreshConfiguration {
                 accepted,
                 configuration,
-            } => {
-                let primary = configuration
-                    .members
-                    .iter()
-                    .find(|member| member.identity.replica_id == configuration.primary_id)
-                    .expect("validated fresh configuration primary");
-                accepted
-                    .required
-                    .replacement
-                    .iter()
-                    .chain(accepted.required.surviving_sessions.iter())
-                    .find(|endpoint| endpoint.identity == primary.identity)
-                    .expect("validated fresh configuration endpoint")
-            }
+            } => Self::configuration_journal_endpoint(accepted, configuration),
         }
     }
 }

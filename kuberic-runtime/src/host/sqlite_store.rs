@@ -572,7 +572,9 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
-                crate::host::HostError::CommandRejected("Public V1 replacement store required".into())
+                crate::host::HostError::CommandRejected(
+                    "Public V1 replacement store required".into(),
+                )
             })?;
             if !preview.identity.is_public_v1()
                 || preview.history.as_ref() != Some(&next.required.history)
@@ -610,17 +612,15 @@ impl AgentStore for SqliteStore {
                     if current == next {
                         return Ok(());
                     }
-                    if !next.is_successor_of(current) {
+                    if !next.is_successor_of(current)
+                        && !crate::host::session_renewal_supersedes_local_journal(next, current)
+                    {
                         return Err(crate::host::HostError::StaleEffectCompletion(
                             "public-v1 session renewal transition is out of order".into(),
                         ));
                     }
                 }
-                (None, None)
-                    if next.stage
-                        == crate::protocol::public_operations::PublicSessionRenewalStage::Required =>
-                {
-                }
+                (None, None) => {}
                 _ => {
                     return Err(crate::host::HostError::DurableEffectConflict(
                         "public-v1 session renewal changed accepted state".into(),

@@ -545,14 +545,16 @@ async fn public_v1_session_renewal_requires_higher_epoch() {
         )
         .await
         .unwrap();
+    let install = PublicV1SessionRenewalCommand::InstallFreshConfiguration {
+        accepted: configuration_pending,
+        configuration: required.fresh_configuration.clone(),
+    };
+    assert_eq!(
+        install.expected_endpoint(),
+        required.replacement.as_ref().unwrap()
+    );
     let authorized = store
-        .apply_public_v1_session_renewal_command(
-            &PublicV1SessionRenewalCommand::InstallFreshConfiguration {
-                accepted: configuration_pending,
-                configuration: required.fresh_configuration.clone(),
-            },
-            &executor,
-        )
+        .apply_public_v1_session_renewal_command(&install, &executor)
         .await
         .unwrap();
     assert_eq!(authorized.stage, PublicSessionRenewalStage::Authorized);
@@ -627,6 +629,110 @@ fn ordinary_replacement_report_validates_and_round_trips_without_data_loss_autho
             kuberic_runtime::control::public_v1_agent_status_to_proto(&data_loss_observation),
         )
         .is_err()
+    );
+}
+
+#[tokio::test]
+async fn public_v1_session_renewal_seeds_survivor_and_supersedes_stale_journal() {
+    let required = ordinary_required(Epoch::new(0, 10), Epoch::new(0, 11));
+    let survivor = required.surviving_sessions[0].clone();
+    let root = test_root("seed-survivor-at-accepted-stage");
+    let path = SqliteStore::metadata_database_path(&root);
+    let preview = PublicV1Identity::new(42);
+    let store = SqliteStore::create_public_v1(
+        &path,
+        preview,
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: required.resource_uid.clone(),
+            pod_uid: PodUid::new("pod-2"),
+            pvc_uid: PvcUid::new("pvc-2"),
+            initialization_id: InitializationId::new("survivor-initialization"),
+            local_identity: survivor.identity.clone(),
+            effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
+        },
+    )
+    .unwrap();
+    let initialization = derive_history_initialization_id(
+        &required.resource_uid,
+        required.history.protocol_generation,
+    );
+    store
+        .initialize_public_v1_history(
+            &initialization,
+            &required.history,
+            &survivor.storage_incarnation,
+        )
+        .await
+        .unwrap();
+    let accepted = PublicV1SessionRenewalStatus::required(required)
+        .unwrap()
+        .close_access()
+        .unwrap()
+        .freeze_surviving_set()
+        .unwrap()
+        .begin_epoch_barriers()
+        .unwrap();
+
+    store
+        .persist_public_v1_session_renewal(None, &accepted)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .public_v1_history_snapshot()
+            .await
+            .unwrap()
+            .session_renewal,
+        Some(accepted)
+    );
+
+    let mut newer_required = ordinary_required(Epoch::new(0, 11), Epoch::new(0, 12));
+    newer_required.operation_id = OperationId::new("renew-primary-again");
+    let previous_replacement = newer_required.replacement.take().unwrap();
+    newer_required.predecessor = ProcessSessionEndpoint {
+        role: ReplicaRole::Primary,
+        ..previous_replacement.clone()
+    };
+    newer_required.replacement = Some(ProcessSessionEndpoint {
+        process_session_id: ProcessSessionId::new("session-newer"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-newer"),
+        role: ReplicaRole::None,
+        ..previous_replacement
+    });
+    newer_required.fresh_configuration = configuration(
+        newer_required.renewal_epoch,
+        &newer_required.predecessor,
+        &newer_required.surviving_sessions,
+    );
+    let newer = PublicV1SessionRenewalStatus::required(newer_required)
+        .unwrap()
+        .close_access()
+        .unwrap()
+        .freeze_surviving_set()
+        .unwrap()
+        .begin_epoch_barriers()
+        .unwrap();
+    let current = store
+        .public_v1_history_snapshot()
+        .await
+        .unwrap()
+        .session_renewal
+        .unwrap();
+
+    store
+        .persist_public_v1_session_renewal(Some(&current), &newer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .public_v1_history_snapshot()
+            .await
+            .unwrap()
+            .session_renewal,
+        Some(newer)
     );
 }
 

@@ -104,6 +104,15 @@ pub trait PublicV1OperationApi: Send + Sync {
         Ok(())
     }
 
+    async fn supersede_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &PublicV1AcceptedTransitionStatus,
+        _command: &kuberic_runtime::protocol::command::ProtocolCommand,
+    ) -> Result<(), String> {
+        Err("public-v1 operation supersession is unsupported".into())
+    }
+
     async fn observe_public_v1_operation(
         &self,
         scope: &PublicV1Scope,

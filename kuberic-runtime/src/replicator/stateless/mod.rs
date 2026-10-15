@@ -162,6 +162,16 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
             .replacement_inbound_build_authority(&authority.attempt.build_id)
             .await?;
         if current.as_ref() != Some(authority) {
+            let terminal = self
+                .context
+                .replacement_terminal_inbound_build_receipt(&authority.attempt.build_id)
+                .await?;
+            if terminal
+                .as_ref()
+                .is_some_and(|receipt| receipt.authority == *authority)
+            {
+                return Ok(());
+            }
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         self.revoke_generation();
@@ -599,15 +609,25 @@ impl StatelessReplicator {
         if self.abandoned_applied_floor.load(Ordering::Acquire) > 0 {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let authority = state
-            .authority
-            .clone()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        if state.role_epoch != Some(authority.epoch)
-            || state.updated_epoch != Some(authority.epoch)
-            || authority.current.primary_id != self.identity.replica_id
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
+        let authority = state.authority.clone().ok_or_else(|| {
+            RuntimeError::AuthorityMismatch("no static configuration authority is admitted".into())
+        })?;
+        if state.role_epoch != Some(authority.epoch) {
+            return Err(RuntimeError::AuthorityMismatch(format!(
+                "primary role epoch {:?} differs from admitted epoch {:?}",
+                state.role_epoch, authority.epoch
+            )));
+        }
+        if state.updated_epoch != Some(authority.epoch) {
+            return Err(RuntimeError::AuthorityMismatch(format!(
+                "updated epoch {:?} differs from admitted epoch {:?}",
+                state.updated_epoch, authority.epoch
+            )));
+        }
+        if authority.current.primary_id != self.identity.replica_id {
+            return Err(RuntimeError::AuthorityMismatch(
+                "admitted configuration selects another primary".into(),
+            ));
         }
         Ok(authority)
     }
@@ -1384,7 +1404,11 @@ impl StatelessReplicator {
     }
 
     async fn send_build(&self, replica: &ReplicaInformation) -> Result<()> {
-        let authority = self.require_primary().await?;
+        let authority = self.require_primary().await.map_err(|error| {
+            RuntimeError::AuthorityMismatch(format!(
+                "build source primary authority is unavailable: {error}"
+            ))
+        })?;
         if replica.role != ReplicaRole::IdleSecondary
             || replica.build_id.is_empty()
             || replica.process_session_id.is_empty()
@@ -1426,8 +1450,17 @@ impl StatelessReplicator {
                 &replica.build_id,
                 &authority.current.configuration_id,
             )
-            .await?
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            .await
+            .map_err(|error| {
+                RuntimeError::AuthorityMismatch(format!(
+                    "outbound build authority lookup failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                RuntimeError::AuthorityMismatch(
+                    "outbound build authority is not durably admitted".into(),
+                )
+            })?;
         if build_authority.attempt.build_id != replica.build_id
             || build_authority.attempt.source != self.identity
             || build_authority.attempt.source_session != self.process_session

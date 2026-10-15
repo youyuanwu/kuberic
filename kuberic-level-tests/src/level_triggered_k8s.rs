@@ -83,6 +83,30 @@ fn public_v1_authority_present(value: &Value) -> bool {
     value["status"]["publicV1Authority"].is_object()
 }
 
+fn public_v1_topology_idle(value: &Value) -> bool {
+    let status = &value["status"];
+    status["publicV1Topology"].is_object()
+        && !status["publicV1Operation"].is_object()
+        && !status["publicV1Transition"].is_object()
+        && !status["publicV1Replacement"].is_object()
+        && !status["publicV1SessionRenewal"].is_object()
+        && status["publicV1Topology"]["unavailablePrimaryId"].is_null()
+}
+
+fn topology_session_matches(value: &Value, replica_id: i64, process_session: &Value) -> bool {
+    let Some(process_session) = process_session.as_str() else {
+        return false;
+    };
+    value["status"]["publicV1Topology"]["sessions"]
+        .as_array()
+        .is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                session["identity"]["replicaId"] == replica_id
+                    && session["processSessionId"] == process_session
+            })
+        })
+}
+
 fn public_v1_primary(kubeconfig: &str, context: &str) -> Result<Option<i64>> {
     let mut granted = Vec::new();
     for replica_id in 1..=3 {
@@ -137,6 +161,51 @@ fn pod_for_replica(kubeconfig: &str, context: &str, replica_id: i64) -> Result<S
 }
 
 fn stop_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Result<()> {
+    let (node, container) = replica_container(kubeconfig, context, replica_id)?;
+    let stopped = Command::new("docker")
+        .args(["exec", &node, "crictl", "stop", &container])
+        .output()
+        .context("stopping exact replica container")?;
+    if !stopped.status.success() {
+        bail!(
+            "cannot stop replica {replica_id} container: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn set_replica_process_paused(
+    kubeconfig: &str,
+    context: &str,
+    replica_id: i64,
+    paused: bool,
+) -> Result<()> {
+    let (node, container) = replica_container(kubeconfig, context, replica_id)?;
+    let action = if paused { "pause" } else { "resume" };
+    let updated = Command::new("docker")
+        .args([
+            "exec",
+            &node,
+            "ctr",
+            "--namespace",
+            "k8s.io",
+            "tasks",
+            action,
+            &container,
+        ])
+        .output()
+        .context("updating exact replica process pause state")?;
+    if !updated.status.success() {
+        bail!(
+            "cannot {action} replica {replica_id} process: {}",
+            String::from_utf8_lossy(&updated.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn replica_container(kubeconfig: &str, context: &str, replica_id: i64) -> Result<(String, String)> {
     let pod = pod_for_replica(kubeconfig, context, replica_id)?;
     let node = kubectl(
         kubeconfig,
@@ -175,23 +244,13 @@ fn stop_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Res
         .filter(|line| !line.trim().is_empty())
         .collect();
     if running.is_empty() {
-        return Ok(());
+        bail!("replica {replica_id} has no running container");
     }
     ensure!(
         running.len() == 1,
         "expected one exact replica container, observed {containers:?}"
     );
-    let stopped = Command::new("docker")
-        .args(["exec", node.trim(), "crictl", "stop", running[0].trim()])
-        .output()
-        .context("stopping exact replica container")?;
-    if !stopped.status.success() {
-        bail!(
-            "cannot stop replica {replica_id} container: {}",
-            String::from_utf8_lossy(&stopped.stderr)
-        );
-    }
-    Ok(())
+    Ok((node.trim().to_string(), running[0].trim().to_string()))
 }
 
 fn replica_diagnostics(kubeconfig: &str, context: &str, replica_id: i64) -> Result<Value> {
@@ -466,18 +525,16 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
     loop {
         if replica_diagnostics(&kubeconfig, &context, primary)
             .is_ok_and(|status| status["writeStatus"] == "Granted")
+            && put_from_replica(&kubeconfig, &context, primary, "bootstrap", "phase6")
+                .is_ok_and(|status| status == 200)
         {
             break;
         }
         if Instant::now() >= access_deadline {
-            bail!("primary did not restore write access after bootstrap restart");
+            bail!("primary did not restore quorum writes after bootstrap restart");
         }
         std::thread::sleep(Duration::from_secs(2));
     }
-    ensure!(
-        put_from_replica(&kubeconfig, &context, primary, "bootstrap", "phase6")? == 200,
-        "quorum write failed"
-    );
     let value = get_from_replica(&kubeconfig, &context, primary, "bootstrap")?;
     ensure!(
         value.trim() == "phase6",
@@ -533,12 +590,33 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
 
     let replacement_deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if pod_uid_for_replica(&kubeconfig, &context, 2)
-            .is_ok_and(|instance| instance != old_instance)
+        if let Ok(instance) = pod_uid_for_replica(&kubeconfig, &context, 2)
+            && instance != old_instance
             && replica_diagnostics(&kubeconfig, &context, 2).is_ok()
-            && public_v1_primary(&kubeconfig, &context)?.is_some()
         {
-            break;
+            let status = set_status(&kubeconfig, &context)?;
+            let replacement_complete = status.pointer("/status/publicV1Replacement").is_none();
+            let replacement_admitted = status
+                .pointer("/status/publicV1Topology/sessions")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|sessions| {
+                    sessions.iter().any(|session| {
+                        session
+                            .pointer("/identity/replicaId")
+                            .and_then(serde_json::Value::as_i64)
+                            == Some(2)
+                            && session
+                                .pointer("/identity/instanceId")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(instance.as_str())
+                    })
+                });
+            if replacement_complete
+                && replacement_admitted
+                && public_v1_primary(&kubeconfig, &context)?.is_some()
+            {
+                break;
+            }
         }
         if Instant::now() >= replacement_deadline {
             bail!("same-cardinality replacement did not converge");
@@ -563,14 +641,19 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
     stop_replica_process(&kubeconfig, &context, 2)?;
     let restart_deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        if replica_diagnostics(&kubeconfig, &context, 2).is_ok_and(|restarted| {
-            restarted["processSession"] != before_restart["processSession"]
-                && restarted["currentConfiguration"] == before_restart["currentConfiguration"]
-        }) {
-            break;
+        if let Ok(restarted) = replica_diagnostics(&kubeconfig, &context, 2)
+            && restarted["processSession"] != before_restart["processSession"]
+            && restarted["currentConfiguration"] == before_restart["currentConfiguration"]
+        {
+            let status = set_status(&kubeconfig, &context)?;
+            if public_v1_topology_idle(&status)
+                && topology_session_matches(&status, 2, &restarted["processSession"])
+            {
+                break;
+            }
         }
         if Instant::now() >= restart_deadline {
-            bail!("replacement process did not reconstruct accepted authority");
+            bail!("replacement process did not reconstruct and publish accepted authority");
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -596,8 +679,14 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
     let old_primary = loop {
         let status = set_status(&kubeconfig, &context)?;
         if public_v1_authority_present(&status)
+            && public_v1_topology_idle(&status)
             && all_replicas_reporting(&kubeconfig, &context)
             && let Some(primary) = public_v1_primary(&kubeconfig, &context)?
+            && (1..=3).all(|replica_id| {
+                replica_diagnostics(&kubeconfig, &context, replica_id).is_ok_and(|report| {
+                    topology_session_matches(&status, replica_id, &report["processSession"])
+                })
+            })
         {
             break primary;
         }
@@ -631,7 +720,7 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
     );
 
     let failover_deadline = Instant::now() + Duration::from_secs(120);
-    stop_replica_process(&kubeconfig, &context, old_primary)?;
+    set_replica_process_paused(&kubeconfig, &context, old_primary, true)?;
     let new_primary = loop {
         if let Some(primary) = public_v1_primary(&kubeconfig, &context)?
             && primary != old_primary
@@ -658,6 +747,32 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
             "after-failover",
         )? == 200,
         "post-failover quorum write failed"
+    );
+
+    set_replica_process_paused(&kubeconfig, &context, old_primary, false)?;
+    let fencing_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let old_fenced = replica_diagnostics(&kubeconfig, &context, old_primary)
+            .is_ok_and(|status| status["writeStatus"] != "Granted");
+        let new_still_primary = replica_diagnostics(&kubeconfig, &context, new_primary)
+            .is_ok_and(|status| status["writeStatus"] == "Granted");
+        if old_fenced && new_still_primary {
+            break;
+        }
+        if Instant::now() >= fencing_deadline {
+            bail!("recovered old primary was not fenced after failover");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    ensure!(
+        put_from_replica(
+            &kubeconfig,
+            &context,
+            old_primary,
+            "failover-stale-primary",
+            "must-be-rejected",
+        )? != 200,
+        "recovered old primary accepted a post-failover write"
     );
     Ok(())
 }

@@ -93,6 +93,17 @@ fn deployment_sources_installation_namespace_from_metadata_namespace_only() {
 }
 
 #[test]
+fn deployment_prevents_concurrent_controller_reconciliation() {
+    let deployment: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(include_str!("../deploy/deployment.yaml")).unwrap();
+    assert_eq!(deployment["spec"]["replicas"].as_i64(), Some(1));
+    assert_eq!(
+        deployment["spec"]["strategy"]["type"].as_str(),
+        Some("Recreate")
+    );
+}
+
+#[test]
 fn production_inventory_contains_only_public_v1_controller_surfaces() {
     let manifest = include_str!("../Cargo.toml");
     let protocol = include_str!("../../kuberic-runtime/src/protocol/command.rs");

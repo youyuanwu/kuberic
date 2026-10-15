@@ -84,6 +84,13 @@ struct HostProjection {
     committed_lsn: i64,
 }
 
+fn renewal_projection_is_current(
+    renewal_epoch: crate::protocol::types::Epoch,
+    configuration: Option<&crate::protocol::public_operations::PublicConfiguration>,
+) -> bool {
+    configuration.is_none_or(|configuration| configuration.current.epoch <= renewal_epoch)
+}
+
 impl HostProjection {
     fn new() -> Self {
         Self {
@@ -461,6 +468,34 @@ impl PodRuntime {
                 }
                 Some(PublicOperationProgram::Progress { .. }) | None => {}
             }
+        }
+        if let Some(renewal) = preview.session_renewal.as_ref().filter(|renewal| {
+            matches!(
+                renewal.stage,
+                crate::protocol::public_operations::PublicSessionRenewalStage::ConfigurationPending
+                    | crate::protocol::public_operations::PublicSessionRenewalStage::Authorized
+            ) && renewal_projection_is_current(
+                renewal.required.renewal_epoch,
+                configuration.as_ref(),
+            )
+        }) && renewal
+            .required
+            .replacement
+            .iter()
+            .chain(renewal.required.surviving_sessions.iter())
+            .any(|endpoint| {
+                endpoint.identity == self.host.identity
+                    && &endpoint.process_session_id == process_session
+            })
+            && let Some(member) = renewal
+                .required
+                .fresh_configuration
+                .members
+                .iter()
+                .find(|member| member.identity == self.host.identity)
+        {
+            epoch = Some(renewal.required.renewal_epoch);
+            role = Some((renewal.required.renewal_epoch, member.role));
         }
         let (applied, committed) = match self.host.registered.get() {
             Some(registered) => (
@@ -1153,5 +1188,49 @@ impl ReplicatorRegistration for RuntimeHost {
         provider_writer.consumed = consumes_provider_writer;
         *creation = ReplicatorCreationState::Registered;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renewal_projection_is_current;
+    use crate::protocol::public_operations::PublicConfiguration;
+    use crate::protocol::types::{
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, ReplicaId,
+        ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    };
+
+    fn configuration(epoch: Epoch) -> PublicConfiguration {
+        PublicConfiguration {
+            current: ConfigurationDescriptor::new(
+                epoch,
+                ReplicaId::new(1),
+                vec![ConfigurationMember {
+                    identity: ReplicaIdentity {
+                        replica_id: ReplicaId::new(1),
+                        instance_id: ReplicaInstanceId::new("pod-1"),
+                        agent_generation: AgentGeneration::new("generation-1"),
+                    },
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            previous: None,
+            replicas: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn stale_session_renewal_does_not_override_newer_topology() {
+        let renewal_epoch = Epoch::new(0, 2);
+        assert!(renewal_projection_is_current(renewal_epoch, None));
+        assert!(renewal_projection_is_current(
+            renewal_epoch,
+            Some(&configuration(Epoch::new(0, 2)))
+        ));
+        assert!(!renewal_projection_is_current(
+            renewal_epoch,
+            Some(&configuration(Epoch::new(0, 3)))
+        ));
     }
 }

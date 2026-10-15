@@ -11,9 +11,10 @@ use crate::host::state::{PublicOperationDisposition, PublicOperationRecord, Publ
 use crate::host::store::{AgentStore, BeginPublicOperation};
 use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
-    PublicOperationClass, PublicOperationIntent, PublicV1Identity,
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicSessionRenewalStage,
+    PublicV1Identity, PublicV1SessionRenewalStatus,
 };
-use crate::protocol::types::{OperationId, ProcessSessionId};
+use crate::protocol::types::{OperationId, ProcessSessionId, ReplicaIdentity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallbackContainment {
@@ -693,6 +694,95 @@ struct RegistryState {
     operations: BTreeMap<OperationId, Arc<PartitionOperation>>,
 }
 
+fn configuration_pending_for_fenced_intent(
+    renewal: &PublicV1SessionRenewalStatus,
+    local_identity: &ReplicaIdentity,
+    intent: &PublicOperationIntent,
+) -> Option<PublicV1SessionRenewalStatus> {
+    let PublicOperationProgram::Configuration(configuration) = intent.program.as_ref()? else {
+        return None;
+    };
+    if intent.class != PublicOperationClass::Authority
+        || configuration.current != renewal.required.fresh_configuration
+        || configuration.previous.is_some()
+        || !renewal
+            .required
+            .replacement
+            .iter()
+            .chain(renewal.required.surviving_sessions.iter())
+            .any(|endpoint| {
+                endpoint.identity == *local_identity
+                    && endpoint.process_session_id == intent.process_session_id
+            })
+    {
+        return None;
+    }
+    let mut aligned = renewal.clone();
+    if aligned.stage == PublicSessionRenewalStage::EpochBarriersPending {
+        while let Some(barrier) = aligned
+            .barriers
+            .iter()
+            .find(|barrier| {
+                barrier.stage
+                    == crate::protocol::public_operations::PublicSessionEpochBarrierStage::Pending
+            })
+            .cloned()
+        {
+            if !aligned
+                .required
+                .fresh_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == barrier.survivor.identity)
+            {
+                return None;
+            }
+            aligned = aligned
+                .record_epoch_updated(&barrier.survivor, aligned.required.renewal_epoch)
+                .ok()?;
+        }
+        aligned = aligned.finish_epoch_barriers().ok()?;
+    }
+    if aligned.stage == PublicSessionRenewalStage::ReplacementRolePending {
+        let replacement = aligned.required.replacement.as_ref()?;
+        aligned = aligned
+            .replay_replacement_role(
+                &replacement.process_session_id,
+                aligned.required.renewal_epoch,
+                aligned.required.predecessor.role,
+            )
+            .ok()?;
+    }
+    (aligned.stage == PublicSessionRenewalStage::ConfigurationPending).then_some(aligned)
+}
+
+fn is_configuration_pending_for_fenced_intent(
+    renewal: &PublicV1SessionRenewalStatus,
+    local_identity: &ReplicaIdentity,
+    intent: &PublicOperationIntent,
+) -> bool {
+    renewal.stage == PublicSessionRenewalStage::ConfigurationPending
+        && configuration_pending_for_fenced_intent(renewal, local_identity, intent)
+            .as_ref()
+            .is_some_and(|aligned| aligned == renewal)
+}
+
+fn renewal_endpoint_matches_intent(
+    renewal: &PublicV1SessionRenewalStatus,
+    local_identity: &ReplicaIdentity,
+    intent: &PublicOperationIntent,
+) -> bool {
+    renewal
+        .required
+        .replacement
+        .iter()
+        .chain(renewal.required.surviving_sessions.iter())
+        .any(|endpoint| {
+            endpoint.identity == *local_identity
+                && endpoint.process_session_id == intent.process_session_id
+        })
+}
+
 pub(crate) struct PartitionOperationRegistry {
     store: Arc<dyn AgentStore>,
     identity: PublicV1Identity,
@@ -779,6 +869,84 @@ impl PartitionOperationRegistry {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    async fn prepare_fenced_session_renewal_configuration(
+        &self,
+        intent: &PublicOperationIntent,
+    ) -> Result<bool> {
+        let state = self.store.load_state().await?;
+        let Some((current, aligned)) =
+            state
+                .public_v1_operation_state
+                .as_ref()
+                .and_then(|preview| {
+                    preview
+                        .session_renewal
+                        .as_ref()
+                        .filter(|renewal| {
+                            preview.history.as_ref() == Some(&renewal.required.history)
+                        })
+                        .and_then(|renewal| {
+                            configuration_pending_for_fenced_intent(
+                                renewal,
+                                &state.identity.local_identity,
+                                intent,
+                            )
+                            .map(|aligned| (renewal.clone(), aligned))
+                        })
+                })
+        else {
+            return Ok(false);
+        };
+        if current != aligned {
+            crate::host::service::align_session_renewal(self.store.as_ref(), current, &aligned)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn release_session_renewal_fence(
+        &self,
+        intent: &PublicOperationIntent,
+    ) -> Result<()> {
+        let state = self.store.load_state().await?;
+        let Some(current) = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| preview.session_renewal.as_ref())
+            .filter(|renewal| {
+                is_configuration_pending_for_fenced_intent(
+                    renewal,
+                    &state.identity.local_identity,
+                    intent,
+                )
+            })
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let PublicOperationProgram::Configuration(configuration) =
+            intent.program.as_ref().expect("configuration checked")
+        else {
+            unreachable!()
+        };
+        let authorized = current
+            .install_fresh_configuration(&configuration.current)
+            .map_err(|message| HostError::CommandRejected(message.into()))?;
+        if !renewal_endpoint_matches_intent(&authorized, &state.identity.local_identity, intent) {
+            return Err(HostError::IdentityMismatch(
+                "authorized renewal endpoint changed before fence release".into(),
+            ));
+        }
+        self.store
+            .persist_public_v1_session_renewal(Some(&current), &authorized)
+            .await?;
+        if self.is_fenced() {
+            self.terminal_fence
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
     pub(crate) fn own_control_task(&self, future: impl Future<Output = ()> + Send + 'static) {
         self.control_tasks
             .lock()
@@ -801,15 +969,21 @@ impl PartitionOperationRegistry {
         intent
             .validate()
             .map_err(|message| HostError::CommandRejected(message.to_string()))?;
-        if self.is_fenced() && !intent.class.is_terminal() {
-            return Err(HostError::CommandRejected(
-                "preview is synchronously fenced".into(),
-            ));
-        }
         if intent.identity != self.identity || intent.process_session_id != self.process_session_id
         {
             return Err(HostError::IdentityMismatch(
                 "public-operation preview or process session changed".into(),
+            ));
+        }
+        let renewal_configuration = if !intent.class.is_terminal() {
+            self.prepare_fenced_session_renewal_configuration(&intent)
+                .await?
+        } else {
+            false
+        };
+        if self.is_fenced() && !intent.class.is_terminal() && !renewal_configuration {
+            return Err(HostError::CommandRejected(
+                "preview is synchronously fenced".into(),
             ));
         }
 
@@ -1436,7 +1610,19 @@ fn retained_relation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::ReplicaId;
+    use crate::host::sqlite_store::SqliteStore;
+    use crate::host::state::{AgentState, StorageIdentity};
+    use crate::protocol::public_operations::{
+        ProcessSessionRenewalRequired, PublicConfiguration, PublicV1LifecycleBinding,
+        PublicV1SessionRenewalStatus, StatePersistence,
+    };
+    use crate::protocol::types::{
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
+        InitializationId, PodUid, ProcessSessionEndpoint, ProcessSessionRenewalReason,
+        PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaInstanceId, ReplicaRole,
+        ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId,
+        ResourceUid, StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
+    };
 
     fn intent(class: PublicOperationClass, revision: u64) -> PublicOperationIntent {
         PublicOperationIntent {
@@ -1455,6 +1641,324 @@ mod tests {
             lifecycle: None,
             program: None,
         }
+    }
+
+    #[test]
+    fn fenced_registry_pairs_configuration_with_exact_renewal_stage() {
+        let resource_uid = ResourceUid::new("resource-renewal-fence");
+        let generation = PublicProtocolGeneration::new(1);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-1"),
+            agent_generation: AgentGeneration::new("generation-1"),
+        };
+        let storage = ReplicaStorageIncarnationContext {
+            replica: identity.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new("pod-1"),
+                pvc_uid: PvcUid::new("pvc-1"),
+            },
+            storage_generation: StorageGeneration::new("storage-1"),
+        };
+        let predecessor = ProcessSessionEndpoint {
+            identity: identity.clone(),
+            storage_incarnation: storage.clone(),
+            process_session_id: ProcessSessionId::new("old-session"),
+            replicator_creation_id: ReplicatorCreationId::new("old-creation"),
+            role: ReplicaRole::Primary,
+        };
+        let replacement = ProcessSessionEndpoint {
+            process_session_id: ProcessSessionId::new("new-session"),
+            replicator_creation_id: ReplicatorCreationId::new("new-creation"),
+            role: ReplicaRole::None,
+            ..predecessor.clone()
+        };
+        let epoch = Epoch::new(0, 2);
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            identity.replica_id,
+            vec![ConfigurationMember {
+                identity: identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+            operation_id: OperationId::new("renewal-fence"),
+            reason: ProcessSessionRenewalReason::PrimaryReplacement,
+            resource_uid,
+            history,
+            previous_epoch: Epoch::new(0, 1),
+            renewal_epoch: epoch,
+            predecessor,
+            replacement: Some(replacement.clone()),
+            surviving_sessions: Vec::new(),
+            fresh_configuration: configuration.clone(),
+            predecessor_contained: true,
+            data_loss: None,
+        })
+        .unwrap();
+        let access_closed = required.close_access().unwrap();
+        let frozen = access_closed.freeze_surviving_set().unwrap();
+        let barriers = frozen.begin_epoch_barriers().unwrap();
+        let role_pending = barriers.finish_epoch_barriers().unwrap();
+        let configuration_pending = role_pending
+            .replay_replacement_role(&replacement.process_session_id, epoch, ReplicaRole::Primary)
+            .unwrap();
+        let authorized = configuration_pending
+            .install_fresh_configuration(&configuration)
+            .unwrap();
+        let configuration_program = PublicOperationProgram::Configuration(PublicConfiguration {
+            current: configuration.clone(),
+            previous: None,
+            replicas: Vec::new(),
+        });
+        let intent_for = |program: PublicOperationProgram, revision: u64| PublicOperationIntent {
+            identity: PublicV1Identity::new(generation.value()),
+            operation_id: OperationId::new(format!("renewal-operation-{revision}")),
+            revision,
+            process_session_id: replacement.process_session_id.clone(),
+            class: PublicOperationClass::Authority,
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
+        };
+        let configuration_intent = intent_for(configuration_program.clone(), 1);
+        let epoch_intent = intent_for(PublicOperationProgram::Epoch { epoch }, 2);
+        let role_intent = intent_for(
+            PublicOperationProgram::Role {
+                epoch,
+                role: ReplicaRole::Primary,
+            },
+            3,
+        );
+        let stages = [
+            &required,
+            &access_closed,
+            &frozen,
+            &barriers,
+            &role_pending,
+            &configuration_pending,
+            &authorized,
+        ];
+
+        for status in stages {
+            assert_eq!(
+                is_configuration_pending_for_fenced_intent(
+                    status,
+                    &identity,
+                    &configuration_intent
+                ),
+                status.stage == PublicSessionRenewalStage::ConfigurationPending
+            );
+            assert!(!is_configuration_pending_for_fenced_intent(
+                status,
+                &identity,
+                &epoch_intent
+            ));
+            assert!(!is_configuration_pending_for_fenced_intent(
+                status,
+                &identity,
+                &role_intent
+            ));
+        }
+        assert_eq!(
+            configuration_pending_for_fenced_intent(&barriers, &identity, &configuration_intent)
+                .unwrap(),
+            configuration_pending
+        );
+        assert!(
+            configuration_pending_for_fenced_intent(&required, &identity, &configuration_intent)
+                .is_none()
+        );
+        assert!(!is_configuration_pending_for_fenced_intent(
+            &configuration_pending,
+            &identity,
+            &intent(PublicOperationClass::Authority, 1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn renewal_configuration_releases_fence_only_after_durable_authorization() {
+        let root = tempfile::tempdir().unwrap();
+        let resource_uid = ResourceUid::new("resource-renewal-release");
+        let generation = PublicProtocolGeneration::new(1);
+        let preview = PublicV1Identity::new(generation.value());
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("pod-release"),
+            agent_generation: AgentGeneration::new("generation-release"),
+        };
+        let storage = ReplicaStorageIncarnationContext {
+            replica: identity.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new("pod-release"),
+                pvc_uid: PvcUid::new("pvc-release"),
+            },
+            storage_generation: StorageGeneration::new("storage-release"),
+        };
+        let predecessor = ProcessSessionEndpoint {
+            identity: identity.clone(),
+            storage_incarnation: storage.clone(),
+            process_session_id: ProcessSessionId::new("old-session"),
+            replicator_creation_id: ReplicatorCreationId::new("old-creation"),
+            role: ReplicaRole::Primary,
+        };
+        let replacement = ProcessSessionEndpoint {
+            process_session_id: ProcessSessionId::new("new-session"),
+            replicator_creation_id: ReplicatorCreationId::new("new-creation"),
+            role: ReplicaRole::None,
+            ..predecessor.clone()
+        };
+        let epoch = Epoch::new(0, 2);
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            identity.replica_id,
+            vec![ConfigurationMember {
+                identity: identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+            operation_id: OperationId::new("renewal-release"),
+            reason: ProcessSessionRenewalReason::PrimaryReplacement,
+            resource_uid: resource_uid.clone(),
+            history: history.clone(),
+            previous_epoch: Epoch::new(0, 1),
+            renewal_epoch: epoch,
+            predecessor,
+            replacement: Some(replacement.clone()),
+            surviving_sessions: Vec::new(),
+            fresh_configuration: configuration.clone(),
+            predecessor_contained: true,
+            data_loss: None,
+        })
+        .unwrap();
+        let configuration_pending = required
+            .close_access()
+            .unwrap()
+            .freeze_surviving_set()
+            .unwrap()
+            .begin_epoch_barriers()
+            .unwrap()
+            .finish_epoch_barriers()
+            .unwrap()
+            .replay_replacement_role(&replacement.process_session_id, epoch, ReplicaRole::Primary)
+            .unwrap();
+        let store = Arc::new(
+            SqliteStore::create_replacement_authorized(
+                root.path().join("agent.sqlite3"),
+                AgentState::new(StorageIdentity {
+                    schema_version: crate::host::state::SCHEMA_VERSION,
+                    resource_uid: resource_uid.clone(),
+                    pod_uid: PodUid::new("pod-release"),
+                    pvc_uid: PvcUid::new("pvc-release"),
+                    initialization_id: InitializationId::new("init-release"),
+                    local_identity: identity.clone(),
+                    effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+                }),
+                PublicV1LifecycleBinding {
+                    identity: preview.clone(),
+                    resource_uid,
+                    spec_generation: 1,
+                    state_persistence: StatePersistence::Persisted,
+                },
+            )
+            .unwrap(),
+        );
+        store
+            .initialize_public_v1_history(&initialization, &history, &storage)
+            .await
+            .unwrap();
+        store
+            .persist_public_v1_session_renewal(None, &required)
+            .await
+            .unwrap();
+        let program = PublicOperationProgram::Configuration(PublicConfiguration {
+            current: configuration,
+            previous: None,
+            replicas: Vec::new(),
+        });
+        let intent = PublicOperationIntent {
+            identity: preview.clone(),
+            operation_id: OperationId::new("renewal-release-configuration"),
+            revision: 1,
+            process_session_id: replacement.process_session_id,
+            class: PublicOperationClass::Authority,
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
+        };
+        let registry = PartitionOperationRegistry::new(
+            store.clone(),
+            preview,
+            intent.process_session_id.clone(),
+        )
+        .unwrap();
+        registry.fence();
+
+        assert!(
+            !registry
+                .prepare_fenced_session_renewal_configuration(&intent)
+                .await
+                .unwrap()
+        );
+        registry
+            .release_session_renewal_fence(&intent)
+            .await
+            .unwrap();
+        assert!(registry.is_fenced());
+        assert_eq!(
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+                .session_renewal
+                .unwrap()
+                .stage,
+            PublicSessionRenewalStage::Required
+        );
+
+        crate::host::service::align_session_renewal(
+            store.as_ref(),
+            required,
+            &configuration_pending,
+        )
+        .await
+        .unwrap();
+        assert!(
+            registry
+                .prepare_fenced_session_renewal_configuration(&intent)
+                .await
+                .unwrap()
+        );
+        assert!(registry.is_fenced());
+        registry
+            .release_session_renewal_fence(&intent)
+            .await
+            .unwrap();
+        assert!(!registry.is_fenced());
+        assert_eq!(
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+                .session_renewal
+                .unwrap()
+                .stage,
+            PublicSessionRenewalStage::Authorized
+        );
     }
 
     #[test]

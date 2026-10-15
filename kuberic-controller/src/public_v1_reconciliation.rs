@@ -64,6 +64,15 @@ where
         .observe_public_v1_operation_report(scope, &expected)
         .await
     {
+        let exact_completion = report
+            .completed_operations
+            .iter()
+            .any(|completion| expected.intent.matches(completion));
+        if report.process_session_id != expected.intent.process_session_id && !exact_completion {
+            api.supersede_public_v1_operation(scope, &expected, &command)
+                .await?;
+            return Ok(PublicV1ReconciliationOutcome::EffectApplied);
+        }
         let plan = plan_public_v1_evidence(&expected, &report)?;
         if !matches!(plan, PublicV1EvidencePlan::Wait) {
             return reconcile_public_v1_consumer(api, scope, &report).await;
