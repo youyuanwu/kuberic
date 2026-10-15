@@ -62,11 +62,11 @@ unprivileged Linux account:
 
 ```bash
 just nextest-postgres-smoke
-just nextest-postgres
 ```
 
 The smoke target runs a representative real-PostgreSQL lifecycle selection for
-routine local checks. The full target remains the complete pre-push validation.
+routine local checks. Run `just nextest-postgres` only when the full PostgreSQL
+suite is explicitly requested or through its configured CI partitions.
 
 Build once and verify the exact ordinary/PostgreSQL partitions with:
 

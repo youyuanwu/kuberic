@@ -79,8 +79,9 @@ A report already present in observation cannot bypass missing scaffolding.
 
 ## Current API
 
-The CRD status contains Public V1 authority, session-renewal, transition, and
-operation values. The command/report protocol is version 11.
+The CRD status contains Public V1 authority, topology, session-renewal,
+replacement, transition, and operation values. The command/report protocol is
+version 11.
 
 The controller is bound to one installation namespace with `Role` and
 `RoleBinding` permissions.

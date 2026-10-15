@@ -119,8 +119,8 @@ endpoints before consuming agent reports. A preseeded report cannot bypass
 resource convergence.
 
 The CRD status is structurally typed and contains only Public V1 authority,
-session-renewal, transition, and operation state. Old or partial controller
-status is rejected before planning or effects.
+topology, session-renewal, replacement, transition, and operation state. Old
+or partial controller status is rejected before planning or effects.
 
 Controller watches and mutations are namespaced. Deployment uses
 `KUBERIC_INSTALLATION_NAMESPACE`, and RBAC uses `Role`/`RoleBinding`; there is

@@ -48,7 +48,9 @@ watches are namespaced. Deployment RBAC uses `Role`/`RoleBinding`.
 CRD status is structurally typed and contains:
 
 - Public V1 authority;
+- topology;
 - session renewal;
+- replacement;
 - transition;
 - operation.
 

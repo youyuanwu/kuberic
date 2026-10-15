@@ -46,7 +46,9 @@ spec:
 Status is structurally typed and contains only:
 
 - `publicV1Authority`;
+- `publicV1Topology`;
 - `publicV1SessionRenewal`;
+- `publicV1Replacement`;
 - `publicV1Transition`;
 - `publicV1Operation`.
 
@@ -68,7 +70,8 @@ accepted and persisted.
 
 Initialization dispatches `InitializeAgentStore` to each exact fresh
 Pod/PVC/process identity. The controller accepts schema-12 established reports,
-initializes one shared history, and originates the first three-member topology.
+initializes one shared history, and originates the first topology containing
+the desired `spec.replicas` members.
 
 ## Topology and Session Convergence
 
