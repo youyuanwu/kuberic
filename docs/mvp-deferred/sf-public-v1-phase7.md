@@ -109,3 +109,10 @@
 - MVP alternative: Reconnect only named low-level tests that reach active production code and add the minimum current Public V1 real-PostgreSQL scenarios for basebackup cancellation, stale completion, production factory/fault behavior and one-writer topology transitions.
 - Revisit when: A concrete active PostgreSQL defect cannot be reproduced or detected through the retained low-level seams and bounded current Public V1 scenarios.
 - Evidence: The Phase 3 current-code completeness assessment found 20 active tests insufficient, while the subsequent simplicity guard required a risk-selected catalog rather than whole-module or historical-count restoration.
+
+### P7D-16: Full renewal dispatch parity in the in-memory bridge
+- Status: PROPOSED
+- Reason: The production Kubernetes path composes exact renewal operations through agent RPCs, while the in-memory bridge models the resulting reports and status directly. Current production command-generation tests, runtime renewal suites, controller restart tests and owned KinD journeys cover the required failure boundaries without a second full-path harness.
+- MVP alternative: Retain exact production dispatch assertions, real runtime renewal tests, controller production tests and the owned bootstrap/replacement/failover KinD sequence.
+- Revisit when: A Kubernetes AgentControl renewal defect cannot be reproduced through the bridge, dispatch semantics materially change, or session renewal becomes a separately required live-cluster acceptance journey.
+- Evidence: Review feedback `BRIDGE-RENEWAL-DISPATCH-DRIFT`; `kuberic-controller/src/cluster_api.rs` production dispatch and in-memory implementations; `kuberic-runtime/tests/public_v1_session_renewal.rs`; `kuberic-controller/tests/public_v1_production.rs`.
