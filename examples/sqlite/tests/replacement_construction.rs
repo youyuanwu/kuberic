@@ -939,6 +939,13 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             .await,
             4
         );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while replacement_persistence.progress().unwrap().committed_lsn < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-build write did not reach the replacement provider");
         assert_eq!(replacement_persistence.progress().unwrap().committed_lsn, 4);
         let inspection = replacement_persistence.inspect_for_test().unwrap();
         std::fs::write(&inspection_path, &inspection.image).unwrap();
