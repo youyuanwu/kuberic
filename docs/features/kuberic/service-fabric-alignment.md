@@ -33,6 +33,9 @@ provider-owned, and topology/lifecycle durability remains agent-owned.
 - controller mutation authority is confined to one namespace;
 - completed transport tasks are reclaimed during normal operation;
 - old agent, controller, and supported provider state rejects unchanged.
+- fresh agent initialization, exact process-session renewal, copy-based
+  replacement, delayed failover, catch-up, and old-primary fencing are
+  ordinary level-triggered production paths.
 
 The public `Replicator`, `PrimaryReplicator`, `StateReplicator`,
 `StateProvider`, and `DurableState` method sets remain stable.
@@ -58,11 +61,21 @@ surface. Extra endpoint, alternate protocol, and alternate controller-owner
 fixtures are injected through the same discovery path and must fail the same
 validator.
 
+The exact final inventory contains 381 tests: 334 ordinary, 41 PostgreSQL,
+three KinD, two build-only, and one DEX. Exact CI run `38804014250` passed all
+partitions and owned live jobs on revision `ad5d766`.
+
 ## Deliberate Differences
 
 - Kubernetes resources replace Service Fabric placement objects.
 - The controller is level-triggered and reconstructs work from observation
   rather than persisting an operator phase cursor.
+- Process-session renewal is explicit durable authority: contained Open,
+  survivor epoch barriers, replacement role replay, exact configuration, and
+  authorization precede restored access.
+- Kubernetes failover uses a configurable observation delay rather than a
+  Service Fabric placement subsystem; recovered primaries clear the marker
+  before expiry, while sustained outages promote and catch up a survivor.
 - Public V1 transport has no credential contract.
 - Application-specific providers define their own durable formats and
   old-format rejection.

@@ -57,6 +57,14 @@ at most one provider writer.
 Old schemas and supported prior provider formats reject without mutation.
 There is no migration or compatibility reader.
 
+Process restart reconstructs the built-in engine from schema-12 authority and
+provider state. A contained process first reopens existing state, then the
+controller renews the exact process/creation session through access closure,
+survivor epoch barriers, replacement role replay, and exact fresh
+configuration. Participant journals advance through validated adjacent stages;
+obsolete journals can be superseded only after the accepted topology epoch has
+advanced.
+
 ## Public V1 Protocol
 
 Protocol version 11 is the only built-in identity. Serialized public values use
@@ -65,6 +73,9 @@ the `identity` field. Protocol 10 and old report/command branches are rejected.
 Replication transport has no authentication contract. Exact identity,
 session, epoch, history, storage, configuration, operation, and build values
 provide correctness fencing.
+
+Agent control uses port 50051. Replication/copy data uses the independently
+advertised port 50052. Application traffic is outside both protocol surfaces.
 
 ## Custom Replicators
 

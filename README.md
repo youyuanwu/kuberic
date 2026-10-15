@@ -9,6 +9,12 @@ level-triggered stack provides the Public V1 replication, copy, history,
 session, fencing, and lifecycle contracts plus an experimental namespace-bound
 controller and owned-cluster validation harness.
 
+The production control loop initializes fresh agents, originates exact
+topology authority, renews restarted process sessions, builds and admits
+same-cardinality replacements, and performs delayed failover from observation.
+Committed application state remains provider-owned; agent schema 12 stores
+history and lifecycle authority.
+
 ## Repository
 
 ```text
@@ -73,6 +79,10 @@ The complete tier inventory, shard commands and DEX Kubernetes-provider
 commands are documented in the
 [test strategy](docs/features/kuberic/testing.md).
 
+The exact inventory is 381 tests: 334 ordinary, 41 PostgreSQL, three KinD,
+two build-only, and one DEX. Exact CI run `38804014250` passed every partition
+and owned live job on revision `ad5d766`.
+
 ## Experimental Kubernetes Validation
 
 The retained controller and KVStore2 Dockerfiles are development/CI assets.
@@ -101,8 +111,10 @@ cluster/context/kubeconfig tuple before every mutation and deletion.
 
 The conformance application exercises the complete level-triggered controller,
 agent and runtime path through an HTTP key/value API. Its retained isolated
-live scenarios cover fresh bootstrap, replacement, and failover; the broader
-behavioral matrix runs in the cluster-free runtime/provider tiers.
+live scenarios cover fresh bootstrap with process-session renewal,
+same-cardinality replacement with preserved data, and sustained-outage
+failover with old-primary fencing; the broader behavioral matrix runs in the
+cluster-free runtime/provider tiers.
 
 ### SQLite
 

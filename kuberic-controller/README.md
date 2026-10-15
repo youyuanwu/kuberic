@@ -21,6 +21,18 @@ Fresh bootstrap creates credentials, peer/write Services, PVCs, Pods, and exact
 per-Pod endpoints before consuming reports. A preseeded report cannot skip
 resource convergence.
 
+After bootstrap, the controller persists exact topology sessions separately
+from logical membership. A same-storage process restart performs only a
+contained Open while its replicator identity is temporary, then originates
+session renewal before role, epoch, or configuration authority. Replacement
+planning selects the durably bound incarnation even while predecessor and
+replacement reports overlap.
+
+Main observation probes an unavailable primary until
+`failoverDelaySeconds` expires. After the deadline it omits only that declared
+primary, configures surviving secondaries before the promoted primary, catches
+up all survivors, and publishes the new topology before routing writes.
+
 ## Configuration
 
 The binary requires:
@@ -39,6 +51,10 @@ CRD status is structurally typed and contains:
 - session renewal;
 - transition;
 - operation.
+
+Status-only reads avoid agent RPCs. Operation dispatch/report paths observe
+only the exact target; ordinary reconciliation retains the broader observation
+needed for topology and failover decisions.
 
 Protocol version 11 is the only production command/report path. Old and
 partial controller state rejects before planning or mutation.

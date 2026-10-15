@@ -66,6 +66,38 @@ Resource names and ownership are deterministic. A preseeded agent report
 cannot skip this resource gate. Once resources exist, Public V1 reports can be
 accepted and persisted.
 
+Initialization dispatches `InitializeAgentStore` to each exact fresh
+Pod/PVC/process identity. The controller accepts schema-12 established reports,
+initializes one shared history, and originates the first three-member topology.
+
+## Topology and Session Convergence
+
+Logical membership and accepted process endpoints are stored separately.
+Reports are selected by exact replica/storage incarnation rather than logical
+replica ID alone.
+
+A same-storage process restart with a temporary replicator identity receives
+only contained Open. Once its real creation identity is published, the
+controller persists session renewal before any new role, epoch, or
+configuration authority. Renewal advances survivor epoch barriers and installs
+exact per-member configuration, with secondaries completed before the primary.
+
+Same-cardinality Pod/PVC replacement persists allocation, storage binding,
+Build authority, completion, admission, and predecessor retirement as
+independent level-triggered stages.
+
+## Failover
+
+When the primary is unavailable, the controller records its logical ID and the
+first unavailable timestamp. It continues exact observation during
+`failoverDelaySeconds`; recovery before the deadline clears the marker without
+changing topology or routing.
+
+After the deadline, only the unavailable primary is suppressed. The controller
+fences survivors at the new epoch, configures secondaries before the promoted
+primary, catches up every survivor, persists the new topology, then routes the
+write Service. A resumed old primary remains fenced.
+
 ## Identity and Fencing
 
 Replica ID, Pod UID, PVC UID, agent generation, process session, epoch,
@@ -89,6 +121,10 @@ service location, data-loss state, and completed operations. They do not
 expose private ACK sets, copy cursors, quorum positions, or managed-engine
 continuation state.
 
+Control RPCs use exact per-Pod port 50051 endpoints. Replication and copy use
+port 50052. Status-only persistence reads do not contact agents, while
+operation dispatch/report reads observe only the exact target.
+
 ## Tests and Diagnostics
 
 Assets are in `kuberic-controller/deploy/`. For an owned disposable cluster:
@@ -109,7 +145,7 @@ See [Testing](testing.md) for the ownership contract and complete commands.
 - published release installation;
 - production activation or traffic movement;
 - Public V1 transport credentials;
-- primary removal or generalized scaling policy parity with Service Fabric.
+- generalized Service Fabric placement and policy parity.
 
 Old state is rejected unchanged. Any future production rollout is separately
 designed around fresh state rather than a compatibility mode.

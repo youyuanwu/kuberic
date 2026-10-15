@@ -27,15 +27,15 @@ The current inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 298 |
-| PostgreSQL | 20 |
+| ordinary | 334 |
+| PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
 | DEX live | 1 |
-| **total** | **324** |
+| **total** | **381** |
 
-Ordinary partition counts are `75, 75, 74, 74`. PostgreSQL partition counts
-are `6, 6, 5, 3`. The validator proves every test has exactly one tier and
+Ordinary partition counts are `84, 84, 83, 83`. PostgreSQL partition counts
+are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
 ## Ordinary Tier
@@ -75,7 +75,7 @@ Routine validation:
 just nextest-postgres-smoke
 ```
 
-The smoke target builds the owned command binary and runs four representative
+The smoke target builds the owned command binary and runs eight representative
 Public V1 custom-Replicator scenarios. Run `just nextest-postgres` only when
 the full PostgreSQL suite is explicitly required.
 
@@ -95,13 +95,16 @@ accounting against the packaged binaries.
 Important focused targets include:
 
 - `kuberic-controller::public_v1_production`: fresh resource bootstrap and
-  preseeded-report ordering;
+  preseeded-report ordering, exact replacement-incarnation selection,
+  contained restart/session renewal, and failover-delay boundaries;
 - `kuberic-runtime::public_v1_wire`: protocol-10 rejection and serialized
   `identity` fields;
 - `kuberic-runtime::public_v1_conformance`: KSF catalog and ownership
   mutations;
 - `kuberic-runtime::public_v1_recovery`: lifecycle, build, failover,
   switchover, containment, task, and writer behavior;
+- `kuberic-runtime::public_v1_session_renewal`: durable stage replay,
+  participant alignment, monotonic journal supersession, and exact fencing;
 - SQLite/KVStore2 `provider_state_rejection`: complete tree/byte immutability
   for old provider state.
 
@@ -123,9 +126,13 @@ just delete-kind-cluster
 
 The harness requires an explicit ownership receipt and refuses default/shared
 cluster coordinates. The three scenarios inspect current Public V1 authority,
-resources, agent diagnostics, and exactly one granted writer; they do not read
+resources, agent diagnostics, and exactly one granted writer. Bootstrap proves
+quorum writes after a contained process restart; replacement proves preserved
+data and exact new-incarnation admission; failover uses a sustained containerd
+task pause and proves preserved data, post-failover quorum writes, resumed
+old-primary fencing, and stale-write rejection. The scenarios do not read
 removed legacy status fields.
 
-If the host Docker daemon cannot create its bridge network, record KinD as
-`NOT_RUN`; do not mutate shared host networking or represent source tests as a
-live-cluster pass.
+Exact CI run `38804014250` passed all 381 tests and both owned live jobs on
+revision `ad5d766`, including all ordinary/PostgreSQL partitions, DEX, PR live
+smoke, and the retained bootstrap/replacement/failover sequence.

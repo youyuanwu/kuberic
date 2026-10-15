@@ -78,6 +78,39 @@ provider progress before serving.
 - completed inbound and outbound transport-task entries are reclaimed during
   ordinary operation rather than retained until shutdown.
 
+### Process-session renewal
+
+The topology stores the accepted process session and replicator creation
+identity for every member. A restarted process on the same storage incarnation
+cannot replace those values directly.
+
+If the runtime is not yet open, the controller permits only a contained
+existing-state Open. It then persists one renewal authority containing the
+predecessor, replacement endpoint, surviving sessions, next epoch, and fresh
+configuration. Participants close access, durably advance survivor epoch
+barriers, replay the unchanged role at the new epoch, install exact peer
+descriptors, and record authorization before releasing local fences.
+
+Participant journals may first observe a later accepted stage. They seed or
+fast-forward only through validated adjacent transitions with identical
+required authority. A later renewal may supersede an obsolete local journal
+only when its captured predecessor topology is at least the earlier renewal
+epoch.
+
+### Replacement and failover
+
+Same-cardinality replacement binds one new Pod/PVC storage incarnation,
+installs exact inbound Build authority before copy, admits the replacement only
+after Build completion, and retires the old storage incarnation. Overlapping
+predecessor/replacement reports remain distinct; topology commands select only
+the durably bound replacement.
+
+Failover continues probing the unavailable primary during the configured
+delay. After expiry, only that primary is omitted from observation. Surviving
+secondaries receive configuration before the promoted primary; the promoted
+candidate is stable through catch-up, and `CatchUp(All)` completes before
+writer access is restored.
+
 ## Controller Integration
 
 The controller observes one installation namespace and creates the support
@@ -122,7 +155,8 @@ just nextest-validate-archive
 
 The current exact inventory is documented in [Testing](testing.md). Live KinD
 validation uses only bootstrap, replacement, and failover in an explicitly
-owned disposable cluster.
+owned disposable cluster. Exact CI run `38804014250` passed the complete matrix
+on revision `ad5d766`.
 
 ## Limitations
 

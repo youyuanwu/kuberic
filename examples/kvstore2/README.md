@@ -10,7 +10,7 @@ The HTTP API is:
 - `PUT /kv/{key}` with a UTF-8 body, returning the committed LSN;
 - `GET /kv/{key}`;
 - `GET /status` for replica, process-session, role, access, progress, and build
-  diagnostics.
+  diagnostics, including durable operation stage and in-flight instruction.
 
 Application state lives under `/var/lib/kuberic/application`. Agent schema-12
 authority lives separately under `/var/lib/kuberic/.kuberic/agent.sqlite3`.
@@ -24,6 +24,12 @@ The retained owned-KinD scenarios are:
 ```bash
 just level-triggered-kind-test bootstrap replacement failover
 ```
+
+Bootstrap includes a process restart and exact session renewal before the
+first quorum write. Replacement preserves committed keys while admitting a new
+Pod/storage incarnation. Failover pauses the old primary's containerd task,
+waits through the configured delay, proves a new quorum write, resumes the old
+primary, and verifies that stale writes remain fenced.
 
 Use only an explicitly owned cluster as documented in the
 [operator guide](../../docs/features/kuberic/level-triggered-operator.md) and
