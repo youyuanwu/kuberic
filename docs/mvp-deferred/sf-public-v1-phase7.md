@@ -102,3 +102,10 @@
 - MVP alternative: Document fresh-state replacement, explicit old-state rejection, ordinary repository verification and a concise statement that any production activation is separately approved.
 - Revisit when: A concrete production-activation project is separately scoped and approved.
 - Evidence: User selected simplification candidate P7-SIM-04 on 2026-10-14 and explicitly requested an audit of all migration and compatibility content.
+
+### P7D-15: Restore the deleted PostgreSQL integration harness or historical test count
+- Status: DEFERRED
+- Reason: The removed harness mixes obsolete managed/compatibility behavior with active PostgreSQL safety checks. Restoring its architecture or targeting the former count would add duplicate fixtures and unsupported paths without defining another production defect class.
+- MVP alternative: Reconnect only named low-level tests that reach active production code and add the minimum current Public V1 real-PostgreSQL scenarios for basebackup cancellation, stale completion, production factory/fault behavior and one-writer topology transitions.
+- Revisit when: A concrete active PostgreSQL defect cannot be reproduced or detected through the retained low-level seams and bounded current Public V1 scenarios.
+- Evidence: The Phase 3 current-code completeness assessment found 20 active tests insufficient, while the subsequent simplicity guard required a risk-selected catalog rather than whole-module or historical-count restoration.
