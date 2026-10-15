@@ -957,7 +957,24 @@ fn persisted_completion_plans_every_terminal_effect_without_a_live_report() {
     );
     assert!(plan_persisted_public_v1_evidence(&empty).unwrap().is_none());
 
-    let mut crossed = rebuild_transition;
-    crossed.evidence.completed_operations[0].input_digest_sha256 = "ff".repeat(32);
-    assert!(plan_persisted_public_v1_evidence(&crossed).is_err());
+    let mut crossed_operation = rebuild_transition.clone();
+    crossed_operation.evidence.completed_operations[0].operation_id =
+        OperationId::new("another-operation");
+    assert!(plan_persisted_public_v1_evidence(&crossed_operation).is_err());
+
+    let mut crossed_session = rebuild_transition.clone();
+    crossed_session.evidence.completed_operations[0].process_session_id =
+        ProcessSessionId::new("another-session");
+    assert!(plan_persisted_public_v1_evidence(&crossed_session).is_err());
+
+    let mut crossed_digest = rebuild_transition.clone();
+    crossed_digest.evidence.completed_operations[0].input_digest_sha256 = "ff".repeat(32);
+    assert!(plan_persisted_public_v1_evidence(&crossed_digest).is_err());
+
+    let mut crossed_result = rebuild_transition;
+    crossed_result.evidence.completed_operations[0].result =
+        kuberic_runtime::protocol::public_operations::PublicV1AcceptedResult::Failed;
+    crossed_result.evidence.completed_operations[0].rebuild_required = None;
+    crossed_result.evidence.completed_operations[0].failure_detail = None;
+    assert!(plan_persisted_public_v1_evidence(&crossed_result).is_err());
 }

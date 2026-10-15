@@ -2230,7 +2230,6 @@ impl Replicator for StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
-        self.reconcile_provider_committed_tail().await?;
         let mut state = self.state.lock().await;
         if role == ReplicaRole::None {
             state.role = role;
@@ -2613,6 +2612,7 @@ impl StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.reconcile_provider_committed_tail().await?;
         let mut state = self.state.lock().await;
         if state.role != local_role
             || (state.role_epoch != Some(authority.epoch)

@@ -232,8 +232,7 @@ impl PodRuntime {
         A: StatefulServiceReplica + 'static,
         S: Send + Sync + 'static,
     {
-        let partition_id =
-            PartitionId::new(format!("partition-{}", identity.agent_generation.as_str()));
+        let partition_id = PartitionId::new(binding.resource_uid.as_str());
         let application: Arc<dyn StatefulServiceReplica> = application;
         Self {
             host: Arc::new_cyclic(|_weak_self| RuntimeHost {

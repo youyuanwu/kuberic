@@ -153,6 +153,39 @@ impl SqliteStore {
         })
     }
 
+    pub fn create_public_v1_with_application_paths(
+        path: impl AsRef<Path>,
+        preview: PublicV1Identity,
+        identity: StorageIdentity,
+        paths: std::collections::BTreeMap<String, PathBuf>,
+    ) -> crate::host::Result<Self> {
+        if !preview.is_public_v1() {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "public-v1 store requires protocol 11".into(),
+            ));
+        }
+        let resource_uid = identity.resource_uid.clone();
+        let mut state = super::state::AgentState::new(identity);
+        state.application_storage = Some(super::state::ApplicationStorageBinding {
+            paths,
+            initializing: true,
+        });
+        Ok(Self {
+            inner: Arc::new(
+                crate::host::sqlite_store::SqliteStore::create_replacement_authorized(
+                    path,
+                    super::convert(state),
+                    PublicV1LifecycleBinding {
+                        identity: preview,
+                        resource_uid,
+                        spec_generation: 1,
+                        state_persistence: StatePersistence::Persisted,
+                    },
+                )?,
+            ),
+        })
+    }
+
     pub fn open_public_v1(
         path: impl AsRef<Path>,
         preview: &PublicV1Identity,

@@ -3,6 +3,9 @@ use crate::durable::{PgDurableIdentity, StorageMode};
 use crate::testing::{
     ProcessProbe, allocate_port, find_pg_bin, native_configuration, native_identity, wrapped_pg_bin,
 };
+use kuberic_runtime::protocol::public_operations::{
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+};
 use kuberic_runtime::protocol::types::ResourceUid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -736,42 +739,246 @@ async fn run_stale_completion_scenario() {
     source.driver.public_close().await.unwrap();
 }
 
-async fn run_factory_and_fault_scenario() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+struct ProductionResolver;
 
-    let directory = OracleDataDir::new();
-    let permanent = Replica::new(directory.path().join("fault-permanent"), 81).await;
-    permanent.singleton(1).await;
-    let factory = crate::service::PgReplicatorFactory(permanent.driver.clone());
-    let interfaces = factory.interfaces();
-    assert!(interfaces.state_replicator().is_none());
-    assert!(interfaces.primary_replicator().is_some());
-    let process = ProcessProbe::postgres(permanent.driver.instance.data_dir());
-    let permanent_reports = Arc::new(AtomicUsize::new(0));
-    let observed = permanent_reports.clone();
-    let generation = permanent.driver.instance.generation_id();
-    let result = permanent
-        .driver
-        .instance
-        .handle_error(
-            PgError::Process("injected permanent provider fault".into())
-                .with_generation(generation),
-            Some(permanent.driver.instance.access_generation()),
-            move |fault, _| {
-                let observed = observed.clone();
-                async move {
-                    assert_eq!(fault, FaultType::Permanent);
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    RuntimeError::Application("permanent fault reported".into())
-                }
-            },
+impl kuberic_runtime::host::ReplicaEndpointResolver for ProductionResolver {
+    fn control_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+        "http://127.0.0.1:1".into()
+    }
+
+    fn replication_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+        "http://127.0.0.1:1".into()
+    }
+}
+
+fn host_address() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    address
+}
+
+struct ProductionService {
+    running: kuberic_runtime::host::RunningReplica,
+    driver: Arc<PgReplicator>,
+    store_path: std::path::PathBuf,
+    preview: kuberic_runtime::protocol::public_operations::PublicV1Identity,
+}
+
+impl ProductionService {
+    async fn fault(&self) -> Option<FaultType> {
+        kuberic_runtime::testing::sqlite_store::SqliteStore::open_public_v1(
+            &self.store_path,
+            &self.preview,
         )
-        .await;
+        .unwrap()
+        .load_state()
+        .await
+        .unwrap()
+        .reported_fault
+    }
+
+    async fn shutdown(mut self) {
+        self.running.shutdown();
+        self.running.wait().await.unwrap();
+    }
+}
+
+fn host_intent(
+    preview: &kuberic_runtime::protocol::public_operations::PublicV1Identity,
+    session: ProcessSessionId,
+    revision: u64,
+    name: &str,
+    program: PublicOperationProgram,
+) -> PublicOperationIntent {
+    PublicOperationIntent {
+        identity: preview.clone(),
+        operation_id: OperationId::new(name),
+        revision,
+        process_session_id: session,
+        class: PublicOperationClass::Authority,
+        input_digest: program.digest(),
+        replay_disposition: program.replay_disposition(),
+        lifecycle: None,
+        program: Some(program),
+    }
+}
+
+async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionService {
+    let resource_uid = ResourceUid::new(format!("production-resource-{id}"));
+    let pod_uid = kuberic_runtime::protocol::types::PodUid::new(format!("production-pod-{id}"));
+    let pvc_uid = kuberic_runtime::protocol::types::PvcUid::new(format!("production-pvc-{id}"));
+    let identity = native_identity(id, pod_uid.as_str());
+    let preview = kuberic_runtime::protocol::public_operations::PublicV1Identity::new(1);
+    let initialization_id = kuberic_runtime::protocol::types::derive_initialization_id(
+        &resource_uid,
+        identity.replica_id,
+        &pod_uid,
+        &pvc_uid,
+    );
+    let service_config = crate::service::PgServiceConfig {
+        resource_uid: resource_uid.clone(),
+        application_root: root.join("a"),
+        pg_data: root.join("d"),
+        pg_bin: find_pg_bin(),
+        pg_port: allocate_port().await,
+        replication_address: format!("http://{}", host_address()),
+    };
+    let application_paths = crate::service::PgService::storage_paths(&service_config);
+    let store_path =
+        kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(&root);
+    drop(
+        kuberic_runtime::testing::sqlite_store::SqliteStore::
+            create_public_v1_with_application_paths(
+            &store_path,
+            preview.clone(),
+            kuberic_runtime::testing::state::StorageIdentity {
+                schema_version: kuberic_runtime::testing::state::SCHEMA_VERSION,
+                resource_uid: resource_uid.clone(),
+                pod_uid: pod_uid.clone(),
+                pvc_uid: pvc_uid.clone(),
+                initialization_id,
+                local_identity: identity.clone(),
+                effective_policy: kuberic_runtime::protocol::types::EffectivePolicy::fixed(1, 30)
+                    .unwrap(),
+            },
+            application_paths.clone(),
+        )
+        .unwrap(),
+    );
+    let service = Arc::new(crate::service::PgService::deferred(service_config.clone()));
+    let running = kuberic_runtime::host::ReplicaHost::new(
+        kuberic_runtime::host::ReplicaProcessConfig {
+            resource_uid: resource_uid.clone(),
+            replica_id: identity.replica_id,
+            pod_uid,
+            pvc_uid,
+            data_root: root,
+            control_address: host_address(),
+            replication_address: host_address(),
+            bearer_token: "unused".into(),
+            rpc_deadline: Duration::from_secs(2),
+            transport_window_capacity: 8,
+        },
+        service.clone(),
+        kuberic_runtime::host::ApplicationStorageState::FreshEmpty,
+        Arc::new(ProductionResolver),
+    )
+    .with_application_storage_paths(application_paths)
+    .start()
+    .await
+    .unwrap();
+    let handle = running.handle();
+    let generation = kuberic_runtime::protocol::types::PublicProtocolGeneration::new(1);
+    let history_initialization = kuberic_runtime::protocol::types::derive_history_initialization_id(
+        &resource_uid,
+        generation,
+    );
+    let history = kuberic_runtime::protocol::types::derive_bootstrap_history(
+        &resource_uid,
+        generation,
+        &history_initialization,
+    );
+    let storage = kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext {
+        replica: identity.clone(),
+        storage: kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+            pod_uid: kuberic_runtime::protocol::types::PodUid::new(identity.instance_id.as_str()),
+            pvc_uid: kuberic_runtime::protocol::types::PvcUid::new(format!("production-pvc-{id}")),
+        },
+        storage_generation: kuberic_runtime::protocol::types::StorageGeneration::new(format!(
+            "production-storage-{id}"
+        )),
+    };
+    handle
+        .initialize_public_v1_history(&history_initialization, &history, &storage)
+        .await
+        .unwrap();
+    let epoch = Epoch::new(0, 1);
+    let configuration = native_configuration(std::slice::from_ref(&identity), 0, 1);
+    for (revision, name, program) in [
+        (
+            1,
+            "production-open",
+            PublicOperationProgram::Open {
+                replica: identity.clone(),
+                existing: false,
+            },
+        ),
+        (
+            2,
+            "production-role",
+            PublicOperationProgram::Role {
+                epoch,
+                role: ReplicaRole::Primary,
+            },
+        ),
+        (
+            3,
+            "production-epoch",
+            PublicOperationProgram::Epoch { epoch },
+        ),
+        (
+            4,
+            "production-configuration",
+            PublicOperationProgram::Configuration(
+                kuberic_runtime::protocol::public_operations::PublicConfiguration {
+                    current: configuration,
+                    previous: None,
+                    replicas: Vec::new(),
+                },
+            ),
+        ),
+    ] {
+        handle
+            .execute_public_v1(host_intent(
+                &preview,
+                handle.process_session_id(),
+                revision,
+                name,
+                program,
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    assert_eq!(handle.public_v1_provider_writer_count(), 0);
+    let driver = service.native_driver().clone();
+    ProductionService {
+        running,
+        driver,
+        store_path,
+        preview,
+    }
+}
+
+async fn run_factory_and_fault_scenario() {
+    let directory = OracleDataDir::new();
+    let permanent = production_service(directory.path().join("fault-permanent"), 81).await;
+    let process = ProcessProbe::postgres(permanent.driver.instance.data_dir());
+    let generation = permanent.driver.instance.generation_id();
+    let reporting = permanent.driver.clone();
     assert!(matches!(
-        result,
-        RuntimeError::Application(ref message) if message == "permanent fault reported"
+        permanent
+            .driver
+            .instance
+            .handle_error(
+                PgError::Process("injected permanent provider fault".into())
+                    .with_generation(generation),
+                Some(permanent.driver.instance.access_generation()),
+                move |fault, error| {
+                    let reporting = reporting.clone();
+                    async move { reporting.report(fault, error).await }
+                },
+            )
+            .await,
+        RuntimeError::Application(_)
     ));
-    assert_eq!(permanent_reports.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while permanent.fault().await != Some(FaultType::Permanent) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     process.assert_gone().await;
     assert!(
         permanent
@@ -781,50 +988,49 @@ async fn run_factory_and_fault_scenario() {
             .await
             .is_err()
     );
+    permanent.shutdown().await;
 
-    let transient = Replica::new(directory.path().join("fault-transient"), 82).await;
-    transient.singleton(1).await;
-    let transient_reports = Arc::new(AtomicUsize::new(0));
-    let observed = transient_reports.clone();
+    let transient = production_service(directory.path().join("fault-transient"), 82).await;
     let generation = transient.driver.instance.generation_id();
-    let result = transient
-        .driver
-        .instance
-        .handle_error(
-            PgError::Timeout("injected transient provider fault".into())
-                .with_generation(generation),
-            Some(transient.driver.instance.access_generation()),
-            move |fault, _| {
-                let observed = observed.clone();
-                async move {
-                    assert_eq!(fault, FaultType::Transient);
-                    observed.fetch_add(1, Ordering::SeqCst);
-                    RuntimeError::Application("transient fault reported".into())
-                }
-            },
-        )
-        .await;
-    assert!(matches!(result, RuntimeError::OperationCancelled));
-    assert_eq!(transient_reports.load(Ordering::SeqCst), 1);
+    let reporting = transient.driver.clone();
+    assert!(matches!(
+        transient
+            .driver
+            .instance
+            .handle_error(
+                PgError::Timeout("injected transient provider fault".into())
+                    .with_generation(generation),
+                Some(transient.driver.instance.access_generation()),
+                move |fault, error| {
+                    let reporting = reporting.clone();
+                    async move { reporting.report(fault, error).await }
+                },
+            )
+            .await,
+        RuntimeError::OperationCancelled
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transient.fault().await != Some(FaultType::Transient) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    transient.shutdown().await;
 
-    let stale = Replica::new(directory.path().join("fault-stale"), 83).await;
-    stale.singleton(1).await;
+    let stale = production_service(directory.path().join("fault-stale"), 83).await;
     let old_generation = stale.driver.instance.generation_id();
     let gate = stale.driver.instance.pause_error_handling();
-    let reports = Arc::new(AtomicUsize::new(0));
-    let observed = reports.clone();
+    let reporting = stale.driver.clone();
     let instance = stale.driver.instance.clone();
     let old = tokio::spawn(async move {
         instance
             .handle_error(
                 PgError::Process("delayed retired fault".into()).with_generation(old_generation),
                 None,
-                move |_, _| {
-                    let observed = observed.clone();
-                    async move {
-                        observed.fetch_add(1, Ordering::SeqCst);
-                        RuntimeError::Application("stale fault reported".into())
-                    }
+                move |fault, error| {
+                    let reporting = reporting.clone();
+                    async move { reporting.report(fault, error).await }
                 },
             )
             .await
@@ -838,8 +1044,9 @@ async fn run_factory_and_fault_scenario() {
         old.await.unwrap(),
         RuntimeError::OperationCancelled
     ));
-    assert_eq!(reports.load(Ordering::SeqCst), 0);
+    assert_eq!(stale.fault().await, None);
     assert_eq!(stale.driver.instance.generation_id(), successor_generation);
+    stale.shutdown().await;
 }
 
 async fn build_and_admit(primary: &Replica, secondary: &Replica, epoch: i64, operation: &str) {
