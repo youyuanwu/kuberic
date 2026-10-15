@@ -9,7 +9,8 @@ use kuberic_controller::evaluator::testing::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
     PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1OperationApi,
     PublicV1ReconciliationOutcome, PublicV1ResourceAuthority, PublicV1ResourceDisposition,
-    PublicV1ResourceProof, execute_public_v1_operation, reconcile_public_v1_consumer,
+    PublicV1ResourceProof, execute_public_v1_operation, plan_persisted_public_v1_evidence,
+    reconcile_public_v1_consumer,
 };
 use kuberic_runtime::protocol::command::{ProtocolCommand, PublicV1OperationCommand};
 use kuberic_runtime::protocol::public_operations::{
@@ -863,4 +864,100 @@ async fn persisted_completion_must_remain_exact_on_later_reconciliation() {
             .is_err()
     );
     assert!(state.effects().is_empty());
+}
+
+#[test]
+fn persisted_completion_plans_every_terminal_effect_without_a_live_report() {
+    let cases = [
+        (
+            PublicV1EvidenceConsumer::Topology,
+            PublicV1CallKind::Role,
+            PublicV1OperationResult::Succeeded,
+            "accept",
+        ),
+        (
+            PublicV1EvidenceConsumer::Removal,
+            PublicV1CallKind::Remove,
+            PublicV1OperationResult::Succeeded,
+            "retire",
+        ),
+        (
+            PublicV1EvidenceConsumer::Topology,
+            PublicV1CallKind::Role,
+            PublicV1OperationResult::Failed("failed".into()),
+            "retire",
+        ),
+    ];
+    for (index, (consumer, call_kind, result, expected)) in cases.into_iter().enumerate() {
+        let mut accepted = accepted();
+        let completion = completion(&accepted, &format!("persisted-{index}"), call_kind, result);
+        accepted
+            .completed_operations
+            .push(PublicV1AcceptedOperationCompletion::from_completion(
+                &completion,
+            ));
+        let target = (call_kind == PublicV1CallKind::Remove).then(|| PublicV1ResourceAuthority {
+            storage_incarnation: storage(2),
+            resource_version: "target-rv-1".into(),
+        });
+        let transition = transition(accepted, consumer, &completion, target);
+        let plan = plan_persisted_public_v1_evidence(&transition)
+            .unwrap()
+            .expect("persisted terminal completion");
+        assert!(
+            matches!(
+                (&plan, expected),
+                (kuberic_controller::evaluator::testing::PublicV1EvidencePlan::Accept { .. }, "accept")
+                    | (
+                        kuberic_controller::evaluator::testing::PublicV1EvidencePlan::RetireExactIncarnation { .. },
+                        "retire"
+                    )
+            ),
+            "unexpected persisted plan for {expected}: {plan:?}"
+        );
+    }
+
+    let mut rebuild_accepted = accepted();
+    let rebuild = rebuild(&rebuild_accepted, "persisted-rebuild");
+    let rebuild_completion = completion(
+        &rebuild_accepted,
+        "persisted-rebuild",
+        PublicV1CallKind::Build,
+        PublicV1OperationResult::RebuildRequired(Box::new(rebuild)),
+    );
+    rebuild_accepted.completed_operations.push(
+        PublicV1AcceptedOperationCompletion::from_completion(&rebuild_completion),
+    );
+    let rebuild_transition = transition(
+        rebuild_accepted,
+        PublicV1EvidenceConsumer::RepairReplacement,
+        &rebuild_completion,
+        Some(PublicV1ResourceAuthority {
+            storage_incarnation: storage(2),
+            resource_version: "target-rv-1".into(),
+        }),
+    );
+    assert!(matches!(
+        plan_persisted_public_v1_evidence(&rebuild_transition)
+            .unwrap()
+            .unwrap(),
+        kuberic_controller::evaluator::testing::PublicV1EvidencePlan::ProvisionReplacement { .. }
+    ));
+
+    let empty = transition(
+        accepted(),
+        PublicV1EvidenceConsumer::Topology,
+        &completion(
+            &accepted(),
+            "not-completed",
+            PublicV1CallKind::Role,
+            PublicV1OperationResult::Succeeded,
+        ),
+        None,
+    );
+    assert!(plan_persisted_public_v1_evidence(&empty).unwrap().is_none());
+
+    let mut crossed = rebuild_transition;
+    crossed.evidence.completed_operations[0].input_digest_sha256 = "ff".repeat(32);
+    assert!(plan_persisted_public_v1_evidence(&crossed).is_err());
 }

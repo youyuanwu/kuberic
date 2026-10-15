@@ -179,6 +179,7 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
 }
 
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const LISTENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicV1DataServiceRegistration {
     ReplicationData,
@@ -302,6 +303,22 @@ struct EngineState {
 struct ListenerOwner {
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<()>>,
+}
+
+async fn drain_listener(owner: ListenerOwner) -> Result<()> {
+    drain_listener_with_timeout(owner, LISTENER_SHUTDOWN_TIMEOUT).await
+}
+
+async fn drain_listener_with_timeout(mut owner: ListenerOwner, timeout: Duration) -> Result<()> {
+    owner.shutdown.send_replace(true);
+    match tokio::time::timeout(timeout, &mut owner.task).await {
+        Ok(result) => result.map_err(|error| RuntimeError::Application(error.to_string()))?,
+        Err(_) => {
+            owner.task.abort();
+            let _ = owner.task.await;
+            Err(RuntimeError::OperationCancelled)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2213,6 +2230,7 @@ impl Replicator for StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.reconcile_provider_committed_tail().await?;
         let mut state = self.state.lock().await;
         if role == ReplicaRole::None {
             state.role = role;
@@ -2308,18 +2326,8 @@ impl Replicator for StatelessReplicator {
             .take();
         self.abort_listener();
         self.streams.shutdown();
-        if let Some(mut owner) = owner {
-            owner.shutdown.send_replace(true);
-            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut owner.task).await {
-                Ok(result) => {
-                    result.map_err(|error| RuntimeError::Application(error.to_string()))??
-                }
-                Err(_) => {
-                    owner.task.abort();
-                    let _ = owner.task.await;
-                    return Err(RuntimeError::OperationCancelled);
-                }
-            }
+        if let Some(owner) = owner {
+            drain_listener(owner).await?;
         }
         Ok(())
     }
@@ -2881,7 +2889,10 @@ fn runtime_status(error: RuntimeError) -> Status {
 
 #[cfg(test)]
 mod task_registry_tests {
-    use super::TaskRegistry;
+    use super::{
+        LISTENER_SHUTDOWN_TIMEOUT, ListenerOwner, RuntimeError, TaskRegistry,
+        drain_listener_with_timeout,
+    };
     use std::time::Duration;
 
     #[tokio::test]
@@ -2910,5 +2921,20 @@ mod task_registry_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_uses_the_exact_five_second_deadline() {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(std::future::pending::<super::Result<()>>());
+        assert!(matches!(
+            drain_listener_with_timeout(
+                ListenerOwner { shutdown, task },
+                Duration::from_millis(10)
+            )
+            .await,
+            Err(RuntimeError::OperationCancelled)
+        ));
+        assert_eq!(LISTENER_SHUTDOWN_TIMEOUT, Duration::from_secs(5));
     }
 }

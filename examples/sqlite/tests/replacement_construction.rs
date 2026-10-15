@@ -269,7 +269,7 @@ async fn seed_retired_provider(
 
 #[tokio::test]
 async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(270), async {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()

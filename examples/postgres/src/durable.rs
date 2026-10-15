@@ -936,7 +936,7 @@ pub enum PgDurableError {
     Json(serde_json::Error),
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use kuberic_runtime::protocol::types::{AgentGeneration, ReplicaId, ReplicaInstanceId};
 

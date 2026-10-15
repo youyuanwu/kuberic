@@ -28,6 +28,9 @@ use crate::build::{
 use crate::durable::{PgDurableRole, PgDurableState, PgDurableStore, PgRecoveryState};
 use crate::instance::{PgError, PgInstanceManager};
 use crate::native::{PgNativeObserver, compile_synchronous_configuration, timeline_history_digest};
+#[cfg(test)]
+#[path = "build_deletion_selected_tests.rs"]
+mod build_deletion_selected_tests;
 #[cfg(any())]
 #[path = "build_deletion_tests.rs"]
 mod build_deletion_tests;

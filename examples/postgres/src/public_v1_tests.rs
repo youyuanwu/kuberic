@@ -1,6 +1,8 @@
 use super::*;
 use crate::durable::{PgDurableIdentity, StorageMode};
-use crate::testing::{allocate_port, find_pg_bin, native_configuration, native_identity};
+use crate::testing::{
+    ProcessProbe, allocate_port, find_pg_bin, native_configuration, native_identity, wrapped_pg_bin,
+};
 use kuberic_runtime::protocol::types::ResourceUid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -257,9 +259,26 @@ impl Drop for OracleDataDir {
 
 impl Replica {
     async fn new(root: std::path::PathBuf, id: i64) -> Self {
+        Self::new_incarnation(
+            root,
+            id,
+            &format!("public-{id}"),
+            &format!("session-{id}"),
+            find_pg_bin(),
+        )
+        .await
+    }
+
+    async fn new_incarnation(
+        root: std::path::PathBuf,
+        id: i64,
+        incarnation: &str,
+        session: &str,
+        pg_bin: std::path::PathBuf,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
-        let identity = native_identity(id, &format!("public-{id}"));
+        let identity = native_identity(id, incarnation);
         let resource = ResourceUid::new("postgres-public-oracle");
         let durable = Arc::new(
             PgDurableStore::open(
@@ -275,7 +294,7 @@ impl Replica {
         );
         let instance = Arc::new(PgInstanceManager::new(
             root.join("d"),
-            find_pg_bin(),
+            pg_bin,
             allocate_port().await,
         ));
         let (fault_tx, _fault_rx) = mpsc::channel(8);
@@ -294,7 +313,7 @@ impl Replica {
             )
             .await,
         );
-        let session = ProcessSessionId::new(format!("session-{id}"));
+        let session = ProcessSessionId::new(session);
         assert!(
             driver
                 .public_v1
@@ -376,6 +395,18 @@ impl Drop for Replica {
         self.driver.abort();
         self.server.abort();
     }
+}
+
+#[tokio::test]
+async fn production_factory_returns_no_parallel_state_replicator() {
+    let directory = OracleDataDir::new();
+    let replica = Replica::new(directory.path().join("factory"), 51).await;
+    let factory = crate::service::PgReplicatorFactory(replica.driver.clone());
+    let interfaces = factory.interfaces();
+    assert!(interfaces.state_replicator().is_none());
+    assert!(interfaces.primary_replicator().is_some());
+    let control: Arc<dyn Replicator> = replica.driver.clone();
+    assert!(Arc::ptr_eq(&interfaces.replicator(), &control));
 }
 
 struct TestService(Arc<PgReplicator>);
@@ -542,6 +573,485 @@ pub(crate) async fn public_v1_postgres_data_loss_history_and_replay() {
 
 pub(crate) async fn public_v1_postgres_contained_close() {
     run_bounded_oracle_scenario(OracleScenario::ContainedClose).await;
+}
+
+pub(crate) async fn public_v1_postgres_basebackup_cancellation_and_retry() {
+    tokio::time::timeout(
+        Duration::from_secs(270),
+        run_basebackup_cancellation_and_retry(),
+    )
+    .await
+    .expect("PostgreSQL basebackup cancellation scenario exceeded its 270-second bound");
+}
+
+pub(crate) async fn public_v1_postgres_stale_completion_cannot_mutate_successor() {
+    tokio::time::timeout(Duration::from_secs(270), run_stale_completion_scenario())
+        .await
+        .expect("PostgreSQL stale-completion scenario exceeded its 270-second bound");
+}
+
+pub(crate) async fn public_v1_postgres_production_factory_and_fault_boundary() {
+    tokio::time::timeout(Duration::from_secs(270), run_factory_and_fault_scenario())
+        .await
+        .expect("PostgreSQL factory/fault scenario exceeded its 270-second bound");
+}
+
+pub(crate) async fn public_v1_postgres_failover_switchover_and_replacement() {
+    tokio::time::timeout(Duration::from_secs(270), run_topology_scenario())
+        .await
+        .expect("PostgreSQL topology scenario exceeded its 270-second bound");
+}
+
+async fn run_basebackup_cancellation_and_retry() {
+    let directory = OracleDataDir::new();
+    let source = Replica::new(directory.path().join("basebackup-source"), 61).await;
+    source.singleton(1).await;
+    let (sql, connection) = source.driver.instance.connect_application().await.unwrap();
+    sql.batch_execute(
+        "CREATE TABLE basebackup_cancel(id integer primary key, payload text);
+         INSERT INTO basebackup_cancel
+         SELECT value, repeat('x', 4096) FROM generate_series(1, 256) AS value",
+    )
+    .await
+    .unwrap();
+    drop(sql);
+    connection.abort();
+
+    let gate = directory.path().join("hold-basebackup");
+    let marker = directory.path().join("basebackup-child");
+    std::fs::write(&gate, b"hold").unwrap();
+    let real = find_pg_bin().join("pg_basebackup");
+    let script = format!(
+        "#!/bin/sh\n\"{}\" \"$@\" &\nchild=$!\nprintf '%s' \"$child\" > \"{}\"\nwhile [ -e \"{}\" ]; do sleep 0.05; done\nwait \"$child\"\n",
+        real.display(),
+        marker.display(),
+        gate.display()
+    );
+    let wrapped = wrapped_pg_bin(directory.path(), "pg_basebackup", &script);
+    let target = Replica::new_incarnation(
+        directory.path().join("basebackup-target"),
+        62,
+        "public-basebackup-target",
+        "session-basebackup-target",
+        wrapped,
+    )
+    .await;
+    target.role(1, ReplicaRole::IdleSecondary).await;
+    let binding = BindingFactory::new().build(&source, &target, "cancel-real-basebackup");
+    let driver = source.driver.clone();
+    let replica = build_replica(&binding);
+    let build = tokio::spawn(async move { driver.build_replica(replica).await });
+    let pid = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = pid.parse()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real pg_basebackup did not start");
+    let process = ProcessProbe::process(pid);
+    build.abort();
+    assert!(build.await.unwrap_err().is_cancelled());
+    process.assert_gone().await;
+    std::fs::remove_file(&gate).unwrap();
+    source
+        .driver
+        .build_replica(build_replica(&binding))
+        .await
+        .unwrap();
+    assert!(target.driver.current_progress().await.unwrap() > 0);
+    target.driver.public_close().await.unwrap();
+    source.driver.public_close().await.unwrap();
+}
+
+async fn run_stale_completion_scenario() {
+    let directory = OracleDataDir::new();
+    let source = Replica::new(directory.path().join("stale-source"), 71).await;
+    let target = Replica::new(directory.path().join("stale-target"), 72).await;
+    source.singleton(1).await;
+    let (sql, connection) = source.driver.instance.connect_application().await.unwrap();
+    sql.batch_execute(
+        "CREATE TABLE stale_completion(id integer primary key);
+         INSERT INTO stale_completion VALUES (1)",
+    )
+    .await
+    .unwrap();
+    drop(sql);
+    connection.abort();
+    target.role(1, ReplicaRole::IdleSecondary).await;
+    let bindings = BindingFactory::new();
+    let old = bindings.build(&source, &target, "stale-completion");
+    let gate = target.driver.pause_public_build_completion();
+    let driver = source.driver.clone();
+    let replica = build_replica(&old);
+    let build = tokio::spawn(async move { driver.build_replica(replica).await });
+    tokio::time::timeout(Duration::from_secs(90), gate.entered.notified())
+        .await
+        .expect("build did not reach delayed completion");
+    let successor = target.root.join("successor-owned");
+    std::fs::write(&successor, b"successor").unwrap();
+    target
+        .driver
+        .public_owner()
+        .fence
+        .update(|context| context.epoch = Epoch::new(0, 2))
+        .unwrap();
+    gate.release.notify_one();
+    assert!(build.await.unwrap().is_err());
+    assert_eq!(std::fs::read(&successor).unwrap(), b"successor");
+    assert!(
+        source
+            .driver
+            .durable
+            .snapshot()
+            .await
+            .outbound_builds
+            .iter()
+            .all(|progress| progress.request.authority.build_id != old.build_id)
+    );
+    source.change_role(2, ReplicaRole::Primary).await;
+    source.epoch(2).await;
+    let successor_target = Replica::new_incarnation(
+        directory.path().join("stale-successor"),
+        72,
+        "public-72-successor",
+        "session-72-successor",
+        find_pg_bin(),
+    )
+    .await;
+    successor_target.role(2, ReplicaRole::IdleSecondary).await;
+    let retry = bindings.build(&source, &successor_target, "successor-completion");
+    source
+        .driver
+        .build_replica(build_replica(&retry))
+        .await
+        .unwrap();
+    assert!(successor_target.driver.current_progress().await.unwrap() > 0);
+    successor_target.driver.public_close().await.unwrap();
+    target.driver.public_close().await.unwrap();
+    source.driver.public_close().await.unwrap();
+}
+
+async fn run_factory_and_fault_scenario() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let directory = OracleDataDir::new();
+    let permanent = Replica::new(directory.path().join("fault-permanent"), 81).await;
+    permanent.singleton(1).await;
+    let factory = crate::service::PgReplicatorFactory(permanent.driver.clone());
+    let interfaces = factory.interfaces();
+    assert!(interfaces.state_replicator().is_none());
+    assert!(interfaces.primary_replicator().is_some());
+    let process = ProcessProbe::postgres(permanent.driver.instance.data_dir());
+    let permanent_reports = Arc::new(AtomicUsize::new(0));
+    let observed = permanent_reports.clone();
+    let generation = permanent.driver.instance.generation_id();
+    let result = permanent
+        .driver
+        .instance
+        .handle_error(
+            PgError::Process("injected permanent provider fault".into())
+                .with_generation(generation),
+            Some(permanent.driver.instance.access_generation()),
+            move |fault, _| {
+                let observed = observed.clone();
+                async move {
+                    assert_eq!(fault, FaultType::Permanent);
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    RuntimeError::Application("permanent fault reported".into())
+                }
+            },
+        )
+        .await;
+    assert!(matches!(
+        result,
+        RuntimeError::Application(ref message) if message == "permanent fault reported"
+    ));
+    assert_eq!(permanent_reports.load(Ordering::SeqCst), 1);
+    process.assert_gone().await;
+    assert!(
+        permanent
+            .driver
+            .instance
+            .connect_application()
+            .await
+            .is_err()
+    );
+
+    let transient = Replica::new(directory.path().join("fault-transient"), 82).await;
+    transient.singleton(1).await;
+    let transient_reports = Arc::new(AtomicUsize::new(0));
+    let observed = transient_reports.clone();
+    let generation = transient.driver.instance.generation_id();
+    let result = transient
+        .driver
+        .instance
+        .handle_error(
+            PgError::Timeout("injected transient provider fault".into())
+                .with_generation(generation),
+            Some(transient.driver.instance.access_generation()),
+            move |fault, _| {
+                let observed = observed.clone();
+                async move {
+                    assert_eq!(fault, FaultType::Transient);
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    RuntimeError::Application("transient fault reported".into())
+                }
+            },
+        )
+        .await;
+    assert!(matches!(result, RuntimeError::OperationCancelled));
+    assert_eq!(transient_reports.load(Ordering::SeqCst), 1);
+
+    let stale = Replica::new(directory.path().join("fault-stale"), 83).await;
+    stale.singleton(1).await;
+    let old_generation = stale.driver.instance.generation_id();
+    let gate = stale.driver.instance.pause_error_handling();
+    let reports = Arc::new(AtomicUsize::new(0));
+    let observed = reports.clone();
+    let instance = stale.driver.instance.clone();
+    let old = tokio::spawn(async move {
+        instance
+            .handle_error(
+                PgError::Process("delayed retired fault".into()).with_generation(old_generation),
+                None,
+                move |_, _| {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        RuntimeError::Application("stale fault reported".into())
+                    }
+                },
+            )
+            .await
+    });
+    gate.entered.notified().await;
+    stale.driver.instance.prepare_native_build().await.unwrap();
+    let successor_generation = stale.driver.instance.generation_id();
+    assert!(successor_generation > old_generation);
+    gate.release.notify_one();
+    assert!(matches!(
+        old.await.unwrap(),
+        RuntimeError::OperationCancelled
+    ));
+    assert_eq!(reports.load(Ordering::SeqCst), 0);
+    assert_eq!(stale.driver.instance.generation_id(), successor_generation);
+}
+
+async fn build_and_admit(primary: &Replica, secondary: &Replica, epoch: i64, operation: &str) {
+    secondary.role(epoch, ReplicaRole::IdleSecondary).await;
+    let bindings = BindingFactory::new();
+    let build = bindings.build(primary, secondary, operation);
+    primary
+        .driver
+        .build_replica(build_replica(&build))
+        .await
+        .unwrap();
+    secondary.role(epoch, ReplicaRole::ActiveSecondary).await;
+    secondary
+        .driver
+        .public_application_role(ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    let members = [primary.identity.clone(), secondary.identity.clone()];
+    let current = native_configuration(&members, 0, epoch);
+    let peer = bindings.peer(primary, secondary, &current, None);
+    primary
+        .driver
+        .public_configuration(
+            ReplicaSetConfiguration {
+                configuration: current,
+                replicas: vec![peer_replica(&peer)],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if PrimaryReplicator::wait_for_catch_up_quorum(
+                primary.driver.as_ref(),
+                ReplicaSetQuorumMode::All,
+            )
+            .await
+            .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("pair catch-up did not converge");
+}
+
+async fn application(replica: &Replica) -> tokio_postgres::Client {
+    stage("PostgreSQL application access", async {
+        loop {
+            if let Ok((client, connection)) = replica.driver.instance.connect_application().await {
+                tokio::spawn(connection);
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+}
+
+async fn row_count(replica: &Replica) -> i64 {
+    application(replica)
+        .await
+        .query_one("SELECT count(*) FROM topology_data", &[])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+async fn run_topology_scenario() {
+    let directory = OracleDataDir::new();
+    let source = Replica::new_incarnation(
+        directory.path().join("topology-source"),
+        91,
+        "topology-source-1",
+        "topology-source-session-1",
+        find_pg_bin(),
+    )
+    .await;
+    let target = Replica::new_incarnation(
+        directory.path().join("topology-target"),
+        92,
+        "topology-target-1",
+        "topology-target-session-1",
+        find_pg_bin(),
+    )
+    .await;
+    source.singleton(1).await;
+    let source_writer = application(&source).await;
+    source_writer
+        .batch_execute(
+            "CREATE TABLE topology_data(id integer primary key);
+             INSERT INTO topology_data VALUES (1)",
+        )
+        .await
+        .unwrap();
+    build_and_admit(&source, &target, 1, "topology-initial-build").await;
+    assert_eq!(row_count(&target).await, 1);
+    assert!(
+        application(&target)
+            .await
+            .execute("INSERT INTO topology_data VALUES (99)", &[])
+            .await
+            .is_err()
+    );
+
+    source
+        .driver
+        .public_application_role(ReplicaRole::None)
+        .await
+        .unwrap();
+    assert!(source_writer.simple_query("SELECT 1").await.is_err());
+    target.change_role(2, ReplicaRole::Primary).await;
+    target.epoch(2).await;
+    target
+        .driver
+        .public_application_role(ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let target_singleton = native_configuration(std::slice::from_ref(&target.identity), 0, 2);
+    target
+        .driver
+        .public_configuration(target_singleton.into(), None)
+        .await
+        .unwrap();
+    let target_writer = application(&target).await;
+    target_writer
+        .execute("INSERT INTO topology_data VALUES (2)", &[])
+        .await
+        .unwrap();
+    assert_eq!(row_count(&target).await, 2);
+
+    let source_replacement = Replica::new_incarnation(
+        directory.path().join("topology-source-replacement"),
+        91,
+        "topology-source-2",
+        "topology-source-session-2",
+        find_pg_bin(),
+    )
+    .await;
+    build_and_admit(
+        &target,
+        &source_replacement,
+        2,
+        "topology-source-replacement-build",
+    )
+    .await;
+    assert_eq!(row_count(&source_replacement).await, 2);
+
+    target
+        .driver
+        .public_application_role(ReplicaRole::None)
+        .await
+        .unwrap();
+    assert!(target_writer.simple_query("SELECT 1").await.is_err());
+    source_replacement
+        .change_role(3, ReplicaRole::Primary)
+        .await;
+    source_replacement.epoch(3).await;
+    source_replacement
+        .driver
+        .public_application_role(ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let replacement_singleton =
+        native_configuration(std::slice::from_ref(&source_replacement.identity), 0, 3);
+    source_replacement
+        .driver
+        .public_configuration(replacement_singleton.into(), None)
+        .await
+        .unwrap();
+    let replacement_writer = application(&source_replacement).await;
+    replacement_writer
+        .execute("INSERT INTO topology_data VALUES (3)", &[])
+        .await
+        .unwrap();
+
+    let target_replacement = Replica::new_incarnation(
+        directory.path().join("topology-target-replacement"),
+        92,
+        "topology-target-2",
+        "topology-target-session-2",
+        find_pg_bin(),
+    )
+    .await;
+    build_and_admit(
+        &source_replacement,
+        &target_replacement,
+        3,
+        "topology-target-replacement-build",
+    )
+    .await;
+    assert_eq!(row_count(&target_replacement).await, 3);
+    let replacement_writer = application(&source_replacement).await;
+    replacement_writer
+        .execute("INSERT INTO topology_data VALUES (4)", &[])
+        .await
+        .unwrap();
+    assert_eq!(row_count(&target_replacement).await, 4);
+    assert!(
+        application(&target_replacement)
+            .await
+            .execute("INSERT INTO topology_data VALUES (100)", &[])
+            .await
+            .is_err()
+    );
+    target_replacement.driver.public_close().await.unwrap();
+    source_replacement.driver.public_close().await.unwrap();
+    target.driver.public_close().await.unwrap();
+    source.driver.public_close().await.unwrap();
 }
 
 async fn run_bounded_oracle_scenario(scenario: OracleScenario) {

@@ -10,7 +10,7 @@ struct ClockState {
     error: Option<PgError>,
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::durable::{PgDurableIdentity, StorageMode};

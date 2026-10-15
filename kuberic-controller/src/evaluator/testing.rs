@@ -4,7 +4,8 @@ use super::EvaluationConfig;
 
 pub use super::public_v1_evidence::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
-    PublicV1EvidencePlan, PublicV1ResourceAuthority, plan_public_v1_evidence,
+    PublicV1EvidencePlan, PublicV1ResourceAuthority, plan_persisted_public_v1_evidence,
+    plan_public_v1_evidence,
 };
 pub use super::public_v1_history::{
     PublicV1ElectionStatus, PublicV1HistoryPlan,

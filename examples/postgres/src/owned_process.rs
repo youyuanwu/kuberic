@@ -534,7 +534,7 @@ impl OwnedProcess {
     }
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -543,7 +543,7 @@ mod tests {
         OwnedProcess::spawn(Command::new("sh").args(["-c", script])).unwrap()
     }
 
-    #[cfg(feature = "testing")]
+    #[cfg(any())]
     #[tokio::test]
     async fn exhausted_fast_shutdown_budget_requires_proven_escalation() {
         let data = crate::testing::TestDataDir::new("stop-budget");
@@ -586,6 +586,7 @@ mod tests {
         owned.stop(data.path()).unwrap();
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn undispatched_supervisor_cannot_launch_after_cleanup() {
         let mut owned = supervisor("exec sleep 30");
@@ -596,6 +597,7 @@ mod tests {
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn signalled_supervisor_is_never_successful_cleanup() {
         let mut owned = supervisor("exec sleep 30");
@@ -610,6 +612,7 @@ mod tests {
         assert!(owned.processes[0].reaped().unwrap());
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn exited_pidfd_is_not_proof_of_reaping() {
         // A std Child is not registered with Tokio's orphan reaper.
@@ -708,6 +711,7 @@ mod tests {
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
+    #[cfg(any())]
     #[tokio::test]
     async fn live_launcher_does_not_delay_reaping_adopted_children() {
         let mut owned = supervisor("sh -c 'sleep 30 & echo $!'; sleep 30");

@@ -90,7 +90,8 @@ impl<'a> PgAccessController<'a> {
     }
 }
 
-#[cfg(any())]
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::testing::{ProcessProbe, TestDataDir, allocate_port, find_pg_bin};

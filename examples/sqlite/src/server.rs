@@ -49,6 +49,10 @@ impl SqliteServer {
                     if application.barrier().is_fenced() {
                         return Err(unknown("local publication was interrupted"));
                     }
+                    if let Err(reason) = require_advanced_publication(before, lsn) {
+                        application.barrier().fence_unknown(reason);
+                        return Err(unknown(reason));
+                    }
                     if let Err(error) = application.persistence().confirm_publication(lsn) {
                         application.barrier().fence_unknown(&error.to_string());
                         return Err(unknown(&error.to_string()));
@@ -78,6 +82,13 @@ impl SqliteServer {
             }
         }
     }
+}
+
+fn require_advanced_publication(before: i64, published: i64) -> Result<(), &'static str> {
+    if published <= before {
+        return Err("replication returned a non-advancing publication receipt");
+    }
+    Ok(())
 }
 
 fn unavailable(error: kuberic_runtime::RuntimeError) -> Status {
@@ -186,5 +197,17 @@ fn proto_value(value: rusqlite::types::Value) -> proto::Value {
     proto::Value {
         is_null: kind.is_none(),
         kind,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_advanced_publication;
+
+    #[test]
+    fn successful_publication_must_advance_the_committed_watermark() {
+        assert!(require_advanced_publication(3, 4).is_ok());
+        assert!(require_advanced_publication(3, 3).is_err());
+        assert!(require_advanced_publication(3, 2).is_err());
     }
 }

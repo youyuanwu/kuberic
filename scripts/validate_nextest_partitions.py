@@ -19,6 +19,9 @@ KIND_PACKAGE = "kuberic-level-tests"
 KIND_PREFIX = "level_triggered_k8s::"
 DEX_LIVE_BINARY = "kuberic-dex::kubernetes_checkpoint_real"
 EXPECTED_KIND_LIVE_COUNT = 3
+POSTGRES_PACKAGE = "postgres-replicated"
+POSTGRES_LIBRARY_BINARY = "postgres-replicated"
+POSTGRES_MAIN_BINARY = "postgres-replicated::bin/postgres-replicated"
 
 
 @dataclass(frozen=True, order=True)
@@ -48,12 +51,78 @@ BUILD_ONLY_TESTS = {
     ),
 }
 
+def postgres_test(name: str, binary: str = POSTGRES_LIBRARY_BINARY) -> TestId:
+    return TestId(POSTGRES_PACKAGE, binary, name)
+
+
+POSTGRES_CATALOG = {
+    "PG-R01": postgres_test("tests::public_v1_postgres_primary_lifecycle_and_joint_configuration"),
+    "PG-R02": postgres_test("tests::public_v1_postgres_build_cancellation_and_retirement"),
+    "PG-R03": postgres_test("tests::public_v1_postgres_data_loss_history_and_replay"),
+    "PG-R04": postgres_test("tests::public_v1_postgres_contained_close"),
+    "PG-N01": postgres_test("tests::public_v1_postgres_basebackup_cancellation_and_retry"),
+    "PG-N02": postgres_test("tests::public_v1_postgres_stale_completion_cannot_mutate_successor"),
+    "PG-N03": postgres_test("tests::public_v1_postgres_production_factory_and_fault_boundary"),
+    "PG-N04": postgres_test("tests::public_v1_postgres_failover_switchover_and_replacement"),
+    "PG-L01": postgres_test("owned_process::tests::cancellation_racing_start_still_reaps_the_launched_tree"),
+    "PG-L02": postgres_test("owned_process::tests::successful_supervisor_exit_cannot_hide_an_unreaped_descendant"),
+    "PG-L03": postgres_test("owned_process::tests::exited_pidfd_never_signals_a_replacement_numeric_pid"),
+    "PG-L04": postgres_test("owned_process::tests::unresponsive_owned_child_is_killed_and_reaped_without_pid_file"),
+    "PG-L05": postgres_test("access::tests::cancelled_hba_grant_cannot_overwrite_successor_closed_generation"),
+    "PG-L06": postgres_test("access::tests::cancelled_grant_remains_fence_required"),
+    "PG-L07": postgres_test("adapter::build_deletion_selected_tests::pgdata_deletion_supersession_reaps_before_successor_configuration"),
+    "PG-L08": postgres_test("adapter::build_deletion_selected_tests::pgdata_deletion_timeout_reaps_before_same_build_retry"),
+    "PG-L09": postgres_test("adapter::build_deletion_selected_tests::pgdata_deletion_io_failure_is_reported_and_partial_copy_retried"),
+    "PG-L10": postgres_test("adapter::build_deletion_selected_tests::pgdata_deletion_release_executes_removals_without_following_symlinks"),
+    "PG-L11": postgres_test("generation::tests::process_clock_never_reuses_ownership_after_reopen_or_exhaustion"),
+    "PG-L12": postgres_test("generation::tests::initialized_process_clock_is_not_recreated_after_loss_or_corruption"),
+    "PG-L13": postgres_test("durable::tests::exhausted_policy_and_metadata_generations_remain_fenced_after_reopen"),
+    "PG-L14": postgres_test("durable::tests::durable_validation_rejects_version_progress_and_fence_mismatches"),
+    "PG-L15": postgres_test("adapter::public_v1::tests::production_factory_returns_no_parallel_state_replicator"),
+    "PG-L16": postgres_test("instance::tests::granted_primary_role_mismatch_reports_permanent_before_returning_error"),
+    "PG-L17": postgres_test("instance::tests::retired_role_mismatch_cannot_fault_successor"),
+}
+
+POSTGRES_AUXILIARY_TESTS = {
+    postgres_test("adapter::public_transport::tests::peer_gateway_accepts_only_the_authorized_physical_slot"),
+    postgres_test("adapter::public_v1::tests::public_v1_process_fence_rejects_same_epoch_session_and_address_substitution"),
+    postgres_test("adapter::public_v1::tests::public_v1_secondary_admits_joint_then_current_only_authority"),
+    postgres_test("adapter::recovery::connection_validation_tests::malformed_streaming_connection_is_rejected_with_or_without_follow_receipt"),
+    postgres_test("adapter::recovery::tests::exact_policy_quorum_requires_strict_intersection_and_valid_configuration_generation"),
+    postgres_test("adapter::recovery::tests::final_round_rejects_stale_sessions_policy_lineage_and_receiver_state"),
+    postgres_test("adapter::recovery::tests::legacy_running_receipts_keep_their_serialized_shape_and_stopped_acks_are_explicit"),
+    postgres_test("monitor::tests::parses_native_lsn_without_truncation"),
+    postgres_test("native::tests::application_names_are_bounded_and_session_unique"),
+    postgres_test("native::tests::zero_secondary_policy_is_identity_and_joint_policy_is_conservative"),
+    postgres_test("owned_command::tests::helper_identity_and_cleanup_epoch_exhaustion_remain_closed"),
+    postgres_test("owned_command::tests::helper_output_preserves_streams_status_and_environment"),
+    postgres_test("owned_command::tests::helper_pipes_are_drained_concurrently"),
+    postgres_test("owned_command::tests::helper_signal_is_not_a_supervisor_cleanup_failure"),
+    postgres_test("tests::shutdown_never_converts_acknowledgement_or_cleanup_failure_to_success", POSTGRES_MAIN_BINARY),
+    postgres_test("tests::shutdown_preserves_acknowledgement_failure_with_cleanup_context", POSTGRES_MAIN_BINARY),
+}
+
+
+def postgres_smoke_tests() -> set[TestId]:
+    return {
+        test_id
+        for catalog_id, test_id in POSTGRES_CATALOG.items()
+        if catalog_id.startswith(("PG-R", "PG-N"))
+    }
+
+
+def postgres_smoke_filter() -> str:
+    return " or ".join(
+        f"test(={test_id.name})" for test_id in sorted(postgres_smoke_tests())
+    )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--archive-file", type=Path)
     parser.add_argument("--ordinary-partitions", type=int, default=4)
     parser.add_argument("--postgres-partitions", type=int, default=4)
+    parser.add_argument("--postgres-smoke-filter", action="store_true")
     return parser.parse_args()
 
 
@@ -192,6 +261,13 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
             f"KinD live selector expected {EXPECTED_KIND_LIVE_COUNT} tests, "
             f"found {len(assignments.get('kind-live', set()))}"
         )
+    expected_postgres = set(POSTGRES_CATALOG.values()) | POSTGRES_AUXILIARY_TESTS
+    if assignments.get("postgres", set()) != expected_postgres:
+        missing = expected_postgres - assignments.get("postgres", set())
+        extra = assignments.get("postgres", set()) - expected_postgres
+        raise ValueError(
+            f"PostgreSQL catalog mismatch: missing={sorted(missing)} extra={sorted(extra)}"
+        )
 
     configured = {
         "build-only": matching_ids(
@@ -211,6 +287,24 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
     for tier, selected in configured.items():
         if selected != assignments.get(tier, set()):
             raise ValueError(f"configured {tier} profile does not exactly match inventory")
+    selected_smoke = matching_ids(
+        nextest_json(
+            root,
+            extracted,
+            "--profile",
+            "postgres",
+            "-E",
+            postgres_smoke_filter(),
+        )
+    )
+    if selected_smoke != postgres_smoke_tests():
+        raise ValueError("PostgreSQL smoke filter does not exactly match PG-R plus PG-N")
+    if selected_smoke & {
+        test_id
+        for catalog_id, test_id in POSTGRES_CATALOG.items()
+        if catalog_id.startswith("PG-L")
+    }:
+        raise ValueError("PostgreSQL smoke filter includes a PG-L low-level test")
 
     ordinary_counts = validate_partitions(
         root,
@@ -303,6 +397,9 @@ def validate_timeout_profiles(config: dict) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.postgres_smoke_filter:
+        print(postgres_smoke_filter())
+        return 0
     root = Path(__file__).resolve().parents[1]
     archive = args.archive_file.resolve() if args.archive_file else None
     if archive is None:

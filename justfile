@@ -92,16 +92,12 @@ nextest-postgres-smoke-inventory:
     scratch="${TMPDIR:-$PWD/target/paw-tmp}"
     mkdir -p "$scratch"
     TMPDIR="$scratch" scripts/install_nextest.sh
+    public_v1_filter="$(python3 scripts/validate_nextest_partitions.py --postgres-smoke-filter)"
     TMPDIR="$scratch" scripts/assert_nextest_selection.sh \
       --label postgres-smoke \
-      --require-binary postgres-replicated \
-      --require-test tests::public_v1_postgres_primary_lifecycle_and_joint_configuration \
-      --require-test tests::public_v1_postgres_data_loss_history_and_replay \
-      --require-test tests::public_v1_postgres_build_cancellation_and_retirement \
-      --require-test tests::public_v1_postgres_contained_close -- \
+      --require-binary postgres-replicated -- \
       cargo nextest list -p postgres-replicated --all-features \
-        --profile postgres \
-        -E 'test(/^(tests::public_v1_postgres_primary_lifecycle_and_joint_configuration|tests::public_v1_postgres_data_loss_history_and_replay|tests::public_v1_postgres_build_cancellation_and_retirement|tests::public_v1_postgres_contained_close)$/)'
+        --profile postgres -E "$public_v1_filter"
 
 # Run a representative real-PostgreSQL smoke selection for routine local checks.
 nextest-postgres-smoke: nextest-postgres-smoke-inventory
@@ -125,7 +121,7 @@ nextest-postgres-smoke: nextest-postgres-smoke-inventory
     fi
     mkdir -p "$public_v1_tmp"
     TMPDIR="$scratch" cargo build -p postgres-replicated --bin postgres-replicated
-    public_v1_filter='test(/^(tests::public_v1_postgres_primary_lifecycle_and_joint_configuration|tests::public_v1_postgres_data_loss_history_and_replay|tests::public_v1_postgres_build_cancellation_and_retirement|tests::public_v1_postgres_contained_close)$/)'
+    public_v1_filter="$(python3 scripts/validate_nextest_partitions.py --postgres-smoke-filter)"
     KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$public_v1_tmp" TMPDIR="$scratch" cargo nextest run -j 1 \
       -p postgres-replicated --all-features --profile postgres -E "$public_v1_filter"
 

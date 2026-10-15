@@ -243,10 +243,10 @@ impl Drop for PgService {
     }
 }
 
-struct PgReplicatorFactory(Arc<PgReplicator>);
+pub(crate) struct PgReplicatorFactory(pub(crate) Arc<PgReplicator>);
 
 impl PgReplicatorFactory {
-    fn interfaces(&self) -> ReplicatorInterfaces {
+    pub(crate) fn interfaces(&self) -> ReplicatorInterfaces {
         ReplicatorInterfaces::primary(self.0.clone(), None, ReplicatorCapabilities::conservative())
     }
 }

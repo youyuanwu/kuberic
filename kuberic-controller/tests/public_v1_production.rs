@@ -1324,3 +1324,80 @@ async fn production_reconciler_consumes_completion_after_lost_dispatch_reply() {
     .await
     .expect("ambiguous dispatch reconciliation exceeded 270 seconds");
 }
+
+#[tokio::test]
+async fn production_reconciler_completes_persisted_evidence_after_session_change() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(1)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..80 {
+            reconciler.reconcile("default", "sample").await.unwrap();
+            if api
+                .observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_transition.is_some())
+            {
+                break;
+            }
+        }
+
+        reconciler.reconcile("default", "sample").await.unwrap();
+        let mut observed = api.observation().await;
+        let status = observed.set.status.as_ref().expect("status");
+        let transition = status
+            .public_v1_transition
+            .as_ref()
+            .expect("persisted transition")
+            .transition()
+            .unwrap();
+        assert!(
+            transition
+                .evidence
+                .completed_operations
+                .iter()
+                .any(|completion| completion.operation_id == transition.intent.operation_id)
+        );
+        assert!(status.public_v1_operation.is_some());
+
+        let report = observed
+            .agents
+            .values_mut()
+            .find_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report) => Some(report.as_mut()),
+                _ => None,
+            })
+            .expect("established report");
+        report.process_session_id =
+            kuberic_runtime::protocol::types::ProcessSessionId::new("session-after-persist");
+        report.replicator_creation_id =
+            kuberic_runtime::protocol::types::ReplicatorCreationId::new("creation-after-persist");
+        api.set_observation(observed).await;
+
+        let executes_before = api
+            .effects()
+            .await
+            .iter()
+            .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+            .count();
+        reconciler.reconcile("default", "sample").await.unwrap();
+        let executes_after = api
+            .effects()
+            .await
+            .iter()
+            .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+            .count();
+        assert_eq!(executes_after, executes_before);
+        let observed = api.observation().await;
+        let status = observed.set.status.as_ref().expect("status");
+        assert!(status.public_v1_transition.is_none());
+        assert!(status.public_v1_operation.is_none());
+    })
+    .await
+    .expect("persisted completion replay exceeded 270 seconds");
+}

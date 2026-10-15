@@ -833,8 +833,17 @@ fn with_shutdown_error(primary: Result<()>, cleanup: Result<()>, context: &str) 
     }
 }
 
+const AGENT_SHUTDOWN_TIMEOUT: Duration = SHUTDOWN_TIMEOUT.saturating_add(Duration::from_secs(1));
+
 async fn finish_agent(task: &mut tokio::task::JoinHandle<Result<()>>) -> Result<()> {
-    match tokio::time::timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(1), &mut *task).await {
+    finish_agent_with_timeout(task, AGENT_SHUTDOWN_TIMEOUT).await
+}
+
+async fn finish_agent_with_timeout(
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    timeout: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, &mut *task).await {
         Ok(result) => {
             result.map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
         }
@@ -966,5 +975,19 @@ mod shutdown_tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn agent_shutdown_timeout_is_exactly_eleven_seconds() {
+        let mut agent = tokio::spawn(std::future::pending::<Result<()>>());
+        assert!(
+            finish_agent_with_timeout(&mut agent, Duration::from_millis(10))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown acknowledgement timed out")
+        );
+        assert_eq!(AGENT_SHUTDOWN_TIMEOUT, Duration::from_secs(11));
+        assert!(agent.is_finished());
     }
 }
