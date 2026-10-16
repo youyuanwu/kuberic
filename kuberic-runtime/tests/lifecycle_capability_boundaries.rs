@@ -33,7 +33,7 @@ fn trait_methods(path: &str, trait_name: &str) -> BTreeSet<String> {
 #[test]
 fn protected_public_trait_method_sets_are_unchanged() {
     assert_eq!(
-        trait_methods("src/replicator/mod.rs", "Replicator"),
+        trait_methods("src/replicator/traits.rs", "Replicator"),
         [
             "abort",
             "catch_up_capability",
@@ -48,7 +48,7 @@ fn protected_public_trait_method_sets_are_unchanged() {
         .collect()
     );
     assert_eq!(
-        trait_methods("src/replicator/mod.rs", "PrimaryReplicator"),
+        trait_methods("src/replicator/traits.rs", "PrimaryReplicator"),
         [
             "build_replica",
             "on_data_loss",
@@ -62,7 +62,7 @@ fn protected_public_trait_method_sets_are_unchanged() {
         .collect()
     );
     assert_eq!(
-        trait_methods("src/replicator/mod.rs", "StateReplicator"),
+        trait_methods("src/replicator/traits.rs", "StateReplicator"),
         [
             "get_copy_stream",
             "get_replication_stream",
@@ -74,7 +74,14 @@ fn protected_public_trait_method_sets_are_unchanged() {
         .collect()
     );
     assert_eq!(
-        trait_methods("src/application.rs", "StateProvider"),
+        trait_methods("src/traits.rs", "StatefulServiceReplica"),
+        ["abort", "change_role", "close", "open"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert_eq!(
+        trait_methods("src/traits.rs", "StateProvider"),
         [
             "get_copy_context",
             "get_copy_state",
@@ -85,6 +92,13 @@ fn protected_public_trait_method_sets_are_unchanged() {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    );
+    assert_eq!(
+        trait_methods("src/replicator/traits.rs", "ReplicatorFactory"),
+        ["create_replicator"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     );
     assert_eq!(
         trait_methods("src/engine.rs", "DurableState"),
@@ -107,7 +121,11 @@ fn protected_public_trait_method_sets_are_unchanged() {
 #[test]
 fn replacement_runtime_has_no_managed_default_or_agent_replication_owner() {
     assert!(!Path::new(&manifest().join("src/runtime.rs")).exists());
-    let replicator = source("src/replicator/mod.rs");
+    let replicator = format!(
+        "{}\n{}",
+        source("src/replicator/mod.rs"),
+        source("src/replicator/traits.rs")
+    );
     for forbidden in [
         "ManagedReplicatorLifecycle",
         "ManagedReplicatorDataPlane",

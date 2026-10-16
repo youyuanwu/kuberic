@@ -73,6 +73,39 @@ private-path documented struct crate::host::transport::KubernetesDnsResolver
 private-path documented trait crate::host::transport::ReplicaEndpointResolver: Send + Sync
 private-path documented trait crate::host::transport::ReplicaEndpointResolver::fn control_endpoint (& self , identity : & ReplicaIdentity) -> String
 private-path documented trait crate::host::transport::ReplicaEndpointResolver::fn replication_endpoint (& self , identity : & ReplicaIdentity) -> String
+private-path documented trait crate::replicator::traits::PrimaryReplicator: Replicator
+private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn build_replica (& self , replica : ReplicaInformation) -> Result < () >
+private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn on_data_loss (& self) -> Result < bool >
+private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn remove_replica (& self , replica_id : ReplicaId) -> Result < () >
+private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn update_catch_up_replica_set_configuration (& self , current : ReplicaSetConfiguration , previous : ReplicaSetConfiguration ,) -> Result < () >
+private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn update_current_replica_set_configuration (& self , current : ReplicaSetConfiguration ,) -> Result < () >
+private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn wait_for_catch_up_quorum (& self , mode : ReplicaSetQuorumMode) -> Result < () >
+private-path documented trait crate::replicator::traits::Replicator: Send + Sync
+private-path documented trait crate::replicator::traits::Replicator::async fn catch_up_capability (& self) -> Result < Lsn >
+private-path documented trait crate::replicator::traits::Replicator::async fn change_role (& self , epoch : Epoch , role : ReplicaRole) -> Result < () >
+private-path documented trait crate::replicator::traits::Replicator::async fn close (& self) -> Result < () >
+private-path documented trait crate::replicator::traits::Replicator::async fn current_progress (& self) -> Result < Lsn >
+private-path documented trait crate::replicator::traits::Replicator::async fn open (& self) -> Result < String >
+private-path documented trait crate::replicator::traits::Replicator::async fn update_epoch (& self , epoch : Epoch) -> Result < () >
+private-path documented trait crate::replicator::traits::Replicator::fn abort (& self)
+private-path documented trait crate::replicator::traits::ReplicatorFactory: Send + Sync
+private-path documented trait crate::replicator::traits::ReplicatorFactory::async fn create_replicator (& self , context : ReplicatorFactoryContext , state_provider : Option < Arc < dyn StateProvider > > , settings : ReplicatorSettings ,) -> Result < ReplicatorInterfaces >
+private-path documented trait crate::replicator::traits::StateReplicator: Send + Sync
+private-path documented trait crate::replicator::traits::StateReplicator::async fn get_copy_stream (& self) -> Result < OperationStream >
+private-path documented trait crate::replicator::traits::StateReplicator::async fn get_replication_stream (& self) -> Result < OperationStream >
+private-path documented trait crate::replicator::traits::StateReplicator::async fn replicate (& self , data : OperationData) -> Result < Lsn >
+private-path documented trait crate::replicator::traits::StateReplicator::async fn update_replicator_settings (& self , settings : ReplicatorSettings) -> Result < () >
+private-path documented trait crate::traits::StateProvider: Send + Sync
+private-path documented trait crate::traits::StateProvider::async fn get_copy_context (& self) -> Result < OperationDataStream >
+private-path documented trait crate::traits::StateProvider::async fn get_copy_state (& self , up_to_lsn : Lsn , copy_context : OperationDataStream ,) -> Result < OperationDataStream >
+private-path documented trait crate::traits::StateProvider::async fn last_committed_lsn (& self) -> Result < Lsn >
+private-path documented trait crate::traits::StateProvider::async fn on_data_loss (& self) -> Result < bool >
+private-path documented trait crate::traits::StateProvider::async fn update_epoch (& self , epoch : Epoch , previous_epoch_last_lsn : Lsn) -> Result < () >
+private-path documented trait crate::traits::StatefulServiceReplica: Send + Sync
+private-path documented trait crate::traits::StatefulServiceReplica::async fn change_role (& self , role : ReplicaRole) -> Result < RoleChange >
+private-path documented trait crate::traits::StatefulServiceReplica::async fn close (& self) -> Result < () >
+private-path documented trait crate::traits::StatefulServiceReplica::async fn open (self : Arc < Self > , context : OpenContext) -> Result < Arc < dyn Replicator > >
+private-path documented trait crate::traits::StatefulServiceReplica::fn abort (& self)
 private-path documented type crate::error::Result< T > = std :: result :: Result < T , RuntimeError >
 private-path documented type crate::host::error::Result< T > = std :: result :: Result < T , HostError >
 private-path documented variant crate::error::RuntimeError::Application((String))
@@ -206,17 +239,6 @@ public-path documented struct crate::replicator::stateless::StatelessReplicatorF
 public-path documented struct crate::replicator::stream::OperationSender
 public-path documented struct crate::replicator::stream::OperationStream
 public-path documented struct crate::replicator::stream::StreamOperation
-public-path documented trait crate::application::StateProvider: Send + Sync
-public-path documented trait crate::application::StateProvider::async fn get_copy_context (& self) -> Result < OperationDataStream >
-public-path documented trait crate::application::StateProvider::async fn get_copy_state (& self , up_to_lsn : Lsn , copy_context : OperationDataStream ,) -> Result < OperationDataStream >
-public-path documented trait crate::application::StateProvider::async fn last_committed_lsn (& self) -> Result < Lsn >
-public-path documented trait crate::application::StateProvider::async fn on_data_loss (& self) -> Result < bool >
-public-path documented trait crate::application::StateProvider::async fn update_epoch (& self , epoch : Epoch , previous_epoch_last_lsn : Lsn) -> Result < () >
-public-path documented trait crate::application::StatefulServiceReplica: Send + Sync
-public-path documented trait crate::application::StatefulServiceReplica::async fn change_role (& self , role : ReplicaRole) -> Result < RoleChange >
-public-path documented trait crate::application::StatefulServiceReplica::async fn close (& self) -> Result < () >
-public-path documented trait crate::application::StatefulServiceReplica::async fn open (self : Arc < Self > , context : OpenContext) -> Result < Arc < dyn Replicator > >
-public-path documented trait crate::application::StatefulServiceReplica::fn abort (& self)
 public-path documented trait crate::engine::DurableState: Send + Sync
 public-path documented trait crate::engine::DurableState::async fn apply (& self , operation : Operation) -> Result < DurableApplicationAck >
 public-path documented trait crate::engine::DurableState::async fn apply_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : CopyChunk ,) -> Result < () >
@@ -226,39 +248,19 @@ public-path documented trait crate::engine::DurableState::async fn finish_copy (
 public-path documented trait crate::engine::DurableState::async fn get_replication_operations (& self , from_lsn : Lsn , to_lsn : Lsn ,) -> Result < RetainedOperationStream >
 public-path documented trait crate::engine::DurableState::async fn verify_applied (& self , operation : & Operation) -> Result < bool >
 public-path documented trait crate::engine::DurableState::async fn verify_copy_chunk (& self , build_id : & OperationId , sequence : u64 , chunk : & CopyChunk ,) -> Result < bool >
-public-path documented trait crate::replicator::PrimaryReplicator: Replicator
-public-path documented trait crate::replicator::PrimaryReplicator::async fn build_replica (& self , replica : ReplicaInformation) -> Result < () >
-public-path documented trait crate::replicator::PrimaryReplicator::async fn on_data_loss (& self) -> Result < bool >
-public-path documented trait crate::replicator::PrimaryReplicator::async fn remove_replica (& self , replica_id : ReplicaId) -> Result < () >
-public-path documented trait crate::replicator::PrimaryReplicator::async fn update_catch_up_replica_set_configuration (& self , current : ReplicaSetConfiguration , previous : ReplicaSetConfiguration ,) -> Result < () >
-public-path documented trait crate::replicator::PrimaryReplicator::async fn update_current_replica_set_configuration (& self , current : ReplicaSetConfiguration ,) -> Result < () >
-public-path documented trait crate::replicator::PrimaryReplicator::async fn wait_for_catch_up_quorum (& self , mode : ReplicaSetQuorumMode) -> Result < () >
-public-path documented trait crate::replicator::Replicator: Send + Sync
-public-path documented trait crate::replicator::Replicator::async fn catch_up_capability (& self) -> Result < Lsn >
-public-path documented trait crate::replicator::Replicator::async fn change_role (& self , epoch : Epoch , role : ReplicaRole) -> Result < () >
-public-path documented trait crate::replicator::Replicator::async fn close (& self) -> Result < () >
-public-path documented trait crate::replicator::Replicator::async fn current_progress (& self) -> Result < Lsn >
-public-path documented trait crate::replicator::Replicator::async fn open (& self) -> Result < String >
-public-path documented trait crate::replicator::Replicator::async fn update_epoch (& self , epoch : Epoch) -> Result < () >
-public-path documented trait crate::replicator::Replicator::fn abort (& self)
-public-path documented trait crate::replicator::ReplicatorFactory: Send + Sync
-public-path documented trait crate::replicator::ReplicatorFactory::async fn create_replicator (& self , context : ReplicatorFactoryContext , state_provider : Option < Arc < dyn StateProvider > > , settings : ReplicatorSettings ,) -> Result < ReplicatorInterfaces >
-public-path documented trait crate::replicator::StateReplicator: Send + Sync
-public-path documented trait crate::replicator::StateReplicator::async fn get_copy_stream (& self) -> Result < OperationStream >
-public-path documented trait crate::replicator::StateReplicator::async fn get_replication_stream (& self) -> Result < OperationStream >
-public-path documented trait crate::replicator::StateReplicator::async fn replicate (& self , data : OperationData) -> Result < Lsn >
-public-path documented trait crate::replicator::StateReplicator::async fn update_replicator_settings (& self , settings : ReplicatorSettings) -> Result < () >
 public-path documented type crate::application::DurableApplicationAck = DurableApplicationProgress
 public-path documented type crate::application::Lsn = i64
 public-path documented type crate::application::OperationData = Bytes
 public-path documented type crate::application::OperationDataStream = Pin < Box < dyn Stream < Item = Result < OperationData > > + Send > >
 public-path documented type crate::engine::RetainedOperationStream = Pin < Box < dyn Stream < Item = Result < Operation > > + Send > >
 public-path documented use crate::application :: { StateProvider , StatefulServiceReplica }
+public-path documented use crate::application::crate :: traits :: { StateProvider , StatefulServiceReplica }
 public-path documented use crate::error :: { Result , RuntimeError }
 public-path documented use crate::host::error :: { HostError , Result }
 public-path documented use crate::host::process :: { ApplicationStorageState , ReplicaBuildDiagnostics , ReplicaDiagnostics , ReplicaHandle , ReplicaHost , ReplicaProcessConfig , RunningReplica , }
 public-path documented use crate::host::transport :: { KubernetesDnsResolver , ReplicaEndpointResolver }
 public-path documented use crate::replicator :: { DefaultReplicatorFactory , PrimaryReplicator , Replicator , ReplicatorFactory , ReplicatorInterfaces , StateReplicator , StatefulServicePartition , }
+public-path documented use crate::replicator::traits :: { PrimaryReplicator , Replicator , ReplicatorFactory , StateReplicator }
 public-path documented variant crate::application::OpenMode::Existing
 public-path documented variant crate::application::OpenMode::New
 public-path documented variant crate::replicator::ReplicaSetQuorumMode::All

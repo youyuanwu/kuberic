@@ -84,6 +84,9 @@ protocols, or controller owners.
 
 See [Testing](testing.md) for current selectors and counts.
 
+Known gaps against these contracts and their remediation status are tracked in
+the [Service Fabric Contract Audit Tracker](service-fabric-contract-audit.md).
+
 ## Unsupported Semantics
 
 Kuberic does not provide:
