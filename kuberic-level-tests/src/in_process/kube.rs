@@ -78,7 +78,7 @@ struct ArmedBarrier {
     entered: oneshot::Sender<Value>,
     release: oneshot::Receiver<()>,
     call_kind: Option<&'static str>,
-    operation_fragment: Option<&'static str>,
+    operation_fragment: Option<String>,
 }
 
 /// Both barriers publish the persisted object before waiting, without a store lock.
@@ -268,7 +268,7 @@ impl ApiServer {
         name: &str,
         conflict: bool,
         call_kind: Option<&'static str>,
-        operation_fragment: Option<&'static str>,
+        operation_fragment: Option<&str>,
     ) -> anyhow::Result<StatusBarrier> {
         let mut store = self.store.lock().unwrap();
         let key = self.key(Kind::KubericSet, name);
@@ -291,7 +291,7 @@ impl ApiServer {
             entered: entered_tx,
             release: release_rx,
             call_kind,
-            operation_fragment,
+            operation_fragment: operation_fragment.map(str::to_owned),
         });
         Ok(StatusBarrier {
             entered,
@@ -803,11 +803,14 @@ fn barrier_matches(barrier: &Option<ArmedBarrier>, key: &Key, object: &Value) ->
             && barrier.call_kind.is_none_or(|kind| {
                 object["status"]["publicV1Transition"]["callKind"].as_str() == Some(kind)
             })
-            && barrier.operation_fragment.is_none_or(|fragment| {
-                object["status"]["publicV1Operation"]["operationId"]
-                    .as_str()
-                    .is_some_and(|id| id.contains(fragment))
-            })
+            && barrier
+                .operation_fragment
+                .as_deref()
+                .is_none_or(|fragment| {
+                    object["status"]["publicV1Operation"]["operationId"]
+                        .as_str()
+                        .is_some_and(|id| id.contains(fragment))
+                })
     })
 }
 

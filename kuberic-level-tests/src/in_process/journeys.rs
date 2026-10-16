@@ -524,7 +524,10 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
     harness.finish(result).await
 }
 
-async fn assert_exact_completion(harness: &Harness, persisted: &serde_json::Value) -> Result<()> {
+async fn assert_exact_completion(
+    harness: &Harness,
+    persisted: &serde_json::Value,
+) -> Result<PublicV1AcceptedOperationCompletion> {
     let accepted: PublicV1OperationStatus =
         serde_json::from_value(persisted["status"]["publicV1Operation"].clone())?;
     let command = accepted.command().map_err(anyhow::Error::msg)?;
@@ -565,7 +568,9 @@ async fn assert_exact_completion(harness: &Harness, persisted: &serde_json::Valu
             && completion.result == PublicV1OperationResult::Succeeded,
         "completion differs from the persisted operation"
     );
-    Ok(())
+    Ok(PublicV1AcceptedOperationCompletion::from_completion(
+        completion,
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1260,4 +1265,238 @@ async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Re
         }
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_recreation_at_persisted_build_intent_preserves_effects() -> Result<()> {
+    recreate_during_change(false, false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_recreation_after_durable_build_consumes_completion_once() -> Result<()> {
+    recreate_during_change(false, true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failover_recreation_at_persisted_promotion_preserves_effects() -> Result<()> {
+    recreate_during_change(true, false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failover_recreation_after_durable_promotion_consumes_completion_once() -> Result<()> {
+    recreate_during_change(true, true).await
+}
+
+async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> {
+    use kuberic_runtime::engine::DurableState;
+    let mut harness = Harness::new().await?;
+    let result = async {
+        let baseline_lsn = harness.write("recreation-before", "acknowledged").await?;
+        harness
+            .assert_values("recreation-before", "acknowledged")
+            .await?;
+        let primary = harness.ready().await?;
+        let predecessor = harness.report(if failover { primary } else { 2 }).await?;
+        let predecessor_uid = predecessor.replica.instance_id.to_string();
+        let predecessor_root = harness.data_root(&predecessor_uid).await?;
+        let predecessor_service = harness.service_uid(&predecessor_uid).await?;
+        let baseline = predecessor_service
+            .persistence()
+            .snapshot_at(baseline_lsn)?;
+        let promotion_session = harness.report(2).await?.process_session_id.to_string();
+        let mut barrier = harness.api.arm_matching(
+            "sample",
+            completion,
+            Some(if failover { "role" } else { "build" }),
+            if failover {
+                Some(promotion_session.as_str())
+            } else {
+                None
+            },
+        )?;
+        let removed = if failover {
+            harness.isolate_uid(&predecessor_uid, true).await?;
+            Vec::new()
+        } else {
+            delete_secondary(&harness).await?
+        };
+        // Leaving this select scope cancels the old reconcile before recreation.
+        let frozen = loop {
+            tokio::select! {
+                frozen = barrier.entered() => break frozen?,
+                step = harness.step() => step?,
+            }
+        };
+        let accepted: PublicV1OperationStatus =
+            serde_json::from_value(frozen["status"]["publicV1Operation"].clone())?;
+        let command = accepted.command().map_err(anyhow::Error::msg)?;
+        let source_before = harness
+            .report_uid(command.target.instance_id.as_str())
+            .await?;
+        let target =
+            if let Some(PublicOperationProgram::Build(build)) = command.intent.program.as_ref() {
+                let target = harness
+                    .service_uid(build.replica.instance_id.as_str())
+                    .await?;
+                let progress = target.persistence().durable_progress().await?;
+                ensure!(progress.applied_lsn == if completion { baseline_lsn } else { 0 });
+                Some((build.replica.instance_id.to_string(), target))
+            } else {
+                ensure!(failover, "replacement cut missed real Build");
+                ensure!(
+                    matches!(
+                        command.intent.program.as_ref(),
+                        Some(PublicOperationProgram::Role {
+                            role: kuberic_runtime::protocol::types::ReplicaRole::Primary,
+                            ..
+                        })
+                    ),
+                    "failover cut missed the accepted primary promotion"
+                );
+                None
+            };
+        if completion {
+            let completed = assert_exact_completion(&harness, &frozen).await?;
+            let authority = harness
+                .set()
+                .await?
+                .status
+                .unwrap()
+                .public_v1_authority
+                .unwrap()
+                .authority()
+                .map_err(anyhow::Error::msg)?;
+            ensure!(
+                !authority.completed_operations.contains(&completed),
+                "completion cut occurred after authority advancement"
+            );
+        } else {
+            ensure!(
+                !source_before
+                    .completed_operations
+                    .iter()
+                    .any(|entry| entry.operation_id == command.intent.operation_id
+                        && entry.revision == command.intent.revision),
+                "intent cut already executed"
+            );
+        }
+        let topology_before = harness
+            .set()
+            .await?
+            .status
+            .unwrap()
+            .public_v1_topology
+            .unwrap();
+        ensure!(topology_before.primary_id.value() == primary);
+        harness.recreate_controller()?;
+        let persisted = harness
+            .api
+            .get(Kind::KubericSet, "sample")
+            .context("set missing")?;
+        for field in [
+            "publicV1Operation",
+            "publicV1Transition",
+            "publicV1Authority",
+            "publicV1Replacement",
+        ] {
+            ensure!(
+                persisted["status"][field] == frozen["status"][field],
+                "recreation rewrote persisted {field}"
+            );
+        }
+        barrier.release();
+        let settled_primary = if failover {
+            harness
+                .ready_survivors(2, std::slice::from_ref(&predecessor_uid))
+                .await?
+        } else {
+            harness.ready().await?
+        };
+        ensure!((settled_primary != primary) == failover);
+        let completed = assert_exact_completion(&harness, &frozen).await?;
+        let authority = harness
+            .set()
+            .await?
+            .status
+            .unwrap()
+            .public_v1_authority
+            .unwrap()
+            .authority()
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            authority
+                .completed_operations
+                .iter()
+                .filter(|entry| **entry == completed)
+                .count()
+                == 1,
+            "matching completion was not consumed exactly once"
+        );
+        let source_after = harness
+            .report_uid(command.target.instance_id.as_str())
+            .await?;
+        ensure!(
+            source_before.process_session_id == source_after.process_session_id
+                && source_before.replicator_creation_id == source_after.replicator_creation_id
+                && source_before.storage_incarnation == source_after.storage_incarnation
+        );
+        for uid in harness.live_uids().await {
+            if failover && uid == predecessor_uid {
+                continue;
+            }
+            let service = harness.service_uid(&uid).await?;
+            let progress = service.persistence().durable_progress().await?;
+            ensure!(
+                progress.applied_lsn == baseline_lsn && progress.committed_lsn == baseline_lsn,
+                "recovery duplicated logical application effects: {progress:?}"
+            );
+            ensure!(service.persistence().snapshot_at(baseline_lsn)? == baseline);
+        }
+        if let Some((uid, target)) = target {
+            let replacement = harness.report(2).await?;
+            ensure!(
+                replacement.replica.instance_id.as_str() == uid
+                    && replacement.replica != predecessor.replica
+                    && replacement.storage_incarnation != predecessor.storage_incarnation
+            );
+            ensure!(std::sync::Arc::ptr_eq(&target, &harness.service(2).await?));
+            for (kind, _, uid) in removed {
+                ensure!(
+                    !harness
+                        .api
+                        .snapshot(kind)
+                        .iter()
+                        .any(|object| object["metadata"]["uid"].as_str() == Some(&uid)),
+                    "exact predecessor resource retained: {uid}"
+                );
+            }
+            ensure!(!predecessor_root.exists(), "retired PVC storage retained");
+        }
+        let next_lsn = harness
+            .service(settled_primary)
+            .await?
+            .replicate_put("recreation-after".into(), "resumed".into())
+            .await?;
+        ensure!(
+            next_lsn == baseline_lsn + 1,
+            "recovery advanced application LSN"
+        );
+        if failover {
+            reject_write(&predecessor_service, "recreation-stale-isolated").await?;
+            harness.isolate_uid(&predecessor_uid, false).await?;
+            harness.ready().await?;
+            let returned = harness.report_uid(&predecessor_uid).await?;
+            ensure!(
+                returned.process_session_id == predecessor.process_session_id
+                    && returned.replicator_creation_id == predecessor.replicator_creation_id
+            );
+            reject_write(&predecessor_service, "recreation-stale-returned").await?;
+        }
+        harness
+            .assert_values("recreation-before", "acknowledged")
+            .await?;
+        harness.assert_values("recreation-after", "resumed").await
+    }
+    .await;
+    harness.finish(result).await
 }
