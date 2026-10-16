@@ -1907,20 +1907,19 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 .unwrap(),
             );
         }
-        let source_address = address();
-        let survivor_address = address();
+        let bind_address = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
         let source_persistence =
             Arc::new(KvPersistence::open(source_root.join("application")).unwrap());
         let survivor_persistence =
             Arc::new(KvPersistence::open(survivor_root.join("application")).unwrap());
         let source_service = Arc::new(KvService::new(
             source_persistence,
-            format!("http://{source_address}"),
+            format!("http://{bind_address}"),
             CopyGate::disabled(),
         ));
         let survivor_service = Arc::new(KvService::new(
             survivor_persistence.clone(),
-            format!("http://{survivor_address}"),
+            format!("http://{bind_address}"),
             CopyGate::disabled(),
         ));
         let mut source = ReplicaHost::new(
@@ -1930,7 +1929,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 pod_uid: PodUid::new("kv-failover-source-pod"),
                 pvc_uid: PvcUid::new("kv-failover-source-pvc"),
                 data_root: source_root.clone(),
-                replication_address: source_address,
+                replication_address: bind_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
                 transport_window_capacity: 8,
@@ -1950,7 +1949,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 pod_uid: PodUid::new("kv-failover-survivor-pod"),
                 pvc_uid: PvcUid::new("kv-failover-survivor-pvc"),
                 data_root: survivor_root.clone(),
-                replication_address: survivor_address,
+                replication_address: bind_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
                 transport_window_capacity: 8,
@@ -1976,6 +1975,37 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             .initialize_public_v1_history(&initialization, &history, &survivor_storage)
             .await
             .unwrap();
+        for (handle, identity) in [
+            (&source_handle, &source_identity),
+            (&survivor_handle, &survivor_identity),
+        ] {
+            handle
+                .execute_public_v1(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    1,
+                    &format!("{}-open", identity.instance_id),
+                    PublicOperationProgram::Open {
+                        replica: identity.clone(),
+                        existing: true,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let source_address = source_handle
+            .public_v1_report()
+            .await
+            .unwrap()
+            .replication_address
+            .unwrap();
+        let survivor_address = survivor_handle
+            .public_v1_report()
+            .await
+            .unwrap()
+            .replication_address
+            .unwrap();
+        assert_ne!(source_address, survivor_address);
         let initial_epoch = Epoch::new(0, 1);
         let initial = ConfigurationDescriptor::new(
             initial_epoch,
@@ -1998,7 +2028,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 source_identity.clone(),
                 ReplicaRole::Primary,
                 survivor_identity.clone(),
-                survivor_address,
+                survivor_address.as_str(),
                 survivor_handle.process_session_id(),
                 survivor_storage.clone(),
             ),
@@ -2007,20 +2037,12 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 survivor_identity.clone(),
                 ReplicaRole::ActiveSecondary,
                 source_identity.clone(),
-                source_address,
+                source_address.as_str(),
                 source_handle.process_session_id(),
                 source_storage.clone(),
             ),
         ] {
             for (revision, name, program) in [
-                (
-                    1,
-                    format!("{}-open", identity.instance_id),
-                    PublicOperationProgram::Open {
-                        replica: identity.clone(),
-                        existing: true,
-                    },
-                ),
                 (
                     2,
                     format!("{}-role", identity.instance_id),
@@ -2045,7 +2067,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                         replicas: vec![PublicReplicaDescriptor {
                             build_id: OperationId::default(),
                             identity: peer,
-                            replication_address: format!("http://{peer_address}"),
+                            replication_address: peer_address.into(),
                             process_session_id: peer_session,
                             storage_incarnation: Some(peer_storage),
                             role: if role == ReplicaRole::Primary {
@@ -2092,7 +2114,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                         replicas: vec![PublicReplicaDescriptor {
                             build_id: OperationId::default(),
                             identity: survivor_identity.clone(),
-                            replication_address: format!("http://{survivor_address}"),
+                            replication_address: survivor_address.clone(),
                             process_session_id: survivor_handle.process_session_id(),
                             storage_incarnation: Some(survivor_storage.clone()),
                             role: ReplicaRole::ActiveSecondary,
@@ -2156,7 +2178,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                     replicas: vec![PublicReplicaDescriptor {
                         build_id: OperationId::default(),
                         identity: source_identity.clone(),
-                        replication_address: format!("http://{source_address}"),
+                        replication_address: source_address,
                         process_session_id: source_handle.process_session_id(),
                         storage_incarnation: Some(source_storage),
                         role: ReplicaRole::ActiveSecondary,
@@ -2184,7 +2206,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
 
         let returning_service = Arc::new(KvService::new(
             Arc::new(KvPersistence::open(source_root.join("application")).unwrap()),
-            format!("http://{source_address}"),
+            format!("http://{bind_address}"),
             CopyGate::disabled(),
         ));
         let mut returning = ReplicaHost::new(
@@ -2194,7 +2216,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 pod_uid: PodUid::new("kv-failover-source-pod"),
                 pvc_uid: PvcUid::new("kv-failover-source-pvc"),
                 data_root: source_root,
-                replication_address: source_address,
+                replication_address: bind_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
                 transport_window_capacity: 8,
