@@ -23,7 +23,7 @@ exporting host capabilities.
 just nextest-validate
 ```
 
-The current inventory is:
+The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
@@ -132,8 +132,3 @@ data and exact new-incarnation admission; failover uses a sustained containerd
 task pause and proves preserved data, post-failover quorum writes, resumed
 old-primary fencing, and stale-write rejection. The scenarios do not read
 removed legacy status fields.
-
-Historical exact CI runs `38804014250` and `38809710653` passed the
-then-current 381-test matrix on implementation revision `ad5d766` and Phase 4
-documentation revision `ce1ca49`. Exact CI for the final 394-test commit
-remains pending.

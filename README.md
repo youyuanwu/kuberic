@@ -79,11 +79,8 @@ The complete tier inventory, shard commands and DEX Kubernetes-provider
 commands are documented in the
 [test strategy](docs/features/kuberic/testing.md).
 
-The current locally validated worktree inventory is 394 tests: 347 ordinary,
-41 PostgreSQL, three KinD, two build-only, and one DEX. Historical exact CI
-runs `38804014250` and `38809710653` passed the then-current 381-test matrix on
-implementation revision `ad5d766` and documentation revision `ce1ca49`.
-Exact CI for the final 394-test commit remains pending.
+The current test inventory contains 394 tests: 347 ordinary, 41 PostgreSQL,
+three KinD, two build-only, and one DEX.
 
 ## Experimental Kubernetes Validation
 
