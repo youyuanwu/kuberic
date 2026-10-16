@@ -36,7 +36,7 @@ nextest-validate-archive: install-nextest
     python3 scripts/validate_nextest_partitions.py \
         --archive-file "{{ nextest_archive }}"
 
-# List one semantic repository tier: all, ordinary, build-only, postgres, kind, or dex-live.
+# List one semantic repository tier: all, ordinary, build-only, postgres, or kind.
 nextest-list tier="all": install-nextest
     #!/usr/bin/env bash
     set -euo pipefail
@@ -47,7 +47,6 @@ nextest-list tier="all": install-nextest
       build-only) profile=build-only; ignored_args=(--run-ignored only) ;;
       postgres) profile=postgres ;;
       kind) profile=kind; ignored_args=(--run-ignored only) ;;
-      dex-live) profile=dex-live ;;
       *) echo "unknown nextest tier: {{ tier }}" >&2; exit 2 ;;
     esac
     cargo nextest list --workspace --all-features --profile "$profile" "${ignored_args[@]}"

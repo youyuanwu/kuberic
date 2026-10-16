@@ -23,7 +23,6 @@ just install-nextest
 just nextest-list ordinary
 just nextest-list postgres
 just nextest-list kind
-just nextest-list dex-live
 ```
 
 The ordinary tier uses the repository profile and keeps the combined SQLite
@@ -93,20 +92,3 @@ explicitly requested.
 
 See the [PostgreSQL validation guide](features/kuberic/testing.md#postgresql)
 and [design](features/postgres/design.md).
-
-## DEX Kubernetes Provider
-
-Default DEX tests are cluster-free. The real provider test requires an isolated
-owned Kubernetes endpoint:
-
-```bash
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --all-targets
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex --doc
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex \
-  --features kubernetes --test kubernetes_checkpoint -- --nocapture
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-dex \
-  --features kubernetes --test kubernetes_checkpoint_real
-```
-
-The real test uses `KIND_CLUSTER_NAME`, `KUBECONFIG` and `KUBE_CONTEXT`; it
-creates and deletes its own namespace.

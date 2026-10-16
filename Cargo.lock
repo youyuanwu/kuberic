@@ -1357,24 +1357,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuberic-dex"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "futures",
- "http",
- "k8s-openapi",
- "kube",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "thiserror",
- "tokio",
- "tower",
-]
-
-[[package]]
 name = "kuberic-level-tests"
 version = "0.0.1"
 dependencies = [

@@ -17,7 +17,6 @@ from pathlib import Path
 
 KIND_PACKAGE = "kuberic-level-tests"
 KIND_PREFIX = "level_triggered_k8s::"
-DEX_LIVE_BINARY = "kuberic-dex::kubernetes_checkpoint_real"
 EXPECTED_KIND_LIVE_COUNT = 3
 POSTGRES_PACKAGE = "postgres-replicated"
 POSTGRES_LIBRARY_BINARY = "postgres-replicated"
@@ -179,8 +178,6 @@ def classify(test: ListedTest) -> str | None:
         if test_id.package == KIND_PACKAGE and test_id.name.startswith(KIND_PREFIX):
             return "kind-live"
         return None
-    if test_id.binary == DEX_LIVE_BINARY:
-        return "dex-live"
     if test_id.package == "postgres-replicated":
         return "postgres"
     return "ordinary"
@@ -282,7 +279,6 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
             nextest_json(root, extracted, "--profile", "kind", "--run-ignored", "only"),
             include_ignored=True,
         ),
-        "dex-live": matching_ids(nextest_json(root, extracted, "--profile", "dex-live")),
     }
     for tier, selected in configured.items():
         if selected != assignments.get(tier, set()):
@@ -377,7 +373,7 @@ def validate_timeout_profiles(config: dict) -> None:
         if seconds > 270 or timeout.get("terminate-after") != 1:
             raise ValueError(f"{label} must terminate once within 270 seconds")
 
-    for name in ["default", "ci", "ordinary", "build-only", "postgres", "kind", "dex-live"]:
+    for name in ["default", "ci", "ordinary", "build-only", "postgres", "kind"]:
         current = profiles.get(name, {})
         seen: set[str] = set()
         while "slow-timeout" not in current:
