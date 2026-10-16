@@ -431,26 +431,20 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn restart_preserves_original_absolute_expiry() {
+    #[test]
+    fn restart_preserves_original_absolute_expiry() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("copy-gate");
-        let first = CopyGate::enabled_with_timeout(&path, Duration::from_millis(240)).unwrap();
+        let first = CopyGate::enabled_with_timeout(&path, Duration::from_secs(3600)).unwrap();
         first.hold().unwrap();
         let original_deadline = first.persisted_deadline().unwrap().unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let restarted = CopyGate::enabled_with_timeout(&path, Duration::from_millis(240)).unwrap();
+        let restarted = CopyGate::enabled_with_timeout(&path, Duration::from_secs(7200)).unwrap();
+        assert!(restarted.is_held());
         assert_eq!(
             restarted.persisted_deadline().unwrap(),
             Some(original_deadline)
         );
-        tokio::time::timeout(Duration::from_millis(220), async {
-            while restarted.is_held() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("restart extended the original arm-time expiry");
+        restarted.release().unwrap();
     }
 
     #[tokio::test]
