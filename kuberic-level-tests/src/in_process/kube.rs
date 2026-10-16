@@ -77,6 +77,8 @@ struct ArmedBarrier {
     uid: String,
     entered: oneshot::Sender<Value>,
     release: oneshot::Receiver<()>,
+    call_kind: Option<&'static str>,
+    operation_fragment: Option<&'static str>,
 }
 
 /// Both barriers publish the persisted object before waiting, without a store lock.
@@ -251,17 +253,23 @@ impl ApiServer {
     }
 
     pub(super) fn arm_operation_barrier(&self, name: &str) -> anyhow::Result<StatusBarrier> {
-        self.arm(name, false)
+        self.arm_matching(name, false, None, None)
     }
 
     /// Targets the next status write that increases accepted completion count.
     /// Instead of accepting its status, bump only the stored RV and return 409
     /// after release. The same submitted RV will genuinely remain stale on retry.
     pub(super) fn arm_completion_conflict(&self, name: &str) -> anyhow::Result<StatusBarrier> {
-        self.arm(name, true)
+        self.arm_matching(name, true, None, None)
     }
 
-    fn arm(&self, name: &str, conflict: bool) -> anyhow::Result<StatusBarrier> {
+    pub(super) fn arm_matching(
+        &self,
+        name: &str,
+        conflict: bool,
+        call_kind: Option<&'static str>,
+        operation_fragment: Option<&'static str>,
+    ) -> anyhow::Result<StatusBarrier> {
         let mut store = self.store.lock().unwrap();
         let key = self.key(Kind::KubericSet, name);
         let object = store
@@ -282,6 +290,8 @@ impl ApiServer {
             uid,
             entered: entered_tx,
             release: release_rx,
+            call_kind,
+            operation_fragment,
         });
         Ok(StatusBarrier {
             entered,
@@ -616,7 +626,7 @@ fn execute(
                     && next["status"]["publicV1Operation"] != old["status"]["publicV1Operation"];
                 let barrier = if route.kind == Kind::KubericSet
                     && newly_pending
-                    && barrier_matches(&store.operation_barrier, &key, &old)
+                    && barrier_matches(&store.operation_barrier, &key, &next)
                 {
                     store.operation_barrier.take()
                 } else {
@@ -787,9 +797,18 @@ fn is_deleting(object: &Value) -> bool {
 }
 
 fn barrier_matches(barrier: &Option<ArmedBarrier>, key: &Key, object: &Value) -> bool {
-    barrier
-        .as_ref()
-        .is_some_and(|barrier| &barrier.key == key && object["metadata"]["uid"] == barrier.uid)
+    barrier.as_ref().is_some_and(|barrier| {
+        &barrier.key == key
+            && object["metadata"]["uid"] == barrier.uid
+            && barrier.call_kind.is_none_or(|kind| {
+                object["status"]["publicV1Transition"]["callKind"].as_str() == Some(kind)
+            })
+            && barrier.operation_fragment.is_none_or(|fragment| {
+                object["status"]["publicV1Operation"]["operationId"]
+                    .as_str()
+                    .is_some_and(|id| id.contains(fragment))
+            })
+    })
 }
 
 fn completion_count(object: &Value) -> u64 {

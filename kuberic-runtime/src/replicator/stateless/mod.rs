@@ -227,6 +227,20 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
 
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const LISTENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn copy_can_replace_tail(applied: i64, committed: i64, copy_boundary: i64) -> bool {
+    (applied == 0 && committed == 0) || (applied > committed && copy_boundary >= committed)
+}
+
+#[test]
+fn inbound_copy_recovery_preserves_committed_floor() {
+    assert!(copy_can_replace_tail(0, 0, 0));
+    assert!(copy_can_replace_tail(2, 1, 2));
+    assert!(copy_can_replace_tail(2, 1, 1));
+    assert!(!copy_can_replace_tail(2, 1, 0));
+    assert!(!copy_can_replace_tail(2, 2, 2));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicV1DataServiceRegistration {
     ReplicationData,
@@ -1181,6 +1195,14 @@ impl StatelessReplicator {
             format!("http://{}", peer.replication_address)
         };
         tokio::time::timeout(PEER_RPC_TIMEOUT, async {
+            #[cfg(feature = "testing")]
+            let endpoint = testing_transport::route(
+                self.identity.instance_id.as_str(),
+                peer.identity.instance_id.as_str(),
+                endpoint,
+            )
+            .await
+            .map_err(|error| ReplicationSendFailure::Unavailable(error.to_string()))?;
             let mut client =
                 proto::replication_data_client::ReplicationDataClient::connect(endpoint)
                     .await
@@ -1322,34 +1344,18 @@ impl StatelessReplicator {
         committed_lsn: i64,
         applied_lsn: i64,
     ) -> Result<Option<i64>> {
-        let first = committed_lsn.saturating_add(1).max(1);
-        let mut retained = self
-            .storage
-            .get_replication_operations(first, applied_lsn)
-            .await?;
-        let mut expected = first;
-        while let Some(operation) = retained.next().await {
-            let operation = operation?;
-            let verified = self.storage.verify_applied(&operation).await?;
-            if operation.lsn != expected || !verified {
-                return Err(self.local_rebuild_required());
-            }
-            match self
-                .send_replication_proof(authority, peer, &operation, committed_lsn)
-                .await
-            {
-                Ok(()) => {}
-                Err(ReplicationSendFailure::Unavailable(_)) => return Ok(None),
-                Err(ReplicationSendFailure::Rejected(_)) => {
-                    return Err(Self::remote_rebuild_required(authority, peer));
-                }
-            }
-            expected = expected.saturating_add(1);
+        // A peer may also lack committed entries. Replay that prefix before
+        // verifying every ambiguous entry, even if its advertised tail is ahead.
+        let mut retained_peer = peer.clone();
+        retained_peer.current_progress = peer.current_progress.min(committed_lsn);
+        match self
+            .catch_up_peer(authority, &retained_peer, applied_lsn, committed_lsn)
+            .await
+        {
+            Ok(progress) => Ok(Some(progress)),
+            Err(RuntimeError::Application(_)) => Ok(None),
+            Err(error) => Err(error),
         }
-        if expected <= applied_lsn {
-            return Err(self.local_rebuild_required());
-        }
-        Ok(Some(applied_lsn))
     }
 
     async fn catch_up_peer(
@@ -1785,6 +1791,14 @@ impl StatelessReplicator {
             ))
         };
         let final_ack = tokio::time::timeout(PEER_RPC_TIMEOUT, async {
+            #[cfg(feature = "testing")]
+            let endpoint = testing_transport::route(
+                self.identity.instance_id.as_str(),
+                replica.identity.instance_id.as_str(),
+                endpoint,
+            )
+            .await
+            .map_err(|_| remote_conflict())?;
             let mut client =
                 proto::replication_data_client::ReplicationDataClient::connect(endpoint)
                     .await
@@ -2012,11 +2026,16 @@ impl StatelessReplicator {
                 }
                 Some(existing) => existing.clone(),
                 None => {
-                    if target_progress.applied_lsn != 0 || target_progress.committed_lsn != 0 {
+                    if !copy_can_replace_tail(
+                        target_progress.applied_lsn,
+                        target_progress.committed_lsn,
+                        item.replication_boundary_lsn,
+                    ) {
                         return Err(Status::failed_precondition(
-                            "inbound build requires an empty target provider",
+                            "inbound build cannot discard an established committed tail",
                         ));
                     }
+
                     state.inbound_build = Some(candidate.clone());
                     candidate
                 }
@@ -3178,3 +3197,7 @@ mod task_registry_tests {
         assert_eq!(LISTENER_SHUTDOWN_TIMEOUT, Duration::from_secs(5));
     }
 }
+#[cfg(feature = "testing")]
+mod testing_transport;
+#[cfg(feature = "testing")]
+pub use testing_transport::TestingTcpRoute;

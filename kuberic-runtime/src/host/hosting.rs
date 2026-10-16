@@ -654,6 +654,11 @@ impl PodRuntime {
                 ))
             });
         Ok(crate::host::public_lifecycle::PublicV1ReportProjection {
+            catch_up_specific_quorum: self
+                .host
+                .registered
+                .get()
+                .map(|registered| registered.capabilities.catch_up_specific_quorum),
             process_session_id,
             replicator_creation_id,
             report_sequence,

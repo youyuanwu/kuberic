@@ -81,6 +81,50 @@ pub fn plan_public_v1_topology(
     if current == Some(&next) && configuration_is_admitted(&next, &eligible) {
         return Ok(PublicV1TopologyPlan::Stable);
     }
+    if current == Some(&next)
+        && eligible
+            .iter()
+            .all(|replica| !replica.replication_address.is_empty())
+        && let Some(primary) = eligible.iter().find(|replica| {
+            replica.report.replica.replica_id == next.primary_id
+                && replica
+                    .report
+                    .completed_operations
+                    .iter()
+                    .any(|completion| {
+                        completion.process_session_id == replica.report.process_session_id
+                            && completion.current_configuration_id.as_ref()
+                                == Some(&next.configuration_id)
+                            && matches!(
+                                completion.call_kind,
+                                PublicV1CallKind::Configuration | PublicV1CallKind::CatchUp
+                            )
+                            && completion.result == PublicV1OperationResult::Succeeded
+                    })
+        })
+    {
+        let program = PublicOperationProgram::CatchUp {
+            configuration: public_configuration(&primary.report.replica, &eligible, &next)?,
+            mode: PublicCatchUpMode::All,
+        };
+        let operation_id = content_addressed_operation_id(
+            format!(
+                "topology-{}-recover-{}",
+                next.configuration_id, primary.report.process_session_id
+            ),
+            &program,
+        );
+        if !accepted.completed_operations.iter().any(|completion| {
+            completion.operation_id == operation_id
+                && completion.result == PublicV1AcceptedResult::Succeeded
+        }) {
+            return begin_operation(accepted, primary, program, operation_id, resource_version)
+                .map(|(transition, command)| PublicV1TopologyPlan::Begin {
+                    transition: Box::new(transition),
+                    command: Box::new(command),
+                });
+        }
+    }
     let transfer = current
         .filter(|configuration| {
             configuration.primary_id != next.primary_id
@@ -178,52 +222,130 @@ pub fn plan_public_v1_topology(
             })
         })
     {
-        let catch_up = PublicOperationProgram::CatchUp {
-            configuration: public_configuration(&source.report.replica, &observed, current)?,
-            mode: PublicCatchUpMode::All,
-        };
-        let catch_up_id = content_addressed_operation_id(
-            format!(
-                "topology-{}-catch-up-{}",
-                current.configuration_id, operational_next.primary_id
-            ),
-            &catch_up,
+        let intermediate = ConfigurationDescriptor::new(
+            operational_next.epoch,
+            current.primary_id,
+            operational_next
+                .members
+                .iter()
+                .cloned()
+                .map(|mut member| {
+                    member.role = if member.identity.replica_id == current.primary_id {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    };
+                    member
+                })
+                .collect(),
+            operational_next.write_quorum,
         );
-        if !accepted.completed_operations.iter().any(|completion| {
-            completion.operation_id == catch_up_id
-                && completion.result == PublicV1AcceptedResult::Succeeded
-        }) {
-            return begin_operation(accepted, source, catch_up, catch_up_id, resource_version).map(
-                |(transition, command)| PublicV1TopologyPlan::Begin {
-                    transition: Box::new(transition),
-                    command: Box::new(command),
-                },
-            );
-        }
-        let swap = planned_swap_program(current, operational_next, &observed, source)?;
-        let swap_id = content_addressed_operation_id(
-            format!(
-                "topology-{}-swap-{}",
-                current.configuration_id, operational_next.primary_id
-            ),
-            &swap,
+        let base = format!(
+            "topology-{}-transfer-{}-{}",
+            current.configuration_id,
+            operational_next.configuration_id,
+            source.report.process_session_id
         );
-        if !accepted.completed_operations.iter().any(|completion| {
-            completion.operation_id == swap_id
-                && completion.result == PublicV1AcceptedResult::Succeeded
-        }) {
-            return begin_swap(
+        let handoff_prefix = format!("{base}-handoff-");
+        if !stage_succeeded(
+            accepted,
+            source,
+            &handoff_prefix,
+            PublicV1CallKind::Swap,
+            Some(&intermediate.configuration_id),
+        ) {
+            let first_prefix = format!("{base}-first-catch-up-");
+            if !stage_succeeded(
                 accepted,
-                operational_next,
                 source,
-                swap,
-                swap_id,
-                resource_version,
-            )
-            .map(|(transition, command)| PublicV1TopologyPlan::Begin {
-                transition: Box::new(transition),
-                command: Box::new(command),
-            });
+                &first_prefix,
+                PublicV1CallKind::CatchUp,
+                Some(&current.configuration_id),
+            ) {
+                let program = PublicOperationProgram::CatchUp {
+                    configuration: public_configuration(
+                        &source.report.replica,
+                        &observed,
+                        current,
+                    )?,
+                    mode: PublicCatchUpMode::All,
+                };
+                return begin_plan(accepted, source, program, &first_prefix, resource_version);
+            }
+            for peer in operational_replicas
+                .iter()
+                .filter(|replica| replica.report.replica != source.report.replica)
+            {
+                for (step, program) in [
+                    (
+                        "epoch",
+                        PublicOperationProgram::Epoch {
+                            epoch: intermediate.epoch,
+                        },
+                    ),
+                    (
+                        "role",
+                        PublicOperationProgram::Role {
+                            epoch: intermediate.epoch,
+                            role: ReplicaRole::ActiveSecondary,
+                        },
+                    ),
+                    (
+                        "configuration",
+                        PublicOperationProgram::Configuration(public_configuration(
+                            &peer.report.replica,
+                            operational_replicas,
+                            &intermediate,
+                        )?),
+                    ),
+                ] {
+                    let prefix = format!(
+                        "{base}-prepare-{}-{}-{step}-",
+                        peer.report.replica.replica_id, peer.report.process_session_id
+                    );
+                    let expected = if step == "configuration" {
+                        Some(&intermediate.configuration_id)
+                    } else {
+                        None
+                    };
+                    let kind = match step {
+                        "epoch" => PublicV1CallKind::Epoch,
+                        "role" => PublicV1CallKind::Role,
+                        _ => PublicV1CallKind::Configuration,
+                    };
+                    if !stage_succeeded(accepted, peer, &prefix, kind, expected) {
+                        return begin_plan(accepted, peer, program, &prefix, resource_version);
+                    }
+                }
+            }
+            let Some(capability) = source.report.extensions.catch_up_specific_quorum else {
+                return Ok(PublicV1TopologyPlan::Wait);
+            };
+            let mut starting =
+                public_configuration(&source.report.replica, operational_replicas, current)?;
+            let mut refreshed =
+                public_configuration(&source.report.replica, operational_replicas, &intermediate)?;
+            if capability {
+                for configuration in [&mut starting, &mut refreshed] {
+                    for peer in &mut configuration.replicas {
+                        peer.must_catchup = peer.identity.replica_id == operational_next.primary_id;
+                    }
+                }
+            }
+            let program = PublicOperationProgram::Swap {
+                starting,
+                refreshed,
+                epoch: intermediate.epoch,
+                handoff: ReplicaRole::ActiveSecondary,
+                catch_up_specific_quorum: capability,
+                mode: if capability {
+                    PublicCatchUpMode::WriteQuorum
+                } else {
+                    PublicCatchUpMode::All
+                },
+                controller_composed: true,
+            };
+            return begin_plan(accepted, source, program, &handoff_prefix, resource_version);
         }
     }
     if let Some(current) = current
@@ -258,21 +380,21 @@ pub fn plan_public_v1_topology(
                 },
             );
         }
-        for (step, program) in [
-            (
-                "build-role",
-                PublicOperationProgram::Role {
-                    epoch: current.epoch,
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ),
-            (
-                "build-epoch",
-                PublicOperationProgram::Epoch {
-                    epoch: current.epoch,
-                },
-            ),
-        ] {
+        let role = (
+            "build-role",
+            PublicOperationProgram::Role {
+                epoch: current.epoch,
+                role: ReplicaRole::IdleSecondary,
+            },
+        );
+        let epoch = (
+            "build-epoch",
+            PublicOperationProgram::Epoch {
+                epoch: current.epoch,
+            },
+        );
+        let preparation = [epoch, role];
+        for (step, program) in preparation {
             let operation_id = content_addressed_operation_id(
                 format!(
                     "topology-{}-{}-{}-{step}",
@@ -360,7 +482,9 @@ pub fn plan_public_v1_topology(
         }
     }
     let mut ordered_replicas = operational_replicas.iter().collect::<Vec<_>>();
-    if ordinary_failover {
+    let changing_primary = current
+        .is_some_and(|configuration| configuration.primary_id != operational_next.primary_id);
+    if changing_primary {
         ordered_replicas.sort_by_key(|replica| {
             replica.report.replica.replica_id == operational_next.primary_id
         });
@@ -378,7 +502,7 @@ pub fn plan_public_v1_topology(
             operational_next,
             prebuilt,
             !ordinary_failover,
-            ordinary_failover && replica.report.replica.replica_id == operational_next.primary_id,
+            changing_primary && replica.report.replica.replica_id == operational_next.primary_id,
         )? {
             let operation_id = content_addressed_operation_id(
                 format!(
@@ -649,79 +773,42 @@ fn begin_build(
     ))
 }
 
-fn begin_swap(
-    accepted: &PublicV1AcceptedStatus,
-    next: &ConfigurationDescriptor,
-    source: &PublicV1TopologyReplica,
-    program: PublicOperationProgram,
-    operation_id: OperationId,
-    resource_version: &str,
-) -> Result<(PublicV1AcceptedTransitionStatus, PublicV1OperationCommand), String> {
-    let revision = operation_revision(accepted, source, &operation_id, &program, "swap")?;
-    let intent = PublicOperationIntent {
-        identity: accepted.identity.clone(),
-        operation_id: operation_id.clone(),
-        revision,
-        process_session_id: source.report.process_session_id.clone(),
-        class: PublicOperationClass::PlannedSwap,
-        input_digest: program.digest(),
-        replay_disposition: program.replay_disposition(),
-        lifecycle: None,
-        program: Some(program),
-    };
-    intent.validate().map_err(str::to_owned)?;
-    let transition = PublicV1AcceptedTransitionStatus {
-        resource_version: resource_version.to_string(),
-        evidence: accepted.clone(),
-        intent: PublicV1AcceptedTransitionIntent {
-            consumer: PublicV1EvidenceConsumer::Switchover,
-            operation_id,
-            revision,
-            call_kind: PublicV1CallKind::Swap,
-            history: accepted.history.clone(),
-            source: PublicV1ResourceAuthority {
-                storage_incarnation: source.report.storage_incarnation.clone(),
-                resource_version: resource_version.to_string(),
-            },
-            target: None,
-            process_session_id: source.report.process_session_id.clone(),
-            input_digest: intent.input_digest.clone(),
-            replay_disposition: intent.replay_disposition,
-            previous_configuration_id: None,
-            current_configuration_id: Some(next.configuration_id.clone()),
-            catch_up_mode: Some(PublicCatchUpMode::All),
-            catch_up_specific_quorum: Some(false),
-        },
-    };
-    transition.validate()?;
-    Ok((
-        transition,
-        PublicV1OperationCommand {
-            target: source.report.replica.clone(),
-            intent,
-        },
-    ))
+fn content_addressed_operation_id(prefix: String, program: &PublicOperationProgram) -> OperationId {
+    OperationId::new(format!("{prefix}-{}", program.digest().sha256()))
 }
 
-fn planned_swap_program(
-    current: &ConfigurationDescriptor,
-    next: &ConfigurationDescriptor,
-    replicas: &[PublicV1TopologyReplica],
-    source: &PublicV1TopologyReplica,
-) -> Result<PublicOperationProgram, String> {
-    Ok(PublicOperationProgram::Swap {
-        starting: public_configuration(&source.report.replica, replicas, current)?,
-        refreshed: public_configuration(&source.report.replica, replicas, next)?,
-        epoch: next.epoch,
-        handoff: ReplicaRole::ActiveSecondary,
-        catch_up_specific_quorum: false,
-        mode: PublicCatchUpMode::All,
-        controller_composed: true,
+fn stage_succeeded(
+    accepted: &PublicV1AcceptedStatus,
+    replica: &PublicV1TopologyReplica,
+    prefix: &str,
+    kind: PublicV1CallKind,
+    configuration: Option<&ConfigurationId>,
+) -> bool {
+    accepted.completed_operations.iter().any(|completion| {
+        completion.operation_id.as_str().starts_with(prefix)
+            && completion.call_kind == kind
+            && completion.storage_incarnation == replica.report.storage_incarnation
+            && completion.process_session_id == replica.report.process_session_id
+            && completion.history == accepted.history
+            && completion.current_configuration_id.as_ref() == configuration
+            && completion.result == PublicV1AcceptedResult::Succeeded
     })
 }
 
-fn content_addressed_operation_id(prefix: String, program: &PublicOperationProgram) -> OperationId {
-    OperationId::new(format!("{prefix}-{}", program.digest().sha256()))
+fn begin_plan(
+    accepted: &PublicV1AcceptedStatus,
+    replica: &PublicV1TopologyReplica,
+    program: PublicOperationProgram,
+    prefix: &str,
+    resource_version: &str,
+) -> Result<PublicV1TopologyPlan, String> {
+    let id = content_addressed_operation_id(prefix.trim_end_matches('-').to_owned(), &program);
+    begin_operation(accepted, replica, program, id, resource_version).map(
+        |(transition, command)| PublicV1TopologyPlan::Begin {
+            transition: Box::new(transition),
+            command: Box::new(command),
+        },
+    )
 }
 
 fn choose_primary(
@@ -987,13 +1074,22 @@ fn begin_operation(
     let (previous_configuration_id, current_configuration_id) = configuration_ids(&intent);
     let (catch_up_mode, catch_up_specific_quorum) = match intent.program.as_ref() {
         Some(PublicOperationProgram::CatchUp { mode, .. }) => (Some(*mode), None),
+        Some(PublicOperationProgram::Swap {
+            mode,
+            catch_up_specific_quorum,
+            ..
+        }) => (Some(*mode), Some(*catch_up_specific_quorum)),
         _ => (None, None),
     };
     let transition = PublicV1AcceptedTransitionStatus {
         resource_version: resource_version.to_string(),
         evidence: accepted.clone(),
         intent: PublicV1AcceptedTransitionIntent {
-            consumer: PublicV1EvidenceConsumer::Topology,
+            consumer: if call_kind == PublicV1CallKind::Swap {
+                PublicV1EvidenceConsumer::Switchover
+            } else {
+                PublicV1EvidenceConsumer::Topology
+            },
             operation_id,
             revision,
             call_kind,
@@ -1119,6 +1215,9 @@ fn configuration_ids(
                 .map(|previous| previous.configuration_id.clone()),
             Some(configuration.current.configuration_id.clone()),
         ),
+        Some(PublicOperationProgram::Swap { refreshed, .. }) => {
+            (None, Some(refreshed.current.configuration_id.clone()))
+        }
         _ => (None, None),
     }
 }

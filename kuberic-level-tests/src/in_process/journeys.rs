@@ -528,7 +528,12 @@ async fn assert_exact_completion(harness: &Harness, persisted: &serde_json::Valu
     let accepted: PublicV1OperationStatus =
         serde_json::from_value(persisted["status"]["publicV1Operation"].clone())?;
     let command = accepted.command().map_err(anyhow::Error::msg)?;
-    let report = harness.report(command.target.replica_id.value()).await?;
+    let transition: kuberic_controller::crd::PublicV1TransitionState =
+        serde_json::from_value(persisted["status"]["publicV1Transition"].clone())?;
+    let frozen = transition.transition().map_err(anyhow::Error::msg)?.intent;
+    let report = harness
+        .report_uid(command.target.instance_id.as_str())
+        .await?;
     ensure!(
         report.replica == command.target,
         "completion target changed"
@@ -550,6 +555,13 @@ async fn assert_exact_completion(harness: &Harness, persisted: &serde_json::Valu
         completion.process_session_id == command.intent.process_session_id
             && completion.input_digest == command.intent.input_digest
             && completion.replay_disposition == command.intent.replay_disposition
+            && completion.call_kind == frozen.call_kind
+            && completion.history == frozen.history
+            && completion.storage_incarnation == frozen.source.storage_incarnation
+            && completion.previous_configuration_id == frozen.previous_configuration_id
+            && completion.current_configuration_id == frozen.current_configuration_id
+            && completion.catch_up_mode == frozen.catch_up_mode
+            && completion.catch_up_specific_quorum == frozen.catch_up_specific_quorum
             && completion.result == PublicV1OperationResult::Succeeded,
         "completion differs from the persisted operation"
     );
@@ -797,4 +809,455 @@ async fn controller_recreation_resumes_committed_operation() -> Result<()> {
     }
     .await;
     harness.finish(result).await
+}
+
+async fn reject_write(service: &kvstore2::service::KvService, key: &str) -> Result<()> {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        service.replicate_put(key.into(), "ambiguous-attempt".into()),
+    )
+    .await;
+    ensure!(
+        !matches!(result, Ok(Ok(_))),
+        "unsafe write acknowledged: {key}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_primary_isolation_fails_over_and_rejoins_without_recreation() -> Result<()> {
+    let mut harness = Harness::new().await?;
+    let result = async {
+        harness.write("live-before", "acknowledged").await?;
+        harness.assert_values("live-before", "acknowledged").await?;
+        let primary = harness.ready().await?;
+        let old = harness.report(primary).await?;
+        let uid = old.replica.instance_id.to_string();
+        let service = harness.service(primary).await?;
+        harness.isolate_uid(&uid, true).await?;
+        let promoted = harness
+            .ready_survivors(2, std::slice::from_ref(&uid))
+            .await?;
+        ensure!(promoted != primary);
+        harness
+            .service(promoted)
+            .await?
+            .replicate_put("live-after".into(), "new-primary".into())
+            .await?;
+        reject_write(&service, "live-stale-isolated").await?;
+        ensure!(harness.live_uids().await.contains(&uid));
+        harness.isolate_uid(&uid, false).await?;
+        let returned = harness.report_uid(&uid).await?;
+        ensure!(
+            returned.process_session_id == old.process_session_id
+                && returned.replicator_creation_id == old.replicator_creation_id
+                && returned.replica == old.replica
+        );
+        ensure!(std::sync::Arc::ptr_eq(
+            &service,
+            &harness.service_uid(&uid).await?
+        ));
+        reject_write(&service, "live-stale-reconnected").await?;
+        harness.ready().await?;
+        let settled = harness.report_uid(&uid).await?;
+        ensure!(
+            settled.process_session_id == old.process_session_id
+                && settled.replicator_creation_id == old.replicator_creation_id
+        );
+        ensure!(settled.role == kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary);
+        reject_write(&service, "live-stale-settled").await?;
+        harness.assert_values("live-before", "acknowledged").await?;
+        harness.assert_values("live-after", "new-primary").await?;
+        harness.write("live-recovered", "quorum").await?;
+        harness.assert_values("live-recovered", "quorum").await
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_loss_rejects_acknowledgements_and_recovers_ambiguous_suffix() -> Result<()> {
+    let mut harness = Harness::new().await?;
+    let result = async {
+        harness.write("quorum-before", "acknowledged").await?;
+        harness
+            .assert_values("quorum-before", "acknowledged")
+            .await?;
+        let primary = harness.ready().await?;
+        let service = harness.service(primary).await?;
+        let before = harness
+            .set()
+            .await?
+            .status
+            .unwrap()
+            .public_v1_topology
+            .unwrap();
+        let mut isolated = Vec::new();
+        for id in 1..=3 {
+            if id != primary {
+                let uid = harness.report(id).await?.replica.instance_id.to_string();
+                harness.isolate_uid(&uid, true).await?;
+                isolated.push(uid);
+            }
+        }
+        reject_write(&service, "quorum-ambiguous").await?;
+        for _ in 0..3 {
+            harness.step().await?;
+            let topology = harness
+                .set()
+                .await?
+                .status
+                .unwrap()
+                .public_v1_topology
+                .unwrap();
+            ensure!(
+                topology.configuration_id == before.configuration_id && topology.member_count == 3,
+                "lone member rewrote quorum authority"
+            );
+            reject_write(&service, "quorum-lone").await?;
+        }
+        for uid in isolated {
+            harness.isolate_uid(&uid, false).await?;
+        }
+        ensure!(harness.ready().await? == primary);
+        harness
+            .assert_values("quorum-before", "acknowledged")
+            .await?;
+        harness.write("quorum-after", "recovered").await?;
+        harness.assert_values("quorum-after", "recovered").await?;
+        for key in ["quorum-ambiguous", "quorum-lone"] {
+            let value = harness.service(1).await?.get(key).await?;
+            ensure!(
+                value
+                    .as_deref()
+                    .is_none_or(|value| value == "ambiguous-attempt")
+            );
+            for id in 2..=3 {
+                ensure!(
+                    harness.service(id).await?.get(key).await? == value,
+                    "ambiguous write diverged"
+                );
+            }
+        }
+        Ok(())
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn specification_switchover_preserves_data_and_fences_old_writer() -> Result<()> {
+    switchover(None).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switchover_recreation_after_catch_up_resumes_accepted_handoff() -> Result<()> {
+    switchover(Some(false)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switchover_recreation_after_durable_handoff_resumes_promotion() -> Result<()> {
+    switchover(Some(true)).await
+}
+
+async fn switchover(cut: Option<bool>) -> Result<()> {
+    let mut harness = Harness::new().await?;
+    let result = async {
+        harness.write("switch-before", "acknowledged").await?;
+        harness
+            .assert_values("switch-before", "acknowledged")
+            .await?;
+        let old = harness.ready().await?;
+        let old_service = harness.service(old).await?;
+        let mut sessions = Vec::new();
+        for uid in harness.live_uids().await {
+            let report = harness.report_uid(&uid).await?;
+            ensure!(report.extensions.catch_up_specific_quorum == Some(true));
+            sessions.push((
+                uid,
+                report.process_session_id,
+                report.replicator_creation_id,
+            ));
+        }
+        let target = if old == 2 { 3 } else { 2 };
+        let mut set = harness.set().await?;
+        let generation = set.metadata.generation;
+        let status = set.status.clone();
+        let mut preparation =
+            harness
+                .api
+                .arm_matching("sample", false, Some("epoch"), Some("-prepare-"))?;
+        set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+            request_id: "requested-transfer".into(),
+            target_replica_id: target as u32,
+        });
+        let updated = Api::<kuberic_controller::crd::KubericSet>::namespaced(
+            harness.api.client(),
+            "in-process",
+        )
+        .replace("sample", &kube::api::PostParams::default(), &set)
+        .await?;
+        ensure!(
+            updated.metadata.generation == generation.map(|generation| generation + 1)
+                && updated.status == status
+        );
+        loop {
+            tokio::select! {
+                frozen = preparation.entered() => { frozen?; break; }
+                step = harness.step() => step?,
+            }
+        }
+        // A first catch-up is not a write fence. Acknowledge another write
+        // before dispatching peer preparation; source Swap must transfer it too.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            old_service.replicate_put(
+                "switch-after-first-catch-up".into(),
+                "racing-transfer".into(),
+            ),
+        )
+        .await??;
+        preparation.release();
+        let mut barrier = cut
+            .map(|completion| {
+                harness
+                    .api
+                    .arm_matching("sample", completion, Some("swap"), Some("-handoff-"))
+            })
+            .transpose()?;
+        let frozen = if let Some(barrier) = &mut barrier {
+            let frozen = loop {
+                tokio::select! {
+                    frozen = barrier.entered() => break frozen?,
+                    step = harness.step() => step?,
+                }
+            };
+            ensure!(
+                harness
+                    .set()
+                    .await?
+                    .status
+                    .unwrap()
+                    .public_v1_topology
+                    .unwrap()
+                    .primary_id
+                    .value()
+                    == old,
+                "handoff published final topology too early"
+            );
+            if cut == Some(true) {
+                assert_exact_completion(&harness, &frozen).await?;
+                reject_write(&old_service, "switch-handoff-boundary").await?;
+            }
+            harness.recreate_controller()?;
+            Some(frozen)
+        } else {
+            None
+        };
+        if let Some(barrier) = barrier.take() {
+            barrier.release();
+        }
+        loop {
+            let set = harness.set().await?;
+            ensure!(
+                set.status
+                    .as_ref()
+                    .is_none_or(|status| status.public_v1_replacement.is_none()),
+                "switchover requested corrective replacement: {:?}",
+                set.status
+            );
+            if set
+                .status
+                .as_ref()
+                .and_then(|s| s.public_v1_topology.as_ref())
+                .is_some_and(|t| {
+                    t.primary_id.value() == target
+                        && t.completed_switchover_request_id.as_deref()
+                            == Some("requested-transfer")
+                })
+            {
+                break;
+            }
+            harness.step().await?;
+        }
+        ensure!(harness.ready().await? == target);
+        for (uid, session, creation) in sessions {
+            let report = harness.report_uid(&uid).await?;
+            ensure!(
+                report.process_session_id == session && report.replicator_creation_id == creation,
+                "switchover replaced/restarted an existing host"
+            );
+        }
+        harness
+            .assert_values("switch-after-first-catch-up", "racing-transfer")
+            .await?;
+        if let Some(frozen) = frozen {
+            assert_exact_completion(&harness, &frozen).await?;
+        }
+        reject_write(&old_service, "switch-stale").await?;
+        harness
+            .assert_values("switch-before", "acknowledged")
+            .await?;
+        harness.write("switch-after", "new-primary").await?;
+        harness.assert_values("switch-after", "new-primary").await
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_build_destination_isolation_precedes_assertion_reads() -> Result<()> {
+    build_transport_cut(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_build_source_isolation_cuts_the_real_dial() -> Result<()> {
+    build_transport_cut(true).await
+}
+
+async fn build_transport_cut(source: bool) -> Result<()> {
+    use kuberic_runtime::engine::DurableState;
+    let mut harness = Harness::new().await?;
+    let result = async {
+        harness.write("build-cut-before", "acknowledged").await?;
+        let mut barrier = harness
+            .api
+            .arm_matching("sample", false, Some("build"), None)?;
+        delete_secondary(&harness).await?;
+        let frozen = loop {
+            tokio::select! {
+                frozen = barrier.entered() => break frozen?,
+                step = harness.step() => step?,
+            }
+        };
+        let accepted: PublicV1OperationStatus =
+            serde_json::from_value(frozen["status"]["publicV1Operation"].clone())?;
+        let command = accepted.command().map_err(anyhow::Error::msg)?;
+        let Some(PublicOperationProgram::Build(build)) = command.intent.program.as_ref() else {
+            bail!("selected barrier was not Build");
+        };
+        let target = harness
+            .service_uid(build.replica.instance_id.as_str())
+            .await?;
+        ensure!(target.persistence().durable_progress().await?.applied_lsn == 0);
+        let cut = if source {
+            command.target.instance_id.as_str()
+        } else {
+            build.replica.instance_id.as_str()
+        };
+        let network = harness.transport();
+        network.isolate_on_next_dial(cut).await;
+        barrier.release();
+        while !network.is_isolated(cut).await {
+            harness.step().await?;
+        }
+        ensure!(
+            target.persistence().durable_progress().await?.applied_lsn == 0,
+            "isolated first Build dial applied provider effects"
+        );
+        let address = network
+            .physical_route(
+                command.target.instance_id.as_str(),
+                &build.replication_address,
+            )
+            .await
+            .context("real Build did not dial the owned route")?;
+        let uri: http::Uri = address.parse()?;
+        let mut blocked = tokio::net::TcpStream::connect(uri.authority().unwrap().as_str()).await?;
+        use tokio::io::AsyncReadExt;
+        ensure!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), blocked.read_u8())
+                .await?
+                .is_err()
+        );
+        harness.isolate_uid(cut, false).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tonic::transport::Endpoint::from_shared(address)?.connect(),
+        )
+        .await??;
+        let report = harness
+            .report_uid(build.replica.instance_id.as_str())
+            .await?;
+        ensure!(report.process_session_id == build.process_session_id);
+        ensure!(target.persistence().durable_progress().await?.applied_lsn == 0);
+        Ok(())
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Result<()> {
+    for completion in [false, true] {
+        let mut harness = Harness::new().await?;
+        let network = harness.transport();
+        let mut uids = Vec::new();
+        let mut addresses = Vec::new();
+        let result = async {
+            harness.write("cleanup-before", "acknowledged").await?;
+            uids = harness.live_uids().await;
+            addresses = harness
+                .api
+                .snapshot(Kind::Pod)
+                .iter()
+                .filter_map(|pod| {
+                    pod["metadata"]["annotations"]
+                        [kuberic_controller::crd::CONTROL_ADDRESS_ANNOTATION]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            let service = harness.service(1).await?;
+            let mut barrier = harness.api.arm_matching("sample", completion, None, None)?;
+            let mut set = harness.set().await?;
+            set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+                request_id: "cleanup-transfer".into(),
+                target_replica_id: 2,
+            });
+            Api::<kuberic_controller::crd::KubericSet>::namespaced(
+                harness.api.client(),
+                "in-process",
+            )
+            .replace("sample", &kube::api::PostParams::default(), &set)
+            .await?;
+            loop {
+                tokio::select! {
+                    frozen = barrier.entered() => { frozen?; break; }
+                    step = harness.step() => step?,
+                }
+            }
+            let uid = harness.report(1).await?.replica.instance_id.to_string();
+            harness.hold_deletion(&uid, true).await;
+            harness.isolate_uid(&uid, true).await?;
+            let write = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                service.replicate_put("cleanup-ambiguous".into(), "attempt".into()),
+            )
+            .await;
+            ensure!(!matches!(write, Ok(Ok(_))));
+            drop(barrier);
+            Ok(())
+        }
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), harness.finish(result)).await??;
+        network.assert_drained().await?;
+        for uid in uids {
+            let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
+                uid,
+                |_, endpoint| Box::pin(async move { Ok(endpoint) }),
+            )?;
+            drop(route);
+        }
+        for address in addresses {
+            let uri: http::Uri = address.parse()?;
+            ensure!(
+                tokio::net::TcpStream::connect(uri.authority().unwrap().as_str())
+                    .await
+                    .is_err(),
+                "owned control frontend survived teardown"
+            );
+        }
+    }
+    Ok(())
 }

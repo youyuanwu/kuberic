@@ -28,6 +28,7 @@ use tokio::time::Instant;
 use super::{
     kube::{ApiServer as TestApi, Kind},
     pod,
+    transport::Network,
 };
 
 const NAMESPACE: &str = "in-process";
@@ -45,6 +46,9 @@ struct Hosted {
     startup: Option<JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>>,
     running: Option<RunningReplica>,
     data_root: PathBuf,
+    _route: kuberic_runtime::replicator::stateless::TestingTcpRoute,
+    network: Network,
+    uid: String,
 }
 
 impl Hosted {
@@ -65,6 +69,9 @@ impl Hosted {
             }
         }
         if let Err(error) = self.service.shutdown_and_drain().await {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = self.network.forget(&self.uid).await {
             errors.push(error.to_string());
         }
         ensure!(errors.is_empty(), "host cleanup: {}", errors.join("; "));
@@ -99,6 +106,7 @@ pub(super) struct Harness {
     pub reconcile_errors: usize,
     last_error: Option<String>,
     cleaned: bool,
+    network: Network,
     renewals: std::sync::Mutex<BTreeMap<String, ProcessSessionRenewalRequired>>,
 }
 
@@ -124,12 +132,16 @@ impl Harness {
         let task_api = api.clone();
         let task_state = supervisor.clone();
         let task_root = root.path().to_owned();
+        let network = Network::default();
+        let task_network = network.clone();
         let supervisor_task = tokio::spawn(async move {
             let result = loop {
                 if *shutdown.borrow() || shutdown.has_changed().is_err() {
                     break Ok(());
                 }
-                if let Err(error) = supervise(&task_api, &task_state, &task_root).await {
+                if let Err(error) =
+                    supervise(&task_api, &task_state, &task_root, &task_network).await
+                {
                     break Err(error);
                 }
                 tokio::select! {
@@ -151,6 +163,7 @@ impl Harness {
             reconcile_errors: 0,
             last_error: None,
             cleaned: false,
+            network,
             renewals: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
@@ -266,6 +279,20 @@ impl Harness {
     }
 
     pub async fn ready_members(&mut self, expected: usize) -> Result<i64> {
+        self.ready_observed(expected, &[]).await
+    }
+
+    pub async fn ready_survivors(&mut self, expected: usize, isolated: &[String]) -> Result<i64> {
+        for uid in isolated {
+            ensure!(
+                self.network.is_isolated(uid).await,
+                "survivor observation requires acknowledged isolation"
+            );
+        }
+        self.ready_observed(expected, isolated).await
+    }
+
+    async fn ready_observed(&mut self, expected: usize, isolated: &[String]) -> Result<i64> {
         loop {
             self.check().await?;
             let set = self.set().await?;
@@ -278,7 +305,18 @@ impl Harness {
             {
                 let configuration = topology.configuration().map_err(anyhow::Error::msg)?;
                 if configuration.members.len() == expected {
-                    let uids = self.live_uids().await;
+                    ensure!(
+                        !configuration.members.iter().any(|member| isolated
+                            .iter()
+                            .any(|uid| member.identity.instance_id.as_str() == uid)),
+                        "isolated host remains admitted"
+                    );
+                    let uids = self
+                        .live_uids()
+                        .await
+                        .into_iter()
+                        .filter(|uid| !isolated.contains(uid))
+                        .collect::<Vec<_>>();
                     let mut reports = Vec::new();
                     let mut complete = true;
                     for uid in &uids {
@@ -373,6 +411,29 @@ impl Harness {
             .get(uid)
             .map(|host| host.data_root.clone())
             .context("host missing")
+    }
+
+    pub async fn service_uid(&self, uid: &str) -> Result<Arc<KvService>> {
+        self.supervisor
+            .lock()
+            .await
+            .hosts
+            .get(uid)
+            .map(|host| host.service.clone())
+            .context("host missing")
+    }
+
+    pub async fn isolate_uid(&self, uid: &str, isolated: bool) -> Result<()> {
+        ensure!(
+            self.live_uids().await.iter().any(|live| live == uid),
+            "isolation target not live"
+        );
+        self.network.isolate(uid, isolated).await?;
+        ensure!(
+            self.live_uids().await.iter().any(|live| live == uid),
+            "isolation stopped host"
+        );
+        Ok(())
     }
 
     pub fn observations_complete(uids: &[String], reports: &[PublicV1AgentReport]) -> bool {
@@ -537,7 +598,19 @@ impl Harness {
             .snapshot(Kind::Pod)
             .into_iter()
             .find(|pod| pod["metadata"]["uid"].as_str() == Some(uid))
-            .context("member Pod missing")?;
+            .with_context(|| {
+                format!(
+                    "member Pod missing: {uid}; current Pods: {:?}",
+                    self.api
+                        .snapshot(Kind::Pod)
+                        .iter()
+                        .map(|pod| (
+                            pod["metadata"]["name"].clone(),
+                            pod["metadata"]["uid"].clone()
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            })?;
         let endpoint = pod["metadata"]["annotations"][CONTROL_ADDRESS_ANNOTATION]
             .as_str()
             .context("control address missing")?;
@@ -558,8 +631,9 @@ impl Harness {
             )
             .await
             .map_err(|error| anyhow!("agent report: {error:?}"))?;
-        kuberic_runtime::control::normalize_public_v1_agent_status_report(report)
-            .map_err(|error| anyhow!("{error}"))
+        let report = kuberic_runtime::control::normalize_public_v1_agent_status_report(report)
+            .map_err(|error| anyhow!("{error}"))?;
+        Ok(report)
     }
 
     pub(super) fn settled(
@@ -720,6 +794,10 @@ impl Harness {
         }
     }
 
+    pub fn transport(&self) -> super::transport::Network {
+        self.network.clone()
+    }
+
     pub async fn finish(mut self, result: Result<()>) -> Result<()> {
         let result = if result.is_ok() {
             self.check().await
@@ -765,13 +843,26 @@ impl Harness {
             .map(|error| format!("{error:#}"))
             .collect::<Vec<_>>();
         if let Some(task) = self.supervisor_task.take() {
-            match task.await {
-                Ok(Ok(())) => {}
+            let mut task = task;
+            match tokio::time::timeout(Duration::from_secs(20), &mut task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => errors.push(error.to_string()),
                 Ok(Err(error)) => errors.push(error.to_string()),
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => {
+                    task.abort();
+                    let _ = task.await;
+                    errors.push(format!("supervisor teardown timed out: {error}"));
+                }
             }
         }
-        let hosts = std::mem::take(&mut self.supervisor.lock().await.hosts);
+        if let Err(error) = self.network.finish().await {
+            errors.push(error.to_string());
+        }
+        let hosts = {
+            let mut state = self.supervisor.lock().await;
+            state.held_deletions.clear();
+            std::mem::take(&mut state.hosts)
+        };
         for (_, host) in hosts {
             match tokio::time::timeout(Duration::from_secs(15), host.stop()).await {
                 Ok(Ok(())) => {}
@@ -814,6 +905,7 @@ async fn supervise(
     api: &TestApi,
     state: &Mutex<SupervisorState>,
     root: &std::path::Path,
+    network: &Network,
 ) -> Result<()> {
     let mut state = state.lock().await;
     let objects = snapshot(api);
@@ -867,7 +959,8 @@ async fn supervise(
         status.pod_ip = Some("127.0.0.1".into());
         let config = pod::resolve(pod, &pvcs, &secrets, root)?;
         let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let control = format!("http://{}", control_listener.local_addr()?);
+        let backend = format!("http://{}", control_listener.local_addr()?);
+        let control = network.route("controller", &uid, &backend).await?;
         let replication = format!("http://{}", config.replication_address);
         let app_path = config.data_root.join("application");
         let storage = if KvPersistence::is_fresh_empty(&app_path)? {
@@ -886,6 +979,21 @@ async fn supervise(
         ));
         let data_root = config.data_root.clone();
         let (startup_shutdown, receiver) = watch::channel(false);
+        let routed_uid = uid.clone();
+        let routed_network = network.clone();
+        let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
+            uid.clone(),
+            move |destination, endpoint| {
+                let network = routed_network.clone();
+                let uid = routed_uid.clone();
+                Box::pin(async move {
+                    network
+                        .route(&uid, &destination, &endpoint)
+                        .await
+                        .map_err(std::io::Error::other)
+                })
+            },
+        )?;
         let host = ReplicaHost::new(config, service.clone(), storage, resolver);
         pod.annotations_mut()
             .insert(CONTROL_ADDRESS_ANNOTATION.into(), control);
@@ -921,13 +1029,16 @@ async fn supervise(
         ensure!(updated, "Pod infrastructure updates repeatedly conflicted");
         let startup = tokio::spawn(host.start_with_shutdown(control_listener, receiver));
         state.hosts.insert(
-            uid,
+            uid.clone(),
             Hosted {
                 service,
                 startup_shutdown,
                 startup: Some(startup),
                 running: None,
                 data_root,
+                _route: route,
+                network: network.clone(),
+                uid: uid.clone(),
             },
         );
     }

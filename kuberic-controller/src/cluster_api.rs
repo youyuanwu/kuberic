@@ -4005,6 +4005,7 @@ impl ClusterApi for InMemoryClusterApi {
                     if let Some(program) = operation.intent.program.as_ref() {
                         match program {
                             kuberic_runtime::protocol::public_operations::PublicOperationProgram::Open { .. } => {
+                                report.extensions.catch_up_specific_quorum = Some(false);
                                 report.replication_address = Some(format!(
                                     "http://10.0.0.{}:50052",
                                     report.replica.replica_id,
