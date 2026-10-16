@@ -166,6 +166,19 @@ pub fn plan_public_v1_topology(
     } else {
         &eligible
     };
+    let retained_rejoins = eligible
+        .iter()
+        .filter(|target| {
+            current.is_some_and(|configuration| {
+                !configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == target.report.replica)
+                    && can_rejoin_retained_member(accepted, configuration, &eligible, target)
+            })
+        })
+        .map(|target| target.report.replica.clone())
+        .collect::<Vec<_>>();
     if let Some(replica) = operational_replicas
         .iter()
         .find(|replica| replica.replication_address.is_empty())
@@ -354,6 +367,7 @@ pub fn plan_public_v1_topology(
                 .members
                 .iter()
                 .any(|member| member.identity == replica.report.replica)
+                && !retained_rejoins.contains(&replica.report.replica)
         })
     {
         let open = PublicOperationProgram::Open {
@@ -430,14 +444,7 @@ pub fn plan_public_v1_topology(
                     .find(|replica| replica.report.replica.replica_id == primary_id)
             })
             .ok_or_else(|| "public-v1 build lacks an available source".to_string())?;
-        let build_id = OperationId::new(format!(
-            "topology-{}-build-{}-{}-{}-{}",
-            current.configuration_id,
-            target.report.replica.replica_id,
-            source.report.process_session_id,
-            target.report.process_session_id,
-            target.report.storage_incarnation.storage_generation,
-        ));
+        let build_id = topology_build_id(current, source, target);
         if !accepted.completed_operations.iter().any(|completion| {
             completion.operation_id == build_id
                 && completion.result == PublicV1AcceptedResult::Succeeded
@@ -484,7 +491,7 @@ pub fn plan_public_v1_topology(
     let mut ordered_replicas = operational_replicas.iter().collect::<Vec<_>>();
     let changing_primary = current
         .is_some_and(|configuration| configuration.primary_id != operational_next.primary_id);
-    if changing_primary {
+    if changing_primary || !retained_rejoins.is_empty() {
         ordered_replicas.sort_by_key(|replica| {
             replica.report.replica.replica_id == operational_next.primary_id
         });
@@ -502,7 +509,8 @@ pub fn plan_public_v1_topology(
             operational_next,
             prebuilt,
             !ordinary_failover,
-            changing_primary && replica.report.replica.replica_id == operational_next.primary_id,
+            (changing_primary || !retained_rejoins.is_empty())
+                && replica.report.replica.replica_id == operational_next.primary_id,
         )? {
             let operation_id = content_addressed_operation_id(
                 format!(
@@ -692,6 +700,60 @@ pub fn plan_public_v1_topology(
         return Ok(PublicV1TopologyPlan::Wait);
     }
     Ok(PublicV1TopologyPlan::Stable)
+}
+
+fn can_rejoin_retained_member(
+    accepted: &PublicV1AcceptedStatus,
+    current: &ConfigurationDescriptor,
+    replicas: &[PublicV1TopologyReplica],
+    target: &PublicV1TopologyReplica,
+) -> bool {
+    // Rejoin only a clean tail whose exact storage/session configuration result
+    // was actually accepted. The new configuration still fences the member and
+    // the primary must prove/catch up the retained log before topology admission.
+    let report = &target.report;
+    report.validate().is_ok()
+        && report.history == accepted.history
+        && report.progress.first == report.progress.last
+        && replicas.iter().any(|source| {
+            current.members.iter().any(|member| {
+                member.role == ReplicaRole::Primary && member.identity == source.report.replica
+            }) && source.report.progress.first >= report.progress.last
+                && !accepted.completed_operations.iter().any(|completion| {
+                    completion.operation_id == topology_build_id(current, source, target)
+                        && completion.result == PublicV1AcceptedResult::Succeeded
+                })
+        })
+        && report.completed_operations.iter().any(|completion| {
+            completion.process_session_id == report.process_session_id
+                && completion.storage_incarnation == report.storage_incarnation
+                && completion.history == accepted.history
+                && completion.current_configuration_id.is_some()
+                && matches!(
+                    completion.call_kind,
+                    PublicV1CallKind::Configuration | PublicV1CallKind::CatchUp
+                )
+                && completion.result == PublicV1OperationResult::Succeeded
+                && accepted.completed_operations.contains(
+                    &kuberic_runtime::protocol::public_operations::
+                        PublicV1AcceptedOperationCompletion::from_completion(completion),
+                )
+        })
+}
+
+fn topology_build_id(
+    current: &ConfigurationDescriptor,
+    source: &PublicV1TopologyReplica,
+    target: &PublicV1TopologyReplica,
+) -> OperationId {
+    OperationId::new(format!(
+        "topology-{}-build-{}-{}-{}-{}",
+        current.configuration_id,
+        target.report.replica.replica_id,
+        source.report.process_session_id,
+        target.report.process_session_id,
+        target.report.storage_incarnation.storage_generation,
+    ))
 }
 
 fn begin_build(
@@ -1530,6 +1592,124 @@ mod tests {
             public_configuration(&replicas[0].report.replica, &replicas[..1], &configuration)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn clean_rejoin_requires_exact_accepted_storage_session_and_delta_catch_up() {
+        let mut replicas = vec![
+            replica(1, ReplicaRole::Primary),
+            replica(2, ReplicaRole::ActiveSecondary),
+            replica(3, ReplicaRole::ActiveSecondary),
+        ];
+        let mut accepted = accepted(&replicas[0]);
+        let original = desired_configuration(None, &replicas, ReplicaId::new(1)).unwrap();
+        let program = PublicOperationProgram::Configuration(
+            public_configuration(&replicas[0].report.replica, &replicas, &original).unwrap(),
+        );
+        let (_, command) = begin_operation(
+            &accepted,
+            &replicas[0],
+            program,
+            OperationId::new("historical-configuration"),
+            "resource-version",
+        )
+        .unwrap();
+        accept_command(&mut accepted, &mut replicas, &command);
+        let storage_incarnation = replicas[0].report.storage_incarnation.clone();
+        replicas[0]
+            .report
+            .completed_operations
+            .push(PublicV1OperationCompletion {
+                operation_id: command.intent.operation_id.clone(),
+                revision: command.intent.revision,
+                call_kind: PublicV1CallKind::Configuration,
+                process_session_id: command.intent.process_session_id.clone(),
+                input_digest: command.intent.input_digest.clone(),
+                replay_disposition: command.intent.replay_disposition,
+                history: accepted.history.clone(),
+                storage_incarnation,
+                previous_configuration_id: None,
+                current_configuration_id: Some(original.configuration_id.clone()),
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+                result: PublicV1OperationResult::Succeeded,
+            });
+        replicas[0].report.progress.first = 1;
+        replicas[0].report.progress.last = 1;
+        replicas[1] = replica(2, ReplicaRole::Primary);
+        replicas[1].report.progress.first = 2;
+        replicas[1].report.progress.last = 2;
+        let current =
+            desired_configuration(Some(&original), &replicas[1..], ReplicaId::new(2)).unwrap();
+        assert!(can_rejoin_retained_member(
+            &accepted,
+            &current,
+            &replicas,
+            &replicas[0]
+        ));
+        for mutation in 0..8 {
+            let mut target = replicas[0].clone();
+            let mut evidence = accepted.clone();
+            match mutation {
+                0 => {
+                    target.report.storage_incarnation.storage_generation =
+                        StorageGeneration::new("fresh-storage")
+                }
+                1 => target.report.process_session_id = ProcessSessionId::new("fresh-session"),
+                2 => {
+                    target.report.history.history_id =
+                        kuberic_runtime::protocol::types::HistoryId::new("other-history")
+                }
+                3 => target.report.progress.last = 2,
+                4 => target.report.completed_operations.clear(),
+                5 => evidence.completed_operations.clear(),
+                6 => {
+                    target.report.progress.first = 3;
+                    target.report.progress.last = 3;
+                }
+                7 => {
+                    let mut built = evidence.completed_operations[0].clone();
+                    built.operation_id = topology_build_id(&current, &replicas[1], &target);
+                    built.call_kind = PublicV1CallKind::Build;
+                    evidence.completed_operations.push(built);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !can_rejoin_retained_member(&evidence, &current, &replicas, &target),
+                "unsafe retained rejoin mutation {mutation}"
+            );
+        }
+        let mut prepared = Vec::new();
+        for _ in 0..20 {
+            let plan = plan_public_v1_topology(
+                &accepted,
+                Some(&current),
+                &replicas,
+                3,
+                None,
+                Some(ReplicaId::new(2)),
+                "resource-version",
+            )
+            .unwrap();
+            let PublicV1TopologyPlan::Begin { command, .. } = plan else {
+                panic!("rejoin must catch up before persisting topology: {plan:?}");
+            };
+            match command.intent.program.as_ref().unwrap() {
+                PublicOperationProgram::Build(_) => panic!("clean rejoin must not snapshot-copy"),
+                PublicOperationProgram::Configuration(_) => prepared.push(command.target.clone()),
+                PublicOperationProgram::CatchUp { mode, .. } => {
+                    assert_eq!(*mode, PublicCatchUpMode::All);
+                    assert_eq!(command.target.replica_id, ReplicaId::new(2));
+                    assert!(prepared.contains(&replicas[0].report.replica));
+                    assert!(prepared.contains(&replicas[2].report.replica));
+                    return;
+                }
+                _ => {}
+            }
+            accept_command(&mut accepted, &mut replicas, &command);
+        }
+        panic!("clean rejoin never reached delta catch-up");
     }
 
     #[test]

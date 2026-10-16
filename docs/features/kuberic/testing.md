@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 311 |
+| ordinary | 313 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **357** |
+| **total** | **359** |
 
-Ordinary partition counts are `78, 78, 78, 77`. PostgreSQL partition counts
+Ordinary partition counts are `79, 78, 78, 78`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -64,7 +64,7 @@ hosted KVStore2 replicas, TCP replication, and durable files. Only Kubernetes
 resource storage, Pod/PVC realization, and explicit socket faults are simulated. It requires no cluster,
 containers, kubeconfig, or application binaries.
 
-Twenty-three ordinary-tier journey/assertion tests cover bootstrap/status conflict,
+Twenty-four ordinary-tier journey/assertion tests cover bootstrap/status conflict,
 support Service/Secret repair, contained restart, replacement with delayed exact
 cleanup, replacement followed by same-storage restart, stopped-primary failover,
 live-primary isolation/reconnection, quorum loss/restoration, and spec-driven
@@ -94,6 +94,12 @@ Switchover cancellation/retargeting after durable peer preparation and controlle
 recreation must complete the frozen transfer before considering the edited spec.
 Completion identifies that original request; both transfers preserve receipts.
 An unaccepted request must not block failover when its source is already absent.
+
+Live-primary return is exercised after genuine session renewal both with and
+without rejected writes on the isolated host. The clean-tail case must fence and
+recover the same host/session through retained-log catch-up, without snapshot
+Build or a manufactured ambiguous suffix. Renewal projection cannot override
+newer explicit Epoch/Role work or a conflicting same-epoch role.
 
 Each scenario owns dynamically allocated loopback listeners, resources, and
 storage. Callers pass a bound control socket at startup, not host construction.

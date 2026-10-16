@@ -910,12 +910,32 @@ async fn reject_write(service: &kvstore2::service::KvService, key: &str) -> Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_primary_isolation_fails_over_and_rejoins_without_recreation() -> Result<()> {
+    live_primary_isolation(true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renewed_primary_returns_without_an_ambiguous_write_suffix() -> Result<()> {
+    live_primary_isolation(false).await
+}
+
+async fn live_primary_isolation(attempt_isolated_writes: bool) -> Result<()> {
     let mut harness = Harness::new().await?;
     let result = async {
         harness.write("live-before", "acknowledged").await?;
         harness.assert_values("live-before", "acknowledged").await?;
+        let before_restart = harness.report(2).await?;
+        harness.stop(2, true).await?;
+        harness.ready().await?;
+        ensure!(
+            harness.report(2).await?.process_session_id != before_restart.process_session_id,
+            "secondary did not renew its session before failover"
+        );
         let primary = harness.ready().await?;
         let old = harness.report(primary).await?;
+        ensure!(
+            old.progress.first == old.progress.last,
+            "failover must start with a clean committed tail"
+        );
         let uid = old.replica.instance_id.to_string();
         let service = harness.service(primary).await?;
         harness.isolate_uid(&uid, true).await?;
@@ -928,7 +948,9 @@ async fn live_primary_isolation_fails_over_and_rejoins_without_recreation() -> R
             .await?
             .replicate_put("live-after".into(), "new-primary".into())
             .await?;
-        reject_write(&service, "live-stale-isolated").await?;
+        if attempt_isolated_writes {
+            reject_write(&service, "live-stale-isolated").await?;
+        }
         ensure!(harness.live_uids().await.contains(&uid));
         harness.isolate_uid(&uid, false).await?;
         let returned = harness.report_uid(&uid).await?;
@@ -941,7 +963,9 @@ async fn live_primary_isolation_fails_over_and_rejoins_without_recreation() -> R
             &service,
             &harness.service_uid(&uid).await?
         ));
-        reject_write(&service, "live-stale-reconnected").await?;
+        if attempt_isolated_writes {
+            reject_write(&service, "live-stale-reconnected").await?;
+        }
         harness.ready().await?;
         let settled = harness.report_uid(&uid).await?;
         ensure!(
@@ -949,6 +973,23 @@ async fn live_primary_isolation_fails_over_and_rejoins_without_recreation() -> R
                 && settled.replicator_creation_id == old.replicator_creation_id
         );
         ensure!(settled.role == kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary);
+        if !attempt_isolated_writes {
+            let source = harness.report(promoted).await?;
+            ensure!(
+                !source
+                    .completed_operations
+                    .iter()
+                    .any(|completion| { completion.call_kind == PublicV1CallKind::Build }),
+                "clean committed-tail rejoin must use retained deltas, not snapshot Build"
+            );
+            ensure!(
+                source.completed_operations.iter().any(|completion| {
+                    completion.call_kind == PublicV1CallKind::CatchUp
+                        && completion.result == PublicV1OperationResult::Succeeded
+                }),
+                "clean return did not complete real catch-up"
+            );
+        }
         reject_write(&service, "live-stale-settled").await?;
         harness.assert_values("live-before", "acknowledged").await?;
         harness.assert_values("live-after", "new-primary").await?;

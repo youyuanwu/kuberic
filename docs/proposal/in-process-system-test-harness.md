@@ -438,6 +438,23 @@ an ambiguous suffix, and permits copy replacement of an ambiguous target only
 when the source boundary covers its committed floor. Existing established,
 nonambiguous nonempty targets remain protected.
 
+A clean returning member with matching accepted configuration evidence for its
+exact storage, history and process session rejoins without snapshot Build.
+Its committed/applied tail must agree and cannot exceed the retained primary's
+committed progress. Peers receive the new epoch/role/configuration before the
+primary performs real All catch-up over retained deltas; only then can topology
+admission advance. A completed Build keeps its original admission path rather
+than switching to delta rejoin after copy has cleaned the tail. Missing evidence,
+fresh storage/session, different history and ambiguous tails do not qualify.
+Retained renewal projection must also respect newer completed Epoch and Role,
+including a conflicting same-epoch role, not just newer Configuration. This keeps
+access conservative between explicit topology stages.
+
+The live-isolation journeys seed a real secondary session renewal before failover.
+One exercises rejected stale writes and the other leaves the old primary's tail
+clean until it has rejoined as the same host/session/service. The clean case
+requires real catch-up without Build and preserves both acknowledged values.
+
 ## Failure Model and Limits
 
 An in-process host restart is a cooperative shutdown and reconstruction, not a
@@ -455,6 +472,9 @@ target provider progress and restored socket/control connectivity, not general
 automatic failed-Build recovery. Exploratory terminal Build failures exposed
 stalled controller retry/re-admission paths; those are outside these recovery
 journeys and are not hidden by asserting application recovery in the probes.
+Clean historically admitted primary return is covered by delta rejoin, avoiding
+the inappropriate snapshot Build and its terminal failure rather than weakening
+the established-committed-tail copy guard.
 The deterministic switchover write after first catch-up is not a claim of
 arbitrary concurrent rapid-write stress support.
 
