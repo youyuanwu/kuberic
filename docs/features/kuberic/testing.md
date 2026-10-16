@@ -27,14 +27,14 @@ The current inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 334 |
+| ordinary | 347 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
 | DEX live | 1 |
-| **total** | **381** |
+| **total** | **394** |
 
-Ordinary partition counts are `84, 84, 83, 83`. PostgreSQL partition counts
+Ordinary partition counts are `87, 87, 87, 86`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -133,6 +133,7 @@ task pause and proves preserved data, post-failover quorum writes, resumed
 old-primary fencing, and stale-write rejection. The scenarios do not read
 removed legacy status fields.
 
-Exact CI run `38804014250` passed all 381 tests and both owned live jobs on
-revision `ad5d766`, including all ordinary/PostgreSQL partitions, DEX, PR live
-smoke, and the retained bootstrap/replacement/failover sequence.
+Historical exact CI runs `38804014250` and `38809710653` passed the
+then-current 381-test matrix on implementation revision `ad5d766` and Phase 4
+documentation revision `ce1ca49`. Exact CI for the final 394-test commit
+remains pending.

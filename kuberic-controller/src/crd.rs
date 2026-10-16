@@ -85,6 +85,8 @@ pub struct PublicV1TopologyState {
     pub unavailable_primary_id: Option<ReplicaId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_since_unix_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_switchover_request_id: Option<String>,
     #[schemars(length(min = 2))]
     pub canonical_configuration_json: String,
 }
@@ -132,6 +134,7 @@ impl PublicV1TopologyState {
             sessions: sessions.to_vec(),
             unavailable_primary_id: None,
             unavailable_since_unix_seconds: None,
+            completed_switchover_request_id: None,
             canonical_configuration_json: serde_json::to_string(configuration)
                 .map_err(|error| error.to_string())?,
         })
@@ -168,6 +171,10 @@ impl PublicV1TopologyState {
             || self
                 .unavailable_since_unix_seconds
                 .is_some_and(|since| since < 0)
+            || self
+                .completed_switchover_request_id
+                .as_ref()
+                .is_some_and(String::is_empty)
         {
             return Err("public-v1 topology summary differs from canonical configuration".into());
         }
@@ -246,6 +253,8 @@ pub struct PublicV1ReplacementState {
     pub predecessor: ReplicaStorageIncarnationContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement: Option<ReplicaStorageIncarnationContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retiring_replacement: Option<ReplicaStorageIncarnationContext>,
 }
 
 impl PublicV1ReplacementState {
@@ -261,6 +270,7 @@ impl PublicV1ReplacementState {
             )),
             predecessor,
             replacement: None,
+            retiring_replacement: None,
         })
     }
 
@@ -268,6 +278,7 @@ impl PublicV1ReplacementState {
         self.validate()?;
         replacement.validate().map_err(str::to_owned)?;
         if self.replacement.is_some()
+            || self.retiring_replacement.is_some()
             || replacement.replica.replica_id != self.predecessor.replica.replica_id
             || replacement.replica == self.predecessor.replica
             || replacement == self.predecessor
@@ -278,18 +289,66 @@ impl PublicV1ReplacementState {
             operation_id: self.operation_id.clone(),
             predecessor: self.predecessor.clone(),
             replacement: Some(replacement),
+            retiring_replacement: None,
+        })
+    }
+
+    pub(crate) fn begin_replacement_retirement(
+        &self,
+        replacement: &ReplicaStorageIncarnationContext,
+    ) -> Result<Self, String> {
+        self.validate()?;
+        if self.replacement.as_ref() != Some(replacement) || self.retiring_replacement.is_some() {
+            return Err("public-v1 replacement unbind differs from bound target".into());
+        }
+        Ok(Self {
+            operation_id: self.operation_id.clone(),
+            predecessor: self.predecessor.clone(),
+            replacement: None,
+            retiring_replacement: Some(replacement.clone()),
+        })
+    }
+
+    pub(crate) fn complete_replacement_retirement(
+        &self,
+        configuration_id: &ConfigurationId,
+        replacement: &ReplicaStorageIncarnationContext,
+        replacement_was_admitted: bool,
+    ) -> Result<Self, String> {
+        self.validate()?;
+        if self.replacement.is_some() || self.retiring_replacement.as_ref() != Some(replacement) {
+            return Err("public-v1 replacement cleanup differs from retiring target".into());
+        }
+        if replacement_was_admitted {
+            return Self::new(configuration_id, replacement.clone());
+        }
+        Ok(Self {
+            operation_id: self.operation_id.clone(),
+            predecessor: self.predecessor.clone(),
+            replacement: None,
+            retiring_replacement: None,
         })
     }
 
     pub fn validate(&self) -> Result<(), String> {
         self.predecessor.validate().map_err(str::to_owned)?;
         if self.operation_id.is_empty()
+            || self.replacement.is_some() && self.retiring_replacement.is_some()
             || self.replacement.as_ref().is_some_and(|replacement| {
                 replacement.validate().is_err()
                     || replacement.replica.replica_id != self.predecessor.replica.replica_id
                     || replacement.replica == self.predecessor.replica
                     || replacement == &self.predecessor
             })
+            || self
+                .retiring_replacement
+                .as_ref()
+                .is_some_and(|replacement| {
+                    replacement.validate().is_err()
+                        || replacement.replica.replica_id != self.predecessor.replica.replica_id
+                        || replacement.replica == self.predecessor.replica
+                        || replacement == &self.predecessor
+                })
         {
             return Err("public-v1 replacement authority is invalid".into());
         }
@@ -439,6 +498,49 @@ impl KubericSetStatus {
         if let Some(replacement) = &self.public_v1_replacement {
             replacement.validate()?;
         }
+        if topology.is_some() && authority.is_none() {
+            return Err("public-v1 topology lacks accepted authority".into());
+        }
+        if let Some(replacement) = &self.public_v1_replacement {
+            let topology = topology
+                .as_ref()
+                .ok_or_else(|| "public-v1 replacement lacks accepted topology".to_string())?;
+            let topology_state = self
+                .public_v1_topology
+                .as_ref()
+                .expect("topology parsed above");
+            let logical_predecessor = topology.members.iter().find(|member| {
+                member.identity.replica_id == replacement.predecessor.replica.replica_id
+            });
+            if authority.is_none()
+                || logical_predecessor.is_some_and(|member| {
+                    let accepted_storage = topology_state
+                        .sessions
+                        .iter()
+                        .find(|session| session.identity == member.identity)
+                        .map(|session| &session.storage_incarnation);
+                    let matches_predecessor = member.identity == replacement.predecessor.replica
+                        && accepted_storage == Some(&replacement.predecessor);
+                    let matches_replacement =
+                        replacement.replacement.as_ref().is_some_and(|target| {
+                            member.identity == target.replica && accepted_storage == Some(target)
+                        });
+                    let matches_retiring =
+                        replacement
+                            .retiring_replacement
+                            .as_ref()
+                            .is_some_and(|target| {
+                                member.identity == target.replica
+                                    && accepted_storage == Some(target)
+                            });
+                    !matches_predecessor && !matches_replacement && !matches_retiring
+                })
+            {
+                return Err(
+                    "public-v1 replacement predecessor differs from accepted topology".into(),
+                );
+            }
+        }
         if let Some(renewal) = &renewal
             && authority.as_ref().is_none_or(|accepted| {
                 accepted.history != renewal.required.history
@@ -492,6 +594,56 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use kuberic_runtime::protocol::types::{
+        AgentGeneration, PodUid, PvcUid, ReplicaIdentity, ReplicaInstanceId,
+        ReplicaStorageIdentity, StorageGeneration,
+    };
+
+    fn replacement_storage(replica_id: i64, instance: &str) -> ReplicaStorageIncarnationContext {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(replica_id),
+            instance_id: ReplicaInstanceId::new(instance),
+            agent_generation: AgentGeneration::new(format!("generation-{instance}")),
+        };
+        ReplicaStorageIncarnationContext {
+            replica: identity,
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new(instance),
+                pvc_uid: PvcUid::new(format!("pvc-{instance}")),
+            },
+            storage_generation: StorageGeneration::new(format!("storage-{instance}")),
+        }
+    }
+
+    #[test]
+    fn replacement_authority_retires_only_its_exact_failed_target() {
+        let predecessor = replacement_storage(1, "predecessor");
+        let target = replacement_storage(1, "target");
+        let crossed = replacement_storage(1, "crossed");
+        let authority =
+            PublicV1ReplacementState::new(&ConfigurationId::new("configuration"), predecessor)
+                .unwrap()
+                .bind(target.clone())
+                .unwrap();
+
+        let retiring = authority.begin_replacement_retirement(&target).unwrap();
+        assert_eq!(retiring.operation_id, authority.operation_id);
+        assert_eq!(retiring.predecessor, authority.predecessor);
+        assert!(retiring.replacement.is_none());
+        assert_eq!(retiring.retiring_replacement.as_ref(), Some(&target));
+        let configuration_id = ConfigurationId::new("configuration");
+        let unbound = retiring
+            .complete_replacement_retirement(&configuration_id, &target, false)
+            .unwrap();
+        assert!(unbound.replacement.is_none());
+        assert!(unbound.retiring_replacement.is_none());
+        let rebased = retiring
+            .complete_replacement_retirement(&configuration_id, &target, true)
+            .unwrap();
+        assert_eq!(rebased.predecessor, target);
+        assert_ne!(rebased.operation_id, authority.operation_id);
+        assert!(authority.begin_replacement_retirement(&crossed).is_err());
+    }
 
     #[test]
     fn crd_schema_is_public_v1_only_and_structurally_typed() {

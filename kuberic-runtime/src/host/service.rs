@@ -39,7 +39,6 @@ pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::fr
 pub(crate) enum PublicV1ControlServiceRegistration {
     AgentControl,
     ReplicaPeer,
-    Alternate,
 }
 
 impl PublicV1ControlServiceRegistration {
@@ -47,20 +46,73 @@ impl PublicV1ControlServiceRegistration {
         match self {
             Self::AgentControl => "AgentControlServer",
             Self::ReplicaPeer => "ReplicaPeerServer",
-            Self::Alternate => "AlternateContinuationServer",
         }
     }
 }
 
-pub(crate) const PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS: &[PublicV1ControlServiceRegistration] = &[
-    PublicV1ControlServiceRegistration::AgentControl,
-    PublicV1ControlServiceRegistration::ReplicaPeer,
-];
+#[derive(Debug, Clone, Copy)]
+struct AgentControlEndpoint;
+
+impl AgentControlEndpoint {
+    fn bind<S>(self, service: S) -> proto::agent_control_server::AgentControlServer<S>
+    where
+        S: proto::agent_control_server::AgentControl,
+    {
+        proto::agent_control_server::AgentControlServer::new(service)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplicaPeerEndpoint;
+
+impl ReplicaPeerEndpoint {
+    fn bind<S>(self, service: S) -> proto::replica_peer_server::ReplicaPeerServer<S>
+    where
+        S: proto::replica_peer_server::ReplicaPeer,
+    {
+        proto::replica_peer_server::ReplicaPeerServer::new(service)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublicV1ControlServiceManifest {
+    agent_control: AgentControlEndpoint,
+    replica_peer: ReplicaPeerEndpoint,
+}
+
+impl PublicV1ControlServiceManifest {
+    pub(crate) const fn registrations(self) -> [PublicV1ControlServiceRegistration; 2] {
+        [
+            PublicV1ControlServiceRegistration::AgentControl,
+            PublicV1ControlServiceRegistration::ReplicaPeer,
+        ]
+    }
+
+    fn agent_control<S>(self, service: S) -> proto::agent_control_server::AgentControlServer<S>
+    where
+        S: proto::agent_control_server::AgentControl,
+    {
+        self.agent_control.bind(service)
+    }
+
+    fn replica_peer<S>(self, service: S) -> proto::replica_peer_server::ReplicaPeerServer<S>
+    where
+        S: proto::replica_peer_server::ReplicaPeer,
+    {
+        self.replica_peer.bind(service)
+    }
+}
+
+pub(crate) const PUBLIC_V1_CONTROL_SERVICES: PublicV1ControlServiceManifest =
+    PublicV1ControlServiceManifest {
+        agent_control: AgentControlEndpoint,
+        replica_peer: ReplicaPeerEndpoint,
+    };
 
 pub(crate) fn validate_public_v1_control_services(
-    registrations: &[PublicV1ControlServiceRegistration],
+    manifest: PublicV1ControlServiceManifest,
 ) -> Result<()> {
-    if registrations
+    if manifest.registrations()
         != [
             PublicV1ControlServiceRegistration::AgentControl,
             PublicV1ControlServiceRegistration::ReplicaPeer,
@@ -138,15 +190,14 @@ impl InitializationService {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let listener = TcpListener::bind(control_address).await?;
-        validate_public_v1_control_services(PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS)?;
+        let services = PUBLIC_V1_CONTROL_SERVICES;
+        validate_public_v1_control_services(services)?;
         let control = self.clone();
         let peer = self;
         ready.send_replace(true);
         let result = tonic::transport::Server::builder()
-            .add_service(proto::agent_control_server::AgentControlServer::new(
-                control,
-            ))
-            .add_service(proto::replica_peer_server::ReplicaPeerServer::new(peer))
+            .add_service(services.agent_control(control))
+            .add_service(services.replica_peer(peer))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 wait_for_shutdown(&mut shutdown).await;
             })
@@ -570,16 +621,15 @@ where
         self.runtime
             .bind_replica_session(state.identity.resource_uid, self.session.id().clone())?;
         let listener = TcpListener::bind(control_address).await?;
-        validate_public_v1_control_services(PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS)?;
+        let services = PUBLIC_V1_CONTROL_SERVICES;
+        validate_public_v1_control_services(services)?;
         let control = self.clone();
         let peer = self.clone();
         self.ready.store(true, Ordering::Release);
         ready.send_replace(true);
         let result = tonic::transport::Server::builder()
-            .add_service(proto::agent_control_server::AgentControlServer::new(
-                control,
-            ))
-            .add_service(proto::replica_peer_server::ReplicaPeerServer::new(peer))
+            .add_service(services.agent_control(control))
+            .add_service(services.replica_peer(peer))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 wait_for_shutdown(&mut shutdown).await;
             })

@@ -5,6 +5,7 @@
 //! none of these records can be passed to production admission APIs. Private
 //! attachment, registration, lifecycle, and authority capabilities stay private.
 
+mod public_v1_alternate_registration_fixture;
 mod public_v1_conformance;
 pub mod session;
 pub mod sqlite_store;

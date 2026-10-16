@@ -155,8 +155,10 @@ just nextest-validate-archive
 
 The current exact inventory is documented in [Testing](testing.md). Live KinD
 validation uses only bootstrap, replacement, and failover in an explicitly
-owned disposable cluster. Exact CI run `38804014250` passed the complete matrix
-on revision `ad5d766`.
+owned disposable cluster. Historical exact CI runs `38804014250` and
+`38809710653` passed the then-current 381-test matrix on implementation
+revision `ad5d766` and Phase 4 documentation revision `ce1ca49`; exact CI for
+the final 394-test commit remains pending.
 
 ## Limitations
 

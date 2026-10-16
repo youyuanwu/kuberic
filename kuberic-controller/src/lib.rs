@@ -67,9 +67,8 @@ struct Config {
 /// }
 /// ```
 pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    public_v1_registration::validate_public_v1_controller_registrations(
-        public_v1_registration::PUBLIC_V1_CONTROLLER_REGISTRATIONS,
-    )?;
+    let controller_manifest = public_v1_registration::PUBLIC_V1_CONTROLLER;
+    public_v1_registration::validate_public_v1_controller_registrations(controller_manifest)?;
     tracing_subscriber::fmt::init();
     let config = Config::parse();
     validate_installation_namespace(&config.installation_namespace)?;
@@ -83,25 +82,29 @@ pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error
         config.agent_bearer_token,
         config.installation_namespace.clone(),
     )?);
-    let reconciler = Arc::new(reconciler::Reconciler::new(
-        api,
-        production_evaluation_config(
-            config.stable_resync_seconds,
-            config.wait_requeue_seconds,
-            config.unsafe_requeue_seconds,
-        ),
-    ));
+    let reconciler = Arc::new(
+        controller_manifest.bind_reconciler(reconciler::Reconciler::new(
+            api,
+            production_evaluation_config(
+                config.stable_resync_seconds,
+                config.wait_requeue_seconds,
+                config.unsafe_requeue_seconds,
+            ),
+        )),
+    );
     let namespace = config.installation_namespace;
     let sets = Api::<crd::KubericSet>::namespaced(client.clone(), &namespace);
-    let pods = Api::<Pod>::namespaced(client.clone(), &namespace);
-    let pvcs = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace);
-    let services = Api::<Service>::namespaced(client.clone(), &namespace);
-    let secrets = Api::<Secret>::namespaced(client, &namespace);
+    let owners = controller_manifest.bind_owners(
+        Api::<Pod>::namespaced(client.clone(), &namespace),
+        Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace),
+        Api::<Service>::namespaced(client.clone(), &namespace),
+        Api::<Secret>::namespaced(client, &namespace),
+    );
     Controller::new(sets, watcher::Config::default())
-        .owns(pods, watcher::Config::default())
-        .owns(pvcs, watcher::Config::default())
-        .owns(services, watcher::Config::default())
-        .owns(secrets, watcher::Config::default())
+        .owns(owners.pods, watcher::Config::default())
+        .owns(owners.persistent_volume_claims, watcher::Config::default())
+        .owns(owners.services, watcher::Config::default())
+        .owns(owners.secrets, watcher::Config::default())
         .run(
             move |set: Arc<crd::KubericSet>, _| {
                 let reconciler = reconciler.clone();

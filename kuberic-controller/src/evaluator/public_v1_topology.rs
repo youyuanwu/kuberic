@@ -125,15 +125,19 @@ pub fn plan_public_v1_topology(
     };
     let ordinary_failover = current.is_some_and(|configuration| {
         configuration.primary_id != operational_next.primary_id
-            && !observed
-                .iter()
-                .any(|replica| replica.report.replica.replica_id == configuration.primary_id)
+            && !observed.iter().any(|replica| {
+                configuration.members.iter().any(|member| {
+                    member.role == ReplicaRole::Primary && member.identity == replica.report.replica
+                })
+            })
     });
     if let Some(current) = current
         && current.primary_id != operational_next.primary_id
-        && let Some(source) = observed
-            .iter()
-            .find(|replica| replica.report.replica.replica_id == current.primary_id)
+        && let Some(source) = observed.iter().find(|replica| {
+            current.members.iter().any(|member| {
+                member.role == ReplicaRole::Primary && member.identity == replica.report.replica
+            })
+        })
     {
         let catch_up = PublicOperationProgram::CatchUp {
             configuration: public_configuration(&source.report.replica, &observed, current)?,
@@ -254,7 +258,11 @@ pub fn plan_public_v1_topology(
         }
         let source = eligible
             .iter()
-            .find(|replica| replica.report.replica.replica_id == current.primary_id)
+            .find(|replica| {
+                current.members.iter().any(|member| {
+                    member.role == ReplicaRole::Primary && member.identity == replica.report.replica
+                })
+            })
             .or_else(|| {
                 eligible
                     .iter()
@@ -273,6 +281,25 @@ pub fn plan_public_v1_topology(
             completion.operation_id == build_id
                 && completion.result == PublicV1AcceptedResult::Succeeded
         }) {
+            let source_is_accepted_primary = current.members.iter().any(|member| {
+                member.role == ReplicaRole::Primary && member.identity == source.report.replica
+            });
+            if !source_is_accepted_primary {
+                let survivors = eligible
+                    .iter()
+                    .filter(|replica| replica.report.replica != target.report.replica)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                return plan_public_v1_topology(
+                    accepted,
+                    Some(current),
+                    &survivors,
+                    desired_replicas,
+                    None,
+                    routed_primary,
+                    resource_version,
+                );
+            }
             if source.report.role != ReplicaRole::Primary
                 || source.report.write_status
                     != kuberic_runtime::protocol::types::AccessStatus::Granted
@@ -673,9 +700,11 @@ fn choose_primary(
         return Err("planned switchover target is unavailable".into());
     }
     if let Some(current) = current
-        && replicas
-            .iter()
-            .any(|replica| replica.report.replica.replica_id == current.primary_id)
+        && replicas.iter().any(|replica| {
+            current.members.iter().any(|member| {
+                member.role == ReplicaRole::Primary && member.identity == replica.report.replica
+            })
+        })
     {
         return Ok(current.primary_id);
     }
@@ -842,26 +871,33 @@ fn public_configuration(
     replicas: &[PublicV1TopologyReplica],
     configuration: &ConfigurationDescriptor,
 ) -> Result<PublicConfiguration, String> {
-    let peers = replicas
+    let peers = configuration
+        .members
         .iter()
-        .filter(|replica| replica.report.replica != *local)
-        .map(|replica| PublicReplicaDescriptor {
-            build_id: OperationId::default(),
-            identity: replica.report.replica.clone(),
-            replication_address: replica.replication_address.clone(),
-            process_session_id: replica.report.process_session_id.clone(),
-            storage_incarnation: Some(replica.report.storage_incarnation.clone()),
-            role: configuration
-                .members
+        .filter(|member| member.identity != *local)
+        .map(|member| {
+            let replica = replicas
                 .iter()
-                .find(|member| member.identity == replica.report.replica)
-                .map(|member| member.role)
-                .expect("eligible replica is configured"),
-            current_progress: replica.report.progress.last,
-            catch_up_capability: replica.report.progress.first,
-            must_catchup: false,
+                .find(|replica| replica.report.replica == member.identity)
+                .ok_or_else(|| {
+                    format!(
+                        "public-v1 configuration member {} lacks exact observed authority",
+                        member.identity.replica_id
+                    )
+                })?;
+            Ok(PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: replica.report.replica.clone(),
+                replication_address: replica.replication_address.clone(),
+                process_session_id: replica.report.process_session_id.clone(),
+                storage_incarnation: Some(replica.report.storage_incarnation.clone()),
+                role: member.role,
+                current_progress: replica.report.progress.last,
+                catch_up_capability: replica.report.progress.first,
+                must_catchup: false,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     let configuration = PublicConfiguration {
         current: configuration.clone(),
         previous: None,
@@ -1050,9 +1086,301 @@ fn configuration_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kuberic_runtime::protocol::public_operations::{
+        PublicProgress, PublicProgressRole, PublicV1AcceptedOperationCompletion,
+        PublicV1AcceptedStatus, PublicV1CallKind, PublicV1Extensions, PublicV1Identity,
+        PublicV1OperationCompletion, PublicV1OperationResult,
+    };
+    use kuberic_runtime::protocol::types::{
+        AccessStatus, AgentGeneration, PodUid, ProcessSessionId, PublicProtocolGeneration, PvcUid,
+        ReplicaIdentity, ReplicaInstanceId, ReplicaStorageIdentity,
+        ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, StorageGeneration,
+        derive_bootstrap_history, derive_history_initialization_id,
+    };
+
+    fn replica(id: i64, role: ReplicaRole) -> PublicV1TopologyReplica {
+        let resource_uid = ResourceUid::new("resource-topology-test");
+        let generation = PublicProtocolGeneration::new(1);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{id}")),
+        };
+        PublicV1TopologyReplica {
+            report: PublicV1AgentReport {
+                identity: PublicV1Identity::new(1),
+                resource_uid: resource_uid.clone(),
+                replica: identity.clone(),
+                process_session_id: ProcessSessionId::new(format!("session-{id}")),
+                replicator_creation_id: ReplicatorCreationId::new(format!("creation-{id}")),
+                report_sequence: 1,
+                role,
+                read_status: if role == ReplicaRole::None {
+                    AccessStatus::NotPrimary
+                } else {
+                    AccessStatus::Granted
+                },
+                write_status: if role == ReplicaRole::Primary {
+                    AccessStatus::Granted
+                } else {
+                    AccessStatus::NotPrimary
+                },
+                history: derive_bootstrap_history(&resource_uid, generation, &initialization),
+                storage_incarnation: ReplicaStorageIncarnationContext {
+                    replica: identity,
+                    storage: ReplicaStorageIdentity::Persistent {
+                        pod_uid: PodUid::new(format!("pod-{id}")),
+                        pvc_uid: PvcUid::new(format!("pvc-{id}")),
+                    },
+                    storage_generation: StorageGeneration::new(format!("storage-{id}")),
+                },
+                progress: PublicProgress {
+                    role: match role {
+                        ReplicaRole::Primary => PublicProgressRole::Primary,
+                        ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary => {
+                            PublicProgressRole::Secondary
+                        }
+                        ReplicaRole::None => PublicProgressRole::Recovery,
+                    },
+                    first: 0,
+                    last: 0,
+                },
+                service_location: None,
+                data_loss_recovery: None,
+                completed_operations: Vec::new(),
+                extensions: PublicV1Extensions::default(),
+            },
+            replication_address: format!("http://10.0.0.{id}:50052"),
+        }
+    }
+
+    fn accepted(replica: &PublicV1TopologyReplica) -> PublicV1AcceptedStatus {
+        PublicV1AcceptedStatus {
+            identity: replica.report.identity.clone(),
+            history_initialization_id: derive_history_initialization_id(
+                &replica.report.resource_uid,
+                PublicProtocolGeneration::new(replica.report.identity.generation),
+            ),
+            history: replica.report.history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: PublicV1Extensions::default(),
+        }
+    }
+
+    fn accept_command(
+        accepted: &mut PublicV1AcceptedStatus,
+        replicas: &mut [PublicV1TopologyReplica],
+        command: &PublicV1OperationCommand,
+    ) {
+        let report = replicas
+            .iter_mut()
+            .find(|replica| replica.report.replica == command.target)
+            .expect("command target");
+        let (
+            call_kind,
+            previous_configuration_id,
+            current_configuration_id,
+            catch_up_mode,
+            catch_up_specific_quorum,
+        ) = match command.intent.program.as_ref().expect("program") {
+            PublicOperationProgram::Open { .. } => (PublicV1CallKind::Open, None, None, None, None),
+            PublicOperationProgram::Role { role, .. } => {
+                report.report.role = if *role == ReplicaRole::IdleSecondary {
+                    ReplicaRole::None
+                } else {
+                    *role
+                };
+                report.report.progress.role = match report.report.role {
+                    ReplicaRole::Primary => PublicProgressRole::Primary,
+                    ReplicaRole::ActiveSecondary => PublicProgressRole::Secondary,
+                    ReplicaRole::IdleSecondary | ReplicaRole::None => PublicProgressRole::Recovery,
+                };
+                report.report.read_status = AccessStatus::NotPrimary;
+                report.report.write_status = AccessStatus::NotPrimary;
+                (PublicV1CallKind::Role, None, None, None, None)
+            }
+            PublicOperationProgram::Epoch { .. } => {
+                (PublicV1CallKind::Epoch, None, None, None, None)
+            }
+            PublicOperationProgram::Configuration(configuration) => {
+                report.report.read_status = AccessStatus::Granted;
+                report.report.write_status = if report.report.role == ReplicaRole::Primary {
+                    AccessStatus::Granted
+                } else {
+                    AccessStatus::NotPrimary
+                };
+                (
+                    PublicV1CallKind::Configuration,
+                    configuration
+                        .previous
+                        .as_ref()
+                        .map(|configuration| configuration.configuration_id.clone()),
+                    Some(configuration.current.configuration_id.clone()),
+                    None,
+                    None,
+                )
+            }
+            PublicOperationProgram::CatchUp {
+                configuration,
+                mode,
+            } => {
+                report.report.read_status = AccessStatus::Granted;
+                report.report.write_status = AccessStatus::Granted;
+                (
+                    PublicV1CallKind::CatchUp,
+                    configuration
+                        .previous
+                        .as_ref()
+                        .map(|configuration| configuration.configuration_id.clone()),
+                    Some(configuration.current.configuration_id.clone()),
+                    Some(*mode),
+                    None,
+                )
+            }
+            other => panic!("unexpected preparation program: {other:?}"),
+        };
+        let completion = PublicV1OperationCompletion {
+            operation_id: command.intent.operation_id.clone(),
+            revision: command.intent.revision,
+            call_kind,
+            process_session_id: command.intent.process_session_id.clone(),
+            input_digest: command.intent.input_digest.clone(),
+            replay_disposition: command.intent.replay_disposition,
+            history: accepted.history.clone(),
+            storage_incarnation: report.report.storage_incarnation.clone(),
+            previous_configuration_id,
+            current_configuration_id,
+            catch_up_mode,
+            catch_up_specific_quorum,
+            result: PublicV1OperationResult::Succeeded,
+        };
+        accepted
+            .completed_operations
+            .push(PublicV1AcceptedOperationCompletion::from_completion(
+                &completion,
+            ));
+    }
 
     #[test]
     fn ordinary_failover_does_not_reopen_transiently_fenced_replica() {
         assert!(!should_reopen(ReplicaRole::None, false, false));
+    }
+
+    #[test]
+    fn public_configuration_uses_exact_members_and_rejects_missing_authority() {
+        let replicas = vec![
+            replica(1, ReplicaRole::Primary),
+            replica(2, ReplicaRole::ActiveSecondary),
+            replica(3, ReplicaRole::ActiveSecondary),
+        ];
+        let configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            ReplicaId::new(1),
+            vec![
+                ConfigurationMember {
+                    identity: replicas[0].report.replica.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: replicas[1].report.replica.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+
+        let exact =
+            public_configuration(&replicas[0].report.replica, &replicas, &configuration).unwrap();
+        assert_eq!(exact.replicas.len(), 1);
+        assert_eq!(exact.replicas[0].identity, replicas[1].report.replica);
+        assert!(
+            public_configuration(&replicas[0].report.replica, &replicas[..1], &configuration)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn corrective_primary_promotes_survivor_before_replacement_build() {
+        let old_primary = replica(1, ReplicaRole::Primary);
+        let mut fresh_primary = replica(1, ReplicaRole::None);
+        fresh_primary.report.replica.instance_id = ReplicaInstanceId::new("pod-1-fresh");
+        fresh_primary.report.replica.agent_generation = AgentGeneration::new("generation-1-fresh");
+        fresh_primary.report.process_session_id = ProcessSessionId::new("session-1-fresh");
+        fresh_primary.report.storage_incarnation.replica = fresh_primary.report.replica.clone();
+        fresh_primary.report.storage_incarnation.storage = ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("pod-1-fresh"),
+            pvc_uid: PvcUid::new("pvc-1-fresh"),
+        };
+        fresh_primary.report.storage_incarnation.storage_generation =
+            StorageGeneration::new("storage-1-fresh");
+        let second = replica(2, ReplicaRole::ActiveSecondary);
+        let third = replica(3, ReplicaRole::ActiveSecondary);
+        let mut current = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            ReplicaId::new(1),
+            vec![
+                ConfigurationMember {
+                    identity: old_primary.report.replica.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: second.report.replica.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: third.report.replica.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        let mut accepted = accepted(&old_primary);
+        let mut replicas = vec![fresh_primary, second, third];
+        let mut routed_primary = Some(ReplicaId::new(1));
+
+        for _ in 0..40 {
+            match plan_public_v1_topology(
+                &accepted,
+                Some(&current),
+                &replicas,
+                3,
+                None,
+                routed_primary,
+                "resource-version",
+            )
+            .unwrap()
+            {
+                PublicV1TopologyPlan::Begin { command, .. } => {
+                    if let Some(PublicOperationProgram::Build(build)) =
+                        command.intent.program.as_ref()
+                    {
+                        assert_ne!(current.primary_id, ReplicaId::new(1));
+                        assert_eq!(build.epoch, current.epoch);
+                        assert_eq!(
+                            build.current_configuration_id.as_ref(),
+                            Some(&current.configuration_id)
+                        );
+                        assert_eq!(command.target.replica_id, current.primary_id);
+                        return;
+                    }
+                    accept_command(&mut accepted, &mut replicas, &command);
+                }
+                PublicV1TopologyPlan::RoutePrimary { primary } => {
+                    assert_ne!(primary.replica_id, ReplicaId::new(1));
+                    routed_primary = Some(primary.replica_id);
+                }
+                PublicV1TopologyPlan::PersistTopology { expected, next } => {
+                    assert_eq!(expected.as_ref(), Some(&current.configuration_id));
+                    current = *next;
+                }
+                PublicV1TopologyPlan::Wait => {
+                    panic!("corrective primary waited before topology persistence or Build")
+                }
+                other => panic!("unexpected corrective-primary plan: {other:?}"),
+            }
+        }
+        panic!("corrective primary never reached a configuration-consistent Build");
     }
 }

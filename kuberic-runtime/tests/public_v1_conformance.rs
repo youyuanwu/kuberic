@@ -15,15 +15,33 @@ fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
     kuberic_runtime::testing::validate_replacement_ownership_inventory(&inventory).unwrap();
     let mutation =
         kuberic_runtime::testing::replacement_ownership_inventory_with_extra_endpoint_fixture();
+    assert_eq!(
+        &mutation.services[..inventory.services.len()],
+        inventory.services.as_slice(),
+        "endpoint mutation changed the reviewed service manifest"
+    );
+    assert_eq!(
+        mutation.services.last().map(String::as_str),
+        Some("unmanifested runtime service registration")
+    );
     assert!(
         kuberic_runtime::testing::validate_replacement_ownership_inventory(&mutation).is_err(),
-        "KSF-16 mutation oracle accepted an extra owner/endpoint"
+        "KSF-16 canonical eligibility accepted an unmanifested reachable endpoint"
     );
     let mutation =
         kuberic_runtime::testing::replacement_ownership_inventory_with_alternate_factory_fixture();
+    assert_eq!(
+        &mutation.factories[..inventory.factories.len()],
+        inventory.factories.as_slice(),
+        "factory mutation changed the reviewed factory manifest"
+    );
+    assert_eq!(
+        mutation.factories.last().map(String::as_str),
+        Some("unmanifested built-in factory construction")
+    );
     assert!(
         kuberic_runtime::testing::validate_replacement_ownership_inventory(&mutation).is_err(),
-        "KSF-16 mutation oracle accepted an alternate factory"
+        "KSF-16 canonical eligibility accepted an unmanifested reachable factory"
     );
     let mutation =
         kuberic_runtime::testing::replacement_ownership_inventory_with_alternate_protocol_fixture();
@@ -34,9 +52,18 @@ fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
     let mutation =
         kuberic_runtime::testing::replacement_ownership_inventory_with_alternate_controller_fixture(
         );
+    assert_eq!(
+        &mutation.controller_modules[..inventory.controller_modules.len()],
+        inventory.controller_modules.as_slice(),
+        "controller-helper mutation changed the reviewed controller manifest"
+    );
+    assert_eq!(
+        mutation.controller_modules.last().map(String::as_str),
+        Some("unmanifested controller startup helper")
+    );
     assert!(
         kuberic_runtime::testing::validate_replacement_ownership_inventory(&mutation).is_err(),
-        "KSF-16 mutation oracle accepted an alternate controller owner"
+        "KSF-16 canonical eligibility accepted an unmanifested reachable controller helper"
     );
 }
 

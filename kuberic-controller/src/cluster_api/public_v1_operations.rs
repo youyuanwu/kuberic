@@ -113,6 +113,14 @@ pub trait PublicV1OperationApi: Send + Sync {
         Err("public-v1 operation supersession is unsupported".into())
     }
 
+    async fn public_v1_operation_source_present(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &PublicV1AcceptedTransitionStatus,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
     async fn observe_public_v1_operation(
         &self,
         scope: &PublicV1Scope,

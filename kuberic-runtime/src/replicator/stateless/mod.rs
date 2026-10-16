@@ -203,13 +203,48 @@ impl PublicV1DataServiceRegistration {
     }
 }
 
-pub(crate) const PUBLIC_V1_DATA_SERVICE_REGISTRATIONS: &[PublicV1DataServiceRegistration] =
-    &[PublicV1DataServiceRegistration::ReplicationData];
+#[derive(Debug, Clone, Copy)]
+struct ReplicationDataEndpoint;
+
+impl ReplicationDataEndpoint {
+    fn bind<S>(self, service: S) -> proto::replication_data_server::ReplicationDataServer<S>
+    where
+        S: proto::replication_data_server::ReplicationData,
+    {
+        proto::replication_data_server::ReplicationDataServer::new(service)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublicV1DataServiceManifest {
+    replication_data: ReplicationDataEndpoint,
+}
+
+impl PublicV1DataServiceManifest {
+    pub(crate) const fn registrations(self) -> [PublicV1DataServiceRegistration; 1] {
+        [PublicV1DataServiceRegistration::ReplicationData]
+    }
+
+    fn replication_data<S>(
+        self,
+        service: S,
+    ) -> proto::replication_data_server::ReplicationDataServer<S>
+    where
+        S: proto::replication_data_server::ReplicationData,
+    {
+        self.replication_data.bind(service)
+    }
+}
+
+pub(crate) const PUBLIC_V1_DATA_SERVICES: PublicV1DataServiceManifest =
+    PublicV1DataServiceManifest {
+        replication_data: ReplicationDataEndpoint,
+    };
 
 pub(crate) fn validate_public_v1_data_services(
-    registrations: &[PublicV1DataServiceRegistration],
+    manifest: PublicV1DataServiceManifest,
 ) -> Result<()> {
-    if registrations != [PublicV1DataServiceRegistration::ReplicationData] {
+    if manifest.registrations() != [PublicV1DataServiceRegistration::ReplicationData] {
         return Err(RuntimeError::Application(
             "Public V1 data service registrations changed".into(),
         ));
@@ -223,6 +258,10 @@ pub struct StatelessReplicatorFactory {
 
 impl StatelessReplicatorFactory {
     pub fn new(storage: Arc<dyn DurableState>) -> Self {
+        super::PUBLIC_V1_FACTORIES.construct_stateless(storage)
+    }
+
+    pub(super) fn from_public_v1_manifest(storage: Arc<dyn DurableState>) -> Self {
         Self { storage }
     }
 }
@@ -2195,7 +2234,7 @@ impl Replicator for StatelessReplicator {
         let listener = TcpListener::bind(self.bind_address)
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        validate_public_v1_data_services(PUBLIC_V1_DATA_SERVICE_REGISTRATIONS)?;
+        validate_public_v1_data_services(PUBLIC_V1_DATA_SERVICES)?;
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let service = ReplacementReplicationService {
             engine: self.self_ref.get().cloned().ok_or_else(|| {
@@ -2204,9 +2243,7 @@ impl Replicator for StatelessReplicator {
         };
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(proto::replication_data_server::ReplicationDataServer::new(
-                    service,
-                ))
+                .add_service(PUBLIC_V1_DATA_SERVICES.replication_data(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     while !*shutdown_rx.borrow_and_update() {
                         if shutdown_rx.changed().await.is_err() {

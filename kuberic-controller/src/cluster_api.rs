@@ -26,10 +26,11 @@ use kuberic_runtime::protocol::public_operations::{
     PublicV1OperationCompletion, PublicV1OperationResult, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, EffectivePolicy, OperationId, PodUid, ProcessSessionEndpoint,
-    ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ResourceUid, derive_agent_generation, derive_initialization_id,
-    derive_replacement_resource_name, derive_replica_endpoint_name,
+    ConfigurationDescriptor, ConfigurationId, EffectivePolicy, OperationId, PodUid,
+    ProcessSessionEndpoint, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ReplicaStorageIncarnationContext, ResourceUid,
+    derive_agent_generation, derive_initialization_id, derive_replacement_resource_name,
+    derive_replica_endpoint_name,
 };
 #[cfg(feature = "runtime-test-bridge")]
 use tokio::sync::Mutex;
@@ -1752,6 +1753,14 @@ where
         if observation.set.uid().as_deref() != Some(scope.resource_uid.as_str()) {
             return Err("public-v1 scope no longer identifies the observed resource".into());
         }
+        if !observation.failures.is_empty() {
+            return Err(observation
+                .failures
+                .iter()
+                .map(|failure| format!("{}: {}", failure.source, failure.message))
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
         validate_public_v1_controller_status(observation.set.status.as_ref())?;
         Ok(observation)
     }
@@ -1878,6 +1887,123 @@ fn normalized_transition(
     Ok(transition)
 }
 
+enum CorrectiveReplacementAction {
+    Persist {
+        next: PublicV1ReplacementState,
+        clear_transition: bool,
+    },
+    Cleanup {
+        next: PublicV1ReplacementState,
+    },
+}
+
+fn replacement_target_is_admitted(
+    status: &KubericSetStatus,
+    target: &ReplicaStorageIncarnationContext,
+) -> bool {
+    status.public_v1_topology.as_ref().is_some_and(|topology| {
+        topology.sessions.iter().any(|session| {
+            session.identity == target.replica && session.storage_incarnation == *target
+        })
+    })
+}
+
+fn corrective_replacement_target_pod_present(
+    observation: &RawObservation,
+    target: &ReplicaStorageIncarnationContext,
+) -> bool {
+    observation
+        .pods
+        .iter()
+        .any(|pod| pod.uid().as_deref() == Some(target.replica.instance_id.as_str()))
+}
+
+pub(crate) fn replica_storage_incarnation_remains(
+    observation: &RawObservation,
+    target: &ReplicaStorageIncarnationContext,
+) -> bool {
+    let exact_agent_remains = observation.agents.iter().any(|(key, agent)| match agent {
+        RawAgentObservation::Absent => false,
+        RawAgentObservation::Unavailable { .. } | RawAgentObservation::Invalid { .. } => {
+            key.replica_id == target.replica.replica_id
+                && key.instance_id == target.replica.instance_id
+        }
+        RawAgentObservation::Uninitialized(agent) => {
+            agent.replica_id == target.replica.replica_id
+                && agent.pod_uid.as_str() == target.replica.instance_id.as_str()
+                && match &target.storage {
+                    kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+                        pod_uid,
+                        pvc_uid,
+                    } => &agent.pod_uid == pod_uid && &agent.pvc_uid == pvc_uid,
+                    kuberic_runtime::protocol::types::ReplicaStorageIdentity::Volatile {
+                        ..
+                    } => false,
+                }
+        }
+        RawAgentObservation::PublicV1Report(report) => report.storage_incarnation == *target,
+    });
+    if exact_agent_remains {
+        return true;
+    }
+    let kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } =
+        &target.storage
+    else {
+        return false;
+    };
+    observation
+        .pods
+        .iter()
+        .any(|pod| pod.uid().as_deref() == Some(pod_uid.as_str()))
+        || observation
+            .pvcs
+            .iter()
+            .any(|pvc| pvc.uid().as_deref() == Some(pvc_uid.as_str()))
+        || observation.services.iter().any(|service| {
+            service.spec.as_ref().is_some_and(|spec| {
+                spec.selector.as_ref().is_some_and(|selector| {
+                    selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
+                })
+            })
+        })
+}
+
+fn plan_corrective_replacement(
+    existing: Option<&PublicV1ReplacementState>,
+    configuration_id: &ConfigurationId,
+    target: &ReplicaStorageIncarnationContext,
+    target_was_admitted: bool,
+) -> std::result::Result<CorrectiveReplacementAction, String> {
+    match existing {
+        None => Ok(CorrectiveReplacementAction::Persist {
+            next: PublicV1ReplacementState::new(configuration_id, target.clone())?,
+            clear_transition: true,
+        }),
+        Some(existing) if existing.predecessor == *target => {
+            Ok(CorrectiveReplacementAction::Persist {
+                next: existing.clone(),
+                clear_transition: true,
+            })
+        }
+        Some(existing) if existing.replacement.as_ref() == Some(target) => {
+            Ok(CorrectiveReplacementAction::Persist {
+                next: existing.begin_replacement_retirement(target)?,
+                clear_transition: false,
+            })
+        }
+        Some(existing) if existing.retiring_replacement.as_ref() == Some(target) => {
+            Ok(CorrectiveReplacementAction::Cleanup {
+                next: existing.complete_replacement_retirement(
+                    configuration_id,
+                    target,
+                    target_was_admitted,
+                )?,
+            })
+        }
+        Some(_) => Err("corrective replacement differs from active authority".into()),
+    }
+}
+
 fn topology_sessions(
     observation: &RawObservation,
     configuration: &ConfigurationDescriptor,
@@ -1963,6 +2089,28 @@ fn renewed_topology_sessions(
             })
         })
         .collect()
+}
+
+fn topology_state_with_switchover_completion(
+    set: &KubericSet,
+    status: &KubericSetStatus,
+    configuration: &ConfigurationDescriptor,
+    sessions: &[ProcessSessionEndpoint],
+) -> std::result::Result<PublicV1TopologyState, String> {
+    let mut topology = PublicV1TopologyState::from_configuration(configuration, sessions)?;
+    topology.completed_switchover_request_id = set
+        .spec
+        .switchover
+        .as_ref()
+        .filter(|request| i64::from(request.target_replica_id) == configuration.primary_id.value())
+        .map(|request| request.request_id.clone())
+        .or_else(|| {
+            status
+                .public_v1_topology
+                .as_ref()
+                .and_then(|topology| topology.completed_switchover_request_id.clone())
+        });
+    Ok(topology)
 }
 
 fn renewal_topology_replicas(
@@ -2336,7 +2484,9 @@ where
             return Err("session renewal changed its predecessor topology".into());
         }
         let sessions = renewed_topology_sessions(&observation, expected)?;
-        status.public_v1_topology = Some(PublicV1TopologyState::from_configuration(
+        status.public_v1_topology = Some(topology_state_with_switchover_completion(
+            &observation.set,
+            &status,
             &expected.required.fresh_configuration,
             &sessions,
         )?);
@@ -2455,8 +2605,12 @@ where
             return Err("public-v1 topology cannot change while an operation is pending".into());
         }
         let sessions = topology_sessions(&observation, next)?;
-        status.public_v1_topology =
-            Some(PublicV1TopologyState::from_configuration(next, &sessions)?);
+        status.public_v1_topology = Some(topology_state_with_switchover_completion(
+            &observation.set,
+            &status,
+            next,
+            &sessions,
+        )?);
         self.replace_public_v1_status(&observation, status).await
     }
 
@@ -2612,6 +2766,27 @@ where
         status.public_v1_transition = None;
         status.public_v1_operation = None;
         self.replace_public_v1_status(&observation, status).await
+    }
+
+    async fn public_v1_operation_source_present(
+        &self,
+        scope: &PublicV1Scope,
+        expected: &PublicV1AcceptedTransitionStatus,
+    ) -> std::result::Result<bool, String> {
+        let observation = self.observe_public_v1_scope(scope).await?;
+        Ok(observation.pods.iter().any(|pod| {
+            pod.uid().as_deref()
+                == Some(
+                    expected
+                        .intent
+                        .source
+                        .storage_incarnation
+                        .replica
+                        .instance_id
+                        .as_str(),
+                )
+                && pod.metadata.deletion_timestamp.is_none()
+        }))
     }
 
     async fn observe_public_v1_operation(
@@ -2868,30 +3043,93 @@ where
         if normalized_transition(&observation)?.as_ref() != Some(expected) {
             return Err("stale public-v1 replacement authority".into());
         }
-        if let Some(command) = observation
+        let command = observation
             .set
             .status
             .as_ref()
             .and_then(|status| status.public_v1_operation.as_ref())
             .map(PublicV1OperationStatus::command)
-            .transpose()?
-        {
-            revoke_inbound_build_authority(
-                self,
-                &observation,
-                expected,
-                &ProtocolCommand::PublicV1Operation(Box::new(command)),
-            )
-            .await?;
+            .transpose()?;
+        let mut status = observation.set.status.clone().unwrap_or_default();
+        let configuration_id = status
+            .public_v1_topology
+            .as_ref()
+            .map(|topology| topology.configuration_id.clone())
+            .ok_or_else(|| "corrective replacement lacks accepted topology".to_string())?;
+        let action = plan_corrective_replacement(
+            status.public_v1_replacement.as_ref(),
+            &configuration_id,
+            &target.storage_incarnation,
+            replacement_target_is_admitted(&status, &target.storage_incarnation),
+        )?;
+        let target_pod_present =
+            corrective_replacement_target_pod_present(&observation, &target.storage_incarnation);
+        match action {
+            CorrectiveReplacementAction::Persist {
+                next,
+                clear_transition,
+            } => {
+                if let Some(command) = command
+                    && target_pod_present
+                {
+                    revoke_inbound_build_authority(
+                        self,
+                        &observation,
+                        expected,
+                        &ProtocolCommand::PublicV1Operation(Box::new(command)),
+                    )
+                    .await?;
+                }
+                status.public_v1_replacement = Some(next);
+                if clear_transition {
+                    status.public_v1_transition = None;
+                    status.public_v1_operation = None;
+                }
+                self.replace_public_v1_status(&observation, status).await
+            }
+            CorrectiveReplacementAction::Cleanup { next } => {
+                let storage = &target.storage_incarnation;
+                if replica_storage_incarnation_remains(&observation, storage) {
+                    let (pod_uid, pvc_uid) = match &storage.storage {
+                        kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+                            pod_uid,
+                            pvc_uid,
+                        } => (Some(pod_uid), Some(pvc_uid)),
+                        kuberic_runtime::protocol::types::ReplicaStorageIdentity::Volatile {
+                            ..
+                        } => (None, None),
+                    };
+                    let pod_name = pod_uid.and_then(|uid| {
+                        observation
+                            .pods
+                            .iter()
+                            .find(|pod| pod.uid().as_deref() == Some(uid.as_str()))
+                            .map(ResourceExt::name_any)
+                    });
+                    let pvc_name = pvc_uid.and_then(|uid| {
+                        observation
+                            .pvcs
+                            .iter()
+                            .find(|pvc| pvc.uid().as_deref() == Some(uid.as_str()))
+                            .map(ResourceExt::name_any)
+                    });
+                    self.delete_replica_scaffolding(
+                        &observation,
+                        pod_name.as_deref(),
+                        pod_uid,
+                        pvc_name.as_deref(),
+                        pvc_uid,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                status.public_v1_replacement = Some(next);
+                status.public_v1_transition = None;
+                status.public_v1_operation = None;
+                self.replace_public_v1_status(&observation, status).await
+            }
         }
-        self.ensure_replacement_scaffolding(
-            &observation,
-            target.storage_incarnation.replica.replica_id,
-            &target.storage_incarnation.replica,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        self.complete_public_v1_transition(scope, expected).await
     }
 }
 
@@ -3550,12 +3788,14 @@ impl ClusterApi for InMemoryClusterApi {
                 .observation
                 .pods
                 .retain(|pod| pod.name_any() != name || pod.uid().as_deref() != Some(uid.as_str()));
+        } else if let Some(name) = pod_name {
+            state.observation.pods.retain(|pod| pod.name_any() != name);
+        }
+        if let Some(uid) = pod_uid {
             state
                 .observation
                 .agents
                 .retain(|key, _| key.instance_id.as_str() != uid.as_str());
-        } else if let Some(name) = pod_name {
-            state.observation.pods.retain(|pod| pod.name_any() != name);
         }
         if let (Some(name), Some(uid)) = (pvc_name, pvc_uid) {
             if state
@@ -3997,6 +4237,14 @@ fn validate_in_memory_public_v1_scope(
     {
         return Err("public-v1 scope differs from in-memory observation".into());
     }
+    if !observation.failures.is_empty() {
+        return Err(observation
+            .failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.source, failure.message))
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
     observation
         .set
         .status
@@ -4124,6 +4372,7 @@ impl PublicV1SessionRenewalApi for InMemoryClusterApi {
             return Err("stale in-memory public-v1 session-renewal completion".into());
         }
         let sessions = renewed_topology_sessions(&state.observation, expected)?;
+        let observed_set = state.observation.set.clone();
         let status = state
             .observation
             .set
@@ -4141,7 +4390,9 @@ impl PublicV1SessionRenewalApi for InMemoryClusterApi {
         {
             return Err("session renewal changed its in-memory predecessor topology".into());
         }
-        status.public_v1_topology = Some(PublicV1TopologyState::from_configuration(
+        status.public_v1_topology = Some(topology_state_with_switchover_completion(
+            &observed_set,
+            status,
             &expected.required.fresh_configuration,
             &sessions,
         )?);
@@ -4300,6 +4551,7 @@ impl PublicV1OperationApi for InMemoryClusterApi {
     ) -> std::result::Result<(), String> {
         let mut state = self.state.lock().await;
         let sessions = topology_sessions(&state.observation, next)?;
+        let observed_set = state.observation.set.clone();
         let status = state
             .observation
             .set
@@ -4319,8 +4571,12 @@ impl PublicV1OperationApi for InMemoryClusterApi {
         {
             return Err("stale public-v1 topology persistence".into());
         }
-        status.public_v1_topology =
-            Some(PublicV1TopologyState::from_configuration(next, &sessions)?);
+        status.public_v1_topology = Some(topology_state_with_switchover_completion(
+            &observed_set,
+            status,
+            next,
+            &sessions,
+        )?);
         advance_in_memory_resource_version(&mut state);
         state.effects.push(EffectRecord::ReplaceStatus);
         Ok(())
@@ -4525,6 +4781,28 @@ impl PublicV1OperationApi for InMemoryClusterApi {
         Ok(())
     }
 
+    async fn public_v1_operation_source_present(
+        &self,
+        scope: &PublicV1Scope,
+        expected: &PublicV1AcceptedTransitionStatus,
+    ) -> std::result::Result<bool, String> {
+        let state = self.state.lock().await;
+        validate_in_memory_public_v1_scope(&state.observation, scope)?;
+        Ok(state.observation.pods.iter().any(|pod| {
+            pod.uid().as_deref()
+                == Some(
+                    expected
+                        .intent
+                        .source
+                        .storage_incarnation
+                        .replica
+                        .instance_id
+                        .as_str(),
+                )
+                && pod.metadata.deletion_timestamp.is_none()
+        }))
+    }
+
     async fn observe_public_v1_operation_report(
         &self,
         scope: &PublicV1Scope,
@@ -4638,13 +4916,122 @@ impl PublicV1EvidenceApi for InMemoryClusterApi {
         scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &PublicV1OperationCompletion,
-        _target: &PublicV1ResourceAuthority,
-        _rebuild: &CanonicalReplicaRebuildRequired,
+        target: &PublicV1ResourceAuthority,
+        rebuild: &CanonicalReplicaRebuildRequired,
     ) -> std::result::Result<(), String> {
-        if !expected.intent.matches(completion) {
+        if !expected.intent.matches(completion)
+            || !matches!(
+                &completion.result,
+                PublicV1OperationResult::RebuildRequired(observed)
+                    if observed.as_ref() == rebuild
+            )
+        {
             return Err("in-memory public-v1 replacement differs from intent".into());
         }
-        clear_in_memory_public_v1_transition(self, scope, expected).await
+        let mut state = self.state.lock().await;
+        validate_in_memory_public_v1_scope(&state.observation, scope)?;
+        if normalized_transition(&state.observation)?.as_ref() != Some(expected) {
+            return Err("stale in-memory corrective replacement".into());
+        }
+        let current_replacement = state
+            .observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_replacement.clone());
+        let configuration_id = state
+            .observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .map(|topology| topology.configuration_id.clone())
+            .ok_or_else(|| "corrective replacement lacks accepted topology".to_string())?;
+        let action = plan_corrective_replacement(
+            current_replacement.as_ref(),
+            &configuration_id,
+            &target.storage_incarnation,
+            state.observation.set.status.as_ref().is_some_and(|status| {
+                replacement_target_is_admitted(status, &target.storage_incarnation)
+            }),
+        )?;
+        match action {
+            CorrectiveReplacementAction::Persist {
+                next,
+                clear_transition,
+            } => {
+                if state.conflict_next_status {
+                    state.conflict_next_status = false;
+                    return Err("injected in-memory public-v1 status conflict".into());
+                }
+                let status = state
+                    .observation
+                    .set
+                    .status
+                    .as_mut()
+                    .expect("status checked above");
+                status.public_v1_replacement = Some(next);
+                if clear_transition {
+                    status.public_v1_transition = None;
+                    status.public_v1_operation = None;
+                }
+            }
+            CorrectiveReplacementAction::Cleanup { next } => {
+                if replica_storage_incarnation_remains(
+                    &state.observation,
+                    &target.storage_incarnation,
+                ) {
+                    if let kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+                        pod_uid,
+                        pvc_uid,
+                    } = &target.storage_incarnation.storage
+                    {
+                        state.observation.services.retain(|service| {
+                            !service.spec.as_ref().is_some_and(|spec| {
+                                spec.selector.as_ref().is_some_and(|selector| {
+                                    selector
+                                        .get(INSTANCE_LABEL)
+                                        .is_some_and(|instance| instance == pod_uid.as_str())
+                                })
+                            })
+                        });
+                        state
+                            .observation
+                            .pods
+                            .retain(|pod| pod.uid().as_deref() != Some(pod_uid.as_str()));
+                        state
+                            .observation
+                            .pvcs
+                            .retain(|pvc| pvc.uid().as_deref() != Some(pvc_uid.as_str()));
+                    }
+                    state.observation.agents.retain(|key, _| {
+                        key.replica_id != target.storage_incarnation.replica.replica_id
+                            || key.instance_id != target.storage_incarnation.replica.instance_id
+                    });
+                    state.effects.push(EffectRecord::DeleteScaffolding {
+                        pod_name: None,
+                        pvc_name: None,
+                    });
+                    return Ok(());
+                }
+                if state.conflict_next_status {
+                    state.conflict_next_status = false;
+                    return Err("injected in-memory public-v1 status conflict".into());
+                }
+                let status = state
+                    .observation
+                    .set
+                    .status
+                    .as_mut()
+                    .expect("status checked above");
+                status.public_v1_replacement = Some(next);
+                status.public_v1_transition = None;
+                status.public_v1_operation = None;
+            }
+        }
+        advance_in_memory_resource_version(&mut state);
+        state.effects.push(EffectRecord::ReplaceStatus);
+        Ok(())
     }
 }
 
@@ -4670,6 +5057,973 @@ async fn clear_in_memory_public_v1_transition(
     advance_in_memory_resource_version(&mut state);
     state.effects.push(EffectRecord::ReplaceStatus);
     Ok(())
+}
+
+#[cfg(all(test, feature = "runtime-test-bridge"))]
+mod corrective_replacement_tests {
+    use super::*;
+    use crate::crd::{KubericSetSpec, PublicV1TopologyState};
+    use crate::evaluator::public_v1_evidence::{
+        PublicV1AcceptedTransitionIntent, PublicV1EvidenceConsumer,
+    };
+    use kuberic_runtime::protocol::public_operations::{
+        CapturedPublicOperationIdentity, ProviderReplicaIdentity, PublicBuildInput,
+        PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1CallKind,
+        PublicV1Identity, ReplicaRebuildReason,
+    };
+    use kuberic_runtime::protocol::types::{
+        AgentGeneration, ConfigurationMember, Epoch, ProcessSessionId, PublicProtocolGeneration,
+        ReplicaStorageIdentity, ReplicatorCreationId, StorageGeneration, derive_bootstrap_history,
+        derive_history_initialization_id,
+    };
+
+    fn storage(instance: &str) -> ReplicaStorageIncarnationContext {
+        ReplicaStorageIncarnationContext {
+            replica: ReplicaIdentity {
+                replica_id: ReplicaId::new(1),
+                instance_id: ReplicaInstanceId::new(instance),
+                agent_generation: AgentGeneration::new(format!("generation-{instance}")),
+            },
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new(instance),
+                pvc_uid: PvcUid::new(format!("pvc-{instance}")),
+            },
+            storage_generation: StorageGeneration::new(format!("storage-{instance}")),
+        }
+    }
+
+    fn accepted_status() -> PublicV1AcceptedStatus {
+        let resource_uid = ResourceUid::new("resource-1");
+        let generation = PublicProtocolGeneration::new(1);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        PublicV1AcceptedStatus {
+            identity: PublicV1Identity::new(1),
+            history_initialization_id: initialization.clone(),
+            history: derive_bootstrap_history(&resource_uid, generation, &initialization),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: Default::default(),
+        }
+    }
+
+    fn configuration(target: &ReplicaStorageIncarnationContext) -> ConfigurationDescriptor {
+        ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            ReplicaId::new(1),
+            vec![ConfigurationMember {
+                identity: target.replica.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        )
+    }
+
+    fn build_program(
+        accepted: &PublicV1AcceptedStatus,
+        target: &ReplicaStorageIncarnationContext,
+        operation_id: &OperationId,
+        process_session_id: &ProcessSessionId,
+        configuration_id: &ConfigurationId,
+    ) -> PublicOperationProgram {
+        PublicOperationProgram::Build(PublicBuildInput {
+            attempt: operation_id.clone(),
+            epoch: Epoch::new(accepted.history.data_loss_number, 1),
+            current_configuration_id: Some(configuration_id.clone()),
+            replica: target.replica.clone(),
+            target_storage: target.clone(),
+            process_session_id: process_session_id.clone(),
+            replication_address: "http://127.0.0.1:50052".into(),
+            history: Some(accepted.history.clone()),
+        })
+    }
+
+    fn corrective_inputs(
+        target: &ReplicaStorageIncarnationContext,
+    ) -> (
+        PublicV1AcceptedTransitionStatus,
+        PublicV1OperationCompletion,
+        PublicV1ResourceAuthority,
+        CanonicalReplicaRebuildRequired,
+    ) {
+        let accepted = accepted_status();
+        let configuration_id = configuration(target).configuration_id;
+        let operation_id = OperationId::new("corrective-rebuild");
+        let process_session_id =
+            kuberic_runtime::protocol::types::ProcessSessionId::new("corrective-session");
+        let program = build_program(
+            &accepted,
+            target,
+            &operation_id,
+            &process_session_id,
+            &configuration_id,
+        );
+        let input_digest = program.digest();
+        let replay_disposition = program.replay_disposition();
+        let rebuild = CanonicalReplicaRebuildRequired::LocalProvider {
+            reason: ReplicaRebuildReason::ProviderMismatch,
+            provider: ProviderReplicaIdentity {
+                replica: target.replica.clone(),
+            },
+            operation: CapturedPublicOperationIdentity {
+                resource_uid: accepted.history.resource_uid.clone(),
+                identity: accepted.identity.clone(),
+                epoch: Epoch::new(0, 1),
+                operation_id: operation_id.clone(),
+                revision: 1,
+                detecting_session: process_session_id.clone(),
+            },
+            local_replica: target.replica.clone(),
+            local_storage: match &target.storage {
+                ReplicaStorageIdentity::Persistent { pvc_uid, .. } => pvc_uid.clone(),
+                ReplicaStorageIdentity::Volatile { .. } => unreachable!(),
+            },
+        };
+        let authority = PublicV1ResourceAuthority {
+            storage_incarnation: target.clone(),
+            resource_version: "target-rv".into(),
+        };
+        let intent = PublicV1AcceptedTransitionIntent {
+            consumer: PublicV1EvidenceConsumer::RepairReplacement,
+            operation_id: operation_id.clone(),
+            revision: 1,
+            call_kind: PublicV1CallKind::Build,
+            history: accepted.history.clone(),
+            source: authority.clone(),
+            target: None,
+            process_session_id: process_session_id.clone(),
+            input_digest: input_digest.clone(),
+            replay_disposition,
+            previous_configuration_id: None,
+            current_configuration_id: Some(configuration_id.clone()),
+            catch_up_mode: None,
+            catch_up_specific_quorum: None,
+        };
+        let expected = PublicV1AcceptedTransitionStatus {
+            resource_version: "1".into(),
+            evidence: accepted.clone(),
+            intent,
+        };
+        let completion = PublicV1OperationCompletion {
+            operation_id,
+            revision: 1,
+            call_kind: PublicV1CallKind::Build,
+            process_session_id,
+            input_digest,
+            replay_disposition,
+            history: accepted.history,
+            storage_incarnation: target.clone(),
+            previous_configuration_id: None,
+            current_configuration_id: Some(configuration_id),
+            catch_up_mode: None,
+            catch_up_specific_quorum: None,
+            result: PublicV1OperationResult::RebuildRequired(Box::new(rebuild.clone())),
+        };
+        (expected, completion, authority, rebuild)
+    }
+
+    fn corrective_observation(
+        authority: PublicV1ReplacementState,
+        expected: &PublicV1AcceptedTransitionStatus,
+        target: &ReplicaStorageIncarnationContext,
+    ) -> RawObservation {
+        let mut set = KubericSet::new(
+            "sample",
+            KubericSetSpec {
+                replicas: 1,
+                image: "example".into(),
+                failover_delay_seconds: 30,
+                switchover: None,
+            },
+        );
+        set.metadata.namespace = Some("default".into());
+        set.metadata.uid = Some("resource-1".into());
+        set.metadata.resource_version = Some("1".into());
+        let endpoint = ProcessSessionEndpoint {
+            storage_incarnation: target.clone(),
+            identity: target.replica.clone(),
+            process_session_id: ProcessSessionId::new("corrective-session"),
+            replicator_creation_id: ReplicatorCreationId::new("corrective-creation"),
+            role: ReplicaRole::Primary,
+        };
+        let configuration = configuration(target);
+        let program = build_program(
+            &expected.evidence,
+            target,
+            &expected.intent.operation_id,
+            &expected.intent.process_session_id,
+            expected
+                .intent
+                .current_configuration_id
+                .as_ref()
+                .expect("build configuration"),
+        );
+        let command = PublicV1OperationCommand {
+            target: target.replica.clone(),
+            intent: PublicOperationIntent {
+                identity: expected.evidence.identity.clone(),
+                operation_id: expected.intent.operation_id.clone(),
+                revision: expected.intent.revision,
+                process_session_id: expected.intent.process_session_id.clone(),
+                class: PublicOperationClass::Build {
+                    target: target.replica.replica_id,
+                },
+                input_digest: expected.intent.input_digest.clone(),
+                replay_disposition: expected.intent.replay_disposition,
+                lifecycle: None,
+                program: Some(program),
+            },
+        };
+        set.status = Some(KubericSetStatus {
+            public_v1_authority: Some(
+                PublicV1AuthorityStatus::from_authority(&expected.evidence).unwrap(),
+            ),
+            public_v1_topology: Some(
+                PublicV1TopologyState::from_configuration(&configuration, &[endpoint]).unwrap(),
+            ),
+            public_v1_replacement: Some(authority),
+            public_v1_transition: Some(PublicV1TransitionState::from_transition(expected).unwrap()),
+            public_v1_operation: Some(PublicV1OperationStatus::from_command(&command).unwrap()),
+            ..Default::default()
+        });
+        let (pod_uid, pvc_uid) = match &target.storage {
+            ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } => (pod_uid, pvc_uid),
+            ReplicaStorageIdentity::Volatile { .. } => unreachable!(),
+        };
+        let pod = Pod {
+            metadata: kube::core::ObjectMeta {
+                name: Some("sample-1".into()),
+                namespace: Some("default".into()),
+                uid: Some(pod_uid.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pvc = PersistentVolumeClaim {
+            metadata: kube::core::ObjectMeta {
+                name: Some("sample-1-data".into()),
+                namespace: Some("default".into()),
+                uid: Some(pvc_uid.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let service = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some("replacement-service".into()),
+                namespace: Some("default".into()),
+                uid: Some("replacement-service-uid".into()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                selector: Some(BTreeMap::from([(
+                    INSTANCE_LABEL.into(),
+                    pod_uid.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let peer_service = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some("sample-peer".into()),
+                namespace: Some("default".into()),
+                uid: Some("peer-service-uid".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let write_service = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some("sample-write".into()),
+                namespace: Some("default".into()),
+                uid: Some("write-service-uid".into()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                selector: Some(BTreeMap::from([(INSTANCE_LABEL.into(), "disabled".into())])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let credentials = Secret {
+            metadata: kube::core::ObjectMeta {
+                name: Some("sample-agent-credentials".into()),
+                namespace: Some("default".into()),
+                uid: Some("credentials-uid".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        RawObservation {
+            set,
+            pods: vec![pod],
+            pvcs: vec![pvc],
+            services: vec![service, peer_service, write_service],
+            secrets: vec![credentials],
+            agents: BTreeMap::new(),
+            failures: Vec::new(),
+            now_unix_seconds: 0,
+        }
+    }
+
+    fn corrective_report(
+        expected: &PublicV1AcceptedTransitionStatus,
+        completion: &PublicV1OperationCompletion,
+        target: &ReplicaStorageIncarnationContext,
+    ) -> PublicV1AgentReport {
+        PublicV1AgentReport {
+            identity: expected.evidence.identity.clone(),
+            resource_uid: expected.evidence.history.resource_uid.clone(),
+            replica: target.replica.clone(),
+            process_session_id: expected.intent.process_session_id.clone(),
+            replicator_creation_id: ReplicatorCreationId::new("corrective-creation"),
+            report_sequence: 1,
+            role: ReplicaRole::Primary,
+            read_status: kuberic_runtime::protocol::types::AccessStatus::Granted,
+            write_status: kuberic_runtime::protocol::types::AccessStatus::Granted,
+            history: expected.evidence.history.clone(),
+            storage_incarnation: target.clone(),
+            progress: kuberic_runtime::protocol::public_operations::PublicProgress {
+                role: kuberic_runtime::protocol::public_operations::PublicProgressRole::Primary,
+                first: 0,
+                last: 0,
+            },
+            service_location: None,
+            data_loss_recovery: None,
+            completed_operations: vec![completion.clone()],
+            extensions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn corrective_replacement_planning_rejects_crossed_authority_before_cleanup() {
+        let predecessor = storage("predecessor");
+        let target = storage("target");
+        let crossed = storage("crossed");
+        let configuration_id = ConfigurationId::new("configuration");
+        let authority = PublicV1ReplacementState::new(&configuration_id, predecessor)
+            .unwrap()
+            .bind(target.clone())
+            .unwrap();
+
+        assert!(
+            plan_corrective_replacement(Some(&authority), &configuration_id, &crossed, false,)
+                .is_err()
+        );
+        let CorrectiveReplacementAction::Persist {
+            next,
+            clear_transition,
+        } = plan_corrective_replacement(Some(&authority), &configuration_id, &target, true)
+            .unwrap()
+        else {
+            panic!("bound target must first persist retirement")
+        };
+        assert!(!clear_transition);
+        assert!(next.replacement.is_none());
+        assert_eq!(next.retiring_replacement.as_ref(), Some(&target));
+        let CorrectiveReplacementAction::Cleanup { next: unbound } =
+            plan_corrective_replacement(Some(&next), &configuration_id, &target, true).unwrap()
+        else {
+            panic!("retiring target must proceed to exact cleanup")
+        };
+        assert_eq!(unbound.predecessor, target);
+        assert_ne!(unbound.operation_id, authority.operation_id);
+        assert!(unbound.replacement.is_none());
+        assert!(unbound.retiring_replacement.is_none());
+        assert!(unbound.bind(storage("fresh")).is_ok());
+        let CorrectiveReplacementAction::Cleanup {
+            next: preadmission_unbound,
+        } = plan_corrective_replacement(Some(&next), &configuration_id, &target, false).unwrap()
+        else {
+            panic!("pre-admission cleanup must preserve predecessor authority")
+        };
+        assert_eq!(preadmission_unbound.predecessor, authority.predecessor);
+        assert_eq!(preadmission_unbound.operation_id, authority.operation_id);
+    }
+
+    #[tokio::test]
+    async fn corrective_replacement_status_conflict_precedes_delete_and_cleanup_retries() {
+        let predecessor = storage("predecessor");
+        let target = storage("target");
+        let configuration_id = ConfigurationId::new("configuration");
+        let authority = PublicV1ReplacementState::new(&configuration_id, predecessor)
+            .unwrap()
+            .bind(target.clone())
+            .unwrap();
+        let (expected, completion, target_authority, rebuild) = corrective_inputs(&target);
+        let observation = corrective_observation(authority.clone(), &expected, &target);
+        assert!(corrective_replacement_target_pod_present(
+            &observation,
+            &target
+        ));
+        assert!(
+            observation.pods[0]
+                .metadata
+                .annotations
+                .as_ref()
+                .is_none_or(|annotations| !annotations.contains_key(CONTROL_ADDRESS_ANNOTATION)),
+            "fixture must prove an addressless present Pod still requires revocation"
+        );
+        let mut absent_pod = observation.clone();
+        absent_pod.pods.clear();
+        assert!(!corrective_replacement_target_pod_present(
+            &absent_pod,
+            &target
+        ));
+        assert!(!absent_pod.pvcs.is_empty() && !absent_pod.services.is_empty());
+        let api = InMemoryClusterApi::new(observation);
+        let scope = PublicV1Scope {
+            namespace: "default".into(),
+            name: "sample".into(),
+            resource_uid: ResourceUid::new("resource-1"),
+        };
+
+        api.conflict_next_status().await;
+        assert!(
+            api.provision_public_v1_replacement(
+                &scope,
+                &expected,
+                &completion,
+                &target_authority,
+                &rebuild,
+            )
+            .await
+            .is_err()
+        );
+        let observed = api.observation().await;
+        assert_eq!(observed.pods.len(), 1);
+        assert_eq!(observed.pvcs.len(), 1);
+        assert_eq!(observed.services.len(), 3);
+        assert_eq!(
+            observed
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref()),
+            Some(&authority)
+        );
+        assert!(api.effects().await.is_empty());
+
+        api.provision_public_v1_replacement(
+            &scope,
+            &expected,
+            &completion,
+            &target_authority,
+            &rebuild,
+        )
+        .await
+        .unwrap();
+        let retiring = api.observation().await;
+        assert_eq!(retiring.pods.len(), 1);
+        assert_eq!(retiring.pvcs.len(), 1);
+        assert_eq!(retiring.services.len(), 3);
+        let retiring_authority = retiring
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_replacement.as_ref())
+            .unwrap();
+        assert!(retiring_authority.replacement.is_none());
+        assert_eq!(
+            retiring_authority.retiring_replacement.as_ref(),
+            Some(&target)
+        );
+        assert!(
+            retiring
+                .set
+                .status
+                .as_ref()
+                .unwrap()
+                .public_v1_transition
+                .is_some()
+        );
+        let cleanup_expected = normalized_transition(&retiring).unwrap().unwrap();
+
+        api.provision_public_v1_replacement(
+            &scope,
+            &cleanup_expected,
+            &completion,
+            &target_authority,
+            &rebuild,
+        )
+        .await
+        .unwrap();
+        let cleanup_pending = api.observation().await;
+        assert!(cleanup_pending.pods.is_empty());
+        assert!(cleanup_pending.pvcs.is_empty());
+        assert_eq!(cleanup_pending.services.len(), 2);
+        assert!(
+            cleanup_pending
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .and_then(|replacement| replacement.retiring_replacement.as_ref())
+                .is_some()
+        );
+        assert!(
+            cleanup_pending
+                .set
+                .status
+                .as_ref()
+                .unwrap()
+                .public_v1_transition
+                .is_some()
+        );
+
+        let mut delayed_resources = cleanup_pending.clone();
+        delayed_resources.pods = retiring.pods.clone();
+        delayed_resources.pvcs = retiring.pvcs.clone();
+        delayed_resources.services = retiring.services.clone();
+        api.set_observation(delayed_resources).await;
+        api.provision_public_v1_replacement(
+            &scope,
+            &cleanup_expected,
+            &completion,
+            &target_authority,
+            &rebuild,
+        )
+        .await
+        .unwrap();
+        let delayed_cleanup = api.observation().await;
+        assert!(delayed_cleanup.pods.is_empty());
+        assert!(delayed_cleanup.pvcs.is_empty());
+        assert_eq!(delayed_cleanup.services.len(), 2);
+        assert!(
+            delayed_cleanup
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .and_then(|replacement| replacement.retiring_replacement.as_ref())
+                .is_some()
+        );
+
+        let mut lingering_endpoint = delayed_cleanup;
+        lingering_endpoint.agents.insert(
+            ReplicaObservationKey::new(
+                target.replica.replica_id,
+                target.replica.instance_id.clone(),
+            ),
+            RawAgentObservation::Unavailable {
+                message: "terminating endpoint".into(),
+            },
+        );
+        api.set_observation(lingering_endpoint).await;
+        api.provision_public_v1_replacement(
+            &scope,
+            &cleanup_expected,
+            &completion,
+            &target_authority,
+            &rebuild,
+        )
+        .await
+        .unwrap();
+        let endpoint_cleanup = api.observation().await;
+        assert!(endpoint_cleanup.agents.is_empty());
+        assert!(
+            endpoint_cleanup
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .and_then(|replacement| replacement.retiring_replacement.as_ref())
+                .is_some()
+        );
+
+        api.conflict_next_status().await;
+        assert!(
+            api.provision_public_v1_replacement(
+                &scope,
+                &cleanup_expected,
+                &completion,
+                &target_authority,
+                &rebuild,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            api.observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .and_then(|replacement| replacement.retiring_replacement.as_ref())
+                .is_some()
+        );
+
+        api.provision_public_v1_replacement(
+            &scope,
+            &cleanup_expected,
+            &completion,
+            &target_authority,
+            &rebuild,
+        )
+        .await
+        .unwrap();
+        let complete = api.observation().await;
+        let status = complete.set.status.as_ref().unwrap();
+        let replacement = status.public_v1_replacement.as_ref().unwrap();
+        assert_eq!(replacement.predecessor, target);
+        assert_ne!(replacement.operation_id, authority.operation_id);
+        assert!(replacement.replacement.is_none());
+        assert!(replacement.retiring_replacement.is_none());
+        assert!(status.public_v1_transition.is_none());
+        assert!(status.public_v1_operation.is_none());
+        status.validate_public_v1().unwrap();
+
+        let fresh = storage("fresh");
+        assert!(
+            api.bind_public_v1_replacement(&scope, &authority.operation_id, &fresh)
+                .await
+                .is_err()
+        );
+        api.bind_public_v1_replacement(&scope, &replacement.operation_id, &fresh)
+            .await
+            .unwrap();
+        let rebound = api.observation().await;
+        let rebound_status = rebound.set.status.as_ref().unwrap();
+        assert_eq!(
+            rebound_status
+                .public_v1_replacement
+                .as_ref()
+                .and_then(|replacement| replacement.replacement.as_ref()),
+            Some(&fresh)
+        );
+        rebound_status.validate_public_v1().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciler_prioritizes_corrective_reentry_and_allocates_with_live_predecessor() {
+        let predecessor = storage("predecessor");
+        let target = storage("target");
+        let configuration_id = ConfigurationId::new("configuration");
+        let bound = PublicV1ReplacementState::new(&configuration_id, predecessor)
+            .unwrap()
+            .bind(target.clone())
+            .unwrap();
+        let (expected, completion, target_authority, rebuild) = corrective_inputs(&target);
+        let mut observation = corrective_observation(bound, &expected, &target);
+        observation.agents.insert(
+            ReplicaObservationKey::new(
+                target.replica.replica_id,
+                target.replica.instance_id.clone(),
+            ),
+            RawAgentObservation::PublicV1Report(Box::new(corrective_report(
+                &expected,
+                &completion,
+                &target,
+            ))),
+        );
+        let api = Arc::new(InMemoryClusterApi::new(observation));
+        let reconciler = crate::reconciler::Reconciler::new(
+            api.clone(),
+            crate::production_evaluation_config(0, 1, 1),
+        );
+
+        for _ in 0..4 {
+            reconciler.reconcile("default", "sample").await.unwrap();
+            if api
+                .observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .and_then(|replacement| replacement.retiring_replacement.as_ref())
+                == Some(&target)
+            {
+                break;
+            }
+        }
+        let reentry = api.observation().await;
+        assert_eq!(
+            reentry
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .and_then(|replacement| replacement.retiring_replacement.as_ref()),
+            Some(&target)
+        );
+
+        let mut initial = corrective_observation(
+            PublicV1ReplacementState::new(&configuration_id, target.clone()).unwrap(),
+            &expected,
+            &target,
+        );
+        initial.set.status.as_mut().unwrap().public_v1_replacement = None;
+        initial.agents.insert(
+            ReplicaObservationKey::new(
+                target.replica.replica_id,
+                target.replica.instance_id.clone(),
+            ),
+            RawAgentObservation::PublicV1Report(Box::new(corrective_report(
+                &expected,
+                &completion,
+                &target,
+            ))),
+        );
+        let initial_topology = initial
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .unwrap()
+            .configuration()
+            .unwrap();
+        assert!(!crate::reconciler::bootstrap_resources_missing(
+            &initial,
+            &[ReplicaId::new(1)],
+            Some(&initial_topology),
+        ));
+        let api = Arc::new(InMemoryClusterApi::new(initial));
+        api.provision_public_v1_replacement(
+            &PublicV1Scope {
+                namespace: "default".into(),
+                name: "sample".into(),
+                resource_uid: ResourceUid::new("resource-1"),
+            },
+            &expected,
+            &completion,
+            &target_authority,
+            &rebuild,
+        )
+        .await
+        .unwrap();
+        for _ in 0..4 {
+            if !crate::reconciler::reconcile_unbound_replacement_scaffolding(
+                &api.observation().await,
+                api.as_ref(),
+            )
+            .await
+            .unwrap()
+            {
+                break;
+            }
+        }
+        let before_initialization = api.observation().await;
+        let topology = before_initialization
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .unwrap()
+            .configuration()
+            .unwrap();
+        let initialization = crate::reconciler::next_initialization_command(
+            &before_initialization,
+            &ResourceUid::new("resource-1"),
+            &[ReplicaId::new(1)],
+            Some(&topology),
+        )
+        .unwrap()
+        .expect("fresh replacement initialization");
+        api.execute_command(
+            &before_initialization,
+            &ProtocolCommand::InitializeAgentStore(Box::new(initialization.clone())),
+        )
+        .await
+        .unwrap();
+        let initialized = api.observation().await;
+        let fresh = initialized
+            .agents
+            .values()
+            .find_map(|observation| match observation {
+                RawAgentObservation::PublicV1Report(report)
+                    if report.replica.replica_id == ReplicaId::new(1)
+                        && report.replica.instance_id != target.replica.instance_id =>
+                {
+                    Some(report.storage_incarnation.clone())
+                }
+                _ => None,
+            })
+            .expect("fresh initialized replacement");
+        let replacement_operation = initialized
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_replacement.as_ref())
+            .unwrap()
+            .operation_id
+            .clone();
+        api.bind_public_v1_replacement(
+            &PublicV1Scope {
+                namespace: "default".into(),
+                name: "sample".into(),
+                resource_uid: ResourceUid::new("resource-1"),
+            },
+            &replacement_operation,
+            &fresh,
+        )
+        .await
+        .unwrap();
+        let live_predecessor = api.observation().await;
+        assert!(
+            live_predecessor
+                .pods
+                .iter()
+                .any(|pod| { pod.uid().as_deref() == Some(target.replica.instance_id.as_str()) })
+        );
+        assert!(
+            api.effects()
+                .await
+                .iter()
+                .any(|effect| matches!(effect, EffectRecord::EnsureReplacement(_))),
+            "live predecessor did not allocate replacement: observation={:#?} effects={:#?}",
+            api.observation().await,
+            api.effects().await
+        );
+        assert_ne!(
+            initialization.expected_pod_uid.as_str(),
+            target.replica.instance_id.as_str()
+        );
+        assert_ne!(
+            initialization.expected_pvc_uid,
+            match &target.storage {
+                ReplicaStorageIdentity::Persistent { pvc_uid, .. } => pvc_uid.clone(),
+                ReplicaStorageIdentity::Volatile { .. } => unreachable!(),
+            }
+        );
+        assert_eq!(
+            initialization.expected_instance_id.as_str(),
+            initialization.expected_pod_uid.as_str()
+        );
+        let replacement = live_predecessor
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_replacement.as_ref())
+            .and_then(|replacement| replacement.replacement.as_ref())
+            .expect("fresh replacement binding");
+        assert_eq!(
+            replacement.replica.instance_id.as_str(),
+            initialization.expected_pod_uid.as_str()
+        );
+        assert_eq!(
+            replacement.storage,
+            ReplicaStorageIdentity::Persistent {
+                pod_uid: initialization.expected_pod_uid,
+                pvc_uid: initialization.expected_pvc_uid,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_replacement_waits_for_exact_service_absence() {
+        let predecessor = storage("predecessor");
+        let target = storage("target");
+        let configuration_id = ConfigurationId::new("configuration");
+        let authority = PublicV1ReplacementState::new(&configuration_id, predecessor.clone())
+            .unwrap()
+            .bind(target.clone())
+            .unwrap();
+        let (expected, _, _, _) = corrective_inputs(&target);
+        let mut observation = corrective_observation(authority, &expected, &target);
+        let status = observation.set.status.as_mut().unwrap();
+        status.public_v1_transition = None;
+        status.public_v1_operation = None;
+        observation
+            .services
+            .iter_mut()
+            .find(|service| service.name_any() == "sample-write")
+            .and_then(|service| service.spec.as_mut())
+            .expect("write service")
+            .selector = Some(BTreeMap::from([(
+            INSTANCE_LABEL.into(),
+            target.replica.instance_id.to_string(),
+        )]));
+        let ReplicaStorageIdentity::Persistent { pod_uid, .. } = &predecessor.storage else {
+            unreachable!()
+        };
+        observation.services.push(Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some("predecessor-service".into()),
+                namespace: Some("default".into()),
+                uid: Some("predecessor-service-uid".into()),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                selector: Some(BTreeMap::from([(
+                    INSTANCE_LABEL.into(),
+                    pod_uid.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let topology = observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .unwrap()
+            .configuration()
+            .unwrap();
+        assert!(!crate::reconciler::bootstrap_resources_missing(
+            &observation,
+            &[ReplicaId::new(1)],
+            Some(&topology),
+        ));
+        let api = Arc::new(InMemoryClusterApi::new(observation));
+        let scope = PublicV1Scope {
+            namespace: "default".into(),
+            name: "sample".into(),
+            resource_uid: ResourceUid::new("resource-1"),
+        };
+        assert!(
+            crate::reconciler::reconcile_replacement_cleanup(
+                &api.observation().await,
+                Some(&topology),
+                &scope,
+                api.as_ref(),
+            )
+            .await
+            .unwrap()
+        );
+        let pending = api.observation().await;
+        assert!(
+            pending
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .is_some()
+        );
+        assert!(
+            !pending.services.iter().any(|service| {
+                service.spec.as_ref().is_some_and(|spec| {
+                    spec.selector.as_ref().is_some_and(|selector| {
+                        selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
+                    })
+                })
+            }),
+            "predecessor service cleanup did not run: observation={pending:#?} effects={:#?}",
+            api.effects().await
+        );
+
+        assert!(
+            crate::reconciler::reconcile_replacement_cleanup(
+                &api.observation().await,
+                Some(&topology),
+                &scope,
+                api.as_ref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            api.observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .is_none()
+        );
+    }
 }
 
 #[cfg(feature = "runtime-test-bridge")]
@@ -4779,6 +6133,7 @@ mod tests {
                 sessions: Vec::new(),
                 unavailable_primary_id: Some(ReplicaId::new(1)),
                 unavailable_since_unix_seconds: Some(100),
+                completed_switchover_request_id: None,
                 canonical_configuration_json: "{}".into(),
             }),
             ..Default::default()

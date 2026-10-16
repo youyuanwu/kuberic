@@ -1,35 +1,99 @@
 pub mod stateless;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicV1FactoryRegistration {
-    Default,
-    Stateless,
-    Alternate,
+#[derive(Clone, Copy)]
+enum PublicV1FactoryConstructor {
+    Default(fn(Arc<dyn DurableState>) -> DefaultReplicatorFactory),
+    Stateless(fn(Arc<dyn DurableState>) -> stateless::StatelessReplicatorFactory),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PublicV1FactoryRegistration {
+    name: &'static str,
+    constructor: PublicV1FactoryConstructor,
 }
 
 impl PublicV1FactoryRegistration {
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Default => "DefaultReplicatorFactory",
-            Self::Stateless => "StatelessReplicatorFactory",
-            Self::Alternate => "AlternateReplicatorFactory",
+    pub(crate) const fn stateless(
+        name: &'static str,
+        constructor: fn(Arc<dyn DurableState>) -> stateless::StatelessReplicatorFactory,
+    ) -> Self {
+        Self {
+            name,
+            constructor: PublicV1FactoryConstructor::Stateless(constructor),
         }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        self.name
     }
 }
 
-pub(crate) const PUBLIC_V1_FACTORY_REGISTRATIONS: &[PublicV1FactoryRegistration] = &[
-    PublicV1FactoryRegistration::Default,
-    PublicV1FactoryRegistration::Stateless,
-];
+#[derive(Clone, Copy)]
+pub(crate) struct PublicV1FactoryManifest {
+    registrations: [PublicV1FactoryRegistration; 2],
+}
 
-pub(crate) fn validate_public_v1_factories(
-    registrations: &[PublicV1FactoryRegistration],
-) -> Result<()> {
-    if registrations
-        != [
-            PublicV1FactoryRegistration::Default,
-            PublicV1FactoryRegistration::Stateless,
-        ]
+impl PublicV1FactoryManifest {
+    pub(crate) const fn registrations(self) -> [PublicV1FactoryRegistration; 2] {
+        self.registrations
+    }
+
+    fn construct_default(self, storage: Arc<dyn DurableState>) -> DefaultReplicatorFactory {
+        self.registrations
+            .into_iter()
+            .find_map(|registration| match registration.constructor {
+                PublicV1FactoryConstructor::Default(constructor) => {
+                    Some(constructor(storage.clone()))
+                }
+                PublicV1FactoryConstructor::Stateless(_) => None,
+            })
+            .expect("Public V1 default factory registration")
+    }
+
+    fn construct_stateless(
+        self,
+        storage: Arc<dyn DurableState>,
+    ) -> stateless::StatelessReplicatorFactory {
+        self.registrations
+            .into_iter()
+            .find_map(|registration| match registration.constructor {
+                PublicV1FactoryConstructor::Default(_) => None,
+                PublicV1FactoryConstructor::Stateless(constructor) => {
+                    Some(constructor(storage.clone()))
+                }
+            })
+            .expect("Public V1 stateless factory registration")
+    }
+}
+
+fn construct_default_factory(storage: Arc<dyn DurableState>) -> DefaultReplicatorFactory {
+    DefaultReplicatorFactory { storage }
+}
+
+fn construct_stateless_factory(
+    storage: Arc<dyn DurableState>,
+) -> stateless::StatelessReplicatorFactory {
+    stateless::StatelessReplicatorFactory::from_public_v1_manifest(storage)
+}
+
+pub(crate) const PUBLIC_V1_FACTORIES: PublicV1FactoryManifest = PublicV1FactoryManifest {
+    registrations: [
+        PublicV1FactoryRegistration {
+            name: "DefaultReplicatorFactory",
+            constructor: PublicV1FactoryConstructor::Default(construct_default_factory),
+        },
+        PublicV1FactoryRegistration {
+            name: "StatelessReplicatorFactory",
+            constructor: PublicV1FactoryConstructor::Stateless(construct_stateless_factory),
+        },
+    ],
+};
+
+pub(crate) fn validate_public_v1_factories(manifest: PublicV1FactoryManifest) -> Result<()> {
+    if manifest
+        .registrations()
+        .map(PublicV1FactoryRegistration::name)
+        != ["DefaultReplicatorFactory", "StatelessReplicatorFactory"]
     {
         return Err(RuntimeError::Application(
             "Public V1 factory registrations changed".into(),
@@ -1001,7 +1065,7 @@ pub struct DefaultReplicatorFactory {
 
 impl DefaultReplicatorFactory {
     pub fn new(storage: Arc<dyn DurableState>) -> Self {
-        Self { storage }
+        PUBLIC_V1_FACTORIES.construct_default(storage)
     }
 }
 
@@ -1013,8 +1077,9 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        validate_public_v1_factories(PUBLIC_V1_FACTORY_REGISTRATIONS)?;
-        stateless::StatelessReplicatorFactory::new(self.storage.clone())
+        validate_public_v1_factories(PUBLIC_V1_FACTORIES)?;
+        PUBLIC_V1_FACTORIES
+            .construct_stateless(self.storage.clone())
             .create_replicator(context, state_provider, settings)
             .await
     }

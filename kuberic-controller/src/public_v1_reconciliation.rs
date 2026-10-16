@@ -77,6 +77,13 @@ where
         if !matches!(plan, PublicV1EvidencePlan::Wait) {
             return reconcile_public_v1_consumer(api, scope, &report).await;
         }
+    } else if !api
+        .public_v1_operation_source_present(scope, &expected)
+        .await?
+    {
+        api.supersede_public_v1_operation(scope, &expected, &command)
+            .await?;
+        return Ok(PublicV1ReconciliationOutcome::EffectApplied);
     }
     if let Err(dispatch_error) =
         crate::executor::execute_public_v1_operation(api, scope, &expected, command.clone()).await

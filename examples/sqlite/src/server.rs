@@ -43,21 +43,24 @@ impl SqliteServer {
             let before = progress.committed_lsn;
             application.barrier().reset_receipt(before);
             let executed = sql.execute(&statements);
+            let publication_attempted = application.barrier().publication_attempted();
             let lsn = application.barrier().last_lsn();
             match executed {
                 Ok((rows, rowid)) => {
                     if application.barrier().is_fenced() {
                         return Err(unknown("local publication was interrupted"));
                     }
-                    if let Err(reason) = require_advanced_publication(before, lsn) {
-                        application.barrier().fence_unknown(reason);
-                        return Err(unknown(reason));
+                    if publication_attempted {
+                        if let Err(reason) = require_advanced_publication(before, lsn) {
+                            application.barrier().fence_unknown(reason);
+                            return Err(unknown(reason));
+                        }
+                        if let Err(error) = application.persistence().confirm_publication(lsn) {
+                            application.barrier().fence_unknown(&error.to_string());
+                            return Err(unknown(&error.to_string()));
+                        }
+                        sql.visible_lsn = lsn;
                     }
-                    if let Err(error) = application.persistence().confirm_publication(lsn) {
-                        application.barrier().fence_unknown(&error.to_string());
-                        return Err(unknown(&error.to_string()));
-                    }
-                    sql.visible_lsn = lsn;
                     Ok((rows, rowid, lsn))
                 }
                 Err(error) => match application.barrier().failure() {
@@ -65,9 +68,13 @@ impl SqliteServer {
                     Some(CommitFailure::Definitive(reason)) => Err(Status::unavailable(format!(
                         "transaction rejected before dispatch: {reason}"
                     ))),
-                    None if lsn > before => {
-                        application.barrier().fence_unknown(&error.to_string());
-                        Err(unknown(&error.to_string()))
+                    None if publication_attempted => {
+                        let reason = match require_advanced_publication(before, lsn) {
+                            Ok(()) => error.to_string(),
+                            Err(reason) => reason.to_owned(),
+                        };
+                        application.barrier().fence_unknown(&reason);
+                        Err(unknown(&reason))
                     }
                     None => Err(Status::invalid_argument(format!("SQL rejected: {error}"))),
                 },

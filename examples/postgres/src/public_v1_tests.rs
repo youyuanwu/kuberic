@@ -1118,10 +1118,57 @@ async fn row_count(replica: &Replica) -> i64 {
         .get(0)
 }
 
+async fn writable(replica: &Replica) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let Ok((mut client, connection)) = replica.driver.instance.connect_application().await
+        else {
+            return false;
+        };
+        let Ok(transaction) = client.transaction().await else {
+            connection.abort();
+            return false;
+        };
+        let writable = transaction
+            .execute("INSERT INTO topology_data VALUES (-2147483648)", &[])
+            .await
+            .is_ok();
+        let _ = transaction.rollback().await;
+        connection.abort();
+        writable
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn assert_only_writable(expected: &Replica, replicas: &[&Replica]) {
+    let mut writable_replicas = Vec::new();
+    for replica in replicas {
+        if writable(replica).await {
+            writable_replicas.push(replica.identity.clone());
+        }
+    }
+    assert_eq!(writable_replicas, vec![expected.identity.clone()]);
+}
+
+async fn crash_owned_postgres(replica: &Replica) {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let processes = ProcessProbe::postgres(replica.driver.instance.data_dir());
+    let pid = std::fs::read_to_string(replica.driver.instance.data_dir().join("postmaster.pid"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    kill_process(Pid::from_raw(pid).unwrap(), Signal::QUIT).unwrap();
+    processes.assert_gone().await;
+}
+
 async fn run_topology_scenario() {
     let directory = OracleDataDir::new();
     let source = Replica::new_incarnation(
-        directory.path().join("topology-source"),
+        directory.path().join("source"),
         91,
         "topology-source-1",
         "topology-source-session-1",
@@ -1129,7 +1176,7 @@ async fn run_topology_scenario() {
     )
     .await;
     let target = Replica::new_incarnation(
-        directory.path().join("topology-target"),
+        directory.path().join("target"),
         92,
         "topology-target-1",
         "topology-target-session-1",
@@ -1154,13 +1201,11 @@ async fn run_topology_scenario() {
             .await
             .is_err()
     );
+    assert_only_writable(&source, &[&source, &target]).await;
 
-    source
-        .driver
-        .public_application_role(ReplicaRole::None)
-        .await
-        .unwrap();
+    crash_owned_postgres(&source).await;
     assert!(source_writer.simple_query("SELECT 1").await.is_err());
+    assert_eq!(row_count(&target).await, 1);
     target.change_role(2, ReplicaRole::Primary).await;
     target.epoch(2).await;
     target
@@ -1180,9 +1225,32 @@ async fn run_topology_scenario() {
         .await
         .unwrap();
     assert_eq!(row_count(&target).await, 2);
+    assert_only_writable(&target, &[&source, &target]).await;
+
+    assert_eq!(
+        source.driver.public_owner().state.lock().await.grants.len(),
+        1
+    );
+    source
+        .driver
+        .remove_replica(target.identity.replica_id)
+        .await
+        .unwrap();
+    assert!(
+        source
+            .driver
+            .public_owner()
+            .state
+            .lock()
+            .await
+            .grants
+            .is_empty()
+    );
+    assert!(source.driver.instance.connect_application().await.is_err());
+    assert_only_writable(&target, &[&source, &target]).await;
 
     let source_replacement = Replica::new_incarnation(
-        directory.path().join("topology-source-replacement"),
+        directory.path().join("source-2"),
         91,
         "topology-source-2",
         "topology-source-session-2",
@@ -1197,6 +1265,7 @@ async fn run_topology_scenario() {
     )
     .await;
     assert_eq!(row_count(&source_replacement).await, 2);
+    assert_only_writable(&target, &[&source, &target, &source_replacement]).await;
 
     target
         .driver
@@ -1225,9 +1294,15 @@ async fn run_topology_scenario() {
         .execute("INSERT INTO topology_data VALUES (3)", &[])
         .await
         .unwrap();
+    assert_eq!(row_count(&source_replacement).await, 3);
+    assert_only_writable(
+        &source_replacement,
+        &[&source, &target, &source_replacement],
+    )
+    .await;
 
     let target_replacement = Replica::new_incarnation(
-        directory.path().join("topology-target-replacement"),
+        directory.path().join("target-2"),
         92,
         "topology-target-2",
         "topology-target-session-2",
@@ -1255,6 +1330,11 @@ async fn run_topology_scenario() {
             .await
             .is_err()
     );
+    assert_only_writable(
+        &source_replacement,
+        &[&source, &target, &source_replacement, &target_replacement],
+    )
+    .await;
     target_replacement.driver.public_close().await.unwrap();
     source_replacement.driver.public_close().await.unwrap();
     target.driver.public_close().await.unwrap();

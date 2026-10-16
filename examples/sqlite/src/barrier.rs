@@ -35,10 +35,13 @@ pub struct ReplicationBarrier {
     worker: Mutex<Option<Worker>>,
     fault_context: Mutex<Option<(tokio::runtime::Handle, StatefulServicePartition)>>,
     last_lsn: AtomicI64,
+    publication_attempted: AtomicBool,
     fenced: AtomicBool,
     failure: Mutex<Option<CommitFailure>>,
     #[cfg(any(test, feature = "testing"))]
     fail_after_quorum: AtomicBool,
+    #[cfg(any(test, feature = "testing"))]
+    stale_receipt: AtomicBool,
     #[cfg(any(test, feature = "testing"))]
     pub before_dispatch: crate::testing::PauseGate,
     #[cfg(any(test, feature = "testing"))]
@@ -73,6 +76,7 @@ impl ReplicationBarrier {
         let name = format!("kuberic-sqlite-{}-{id}", std::process::id());
         let barrier = Arc::new(Self {
             last_lsn: AtomicI64::new(committed_lsn),
+            publication_attempted: AtomicBool::new(false),
             persistence,
             worker: Mutex::new(None),
             fault_context: Mutex::new(None),
@@ -80,6 +84,8 @@ impl ReplicationBarrier {
             failure: Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             fail_after_quorum: AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            stale_receipt: AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             before_dispatch: crate::testing::PauseGate::default(),
             #[cfg(any(test, feature = "testing"))]
@@ -95,8 +101,12 @@ impl ReplicationBarrier {
     pub fn last_lsn(&self) -> i64 {
         self.last_lsn.load(Ordering::SeqCst)
     }
+    pub(crate) fn publication_attempted(&self) -> bool {
+        self.publication_attempted.load(Ordering::SeqCst)
+    }
     pub(crate) fn reset_receipt(&self, lsn: i64) {
         self.last_lsn.store(lsn, Ordering::SeqCst);
+        self.publication_attempted.store(false, Ordering::SeqCst);
         self.failure.lock().expect("barrier failure").take();
     }
     pub fn failure(&self) -> Option<CommitFailure> {
@@ -155,6 +165,12 @@ impl ReplicationBarrier {
                             #[cfg(any(test, feature = "testing"))]
                             barrier.after_quorum.pause().await;
                             #[cfg(any(test, feature = "testing"))]
+                            if barrier.stale_receipt.swap(false, Ordering::SeqCst) {
+                                let stale = barrier.last_lsn();
+                                let _ = request.reply.send(Ok(stale));
+                                continue;
+                            }
+                            #[cfg(any(test, feature = "testing"))]
                             if barrier.fail_after_quorum.swap(false, Ordering::SeqCst) {
                                 let reason =
                                     "injected quorum-committed/local-unpublished cut".to_owned();
@@ -204,10 +220,16 @@ impl ReplicationBarrier {
     pub fn fail_after_quorum_once(&self) {
         self.fail_after_quorum.store(true, Ordering::SeqCst);
     }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn return_stale_receipt_once(&self) {
+        self.stale_receipt.store(true, Ordering::SeqCst);
+    }
 }
 
 impl CommitBarrier for ReplicationBarrier {
     fn publish(&self, transaction: &Transaction<'_>) -> Result<(), BarrierError> {
+        self.publication_attempted.store(true, Ordering::SeqCst);
         let outcome = (|| {
             if self.is_fenced() {
                 return Err(CommitFailure::Unknown(

@@ -582,6 +582,128 @@ async fn production_reconciler_originates_failover_and_retargets_writer() {
 }
 
 #[tokio::test]
+async fn production_reconciler_fails_over_before_replacing_deleted_primary_pod() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        let primary = observed
+            .agents
+            .iter()
+            .find_map(|(key, agent)| match agent {
+                RawAgentObservation::PublicV1Report(report)
+                    if report.write_status == AccessStatus::Granted =>
+                {
+                    Some((key.clone(), report.replica.clone()))
+                }
+                _ => None,
+            })
+            .expect("initial primary");
+        observed.agents.remove(&primary.0);
+        observed
+            .pods
+            .retain(|pod| pod.uid().as_deref() != Some(primary.1.instance_id.as_str()));
+        api.set_observation(observed).await;
+        let effects_start = api.effects().await.len();
+
+        assert_eq!(
+            reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+        let mut observed = api.observation().await;
+        observed.now_unix_seconds = 30;
+        api.set_observation(observed).await;
+
+        let mut converged = false;
+        for _ in 0..300 {
+            let action = reconciler.reconcile("default", "sample").await.unwrap();
+            let observed = api.observation().await;
+            let complete = observed.set.status.as_ref().is_some_and(|status| {
+                status.public_v1_replacement.is_none()
+                    && status.public_v1_transition.is_none()
+                    && status
+                        .public_v1_topology
+                        .as_ref()
+                        .and_then(|topology| topology.configuration().ok())
+                        .is_some_and(|configuration| configuration.members.len() == 3)
+            });
+            if action.kind == ReconcileKind::Stable && complete {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "deleted-primary failover and replacement did not converge: observation={:#?} effects={:#?}",
+            api.observation().await,
+            api.effects().await
+        );
+        let observed = api.observation().await;
+        assert_eq!(
+            observed
+                .agents
+                .values()
+                .filter(|agent| matches!(
+                    agent,
+                    RawAgentObservation::PublicV1Report(report)
+                        if report.write_status == AccessStatus::Granted
+                ))
+                .count(),
+            1
+        );
+        let replacement = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .and_then(|topology| {
+                topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.identity.replica_id == primary.1.replica_id)
+            })
+            .expect("replacement primary session");
+        assert_ne!(replacement.identity, primary.1);
+        let effects = api.effects().await;
+        let route = effects[effects_start..]
+            .iter()
+            .position(|effect| matches!(effect, EffectRecord::RoutePrimary(_)))
+            .expect("survivor route");
+        let replacement_start = effects[effects_start..]
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    EffectRecord::EnsureReplacement(identity)
+                        if identity.replica_id == primary.1.replica_id
+                )
+            })
+            .expect("replacement scaffolding");
+        assert!(route < replacement_start);
+    })
+    .await
+    .expect("deleted-primary recovery exceeded 270 seconds");
+}
+
+#[tokio::test]
 async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
@@ -750,6 +872,8 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
         primary.role = ReplicaRole::None;
         primary.read_status = AccessStatus::NotPrimary;
         primary.write_status = AccessStatus::NotPrimary;
+        primary.progress.role = PublicProgressRole::Recovery;
+        let primary_service_location = primary.service_location.take();
         api.set_observation(observed).await;
         let scope = PublicV1Scope {
             namespace: "default".into(),
@@ -890,11 +1014,38 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                 primary.role = ReplicaRole::Primary;
                 primary.read_status = AccessStatus::Granted;
                 primary.write_status = AccessStatus::Granted;
+                primary.progress.role = PublicProgressRole::Primary;
+                primary.service_location = primary_service_location.clone();
                 api.set_observation(observed).await;
                 source_waited_before_build = true;
                 continue;
             }
             if build_dispatched && !build_seen {
+                let build_source = effects[effects_start..]
+                    .iter()
+                    .find_map(|effect| match effect {
+                        EffectRecord::Execute(
+                            kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(
+                                command,
+                            ),
+                        ) if matches!(
+                            command.intent.program,
+                            Some(
+                                kuberic_runtime::protocol::public_operations::PublicOperationProgram::Build(_)
+                            )
+                        ) => Some(&command.target),
+                        _ => None,
+                    })
+                    .expect("Build command source");
+                assert!(observed.agents.values().any(|agent| {
+                    matches!(
+                        agent,
+                        RawAgentObservation::PublicV1Report(report)
+                            if report.replica == *build_source
+                                && report.role == ReplicaRole::Primary
+                                && report.write_status == AccessStatus::Granted
+                    )
+                }));
                 build_seen = true;
                 let authority = authority.expect("Build retains replacement authority");
                 assert_eq!(authority.replacement.as_ref(), bound_target.as_ref());
@@ -1367,6 +1518,15 @@ async fn production_reconciler_originates_planned_switchover() {
         }
         assert!(stable);
         let observed = api.observation().await;
+        assert_eq!(
+            observed
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_topology.as_ref())
+                .and_then(|topology| topology.completed_switchover_request_id.as_deref()),
+            Some("switch-to-2")
+        );
         let writers = observed
             .agents
             .values()
@@ -1380,6 +1540,61 @@ async fn production_reconciler_originates_planned_switchover() {
             })
             .collect::<Vec<_>>();
         assert_eq!(writers, vec![ReplicaId::new(2)]);
+
+        let mut observed = observed;
+        observed.agents.retain(|_, agent| {
+            !matches!(
+                agent,
+                RawAgentObservation::PublicV1Report(report)
+                    if report.replica.replica_id == ReplicaId::new(2)
+            )
+        });
+        api.set_observation(observed).await;
+        assert_eq!(
+            reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind,
+            ReconcileKind::Applied
+        );
+        let mut observed = api.observation().await;
+        observed.now_unix_seconds = 30;
+        api.set_observation(observed).await;
+        let mut failed_over = false;
+        for _ in 0..160 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                let observed = api.observation().await;
+                if observed
+                    .agents
+                    .values()
+                    .filter_map(|agent| match agent {
+                        RawAgentObservation::PublicV1Report(report)
+                            if report.write_status == AccessStatus::Granted =>
+                        {
+                            Some(report.replica.replica_id)
+                        }
+                        _ => None,
+                    })
+                    .all(|replica_id| replica_id != ReplicaId::new(2))
+                {
+                    failed_over = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            failed_over,
+            "completed switchover request blocked later failover: observation={:#?} effects={:#?}",
+            api.observation().await,
+            api.effects().await
+        );
     })
     .await
     .expect("Public V1 switchover exceeded 270 seconds");
@@ -1437,8 +1652,41 @@ async fn production_reconciler_originates_desired_membership_changes() {
         );
 
         let mut observed = observed;
+        let removed_session = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .and_then(|topology| {
+                topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.identity.replica_id == ReplicaId::new(3))
+                    .cloned()
+            })
+            .expect("third topology session");
+        observed
+            .agents
+            .retain(|key, _| key.replica_id != ReplicaId::new(3));
         observed.set.spec.replicas = 2;
         api.set_observation(observed).await;
+        let effects_start = api.effects().await.len();
+        reconciler.reconcile("default", "sample").await.unwrap();
+        let unavailable = api.observation().await;
+        assert!(unavailable.pods.iter().any(|pod| {
+            pod.uid().as_deref() == Some(removed_session.identity.instance_id.as_str())
+        }));
+        assert!(
+            !api.effects().await[effects_start..]
+                .iter()
+                .any(|effect| matches!(effect, EffectRecord::DeleteScaffolding { .. })),
+            "report unavailability must not authorize accepted-member storage deletion"
+        );
+        let mut unavailable = unavailable;
+        unavailable.pods.retain(|pod| {
+            pod.uid().as_deref() != Some(removed_session.identity.instance_id.as_str())
+        });
+        api.set_observation(unavailable).await;
         let mut scaled_down = false;
         for _ in 0..200 {
             if reconciler
@@ -1473,6 +1721,32 @@ async fn production_reconciler_originates_desired_membership_changes() {
                 .get(kuberic_controller::crd::REPLICA_ID_LABEL)
                 .is_some_and(|value| value == "3")
         }));
+        let removed_pvc_uid = match &removed_session.storage_incarnation.storage {
+            kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+                pvc_uid,
+                ..
+            } => pvc_uid,
+            kuberic_runtime::protocol::types::ReplicaStorageIdentity::Volatile { .. } => {
+                panic!("expected persistent test storage")
+            }
+        };
+        assert!(
+            !observed
+                .pvcs
+                .iter()
+                .any(|pvc| pvc.uid().as_deref() == Some(removed_pvc_uid.as_str()))
+        );
+        assert!(!observed.services.iter().any(|service| {
+            service.spec.as_ref().is_some_and(|spec| {
+                spec.selector.as_ref().is_some_and(|selector| {
+                    selector
+                        .get(kuberic_controller::crd::INSTANCE_LABEL)
+                        .is_some_and(|instance| {
+                            instance == removed_session.identity.instance_id.as_str()
+                        })
+                })
+            })
+        }));
         assert_eq!(
             observed
                 .agents
@@ -1484,6 +1758,41 @@ async fn production_reconciler_originates_desired_membership_changes() {
                 ))
                 .count(),
             1
+        );
+
+        let mut observed = observed;
+        observed.set.spec.replicas = 3;
+        api.set_observation(observed).await;
+        let mut rescaled = false;
+        for _ in 0..200 {
+            if reconciler
+                .reconcile("default", "sample")
+                .await
+                .unwrap()
+                .kind
+                == ReconcileKind::Stable
+            {
+                rescaled = true;
+                break;
+            }
+        }
+        assert!(rescaled, "fresh scale-up after cleanup did not converge");
+        let observed = api.observation().await;
+        let replacement_session = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .and_then(|topology| {
+                topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.identity.replica_id == ReplicaId::new(3))
+            })
+            .expect("rescaled third topology session");
+        assert_ne!(
+            replacement_session.storage_incarnation,
+            removed_session.storage_incarnation
         );
     })
     .await
@@ -1530,8 +1839,33 @@ async fn production_reconciler_transfers_routing_before_removing_current_primary
         let mut observed = api.observation().await;
         observed.set.spec.switchover = None;
         observed.set.spec.replicas = 2;
+        let primary_key = observed
+            .agents
+            .keys()
+            .find(|key| key.replica_id == ReplicaId::new(3))
+            .cloned()
+            .expect("third replica report");
+        let primary_agent = observed
+            .agents
+            .remove(&primary_key)
+            .expect("third replica observation");
         api.set_observation(observed).await;
         let start = api.effects().await.len();
+        reconciler.reconcile("default", "sample").await.unwrap();
+        let mut unavailable_primary = api.observation().await;
+        assert!(unavailable_primary.pods.iter().any(|pod| {
+            pod.uid().as_deref() == Some(primary_key.instance_id.as_str())
+        }));
+        assert!(
+            !api.effects().await[start..]
+                .iter()
+                .any(|effect| matches!(effect, EffectRecord::DeleteScaffolding { .. })),
+            "unavailable accepted primary must not be deleted before safe transfer"
+        );
+        unavailable_primary
+            .agents
+            .insert(primary_key, primary_agent);
+        api.set_observation(unavailable_primary).await;
         let mut restarted_after_handoff = false;
         let mut remove_seen = false;
         for _ in 0..240 {
@@ -2362,6 +2696,72 @@ async fn production_reconciler_supersedes_incomplete_predecessor_session() {
     })
     .await
     .expect("incomplete predecessor supersession exceeded 270 seconds");
+}
+
+#[tokio::test]
+async fn production_reconciler_supersedes_operation_after_source_pod_loss() {
+    tokio::time::timeout(Duration::from_secs(270), async {
+        let api = Arc::new(InMemoryClusterApi::new(empty_observation(1)));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        for _ in 0..80 {
+            reconciler.reconcile("default", "sample").await.unwrap();
+            if api
+                .observation()
+                .await
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_transition.is_some())
+            {
+                break;
+            }
+        }
+        let mut observed = api.observation().await;
+        let source = observed
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_transition.as_ref())
+            .expect("accepted transition")
+            .transition()
+            .unwrap()
+            .intent
+            .source
+            .storage_incarnation
+            .replica;
+        observed
+            .pods
+            .retain(|pod| pod.uid().as_deref() != Some(source.instance_id.as_str()));
+        observed.agents.retain(|key, _| {
+            key.replica_id != source.replica_id || key.instance_id != source.instance_id
+        });
+        api.set_observation(observed).await;
+        let executes_before = api
+            .effects()
+            .await
+            .iter()
+            .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+            .count();
+
+        reconciler.reconcile("default", "sample").await.unwrap();
+
+        let executes_after = api
+            .effects()
+            .await
+            .iter()
+            .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+            .count();
+        assert_eq!(executes_after, executes_before);
+        let observed = api.observation().await;
+        let status = observed.set.status.as_ref().expect("status");
+        assert!(status.public_v1_transition.is_none());
+        assert!(status.public_v1_operation.is_none());
+    })
+    .await
+    .expect("lost-source supersession exceeded 270 seconds");
 }
 
 #[tokio::test]

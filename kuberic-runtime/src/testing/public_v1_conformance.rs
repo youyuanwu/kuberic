@@ -135,6 +135,31 @@ const HOST_PROCESS: &str = include_str!("../host/process.rs");
 const PUBLIC_OPERATIONS: &str = include_str!("../protocol/public_operations.rs");
 const HOST_OPERATION: &str = include_str!("../host/operation.rs");
 const HOST_LIFECYCLE_PROGRAM: &str = include_str!("../host/public_lifecycle_program.rs");
+const CONTROL_SERVICE_SOURCE: &str = include_str!("../host/service.rs");
+const DATA_SERVICE_SOURCE: &str = include_str!("../replicator/stateless/mod.rs");
+const CONTROLLER_STARTUP_SOURCE: &str = include_str!("../../../kuberic-controller/src/lib.rs");
+const CONTROL_SERVICE_WITH_UNMANIFESTED_ENDPOINT: &str = concat!(
+    include_str!("../host/service.rs"),
+    r#"
+pub(crate) fn start_alternate_control_endpoint(service: AlternateContinuationService) {
+    tonic::transport::Server::builder()
+        .add_service(AlternateContinuationServer::new(service));
+}
+"#
+);
+const CONTROLLER_SOURCE_WITH_UNMANIFESTED_HELPER: &str = concat!(
+    include_str!("../../../kuberic-controller/src/lib.rs"),
+    r#"
+pub(crate) fn start_alternate_controller_helper(
+    sets: Api<crd::KubericSet>,
+    alternate: Api<AlternateOwner>,
+) {
+    Controller::new(sets, watcher::Config::default())
+        .owns(alternate, watcher::Config::default());
+}
+"#
+);
+#[allow(dead_code)]
 mod controller_registration {
     include!("../../../kuberic-controller/src/public_v1_registration.rs");
 }
@@ -157,10 +182,14 @@ struct ProductionSources<'a> {
     public_operations: &'a str,
     host_operation: &'a str,
     host_lifecycle_program: &'a str,
-    controller_modules: &'a [controller_registration::PublicV1ControllerRegistration],
-    control_services: &'a [crate::host::service::PublicV1ControlServiceRegistration],
-    data_services: &'a [crate::replicator::stateless::PublicV1DataServiceRegistration],
-    factories: &'a [crate::replicator::PublicV1FactoryRegistration],
+    controller_manifest: controller_registration::PublicV1ControllerManifest,
+    control_service_manifest: crate::host::service::PublicV1ControlServiceManifest,
+    data_service_manifest: crate::replicator::stateless::PublicV1DataServiceManifest,
+    factory_registrations: Vec<crate::replicator::PublicV1FactoryRegistration>,
+    control_service_source: &'a str,
+    data_service_source: &'a str,
+    factory_source: &'a str,
+    controller_startup_source: &'a str,
     host_attachments: &'a [&'a str],
     report_branches: &'a [&'a str],
     store_tables: &'a [&'a str],
@@ -174,10 +203,16 @@ fn production_sources() -> ProductionSources<'static> {
         public_operations: PUBLIC_OPERATIONS,
         host_operation: HOST_OPERATION,
         host_lifecycle_program: HOST_LIFECYCLE_PROGRAM,
-        controller_modules: controller_registration::PUBLIC_V1_CONTROLLER_REGISTRATIONS,
-        control_services: crate::host::service::PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS,
-        data_services: crate::replicator::stateless::PUBLIC_V1_DATA_SERVICE_REGISTRATIONS,
-        factories: crate::replicator::PUBLIC_V1_FACTORY_REGISTRATIONS,
+        controller_manifest: controller_registration::PUBLIC_V1_CONTROLLER,
+        control_service_manifest: crate::host::service::PUBLIC_V1_CONTROL_SERVICES,
+        data_service_manifest: crate::replicator::stateless::PUBLIC_V1_DATA_SERVICES,
+        factory_registrations: crate::replicator::PUBLIC_V1_FACTORIES
+            .registrations()
+            .to_vec(),
+        control_service_source: CONTROL_SERVICE_SOURCE,
+        data_service_source: DATA_SERVICE_SOURCE,
+        factory_source: REPLICATOR,
+        controller_startup_source: CONTROLLER_STARTUP_SOURCE,
         host_attachments: crate::host::hosting::PUBLIC_V1_HOST_ATTACHMENTS,
         report_branches: crate::host::service::PUBLIC_V1_AGENT_REPORT_BRANCHES,
         store_tables: crate::host::sqlite_store::PUBLIC_V1_AGENT_TABLES,
@@ -193,26 +228,115 @@ fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
     values
 }
 
+fn compact_source(source: &str) -> String {
+    source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn occurrences(source: &str, needle: &str) -> usize {
+    source.match_indices(needle).count()
+}
+
+fn runtime_service_sources_are_manifest_bound(sources: &ProductionSources<'_>) -> bool {
+    let control = compact_source(sources.control_service_source);
+    let data = compact_source(sources.data_service_source);
+    occurrences(&control, ".add_service(") == 4
+        && occurrences(&control, ".add_service(services.agent_control(control))") == 2
+        && occurrences(&control, ".add_service(services.replica_peer(peer))") == 2
+        && occurrences(
+            &control,
+            "proto::agent_control_server::AgentControlServer::new(service)",
+        ) == 1
+        && occurrences(
+            &control,
+            "proto::replica_peer_server::ReplicaPeerServer::new(service)",
+        ) == 1
+        && occurrences(&data, ".add_service(") == 1
+        && occurrences(
+            &data,
+            ".add_service(PUBLIC_V1_DATA_SERVICES.replication_data(service))",
+        ) == 1
+        && occurrences(
+            &data,
+            "proto::replication_data_server::ReplicationDataServer::new(service)",
+        ) == 1
+}
+
+fn factory_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
+    let factory = compact_source(sources.factory_source);
+    let stateless = compact_source(sources.data_service_source);
+    occurrences(&factory, "PUBLIC_V1_FACTORIES.construct_default(storage)") == 1
+        && occurrences(
+            &factory,
+            "PUBLIC_V1_FACTORIES.construct_stateless(self.storage.clone())",
+        ) == 1
+        && occurrences(
+            &factory,
+            "stateless::StatelessReplicatorFactory::from_public_v1_manifest(storage)",
+        ) == 1
+        && occurrences(
+            &stateless,
+            "super::PUBLIC_V1_FACTORIES.construct_stateless(storage)",
+        ) == 1
+        && occurrences(&factory, "Factory::") + occurrences(&stateless, "Factory::") == 1
+}
+
+fn controller_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
+    let controller = compact_source(sources.controller_startup_source);
+    occurrences(
+        &controller,
+        "letcontroller_manifest=public_v1_registration::PUBLIC_V1_CONTROLLER;",
+    ) == 1
+        && occurrences(&controller, "controller_manifest.bind_reconciler(") == 1
+        && occurrences(&controller, "controller_manifest.bind_owners(") == 1
+        && occurrences(&controller, "Controller::new(") == 1
+        && occurrences(&controller, ".owns(") == 4
+        && occurrences(&controller, ".owns(owners.pods,watcher::Config::default())") == 1
+        && occurrences(
+            &controller,
+            ".owns(owners.persistent_volume_claims,watcher::Config::default())",
+        ) == 1
+        && occurrences(
+            &controller,
+            ".owns(owners.services,watcher::Config::default())",
+        ) == 1
+        && occurrences(
+            &controller,
+            ".owns(owners.secrets,watcher::Config::default())",
+        ) == 1
+}
+
 fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipInventory {
-    let factories = sorted_unique(
+    let mut factories = sorted_unique(
         sources
-            .factories
+            .factory_registrations
             .iter()
+            .copied()
             .map(|registration| registration.name().to_string())
             .collect(),
     );
+    if !factory_source_is_manifest_bound(sources) {
+        factories.push("unmanifested built-in factory construction".to_string());
+    }
     let mut services = sources
-        .control_services
-        .iter()
+        .control_service_manifest
+        .registrations()
+        .into_iter()
         .map(|registration| registration.name().to_string())
         .collect::<Vec<_>>();
     services.extend(
         sources
-            .data_services
-            .iter()
+            .data_service_manifest
+            .registrations()
+            .into_iter()
             .map(|registration| registration.name().to_string()),
     );
-    let services = sorted_unique(services);
+    let mut services = sorted_unique(services);
+    if !runtime_service_sources_are_manifest_bound(sources) {
+        services.push("unmanifested runtime service registration".to_string());
+    }
     let store_tables = sorted_unique(
         sources
             .store_tables
@@ -231,11 +355,15 @@ fn discover_inventory(sources: &ProductionSources<'_>) -> ReplacementOwnershipIn
         .iter()
         .map(|name| (*name).to_string())
         .collect();
-    let controller_modules = sources
-        .controller_modules
-        .iter()
+    let mut controller_modules = sources
+        .controller_manifest
+        .registrations()
+        .into_iter()
         .map(|registration| registration.name().to_string())
-        .collect();
+        .collect::<Vec<_>>();
+    if !controller_source_is_manifest_bound(sources) {
+        controller_modules.push("unmanifested controller startup helper".to_string());
+    }
     ReplacementOwnershipInventory {
         factories,
         services,
@@ -266,28 +394,19 @@ pub fn replacement_ownership_inventory() -> ReplacementOwnershipInventory {
 
 pub fn replacement_ownership_inventory_with_extra_endpoint_fixture() -> ReplacementOwnershipInventory
 {
-    let control_services = [
-        crate::host::service::PublicV1ControlServiceRegistration::AgentControl,
-        crate::host::service::PublicV1ControlServiceRegistration::ReplicaPeer,
-        crate::host::service::PublicV1ControlServiceRegistration::Alternate,
-    ];
     discover_inventory(&ProductionSources {
-        control_services: &control_services,
+        control_service_source: CONTROL_SERVICE_WITH_UNMANIFESTED_ENDPOINT,
         ..production_sources()
     })
 }
 
 pub fn replacement_ownership_inventory_with_alternate_factory_fixture()
 -> ReplacementOwnershipInventory {
-    let factories = [
-        crate::replicator::PublicV1FactoryRegistration::Default,
-        crate::replicator::PublicV1FactoryRegistration::Stateless,
-        crate::replicator::PublicV1FactoryRegistration::Alternate,
-    ];
-    discover_inventory(&ProductionSources {
-        factories: &factories,
-        ..production_sources()
-    })
+    let mut sources = production_sources();
+    sources.factory_registrations.push(
+        super::public_v1_alternate_registration_fixture::alternate_builtin_factory_registration(),
+    );
+    discover_inventory(&sources)
 }
 
 pub fn replacement_ownership_inventory_with_alternate_protocol_fixture()
@@ -301,12 +420,8 @@ pub fn replacement_ownership_inventory_with_alternate_protocol_fixture()
 
 pub fn replacement_ownership_inventory_with_alternate_controller_fixture()
 -> ReplacementOwnershipInventory {
-    let controller_modules = [
-        controller_registration::PublicV1ControllerRegistration::Reconciler,
-        controller_registration::PublicV1ControllerRegistration::Alternate,
-    ];
     discover_inventory(&ProductionSources {
-        controller_modules: &controller_modules,
+        controller_startup_source: CONTROLLER_SOURCE_WITH_UNMANIFESTED_HELPER,
         ..production_sources()
     })
 }
@@ -370,12 +485,19 @@ pub fn validate_replacement_ownership_inventory(
     if inventory.protocol_versions.as_slice() != ["PUBLIC_V1_PROTOCOL_VERSION"] {
         return reject("protocol version", &inventory.protocol_versions);
     }
-    if inventory.controller_modules.as_slice() != ["reconciler"] {
+    if inventory.controller_modules.as_slice()
+        != [
+            "owner:PersistentVolumeClaim",
+            "owner:Pod",
+            "owner:Secret",
+            "owner:Service",
+            "reconciler",
+        ]
+    {
         return reject("controller module", &inventory.controller_modules);
     }
     if REPLICATOR.contains("LegacyManaged")
         || REPLICATOR.contains("pub struct DefaultReplicator {")
-        || !REPLICATOR.contains("stateless::StatelessReplicatorFactory::new")
         || PUBLIC_LIFECYCLE.contains("ManagedReplicatorCapabilities")
         || HOST_PROCESS.contains("run_outbound(")
         || HOST_PROCESS.contains("run_peer_discovery(")
@@ -404,24 +526,45 @@ fn sources_contain_alternate_protocol(sources: &ProductionSources<'_>) -> bool {
 }
 
 fn replacement_ownership_gate() {
-    crate::replicator::validate_public_v1_factories(
-        crate::replicator::PUBLIC_V1_FACTORY_REGISTRATIONS,
-    )
-    .unwrap();
+    crate::replicator::validate_public_v1_factories(crate::replicator::PUBLIC_V1_FACTORIES)
+        .unwrap();
     crate::host::service::validate_public_v1_control_services(
-        crate::host::service::PUBLIC_V1_CONTROL_SERVICE_REGISTRATIONS,
+        crate::host::service::PUBLIC_V1_CONTROL_SERVICES,
     )
     .unwrap();
     crate::replicator::stateless::validate_public_v1_data_services(
-        crate::replicator::stateless::PUBLIC_V1_DATA_SERVICE_REGISTRATIONS,
+        crate::replicator::stateless::PUBLIC_V1_DATA_SERVICES,
     )
     .unwrap();
     controller_registration::validate_public_v1_controller_registrations(
-        controller_registration::PUBLIC_V1_CONTROLLER_REGISTRATIONS,
+        controller_registration::PUBLIC_V1_CONTROLLER,
     )
     .unwrap();
     let inventory = replacement_ownership_inventory();
     validate_replacement_ownership_inventory(&inventory).unwrap();
+    for (category, mutation) in [
+        (
+            "unmanifested runtime service",
+            replacement_ownership_inventory_with_extra_endpoint_fixture(),
+        ),
+        (
+            "unmanifested built-in factory",
+            replacement_ownership_inventory_with_alternate_factory_fixture(),
+        ),
+        (
+            "alternate protocol",
+            replacement_ownership_inventory_with_alternate_protocol_fixture(),
+        ),
+        (
+            "unmanifested controller startup helper",
+            replacement_ownership_inventory_with_alternate_controller_fixture(),
+        ),
+    ] {
+        assert!(
+            validate_replacement_ownership_inventory(&mutation).is_err(),
+            "canonical replacement eligibility accepted {category}"
+        );
+    }
 }
 
 const GATES: [Gate; 16] = [
