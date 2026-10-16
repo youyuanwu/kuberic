@@ -394,11 +394,10 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
                     configuration: public,
                     ..
                 } = program
+                    && let Some(peer) = public.replicas.first_mut()
                 {
-                    if let Some(peer) = public.replicas.first_mut() {
-                        peer.process_session_id =
-                            kuberic_runtime::protocol::types::ProcessSessionId::new("stale-peer");
-                    }
+                    peer.process_session_id =
+                        kuberic_runtime::protocol::types::ProcessSessionId::new("stale-peer");
                 }
             })?;
         ensure!(!Harness::configurations_settled(
@@ -985,13 +984,18 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
             ));
         }
         let target = if old == 2 { 3 } else { 2 };
+        let last_peer = (1..=3).find(|id| *id != old && *id != target).unwrap();
+        ensure!(target < last_peer, "fixture must prepare the target first");
+        let preparation_fragment = format!("-prepare-{last_peer}-");
         let mut set = harness.set().await?;
         let generation = set.metadata.generation;
         let status = set.status.clone();
-        let mut preparation =
-            harness
-                .api
-                .arm_matching("sample", false, Some("epoch"), Some("-prepare-"))?;
+        let mut preparation = harness.api.arm_matching(
+            "sample",
+            false,
+            Some("epoch"),
+            Some(&preparation_fragment),
+        )?;
         set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
             request_id: "requested-transfer".into(),
             target_replica_id: target as u32,
@@ -1013,7 +1017,8 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
             }
         }
         // A first catch-up is not a write fence. Acknowledge another write
-        // before dispatching peer preparation; source Swap must transfer it too.
+        // after target preparation. Only the other old-epoch peer can ACK;
+        // source Swap must transfer this missing committed prefix to the target.
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             old_service.replicate_put(
@@ -1022,6 +1027,15 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
             ),
         )
         .await??;
+        ensure!(
+            harness
+                .service(target)
+                .await?
+                .persistence()
+                .get("switch-after-first-catch-up")
+                .is_none(),
+            "the prepared target unexpectedly received the old-epoch write"
+        );
         preparation.release();
         let mut barrier = cut
             .map(|completion| {
