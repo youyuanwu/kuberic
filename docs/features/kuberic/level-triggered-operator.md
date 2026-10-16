@@ -89,6 +89,24 @@ Same-cardinality Pod/PVC replacement persists allocation, storage binding,
 Build authority, completion, admission, and predecessor retirement as
 independent level-triggered stages.
 
+## Planned Switchover
+
+Request a transfer with `spec.switchover.requestId` and
+`spec.switchover.targetReplicaId`. Before authorizing transfer work, the
+controller persists `publicV1Topology.pendingSwitchover` alongside the starting
+configuration and exact admitted sessions. Removing or retargeting the spec
+cannot abandon prepared peer epochs. The accepted transfer finishes first,
+including after controller recreation; a later request is considered only
+afterward. Completion records the frozen request ID, not a newer spec value.
+If the source is already unavailable before acceptance, the request does not
+block ordinary delayed failover to a surviving requested target.
+
+Each peer prepares the next epoch with the old primary retained. Source Swap
+atomically revokes access, catches up the requested successor and demotes before
+final target promotion. Final publication clears the pending request. Missing or
+changed frozen process/storage participants cause waiting rather than silently
+substituting a different transfer.
+
 ## Failover
 
 When the primary is unavailable, the controller records its logical ID and the

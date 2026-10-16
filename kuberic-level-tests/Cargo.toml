@@ -21,7 +21,7 @@ form_urlencoded = "1"
 k8s-openapi.workspace = true
 kube.workspace = true
 kuberic-controller.workspace = true
-kuberic-runtime = { workspace = true, features = ["host"] }
+kuberic-runtime = { workspace = true, features = ["host", "testing"] }
 kvstore2 = { path = "../examples/kvstore2" }
 tonic.workspace = true
 tower = { version = "0.5", features = ["util"] }

@@ -639,13 +639,16 @@ fn replication_open_endpoint_round_trips_and_rejects_empty_advertisement() {
     let mut report = replacement_report(&required);
     report.replication_address = Some("http://127.0.0.1:41001".into());
     report.validate().unwrap();
-    assert_eq!(
-        kuberic_runtime::control::normalize_public_v1_agent_status_report(
-            kuberic_runtime::control::public_v1_agent_status_to_proto(&report),
-        )
-        .unwrap(),
-        report,
-    );
+    for capability in [None, Some(false), Some(true)] {
+        report.extensions.catch_up_specific_quorum = capability;
+        assert_eq!(
+            kuberic_runtime::control::normalize_public_v1_agent_status_report(
+                kuberic_runtime::control::public_v1_agent_status_to_proto(&report),
+            )
+            .unwrap(),
+            report,
+        );
+    }
     for address in ["", " \t"] {
         report.replication_address = Some(address.into());
         assert!(report.validate().is_err());

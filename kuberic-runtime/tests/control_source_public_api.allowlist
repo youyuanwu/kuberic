@@ -1064,6 +1064,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::storage_incarnation: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::write_status: AccessStatus
 public-path hidden field crate::protocol::public_operations::PublicV1ExtensionSlot::version: u16
+public-path hidden field crate::protocol::public_operations::PublicV1Extensions::catch_up_specific_quorum: Option < bool >
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::history_recovery: Option < PublicV1ExtensionSlot >
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::public_build_evidence: Option < PublicV1ExtensionSlot >
 public-path hidden field crate::protocol::public_operations::PublicV1Identity::generation: u64

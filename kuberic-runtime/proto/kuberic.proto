@@ -146,6 +146,7 @@ message PublicV1AgentStatus {
   PublicV1DataLossRecoveryStatus data_loss_recovery = 19;
   PublicV1ServiceLocation service_location = 20;
   string replicator_creation_id = 21;
+  optional bool catch_up_specific_quorum = 23;
   optional string replication_address = 22;
 }
 

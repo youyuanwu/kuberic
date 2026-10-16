@@ -1190,8 +1190,8 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
             .expect("replacement pre-Build Epoch effect");
         assert!(replacement_open < replacement_build);
         assert!(replacement_open < replacement_role);
-        assert!(replacement_role < replacement_epoch);
-        assert!(replacement_epoch < replacement_build);
+        assert!(replacement_epoch < replacement_role);
+        assert!(replacement_role < replacement_build);
         let build_command = match &effects[effects_start + replacement_build] {
             EffectRecord::Execute(
                 kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command),
@@ -1398,14 +1398,26 @@ async fn production_reconciler_finishes_accepted_operation_before_replacement() 
             target_replica_id: u32::try_from(target.value()).unwrap(),
         });
         api.set_observation(observed).await;
-        assert_eq!(
-            reconciler
-                .reconcile("default", "sample")
+        for _ in 0..4 {
+            if api
+                .observation()
                 .await
-                .unwrap()
-                .kind,
-            ReconcileKind::Applied
-        );
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_transition.is_some())
+            {
+                break;
+            }
+            assert_eq!(
+                reconciler
+                    .reconcile("default", "sample")
+                    .await
+                    .unwrap()
+                    .kind,
+                ReconcileKind::Applied
+            );
+        }
 
         let mut observed = api.observation().await;
         assert!(
@@ -1980,20 +1992,20 @@ async fn production_reconciler_transfers_routing_before_removing_current_primary
                 )
             ))
             .expect("CatchUp effect");
-        let swap = new_effects
+        let handoff = new_effects
             .iter()
             .position(|effect| matches!(
                 effect,
                 EffectRecord::Execute(
                     kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
-                ) if matches!(
+                ) if command.intent.operation_id.as_str().contains("-handoff-") && matches!(
                     command.intent.program,
                     Some(
                         kuberic_runtime::protocol::public_operations::PublicOperationProgram::Swap { .. }
                     )
                 )
             ))
-            .expect("Swap effect");
+            .expect("durable source handoff effect");
         let route = new_effects
             .iter()
             .position(|effect| matches!(effect, EffectRecord::RoutePrimary(_)))
@@ -2012,7 +2024,7 @@ async fn production_reconciler_transfers_routing_before_removing_current_primary
                 )
             ))
             .expect("Remove effect");
-        assert!(catch_up < swap && swap < route && route < remove);
+        assert!(catch_up < handoff && handoff < route && route < remove);
     })
     .await
     .expect("Public V1 primary removal ordering exceeded 270 seconds");

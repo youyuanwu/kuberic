@@ -456,13 +456,29 @@ impl Reconciler {
                 kind: ReconcileKind::Executed,
             });
         }
-        if cleanup_stale_scaffolding(&raw, current_topology.as_ref(), self.api.as_ref()).await? {
+        let frozen_topology = raw
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            .filter(|topology| topology.pending_switchover.is_some());
+        let desired_replicas = frozen_topology.map_or(raw.set.spec.replicas, |topology| {
+            topology
+                .sessions
+                .iter()
+                .map(|session| session.identity.replica_id.value() as u32)
+                .max()
+                .unwrap_or(raw.set.spec.replicas)
+        });
+        if frozen_topology.is_none()
+            && cleanup_stale_scaffolding(&raw, current_topology.as_ref(), self.api.as_ref()).await?
+        {
             return Ok(ReconcileAction {
                 requeue_after: Duration::ZERO,
                 kind: ReconcileKind::Executed,
             });
         }
-        let replica_ids = (1..=raw.set.spec.replicas)
+        let replica_ids = (1..=desired_replicas)
             .map(|replica_id| {
                 kuberic_runtime::protocol::types::ReplicaId::new(i64::from(replica_id))
             })
@@ -473,7 +489,9 @@ impl Reconciler {
                 kind: ReconcileKind::Executed,
             });
         }
-        if bootstrap_resources_missing(&raw, &replica_ids, current_topology.as_ref()) {
+        if frozen_topology.is_none()
+            && bootstrap_resources_missing(&raw, &replica_ids, current_topology.as_ref())
+        {
             self.api.ensure_replica_support(&raw).await?;
             self.api
                 .ensure_replica_scaffolding(&raw, &replica_ids)
@@ -509,7 +527,7 @@ impl Reconciler {
             .is_some();
         if let Some(configuration) = current_topology.as_ref()
             && let Some(member) = configuration.members.iter().find(|member| {
-                if member.identity.replica_id.value() > i64::from(raw.set.spec.replicas) {
+                if member.identity.replica_id.value() > i64::from(desired_replicas) {
                     return false;
                 }
                 if member.identity.replica_id == configuration.primary_id
@@ -589,6 +607,22 @@ impl Reconciler {
                     kind: ReconcileKind::Executed,
                 });
             }
+        }
+        if let Some(topology) = frozen_topology
+            && !topology.sessions.iter().all(|session| {
+                raw.agents.values().any(|observation| {
+                    matches!(observation, RawAgentObservation::PublicV1Report(report)
+                    if report.replica == session.identity
+                        && report.storage_incarnation == session.storage_incarnation
+                        && report.process_session_id == session.process_session_id
+                        && report.replicator_creation_id == session.replicator_creation_id)
+                })
+            })
+        {
+            return Ok(ReconcileAction {
+                requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
+                kind: ReconcileKind::Waiting,
+            });
         }
         let replacement_initialization_blocked_for_failover = raw
             .set
@@ -872,19 +906,28 @@ impl Reconciler {
                 });
             }
         }
-        let topology_replicas = topology_replicas(&raw, current.as_ref(), &reports)?;
+        let mut topology_replicas = topology_replicas(&raw, current.as_ref(), &reports)?;
+        if let Some(topology) = frozen_topology {
+            topology_replicas.retain(|replica| {
+                topology
+                    .sessions
+                    .iter()
+                    .any(|session| session.identity == replica.report.replica)
+            });
+        }
         let completed_switchover_request_id = raw
             .set
             .status
             .as_ref()
             .and_then(|status| status.public_v1_topology.as_ref())
             .and_then(|topology| topology.completed_switchover_request_id.as_deref());
-        let active_switchover =
-            raw.set.spec.switchover.as_ref().filter(|request| {
-                completed_switchover_request_id != Some(request.request_id.as_str())
+        let active_switchover = frozen_topology
+            .and_then(|topology| topology.pending_switchover.as_ref())
+            .or_else(|| {
+                raw.set.spec.switchover.as_ref().filter(|request| {
+                    completed_switchover_request_id != Some(request.request_id.as_str())
+                })
             });
-        let requested_switchover_target =
-            active_switchover.map(|request| ReplicaId::new(i64::from(request.target_replica_id)));
         let current_primary_available = current.as_ref().is_some_and(|configuration| {
             topology_replicas.iter().any(|replica| {
                 configuration.members.iter().any(|member| {
@@ -892,6 +935,34 @@ impl Reconciler {
                 })
             })
         });
+        if frozen_topology.is_none()
+            && current_primary_available
+            && active_switchover.is_some_and(|request| {
+                current.as_ref().is_some_and(|configuration| {
+                    i64::from(request.target_replica_id) != configuration.primary_id.value()
+                        && configuration.members.iter().any(|member| {
+                            member.identity.replica_id.value()
+                                == i64::from(request.target_replica_id)
+                        })
+                })
+            })
+        {
+            let configuration = current.as_ref().expect("checked current topology");
+            self.api
+                .persist_public_v1_topology(
+                    &scope,
+                    Some(&configuration.configuration_id),
+                    configuration,
+                )
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Applied,
+            });
+        }
+        let requested_switchover_target =
+            active_switchover.map(|request| ReplicaId::new(i64::from(request.target_replica_id)));
         let switchover_target = requested_switchover_target.filter(|target| {
             current_primary_available
                 || topology_replicas
@@ -919,7 +990,7 @@ impl Reconciler {
             accepted,
             current.as_ref(),
             &topology_replicas,
-            raw.set.spec.replicas,
+            desired_replicas,
             switchover_target,
             routed_primary,
             &resource_version,
@@ -942,7 +1013,7 @@ impl Reconciler {
             PublicV1TopologyPlan::PersistTopology { expected, next } => {
                 if let Some(current) = current.as_ref()
                     && let Some(removed) = current.members.iter().find(|member| {
-                        member.identity.replica_id.value() <= i64::from(raw.set.spec.replicas)
+                        member.identity.replica_id.value() <= i64::from(desired_replicas)
                             && !next
                                 .members
                                 .iter()

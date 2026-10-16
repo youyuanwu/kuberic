@@ -85,10 +85,17 @@ struct HostProjection {
 }
 
 fn renewal_projection_is_current(
-    renewal_epoch: crate::protocol::types::Epoch,
+    renewal_epoch: Epoch,
+    renewal_role: ReplicaRole,
+    epoch: Option<Epoch>,
+    role: Option<(Epoch, ReplicaRole)>,
     configuration: Option<&crate::protocol::public_operations::PublicConfiguration>,
 ) -> bool {
-    configuration.is_none_or(|configuration| configuration.current.epoch <= renewal_epoch)
+    epoch.is_none_or(|epoch| epoch <= renewal_epoch)
+        && role.is_none_or(|(epoch, role)| {
+            epoch < renewal_epoch || (epoch == renewal_epoch && role == renewal_role)
+        })
+        && configuration.is_none_or(|configuration| configuration.current.epoch <= renewal_epoch)
 }
 
 impl HostProjection {
@@ -474,9 +481,6 @@ impl PodRuntime {
                 renewal.stage,
                 crate::protocol::public_operations::PublicSessionRenewalStage::ConfigurationPending
                     | crate::protocol::public_operations::PublicSessionRenewalStage::Authorized
-            ) && renewal_projection_is_current(
-                renewal.required.renewal_epoch,
-                configuration.as_ref(),
             )
         }) && renewal
             .required
@@ -493,6 +497,13 @@ impl PodRuntime {
                 .members
                 .iter()
                 .find(|member| member.identity == self.host.identity)
+            && renewal_projection_is_current(
+                renewal.required.renewal_epoch,
+                member.role,
+                epoch,
+                role,
+                configuration.as_ref(),
+            )
         {
             epoch = Some(renewal.required.renewal_epoch);
             role = Some((renewal.required.renewal_epoch, member.role));
@@ -654,6 +665,11 @@ impl PodRuntime {
                 ))
             });
         Ok(crate::host::public_lifecycle::PublicV1ReportProjection {
+            catch_up_specific_quorum: self
+                .host
+                .registered
+                .get()
+                .map(|registered| registered.capabilities.catch_up_specific_quorum),
             process_session_id,
             replicator_creation_id,
             report_sequence,
@@ -1237,14 +1253,39 @@ mod tests {
     #[test]
     fn stale_session_renewal_does_not_override_newer_topology() {
         let renewal_epoch = Epoch::new(0, 2);
-        assert!(renewal_projection_is_current(renewal_epoch, None));
         assert!(renewal_projection_is_current(
             renewal_epoch,
+            ReplicaRole::Primary,
+            None,
+            None,
+            None
+        ));
+        assert!(renewal_projection_is_current(
+            renewal_epoch,
+            ReplicaRole::Primary,
+            None,
+            None,
             Some(&configuration(Epoch::new(0, 2)))
         ));
         assert!(!renewal_projection_is_current(
             renewal_epoch,
+            ReplicaRole::Primary,
+            None,
+            None,
             Some(&configuration(Epoch::new(0, 3)))
         ));
+        for (epoch, role) in [
+            (Some(Epoch::new(0, 3)), None),
+            (None, Some((Epoch::new(0, 3), ReplicaRole::Primary))),
+            (None, Some((renewal_epoch, ReplicaRole::IdleSecondary))),
+        ] {
+            assert!(!renewal_projection_is_current(
+                renewal_epoch,
+                ReplicaRole::Primary,
+                epoch,
+                role,
+                Some(&configuration(Epoch::new(0, 2))),
+            ));
+        }
     }
 }

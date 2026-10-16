@@ -87,6 +87,8 @@ pub struct PublicV1TopologyState {
     pub unavailable_since_unix_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_switchover_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_switchover: Option<PlannedSwitchoverRequestSpec>,
     #[schemars(length(min = 2))]
     pub canonical_configuration_json: String,
 }
@@ -135,6 +137,7 @@ impl PublicV1TopologyState {
             unavailable_primary_id: None,
             unavailable_since_unix_seconds: None,
             completed_switchover_request_id: None,
+            pending_switchover: None,
             canonical_configuration_json: serde_json::to_string(configuration)
                 .map_err(|error| error.to_string())?,
         })
@@ -175,6 +178,13 @@ impl PublicV1TopologyState {
                 .completed_switchover_request_id
                 .as_ref()
                 .is_some_and(String::is_empty)
+            || self.pending_switchover.as_ref().is_some_and(|request| {
+                request.request_id.is_empty()
+                    || i64::from(request.target_replica_id) == configuration.primary_id.value()
+                    || !configuration.members.iter().any(|member| {
+                        member.identity.replica_id.value() == i64::from(request.target_replica_id)
+                    })
+            })
         {
             return Err("public-v1 topology summary differs from canonical configuration".into());
         }

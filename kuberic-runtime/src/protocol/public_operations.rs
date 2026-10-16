@@ -2342,6 +2342,8 @@ impl PublicV1ExtensionSlot {
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1Extensions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catch_up_specific_quorum: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_recovery: Option<PublicV1ExtensionSlot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_build_evidence: Option<PublicV1ExtensionSlot>,

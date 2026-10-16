@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 291 |
+| ordinary | 313 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **337** |
+| **total** | **359** |
 
-Ordinary partition counts are `73, 73, 73, 72`. PostgreSQL partition counts
+Ordinary partition counts are `79, 78, 78, 78`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -61,24 +61,58 @@ cargo nextest run -p kuberic-level-tests --all-features --profile ordinary \
 The [in-process harness](../../proposal/in-process-system-test-harness.md)
 connects the production reconciler and Kubernetes adapter to real agent RPCs,
 hosted KVStore2 replicas, TCP replication, and durable files. Only Kubernetes
-resource storage and Pod/PVC realization are simulated. It requires no cluster,
+resource storage, Pod/PVC realization, and explicit socket faults are simulated. It requires no cluster,
 containers, kubeconfig, or application binaries.
 
-Five ordinary-tier journeys cover bootstrap with a status conflict, contained
-restart/session renewal, secondary replacement with delayed deletion,
-stopped-primary failover, and controller recreation after an operation is
-persisted. Scenarios call `KvService` directly rather than its HTTP router.
-Failover admits the surviving two-member quorum; it does not prove fencing of
-a frozen or partitioned process.
+Twenty-four ordinary-tier journey/assertion tests cover bootstrap/status conflict,
+support Service/Secret repair, contained restart, replacement with delayed exact
+cleanup, replacement followed by same-storage restart, stopped-primary failover,
+live-primary isolation/reconnection, quorum loss/restoration, and spec-driven
+switchover. Controller recreation cuts cover persisted intent and durable
+completion before status advancement for replacement and failover, plus prepared
+and completed switchover handoff. Provider LSNs/snapshots detect duplicate logical
+effects; exact accepted completions must be consumed once. Scenarios call
+`KvService` directly rather than its HTTP router.
+
+Readiness requires no pending accepted operation, transition, replacement,
+session renewal, or planned transfer; exact admitted/live session, creation and storage agreement;
+canonical configuration evidence; and settled access for all live hosts,
+including excluded predecessors. Admitted committed and applied progress must
+agree. Survivor observations explicitly exclude only
+acknowledged isolated hosts. Rejected real application writes, not stale
+inaccessible reports, establish stale-writer safety. Timed-out writes remain
+ambiguous; restored members must agree on an absent or attempted value.
+
+Owned TCP proxies cut existing duplex streams and new source/destination
+connections at both replication and Build dial paths, including controller
+control traffic, without replacing the isolated host/service/session. Unrelated
+connections survive cuts and restoration. Fresh-Build fault probes verify zero
+provider effects while blocked and transport reconnection, not automatic retry
+of a failed Build. Negative-path tests drain active cuts and entered barriers.
+
+Switchover cancellation/retargeting after durable peer preparation and controller
+recreation must complete the frozen transfer before considering the edited spec.
+Completion identifies that original request; both transfers preserve receipts.
+An unaccepted request must not block failover when its source is already absent.
+
+Live-primary return is exercised after genuine session renewal both with and
+without rejected writes on the isolated host. The clean-tail case must fence and
+recover the same host/session through retained-log catch-up, without snapshot
+Build or a manufactured ambiguous suffix. Renewal projection cannot override
+newer explicit Epoch/Role work or a conflicting same-epoch role.
 
 Each scenario owns dynamically allocated loopback listeners, resources, and
 storage. Callers pass a bound control socket at startup, not host construction.
 One server task owns it across initialization and established agent serving,
 with no close/rebind or shared listener ownership. The replicator binds during
 Open and the controller discovers its returned endpoint through the real agent
-report. Teardown drains hosts and application consumers before releasing storage;
+report. A testing-feature hook routes physical sockets using the real canonical
+source/destination identities, without changing commands or protocol payloads.
+Teardown joins forwarding tasks, hosts and application consumers before releasing storage;
 failures retain the data directory and report its path. Deployment, Service
 networking, watch delivery, and process pause/resume remain KinD concerns.
+Live network isolation is not scheduler suspension: the retained KinD failover
+journey still pauses and resumes the original containerd task.
 
 ## Build-Only Tier
 

@@ -7,10 +7,17 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, PodStatus, Secret};
 use kube::{Api, ResourceExt, api::PostParams};
 use kuberic_controller::cluster_api::{AgentApi, ClusterApi, GrpcAgentApi, KubeClusterApi};
-use kuberic_controller::crd::{CONTROL_ADDRESS_ANNOTATION, KubericSet, KubericSetSpec};
+use kuberic_controller::crd::{
+    CONTROL_ADDRESS_ANNOTATION, KubericSet, KubericSetSpec, KubericSetStatus,
+};
 use kuberic_controller::reconciler::Reconciler;
 use kuberic_runtime::host::{
     ApplicationStorageState, KubernetesDnsResolver, ReplicaHost, RunningReplica,
+};
+use kuberic_runtime::protocol::public_operations::{
+    ProcessSessionRenewalRequired, PublicOperationIntent, PublicOperationProgram,
+    PublicV1AcceptedOperationCompletion, PublicV1AgentReport, PublicV1OperationCompletion,
+    PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
 use kvstore2::{persistence::KvPersistence, service::KvService, state::CopyGate};
@@ -21,11 +28,17 @@ use tokio::time::Instant;
 use super::{
     kube::{ApiServer as TestApi, Kind},
     pod,
+    transport::Network,
 };
 
 const NAMESPACE: &str = "in-process";
 const NAME: &str = "sample";
 const TIMEOUT: Duration = Duration::from_secs(150);
+#[derive(Clone)]
+pub(super) struct ConfigurationEvidence {
+    pub operations: BTreeMap<String, (PublicOperationIntent, PublicV1OperationCompletion)>,
+    renewals: Vec<ProcessSessionRenewalRequired>,
+}
 
 struct Hosted {
     service: Arc<KvService>,
@@ -33,6 +46,9 @@ struct Hosted {
     startup: Option<JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>>,
     running: Option<RunningReplica>,
     data_root: PathBuf,
+    _route: kuberic_runtime::replicator::stateless::TestingTcpRoute,
+    network: Network,
+    uid: String,
 }
 
 impl Hosted {
@@ -53,6 +69,9 @@ impl Hosted {
             }
         }
         if let Err(error) = self.service.shutdown_and_drain().await {
+            errors.push(error.to_string());
+        }
+        if let Err(error) = self.network.forget(&self.uid).await {
             errors.push(error.to_string());
         }
         ensure!(errors.is_empty(), "host cleanup: {}", errors.join("; "));
@@ -87,6 +106,8 @@ pub(super) struct Harness {
     pub reconcile_errors: usize,
     last_error: Option<String>,
     cleaned: bool,
+    network: Network,
+    renewals: std::sync::Mutex<BTreeMap<String, ProcessSessionRenewalRequired>>,
 }
 
 impl Harness {
@@ -111,12 +132,16 @@ impl Harness {
         let task_api = api.clone();
         let task_state = supervisor.clone();
         let task_root = root.path().to_owned();
+        let network = Network::default();
+        let task_network = network.clone();
         let supervisor_task = tokio::spawn(async move {
             let result = loop {
                 if *shutdown.borrow() || shutdown.has_changed().is_err() {
                     break Ok(());
                 }
-                if let Err(error) = supervise(&task_api, &task_state, &task_root).await {
+                if let Err(error) =
+                    supervise(&task_api, &task_state, &task_root, &task_network).await
+                {
                     break Err(error);
                 }
                 tokio::select! {
@@ -138,6 +163,8 @@ impl Harness {
             reconcile_errors: 0,
             last_error: None,
             cleaned: false,
+            network,
+            renewals: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -156,9 +183,21 @@ impl Harness {
     }
 
     pub async fn set(&self) -> Result<KubericSet> {
-        Ok(Api::<KubericSet>::namespaced(self.api.client(), NAMESPACE)
+        let set = Api::<KubericSet>::namespaced(self.api.client(), NAMESPACE)
             .get(NAME)
-            .await?)
+            .await?;
+        if let Some(renewal) = set
+            .status
+            .as_ref()
+            .and_then(|s| s.public_v1_session_renewal.as_ref())
+        {
+            let required = renewal.renewal().map_err(anyhow::Error::msg)?.required;
+            self.renewals
+                .lock()
+                .unwrap()
+                .insert(required.operation_id.to_string(), required);
+        }
+        Ok(set)
     }
 
     async fn check(&mut self) -> Result<()> {
@@ -240,41 +279,64 @@ impl Harness {
     }
 
     pub async fn ready_members(&mut self, expected: usize) -> Result<i64> {
+        self.ready_observed(expected, &[]).await
+    }
+
+    pub async fn ready_survivors(&mut self, expected: usize, isolated: &[String]) -> Result<i64> {
+        for uid in isolated {
+            ensure!(
+                self.network.is_isolated(uid).await,
+                "survivor observation requires acknowledged isolation"
+            );
+        }
+        self.ready_observed(expected, isolated).await
+    }
+
+    async fn ready_observed(&mut self, expected: usize, isolated: &[String]) -> Result<i64> {
         loop {
             self.check().await?;
             let set = self.set().await?;
             if let Some(status) = set.status.as_ref()
+                && status.public_v1_operation.is_none()
                 && status.public_v1_transition.is_none()
                 && status.public_v1_replacement.is_none()
                 && status.public_v1_session_renewal.is_none()
                 && let Some(topology) = status.public_v1_topology.as_ref()
             {
-                let configuration = topology
-                    .configuration()
-                    .map_err(|error| anyhow!("{error}"))?;
+                let configuration = topology.configuration().map_err(anyhow::Error::msg)?;
                 if configuration.members.len() == expected {
-                    let mut granted = 0;
-                    let mut admitted = 0;
-                    let state = self.supervisor.lock().await;
-                    for member in &configuration.members {
-                        if let Some(host) = state.hosts.get(member.identity.instance_id.as_str())
-                            && let Some(running) = &host.running
-                        {
-                            let _ = running;
-                            let report = self.report(member.identity.replica_id.value()).await?;
-                            if report.replica == member.identity && report.role == member.role {
-                                if report.write_status == AccessStatus::Granted {
-                                    granted += 1;
-                                }
-                                if report.role == ReplicaRole::Primary
-                                    || report.read_status == AccessStatus::Granted
-                                {
-                                    admitted += 1;
-                                }
+                    ensure!(
+                        !configuration.members.iter().any(|member| isolated
+                            .iter()
+                            .any(|uid| member.identity.instance_id.as_str() == uid)),
+                        "isolated host remains admitted"
+                    );
+                    let uids = self
+                        .live_uids()
+                        .await
+                        .into_iter()
+                        .filter(|uid| !isolated.contains(uid))
+                        .collect::<Vec<_>>();
+                    let mut reports = Vec::new();
+                    let mut complete = true;
+                    for uid in &uids {
+                        match self.report_uid(uid).await {
+                            Ok(report) => reports.push(report),
+                            Err(error) => {
+                                self.last_error = Some(format!("readiness observation: {error:#}"));
+                                complete = false;
                             }
                         }
                     }
-                    if admitted == expected && granted == 1 {
+                    if complete
+                        && Self::observations_complete(&uids, &reports)
+                        && Self::settled(status, &reports, expected)
+                        && Self::configurations_settled(
+                            status,
+                            &reports,
+                            &self.configuration_evidence(&reports).await?,
+                        )
+                    {
                         return Ok(configuration.primary_id.value());
                     }
                 }
@@ -323,17 +385,242 @@ impl Harness {
             .iter()
             .find(|member| member.identity.replica_id.value() == replica_id)
             .context("member missing")?;
+        self.report_uid(member.identity.instance_id.as_str()).await
+    }
+
+    pub async fn live_uids(&self) -> Vec<String> {
+        self.supervisor
+            .lock()
+            .await
+            .hosts
+            .iter()
+            .filter(|(_, host)| {
+                host.running
+                    .as_ref()
+                    .is_some_and(|running| !running.is_finished())
+            })
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    }
+
+    pub async fn data_root(&self, uid: &str) -> Result<PathBuf> {
+        self.supervisor
+            .lock()
+            .await
+            .hosts
+            .get(uid)
+            .map(|host| host.data_root.clone())
+            .context("host missing")
+    }
+
+    pub async fn service_uid(&self, uid: &str) -> Result<Arc<KvService>> {
+        self.supervisor
+            .lock()
+            .await
+            .hosts
+            .get(uid)
+            .map(|host| host.service.clone())
+            .context("host missing")
+    }
+
+    pub async fn isolate_uid(&self, uid: &str, isolated: bool) -> Result<()> {
+        ensure!(
+            self.live_uids().await.iter().any(|live| live == uid),
+            "isolation target not live"
+        );
+        self.network.isolate(uid, isolated).await?;
+        ensure!(
+            self.live_uids().await.iter().any(|live| live == uid),
+            "isolation stopped host"
+        );
+        Ok(())
+    }
+
+    pub fn observations_complete(uids: &[String], reports: &[PublicV1AgentReport]) -> bool {
+        uids.iter().all(|uid| {
+            reports
+                .iter()
+                .any(|report| report.replica.instance_id.as_str() == uid)
+        })
+    }
+
+    pub async fn configuration_evidence(
+        &self,
+        reports: &[PublicV1AgentReport],
+    ) -> Result<ConfigurationEvidence> {
+        let handles = self
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .iter()
+            .filter_map(|(uid, host)| {
+                host.running
+                    .as_ref()
+                    .map(|running| (uid.clone(), running.handle()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut evidence = BTreeMap::new();
+        for report in reports {
+            let Some(handle) = handles.get(report.replica.instance_id.as_str()) else {
+                continue;
+            };
+            let mut completions = report
+                .completed_operations
+                .iter()
+                .filter(|completion| {
+                    completion.process_session_id == report.process_session_id
+                        && completion.result == PublicV1OperationResult::Succeeded
+                })
+                .collect::<Vec<_>>();
+            completions.sort_by_key(|completion| std::cmp::Reverse(completion.revision));
+            for completion in completions {
+                let Some(intent) = handle
+                    .public_v1_operation_intent(&completion.operation_id)
+                    .await?
+                else {
+                    continue;
+                };
+                if matches!(
+                    intent.program,
+                    Some(
+                        PublicOperationProgram::Configuration(_)
+                            | PublicOperationProgram::CatchUp { .. }
+                            | PublicOperationProgram::Swap { .. }
+                    )
+                ) {
+                    evidence.insert(
+                        report.replica.instance_id.to_string(),
+                        (intent, completion.clone()),
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(ConfigurationEvidence {
+            operations: evidence,
+            renewals: self.renewals.lock().unwrap().values().cloned().collect(),
+        })
+    }
+
+    pub fn configurations_settled(
+        status: &KubericSetStatus,
+        reports: &[PublicV1AgentReport],
+        evidence: &ConfigurationEvidence,
+    ) -> bool {
+        let Some(topology) = &status.public_v1_topology else {
+            return false;
+        };
+        if !Self::settled(status, reports, topology.member_count as usize) {
+            return false;
+        }
+        let Ok(configuration) = topology.configuration() else {
+            return false;
+        };
+        let Some(authority) = &status.public_v1_authority else {
+            return false;
+        };
+        let Ok(accepted) = authority.authority() else {
+            return false;
+        };
+        topology.sessions.iter().all(|session| {
+            let Some((intent, completion)) = evidence
+                .operations
+                .get(session.identity.instance_id.as_str())
+            else {
+                return false;
+            };
+            if intent.validate().is_err()
+                || intent.process_session_id != session.process_session_id
+                || intent.operation_id != completion.operation_id
+                || intent.revision != completion.revision
+                || intent.input_digest != completion.input_digest
+                || completion.process_session_id != session.process_session_id
+                || completion.history != accepted.history
+                || completion.storage_incarnation != session.storage_incarnation
+            {
+                return false;
+            }
+            let public = match &intent.program {
+                Some(
+                    PublicOperationProgram::Configuration(public)
+                    | PublicOperationProgram::CatchUp {
+                        configuration: public,
+                        ..
+                    },
+                ) => public,
+                Some(PublicOperationProgram::Swap { refreshed, .. }) => refreshed,
+                _ => return false,
+            };
+            let authorized = accepted.completed_operations.contains(
+                &PublicV1AcceptedOperationCompletion::from_completion(completion),
+            ) || evidence.renewals.iter().any(|required| {
+                required.history == accepted.history
+                    && required.fresh_configuration == configuration
+                    && intent.operation_id.to_string()
+                        == format!(
+                            "{}-configuration-{}",
+                            required.operation_id, session.identity.replica_id
+                        )
+                    && required
+                        .replacement
+                        .iter()
+                        .chain(required.surviving_sessions.iter())
+                        .any(|endpoint| {
+                            let mut authorized = endpoint.clone();
+                            authorized.role = session.role;
+                            authorized == *session
+                        })
+            });
+            authorized
+                && public.current == configuration
+                && public.previous.is_none()
+                && public.validate().is_ok()
+                && public.replicas.iter().all(|peer| {
+                    topology.sessions.iter().any(|admitted| {
+                        peer.identity == admitted.identity
+                            && peer.process_session_id == admitted.process_session_id
+                            && peer.storage_incarnation.as_ref()
+                                == Some(&admitted.storage_incarnation)
+                            && peer.role == admitted.role
+                    }) && reports.iter().any(|report| {
+                        report.replica == peer.identity
+                            && report.replication_address.as_ref().is_some_and(|address| {
+                                address.trim_end_matches('/')
+                                    == peer.replication_address.trim_end_matches('/')
+                            })
+                    })
+                })
+        })
+    }
+
+    pub async fn report_uid(&self, uid: &str) -> Result<PublicV1AgentReport> {
+        let set = self.set().await?;
         let pod = self
             .api
             .snapshot(Kind::Pod)
             .into_iter()
-            .find(|pod| {
-                pod["metadata"]["uid"].as_str() == Some(member.identity.instance_id.as_str())
-            })
-            .context("member Pod missing")?;
+            .find(|pod| pod["metadata"]["uid"].as_str() == Some(uid))
+            .with_context(|| {
+                format!(
+                    "member Pod missing: {uid}; current Pods: {:?}",
+                    self.api
+                        .snapshot(Kind::Pod)
+                        .iter()
+                        .map(|pod| (
+                            pod["metadata"]["name"].clone(),
+                            pod["metadata"]["uid"].clone()
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            })?;
         let endpoint = pod["metadata"]["annotations"][CONTROL_ADDRESS_ANNOTATION]
             .as_str()
             .context("control address missing")?;
+        let replica_id = pod["metadata"]["labels"][kuberic_controller::crd::REPLICA_ID_LABEL]
+            .as_str()
+            .context("replica label missing")?
+            .parse()?;
         let report = GrpcAgentApi::new(pod::RPC_DEADLINE)
             .get_status(
                 endpoint,
@@ -342,13 +629,89 @@ impl Harness {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                     resource_uid: set.uid().context("set UID missing")?,
                     replica_id,
-                    expected_instance_id: member.identity.instance_id.to_string(),
+                    expected_instance_id: uid.to_owned(),
                 },
             )
             .await
             .map_err(|error| anyhow!("agent report: {error:?}"))?;
-        kuberic_runtime::control::normalize_public_v1_agent_status_report(report)
-            .map_err(|error| anyhow!("{error}"))
+        let report = kuberic_runtime::control::normalize_public_v1_agent_status_report(report)
+            .map_err(|error| anyhow!("{error}"))?;
+        Ok(report)
+    }
+
+    pub(super) fn settled(
+        status: &KubericSetStatus,
+        reports: &[PublicV1AgentReport],
+        expected: usize,
+    ) -> bool {
+        if status.public_v1_operation.is_some()
+            || status.public_v1_transition.is_some()
+            || status.public_v1_replacement.is_some()
+            || status.public_v1_session_renewal.is_some()
+        {
+            return false;
+        }
+        let Some(topology) = &status.public_v1_topology else {
+            return false;
+        };
+        if topology.pending_switchover.is_some() {
+            return false;
+        }
+        let Ok(configuration) = topology.configuration() else {
+            return false;
+        };
+        let Some(authority) = &status.public_v1_authority else {
+            return false;
+        };
+        let Ok(accepted) = authority.authority() else {
+            return false;
+        };
+        if configuration.members.len() != expected {
+            return false;
+        }
+        for session in &topology.sessions {
+            let Some(report) = reports
+                .iter()
+                .find(|report| report.replica == session.identity)
+            else {
+                return false;
+            };
+            if report.identity != accepted.identity
+                || report.history != accepted.history
+                || report.resource_uid != accepted.history.resource_uid
+                || report.storage_incarnation != session.storage_incarnation
+                || report.process_session_id != session.process_session_id
+                || report.replicator_creation_id != session.replicator_creation_id
+                || report
+                    .replicator_creation_id
+                    .as_str()
+                    .starts_with("pending-")
+                || report.role != session.role
+                || report.read_status != AccessStatus::Granted
+                || (report.write_status == AccessStatus::Granted)
+                    != (session.role == ReplicaRole::Primary)
+                || report.progress.first != report.progress.last
+                || !report.completed_operations.iter().any(|completion| {
+                    completion.process_session_id == session.process_session_id
+                        && completion.storage_incarnation == session.storage_incarnation
+                        && completion.history == accepted.history
+                        && completion.current_configuration_id.as_ref()
+                            == Some(&configuration.configuration_id)
+                        && completion.result == PublicV1OperationResult::Succeeded
+                })
+            {
+                return false;
+            }
+        }
+        !reports.iter().any(|report| {
+            !topology
+                .sessions
+                .iter()
+                .any(|session| session.identity == report.replica)
+                && (report.role != ReplicaRole::None
+                    || report.read_status == AccessStatus::Granted
+                    || report.write_status == AccessStatus::Granted)
+        })
     }
 
     pub async fn write(&mut self, key: &str, value: &str) -> Result<i64> {
@@ -437,6 +800,10 @@ impl Harness {
         }
     }
 
+    pub fn transport(&self) -> super::transport::Network {
+        self.network.clone()
+    }
+
     pub async fn finish(mut self, result: Result<()>) -> Result<()> {
         let result = if result.is_ok() {
             self.check().await
@@ -482,13 +849,26 @@ impl Harness {
             .map(|error| format!("{error:#}"))
             .collect::<Vec<_>>();
         if let Some(task) = self.supervisor_task.take() {
-            match task.await {
-                Ok(Ok(())) => {}
+            let mut task = task;
+            match tokio::time::timeout(Duration::from_secs(20), &mut task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => errors.push(error.to_string()),
                 Ok(Err(error)) => errors.push(error.to_string()),
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => {
+                    task.abort();
+                    let _ = task.await;
+                    errors.push(format!("supervisor teardown timed out: {error}"));
+                }
             }
         }
-        let hosts = std::mem::take(&mut self.supervisor.lock().await.hosts);
+        if let Err(error) = self.network.finish().await {
+            errors.push(error.to_string());
+        }
+        let hosts = {
+            let mut state = self.supervisor.lock().await;
+            state.held_deletions.clear();
+            std::mem::take(&mut state.hosts)
+        };
         for (_, host) in hosts {
             match tokio::time::timeout(Duration::from_secs(15), host.stop()).await {
                 Ok(Ok(())) => {}
@@ -531,6 +911,7 @@ async fn supervise(
     api: &TestApi,
     state: &Mutex<SupervisorState>,
     root: &std::path::Path,
+    network: &Network,
 ) -> Result<()> {
     let mut state = state.lock().await;
     let objects = snapshot(api);
@@ -584,7 +965,8 @@ async fn supervise(
         status.pod_ip = Some("127.0.0.1".into());
         let config = pod::resolve(pod, &pvcs, &secrets, root)?;
         let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let control = format!("http://{}", control_listener.local_addr()?);
+        let backend = format!("http://{}", control_listener.local_addr()?);
+        let control = network.route("controller", &uid, &backend).await?;
         let replication = format!("http://{}", config.replication_address);
         let app_path = config.data_root.join("application");
         let storage = if KvPersistence::is_fresh_empty(&app_path)? {
@@ -603,6 +985,21 @@ async fn supervise(
         ));
         let data_root = config.data_root.clone();
         let (startup_shutdown, receiver) = watch::channel(false);
+        let routed_uid = uid.clone();
+        let routed_network = network.clone();
+        let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
+            uid.clone(),
+            move |destination, endpoint| {
+                let network = routed_network.clone();
+                let uid = routed_uid.clone();
+                Box::pin(async move {
+                    network
+                        .route(&uid, &destination, &endpoint)
+                        .await
+                        .map_err(std::io::Error::other)
+                })
+            },
+        )?;
         let host = ReplicaHost::new(config, service.clone(), storage, resolver);
         pod.annotations_mut()
             .insert(CONTROL_ADDRESS_ANNOTATION.into(), control);
@@ -638,13 +1035,16 @@ async fn supervise(
         ensure!(updated, "Pod infrastructure updates repeatedly conflicted");
         let startup = tokio::spawn(host.start_with_shutdown(control_listener, receiver));
         state.hosts.insert(
-            uid,
+            uid.clone(),
             Hosted {
                 service,
                 startup_shutdown,
                 startup: Some(startup),
                 running: None,
                 data_root,
+                _route: route,
+                network: network.clone(),
+                uid: uid.clone(),
             },
         );
     }

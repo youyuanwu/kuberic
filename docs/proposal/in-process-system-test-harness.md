@@ -64,7 +64,7 @@ Scenario
 
 All components run in the same process. The controller uses its normal
 Kubernetes adapter and normal agent gRPC client. Only Kubernetes resource
-storage and Pod/PVC realization are simulated. Replication endpoint discovery
+storage, Pod/PVC realization, and explicit socket faults are simulated. Replication endpoint discovery
 uses the real Replicator Open result published by each agent.
 
 Do not introduce another `ProductionClusterApi` implementation or extend the
@@ -171,7 +171,9 @@ The replicator owns replication binding. Construct `KvService` with
 substitutes the actual port in its advertised settings, and returns that URI.
 Repeated Open returns the same endpoint. Explicit fixed advertised endpoints
 remain unchanged, including when their host differs from the bind address.
-There is no injected replication listener or harness endpoint map.
+There is no injected replication listener or synthetic advertised endpoint.
+The testing-feature transport hook may redirect a physical dial through an
+owned proxy, while preserving the real Open endpoint in canonical inputs.
 
 The host publishes the successful current-session Open return in
 `PublicV1AgentReport::replication_address`, including over agent gRPC. It is
@@ -186,7 +188,7 @@ Publish the actual endpoints through these paths:
 
 | Endpoint | Discovery |
 |---|---|
-| Control | Set the existing `operator.kuberic.io/control-address` Pod annotation to the allocated address. The production `GrpcAgentApi` still performs real RPCs. |
+| Control | Set the existing `operator.kuberic.io/control-address` Pod annotation to the owned proxy frontend for the allocated host socket. The production `GrpcAgentApi` still performs real RPCs. |
 | Replication | Read the current process's Open result from its exact agent report in both ordinary topology and session-renewal configuration construction. Never infer it from Pod IP or a fixed port. |
 | Application service | Retain the existing `RoleChange::service_address` path. Application Open returns the replicator; promotion returns the client-facing service address. The harness invokes `KvService` directly and does not bind an application HTTP endpoint. |
 
@@ -238,6 +240,28 @@ No application HTTP server or router extraction is required for the initial
 harness. HTTP serialization, executable configuration, images, and deployment
 behavior remain covered outside this integration boundary.
 
+### Explicit Live Transport Faults
+
+The default engine's testing-only routing registration is owned by each exact
+host instance. Both replication and Build dial sites supply the source instance,
+the canonical destination instance, and the actual Open endpoint. Ownership is
+established before gate evaluation and dialing, independently of assertion reads.
+Unregistered engines connect directly. No protected replicator/provider trait
+changes, fabricated reports, or alternative replication protocol are involved.
+
+Opaque TCP proxies own their listeners and forwarding tasks. Isolation gates
+both source and destination traffic, closes and joins affected existing duplex
+streams before acknowledging the cut, and rejects new connections. Controller
+traffic uses the same destination gate. Unchanged healthy gates and restoration
+do not reset unrelated survivor streams. Retired hosts remove their exact routes
+before an ephemeral endpoint can be reused.
+
+The real old primary remains scheduled with its original service, host,
+session, creation, and journals. Its stale application writes cannot return
+successful receipts during survivor operation or after it reconnects. This is
+network separation, not cooperative stop, task suspension, or frozen-process
+resume. Those distinctions matter for the retained KinD pause/resume journey.
+
 ## Reconciliation and Time
 
 Run the production `Reconciler::reconcile` entry point from an explicit driver.
@@ -288,10 +312,12 @@ One harness instance owns its resource store, controller driver, supervisor,
 startup tasks, running replicas, application instances, bound listeners,
 endpoint registrations, and temporary root.
 
-Normal teardown stops new reconciliation, cancels unfinished startup through
-its shutdown channel, shuts down running replicas, awaits completion, releases
-application handles, and only then retires endpoint registrations and removes
-storage. Listeners close as their owners finish. Preserve cleanup errors
+Normal teardown stops new reconciliation and the supervisor, closes and joins
+owned proxies, cancels unfinished startup through its shutdown channel, and
+shuts down running replicas and application consumers. It awaits completion
+before retiring routing registrations and storage. Entered barriers release on
+drop and deletion holds clear during cleanup. Listeners close as their owners
+finish. Preserve cleanup errors
 alongside a scenario failure. Drop guards request shutdown on early exit, but
 asynchronous teardown is the normal completion path.
 
@@ -336,6 +362,12 @@ configuration, without a generic application-plugin framework.
 | Secondary replacement | Pod loss drives controller-owned replacement; the new incarnation is built and admitted, old resources retire, and subsequent writes succeed. |
 | Stopped-primary failover | A cooperatively stopped primary becomes unavailable; survivors converge through the configured delay, preserve acknowledged data, and accept new writes. |
 | Controller recreation | Reconstructing the reconciler over the same resource store and live hosts resumes accepted work without test-side authority repair. |
+| Support-resource repair | Deleting the peer Service and credentials Secret drives real ownership, selector, port and credential reconstruction; application values and quorum writes remain usable. |
+| Replacement followed by restart | A new replica/storage incarnation completes exact predecessor cleanup, then a new process reopens that replacement PVC and is explicitly admitted with coherent configuration and preserved values. |
+| Live-primary isolation and return | Surviving members promote and write while the original live host is isolated; stale writes fail, and the same process/session returns as an authorized secondary. |
+| Quorum loss and recovery | A lone reachable member cannot acknowledge writes or invent writable authority; restored members retain acknowledged data, settle ambiguous outcomes, and resume quorum writes. |
+| Planned switchover | A typed `KubericSet.spec.switchover` request drives accepted handoff and target promotion; old and post-first-catch-up acknowledged values survive, and the old writer rejects writes. |
+| Durable recreation boundaries | Replacement Build and failover primary Role are cut at accepted intent and durable completion before status advancement; matching completion is accepted once and provider LSN/snapshot effects are not duplicated. Switchover is also recreated before and after source handoff. |
 
 The stopped-primary journey leaves its Pod present and admits the two surviving
 members. It verifies preserved data and a new quorum write without requiring a
@@ -364,17 +396,87 @@ For every journey, validate acknowledged application data, exact admitted
 identities, and live access grants. Do not use a status-only assertion as a
 substitute for a successful application write.
 
+Shared readiness additionally requires no pending accepted operation,
+transition, replacement, session renewal, or planned transfer, and equal
+committed/applied progress for every admitted host. Compare the complete current
+admitted/live identity, storage, process-session and replicator-creation tuple,
+plus canonical configuration and peer descriptors from real successful journal
+inputs. Session-renewal configuration authority is observed from its persisted
+renewal requirement, not invented as a generic accepted topology completion.
+Check all live hosts, including returning or excluded predecessors, for their
+authorized role and closed writer/read access where appropriate.
+
+During an acknowledged cut, survivor readiness is a separate assertion that
+does not pretend inaccessible historical reports are simultaneous evidence.
+Rejected application writes supply the stale-writer evidence. A failed or
+timed-out write can have a durable applied suffix; recovery asserts converged
+absent/attempted values, never mandatory absence.
+
+Planned transfer first durably catches up All at the old configuration, then
+prepares peers through accepted Epoch, secondary Role and intermediate
+Configuration retaining the old primary. Atomic source Swap revokes application
+access, advances epoch, installs that intermediate configuration, catches up
+again, and demotes. The optional reported `catch_up_specific_quorum` capability
+comes from the real factory: true selects WriteQuorum with the requested target
+as must-catchup successor; false selects All; missing capability waits. Final
+target-last Role/Configuration/CatchUp precedes topology/routing/request
+completion. Completed stage identities are stable across mutable progress and
+advance only from accepted exact-session/storage/history/configuration evidence.
+
+Before the first transfer command, topology status freezes the request alongside
+its starting configuration and exact admitted sessions. Removing or retargeting
+the spec after durable peer preparation does not abandon the accepted transfer.
+Controller recreation resumes it; final publication records the frozen request
+ID and clears it before a newer request is considered. Unavailable or changed
+frozen participants wait instead of being silently substituted.
+
+Same-primary quorum restoration uses accepted All catch-up for an established
+current-session configuration. Returning primary Build preparation advances
+epoch before IdleSecondary, even when an ambiguous suffix hides the engine's
+old role. The built-in engine repairs a missing committed prefix before proving
+an ambiguous suffix, and permits copy replacement of an ambiguous target only
+when the source boundary covers its committed floor. Existing established,
+nonambiguous nonempty targets remain protected.
+
+A clean returning member with matching accepted configuration evidence for its
+exact storage, history and process session rejoins without snapshot Build.
+Its committed/applied tail must agree and cannot exceed the retained primary's
+committed progress. Peers receive the new epoch/role/configuration before the
+primary performs real All catch-up over retained deltas; only then can topology
+admission advance. A completed Build keeps its original admission path rather
+than switching to delta rejoin after copy has cleaned the tail. Missing evidence,
+fresh storage/session, different history and ambiguous tails do not qualify.
+Retained renewal projection must also respect newer completed Epoch and Role,
+including a conflicting same-epoch role, not just newer Configuration. This keeps
+access conservative between explicit topology stages.
+
+The live-isolation journeys seed a real secondary session renewal before failover.
+One exercises rejected stale writes and the other leaves the old primary's tail
+clean until it has rejoined as the same host/session/service. The clean case
+requires real catch-up without Build and preserves both acknowledged values.
+
 ## Failure Model and Limits
 
 An in-process host restart is a cooperative shutdown and reconstruction, not a
 process crash. All replicas share a scheduler, address space, allocator, and
 failure domain.
 
-In particular, stopped-primary failover does not prove fencing of a
-still-running partitioned primary. Reopening that host creates a new session;
-it is not equivalent to resuming frozen execution. Do not claim crash recovery,
-arbitrary network partition coverage, or old-process resume coverage from this
-harness.
+Stopped-primary failover alone does not establish fencing of a still-running
+partitioned primary; the separate live-isolation journey now covers that bounded
+case without recreating it. Reopening a stopped host creates a new session and
+is not equivalent to resuming frozen execution. Do not claim crash recovery,
+arbitrary network partition coverage, or frozen-process resume coverage.
+
+Fresh-Build fault probes establish transport containment, unchanged empty
+target provider progress and restored socket/control connectivity, not general
+automatic failed-Build recovery. Exploratory terminal Build failures exposed
+stalled controller retry/re-admission paths; those are outside these recovery
+journeys and are not hidden by asserting application recovery in the probes.
+Clean historically admitted primary return is covered by delta rejoin, avoiding
+the inappropriate snapshot Build and its terminal failure rather than weakening
+the established-committed-tail copy guard.
+The deterministic switchover write after first catch-up is not a claim of
+arbitrary concurrent rapid-write stress support.
 
 The following remain outside scope:
 
@@ -406,7 +508,7 @@ rather than adding listener transfer to the factory context or another public
 lifecycle framework. Do not expose a production fake-cluster API or add test-only
 lifecycle capabilities to protected interfaces.
 
-The five journeys run without cluster environment variables in the ordinary
+The twenty-three journey/assertion tests run without cluster environment variables in the ordinary
 nextest tier:
 
 ```bash
@@ -414,7 +516,7 @@ cargo nextest run -p kuberic-level-tests --all-features --profile ordinary \
   -E 'test(in_process::journeys)'
 ```
 
-To run all five concurrently inside one test process:
+For a focused same-process concurrency check:
 
 ```bash
 cargo test -p kuberic-level-tests --lib --all-features \

@@ -459,6 +459,25 @@
                         "minimum": 0.0,
                         "type": "integer"
                       },
+                      "pendingSwitchover": {
+                        "nullable": true,
+                        "properties": {
+                          "requestId": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "targetReplicaId": {
+                            "format": "uint32",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "requestId",
+                          "targetReplicaId"
+                        ],
+                        "type": "object"
+                      },
                       "primaryId": {
                         "format": "int64",
                         "minimum": 1.0,

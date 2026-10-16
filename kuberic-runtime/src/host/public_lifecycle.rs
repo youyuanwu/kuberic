@@ -568,6 +568,7 @@ pub(super) fn enrich_remote_rebuild(
 }
 
 pub(crate) struct PublicV1ReportProjection {
+    pub(crate) catch_up_specific_quorum: Option<bool>,
     pub(crate) process_session_id: ProcessSessionId,
     pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) report_sequence: u64,
@@ -861,7 +862,10 @@ pub(crate) async fn public_v1_report(
         service_location,
         data_loss_recovery,
         completed_operations,
-        extensions: Default::default(),
+        extensions: crate::protocol::public_operations::PublicV1Extensions {
+            catch_up_specific_quorum: projection.catch_up_specific_quorum,
+            ..Default::default()
+        },
     };
     report
         .validate()

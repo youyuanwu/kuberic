@@ -285,6 +285,7 @@ pub fn normalize_public_v1_agent_status_report(
         .map(public_v1_completion_from_proto)
         .collect::<Result<Vec<_>, _>>()?;
     let extensions = PublicV1Extensions {
+        catch_up_specific_quorum: public.catch_up_specific_quorum,
         history_recovery: public
             .history_recovery_extension_version
             .map(extension_slot)
@@ -399,6 +400,7 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
                 .iter()
                 .map(public_v1_completion_to_proto)
                 .collect(),
+            catch_up_specific_quorum: report.extensions.catch_up_specific_quorum,
             history_recovery_extension_version: report
                 .extensions
                 .history_recovery

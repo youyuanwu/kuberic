@@ -842,6 +842,7 @@ impl SqliteStore {
             self.inner.as_ref(),
             identity,
             crate::host::public_lifecycle::PublicV1ReportProjection {
+                catch_up_specific_quorum: None,
                 replicator_creation_id: crate::protocol::types::ReplicatorCreationId::new(format!(
                     "testing-{}",
                     projection.process_session_id
