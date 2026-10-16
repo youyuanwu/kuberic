@@ -1,42 +1,131 @@
-//! Tonic control, peer, and replication services.
+//! Public V1 control and peer services.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use crate::application::OpenMode;
-use crate::control::{normalize_execute_request, proto};
-use crate::protocol::command::{EnsureReplicaBuild, ProtocolCommand};
-use crate::protocol::types::{
-    ProcessSessionId, ReplicaId, ReplicaIdentity, TransitionIntent, TransitionKind,
-    derive_transition_id,
-};
-use futures::{Stream, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock, oneshot, watch};
-use tokio::task::JoinSet;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tokio::sync::{Mutex, watch};
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 use crate::RuntimeError;
+use crate::application::OpenMode;
+use crate::control::{normalize_execute_request, proto, public_v1_agent_status_to_proto};
 use crate::host::Result;
-use crate::host::coordinator::Coordinator;
-use crate::host::hosting::{PodRuntime, RuntimeDataPlane};
+use crate::host::hosting::PodRuntime;
 use crate::host::provisioning::{InitializationAuthority, ObservedStorageIdentity};
-use crate::host::recovery::{PartitionReportOwner, RecoveryOwner};
-use crate::host::report::AgentReporter;
-use crate::host::runtime_adapter::RuntimeEffectExecutor;
 use crate::host::session::ProcessSession;
 use crate::host::sqlite_store::SqliteStore;
-use crate::host::state::{AgentState, ApplicationStorageBinding, CoordinatorStage};
+use crate::host::state::{
+    AgentState, ApplicationStorageBinding, PublicOperationDisposition, PublicOperationStage,
+};
 use crate::host::store::AgentStore;
+use crate::protocol::command::{
+    ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
+};
+use crate::protocol::public_operations::{
+    PublicOperationIntent, PublicOperationProgram, PublicV1LifecycleBinding,
+};
+use crate::protocol::types::{
+    ProcessSessionId, ReplicaId, TransitionIntent, TransitionKind, derive_transition_id,
+};
 
 const AUTHORIZATION_HEADER: &str = "authorization";
 pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicV1ControlServiceRegistration {
+    AgentControl,
+    ReplicaPeer,
+}
+
+impl PublicV1ControlServiceRegistration {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::AgentControl => "AgentControlServer",
+            Self::ReplicaPeer => "ReplicaPeerServer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentControlEndpoint;
+
+impl AgentControlEndpoint {
+    fn bind<S>(self, service: S) -> proto::agent_control_server::AgentControlServer<S>
+    where
+        S: proto::agent_control_server::AgentControl,
+    {
+        proto::agent_control_server::AgentControlServer::new(service)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplicaPeerEndpoint;
+
+impl ReplicaPeerEndpoint {
+    fn bind<S>(self, service: S) -> proto::replica_peer_server::ReplicaPeerServer<S>
+    where
+        S: proto::replica_peer_server::ReplicaPeer,
+    {
+        proto::replica_peer_server::ReplicaPeerServer::new(service)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublicV1ControlServiceManifest {
+    agent_control: AgentControlEndpoint,
+    replica_peer: ReplicaPeerEndpoint,
+}
+
+impl PublicV1ControlServiceManifest {
+    pub(crate) const fn registrations(self) -> [PublicV1ControlServiceRegistration; 2] {
+        [
+            PublicV1ControlServiceRegistration::AgentControl,
+            PublicV1ControlServiceRegistration::ReplicaPeer,
+        ]
+    }
+
+    fn agent_control<S>(self, service: S) -> proto::agent_control_server::AgentControlServer<S>
+    where
+        S: proto::agent_control_server::AgentControl,
+    {
+        self.agent_control.bind(service)
+    }
+
+    fn replica_peer<S>(self, service: S) -> proto::replica_peer_server::ReplicaPeerServer<S>
+    where
+        S: proto::replica_peer_server::ReplicaPeer,
+    {
+        self.replica_peer.bind(service)
+    }
+}
+
+pub(crate) const PUBLIC_V1_CONTROL_SERVICES: PublicV1ControlServiceManifest =
+    PublicV1ControlServiceManifest {
+        agent_control: AgentControlEndpoint,
+        replica_peer: ReplicaPeerEndpoint,
+    };
+
+pub(crate) fn validate_public_v1_control_services(
+    manifest: PublicV1ControlServiceManifest,
+) -> Result<()> {
+    if manifest.registrations()
+        != [
+            PublicV1ControlServiceRegistration::AgentControl,
+            PublicV1ControlServiceRegistration::ReplicaPeer,
+        ]
+    {
+        return Err(crate::host::HostError::CommandRejected(
+            "Public V1 control service registrations changed".into(),
+        ));
+    }
+    Ok(())
+}
+pub(crate) const PUBLIC_V1_AGENT_REPORT_BRANCHES: &[&str] = &["public_v1"];
+pub(crate) const PUBLIC_V1_SERVICE_STARTUP_OWNERS: &[&str] = &["PartitionOperationRuntime"];
 
 pub(crate) struct InitializationService {
     observed: ObservedStorageIdentity,
@@ -47,8 +136,7 @@ pub(crate) struct InitializationService {
     initialized: watch::Sender<bool>,
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
-    #[cfg(feature = "testing")]
-    preview_binding: Option<crate::protocol::public_operations::PreviewLifecycleBinding>,
+    binding: Option<PublicV1LifecycleBinding>,
 }
 
 impl InitializationService {
@@ -75,8 +163,7 @@ impl InitializationService {
             initialized,
             fresh_application_state,
             application_storage_paths: None,
-            #[cfg(feature = "testing")]
-            preview_binding: None,
+            binding: None,
         })
     }
 
@@ -88,12 +175,11 @@ impl InitializationService {
         self
     }
 
-    #[cfg(feature = "testing")]
-    pub(crate) fn with_stateless_preview(
+    pub(crate) fn with_public_v1_binding(
         mut self,
-        binding: Option<crate::protocol::public_operations::PreviewLifecycleBinding>,
+        binding: Option<PublicV1LifecycleBinding>,
     ) -> Self {
-        self.preview_binding = binding;
+        self.binding = binding;
         self
     }
 
@@ -104,14 +190,14 @@ impl InitializationService {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let listener = TcpListener::bind(control_address).await?;
+        let services = PUBLIC_V1_CONTROL_SERVICES;
+        validate_public_v1_control_services(services)?;
         let control = self.clone();
         let peer = self;
         ready.send_replace(true);
         let result = tonic::transport::Server::builder()
-            .add_service(proto::agent_control_server::AgentControlServer::new(
-                control,
-            ))
-            .add_service(proto::replica_peer_server::ReplicaPeerServer::new(peer))
+            .add_service(services.agent_control(control))
+            .add_service(services.replica_peer(peer))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 wait_for_shutdown(&mut shutdown).await;
             })
@@ -126,31 +212,23 @@ impl InitializationService {
     }
 
     fn report(&self) -> proto::AgentStatusReport {
-        if !self.fresh_application_state {
-            return proto::AgentStatusReport {
-                protocol_version: crate::protocol::PROTOCOL_VERSION,
-                resource_uid: self.observed.resource_uid.to_string(),
-                process_session_id: self.session.id().to_string(),
-                report_sequence: self.session.next_report_sequence(),
-                storage_state: proto::AgentStorageState::Unsafe as i32,
-                pod_uid: self.observed.pod_uid.to_string(),
-                pvc_uid: self.observed.pvc_uid.to_string(),
-                storage_error: "application state exists without matching Kuberic agent metadata"
-                    .to_string(),
-                healthy: false,
-                replica_id: self.replica_id.value(),
-                ..Default::default()
-            };
-        }
         proto::AgentStatusReport {
-            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
             resource_uid: self.observed.resource_uid.to_string(),
             process_session_id: self.session.id().to_string(),
-            report_sequence: self.session.next_report_sequence(),
-            storage_state: proto::AgentStorageState::Uninitialized as i32,
+            storage_state: if self.fresh_application_state {
+                proto::AgentStorageState::Uninitialized as i32
+            } else {
+                proto::AgentStorageState::Unsafe as i32
+            },
             pod_uid: self.observed.pod_uid.to_string(),
             pvc_uid: self.observed.pvc_uid.to_string(),
-            healthy: true,
+            storage_error: if self.fresh_application_state {
+                String::new()
+            } else {
+                "application state exists without matching Kuberic agent metadata".to_string()
+            },
+            healthy: self.fresh_application_state,
             replica_id: self.replica_id.value(),
             ..Default::default()
         }
@@ -160,7 +238,9 @@ impl InitializationService {
         &self,
         request: &proto::GetAgentStatusRequest,
     ) -> std::result::Result<(), Status> {
-        if request.protocol_version != crate::protocol::PROTOCOL_VERSION {
+        if request.protocol_version
+            != crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION
+        {
             return Err(Status::failed_precondition("unsupported protocol version"));
         }
         if request.resource_uid != self.observed.resource_uid.as_str()
@@ -174,7 +254,7 @@ impl InitializationService {
         Ok(())
     }
 
-    fn initialize(
+    async fn initialize(
         &self,
         request: proto::ExecuteCommandRequest,
     ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
@@ -195,15 +275,6 @@ impl InitializationService {
                 "fresh storage accepts only InitializeAgentStore",
             ));
         };
-        if envelope.resource_uid != self.observed.resource_uid
-            || envelope.target.replica_id != command.local_replica_id
-            || envelope.target.instance_id != command.expected_instance_id
-            || envelope.target.agent_generation != command.assigned_agent_generation
-        {
-            return Err(Status::failed_precondition(
-                "initialization targets another replica incarnation",
-            ));
-        }
         let transition = TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
@@ -245,48 +316,57 @@ impl InitializationService {
                     paths,
                     initializing: true,
                 });
-        state.scale_up_initialization = command
-            .provisioning
-            .clone()
-            .filter(|provisioning| provisioning.scale_up().is_some());
-        #[cfg(feature = "testing")]
-        let create = match self.preview_binding.clone() {
-            Some(binding) => {
-                SqliteStore::create_preview_bound_authorized(&self.database_path, state, binding)
-            }
-            None => SqliteStore::create_authorized(&self.database_path, state),
-        };
-        #[cfg(not(feature = "testing"))]
-        let create = SqliteStore::create_authorized(&self.database_path, state);
-        match create {
-            Ok(store) => drop(store),
+        let binding = self.binding.as_ref().ok_or_else(|| {
+            Status::failed_precondition("Public V1 lifecycle binding is required")
+        })?;
+        let store = match SqliteStore::create_replacement_authorized(
+            &self.database_path,
+            state,
+            binding.clone(),
+        ) {
+            Ok(store) => store,
             Err(crate::host::HostError::Io(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
             {
-                #[cfg(feature = "testing")]
-                match self.preview_binding.as_ref() {
-                    Some(binding) => {
-                        SqliteStore::open_preview_bound_existing(
-                            &self.database_path,
-                            Some(&identity),
-                            binding,
-                        )
-                        .map_err(status_from_agent)?;
-                    }
-                    None => {
-                        SqliteStore::open_existing(&self.database_path, Some(&identity))
-                            .map_err(status_from_agent)?;
-                    }
-                }
-                #[cfg(not(feature = "testing"))]
-                SqliteStore::open_existing(&self.database_path, Some(&identity))
-                    .map_err(status_from_agent)?;
+                SqliteStore::open_replacement_bound_existing(
+                    &self.database_path,
+                    Some(&identity),
+                    binding,
+                )
+                .map_err(status_from_agent)?
             }
             Err(error) => return Err(status_from_agent(error)),
-        }
+        };
+        let generation =
+            crate::protocol::types::PublicProtocolGeneration::new(binding.identity.generation);
+        let history_initialization_id = crate::protocol::types::derive_history_initialization_id(
+            &identity.resource_uid,
+            generation,
+        );
+        let history = crate::protocol::types::derive_bootstrap_history(
+            &identity.resource_uid,
+            generation,
+            &history_initialization_id,
+        );
+        let storage = crate::protocol::types::ReplicaStorageIncarnationContext {
+            replica: identity.local_identity.clone(),
+            storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+                pod_uid: identity.pod_uid.clone(),
+                pvc_uid: identity.pvc_uid.clone(),
+            },
+            storage_generation: crate::protocol::types::StorageGeneration::new(format!(
+                "storage-{}",
+                identity.initialization_id
+            )),
+        };
+        store
+            .initialize_public_v1_history(&history_initialization_id, &history, &storage)
+            .await
+            .map_err(status_from_agent)?;
+        drop(store);
         self.initialized.send_replace(true);
         Ok(proto::ExecuteCommandResponse {
-            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
             observation: Some(self.report()),
         })
     }
@@ -303,8 +383,7 @@ impl Clone for InitializationService {
             initialized: self.initialized.clone(),
             fresh_application_state: self.fresh_application_state,
             application_storage_paths: self.application_storage_paths.clone(),
-            #[cfg(feature = "testing")]
-            preview_binding: self.preview_binding.clone(),
+            binding: self.binding.clone(),
         }
     }
 }
@@ -325,7 +404,7 @@ impl proto::agent_control_server::AgentControl for InitializationService {
         request: Request<proto::ExecuteCommandRequest>,
     ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
         self.authorize(&request)?;
-        Ok(Response::new(self.initialize(request.into_inner())?))
+        Ok(Response::new(self.initialize(request.into_inner()).await?))
     }
 }
 
@@ -345,7 +424,576 @@ impl proto::replica_peer_server::ReplicaPeer for InitializationService {
         request: Request<proto::ExecuteCommandRequest>,
     ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
         self.authorize(&request)?;
-        Ok(Response::new(self.initialize(request.into_inner())?))
+        Ok(Response::new(self.initialize(request.into_inner()).await?))
+    }
+}
+
+pub(crate) struct AgentService<S> {
+    store: Arc<S>,
+    runtime: Arc<PodRuntime>,
+    session: Arc<ProcessSession>,
+    bearer_token: Arc<str>,
+    ready: Arc<AtomicBool>,
+    report_sequence: Arc<AtomicU64>,
+    registry: Arc<OnceLock<Arc<crate::host::operation::PartitionOperationRegistry>>>,
+    operation_runtime:
+        Arc<Mutex<Option<crate::host::operation_recovery::PartitionOperationRuntime>>>,
+}
+
+pub(crate) async fn align_session_renewal(
+    store: &dyn crate::host::store::AgentStore,
+    mut current: crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    accepted: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+) -> Result<crate::protocol::public_operations::PublicV1SessionRenewalStatus> {
+    use crate::protocol::public_operations::{
+        PublicSessionEpochBarrierStage, PublicSessionRenewalStage,
+    };
+
+    if current.required != accepted.required {
+        return Err(crate::host::HostError::StaleEffectCompletion(
+            "Public V1 session renewal changed required authority".into(),
+        ));
+    }
+    for _ in 0..32 {
+        if &current == accepted {
+            return Ok(current);
+        }
+        let next = match current.stage {
+            PublicSessionRenewalStage::Required => current.close_access(),
+            PublicSessionRenewalStage::AccessClosed => current.freeze_surviving_set(),
+            PublicSessionRenewalStage::SurvivingSetFrozen => current.begin_epoch_barriers(),
+            PublicSessionRenewalStage::EpochBarriersPending => {
+                if let Some(barrier) = current.barriers.iter().find(|barrier| {
+                    barrier.stage == PublicSessionEpochBarrierStage::Pending
+                        && accepted
+                            .barriers
+                            .iter()
+                            .find(|accepted| accepted.survivor == barrier.survivor)
+                            .is_some_and(|accepted| {
+                                accepted.stage != PublicSessionEpochBarrierStage::Pending
+                            })
+                }) {
+                    let accepted_barrier = accepted
+                        .barriers
+                        .iter()
+                        .find(|accepted| accepted.survivor == barrier.survivor)
+                        .expect("selected accepted barrier");
+                    match accepted_barrier.stage {
+                        PublicSessionEpochBarrierStage::Updated => current.record_epoch_updated(
+                            &barrier.survivor,
+                            current.required.renewal_epoch,
+                        ),
+                        PublicSessionEpochBarrierStage::Excluded => current.exclude_survivor(
+                            &barrier.survivor,
+                            accepted_barrier
+                                .retirement_operation_id
+                                .clone()
+                                .expect("validated excluded barrier"),
+                        ),
+                        PublicSessionEpochBarrierStage::Pending => unreachable!(),
+                    }
+                } else {
+                    current.finish_epoch_barriers()
+                }
+            }
+            PublicSessionRenewalStage::ReplacementRolePending => {
+                let replacement = current
+                    .required
+                    .replacement
+                    .as_ref()
+                    .expect("validated replacement stage");
+                current.replay_replacement_role(
+                    &replacement.process_session_id,
+                    current.required.renewal_epoch,
+                    current.required.predecessor.role,
+                )
+            }
+            PublicSessionRenewalStage::ConfigurationPending => {
+                current.install_fresh_configuration(&current.required.fresh_configuration)
+            }
+            PublicSessionRenewalStage::Authorized | PublicSessionRenewalStage::Retired => {
+                return Err(crate::host::HostError::StaleEffectCompletion(
+                    "Public V1 session renewal regressed accepted state".into(),
+                ));
+            }
+        }
+        .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        store
+            .persist_public_v1_session_renewal(Some(&current), &next)
+            .await?;
+        current = next;
+    }
+    Err(crate::host::HostError::CommandRejected(
+        "Public V1 session renewal exceeded bounded local replay".into(),
+    ))
+}
+
+async fn replay_role_at_epoch(
+    replicator: &dyn crate::replicator::Replicator,
+    epoch: crate::protocol::types::Epoch,
+    role: crate::protocol::types::ReplicaRole,
+) -> crate::Result<()> {
+    replicator.update_epoch(epoch).await?;
+    replicator.change_role(epoch, role).await
+}
+
+impl<S> Clone for AgentService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            runtime: self.runtime.clone(),
+            session: self.session.clone(),
+            bearer_token: self.bearer_token.clone(),
+            ready: self.ready.clone(),
+            report_sequence: self.report_sequence.clone(),
+            registry: self.registry.clone(),
+            operation_runtime: self.operation_runtime.clone(),
+        }
+    }
+}
+
+impl<S> AgentService<S>
+where
+    S: AgentStore + 'static,
+{
+    pub(crate) fn new(
+        store: Arc<S>,
+        runtime: Arc<PodRuntime>,
+        bearer_token: impl Into<Arc<str>>,
+    ) -> Result<Self> {
+        let bearer_token = bearer_token.into();
+        if bearer_token.is_empty() {
+            return Err(crate::host::HostError::CommandRejected(
+                "agent bearer token must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            store,
+            runtime,
+            session: Arc::new(ProcessSession::new()),
+            bearer_token,
+            ready: Arc::new(AtomicBool::new(false)),
+            report_sequence: Arc::new(AtomicU64::new(1)),
+            registry: Arc::new(OnceLock::new()),
+            operation_runtime: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    pub(crate) fn local_session(&self) -> &ProcessSessionId {
+        self.session.id()
+    }
+
+    pub(crate) async fn public_operation_runtime(
+        &self,
+        preview: crate::protocol::public_operations::PublicV1Identity,
+    ) -> Result<Arc<crate::host::operation::PartitionOperationRegistry>> {
+        let registry = crate::host::operation::PartitionOperationRegistry::new(
+            self.store.clone(),
+            preview.clone(),
+            self.session.id().clone(),
+        )?;
+        self.registry.set(registry.clone()).map_err(|_| {
+            crate::host::HostError::CommandRejected(
+                "Public V1 operation runtime is already active".into(),
+            )
+        })?;
+        let runtime =
+            crate::host::operation_recovery::PartitionOperationRuntime::start(registry.clone());
+        self.runtime
+            .bind_public_fault_runtime(
+                self.store.clone(),
+                registry.clone(),
+                preview,
+                self.session.id().clone(),
+            )
+            .await?;
+        *self.operation_runtime.lock().await = Some(runtime);
+        Ok(registry)
+    }
+
+    pub(crate) async fn serve_control_only(
+        self,
+        control_address: SocketAddr,
+        ready: watch::Sender<bool>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let state = self.store.load_state().await?;
+        self.runtime
+            .bind_replica_session(state.identity.resource_uid, self.session.id().clone())?;
+        let listener = TcpListener::bind(control_address).await?;
+        let services = PUBLIC_V1_CONTROL_SERVICES;
+        validate_public_v1_control_services(services)?;
+        let control = self.clone();
+        let peer = self.clone();
+        self.ready.store(true, Ordering::Release);
+        ready.send_replace(true);
+        let result = tonic::transport::Server::builder()
+            .add_service(services.agent_control(control))
+            .add_service(services.replica_peer(peer))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                wait_for_shutdown(&mut shutdown).await;
+            })
+            .await
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()));
+        self.ready.store(false, Ordering::Release);
+        ready.send_replace(false);
+        if let Some(runtime) = self.operation_runtime.lock().await.take() {
+            runtime.shutdown().await?;
+        }
+        let (load_metrics, reported_fault) = self.runtime.partition_report().await;
+        self.store
+            .record_partition_reports(load_metrics, reported_fault)
+            .await?;
+        self.runtime.abort();
+        result
+    }
+
+    async fn public_report(&self) -> Result<proto::AgentStatusReport> {
+        let state = self.store.load_state().await?;
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "Public V1 report requires replacement state".into(),
+            )
+        })?;
+        self.runtime
+            .refresh_replacement_projection(self.store.as_ref(), self.session.id(), false)
+            .await?;
+        let projection = self
+            .runtime
+            .replacement_report_projection(
+                self.session.id().clone(),
+                self.report_sequence.fetch_add(1, Ordering::Relaxed),
+            )
+            .await?;
+        let report = crate::host::public_lifecycle::public_v1_report(
+            self.store.as_ref(),
+            &preview.identity,
+            projection,
+        )
+        .await?;
+        Ok(public_v1_agent_status_to_proto(&report))
+    }
+
+    async fn execute_public_intent(&self, intent: PublicOperationIntent) -> Result<()> {
+        let terminal_program = matches!(
+            intent.program.as_ref(),
+            Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
+        );
+        let open_program = matches!(
+            intent.program.as_ref(),
+            Some(PublicOperationProgram::Open { .. })
+        );
+        if !matches!(
+            intent.program,
+            Some(PublicOperationProgram::Progress { .. } | PublicOperationProgram::Build(_))
+        ) {
+            self.runtime.fence_replacement_access().await;
+        }
+        let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
+        if open_program {
+            let state = self.store.load_state().await?;
+            let mode = if state
+                .application_storage
+                .as_ref()
+                .is_some_and(|binding| binding.initializing)
+            {
+                OpenMode::New
+            } else {
+                OpenMode::Existing
+            };
+            callbacks.open_context = Some(self.runtime.public_open_context(mode).await);
+        }
+        let registry = self.registry.get().cloned().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "Public V1 operation runtime is unavailable".into(),
+            )
+        })?;
+        let operation =
+            crate::host::public_lifecycle::launch(&registry, self.store.clone(), intent, callbacks)
+                .await?;
+        let terminal = operation.wait_for_terminal().await?;
+        if terminal.stage != PublicOperationStage::Completed
+            || terminal.disposition != Some(PublicOperationDisposition::Succeeded)
+        {
+            return Err(crate::host::HostError::CommandRejected(format!(
+                "Public V1 operation did not complete successfully: {:?}",
+                terminal.disposition
+            )));
+        }
+        registry
+            .release_session_renewal_fence(&operation.intent())
+            .await?;
+        if open_program {
+            self.runtime.complete_replacement_open().await;
+            if self
+                .store
+                .load_state()
+                .await?
+                .application_storage
+                .as_ref()
+                .is_some_and(|binding| binding.initializing)
+            {
+                self.store.complete_application_initialization().await?;
+            }
+        }
+        if !terminal_program {
+            self.runtime
+                .refresh_replacement_projection(self.store.as_ref(), self.session.id(), true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn execute_history(&self, command: PublicV1HistoryCommand) -> Result<()> {
+        command
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        match command {
+            PublicV1HistoryCommand::Initialize {
+                accepted, storage, ..
+            } => {
+                self.store
+                    .initialize_public_v1_history(
+                        &accepted.history_initialization_id,
+                        &accepted.history,
+                        &storage,
+                    )
+                    .await
+            }
+            PublicV1HistoryCommand::Recover { intent, .. } => {
+                self.execute_public_intent(*intent).await
+            }
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                let state = self.store.load_state().await?;
+                if authority.attempt.target != state.identity.local_identity {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "inbound build authority targets another replica".into(),
+                    ));
+                }
+                self.runtime
+                    .install_replacement_inbound_build_authority(&authority)
+                    .await
+                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                let state = self.store.load_state().await?;
+                if authority.attempt.target != state.identity.local_identity {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "inbound build authority targets another replica".into(),
+                    ));
+                }
+                self.runtime
+                    .revoke_replacement_inbound_build_authority(&authority)
+                    .await
+                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+            }
+            PublicV1HistoryCommand::SessionRenewal { command } => {
+                self.execute_session_renewal(*command).await
+            }
+        }
+    }
+
+    async fn execute_session_renewal(&self, command: PublicV1SessionRenewalCommand) -> Result<()> {
+        command
+            .validate()
+            .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        let endpoint = command.expected_endpoint();
+        if endpoint.process_session_id != *self.session.id()
+            || endpoint.replicator_creation_id
+                != self.runtime.replacement_replicator_creation_id()?
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "session-renewal command targets another process endpoint".into(),
+            ));
+        }
+        let accepted = command.accepted();
+        let current = self
+            .store
+            .load_state()
+            .await?
+            .public_v1_operation_state
+            .and_then(|preview| preview.session_renewal);
+        let current = match current {
+            Some(current)
+                if crate::host::session_renewal_supersedes_local_journal(accepted, &current) =>
+            {
+                self.store
+                    .persist_public_v1_session_renewal(Some(&current), accepted)
+                    .await?;
+                accepted.clone()
+            }
+            Some(current) => align_session_renewal(self.store.as_ref(), current, accepted).await?,
+            None => {
+                self.store
+                    .persist_public_v1_session_renewal(None, accepted)
+                    .await?;
+                accepted.clone()
+            }
+        };
+        debug_assert_eq!(&current, accepted);
+        let callbacks = self.runtime.public_lifecycle_callbacks()?;
+        let next = match &command {
+            PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. } => {
+                self.runtime.fence_replacement_access().await;
+                if let Some(registry) = self.registry.get() {
+                    registry.fence();
+                }
+                accepted.close_access()
+            }
+            PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+                survivor, epoch, ..
+            } => {
+                if survivor.identity == self.store.load_state().await?.identity.local_identity {
+                    replay_role_at_epoch(callbacks.replicator.as_ref(), *epoch, survivor.role)
+                        .await?;
+                }
+                accepted.record_epoch_updated(survivor, *epoch)
+            }
+            PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                process_session_id,
+                epoch,
+                role,
+                ..
+            } => {
+                replay_role_at_epoch(callbacks.replicator.as_ref(), *epoch, *role).await?;
+                accepted.replay_replacement_role(process_session_id, *epoch, *role)
+            }
+            PublicV1SessionRenewalCommand::InstallFreshConfiguration { configuration, .. } => {
+                accepted.install_fresh_configuration(configuration)
+            }
+        }
+        .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
+        self.store
+            .persist_public_v1_session_renewal(Some(accepted), &next)
+            .await
+    }
+
+    async fn execute_inner(
+        &self,
+        request: proto::ExecuteCommandRequest,
+    ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
+        let envelope = normalize_execute_request(request)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if envelope.expected_process_session_id != *self.session.id() {
+            return Err(Status::failed_precondition(
+                "command targets a stale agent process session",
+            ));
+        }
+        let state = self.store.load_state().await.map_err(status_from_agent)?;
+        if envelope.resource_uid != state.identity.resource_uid
+            || envelope.target != state.identity.local_identity
+        {
+            return Err(Status::failed_precondition(
+                "command targets another durable replica identity",
+            ));
+        }
+        match envelope.command {
+            ProtocolCommand::InitializeAgentStore(initialization) => {
+                if initialization.initialization_id != state.identity.initialization_id
+                    || initialization.resource_uid != state.identity.resource_uid
+                    || initialization.local_replica_id != state.identity.local_identity.replica_id
+                    || initialization.expected_instance_id
+                        != state.identity.local_identity.instance_id
+                    || initialization.expected_pod_uid != state.identity.pod_uid
+                    || initialization.expected_pvc_uid != state.identity.pvc_uid
+                    || initialization.assigned_agent_generation
+                        != state.identity.local_identity.agent_generation
+                    || initialization.effective_policy != state.identity.effective_policy
+                {
+                    return Err(Status::already_exists(
+                        "agent store is initialized with different authority",
+                    ));
+                }
+            }
+            ProtocolCommand::PublicV1History(command) => {
+                self.execute_history(*command)
+                    .await
+                    .map_err(status_from_agent)?;
+            }
+            ProtocolCommand::PublicV1Operation(command) => {
+                command
+                    .validate()
+                    .map_err(|message| Status::invalid_argument(message.to_string()))?;
+                if command.target != state.identity.local_identity {
+                    return Err(Status::failed_precondition(
+                        "Public V1 operation targets another replica",
+                    ));
+                }
+                self.execute_public_intent(command.intent)
+                    .await
+                    .map_err(status_from_agent)?;
+            }
+        }
+        Ok(proto::ExecuteCommandResponse {
+            protocol_version: crate::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION,
+            observation: Some(self.public_report().await.map_err(status_from_agent)?),
+        })
+    }
+
+    fn authorize<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
+        authorize_request(request, &self.bearer_token)
+    }
+
+    fn require_ready(&self) -> std::result::Result<(), Status> {
+        if self.ready.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Status::unavailable("agent runtime is not ready"))
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl<S> proto::agent_control_server::AgentControl for AgentService<S>
+where
+    S: AgentStore + 'static,
+{
+    async fn get_status(
+        &self,
+        request: Request<proto::GetAgentStatusRequest>,
+    ) -> std::result::Result<Response<proto::AgentStatusReport>, Status> {
+        self.authorize(&request)?;
+        Ok(Response::new(
+            self.public_report().await.map_err(status_from_agent)?,
+        ))
+    }
+
+    async fn execute(
+        &self,
+        request: Request<proto::ExecuteCommandRequest>,
+    ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
+        self.authorize(&request)?;
+        self.require_ready()?;
+        Ok(Response::new(
+            self.execute_inner(request.into_inner()).await?,
+        ))
+    }
+}
+
+#[tonic::async_trait]
+impl<S> proto::replica_peer_server::ReplicaPeer for AgentService<S>
+where
+    S: AgentStore + 'static,
+{
+    async fn get_status(
+        &self,
+        request: Request<proto::GetAgentStatusRequest>,
+    ) -> std::result::Result<Response<proto::AgentStatusReport>, Status> {
+        self.authorize(&request)?;
+        Ok(Response::new(
+            self.public_report().await.map_err(status_from_agent)?,
+        ))
+    }
+
+    async fn execute(
+        &self,
+        request: Request<proto::ExecuteCommandRequest>,
+    ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
+        self.authorize(&request)?;
+        self.require_ready()?;
+        Ok(Response::new(
+            self.execute_inner(request.into_inner()).await?,
+        ))
     }
 }
 
@@ -364,1153 +1012,12 @@ fn authorize_request<T>(
     Ok(())
 }
 
-pub(crate) struct SessionRegistry {
-    local_session: ProcessSessionId,
-    peers: Arc<RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>>,
-    excluded: RwLock<std::collections::BTreeSet<ReplicaIdentity>>,
-}
-
-pub(crate) struct SessionLease {
-    _peers: OwnedRwLockReadGuard<BTreeMap<ReplicaIdentity, ProcessSessionId>>,
-}
-
-impl SessionRegistry {
-    pub(crate) fn new(local_session: ProcessSessionId) -> Self {
-        Self {
-            local_session,
-            peers: Arc::new(RwLock::new(BTreeMap::new())),
-            excluded: RwLock::new(std::collections::BTreeSet::new()),
-        }
-    }
-
-    pub(crate) fn local_session(&self) -> &ProcessSessionId {
-        &self.local_session
-    }
-
-    pub(crate) async fn register_peer(&self, identity: ReplicaIdentity, session: ProcessSessionId) {
-        let excluded = self.excluded.read().await;
-        if excluded.contains(&identity) {
-            return;
-        }
-        self.peers.write().await.insert(identity, session);
-    }
-
-    pub(crate) async fn retire_peer(&self, identity: &ReplicaIdentity) {
-        let mut excluded = self.excluded.write().await;
-        excluded.insert(identity.clone());
-        self.peers.write().await.remove(identity);
-    }
-
-    pub(crate) async fn retain_members(
-        &self,
-        authority: Option<&crate::authority::AdmittedAuthority>,
-    ) {
-        self.peers
-            .write()
-            .await
-            .retain(|identity, _| authority.is_some_and(|a| a.contains_member(identity)));
-    }
-
-    pub(crate) async fn validate_peer(
-        &self,
-        sender: &ReplicaIdentity,
-        sender_session: &str,
-        receiver_session: &str,
-    ) -> std::result::Result<SessionLease, Status> {
-        if receiver_session != self.local_session.as_str() {
-            return Err(Status::failed_precondition(
-                "replication targets a retired receiver session",
-            ));
-        }
-        let peers = self.peers.clone().read_owned().await;
-        let expected = peers
-            .get(sender)
-            .ok_or_else(|| Status::failed_precondition("sender session has not been admitted"))?;
-        if expected.as_str() != sender_session {
-            return Err(Status::failed_precondition(
-                "replication originates from a retired sender session",
-            ));
-        }
-        Ok(SessionLease { _peers: peers })
-    }
-}
-
-pub(crate) struct AgentService<S, E> {
-    store: Arc<S>,
-    runtime: Arc<PodRuntime>,
-    data_plane: RuntimeDataPlane,
-    coordinator: Arc<Coordinator<S, E>>,
-    reporter: Arc<AgentReporter<S>>,
-    sessions: Arc<SessionRegistry>,
-    bearer_token: Arc<str>,
-    ready_state: Arc<AtomicBool>,
-    command_tasks: Arc<CommandTaskOwner>,
-    #[cfg(feature = "testing")]
-    public_operation_preview:
-        Arc<Mutex<Option<crate::host::operation_recovery::PartitionOperationRuntime>>>,
-}
-
-struct CommandTaskOwner {
-    closed: AtomicBool,
-    tasks: Mutex<JoinSet<()>>,
-}
-
-impl CommandTaskOwner {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            closed: AtomicBool::new(false),
-            tasks: Mutex::new(JoinSet::new()),
-        })
-    }
-
-    async fn run<T, F>(&self, task: F) -> Result<T>
-    where
-        T: Send + 'static,
-        F: Future<Output = Result<T>> + Send + 'static,
-    {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(crate::host::HostError::Runtime(
-                RuntimeError::OperationCancelled,
-            ));
-        }
-        let (result, completed) = oneshot::channel();
-        let mut tasks = self.tasks.lock().await;
-        if self.closed.load(Ordering::Acquire) {
-            return Err(crate::host::HostError::Runtime(
-                RuntimeError::OperationCancelled,
-            ));
-        }
-        while tasks.try_join_next().is_some() {}
-        tasks.spawn(async move {
-            let _ = result.send(task.await);
-        });
-        drop(tasks);
-        completed
-            .await
-            .unwrap_or(Err(crate::host::HostError::Runtime(
-                RuntimeError::OperationCancelled,
-            )))
-    }
-
-    async fn shutdown(&self) {
-        self.closed.store(true, Ordering::Release);
-        let mut tasks = self.tasks.lock().await;
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-    }
-}
-
-impl<S, E> Clone for AgentService<S, E> {
-    fn clone(&self) -> Self {
-        Self {
-            store: self.store.clone(),
-            runtime: self.runtime.clone(),
-            data_plane: self.data_plane.clone(),
-            coordinator: self.coordinator.clone(),
-            reporter: self.reporter.clone(),
-            sessions: self.sessions.clone(),
-            bearer_token: self.bearer_token.clone(),
-            ready_state: self.ready_state.clone(),
-            command_tasks: self.command_tasks.clone(),
-            #[cfg(feature = "testing")]
-            public_operation_preview: self.public_operation_preview.clone(),
-        }
-    }
-}
-
-impl<S, E> AgentService<S, E>
-where
-    S: AgentStore + 'static,
-    E: RuntimeEffectExecutor + 'static,
-{
-    pub(crate) fn new(
-        store: Arc<S>,
-        runtime: Arc<PodRuntime>,
-        executor: Arc<E>,
-        bearer_token: impl Into<Arc<str>>,
-    ) -> Result<Self> {
-        let bearer_token = bearer_token.into();
-        if bearer_token.is_empty() {
-            return Err(crate::host::HostError::CommandRejected(
-                "agent bearer token must not be empty".into(),
-            ));
-        }
-        let reporter = Arc::new(AgentReporter::new(store.clone()));
-        let sessions = Arc::new(SessionRegistry::new(reporter.session().id().clone()));
-        Ok(Self {
-            coordinator: Arc::new(Coordinator::new(store.clone(), executor)),
-            store,
-            data_plane: runtime.data_plane(),
-            runtime,
-            reporter,
-            sessions,
-            bearer_token,
-            ready_state: Arc::new(AtomicBool::new(false)),
-            command_tasks: CommandTaskOwner::new(),
-            #[cfg(feature = "testing")]
-            public_operation_preview: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    pub(crate) fn sessions(&self) -> &Arc<SessionRegistry> {
-        &self.sessions
-    }
-
-    #[cfg(feature = "testing")]
-    #[allow(dead_code)]
-    pub(crate) async fn public_operation_preview_runtime(
-        &self,
-        preview: crate::protocol::public_operations::PublicOperationPreviewIdentity,
-    ) -> Result<Arc<crate::host::operation::PartitionOperationRegistry>> {
-        let mut owner = self.public_operation_preview.lock().await;
-        if owner.is_some() {
-            return Err(crate::host::HostError::CommandRejected(
-                "public-operation preview runtime is already active".into(),
-            ));
-        }
-        let runtime = crate::host::testing::PublicOperationPreviewRuntime::start(
-            self.store.clone(),
-            preview.clone(),
-            self.sessions.local_session().clone(),
-        )?;
-        let registry = runtime.registry();
-        self.runtime
-            .bind_public_fault_preview(
-                self.store.clone(),
-                registry.clone(),
-                preview,
-                self.sessions.local_session().clone(),
-            )
-            .await?;
-        *owner = Some(runtime.into_owner());
-        Ok(registry)
-    }
-
-    pub(crate) async fn serve(
-        self,
-        control_address: SocketAddr,
-        replication_address: SocketAddr,
-        ready: watch::Sender<bool>,
-        shutdown: watch::Receiver<bool>,
-    ) -> Result<()> {
-        let control_listener = TcpListener::bind(control_address).await?;
-        let replication_listener = TcpListener::bind(replication_address).await?;
-        self.serve_with_listeners(control_listener, replication_listener, ready, shutdown)
-            .await
-    }
-
-    #[cfg(feature = "testing")]
-    pub(crate) async fn serve_control_only(
-        self,
-        control_address: SocketAddr,
-        ready: watch::Sender<bool>,
-        shutdown: watch::Receiver<bool>,
-    ) -> Result<()> {
-        let control_listener = TcpListener::bind(control_address).await?;
-        self.serve_with_optional_replication_listener(control_listener, None, ready, shutdown)
-            .await
-    }
-
-    pub(crate) async fn serve_with_listeners(
-        self,
-        control_listener: TcpListener,
-        replication_listener: TcpListener,
-        ready: watch::Sender<bool>,
-        shutdown: watch::Receiver<bool>,
-    ) -> Result<()> {
-        self.serve_with_optional_replication_listener(
-            control_listener,
-            Some(replication_listener),
-            ready,
-            shutdown,
-        )
-        .await
-    }
-
-    async fn serve_with_optional_replication_listener(
-        self,
-        control_listener: TcpListener,
-        replication_listener: Option<TcpListener>,
-        ready: watch::Sender<bool>,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> Result<()> {
-        let preview_quarantine = self
-            .store
-            .load_state()
-            .await?
-            .public_operation_preview
-            .is_some();
-        let control_service = self.clone();
-        let peer_service = self.clone();
-        let replication_service = self.clone();
-        let mut control_shutdown = shutdown.clone();
-        let mut replication_shutdown = shutdown.clone();
-        let mut control = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(proto::agent_control_server::AgentControlServer::new(
-                    control_service,
-                ))
-                .add_service(proto::replica_peer_server::ReplicaPeerServer::new(
-                    peer_service,
-                ))
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(control_listener),
-                    async move {
-                        wait_for_shutdown(&mut control_shutdown).await;
-                    },
-                )
-                .await
-        });
-        let mut replication = tokio::spawn(async move {
-            match replication_listener {
-                Some(replication_listener) => {
-                    tonic::transport::Server::builder()
-                        .add_service(proto::replication_data_server::ReplicationDataServer::new(
-                            replication_service,
-                        ))
-                        .serve_with_incoming_shutdown(
-                            TcpListenerStream::new(replication_listener),
-                            async move {
-                                wait_for_shutdown(&mut replication_shutdown).await;
-                            },
-                        )
-                        .await
-                }
-                None => {
-                    wait_for_shutdown(&mut replication_shutdown).await;
-                    Ok(())
-                }
-            }
-        });
-
-        let startup_result = {
-            let startup = self.reconstruct_runtime();
-            tokio::pin!(startup);
-            tokio::select! {
-                biased;
-                result = &mut startup => result,
-                _ = wait_for_shutdown(&mut shutdown) => {
-                    Err(crate::host::HostError::Runtime(
-                        crate::RuntimeError::OperationCancelled,
-                    ))
-                }
-            }
-        };
-        if let Err(error) = startup_result {
-            control.abort();
-            replication.abort();
-            let _ = tokio::join!(&mut control, &mut replication);
-            self.runtime.shutdown_recovery_tasks().await;
-            if !preview_quarantine {
-                let _ = self.runtime.shutdown_configuration_work().await;
-            }
-            self.runtime.quiesce_partition_reports().await;
-            let persisted = if preview_quarantine {
-                Ok(())
-            } else {
-                self.persist_partition_fault().await
-            };
-            self.runtime.abort();
-            if let Err(persisted) = persisted {
-                return Err(crate::host::HostError::CommandRejected(format!(
-                    "{persisted}; startup: {error}"
-                )));
-            }
-            return Err(error);
-        }
-
-        let (recovery_stop, recovery_shutdown) = watch::channel(false);
-        let mut recovery_owner_task = if preview_quarantine {
-            None
-        } else {
-            let recovery_owner = RecoveryOwner::with_admission_lock(
-                self.runtime.recovery_owner_runtime(),
-                self.store.clone(),
-                self.coordinator.recovery_admission_lock(),
-            );
-            Some(tokio::spawn(async move {
-                recovery_owner.run(recovery_shutdown).await
-            }))
-        };
-        let (partition_stop, partition_shutdown) = watch::channel(false);
-        let mut partition_owner_task = if preview_quarantine {
-            None
-        } else {
-            let partition_owner = PartitionReportOwner::new(
-                self.runtime.recovery_owner_runtime(),
-                self.store.clone(),
-            );
-            Some(tokio::spawn(async move {
-                partition_owner.run(partition_shutdown).await
-            }))
-        };
-
-        self.ready_state.store(true, Ordering::Release);
-        ready.send_replace(true);
-        let configuration_recovery_task = if preview_quarantine {
-            None
-        } else {
-            let recovery_coordinator = self.coordinator.clone();
-            Some(tokio::spawn(async move {
-                if let Err(error) = recovery_coordinator.resume_configuration().await {
-                    tracing::warn!(%error, "background configuration recovery stopped");
-                }
-            }))
-        };
-        let result = tokio::select! {
-            result = &mut control => {
-                replication.abort();
-                let _ = (&mut replication).await;
-                flatten_server_result(result)
-            }
-            result = &mut replication => {
-                control.abort();
-                let _ = (&mut control).await;
-                flatten_server_result(result)
-            }
-            _ = wait_for_shutdown(&mut shutdown) => {
-                self.ready_state.store(false, Ordering::Release);
-                ready.send_replace(false);
-                // A retained HTTP/2 stream must not delay the durable shutdown
-                // acknowledgement. Interrupted command intents are replayable.
-                control.abort();
-                replication.abort();
-                let _ = tokio::join!(&mut control, &mut replication);
-                Ok(())
-            }
-        };
-        self.ready_state.store(false, Ordering::Release);
-        ready.send_replace(false);
-        if let Some(configuration_recovery_task) = configuration_recovery_task {
-            configuration_recovery_task.abort();
-            let _ = configuration_recovery_task.await;
-        }
-        #[cfg(feature = "testing")]
-        let public_operation_preview_result =
-            if let Some(owner) = self.public_operation_preview.lock().await.take() {
-                owner.shutdown().await
-            } else {
-                Ok(())
-            };
-        self.command_tasks.shutdown().await;
-        recovery_stop.send_replace(true);
-        partition_stop.send_replace(true);
-        self.runtime.shutdown_recovery_tasks().await;
-        if let Some(recovery_owner_task) = &mut recovery_owner_task
-            && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut *recovery_owner_task)
-                .await
-                .is_err()
-        {
-            recovery_owner_task.abort();
-            let _ = recovery_owner_task.await;
-        }
-        if let Some(partition_owner_task) = &mut partition_owner_task
-            && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut *partition_owner_task)
-                .await
-                .is_err()
-        {
-            partition_owner_task.abort();
-            let _ = partition_owner_task.await;
-        }
-        if !preview_quarantine {
-            self.runtime.shutdown_configuration_work().await?;
-        }
-        self.runtime.quiesce_partition_reports().await;
-        let persisted = if preview_quarantine {
-            Ok(())
-        } else {
-            self.persist_partition_fault().await
-        };
-        self.runtime.abort();
-        #[cfg(feature = "testing")]
-        public_operation_preview_result?;
-        persisted?;
-        result
-    }
-
-    async fn persist_partition_fault(&self) -> Result<()> {
-        tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-            let partition = self.runtime.partition_report().await;
-            self.store
-                .record_partition_reports(partition.load_metrics, partition.reported_fault)
-                .await?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| {
-            crate::host::HostError::CommandRejected("partition fault persistence timed out".into())
-        })?
-    }
-
-    pub(crate) async fn reconstruct_runtime(&self) -> Result<()> {
-        let state = self.store.load_state().await?;
-        let preview_quarantine = state.public_operation_preview.is_some();
-        self.runtime.bind_replica_session(
-            state.identity.resource_uid.clone(),
-            self.sessions.local_session().clone(),
-        )?;
-        self.runtime
-            .stage_authority_recovery(if preview_quarantine {
-                None
-            } else {
-                state
-                    .pending_effect
-                    .as_ref()
-                    .map(|pending| pending.effect.clone())
-            });
-        let transition = if preview_quarantine {
-            None
-        } else {
-            startup_transition(&state)
-        };
-        let removal_pending = !preview_quarantine
-            && (state.pending_effect.as_ref().is_some_and(|p| {
-                matches!(
-                    p.effect.action,
-                    crate::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                        | crate::effects::RuntimeEffectAction::RetireReplica(_)
-                )
-            }) || state.reconfiguration.as_ref().is_some_and(|r| {
-                r.command.transition_kind
-                    == crate::protocol::types::TransitionKind::SecondaryScaleDown
-            }));
-        let planned_switchover_pending = !preview_quarantine
-            && state.reconfiguration.as_ref().is_some_and(|record| {
-                record.command.transition_kind
-                    == crate::protocol::types::TransitionKind::PlannedSwitchover
-            });
-        let open_mode = if state
-            .application_storage
-            .as_ref()
-            .is_some_and(|b| b.initializing)
-        {
-            OpenMode::New
-        } else {
-            OpenMode::Existing
-        };
-        if preview_quarantine {
-            self.runtime.reconstruct_quarantined(open_mode).await?;
-        } else {
-            self.runtime
-                .reconstruct(
-                    open_mode,
-                    state.role,
-                    if removal_pending {
-                        crate::protocol::types::AccessStatus::ReconfigurationPending
-                    } else {
-                        state.read_status
-                    },
-                    startup_write_status(
-                        state.write_status,
-                        state
-                            .pending_effect
-                            .as_ref()
-                            .map(|pending| &pending.effect.action),
-                        removal_pending || planned_switchover_pending,
-                    ),
-                    transition,
-                )
-                .await?;
-        }
-        // Consume creation permission before readiness permits any authority/access commands.
-        if !preview_quarantine
-            && state
-                .application_storage
-                .as_ref()
-                .is_some_and(|b| b.initializing)
-        {
-            self.store.complete_application_initialization().await?;
-        }
-        if preview_quarantine {
-            return Ok(());
-        }
-        if let Some(committed) = state.accepted_secondary_removal
-            && self
-                .runtime
-                .snapshot()
-                .await
-                .authority
-                .as_ref()
-                .is_some_and(|a| {
-                    a.previous_configuration.is_none()
-                        && a.secondary_removal.as_ref() == Some(&committed.evidence)
-                })
-        {
-            let operation = committed.evidence.preparation.intent.command_operation_id(
-                crate::protocol::types::SecondaryRemovalStage::AcceptCommit,
-                &state.identity.local_identity,
-            );
-            let historical = state.removal_effects.get(&operation).and_then(|retained| {
-                match &retained.effect.action {
-                    crate::effects::RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(
-                        command,
-                    ) if command.committed == committed => Some(*command.clone()),
-                    _ => None,
-                }
-            });
-            self.runtime
-                .restore_accepted_removal(committed, historical)
-                .await?;
-        }
-        if let Some(pending) = state.pending_effect.as_ref()
-            && matches!(
-                pending.effect.action,
-                crate::effects::RuntimeEffectAction::Open(_)
-            )
-        {
-            let result = pending.applied_result.as_deref().cloned().unwrap_or(
-                crate::effects::RuntimeEffectResult {
-                    operation_id: pending.effect.operation_id.clone(),
-                    sequence: pending.effect.sequence,
-                    outcome: crate::effects::RuntimeEffectOutcome::Opened,
-                },
-            );
-            self.store
-                .mark_effect_applied(&pending.effect, &result)
-                .await?;
-            self.store.complete_effect(&result).await?;
-        }
-        let pending_acceptance = state.pending_effect.as_ref().is_some_and(|pending| {
-            matches!(
-                pending.effect.action,
-                crate::effects::RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
-            )
-        });
-        let pending_catchup = state.pending_effect.as_ref().is_some_and(|pending| {
-            matches!(
-                pending.effect.action,
-                crate::effects::RuntimeEffectAction::WaitForCatchup
-            )
-        });
-        let pending_abandoned_build = state.pending_effect.as_ref().is_some_and(|pending| {
-            matches!(
-                &pending.effect.action,
-                crate::effects::RuntimeEffectAction::BuildReplica {
-                    build_id,
-                    ..
-                } if state.abandoned_builds.contains(build_id)
-            )
-        });
-        if !pending_catchup
-            && !pending_abandoned_build
-            && let Err(error) = self.coordinator.resume_pending().await
-            && !(pending_acceptance
-                && matches!(
-                    error,
-                    crate::host::HostError::Runtime(crate::RuntimeError::ReconfigurationPending)
-                ))
-        {
-            return Err(error);
-        }
-        self.runtime.finish_authority_recovery();
-        let build_recovery = self.store.load_state().await?;
-        if let Some(retained) = build_recovery.retained_result.as_ref()
-            && let crate::effects::RuntimeEffectAction::AdmitBuildAuthority(authority) =
-                &retained.effect.action
-            && !build_recovery.retired_builds.contains(&authority.build_id)
-        {
-            self.runtime.apply_effect(retained.effect.clone()).await?;
-        }
-        for command in build_recovery.build_commands.values().cloned() {
-            if !build_recovery
-                .retired_builds
-                .contains(&command.operation_id)
-            {
-                if build_recovery
-                    .abandoned_builds
-                    .contains(&command.operation_id)
-                {
-                    self.coordinator
-                        .ensure_build(EnsureReplicaBuild {
-                            retire: true,
-                            ..command
-                        })
-                        .await?;
-                    continue;
-                }
-                if command.authority.is_none() {
-                    continue;
-                }
-                self.coordinator.ensure_build(command).await?;
-            }
-        }
-        Ok(())
-    }
-
-    fn require_ready(&self) -> std::result::Result<(), Status> {
-        if self.ready_state.load(Ordering::Acquire) {
-            Ok(())
-        } else {
-            Err(Status::unavailable("agent runtime is not ready"))
-        }
-    }
-
-    fn authorize<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
-        let expected = format!("Bearer {}", self.bearer_token);
-        let observed = request
-            .metadata()
-            .get(AUTHORIZATION_HEADER)
-            .and_then(|value| value.to_str().ok());
-        if observed != Some(expected.as_str()) {
-            return Err(Status::unauthenticated("invalid agent credentials"));
-        }
-        Ok(())
-    }
-
-    async fn get_status_inner(
-        &self,
-        request: proto::GetAgentStatusRequest,
-    ) -> std::result::Result<proto::AgentStatusReport, Status> {
-        if request.protocol_version != crate::protocol::PROTOCOL_VERSION {
-            return Err(Status::failed_precondition("unsupported protocol version"));
-        }
-        let state = self.store.load_state().await.map_err(status_from_agent)?;
-        if request.resource_uid != state.identity.resource_uid.as_str()
-            || request.replica_id != state.identity.local_identity.replica_id.value()
-            || request.expected_instance_id != state.identity.local_identity.instance_id.as_str()
-        {
-            return Err(Status::failed_precondition(
-                "status request targets another replica incarnation",
-            ));
-        }
-        let report_runtime = self.runtime.report_runtime();
-        self.reporter
-            .report(&report_runtime)
-            .await
-            .map_err(|error| match error {
-                crate::host::HostError::DurableEffectConflict(message)
-                | crate::host::HostError::StaleEffectCompletion(message) => {
-                    Status::unavailable(message)
-                }
-                other => status_from_agent(other),
-            })
-    }
-
-    async fn execute_inner(
-        &self,
-        request: proto::ExecuteCommandRequest,
-    ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
-        let command = normalize_execute_request(request)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        if command.expected_process_session_id != *self.reporter.session().id() {
-            return Err(Status::failed_precondition(
-                "command targets a stale agent process session",
-            ));
-        }
-        let state = self.store.load_state().await.map_err(status_from_agent)?;
-        if command.resource_uid != state.identity.resource_uid
-            || command.target != state.identity.local_identity
-        {
-            return Err(Status::failed_precondition(
-                "command targets another durable replica identity",
-            ));
-        }
-        match command.command {
-            ProtocolCommand::AcceptSecondaryRemovalCommit(command) => {
-                Box::pin(self.coordinator.accept_secondary_removal_commit(*command))
-                    .await
-                    .map_err(status_from_agent)?;
-            }
-            ProtocolCommand::PrepareSecondaryRemoval(command) => {
-                self.coordinator
-                    .ensure_secondary_removal_prepared(
-                        *command,
-                        self.reporter.session().id().clone(),
-                        self.reporter.session().next_report_sequence(),
-                    )
-                    .await
-                    .map_err(status_from_agent)?;
-            }
-            ProtocolCommand::RetireReplica(command) => {
-                self.coordinator
-                    .ensure_replica_retired(
-                        *command,
-                        self.reporter.session().id().clone(),
-                        self.reporter.session().next_report_sequence(),
-                    )
-                    .await
-                    .map_err(status_from_agent)?;
-            }
-            ProtocolCommand::InitializeAgentStore(initialization) => {
-                if initialization.initialization_id != state.identity.initialization_id
-                    || initialization.resource_uid != state.identity.resource_uid
-                    || initialization.local_replica_id != state.identity.local_identity.replica_id
-                    || initialization.expected_instance_id
-                        != state.identity.local_identity.instance_id
-                    || initialization.expected_pod_uid != state.identity.pod_uid
-                    || initialization.expected_pvc_uid != state.identity.pvc_uid
-                    || initialization.assigned_agent_generation
-                        != state.identity.local_identity.agent_generation
-                    || initialization.effective_policy != state.identity.effective_policy
-                    || initialization
-                        .provisioning
-                        .as_ref()
-                        .filter(|provisioning| provisioning.scale_up().is_some())
-                        != state.scale_up_initialization.as_ref()
-                {
-                    return Err(Status::already_exists(
-                        "agent store is initialized with different authority",
-                    ));
-                }
-            }
-            ProtocolCommand::EnsureConfiguration(command) => {
-                let coordinator = self.coordinator.clone();
-                self.command_tasks
-                    .run(async move { coordinator.ensure_configuration(*command).await })
-                    .await
-                    .map_err(status_from_agent)?;
-            }
-            ProtocolCommand::PrepareSwitchover(command) => {
-                self.coordinator
-                    .ensure_switchover_prepared(*command)
-                    .await
-                    .map_err(status_from_agent)?;
-            }
-            ProtocolCommand::EnsureReplicaBuild(command) => {
-                if let (Some(authority), Some(source_session_id)) =
-                    (&command.authority, &command.source_session_id)
-                {
-                    self.sessions
-                        .register_peer(authority.source.clone(), source_session_id.clone())
-                        .await;
-                    self.runtime
-                        .register_peer_session(authority.source.clone(), source_session_id.clone())
-                        .await
-                        .map_err(status_from_runtime)?;
-                }
-                let coordinator = self.coordinator.clone();
-                self.command_tasks
-                    .run(async move { coordinator.ensure_build(*command).await })
-                    .await
-                    .map_err(status_from_agent)?;
-            }
-            #[cfg(feature = "testing")]
-            ProtocolCommand::RestartReplicaProcess(_)
-            | ProtocolCommand::DropReplicaIncarnation(_)
-            | ProtocolCommand::PublicV1History(_)
-            | ProtocolCommand::PublicV1Operation(_) => {
-                return Err(Status::failed_precondition(
-                    "preview commands require a repository-only dispatch path",
-                ));
-            }
-        }
-        let report_runtime = self.runtime.report_runtime();
-        let observation = self
-            .reporter
-            .report(&report_runtime)
-            .await
-            .map_err(status_from_agent)?;
-        crate::control::validate_agent_status_report(&observation)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        Ok(proto::ExecuteCommandResponse {
-            protocol_version: crate::protocol::PROTOCOL_VERSION,
-            observation: Some(observation),
-        })
-    }
-}
-
-fn startup_write_status(
-    persisted: crate::protocol::types::AccessStatus,
-    pending: Option<&crate::effects::RuntimeEffectAction>,
-    lifecycle_pending: bool,
-) -> crate::protocol::types::AccessStatus {
-    if lifecycle_pending
-        || pending.is_some_and(|action| {
-            matches!(
-                action,
-                crate::effects::RuntimeEffectAction::PrepareSwitchover { .. }
-                    | crate::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
-                    | crate::effects::RuntimeEffectAction::RetireReplica(_)
-            )
-        })
-    {
-        crate::protocol::types::AccessStatus::ReconfigurationPending
-    } else {
-        persisted
-    }
-}
-
-fn startup_transition(
-    state: &AgentState,
-) -> Option<(crate::protocol::types::ReplicaRole, bool, bool)> {
-    if let Some(pending) = &state.pending_effect {
-        if let Some(result) = pending.applied_result.as_deref() {
-            match &result.outcome {
-                crate::effects::RuntimeEffectOutcome::ReplicatorRoleChanged(completion) => {
-                    let transition = completion.role_transition.as_ref()?;
-                    return Some((
-                        transition.target_role,
-                        transition.epoch_completed,
-                        transition.application_completed,
-                    ));
-                }
-                crate::effects::RuntimeEffectOutcome::EpochUpdated(completion) => {
-                    let transition = completion.role_transition.as_ref()?;
-                    return Some((
-                        transition.target_role,
-                        true,
-                        transition.application_completed,
-                    ));
-                }
-                crate::effects::RuntimeEffectOutcome::ApplicationRoleChanged {
-                    completion, ..
-                }
-                | crate::effects::RuntimeEffectOutcome::RoleChanged(completion) => {
-                    return Some((completion.role, true, true));
-                }
-                _ => {}
-            }
-        }
-        match pending.effect.action {
-            crate::effects::RuntimeEffectAction::ChangeRole(role)
-            | crate::effects::RuntimeEffectAction::ChangeReplicatorRole(role) => {
-                return Some((role, false, false));
-            }
-            _ => {}
-        }
-    }
-    let record = state.reconfiguration.as_ref()?;
-    let target_role = record
-        .command
-        .current_configuration
-        .members
-        .iter()
-        .find(|member| member.identity == state.identity.local_identity)
-        .map(|member| member.role)?;
-    // A planned demotion may already have replaced primary authority. Restore
-    // only the fenced target replicator; the certified handoff needs no further
-    // old-primary catch-up and the journal must finish the application transition.
-    if record.command.transition_kind == crate::protocol::types::TransitionKind::PlannedSwitchover
-        && state.role == crate::protocol::types::ReplicaRole::Primary
-        && target_role != crate::protocol::types::ReplicaRole::Primary
-    {
-        return Some((target_role, false, false));
-    }
-    if let Some(retained) = state.retained_result.as_ref() {
-        match &retained.effect.action {
-            crate::effects::RuntimeEffectAction::ChangeReplicatorRole(role)
-                if *role == target_role =>
-            {
-                return Some((target_role, false, false));
-            }
-            crate::effects::RuntimeEffectAction::UpdateEpoch => {
-                return Some((target_role, true, false));
-            }
-            crate::effects::RuntimeEffectAction::ChangeApplicationRole(role)
-                if *role == target_role =>
-            {
-                return Some((target_role, true, true));
-            }
-            _ => {}
-        }
-    }
-    match record.stage {
-        CoordinatorStage::Epoch => Some((target_role, false, false)),
-        CoordinatorStage::ApplicationRole => Some((target_role, true, false)),
-        _ => None,
-    }
-}
-
-fn flatten_server_result(
-    result: std::result::Result<
-        std::result::Result<(), tonic::transport::Error>,
-        tokio::task::JoinError,
-    >,
-) -> Result<()> {
-    result
-        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
-        .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
-}
-
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    loop {
-        if *shutdown.borrow_and_update() {
-            return;
-        }
-        if shutdown.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
-#[tonic::async_trait]
-impl<S, E> proto::agent_control_server::AgentControl for AgentService<S, E>
-where
-    S: AgentStore + 'static,
-    E: RuntimeEffectExecutor + 'static,
-{
-    async fn get_status(
-        &self,
-        request: Request<proto::GetAgentStatusRequest>,
-    ) -> std::result::Result<Response<proto::AgentStatusReport>, Status> {
-        self.authorize(&request)?;
-        Ok(Response::new(
-            self.get_status_inner(request.into_inner()).await?,
-        ))
-    }
-
-    async fn execute(
-        &self,
-        request: Request<proto::ExecuteCommandRequest>,
-    ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
-        self.authorize(&request)?;
-        self.require_ready()?;
-        Ok(Response::new(
-            self.execute_inner(request.into_inner()).await?,
-        ))
-    }
-}
-
-#[tonic::async_trait]
-impl<S, E> proto::replica_peer_server::ReplicaPeer for AgentService<S, E>
-where
-    S: AgentStore + 'static,
-    E: RuntimeEffectExecutor + 'static,
-{
-    async fn get_status(
-        &self,
-        request: Request<proto::GetAgentStatusRequest>,
-    ) -> std::result::Result<Response<proto::AgentStatusReport>, Status> {
-        self.authorize(&request)?;
-        Ok(Response::new(
-            self.get_status_inner(request.into_inner()).await?,
-        ))
-    }
-
-    async fn execute(
-        &self,
-        request: Request<proto::ExecuteCommandRequest>,
-    ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
-        self.authorize(&request)?;
-        self.require_ready()?;
-        Ok(Response::new(
-            self.execute_inner(request.into_inner()).await?,
-        ))
-    }
-}
-
-type ReplicationResponseStream =
-    Pin<Box<dyn Stream<Item = std::result::Result<proto::ReplicationAck, Status>> + Send>>;
-type CopyResponseStream =
-    Pin<Box<dyn Stream<Item = std::result::Result<proto::CopyAck, Status>> + Send>>;
-
-#[tonic::async_trait]
-impl<S, E> proto::replication_data_server::ReplicationData for AgentService<S, E>
-where
-    S: AgentStore + 'static,
-    E: RuntimeEffectExecutor + 'static,
-{
-    type ReplicateStream = ReplicationResponseStream;
-    type BuildStream = CopyResponseStream;
-
-    async fn replicate(
-        &self,
-        request: Request<tonic::Streaming<proto::ReplicationItem>>,
-    ) -> std::result::Result<Response<Self::ReplicateStream>, Status> {
-        self.authorize(&request)?;
-        self.require_ready()?;
-        let mut incoming = request.into_inner();
-        let data_plane = self.data_plane.clone();
-        let sessions = self.sessions.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(async move {
-            while let Some(item) = incoming.next().await {
-                let result = async {
-                    let item = item?;
-                    let sender_identity: ReplicaIdentity = item
-                        .sender
-                        .clone()
-                        .ok_or_else(|| Status::invalid_argument("missing sender"))?
-                        .try_into()
-                        .map_err(|error: crate::control::WireError| {
-                            Status::invalid_argument(error.to_string())
-                        })?;
-                    let _lease = sessions
-                        .validate_peer(
-                            &sender_identity,
-                            &item.sender_session_id,
-                            &item.receiver_session_id,
-                        )
-                        .await?;
-                    let sender_session_id = item.sender_session_id.clone();
-                    let receiver_session_id = item.receiver_session_id.clone();
-                    let mut acknowledgement = data_plane
-                        .receive_replication(item)
-                        .await
-                        .map_err(status_from_runtime)?
-                        .applied()
-                        .await
-                        .map_err(status_from_runtime)?;
-                    acknowledgement.sender_session_id = sender_session_id;
-                    acknowledgement.receiver_session_id = receiver_session_id;
-                    Ok(acknowledgement)
-                }
-                .await;
-                if sender.send(result).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
-    }
-
-    async fn build(
-        &self,
-        request: Request<tonic::Streaming<proto::CopyItem>>,
-    ) -> std::result::Result<Response<Self::BuildStream>, Status> {
-        self.authorize(&request)?;
-        self.require_ready()?;
-        let mut incoming = request.into_inner();
-        let data_plane = self.data_plane.clone();
-        let sessions = self.sessions.clone();
-        let (sender, receiver) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(async move {
-            while let Some(item) = incoming.next().await {
-                let result = async {
-                    let item = item?;
-                    let sender_identity: ReplicaIdentity = item
-                        .sender
-                        .clone()
-                        .ok_or_else(|| Status::invalid_argument("missing sender"))?
-                        .try_into()
-                        .map_err(|error: crate::control::WireError| {
-                            Status::invalid_argument(error.to_string())
-                        })?;
-                    let _lease = sessions
-                        .validate_peer(
-                            &sender_identity,
-                            &item.sender_session_id,
-                            &item.receiver_session_id,
-                        )
-                        .await?;
-                    let sender_session_id = item.sender_session_id.clone();
-                    let receiver_session_id = item.receiver_session_id.clone();
-                    let mut acknowledgement = data_plane
-                        .receive_copy_item(item)
-                        .await
-                        .map_err(status_from_runtime)?;
-                    acknowledgement.sender_session_id = sender_session_id;
-                    acknowledgement.receiver_session_id = receiver_session_id;
-                    Ok(acknowledgement)
-                }
-                .await;
-                if sender.send(result).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
-    }
-}
-
 fn status_from_agent(error: crate::host::HostError) -> Status {
     match error {
         crate::host::HostError::DurableEffectConflict(_)
         | crate::host::HostError::StaleEffectCompletion(_)
-        | crate::host::HostError::CommandRejected(_) => {
-            Status::failed_precondition(error.to_string())
-        }
-        crate::host::HostError::SessionRejected(_) => {
+        | crate::host::HostError::CommandRejected(_)
+        | crate::host::HostError::SessionRejected(_) => {
             Status::failed_precondition(error.to_string())
         }
         crate::host::HostError::Backpressure(_) => Status::resource_exhausted(error.to_string()),
@@ -1519,7 +1026,7 @@ fn status_from_agent(error: crate::host::HostError) -> Status {
     }
 }
 
-fn status_from_runtime(error: crate::RuntimeError) -> Status {
+fn status_from_runtime(error: RuntimeError) -> Status {
     match error {
         RuntimeError::OperationCancelled => Status::cancelled(error.to_string()),
         RuntimeError::QueueFull => Status::resource_exhausted(error.to_string()),
@@ -1536,186 +1043,346 @@ fn status_from_runtime(error: crate::RuntimeError) -> Status {
     }
 }
 
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{
-        AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId,
-        ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId, PvcUid,
-        ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, ScaleUpConfigurationEvidence,
-        ScaleUpIntent, SwitchoverRequestId, TransitionKind,
+    use std::sync::Mutex as StdMutex;
+
+    use crate::application::{OpenContext, RoleChange, StatefulServiceReplica};
+    use crate::protocol::command::{
+        InitializeAgentStore, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
     };
+    use crate::protocol::public_operations::{
+        ProcessSessionRenewalRequired, PublicSessionRenewalStage, PublicV1Identity,
+        PublicV1LifecycleBinding, PublicV1SessionRenewalStatus, StatePersistence,
+    };
+    use crate::protocol::types::{
+        ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, InitializationId,
+        OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
+        PvcUid, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
+        ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, StorageGeneration,
+        derive_agent_generation, derive_initialization_id,
+    };
+    use crate::replicator::Replicator;
 
-    #[test]
-    fn uninitialized_report_is_unsafe_when_application_state_survives() {
-        let directory = crate::host::tests::tempdir().unwrap();
-        let (initialized, _) = watch::channel(false);
-        let service = InitializationService::new(
-            ObservedStorageIdentity {
-                resource_uid: ResourceUid::new("resource"),
-                pod_uid: PodUid::new("pod"),
-                pvc_uid: PvcUid::new("pvc"),
-                instance_id: ReplicaInstanceId::new("pod"),
-            },
-            ReplicaId::new(1),
-            SqliteStore::metadata_database_path(directory.path()),
-            "token",
-            initialized,
-            false,
-        )
-        .unwrap();
-
-        let report = service.report();
-        assert_eq!(
-            report.storage_state,
-            proto::AgentStorageState::Unsafe as i32
-        );
-        assert!(report.storage_error.contains("application state exists"));
+    #[derive(Default)]
+    struct RenewalReplicator {
+        calls: StdMutex<Vec<(&'static str, Epoch, Option<ReplicaRole>)>>,
+        updated_epoch: StdMutex<Option<Epoch>>,
     }
 
-    #[test]
-    fn pending_switchover_preparation_reconstructs_write_closed() {
-        let action = crate::effects::RuntimeEffectAction::PrepareSwitchover {
-            preparation_generation: 1,
-            request_id: SwitchoverRequestId::new("request-1"),
-            source: ReplicaIdentity {
-                replica_id: ReplicaId::new(1),
-                instance_id: ReplicaInstanceId::new("pod-1"),
-                agent_generation: AgentGeneration::new("generation-1"),
-            },
-            target: ReplicaIdentity {
-                replica_id: ReplicaId::new(2),
-                instance_id: ReplicaInstanceId::new("pod-2"),
-                agent_generation: AgentGeneration::new("generation-2"),
-            },
-            starting_configuration_id: ConfigurationId::new("configuration-1"),
-            starting_epoch: crate::protocol::types::Epoch::new(0, 1),
-        };
-        assert_eq!(
-            startup_write_status(
-                crate::protocol::types::AccessStatus::Granted,
-                Some(&action),
-                false,
-            ),
-            crate::protocol::types::AccessStatus::ReconfigurationPending
-        );
+    #[async_trait::async_trait]
+    impl Replicator for RenewalReplicator {
+        async fn open(&self) -> crate::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> crate::Result<()> {
+            if *self.updated_epoch.lock().unwrap() != Some(epoch) {
+                return Err(crate::RuntimeError::ReconfigurationPending);
+            }
+            self.calls.lock().unwrap().push(("role", epoch, Some(role)));
+            Ok(())
+        }
+
+        async fn update_epoch(&self, epoch: Epoch) -> crate::Result<()> {
+            *self.updated_epoch.lock().unwrap() = Some(epoch);
+            self.calls.lock().unwrap().push(("epoch", epoch, None));
+            Ok(())
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn abort(&self) {}
+
+        async fn current_progress(&self) -> crate::Result<i64> {
+            Ok(0)
+        }
+
+        async fn catch_up_capability(&self) -> crate::Result<i64> {
+            Ok(0)
+        }
     }
 
-    #[test]
-    fn scale_up_pending_admission_preserves_the_persisted_write_grant() {
-        let primary = ReplicaIdentity {
-            replica_id: ReplicaId::new(1),
-            instance_id: ReplicaInstanceId::new("pod-1"),
-            agent_generation: AgentGeneration::new("generation-1"),
-        };
-        let target = ReplicaIdentity {
-            replica_id: ReplicaId::new(2),
-            instance_id: ReplicaInstanceId::new("pod-2"),
-            agent_generation: AgentGeneration::new("generation-2"),
-        };
-        let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
-        let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
-        let previous = ConfigurationDescriptor::new(
-            Epoch::new(0, 1),
-            primary.replica_id,
-            vec![ConfigurationMember {
-                identity: primary.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            previous_policy.write_quorum,
-        );
-        let current = ConfigurationDescriptor::new(
-            Epoch::new(0, 2),
-            primary.replica_id,
+    struct RenewalApplication;
+
+    #[async_trait::async_trait]
+    impl StatefulServiceReplica for RenewalApplication {
+        async fn open(
+            self: Arc<Self>,
+            _context: OpenContext,
+        ) -> crate::Result<Arc<dyn Replicator>> {
+            Err(crate::RuntimeError::NotOpen)
+        }
+
+        async fn change_role(&self, _role: ReplicaRole) -> crate::Result<RoleChange> {
+            Err(crate::RuntimeError::NotOpen)
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn abort(&self) {}
+    }
+
+    #[tokio::test]
+    async fn role_replay_updates_epoch_before_role() {
+        let replicator = RenewalReplicator::default();
+        let epoch = Epoch::new(0, 2);
+
+        replay_role_at_epoch(&replicator, epoch, ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *replicator.calls.lock().unwrap(),
             vec![
-                ConfigurationMember {
-                    identity: primary.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: target.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            current_policy.write_quorum,
-        );
-        let mut intent = ScaleUpIntent {
-            operation_id: OperationId::default(),
-            resource_uid: ResourceUid::new("set"),
-            spec_generation: 2,
-            desired_replicas: 2,
-            previous_configuration: previous.clone(),
-            current_configuration: current.clone(),
-            previous_policy,
-            current_policy,
-            primary: primary.clone(),
-            target,
-            build_id: OperationId::new("build"),
-            snapshot_boundary_lsn: 0,
-            catch_up_boundary_lsn: 0,
-        };
-        intent.operation_id = intent.expected_operation_id();
-        let pending = crate::effects::RuntimeEffectAction::AdmitAuthority(Box::new(
-            crate::authority::AdmittedAuthority {
-                local_identity: primary,
-                transition_kind: Some(TransitionKind::ScaleUp),
-                previous_configuration: Some(previous),
-                current_configuration: current,
-                switchover_handoff: None,
-                secondary_removal: None,
-                scale_up: Some(Box::new(ScaleUpConfigurationEvidence::Admission { intent })),
-            },
-        ));
-        assert_eq!(
-            startup_write_status(AccessStatus::Granted, Some(&pending), false),
-            AccessStatus::Granted
+                ("epoch", epoch, None),
+                ("role", epoch, Some(ReplicaRole::ActiveSecondary)),
+            ]
         );
     }
 
     #[tokio::test]
-    async fn scale_up_carried_failover_rejects_old_primary_and_receiver_sessions() {
-        let old_primary = ReplicaIdentity {
+    async fn initialization_service_persists_bootstrap_history_before_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let resource_uid = ResourceUid::new("resource-init");
+        let pod_uid = PodUid::new("pod-init");
+        let pvc_uid = PvcUid::new("pvc-init");
+        let replica_id = ReplicaId::new(1);
+        let initialization_id =
+            derive_initialization_id(&resource_uid, replica_id, &pod_uid, &pvc_uid);
+        let local = ReplicaIdentity {
+            replica_id,
+            instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+            agent_generation: derive_agent_generation(&initialization_id),
+        };
+        let policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            replica_id,
+            vec![ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let binding = PublicV1LifecycleBinding {
+            identity: PublicV1Identity::new(1),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let database = root.path().join("agent.sqlite3");
+        let (initialized, _) = watch::channel(false);
+        let service = InitializationService::new(
+            ObservedStorageIdentity {
+                resource_uid: resource_uid.clone(),
+                pod_uid: pod_uid.clone(),
+                pvc_uid: pvc_uid.clone(),
+                instance_id: local.instance_id.clone(),
+            },
+            replica_id,
+            database.clone(),
+            "test-token",
+            initialized,
+            true,
+        )
+        .unwrap()
+        .with_public_v1_binding(Some(binding.clone()));
+        let command = InitializeAgentStore {
+            initialization_id: InitializationId::new(initialization_id.as_str()),
+            resource_uid: resource_uid.clone(),
+            local_replica_id: replica_id,
+            expected_instance_id: local.instance_id.clone(),
+            expected_pod_uid: pod_uid,
+            expected_pvc_uid: pvc_uid,
+            assigned_agent_generation: local.agent_generation.clone(),
+            effective_policy: policy.clone(),
+            bootstrap_configuration: configuration.clone(),
+            provisioning: None,
+        };
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            resource_uid: resource_uid.to_string(),
+            target: Some(local.clone().into()),
+            expected_process_session_id: service.session.id().to_string(),
+            command: Some(
+                proto::execute_command_request::Command::InitializeAgentStore(
+                    proto::InitializeAgentStoreCommand {
+                        initialization_id: command.initialization_id.to_string(),
+                        resource_uid: resource_uid.to_string(),
+                        local_replica_id: replica_id.value(),
+                        expected_instance_id: local.instance_id.to_string(),
+                        expected_pod_uid: command.expected_pod_uid.to_string(),
+                        expected_pvc_uid: command.expected_pvc_uid.to_string(),
+                        assigned_agent_generation: local.agent_generation.to_string(),
+                        effective_policy: Some(proto::EffectivePolicy {
+                            replica_set_size: policy.replica_set_size,
+                            write_quorum: policy.write_quorum,
+                            read_quorum: policy.read_quorum,
+                            failover_delay_seconds: policy.failover_delay_seconds,
+                        }),
+                        bootstrap_configuration: Some(configuration.into()),
+                        provisioning: None,
+                    },
+                ),
+            ),
+        };
+        service.initialize(request).await.unwrap();
+        let store =
+            SqliteStore::open_replacement_bound_existing(&database, None, &binding).unwrap();
+        let state = store.load_state().await.unwrap();
+        let public = state
+            .public_v1_operation_state
+            .expect("initialized Public V1 state");
+        let history = public.history.expect("bootstrap history");
+        assert_eq!(history.resource_uid, resource_uid);
+        assert_eq!(history.protocol_generation.value(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_service_dispatches_initial_session_renewal_through_wire_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let resource_uid = ResourceUid::new("resource-renewal");
+        let local = ReplicaIdentity {
             replica_id: ReplicaId::new(1),
-            instance_id: ReplicaInstanceId::new("old-primary"),
-            agent_generation: AgentGeneration::new("old-primary-generation"),
+            instance_id: ReplicaInstanceId::new("pod-renewal"),
+            agent_generation: crate::protocol::types::AgentGeneration::new("generation-renewal"),
         };
-        let new_primary = ReplicaIdentity {
-            replica_id: ReplicaId::new(2),
-            instance_id: ReplicaInstanceId::new("new-primary"),
-            agent_generation: AgentGeneration::new("new-primary-generation"),
+        let storage = ReplicaStorageIncarnationContext {
+            replica: local.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new("pod-renewal"),
+                pvc_uid: PvcUid::new("pvc-renewal"),
+            },
+            storage_generation: StorageGeneration::new("storage-renewal"),
         };
-        let registry = SessionRegistry::new(ProcessSessionId::new("receiver-current"));
-        registry
-            .register_peer(
-                new_primary.clone(),
-                ProcessSessionId::new("new-primary-current"),
+        let identity = PublicV1Identity::new(1);
+        let binding = PublicV1LifecycleBinding {
+            identity: identity.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let database = root.path().join("agent.sqlite3");
+        let store = Arc::new(
+            SqliteStore::create_replacement_authorized(
+                &database,
+                crate::host::state::AgentState::new(crate::host::state::StorageIdentity {
+                    schema_version: crate::host::state::SCHEMA_VERSION,
+                    resource_uid: resource_uid.clone(),
+                    pod_uid: PodUid::new("pod-renewal"),
+                    pvc_uid: PvcUid::new("pvc-renewal"),
+                    initialization_id: InitializationId::new("init-renewal"),
+                    local_identity: local.clone(),
+                    effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+                }),
+                binding.clone(),
             )
-            .await;
-        assert!(
-            registry
-                .validate_peer(
-                    &old_primary,
-                    "old-primary-retired",
-                    registry.local_session().as_str()
-                )
-                .await
-                .is_err()
+            .unwrap(),
         );
-        assert!(
-            registry
-                .validate_peer(&new_primary, "new-primary-current", "receiver-retired")
-                .await
-                .is_err()
+        let initialization = crate::protocol::types::derive_history_initialization_id(
+            &resource_uid,
+            crate::protocol::types::PublicProtocolGeneration::new(1),
         );
-        assert!(
-            registry
-                .validate_peer(
-                    &new_primary,
-                    "new-primary-current",
-                    registry.local_session().as_str()
-                )
+        let history = crate::protocol::types::derive_bootstrap_history(
+            &resource_uid,
+            crate::protocol::types::PublicProtocolGeneration::new(1),
+            &initialization,
+        );
+        store
+            .initialize_public_v1_history(&initialization, &history, &storage)
+            .await
+            .unwrap();
+        let runtime = Arc::new(PodRuntime::new_replacement(
+            local.clone(),
+            Arc::new(RenewalApplication),
+            store.clone(),
+            binding,
+            "127.0.0.1:0".parse().unwrap(),
+        ));
+        let service = AgentService::new(store.clone(), runtime.clone(), "test-token").unwrap();
+        runtime
+            .bind_replica_session(resource_uid.clone(), service.local_session().clone())
+            .unwrap();
+        let replacement = ProcessSessionEndpoint {
+            identity: local.clone(),
+            storage_incarnation: storage.clone(),
+            process_session_id: service.local_session().clone(),
+            replicator_creation_id: ReplicatorCreationId::new(format!(
+                "pending-{}",
+                service.local_session()
+            )),
+            role: ReplicaRole::None,
+        };
+        let renewal_epoch = Epoch::new(0, 2);
+        let accepted = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+            operation_id: OperationId::new("renewal-wire"),
+            reason: ProcessSessionRenewalReason::PrimaryReplacement,
+            resource_uid: resource_uid.clone(),
+            history,
+            previous_epoch: Epoch::new(0, 1),
+            renewal_epoch,
+            predecessor: ProcessSessionEndpoint {
+                process_session_id: ProcessSessionId::new("predecessor-session"),
+                replicator_creation_id: ReplicatorCreationId::new("predecessor-creation"),
+                role: ReplicaRole::Primary,
+                ..replacement.clone()
+            },
+            replacement: Some(replacement),
+            surviving_sessions: Vec::new(),
+            fresh_configuration: ConfigurationDescriptor::new(
+                renewal_epoch,
+                local.replica_id,
+                vec![ConfigurationMember {
+                    identity: local.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            predecessor_contained: true,
+            data_loss: None,
+        })
+        .unwrap();
+        let command = PublicV1HistoryCommand::SessionRenewal {
+            command: Box::new(PublicV1SessionRenewalCommand::CloseAccessAndIngress { accepted }),
+        };
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            resource_uid: resource_uid.to_string(),
+            target: Some(local.into()),
+            expected_process_session_id: service.local_session().to_string(),
+            command: Some(proto::execute_command_request::Command::PublicV1History(
+                crate::control::public_v1_history_command_to_proto(&command).unwrap(),
+            )),
+        };
+        service.execute_inner(request).await.unwrap();
+        assert_eq!(
+            store
+                .load_state()
                 .await
-                .is_ok()
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+                .session_renewal
+                .unwrap()
+                .stage,
+            PublicSessionRenewalStage::AccessClosed
         );
     }
 }

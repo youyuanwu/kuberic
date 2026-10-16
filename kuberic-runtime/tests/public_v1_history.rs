@@ -1,6 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
 use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, DataLossRenewalDecision, DataLossReplay,
-    ProcessAttemptContext, ProviderProgressReset, PublicOperationPreviewIdentity,
+    ProcessAttemptContext, ProviderProgressReset, PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
     AgentGeneration, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
@@ -9,8 +12,74 @@ use kuberic_runtime::protocol::types::{
     ReplicatorCreationId, ResourceUid, StorageGeneration, derive_bootstrap_history,
     derive_data_loss_history, derive_history_initialization_id,
 };
-use kuberic_runtime::testing::sqlite_store::{PUBLIC_V1_PREVIEW_SCHEMA_VERSION, SqliteStore};
+use kuberic_runtime::testing::sqlite_store::{PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, SqliteStore};
 use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileTreeSnapshot {
+    directories: BTreeSet<PathBuf>,
+    files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+fn snapshot_file_tree(root: &Path) -> FileTreeSnapshot {
+    fn visit(
+        root: &Path,
+        current: &Path,
+        directories: &mut BTreeSet<PathBuf>,
+        files: &mut BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        let relative = current.strip_prefix(root).unwrap().to_path_buf();
+        if current.is_dir() {
+            directories.insert(relative);
+            let mut entries = std::fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                visit(root, &entry, directories, files);
+            }
+        } else {
+            files.insert(relative, std::fs::read(current).unwrap());
+        }
+    }
+
+    let mut directories = BTreeSet::new();
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut directories, &mut files);
+    FileTreeSnapshot { directories, files }
+}
+
+fn create_rejected_store(path: &Path, version: u32, partial_replacement: bool) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE agent_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                state_json TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+    if !partial_replacement {
+        connection
+            .execute(
+                "INSERT INTO agent_state(singleton, state_json) VALUES(1, ?1)",
+                [format!("legacy-schema-{version}")],
+            )
+            .unwrap();
+    }
+    connection
+        .pragma_update(None, "user_version", version)
+        .unwrap();
+}
+
+fn sqlite_sidecars(path: &Path) -> [PathBuf; 2] {
+    [
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ]
+}
 
 fn replica(replica_id: i64, pod: &str, generation: &str) -> ReplicaIdentity {
     ReplicaIdentity {
@@ -180,10 +249,10 @@ fn public_v1_history_data_loss_attempt_renews_higher_epoch() {
 
 #[tokio::test]
 async fn public_v1_history_store_uses_the_current_exact_schema() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 11);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
     let directory = tempfile::tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+    let preview = PublicV1Identity::new(42);
     let resource_uid = ResourceUid::new("resource-1");
     let local = replica(1, "pod-1", "generation-1");
     let store = SqliteStore::create_public_v1(
@@ -226,37 +295,57 @@ async fn public_v1_history_store_uses_the_current_exact_schema() {
     drop(reopened);
 
     let connection = rusqlite::Connection::open(&path).unwrap();
-    connection.pragma_update(None, "user_version", 10).unwrap();
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(tables, vec!["agent_state"]);
     drop(connection);
-    assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
 
-    for rejected_version in [6, 7, 8, 9] {
+    for rejected_version in [6, 7, 11] {
         let directory = tempfile::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
-        let store = SqliteStore::create_public_v1(
-            &path,
-            preview.clone(),
-            StorageIdentity {
-                schema_version: SCHEMA_VERSION,
-                resource_uid: resource_uid.clone(),
-                pod_uid: PodUid::new("pod-1"),
-                pvc_uid: PvcUid::new("pvc-1"),
-                initialization_id: InitializationId::new("local-initialization"),
-                local_identity: local.clone(),
-                effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
-            },
-        )
-        .unwrap();
-        store
-            .initialize_public_v1_history(&initialization, &history, &incarnation)
-            .await
-            .unwrap();
-        drop(store);
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .pragma_update(None, "user_version", rejected_version)
-            .unwrap();
-        drop(connection);
+        create_rejected_store(&path, rejected_version, false);
+        if rejected_version == 11 {
+            for (index, sidecar) in sqlite_sidecars(&path).iter().enumerate() {
+                std::fs::write(sidecar, format!("unchanged-sidecar-{index}")).unwrap();
+            }
+        } else {
+            assert!(
+                sqlite_sidecars(&path)
+                    .iter()
+                    .all(|sidecar| !sidecar.exists())
+            );
+        }
+        let before = snapshot_file_tree(directory.path());
         assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+        assert_eq!(snapshot_file_tree(directory.path()), before);
+        if rejected_version != 11 {
+            assert!(
+                sqlite_sidecars(&path)
+                    .iter()
+                    .all(|sidecar| !sidecar.exists())
+            );
+        }
     }
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    create_rejected_store(&path, 12, true);
+    assert!(
+        sqlite_sidecars(&path)
+            .iter()
+            .all(|sidecar| !sidecar.exists())
+    );
+    let before = snapshot_file_tree(directory.path());
+    assert!(SqliteStore::open_public_v1(&path, &preview).is_err());
+    assert_eq!(snapshot_file_tree(directory.path()), before);
+    assert!(
+        sqlite_sidecars(&path)
+            .iter()
+            .all(|sidecar| !sidecar.exists())
+    );
 }

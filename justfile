@@ -18,10 +18,11 @@ nextest-build-only: install-nextest
     scripts/check_runtime_public_api.sh
     cargo nextest run -j 1 -p kuberic-runtime --all-features \
         --profile build-only --run-ignored only \
-        -E 'test(=public_v1_conformance_executes_strict_and_hosted_preview_scenarios)'
+        -E 'test(=public_v1_conformance_executes_built_in_replacement_scenarios)'
 
 # Verify build-only guards and build one reusable all-features test archive.
 nextest-archive: nextest-build-only
+    cargo build -p postgres-replicated --bin postgres-replicated --all-features
     mkdir -p "$(dirname "{{ nextest_archive }}")"
     cargo nextest archive --workspace --all-features --profile ci \
         --archive-file "{{ nextest_archive }}"
@@ -35,7 +36,7 @@ nextest-validate-archive: install-nextest
     python3 scripts/validate_nextest_partitions.py \
         --archive-file "{{ nextest_archive }}"
 
-# List one semantic repository tier: all, ordinary, build-only, postgres, kind, dex-live, or helper.
+# List one semantic repository tier: all, ordinary, build-only, postgres, kind, or dex-live.
 nextest-list tier="all": install-nextest
     #!/usr/bin/env bash
     set -euo pipefail
@@ -47,7 +48,6 @@ nextest-list tier="all": install-nextest
       postgres) profile=postgres ;;
       kind) profile=kind; ignored_args=(--run-ignored only) ;;
       dex-live) profile=dex-live ;;
-      helper) profile=helper; ignored_args=(--run-ignored only) ;;
       *) echo "unknown nextest tier: {{ tier }}" >&2; exit 2 ;;
     esac
     cargo nextest list --workspace --all-features --profile "$profile" "${ignored_args[@]}"
@@ -92,16 +92,12 @@ nextest-postgres-smoke-inventory:
     scratch="${TMPDIR:-$PWD/target/paw-tmp}"
     mkdir -p "$scratch"
     TMPDIR="$scratch" scripts/install_nextest.sh
+    public_v1_filter="$(python3 scripts/validate_nextest_partitions.py --postgres-smoke-filter)"
     TMPDIR="$scratch" scripts/assert_nextest_selection.sh \
       --label postgres-smoke \
-      --require-binary postgres-replicated \
-      --require-test tests::public_v1_postgres_primary_lifecycle_and_joint_configuration \
-      --require-test tests::public_v1_postgres_data_loss_history_and_replay \
-      --require-test tests::public_v1_postgres_build_cancellation_and_retirement \
-      --require-test tests::public_v1_postgres_contained_close -- \
+      --require-binary postgres-replicated -- \
       cargo nextest list -p postgres-replicated --all-features \
-        --profile postgres \
-        -E 'test(/^(tests::public_v1_postgres_primary_lifecycle_and_joint_configuration|tests::public_v1_postgres_data_loss_history_and_replay|tests::public_v1_postgres_build_cancellation_and_retirement|tests::public_v1_postgres_contained_close)$/)'
+        --profile postgres -E "$public_v1_filter"
 
 # Run a representative real-PostgreSQL smoke selection for routine local checks.
 nextest-postgres-smoke: nextest-postgres-smoke-inventory
@@ -124,12 +120,10 @@ nextest-postgres-smoke: nextest-postgres-smoke-inventory
       fi
     fi
     mkdir -p "$public_v1_tmp"
-    public_v1_filter='test(/^(tests::public_v1_postgres_primary_lifecycle_and_joint_configuration|tests::public_v1_postgres_data_loss_history_and_replay|tests::public_v1_postgres_build_cancellation_and_retirement|tests::public_v1_postgres_contained_close)$/)'
+    TMPDIR="$scratch" cargo build -p postgres-replicated --bin postgres-replicated
+    public_v1_filter="$(python3 scripts/validate_nextest_partitions.py --postgres-smoke-filter)"
     KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$public_v1_tmp" TMPDIR="$scratch" cargo nextest run -j 1 \
       -p postgres-replicated --all-features --profile postgres -E "$public_v1_filter"
-    filter='test(/^(tests::singleton_bootstrap_fence_and_restart_use_fresh_sessions_and_preserve_sql|tests::three_public_custom_hosts_reopen_same_roots_with_fresh_sessions|fresh_native_build_requires_durable_replay_and_exact_lineage|acknowledged_row_is_replayed_before_candidate_primary_callback_completes|planned_switchover_requires_source_shutdown_before_target_writes|stalled_failover_scenario_times_out_and_reaps_postgres|scaling_reopens_agent_after_built_boundary|storage_failure_is_explicit_and_keeps_clients_closed)$/)'
-    TMPDIR="$scratch" cargo nextest run \
-      --workspace --all-features --profile postgres -E "$filter"
 
 # Create the local Kind cluster and write its kubeconfig.
 create-kind-cluster:
@@ -214,9 +208,7 @@ level-triggered-kind-test *scenarios: verify-kind-context
     expanded=()
     for scenario in "${requested[@]}"; do
       if [[ "$scenario" == "all" ]]; then
-        expanded+=(scale-up-adversarial scale-up scale-up-multi replacement quorum-loss adversarial switchover switchover-adversarial scale-down scale-down-adversarial)
-      elif [[ "$scenario" == "scale-up-full" ]]; then
-        expanded+=(scale-up scale-up-multi scale-up-adversarial)
+        expanded+=(bootstrap replacement failover)
       else
         expanded+=("$scenario")
       fi
@@ -226,15 +218,6 @@ level-triggered-kind-test *scenarios: verify-kind-context
         bootstrap) test_names=("level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write") ;;
         replacement) test_names=("level_triggered_k8s::replacement_preserves_quorum_write_and_retires_old_incarnation") ;;
         failover) test_names=("level_triggered_k8s::failover_fences_old_primary_and_preserves_committed_data") ;;
-        quorum-loss) test_names=("level_triggered_k8s::quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change") ;;
-        adversarial) test_names=("level_triggered_k8s::adversarial_restart_partition_and_healing_preserve_single_writer") ;;
-        switchover) test_names=("level_triggered_k8s::planned_switchover") ;;
-        switchover-adversarial) test_names=("level_triggered_k8s::planned_switchover_adversarial") ;;
-        scale-down) test_names=("level_triggered_k8s::scale_down" "level_triggered_k8s::scale_down_non_contiguous") ;;
-        scale-down-adversarial) test_names=("level_triggered_k8s::scale_down_adversarial_historical" "level_triggered_k8s::scale_down_adversarial_reachable" "level_triggered_k8s::scale_down_adversarial_unreachable" "level_triggered_k8s::scale_down_adversarial_absent_pod") ;;
-        scale-up) test_names=("level_triggered_k8s::scale_up") ;;
-        scale-up-multi) test_names=("level_triggered_k8s::scale_up_multi") ;;
-        scale-up-adversarial) test_names=("level_triggered_k8s::scale_up_adversarial_cancellation" "level_triggered_k8s::scale_up_adversarial_pre_admission_failover" "level_triggered_k8s::scale_up_adversarial_post_admission_recovery" "level_triggered_k8s::scale_up_adversarial_non_contiguous_restore") ;;
         *) echo "unknown level-triggered scenario: $scenario" >&2; exit 2 ;;
       esac
       started=$SECONDS
@@ -253,31 +236,31 @@ level-triggered-diagnostics: verify-kind-context
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n kuberic-system logs deployment/kuberic-controller --all-containers --tail=-1 || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default get kubericset kvstore2 -o yaml || true
+        -n kuberic-system get kubericset kvstore2 -o yaml || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default get kubericset kvstore2 \
+        -n kuberic-system get kubericset kvstore2 \
         -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}' || true
     echo
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default get pods,pvc,services -o wide || true
+        -n kuberic-system get pods,pvc,services -o wide || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default get pods,pvc,services -l operator.kuberic.io/set-name=kvstore2 -o yaml || true
+        -n kuberic-system get pods,pvc,services -l operator.kuberic.io/set-name=kvstore2 -o yaml || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default get events --sort-by=.lastTimestamp || true
+        -n kuberic-system get events --sort-by=.lastTimestamp || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default logs -l operator.kuberic.io/set-name=kvstore2 --all-containers --tail=-1 || true
+        -n kuberic-system logs -l operator.kuberic.io/set-name=kvstore2 --all-containers --tail=-1 || true
     # Replica /status combines durable agent identity/PC/CC/pending work with runtime progress/access.
     for pod in $(kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-      -n default get pods -l operator.kuberic.io/set-name=kvstore2 -o name); do
+      -n kuberic-system get pods -l operator.kuberic.io/set-name=kvstore2 -o name); do
       echo "=== ${pod}: agent/runtime evidence ==="
       timeout --kill-after=2s 15s kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default exec "${pod}" -- curl --fail --silent --show-error --max-time 5 \
+        -n kuberic-system exec "${pod}" -- curl --fail --silent --show-error --max-time 5 \
         http://127.0.0.1:8080/status || true
       echo
       kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default logs "${pod}" --all-containers --previous --tail=200 || true
+        -n kuberic-system logs "${pod}" --all-containers --previous --tail=200 || true
       echo "=== ${pod}: storage layout ==="
       timeout --kill-after=2s 15s kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default exec "${pod}" -- sh -c \
+        -n kuberic-system exec "${pod}" -- sh -c \
         'find /var/lib/kuberic -maxdepth 4 -printf "%y %s %p\n" 2>/dev/null | sort; du -ah /var/lib/kuberic 2>/dev/null | sort -h | tail -100' || true
     done

@@ -3,8 +3,8 @@ use std::cmp::Ordering;
 use kuberic_runtime::protocol::command::{ProtocolCommand, PublicV1HistoryCommand};
 use kuberic_runtime::protocol::public_operations::{
     DataLossAttempt, DataLossAuthorization, PublicDataLossRecoveryStage,
-    PublicDataLossRecoveryStatus, PublicOperationPreviewIdentity, PublicProgressRole,
-    PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicDataLossRecoveryStatus, PublicProgressRole, PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
     HistoryContext, PublicProtocolGeneration, ReplicaStorageIncarnationContext, ResourceUid,
@@ -35,7 +35,7 @@ pub enum PublicV1ElectionStatus {
 pub fn ensure_bootstrap_history(
     accepted: Option<PublicV1AcceptedStatus>,
     resource_uid: &ResourceUid,
-    identity: &PublicOperationPreviewIdentity,
+    identity: &PublicV1Identity,
 ) -> Result<PublicV1AcceptedStatus, String> {
     if !identity.is_public_v1() {
         return Err("public-v1 bootstrap history requires protocol 11".into());
@@ -127,7 +127,7 @@ pub fn election_status(
 pub fn plan_bootstrap_history(
     accepted: Option<PublicV1AcceptedStatus>,
     resource_uid: &ResourceUid,
-    identity: &PublicOperationPreviewIdentity,
+    identity: &PublicV1Identity,
     storage: ReplicaStorageIncarnationContext,
 ) -> Result<PublicV1HistoryPlan, String> {
     let next = ensure_bootstrap_history(accepted.clone(), resource_uid, identity)?;
@@ -138,7 +138,7 @@ pub fn plan_bootstrap_history(
         });
     }
     let command = PublicV1HistoryCommand::Initialize {
-        preview: identity.clone(),
+        identity: identity.clone(),
         accepted: next.clone(),
         storage,
     };

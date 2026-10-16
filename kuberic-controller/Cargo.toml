@@ -9,6 +9,7 @@ description = "Level-triggered Kubernetes controller for Kuberic"
 readme = "README.md"
 
 [features]
+default = []
 runtime-test-bridge = ["kuberic-runtime/testing"]
 
 [[bin]]

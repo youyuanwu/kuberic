@@ -3,8 +3,6 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceReplica};
 use kuberic_runtime::protocol::types::ReplicaRole;
-#[cfg(feature = "testing")]
-use kuberic_runtime::replicator::stateless::StatelessReplicatorFactory;
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
@@ -23,7 +21,6 @@ pub struct KvService {
     control: RwLock<Option<Arc<dyn Replicator>>>,
     partition: RwLock<Option<StatefulServicePartition>>,
     role: Mutex<ReplicaRole>,
-    stateless_preview: std::sync::atomic::AtomicBool,
 }
 
 impl KvService {
@@ -39,16 +36,7 @@ impl KvService {
             control: RwLock::new(None),
             partition: RwLock::new(None),
             role: Mutex::new(ReplicaRole::None),
-            stateless_preview: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    #[cfg(feature = "testing")]
-    #[allow(dead_code)]
-    pub fn with_stateless_preview(self) -> Self {
-        self.stateless_preview
-            .store(true, std::sync::atomic::Ordering::Release);
-        self
     }
 
     pub fn persistence(&self) -> &Arc<KvPersistence> {
@@ -94,25 +82,9 @@ impl StatefulServiceReplica for KvService {
             return Ok(control);
         }
         *self.partition.write().await = Some(context.partition.clone());
-        let preview = self
-            .stateless_preview
-            .load(std::sync::atomic::Ordering::Acquire);
-        let factory: Arc<dyn ReplicatorFactory> = if preview {
-            #[cfg(feature = "testing")]
-            {
-                Arc::new(StatelessReplicatorFactory::new(
-                    self.provider.persistence().clone(),
-                ))
-            }
-            #[cfg(not(feature = "testing"))]
-            {
-                unreachable!("preview construction is unavailable without testing")
-            }
-        } else {
-            Arc::new(DefaultReplicatorFactory::new(
-                self.provider.persistence().clone(),
-            ))
-        };
+        let factory: Arc<dyn ReplicatorFactory> = Arc::new(DefaultReplicatorFactory::new(
+            self.provider.persistence().clone(),
+        ));
         let interfaces = context
             .partition
             .with_factory(factory)
@@ -120,7 +92,6 @@ impl StatefulServiceReplica for KvService {
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: preview,
                 }),
             )
             .await?;

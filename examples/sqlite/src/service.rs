@@ -11,8 +11,6 @@ use futures::{StreamExt, stream};
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::engine::DurableState;
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
-#[cfg(feature = "testing")]
-use kuberic_runtime::replicator::stateless::StatelessReplicatorFactory;
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
@@ -84,7 +82,6 @@ pub struct SqliteService {
     replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
     streams: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     replication_address: String,
-    stateless_preview: AtomicBool,
 }
 
 impl SqliteService {
@@ -130,15 +127,9 @@ impl SqliteService {
             replicator: Mutex::new(None),
             streams: Mutex::new(Vec::new()),
             replication_address,
-            stateless_preview: AtomicBool::new(false),
         })
     }
 
-    #[cfg(feature = "testing")]
-    pub fn with_stateless_preview(self) -> Self {
-        self.stateless_preview.store(true, Ordering::Release);
-        self
-    }
     pub fn persistence(&self) -> &Arc<SqlitePersistence> {
         &self.persistence
     }
@@ -247,19 +238,8 @@ impl StatefulServiceReplica for SqliteService {
                 .committed_lsn,
         );
         *self.partition.lock().expect("partition") = Some(context.partition.clone());
-        let preview = self.stateless_preview.load(Ordering::Acquire);
-        let factory: Arc<dyn ReplicatorFactory> = if preview {
-            #[cfg(feature = "testing")]
-            {
-                Arc::new(StatelessReplicatorFactory::new(self.persistence.clone()))
-            }
-            #[cfg(not(feature = "testing"))]
-            {
-                unreachable!("preview construction is unavailable without testing")
-            }
-        } else {
-            Arc::new(DefaultReplicatorFactory::new(self.persistence.clone()))
-        };
+        let factory: Arc<dyn ReplicatorFactory> =
+            Arc::new(DefaultReplicatorFactory::new(self.persistence.clone()));
         let interfaces = context
             .partition
             .with_factory(factory)
@@ -267,7 +247,6 @@ impl StatefulServiceReplica for SqliteService {
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.replication_address.clone(),
-                    public_v1: preview,
                 }),
             )
             .await?;

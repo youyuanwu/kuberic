@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 
-use kuberic_controller::evaluator::test_bridge::{
+use kuberic_controller::cluster_api::PublicV1Scope;
+use kuberic_controller::evaluator::testing::{
     PublicV1SessionRenewalApi, PublicV1SessionRenewalPlan, accept_public_v1_session_access_closed,
     accept_public_v1_session_epoch_updated, accept_public_v1_session_renewal,
     accept_public_v1_survivor_retired, execute_public_v1_session_renewal,
@@ -10,9 +11,8 @@ use kuberic_runtime::protocol::command::{
     ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
-    ProcessSessionRenewalRequired, PublicOperationPreviewIdentity, PublicProgress,
-    PublicProgressRole, PublicSessionRenewalStage, PublicV1AgentReport,
-    PublicV1SessionRenewalStatus,
+    ProcessSessionRenewalRequired, PublicProgress, PublicProgressRole, PublicSessionRenewalStage,
+    PublicV1AgentReport, PublicV1Identity, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch,
@@ -32,12 +32,14 @@ struct FakeApi {
 impl PublicV1SessionRenewalApi for FakeApi {
     async fn observe_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1SessionRenewalStatus>, String> {
         Ok(self.status.lock().unwrap().clone())
     }
 
     async fn persist_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: Option<&PublicV1SessionRenewalStatus>,
         next: &PublicV1SessionRenewalStatus,
     ) -> Result<(), String> {
@@ -51,6 +53,7 @@ impl PublicV1SessionRenewalApi for FakeApi {
 
     async fn dispatch_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1SessionRenewalStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -59,6 +62,14 @@ impl PublicV1SessionRenewalApi for FakeApi {
         }
         self.dispatched.lock().unwrap().push(command.clone());
         Ok(())
+    }
+}
+
+fn test_scope() -> PublicV1Scope {
+    PublicV1Scope {
+        namespace: "kuberic-system".into(),
+        name: "resource-1".into(),
+        resource_uid: ResourceUid::new("resource-1"),
     }
 }
 
@@ -167,10 +178,11 @@ fn requirement(reason: ProcessSessionRenewalReason) -> ProcessSessionRenewalRequ
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
-        identity: PublicOperationPreviewIdentity::public_v1(42),
+        identity: PublicV1Identity::new(42),
         resource_uid: required.resource_uid.clone(),
         replica: replacement.identity.clone(),
         process_session_id: replacement.process_session_id.clone(),
+        replicator_creation_id: replacement.replicator_creation_id.clone(),
         report_sequence: 1,
         role: ReplicaRole::None,
         read_status: AccessStatus::NotPrimary,
@@ -207,7 +219,7 @@ fn renewal_command(plan: &PublicV1SessionRenewalPlan) -> &PublicV1SessionRenewal
     let ProtocolCommand::PublicV1History(command) = command else {
         panic!("expected dormant public-v1 command");
     };
-    let PublicV1HistoryCommand::SessionRenewal(command) = command.as_ref() else {
+    let PublicV1HistoryCommand::SessionRenewal { command } = command.as_ref() else {
         panic!("expected session-renewal command");
     };
     command
@@ -219,7 +231,7 @@ async fn public_v1_session_renewal_is_conditionally_accepted() {
     let report = replacement_report(&required);
     let plan = accept_public_v1_session_renewal(None, required.clone(), Some(&report)).unwrap();
     let api = FakeApi::default();
-    execute_public_v1_session_renewal(&api, plan.clone())
+    execute_public_v1_session_renewal(&api, &test_scope(), plan.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -237,7 +249,7 @@ async fn public_v1_session_renewal_is_conditionally_accepted() {
         ..Default::default()
     };
     assert!(
-        execute_public_v1_session_renewal(&stale, plan)
+        execute_public_v1_session_renewal(&stale, &test_scope(), plan)
             .await
             .is_err()
     );
@@ -287,7 +299,7 @@ fn public_v1_primary_and_secondary_replacements_obey_epoch_ordering() {
 }
 
 #[tokio::test]
-async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retirement() {
+async fn hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_retirement() {
     tokio::time::timeout(std::time::Duration::from_secs(270), async {
         let required = requirement(ProcessSessionRenewalReason::PrimaryReplacement);
         let pending = pending_barriers(required.clone());
@@ -337,6 +349,16 @@ async fn hosted_preview_unreachable_survivor_blocks_access_until_return_or_retir
 fn public_v1_peer_withdrawal_advances_epoch_without_role_replay() {
     let required = requirement(ProcessSessionRenewalReason::PeerWithdrawal);
     required.validate().unwrap();
+    let accepted = PublicV1SessionRenewalStatus::required(required.clone()).unwrap();
+    let close = plan_public_v1_session_renewal(&accepted, &[]).unwrap();
+    assert!(matches!(
+        renewal_command(&close),
+        PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. }
+    ));
+    assert_eq!(
+        renewal_command(&close).expected_endpoint(),
+        &required.predecessor
+    );
     let pending = pending_barriers(required.clone());
     let updated = accept_public_v1_session_epoch_updated(
         &pending,

@@ -67,9 +67,9 @@ pub fn plan_session_renewal(
             Ok(PublicV1SessionRenewalPlan::Dispatch {
                 expected: Box::new(accepted.clone()),
                 command: ProtocolCommand::PublicV1History(Box::new(
-                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal(
-                        Box::new(command),
-                    ),
+                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal {
+                        command: Box::new(command),
+                    },
                 )),
             })
         }
@@ -104,9 +104,9 @@ pub fn plan_session_renewal(
                 return Ok(PublicV1SessionRenewalPlan::Dispatch {
                     expected: Box::new(accepted.clone()),
                     command: ProtocolCommand::PublicV1History(Box::new(
-                        kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal(
-                            Box::new(command),
-                        ),
+                        kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal {
+                            command: Box::new(command),
+                        },
                     )),
                 });
             }
@@ -131,9 +131,9 @@ pub fn plan_session_renewal(
             Ok(PublicV1SessionRenewalPlan::Dispatch {
                 expected: Box::new(accepted.clone()),
                 command: ProtocolCommand::PublicV1History(Box::new(
-                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal(
-                        Box::new(command),
-                    ),
+                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal {
+                        command: Box::new(command),
+                    },
                 )),
             })
         }
@@ -146,9 +146,9 @@ pub fn plan_session_renewal(
             Ok(PublicV1SessionRenewalPlan::Dispatch {
                 expected: Box::new(accepted.clone()),
                 command: ProtocolCommand::PublicV1History(Box::new(
-                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal(
-                        Box::new(command),
-                    ),
+                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::SessionRenewal {
+                        command: Box::new(command),
+                    },
                 )),
             })
         }

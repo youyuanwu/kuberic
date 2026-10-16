@@ -7,30 +7,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::StatefulServiceReplica;
-use crate::protocol::public_operations::PreviewLifecycleBinding;
-use crate::protocol::types::{
-    FaultType, PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid,
-};
+use crate::protocol::public_operations::PublicV1LifecycleBinding;
+use crate::protocol::public_operations::{PublicV1Identity, StatePersistence};
+use crate::protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid};
 use serde::Serialize;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 
 use crate::host::Result;
 use crate::host::hosting::PodRuntime;
-use crate::host::provisioning::{ObservedStorageIdentity, validate_established_identity};
+use crate::host::provisioning::ObservedStorageIdentity;
 use crate::host::service::{AgentService, InitializationService, SHUTDOWN_TIMEOUT};
 use crate::host::sqlite_store::SqliteStore;
 use crate::host::store::AgentStore;
-use crate::host::transport::{
-    GrpcOutboundDispatcher, ReliableTransport, ReplicaEndpointResolver, run_outbound,
-    run_peer_discovery,
-};
+use crate::host::transport::ReplicaEndpointResolver;
 
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-use crate::protocol::public_operations::{
-    PublicFaultAction, RestartActionRecord, RestartActionStage,
-};
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-use crate::protocol::types::ProcessSessionId;
+pub(crate) const PUBLIC_V1_PROCESS_STARTUP_OWNERS: &[&str] = &["serve_control_only"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationStorageState {
@@ -50,664 +41,6 @@ pub struct ReplicaProcessConfig {
     pub bearer_token: String,
     pub rpc_deadline: Duration,
     pub transport_window_capacity: usize,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-pub(crate) const PREVIEW_RESTART_DISPOSITION: i32 = 75;
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct PreviewChildCommand {
-    pub(crate) executable: PathBuf,
-    pub(crate) arguments: Vec<String>,
-    pub(crate) environment: BTreeMap<String, String>,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct PreviewChildEvidence {
-    pub(crate) process_session: ProcessSessionId,
-    pub(crate) child_pid: u32,
-    pub(crate) child_start_time: String,
-    pub(crate) data_root: PathBuf,
-    pub(crate) pod_uid: PodUid,
-    pub(crate) pvc_uid: PvcUid,
-    pub(crate) provider_sentinel: String,
-    pub(crate) application_instance_id: String,
-    pub(crate) replicator_instance_id: String,
-    pub(crate) callbacks: Vec<String>,
-    pub(crate) launch_nonce: String,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-pub(crate) struct PreviewChildProcess {
-    pub(crate) child: tokio::process::Child,
-    pub(crate) evidence: PreviewChildEvidence,
-    pub(crate) restart_signal: PathBuf,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PreviewRestartCut {
-    Accepted,
-    PredecessorContained,
-    SuccessorLaunched,
-    SuccessorStarted,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreviewRestartResult {
-    pub(crate) record: RestartActionRecord,
-    pub(crate) successor: PreviewChildEvidence,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PreviewSupervisorIdentity {
-    pid: u32,
-    start_time: String,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PreviewLaunchOwner {
-    nonce: String,
-    supervisor_id: String,
-    pid: u32,
-    start_time: String,
-    claimed_at_unix_millis: u128,
-    child_pid: Option<u32>,
-    child_start_time: Option<String>,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-pub(crate) struct ReplicaProcessSupervisor {
-    store: Arc<SqliteStore>,
-    data_root: PathBuf,
-    child: PreviewChildCommand,
-    active_child: Mutex<Option<tokio::process::Child>>,
-    launch: Mutex<()>,
-    container_restart_proven: bool,
-    instance_id: String,
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-#[allow(dead_code)]
-impl ReplicaProcessSupervisor {
-    pub(crate) fn new(
-        store: Arc<SqliteStore>,
-        data_root: PathBuf,
-        child: PreviewChildCommand,
-    ) -> Result<Self> {
-        let marker = data_root.join(".kuberic").join("supervisor-session");
-        let container_restart_proven = std::fs::read(&marker)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PreviewSupervisorIdentity>(&bytes).ok())
-            .is_some_and(|previous| !process_identity_is_alive(&previous));
-        Self::record_parent_identity(&data_root)?;
-        Ok(Self {
-            store,
-            data_root,
-            child,
-            active_child: Mutex::new(None),
-            launch: Mutex::new(()),
-            container_restart_proven,
-            instance_id: uuid::Uuid::new_v4().to_string(),
-        })
-    }
-
-    pub(crate) fn record_parent_identity(data_root: &Path) -> Result<()> {
-        let marker = data_root.join(".kuberic").join("supervisor-session");
-        if let Some(parent) = marker.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let identity = PreviewSupervisorIdentity {
-            pid: std::process::id(),
-            start_time: process_start_time(std::process::id()).ok_or_else(|| {
-                crate::host::HostError::CommandRejected(
-                    "cannot read supervisor process identity".into(),
-                )
-            })?,
-        };
-        std::fs::write(
-            marker,
-            serde_json::to_vec(&identity)
-                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?,
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn record_current_child_launch(
-        owner_path: &Path,
-        launch_nonce: &str,
-        supervisor_id: &str,
-    ) -> Result<()> {
-        with_launch_owner_lock(owner_path, || {
-            let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
-                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-            if owner.nonce != launch_nonce || owner.supervisor_id != supervisor_id {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "child launch nonce differs from durable owner".into(),
-                ));
-            }
-            owner.child_pid = Some(std::process::id());
-            owner.child_start_time =
-                Some(process_start_time(std::process::id()).ok_or_else(|| {
-                    crate::host::HostError::CommandRejected(
-                        "cannot read child process identity".into(),
-                    )
-                })?);
-            write_json_atomic(owner_path, "child", &owner)
-        })
-    }
-
-    pub(crate) fn publish_current_child_evidence(
-        owner_path: &Path,
-        launch_nonce: &str,
-        supervisor_id: &str,
-        evidence_path: &Path,
-        evidence: &PreviewChildEvidence,
-    ) -> Result<()> {
-        with_launch_owner_lock(owner_path, || {
-            let owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(owner_path)?)
-                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-            if owner.nonce != launch_nonce
-                || owner.supervisor_id != supervisor_id
-                || owner.child_pid != Some(std::process::id())
-                || owner.child_start_time.as_deref()
-                    != process_start_time(std::process::id()).as_deref()
-            {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "child lost launch ownership before readiness".into(),
-                ));
-            }
-            write_json_atomic(evidence_path, "evidence", evidence)
-        })
-    }
-
-    pub(crate) async fn restart_with_child(
-        &self,
-        action: &PublicFaultAction,
-        predecessor: &mut PreviewChildProcess,
-        cut: Option<PreviewRestartCut>,
-    ) -> Result<PreviewRestartResult> {
-        let record = self.store.begin_restart_action(action).await?;
-        if cut == Some(PreviewRestartCut::Accepted) {
-            return Err(crate::host::HostError::CommandRejected(
-                "injected crash after durable restart acceptance".into(),
-            ));
-        }
-
-        if record.stage == RestartActionStage::Accepted {
-            if predecessor.evidence.process_session != action.predecessor_session
-                || predecessor.evidence.child_pid != action.predecessor_process_id
-                || predecessor.child.id() != Some(predecessor.evidence.child_pid)
-            {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "restart action does not name the supervised predecessor child".into(),
-                ));
-            }
-            std::fs::write(&predecessor.restart_signal, b"restart")?;
-            let status = predecessor.child.wait().await?;
-            if status.code() != Some(PREVIEW_RESTART_DISPOSITION) {
-                return Err(crate::host::HostError::CommandRejected(format!(
-                    "predecessor did not exit with restart disposition {PREVIEW_RESTART_DISPOSITION}"
-                )));
-            }
-        }
-        self.resume_existing(action, cut).await
-    }
-
-    pub(crate) async fn resume_after_container_restart(
-        &self,
-        action: &PublicFaultAction,
-        cut: Option<PreviewRestartCut>,
-    ) -> Result<PreviewRestartResult> {
-        let record = self.store.restart_action().await?.ok_or_else(|| {
-            crate::host::HostError::CommandRejected(
-                "container recovery cannot admit a new restart action".into(),
-            )
-        })?;
-        if record.action != *action {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "container recovery action differs from durable acceptance".into(),
-            ));
-        }
-        if record.stage == RestartActionStage::Accepted
-            && (!self.container_restart_proven
-                || Path::new(&format!("/proc/{}", action.predecessor_process_id)).exists())
-        {
-            return Err(crate::host::HostError::CommandRejected(
-                "durable supervisor marker does not prove a parent/container restart".into(),
-            ));
-        }
-        self.resume_existing(action, cut).await
-    }
-
-    async fn resume_existing(
-        &self,
-        action: &PublicFaultAction,
-        cut: Option<PreviewRestartCut>,
-    ) -> Result<PreviewRestartResult> {
-        let _launch = self.launch.lock().await;
-        let mut record = self.store.restart_action().await?.ok_or_else(|| {
-            crate::host::HostError::CommandRejected("restart action is not accepted".into())
-        })?;
-        if record.action != *action {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "restart action changed during recovery".into(),
-            ));
-        }
-        if cut == Some(PreviewRestartCut::Accepted) && record.stage == RestartActionStage::Accepted
-        {
-            return Err(crate::host::HostError::CommandRejected(
-                "injected crash after durable restart acceptance".into(),
-            ));
-        }
-        if record.stage == RestartActionStage::Accepted {
-            record = self
-                .store
-                .advance_restart_action(
-                    action,
-                    RestartActionStage::Accepted,
-                    RestartActionStage::PredecessorContained,
-                    None,
-                    None,
-                    None,
-                )
-                .await?;
-        }
-        if cut == Some(PreviewRestartCut::PredecessorContained)
-            && record.stage == RestartActionStage::PredecessorContained
-        {
-            return Err(crate::host::HostError::CommandRejected(
-                "injected crash after predecessor containment".into(),
-            ));
-        }
-        let (launch_nonce, may_spawn) = self.claim_successor_launch(action)?;
-        if record.stage == RestartActionStage::PredecessorContained {
-            record = self
-                .store
-                .advance_restart_action(
-                    action,
-                    RestartActionStage::PredecessorContained,
-                    RestartActionStage::SuccessorLaunching,
-                    None,
-                    None,
-                    Some(&launch_nonce),
-                )
-                .await?;
-        }
-        if record.stage == RestartActionStage::SuccessorStarted {
-            let successor = self.read_successor_evidence(action)?;
-            return Ok(PreviewRestartResult { record, successor });
-        }
-        if record.stage != RestartActionStage::SuccessorLaunching
-            || record.launch_nonce.as_deref() != Some(launch_nonce.as_str())
-        {
-            return Err(crate::host::HostError::DurableEffectConflict(
-                "successor launch claim differs from durable restart state".into(),
-            ));
-        }
-        let successor = self
-            .launch_successor(action, &launch_nonce, may_spawn)
-            .await?;
-        if cut == Some(PreviewRestartCut::SuccessorLaunched) {
-            return Err(crate::host::HostError::CommandRejected(
-                "injected crash after successor launch".into(),
-            ));
-        }
-        record = self
-            .store
-            .advance_restart_action(
-                action,
-                RestartActionStage::SuccessorLaunching,
-                RestartActionStage::SuccessorStarted,
-                Some(&successor.process_session),
-                Some(successor.child_pid),
-                None,
-            )
-            .await?;
-        if cut == Some(PreviewRestartCut::SuccessorStarted) {
-            return Err(crate::host::HostError::CommandRejected(
-                "injected crash after successor start".into(),
-            ));
-        }
-        Ok(PreviewRestartResult { record, successor })
-    }
-
-    fn evidence_path(&self, action: &PublicFaultAction) -> PathBuf {
-        self.data_root
-            .join(".kuberic")
-            .join(format!("{}.successor.json", action.action_id))
-    }
-
-    fn shutdown_path(&self, action: &PublicFaultAction) -> PathBuf {
-        self.data_root
-            .join(".kuberic")
-            .join(format!("{}.successor.shutdown", action.action_id))
-    }
-
-    fn launch_owner_path(&self, action: &PublicFaultAction) -> PathBuf {
-        self.data_root
-            .join(".kuberic")
-            .join(format!("{}.launch-owner.json", action.action_id))
-    }
-
-    fn claim_successor_launch(&self, action: &PublicFaultAction) -> Result<(String, bool)> {
-        let path = self.launch_owner_path(action);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let nonce = format!("{}-successor", action.action_id);
-        let current = PreviewLaunchOwner {
-            nonce: nonce.clone(),
-            supervisor_id: self.instance_id.clone(),
-            pid: std::process::id(),
-            start_time: process_start_time(std::process::id()).ok_or_else(|| {
-                crate::host::HostError::CommandRejected(
-                    "cannot read launch-owner process identity".into(),
-                )
-            })?,
-            claimed_at_unix_millis: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
-                .as_millis(),
-            child_pid: None,
-            child_start_time: None,
-        };
-        with_launch_owner_lock(&path, || {
-            let owner = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<PreviewLaunchOwner>(&bytes).ok());
-            let Some(owner) = owner else {
-                write_json_atomic(&path, "owner", &current)?;
-                return Ok((nonce, true));
-            };
-            if owner.nonce != nonce {
-                return Err(crate::host::HostError::DurableEffectConflict(
-                    "successor launch nonce changed".into(),
-                ));
-            }
-            if let (Some(child_pid), Some(child_start_time)) =
-                (owner.child_pid, owner.child_start_time.as_ref())
-                && process_start_time(child_pid).as_deref() == Some(child_start_time.as_str())
-            {
-                return Ok((nonce, false));
-            }
-            let identity = PreviewSupervisorIdentity {
-                pid: owner.pid,
-                start_time: owner.start_time.clone(),
-            };
-            if process_identity_is_alive(&identity) {
-                return Ok((nonce, owner.supervisor_id == current.supervisor_id));
-            }
-            let age = current
-                .claimed_at_unix_millis
-                .saturating_sub(owner.claimed_at_unix_millis);
-            if owner.child_pid.is_none() && age < 5_000 {
-                return Ok((nonce, false));
-            }
-            write_json_atomic(&path, "owner", &current)?;
-            Ok((nonce, true))
-        })
-    }
-
-    fn read_successor_evidence(&self, action: &PublicFaultAction) -> Result<PreviewChildEvidence> {
-        let bytes = std::fs::read(self.evidence_path(action))?;
-        let evidence: PreviewChildEvidence = serde_json::from_slice(&bytes)
-            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-        self.validate_successor(action, &evidence)?;
-        Ok(evidence)
-    }
-
-    async fn launch_successor(
-        &self,
-        action: &PublicFaultAction,
-        launch_nonce: &str,
-        may_spawn: bool,
-    ) -> Result<PreviewChildEvidence> {
-        let evidence_path = self.evidence_path(action);
-        let existing = with_launch_owner_lock(&self.launch_owner_path(action), || {
-            if evidence_path.exists() {
-                let evidence: PreviewChildEvidence =
-                    serde_json::from_slice(&std::fs::read(&evidence_path)?)
-                        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-                if process_start_time(evidence.child_pid).as_deref()
-                    == Some(evidence.child_start_time.as_str())
-                {
-                    self.validate_successor(action, &evidence)?;
-                    return Ok(Some(evidence));
-                }
-                std::fs::remove_file(&evidence_path)?;
-            }
-            Ok(None)
-        })?;
-        if let Some(evidence) = existing {
-            return Ok(evidence);
-        }
-        if self.active_child.lock().await.is_some() {
-            return self.await_successor_evidence(action, launch_nonce).await;
-        }
-        if !may_spawn {
-            return self.await_successor_evidence(action, launch_nonce).await;
-        }
-        if let Some(parent) = evidence_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let shutdown_path = self.shutdown_path(action);
-        if shutdown_path.exists() {
-            std::fs::remove_file(&shutdown_path)?;
-        }
-        let mut command = tokio::process::Command::new(&self.child.executable);
-        command
-            .args(&self.child.arguments)
-            .envs(&self.child.environment)
-            .env("KUBERIC_PREVIEW_CHILD_OUTPUT", &evidence_path)
-            .env("KUBERIC_PREVIEW_DATA_ROOT", &self.data_root)
-            .env("KUBERIC_PREVIEW_CHILD_MODE", "successor")
-            .env("KUBERIC_PREVIEW_SHUTDOWN", &shutdown_path)
-            .env("KUBERIC_PREVIEW_POD_UID", action.resources.pod_uid.as_str())
-            .env("KUBERIC_PREVIEW_PVC_UID", action.resources.pvc_uid.as_str())
-            .env("KUBERIC_PREVIEW_LAUNCH_NONCE", launch_nonce)
-            .env("KUBERIC_PREVIEW_SUPERVISOR_ID", &self.instance_id)
-            .env(
-                "KUBERIC_PREVIEW_LAUNCH_OWNER",
-                self.launch_owner_path(action),
-            );
-        let child = command.spawn()?;
-        let child_pid = child.id().ok_or_else(|| {
-            crate::host::HostError::CommandRejected("successor child has no PID".into())
-        })?;
-        let child_start_time = process_start_time(child_pid).ok_or_else(|| {
-            crate::host::HostError::CommandRejected(
-                "cannot read successor child process identity".into(),
-            )
-        })?;
-        self.record_launched_child(action, launch_nonce, child_pid, &child_start_time)?;
-        *self.active_child.lock().await = Some(child);
-        self.await_successor_evidence(action, launch_nonce).await
-    }
-
-    fn record_launched_child(
-        &self,
-        action: &PublicFaultAction,
-        launch_nonce: &str,
-        child_pid: u32,
-        child_start_time: &str,
-    ) -> Result<()> {
-        let path = self.launch_owner_path(action);
-        with_launch_owner_lock(&path, || {
-            let mut owner: PreviewLaunchOwner = serde_json::from_slice(&std::fs::read(&path)?)
-                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-            if owner.nonce != launch_nonce || owner.supervisor_id != self.instance_id {
-                return Err(crate::host::HostError::IdentityMismatch(
-                    "launch owner nonce changed before child publication".into(),
-                ));
-            }
-            owner.child_pid = Some(child_pid);
-            owner.child_start_time = Some(child_start_time.into());
-            write_json_atomic(&path, "parent", &owner)
-        })
-    }
-
-    async fn await_successor_evidence(
-        &self,
-        action: &PublicFaultAction,
-        launch_nonce: &str,
-    ) -> Result<PreviewChildEvidence> {
-        let evidence_path = self.evidence_path(action);
-        for _ in 0..500 {
-            if evidence_path.exists() {
-                let evidence = self.read_successor_evidence(action)?;
-                if evidence.launch_nonce != launch_nonce {
-                    return Err(crate::host::HostError::IdentityMismatch(
-                        "successor evidence launch nonce changed".into(),
-                    ));
-                }
-                return Ok(evidence);
-            }
-            let status = {
-                let mut child = self.active_child.lock().await;
-                match child.as_mut() {
-                    Some(child) => child.try_wait()?,
-                    None => None,
-                }
-            };
-            if let Some(status) = status {
-                self.active_child.lock().await.take();
-                return Err(crate::host::HostError::CommandRejected(format!(
-                    "successor child exited before readiness with {status}"
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        Err(crate::host::HostError::CommandRejected(
-            "successor child readiness timed out".into(),
-        ))
-    }
-
-    pub(crate) async fn shutdown_successor(&self, action: &PublicFaultAction) -> Result<()> {
-        let shutdown_path = self.shutdown_path(action);
-        if let Some(parent) = shutdown_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&shutdown_path, b"shutdown")?;
-        if let Some(mut child) = self.active_child.lock().await.take() {
-            let status = child.wait().await?;
-            if !status.success() {
-                return Err(crate::host::HostError::CommandRejected(format!(
-                    "successor child shutdown failed with {status}"
-                )));
-            }
-        } else if let Some(process_id) = self
-            .store
-            .restart_action()
-            .await?
-            .and_then(|record| record.successor_process_id)
-        {
-            for _ in 0..500 {
-                if !Path::new(&format!("/proc/{process_id}")).exists() {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            return Err(crate::host::HostError::CommandRejected(
-                "adopted successor did not stop".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_successor(
-        &self,
-        action: &PublicFaultAction,
-        evidence: &PreviewChildEvidence,
-    ) -> Result<()> {
-        if evidence.process_session.is_empty()
-            || evidence.process_session == action.predecessor_session
-            || evidence.child_pid == 0
-            || process_start_time(evidence.child_pid).as_deref()
-                != Some(evidence.child_start_time.as_str())
-            || evidence.data_root != self.data_root
-            || evidence.pod_uid != action.resources.pod_uid
-            || evidence.pvc_uid != action.resources.pvc_uid
-            || evidence.provider_sentinel.is_empty()
-            || evidence.application_instance_id.is_empty()
-            || evidence.replicator_instance_id.is_empty()
-            || evidence.callbacks
-                != [
-                    "replicator.open",
-                    "replicator.change_role.none",
-                    "application.change_role.none",
-                ]
-        {
-            return Err(crate::host::HostError::IdentityMismatch(
-                "successor child evidence changed storage, process, or construction identity"
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-fn process_start_time(pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, fields) = stat.rsplit_once(") ")?;
-    fields.split_whitespace().nth(19).map(str::to_string)
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-fn process_identity_is_alive(identity: &PreviewSupervisorIdentity) -> bool {
-    process_start_time(identity.pid).as_deref() == Some(identity.start_time.as_str())
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-fn with_launch_owner_lock<T>(
-    owner_path: &Path,
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let lock = owner_path.with_extension("lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock)?;
-    file.lock()?;
-    let result = operation();
-    file.unlock()?;
-    result
-}
-
-#[cfg(all(feature = "testing", kuberic_workspace_tests))]
-fn write_json_atomic(path: &Path, tag: &str, value: &impl serde::Serialize) -> Result<()> {
-    let temporary = path.with_extension(format!(
-        "{tag}.{}.{}.tmp",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    use std::io::Write;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -751,14 +84,12 @@ pub struct ReplicaHandle {
     runtime: Arc<PodRuntime>,
     store: Arc<SqliteStore>,
     process_session: Arc<str>,
-    #[cfg(feature = "testing")]
-    preview: Option<PreviewProcessHandle>,
+    replacement: Option<ReplacementProcessHandle>,
 }
 
-#[cfg(feature = "testing")]
 #[derive(Clone)]
-struct PreviewProcessHandle {
-    binding: PreviewLifecycleBinding,
+struct ReplacementProcessHandle {
+    binding: PublicV1LifecycleBinding,
     registry: Arc<crate::host::operation::PartitionOperationRegistry>,
     report_sequence: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -766,89 +97,84 @@ struct PreviewProcessHandle {
 impl ReplicaHandle {
     pub async fn diagnostics(&self) -> Result<ReplicaDiagnostics> {
         let state = self.store.load_state().await?;
-        let snapshot = self.runtime.snapshot().await;
+        let blocking = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| {
+                let operation_id = preview.current_operation.as_ref()?;
+                let record = preview.operations.get(operation_id)?;
+                Some(format!(
+                    "{:?}/{:?}",
+                    record.stage, record.lifecycle.in_flight
+                ))
+            });
+        let (
+            _open,
+            _replication_address,
+            role,
+            read_status,
+            write_status,
+            current_progress,
+            committed_lsn,
+        ) = self.runtime.diagnostic_projection().await;
         Ok(ReplicaDiagnostics {
             replica_id: state.identity.local_identity.replica_id.value(),
             instance_id: state.identity.local_identity.instance_id.to_string(),
             agent_generation: state.identity.local_identity.agent_generation.to_string(),
             process_session: self.process_session.to_string(),
-            role: format!("{:?}", snapshot.role),
-            epoch: format!(
-                "{}.{}",
-                state.highest_epoch.data_loss_number, state.highest_epoch.configuration_number
-            ),
-            previous_configuration: state
-                .previous_configuration
-                .map(|configuration| configuration.configuration_id.to_string()),
-            current_configuration: state
-                .current_configuration
-                .map(|configuration| configuration.configuration_id.to_string()),
-            current_progress: snapshot.current_progress,
-            verified_replication_lsn: snapshot.verified_replication_lsn,
-            committed_lsn: snapshot.committed_lsn,
-            read_status: format!("{:?}", snapshot.read_status),
-            write_status: format!("{:?}", snapshot.write_status),
-            catch_up_boundary_lsn: snapshot.catch_up_boundary,
-            catch_up_complete: snapshot.catch_up_complete,
-            scale_up_operation: state
-                .scale_up_evidence
-                .as_deref()
-                .map(|evidence| evidence.intent().operation_id.to_string()),
-            retired: state.retired_authority.is_some() || snapshot.retired_authority.is_some(),
+            role: format!("{role:?}"),
+            epoch: state
+                .public_v1_operation_state
+                .as_ref()
+                .and_then(|preview| preview.history.as_ref())
+                .map_or_else(
+                    || "0.0".to_string(),
+                    |history| {
+                        format!(
+                            "{}.{}",
+                            history.data_loss_number,
+                            history.protocol_generation.value()
+                        )
+                    },
+                ),
+            previous_configuration: None,
+            current_configuration: None,
+            current_progress,
+            verified_replication_lsn: None,
+            committed_lsn,
+            read_status: format!("{read_status:?}"),
+            write_status: format!("{write_status:?}"),
+            catch_up_boundary_lsn: None,
+            catch_up_complete: current_progress == committed_lsn,
+            scale_up_operation: None,
+            retired: state
+                .public_v1_operation_state
+                .as_ref()
+                .is_some_and(|preview| preview.terminal),
             pending_operation: state
-                .reconfiguration
+                .public_v1_operation_state
                 .as_ref()
-                .map(|record| record.command.operation_id.to_string())
-                .or_else(|| {
-                    state
-                        .pending_effect
-                        .as_ref()
-                        .map(|pending| pending.effect.operation_id.to_string())
-                }),
-            blocking: state
-                .reconfiguration
-                .as_ref()
-                .map(|record| {
-                    format!(
-                        "configuration:{:?}:{}",
-                        record.stage, record.command.operation_id
-                    )
-                })
-                .or_else(|| {
-                    state.pending_effect.as_ref().map(|pending| {
-                        format!("effect:{:?}:{}", pending.stage, pending.effect.operation_id)
-                    })
-                }),
-            builds: snapshot
-                .builds
-                .into_iter()
-                .map(|build| ReplicaBuildDiagnostics {
-                    build_id: build.authority.build_id.to_string(),
-                    target_instance: build.authority.target.instance_id.to_string(),
-                    replication_boundary_lsn: build.authority.replication_boundary_lsn,
-                    durable_lsn: build.durable_lsn,
-                    completed: build.completed,
-                    catch_up_boundary_lsn: build.catch_up_boundary_lsn,
-                })
-                .collect(),
+                .and_then(|preview| preview.current_operation.as_ref().map(ToString::to_string)),
+            blocking,
+            builds: Vec::new(),
         })
     }
 
     #[cfg(feature = "testing")]
-    pub async fn initialize_stateless_preview_history(
+    pub async fn initialize_public_v1_history(
         &self,
         initialization_id: &crate::protocol::types::HistoryInitializationId,
         history: &crate::protocol::types::HistoryContext,
         storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
     ) -> Result<()> {
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
-        if !preview.binding.preview.is_public_v1() {
+        if !preview.binding.identity.is_public_v1() {
             return Err(crate::host::HostError::IdentityMismatch(
-                "stateless preview requires Public V1".into(),
+                "replacement runtime requires Public V1".into(),
             ));
         }
         self.store
@@ -857,45 +183,68 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn install_stateless_preview_inbound_build_authority(
+    pub async fn install_public_v1_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
-        if !preview.binding.preview.is_public_v1()
+        if !preview.binding.identity.is_public_v1()
             || authority.attempt.target != self.store.load_state().await?.identity.local_identity
         {
             return Err(crate::host::HostError::IdentityMismatch(
-                "inbound build authority differs from selected preview target".into(),
+                "inbound build authority differs from the replacement target".into(),
             ));
         }
         self.runtime
-            .install_stateless_preview_inbound_build_authority(authority)
+            .install_replacement_inbound_build_authority(authority)
             .await
             .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
     }
 
     #[cfg(feature = "testing")]
-    pub async fn execute_stateless_preview(
+    pub async fn revoke_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with Public V1 replacement authority".into(),
+            )
+        })?;
+        if !preview.binding.identity.is_public_v1()
+            || authority.attempt.target != self.store.load_state().await?.identity.local_identity
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "inbound build authority differs from the replacement target".into(),
+            ));
+        }
+        self.runtime
+            .revoke_replacement_inbound_build_authority(authority)
+            .await
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn execute_public_v1(
         &self,
         intent: crate::protocol::public_operations::PublicOperationIntent,
     ) -> Result<()> {
         use crate::host::state::{PublicOperationDisposition, PublicOperationStage};
 
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
-        if intent.preview != preview.binding.preview
+        if intent.identity != preview.binding.identity
             || intent.process_session_id.as_str() != self.process_session.as_ref()
         {
             return Err(crate::host::HostError::IdentityMismatch(
-                "public operation differs from the selected preview process".into(),
+                "public operation differs from the replacement process".into(),
             ));
         }
         let terminal_program = matches!(
@@ -916,7 +265,7 @@ impl ReplicaHandle {
                     | crate::protocol::public_operations::PublicOperationProgram::Build(_)
             )
         ) {
-            self.runtime.fence_stateless_preview_access().await;
+            self.runtime.fence_replacement_access().await;
         }
         let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
         if matches!(
@@ -952,7 +301,7 @@ impl ReplicaHandle {
             )));
         }
         if open_program {
-            self.runtime.complete_stateless_preview_open().await;
+            self.runtime.complete_replacement_open().await;
             let state = self.store.load_state().await?;
             if state
                 .application_storage
@@ -964,7 +313,7 @@ impl ReplicaHandle {
         }
         if !terminal_program {
             self.runtime
-                .refresh_stateless_preview_projection(
+                .refresh_replacement_projection(
                     self.store.as_ref(),
                     &crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref()),
                     true,
@@ -975,13 +324,13 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn execute_stateless_preview_command(
+    pub async fn execute_public_v1_command(
         &self,
         command: crate::protocol::command::ProtocolCommand,
     ) -> Result<()> {
         let crate::protocol::command::ProtocolCommand::PublicV1Operation(command) = command else {
             return Err(crate::host::HostError::CommandRejected(
-                "stateless preview operation dispatcher received another command".into(),
+                "replacement operation dispatcher received another command".into(),
             ));
         };
         command
@@ -993,48 +342,48 @@ impl ReplicaHandle {
                 "public-v1 operation command targets another replica".into(),
             ));
         }
-        self.execute_stateless_preview(command.intent).await
+        self.execute_public_v1(command.intent).await
     }
 
     #[cfg(feature = "testing")]
-    pub async fn fence_stateless_preview_access(&self) {
-        self.runtime.fence_stateless_preview_access().await;
+    pub async fn fence_public_v1_access(&self) {
+        self.runtime.fence_replacement_access().await;
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_process_endpoint(
+    pub async fn public_v1_process_endpoint(
         &self,
         role: crate::protocol::types::ReplicaRole,
     ) -> Result<crate::protocol::types::ProcessSessionEndpoint> {
         let state = self.store.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "stateless preview process endpoint requires schema-11 state".into(),
+                "replacement process endpoint requires current state".into(),
             )
         })?;
         Ok(crate::protocol::types::ProcessSessionEndpoint {
             identity: state.identity.local_identity,
             process_session_id: self.process_session_id(),
-            replicator_creation_id: self.runtime.stateless_preview_replicator_creation_id()?,
+            replicator_creation_id: self.runtime.replacement_replicator_creation_id()?,
             role,
             storage_incarnation: preview.storage_incarnation.ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview process endpoint lacks storage authority".into(),
+                    "replacement process endpoint lacks storage authority".into(),
                 )
             })?,
         })
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_next_operation_revision(&self) -> Result<u64> {
+    pub async fn public_v1_next_operation_revision(&self) -> Result<u64> {
         let preview = self
             .store
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview requires schema-11 operation state".into(),
+                    "replacement runtime requires operation state".into(),
                 )
             })?;
         preview
@@ -1046,13 +395,13 @@ impl ReplicaHandle {
             .checked_add(1)
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview operation revision exhausted".into(),
+                    "replacement operation revision exhausted".into(),
                 )
             })
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_operation_intent(
+    pub async fn public_v1_operation_intent(
         &self,
         operation_id: &crate::protocol::types::OperationId,
     ) -> Result<Option<crate::protocol::public_operations::PublicOperationIntent>> {
@@ -1060,10 +409,10 @@ impl ReplicaHandle {
             .store
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
-                    "stateless preview requires schema-11 operation state".into(),
+                    "replacement runtime requires operation state".into(),
                 )
             })?;
         Ok(preview
@@ -1073,7 +422,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn authorize_stateless_preview_session_renewal(
+    pub async fn authorize_public_v1_session_renewal(
         &self,
         required: crate::protocol::public_operations::ProcessSessionRenewalRequired,
     ) -> Result<crate::protocol::public_operations::PublicV1SessionRenewalStatus> {
@@ -1153,7 +502,7 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn persist_stateless_preview_session_renewal(
+    pub async fn persist_public_v1_session_renewal(
         &self,
         expected: Option<&crate::protocol::public_operations::PublicV1SessionRenewalStatus>,
         next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
@@ -1164,21 +513,21 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub async fn stateless_preview_report(
+    pub async fn public_v1_report(
         &self,
     ) -> Result<crate::protocol::public_operations::PublicV1AgentReport> {
-        let preview = self.preview.as_ref().ok_or_else(|| {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
             crate::host::HostError::CommandRejected(
-                "replica was not constructed with stateless preview selection".into(),
+                "replica was not constructed with Public V1 replacement authority".into(),
             )
         })?;
         let session = crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref());
         self.runtime
-            .refresh_stateless_preview_projection(self.store.as_ref(), &session, false)
+            .refresh_replacement_projection(self.store.as_ref(), &session, false)
             .await?;
         let projection = self
             .runtime
-            .stateless_preview_report_projection(
+            .replacement_report_projection(
                 session,
                 preview
                     .report_sequence
@@ -1187,7 +536,7 @@ impl ReplicaHandle {
             .await?;
         crate::host::public_lifecycle::public_v1_report(
             self.store.as_ref(),
-            &preview.binding.preview,
+            &preview.binding.identity,
             projection,
         )
         .await
@@ -1199,8 +548,15 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
-    pub fn stateless_preview_provider_writer_count(&self) -> usize {
+    pub fn public_v1_provider_writer_count(&self) -> usize {
         self.runtime.provider_writer_lease_count()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn public_v1_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
+        self.runtime
+            .replacement_raw_retained_task_cardinality()
+            .map_err(Into::into)
     }
 }
 
@@ -1241,8 +597,8 @@ pub struct ReplicaHost<A, R> {
     application: Arc<A>,
     application_storage: ApplicationStorageState,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
-    resolver: Arc<R>,
-    preview_binding: Option<PreviewLifecycleBinding>,
+    _resolver: Arc<R>,
+    public_v1_binding: Option<PublicV1LifecycleBinding>,
 }
 
 impl<A, R> ReplicaHost<A, R>
@@ -1257,18 +613,22 @@ where
         resolver: Arc<R>,
     ) -> Self {
         Self {
+            public_v1_binding: Some(PublicV1LifecycleBinding {
+                identity: PublicV1Identity::new(1),
+                resource_uid: config.resource_uid.clone(),
+                spec_generation: 1,
+                state_persistence: StatePersistence::Persisted,
+            }),
             config,
             application,
             application_storage,
             application_storage_paths: None,
-            resolver,
-            preview_binding: None,
+            _resolver: resolver,
         }
     }
 
-    #[cfg(feature = "testing")]
-    pub fn with_stateless_preview(mut self, binding: PreviewLifecycleBinding) -> Self {
-        self.preview_binding = Some(binding);
+    pub fn with_public_v1_binding(mut self, binding: PublicV1LifecycleBinding) -> Self {
+        self.public_v1_binding = Some(binding);
         self
     }
 
@@ -1304,20 +664,18 @@ where
                 "replica ID must be positive".into(),
             ));
         }
-        if self.config.transport_window_capacity == 0 {
-            return Err(crate::host::HostError::Backpressure(
-                "transport window capacity must be positive".into(),
+        let binding = self.public_v1_binding.as_ref().ok_or_else(|| {
+            crate::host::HostError::InitializationNotAuthorized(
+                "Public V1 lifecycle binding is required".into(),
+            )
+        })?;
+        binding.validate().map_err(|message| {
+            crate::host::HostError::InitializationNotAuthorized(message.into())
+        })?;
+        if !binding.identity.is_public_v1() || binding.resource_uid != self.config.resource_uid {
+            return Err(crate::host::HostError::InitializationNotAuthorized(
+                "Public V1 binding differs from the selected process identity".into(),
             ));
-        }
-        if let Some(binding) = self.preview_binding.as_ref() {
-            binding.validate().map_err(|message| {
-                crate::host::HostError::InitializationNotAuthorized(message.into())
-            })?;
-            if !binding.preview.is_public_v1() || binding.resource_uid != self.config.resource_uid {
-                return Err(crate::host::HostError::InitializationNotAuthorized(
-                    "stateless preview binding differs from the selected process identity".into(),
-                ));
-            }
         }
         let observed = ObservedStorageIdentity {
             resource_uid: self.config.resource_uid.clone(),
@@ -1343,7 +701,7 @@ where
                 self.application_storage == ApplicationStorageState::FreshEmpty,
                 paths.clone(),
                 startup_shutdown.clone(),
-                self.preview_binding.clone(),
+                self.public_v1_binding.clone(),
             )
             .await?;
         }
@@ -1351,144 +709,39 @@ where
             return Ok(None);
         }
 
-        let store = Arc::new(match self.preview_binding.as_ref() {
-            Some(binding) => {
-                #[cfg(feature = "testing")]
-                {
-                    SqliteStore::open_preview_bound_existing(&database_path, None, binding)?
-                }
-                #[cfg(not(feature = "testing"))]
-                {
-                    let _ = binding;
-                    return Err(crate::host::HostError::InitializationNotAuthorized(
-                        "stateless preview is unavailable in production construction".into(),
-                    ));
-                }
-            }
-            None => SqliteStore::open_existing(&database_path, None)?,
-        });
+        let store = Arc::new(SqliteStore::open_replacement_for_process(
+            &database_path,
+            &observed,
+            self.config.replica_id,
+            paths.as_ref(),
+            binding,
+        )?);
         let identity = store.identity().await?;
-        validate_established_identity(&identity, &observed, self.config.replica_id)?;
-        let state = store.load_state().await?;
-        if state
-            .application_storage
-            .as_ref()
-            .map(|binding| &binding.paths)
-            != paths.as_ref()
-        {
-            store
-                .record_partition_reports(state.load_metrics, Some(FaultType::Permanent))
-                .await?;
-            return Err(crate::host::HostError::InitializationNotAuthorized(
-                "application storage paths differ from the authorized agent binding".into(),
-            ));
-        }
-        let runtime = Arc::new(match self.preview_binding.clone() {
-            Some(binding) => {
-                #[cfg(feature = "testing")]
-                {
-                    PodRuntime::new_stateless_preview(
-                        identity.local_identity.clone(),
-                        self.application,
-                        store.clone(),
-                        binding,
-                        self.config.replication_address,
-                    )
-                }
-                #[cfg(not(feature = "testing"))]
-                {
-                    let _ = binding;
-                    unreachable!("preview selection is rejected above")
-                }
-            }
-            None => PodRuntime::new(
-                identity.local_identity.clone(),
-                self.application,
-                store.clone(),
-            ),
-        });
+        let runtime = Arc::new(PodRuntime::new_replacement(
+            identity.local_identity.clone(),
+            self.application,
+            store.clone(),
+            binding.clone(),
+            self.config.replication_address,
+        ));
         let agent = AgentService::new(
             store.clone(),
             runtime.clone(),
-            runtime.clone(),
             self.config.bearer_token.clone(),
         )?;
-        let local_session = agent.sessions().local_session().clone();
-        let sessions = agent.sessions().clone();
+        let local_session = agent.local_session().clone();
         let process_session: Arc<str> = Arc::from(local_session.as_str());
-        #[cfg(feature = "testing")]
-        let preview_registry = match self.preview_binding.as_ref() {
-            Some(binding) => Some(
-                agent
-                    .public_operation_preview_runtime(binding.preview.clone())
-                    .await?,
-            ),
-            None => None,
-        };
+        let replacement_registry = agent
+            .public_operation_runtime(binding.identity.clone())
+            .await?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (ready, mut ready_rx) = watch::channel(false);
-        #[cfg(feature = "testing")]
-        let mut agent_task = if self.preview_binding.is_some() {
-            tokio::spawn(agent.serve_control_only(
-                self.config.control_address,
-                ready,
-                shutdown_rx.clone(),
-            ))
-        } else {
-            tokio::spawn(agent.serve(
-                self.config.control_address,
-                self.config.replication_address,
-                ready,
-                shutdown_rx.clone(),
-            ))
-        };
-        #[cfg(not(feature = "testing"))]
-        let mut agent_task = tokio::spawn(agent.serve(
+        let mut agent_task = tokio::spawn(agent.serve_control_only(
             self.config.control_address,
-            self.config.replication_address,
             ready,
             shutdown_rx.clone(),
         ));
-        let preview_selected = self.preview_binding.is_some();
-        let (mut outbound_task, mut peer_task) = if preview_selected {
-            (
-                tokio::spawn(std::future::pending::<Result<()>>()),
-                tokio::spawn(std::future::pending::<Result<()>>()),
-            )
-        } else {
-            let transport = Arc::new(Mutex::new(ReliableTransport::new(
-                local_session,
-                self.config.transport_window_capacity,
-            )?));
-            let dispatcher = Arc::new(GrpcOutboundDispatcher::new(
-                runtime.build_runtime(),
-                transport.clone(),
-                self.resolver,
-                self.config.resource_uid.to_string(),
-                self.config.bearer_token,
-                self.config.rpc_deadline,
-            )?);
-            (
-                tokio::spawn(run_outbound(
-                    Arc::new(runtime.outbound_runtime()),
-                    transport.clone(),
-                    dispatcher.clone(),
-                    shutdown_rx.clone(),
-                )),
-                tokio::spawn(run_peer_discovery(
-                    identity.local_identity,
-                    Arc::new(runtime.peer_discovery_runtime()),
-                    store.clone(),
-                    transport,
-                    dispatcher,
-                    sessions,
-                    shutdown_rx,
-                )),
-            )
-        };
         let mut agent_finished = false;
-        let mut outbound_finished = false;
-        let mut peer_finished = false;
         let startup_result = tokio::select! {
             biased;
             result = &mut agent_task => {
@@ -1498,26 +751,6 @@ where
                     Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
                     Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
                         "agent service stopped before becoming ready".into(),
-                    )),
-                }
-            }
-            result = &mut outbound_task => {
-                outbound_finished = true;
-                match result {
-                    Ok(Err(error)) => Err(error),
-                    Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
-                    Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
-                        "outbound progress stopped before agent readiness".into(),
-                    )),
-                }
-            }
-            result = &mut peer_task => {
-                peer_finished = true;
-                match result {
-                    Ok(Err(error)) => Err(error),
-                    Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
-                    Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
-                        "peer discovery stopped before agent readiness".into(),
                     )),
                 }
             }
@@ -1540,8 +773,6 @@ where
         };
         if !matches!(startup_result, Ok(true)) {
             shutdown.send_replace(true);
-            let outbound = abort_progress(&mut outbound_task, outbound_finished).await;
-            let peer = abort_progress(&mut peer_task, peer_finished).await;
             let cleanup = if agent_finished {
                 Ok(())
             } else {
@@ -1556,35 +787,18 @@ where
                     result => result,
                 };
             let result = with_shutdown_error(startup_result.map(|_| ()), cleanup, "agent shutdown");
-            let result = with_shutdown_error(result, outbound, "outbound shutdown");
-            with_shutdown_error(result, peer, "peer discovery shutdown")?;
+            result?;
             return Ok(None);
         }
         let supervisor_shutdown = shutdown.clone();
         let supervisor_runtime = runtime.clone();
         let completion = tokio::spawn(async move {
-            let (first, finished) = tokio::select! {
-                result = &mut agent_task => (result, 0),
-                result = &mut outbound_task => (result, 1),
-                result = &mut peer_task => (result, 2),
-            };
+            let first = (&mut agent_task).await;
             supervisor_shutdown.send_replace(true);
-            let outbound = abort_progress(&mut outbound_task, finished == 1).await;
-            let peer = abort_progress(&mut peer_task, finished == 2).await;
-            // Joining the agent is the persistence acknowledgement. Aborting its
-            // wrapper task can otherwise discard an accepted fault during shutdown.
-            let cleanup = if finished == 0 {
-                Ok(())
-            } else {
-                finish_agent(&mut agent_task).await
-            };
             supervisor_runtime.abort();
-            let first = first
+            first
                 .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
-                .and_then(|result| result);
-            let result = with_shutdown_error(cleanup, first, "replica task");
-            let result = with_shutdown_error(result, outbound, "outbound shutdown");
-            with_shutdown_error(result, peer, "peer discovery shutdown")
+                .and_then(|result| result)
         });
 
         Ok(Some(RunningReplica {
@@ -1592,15 +806,11 @@ where
                 runtime,
                 store,
                 process_session,
-                #[cfg(feature = "testing")]
-                preview: self
-                    .preview_binding
-                    .zip(preview_registry)
-                    .map(|(binding, registry)| PreviewProcessHandle {
-                        binding,
-                        registry,
-                        report_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                    }),
+                replacement: Some(ReplacementProcessHandle {
+                    binding: self.public_v1_binding.expect("validated Public V1 binding"),
+                    registry: replacement_registry,
+                    report_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                }),
             },
             shutdown,
             completion,
@@ -1608,6 +818,7 @@ where
     }
 }
 
+#[cfg(test)]
 async fn abort_progress(
     task: &mut tokio::task::JoinHandle<Result<()>>,
     finished: bool,
@@ -1633,8 +844,17 @@ fn with_shutdown_error(primary: Result<()>, cleanup: Result<()>, context: &str) 
     }
 }
 
+const AGENT_SHUTDOWN_TIMEOUT: Duration = SHUTDOWN_TIMEOUT.saturating_add(Duration::from_secs(1));
+
 async fn finish_agent(task: &mut tokio::task::JoinHandle<Result<()>>) -> Result<()> {
-    match tokio::time::timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(1), &mut *task).await {
+    finish_agent_with_timeout(task, AGENT_SHUTDOWN_TIMEOUT).await
+}
+
+async fn finish_agent_with_timeout(
+    task: &mut tokio::task::JoinHandle<Result<()>>,
+    timeout: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(timeout, &mut *task).await {
         Ok(result) => {
             result.map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))?
         }
@@ -1655,7 +875,7 @@ async fn serve_initialization(
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     mut startup_shutdown: watch::Receiver<bool>,
-    preview_binding: Option<PreviewLifecycleBinding>,
+    public_v1_binding: Option<PublicV1LifecycleBinding>,
 ) -> Result<()> {
     let (initialized, mut initialized_rx) = watch::channel(false);
     let service = InitializationService::new(
@@ -1667,14 +887,7 @@ async fn serve_initialization(
         fresh_application_state,
     )?
     .with_application_storage_paths(application_storage_paths);
-    #[cfg(feature = "testing")]
-    let service = service.with_stateless_preview(preview_binding);
-    #[cfg(not(feature = "testing"))]
-    if preview_binding.is_some() {
-        return Err(crate::host::HostError::InitializationNotAuthorized(
-            "stateless preview is unavailable in production construction".into(),
-        ));
-    }
+    let service = service.with_public_v1_binding(public_v1_binding);
     let (shutdown, shutdown_rx) = watch::channel(false);
     let (ready, _) = watch::channel(false);
     let stop = tokio::spawn(async move {
@@ -1773,5 +986,19 @@ mod shutdown_tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn agent_shutdown_timeout_is_exactly_eleven_seconds() {
+        let mut agent = tokio::spawn(std::future::pending::<Result<()>>());
+        assert!(
+            finish_agent_with_timeout(&mut agent, Duration::from_millis(10))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("shutdown acknowledgement timed out")
+        );
+        assert_eq!(AGENT_SHUTDOWN_TIMEOUT, Duration::from_secs(11));
+        assert!(agent.is_finished());
     }
 }

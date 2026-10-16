@@ -12,10 +12,6 @@ use crate::build::{PgLineage, decode, encode};
 use crate::durable::{PgDurableError, PgDurableRole};
 use crate::native::{AcknowledgementPolicy, PgReplicationEvidence};
 
-#[cfg(all(test, feature = "testing"))]
-#[path = "promotion_status_tests.rs"]
-mod promotion_status_tests;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryStage {
     PolicyInvalidated,
@@ -363,7 +359,32 @@ mod connection_validation_tests {
     use super::*;
     use crate::build::PgLineage;
     use crate::durable::{PgDurableIdentity, PgDurableStore, StorageMode};
-    use crate::testing::{TestDataDir, native_configuration, native_identity};
+    use crate::testing::{native_configuration, native_identity};
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "kuberic-postgres-recovery-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum MalformedConnection {
@@ -465,7 +486,7 @@ mod connection_validation_tests {
     async fn malformed_streaming_connection_is_rejected_with_or_without_follow_receipt() {
         for followed in [false, true] {
             for malformed in MalformedConnection::all() {
-                let directory = TestDataDir::new("invalid-streaming-connection");
+                let directory = TestDirectory::new();
                 let local = native_identity(2, "local");
                 let identity = PgDurableIdentity {
                     resource_uid: ResourceUid::new("postgres-native-test"),
@@ -2210,10 +2231,6 @@ fn validate_observation(policy: &Policy, observation: &Observation, drained: boo
 
     Ok(())
 }
-
-#[cfg(all(test, feature = "testing"))]
-#[path = "recovery_subset_tests.rs"]
-mod subset_tests;
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {

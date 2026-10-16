@@ -5,18 +5,11 @@
 //! none of these records can be passed to production admission APIs. Private
 //! attachment, registration, lifecycle, and authority capabilities stay private.
 
-pub mod authority;
-pub mod copy;
-pub mod effects;
-pub mod hosting;
+mod public_v1_alternate_registration_fixture;
 mod public_v1_conformance;
-pub mod report;
-pub mod runtime_adapter;
-pub mod service;
 pub mod session;
 pub mod sqlite_store;
 pub mod state;
-pub mod transport;
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -26,25 +19,13 @@ fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> U {
 }
 
 pub use public_v1_conformance::{
-    assert_public_v1_conformance_gate, assert_public_v1_conformance_not_applicable,
-    assert_public_v1_conformance_subject, execute_public_v1_conformance_subject,
-    public_v1_postgres_conformance_scenarios,
+    ReplacementOwnershipInventory, assert_public_v1_conformance_gate,
+    assert_public_v1_conformance_not_applicable, assert_public_v1_conformance_subject,
+    execute_public_v1_conformance_subject, public_v1_postgres_conformance_scenarios,
+    replacement_ownership_inventory,
+    replacement_ownership_inventory_with_alternate_controller_fixture,
+    replacement_ownership_inventory_with_alternate_factory_fixture,
+    replacement_ownership_inventory_with_alternate_protocol_fixture,
+    replacement_ownership_inventory_with_extra_endpoint_fixture,
+    validate_replacement_ownership_inventory,
 };
-pub use transport::{
-    ControlOutput, DeliveryId, InProcessTransport, Message, PumpReport, TransportError,
-    TransportEvent,
-};
-
-pub async fn describe_peer(
-    runtime: &hosting::PodRuntime,
-    replica: crate::replicator::ReplicaInformation,
-) -> crate::Result<()> {
-    crate::host::testing::describe_peer(&runtime.inner, replica).await
-}
-
-pub async fn execute_build(
-    runtime: &hosting::PodRuntime,
-    replica: crate::replicator::ReplicaInformation,
-) -> crate::Result<()> {
-    crate::host::testing::execute_build(&runtime.inner, replica).await
-}

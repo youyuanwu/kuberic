@@ -13,10 +13,11 @@ pub mod proto {
 
 pub use convert::{
     CopyAcknowledgement, CopyEnvelope, ExecuteEnvelope, ReplicationAcknowledgement,
-    ReplicationEnvelope, WireError, configuration_command_to_proto, ensure_supported_version,
-    normalize_agent_status_report, normalize_copy_ack, normalize_copy_item,
-    normalize_execute_request, normalize_public_v1_agent_status_report, normalize_replication_ack,
-    normalize_replication_item, public_v1_agent_status_to_proto, validate_agent_status_report,
-    validate_copy_ack, validate_copy_item, validate_execute_request, validate_replication_ack,
+    ReplicationEnvelope, WireError, ensure_supported_version, normalize_copy_ack,
+    normalize_copy_item, normalize_execute_request, normalize_public_v1_agent_status_report,
+    normalize_replication_ack, normalize_replication_item,
+    normalize_uninitialized_agent_status_report, public_v1_agent_status_to_proto,
+    public_v1_history_command_to_proto, public_v1_operation_command_to_proto, validate_copy_ack,
+    validate_copy_item, validate_execute_request, validate_replication_ack,
     validate_replication_item,
 };

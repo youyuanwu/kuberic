@@ -35,7 +35,6 @@ pub struct PgService {
     driver: OnceLock<Arc<PgReplicator>>,
     cancellation: CancellationToken,
     coordination_token: String,
-    public_v1: bool,
 }
 
 impl PgService {
@@ -51,7 +50,6 @@ impl PgService {
             driver: OnceLock::new(),
             cancellation: CancellationToken::new(),
             coordination_token: String::new(),
-            public_v1: false,
         }
     }
 
@@ -79,12 +77,6 @@ impl PgService {
 
     pub fn with_coordination_token(mut self, token: String) -> Self {
         self.coordination_token = token;
-        self
-    }
-
-    #[cfg(feature = "testing")]
-    pub fn with_public_v1(mut self) -> Self {
-        self.public_v1 = true;
         self
     }
 
@@ -199,9 +191,8 @@ impl StatefulServiceReplica for PgService {
             .with_factory(Arc::new(PgReplicatorFactory(driver)))
             .create_replicator(
                 None,
-                self.public_v1.then(|| ReplicatorSettings {
+                Some(ReplicatorSettings {
                     replication_address: self.config.replication_address.clone(),
-                    public_v1: true,
                 }),
             )
             .await?;
@@ -252,15 +243,15 @@ impl Drop for PgService {
     }
 }
 
-struct PgReplicatorFactory(Arc<PgReplicator>);
+pub(crate) struct PgReplicatorFactory(pub(crate) Arc<PgReplicator>);
 
 impl PgReplicatorFactory {
-    fn interfaces(&self) -> ReplicatorInterfaces {
+    pub(crate) fn interfaces(&self) -> ReplicatorInterfaces {
         ReplicatorInterfaces::primary(self.0.clone(), None, ReplicatorCapabilities::conservative())
     }
 }
 
-#[cfg(all(test, feature = "testing"))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::testing::{PgPod, TestDataDir, layout::SINGLE_REPLICA_DIRECTORY, native_identity};

@@ -60,9 +60,6 @@ pub(crate) fn replayable(record: &PublicOperationRecord) -> bool {
     if record.intent.lifecycle.is_none() && record.intent.program.is_none() {
         return false;
     }
-    if record.intent.preview.is_legacy_preview() {
-        return record.lifecycle.in_flight.is_none_or(repeatable);
-    }
     record
         .lifecycle
         .in_flight
@@ -168,40 +165,6 @@ fn configuration(
         }
         _ => unreachable!("validated configuration instruction"),
     }
-}
-
-pub(crate) async fn abort(
-    registry: &Arc<PartitionOperationRegistry>,
-    store: Arc<dyn AgentStore>,
-    intent: PublicOperationIntent,
-    mut callbacks: PublicLifecycleCallbacks,
-) -> Result<()> {
-    intent
-        .validate()
-        .map_err(|message| HostError::CommandRejected(message.into()))?;
-    callbacks.validate_intent_capabilities(&intent)?;
-    if intent.program != Some(PublicOperationProgram::Abort) {
-        return Err(HostError::CommandRejected(
-            "synchronous abort requires exact abort input".into(),
-        ));
-    }
-    let operation = registry.admit(intent.clone()).await?;
-    let should_abort = !matches!(
-        operation.snapshot().stage,
-        PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-    );
-    registry.fence();
-    callbacks.aborted = registry.abort_guard();
-    if should_abort {
-        callbacks.abort_once();
-    }
-    let owner = registry.clone();
-    registry.own_control_task(async move {
-        if let Err(error) = launch(&owner, store, intent, callbacks).await {
-            tracing::warn!(%error, "aborted preview requires durable containment");
-        }
-    });
-    Ok(())
 }
 
 pub(super) async fn execute(
@@ -413,7 +376,7 @@ pub(super) async fn execute(
                     {
                         let state = store.load_state().await?;
                         let source_storage = state
-                            .public_operation_preview
+                            .public_v1_operation_state
                             .as_ref()
                             .and_then(|preview| preview.storage_incarnation.as_ref())
                             .ok_or_else(|| {

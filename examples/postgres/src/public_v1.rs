@@ -239,6 +239,14 @@ pub(super) struct PublicPg {
     fence: LifecycleFence,
     state: Mutex<PublicState>,
     work: std::sync::Mutex<CancellationToken>,
+    #[cfg(all(test, feature = "testing"))]
+    completion_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
+}
+
+#[cfg(all(test, feature = "testing"))]
+pub(crate) struct BuildCompletionGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
 impl PublicPg {
@@ -262,6 +270,8 @@ impl PublicPg {
                 built: None,
             }),
             work: std::sync::Mutex::new(CancellationToken::new()),
+            #[cfg(all(test, feature = "testing"))]
+            completion_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -269,6 +279,26 @@ impl PublicPg {
         let mut work = self.work.lock().unwrap();
         work.cancel();
         *work = CancellationToken::new();
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    fn pause_completion(&self) -> Arc<BuildCompletionGate> {
+        let gate = Arc::new(BuildCompletionGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.completion_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    async fn completion_checkpoint(&self) {
+        let gate = self.completion_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+            *self.completion_gate.lock().unwrap() = None;
+        }
     }
 }
 
@@ -349,14 +379,6 @@ impl PgReplicator {
         identity: ReplicaIdentity,
         process_session_id: ProcessSessionId,
     ) -> Result<()> {
-        if !settings.public_v1 {
-            if self.is_public_v1() {
-                return Err(application_error(
-                    "cannot downgrade immutable PostgreSQL construction",
-                ));
-            }
-            return Ok(());
-        }
         if settings.replication_address != self.coordination.local_endpoint {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -434,6 +456,11 @@ impl PgReplicator {
         self.public_v1
             .get()
             .expect("immutable Public V1 construction")
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn pause_public_build_completion(&self) -> Arc<BuildCompletionGate> {
+        self.public_owner().pause_completion()
     }
 
     async fn public_owned<T>(
@@ -1499,7 +1526,11 @@ impl PgReplicator {
                         .await
                         .map_err(application_error)?;
                     self.public_source(&binding).await?;
+                    #[cfg(all(test, feature = "testing"))]
+                    self.public_owner().completion_checkpoint().await;
+                    self.public_owner().fence.validate_binding(&binding)?;
                     self.public_snapshot_and_persist().await?;
+                    self.public_owner().fence.validate_binding(&binding)?;
                     let completion = BuildCompletion {
                         binding: build,
                         lineage,

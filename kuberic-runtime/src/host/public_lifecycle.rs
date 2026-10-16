@@ -14,9 +14,9 @@ use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
     PublicBuildInput, PublicCatchUpMode, PublicLifecycleInput, PublicLifecycleRecipe,
-    PublicLifecycleReport, PublicOperationIntent, PublicOperationPreviewIdentity,
-    PublicOperationProgram, PublicProgress, PublicV1AgentReport, PublicV1CallKind,
-    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildRequired, ServiceLocation,
+    PublicOperationIntent, PublicOperationProgram, PublicProgress, PublicV1AgentReport,
+    PublicV1CallKind, PublicV1Identity, PublicV1OperationCompletion, PublicV1OperationResult,
+    ReplicaRebuildRequired, ServiceLocation,
 };
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, ProcessSessionId, ReplicaRole, ReplicatorCreationId,
@@ -27,8 +27,7 @@ use crate::replicator::{
 
 #[path = "public_lifecycle_program.rs"]
 mod program;
-#[allow(unused_imports)]
-pub(crate) use program::{abort, operation_instructions, repeatable, replayable};
+pub(crate) use program::{operation_instructions, repeatable, replayable};
 
 type ApplicationControlMatch = Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>;
 
@@ -95,9 +94,6 @@ impl PublicLifecycleCallbacks {
     }
 
     fn validate_intent_capabilities(&self, intent: &PublicOperationIntent) -> Result<()> {
-        if !intent.preview.is_public_v1() {
-            return Ok(());
-        }
         if let Some(PublicOperationProgram::Swap {
             catch_up_specific_quorum,
             ..
@@ -443,7 +439,7 @@ fn captured_operation(
 ) -> CapturedPublicOperationIdentity {
     CapturedPublicOperationIdentity {
         resource_uid: identity.resource_uid.clone(),
-        preview: intent.preview.clone(),
+        identity: intent.identity.clone(),
         epoch,
         operation_id: intent.operation_id.clone(),
         revision: intent.revision,
@@ -571,89 +567,9 @@ pub(super) fn enrich_remote_rebuild(
     })
 }
 
-pub(crate) async fn report(
-    store: &dyn AgentStore,
-    identity: &PublicOperationPreviewIdentity,
-    session: &ProcessSessionId,
-) -> Result<PublicLifecycleReport> {
-    let state = store.load_state().await?;
-    let preview = state.public_operation_preview.ok_or_else(|| {
-        HostError::CommandRejected("preview report requires preview store".into())
-    })?;
-    if &preview.identity != identity {
-        return Err(HostError::IdentityMismatch(
-            "preview report identity changed".into(),
-        ));
-    }
-    let record = preview
-        .current_operation
-        .as_ref()
-        .and_then(|id| preview.operations.get(id));
-    let mut report = PublicLifecycleReport {
-        preview: identity.clone(),
-        binding: preview.binding.clone(),
-        resource_uid: state.identity.resource_uid.clone(),
-        replica: state.identity.local_identity,
-        process_session_id: session.clone(),
-        process_id: std::process::id(),
-        revision: preview
-            .operations
-            .values()
-            .map(|record| record.intent.revision)
-            .max()
-            .unwrap_or(0),
-        operation_id: record.map(|record| record.intent.operation_id.clone()),
-        role: ReplicaRole::None,
-        write_access: false,
-        service_location: None,
-    };
-    let Some(record) = record else {
-        return Ok(report);
-    };
-    let Some(input) = &record.intent.lifecycle else {
-        return Ok(report);
-    };
-    if &record.intent.process_session_id != session
-        || record.stage != PublicOperationStage::Completed
-        || record.superseded_by.is_some()
-        || record.disposition != Some(PublicOperationDisposition::Succeeded)
-        || !preview.history_barriers.is_empty()
-        || preview.writes_revoked
-        || preview.terminal
-        || !complete(record)
-    {
-        return Ok(report);
-    }
-    report.revision = record.intent.revision;
-    report.role = if input.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
-        ReplicaRole::ActiveSecondary
-    } else {
-        ReplicaRole::Primary
-    };
-    report.write_access = report.role == ReplicaRole::Primary;
-    if report.write_access {
-        report.service_location = record.lifecycle.outcomes.iter().rev().find_map(|outcome| {
-            if let PublicInstructionOutcome::ApplicationRole(Some(address)) = outcome {
-                (!address.is_empty()).then(|| ServiceLocation {
-                    preview: identity.clone(),
-                    resource_uid: state.identity.resource_uid.clone(),
-                    operation_id: record.intent.operation_id.clone(),
-                    replica: report.replica.clone(),
-                    process_session_id: session.clone(),
-                    epoch: input.epoch,
-                    revision: record.intent.revision,
-                    address: address.clone(),
-                })
-            } else {
-                None
-            }
-        });
-    }
-    Ok(report)
-}
-
 pub(crate) struct PublicV1ReportProjection {
     pub(crate) process_session_id: ProcessSessionId,
+    pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) report_sequence: u64,
     pub(crate) role: ReplicaRole,
     pub(crate) read_status: AccessStatus,
@@ -682,7 +598,7 @@ fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKin
         Some(PublicOperationProgram::Close) => Ok(PublicV1CallKind::Close),
         Some(PublicOperationProgram::Abort) => Ok(PublicV1CallKind::Abort),
         None => Err(HostError::Corrupt(
-            "schema-11 completion lacks a public call kind".into(),
+            "replacement completion lacks a public call kind".into(),
         )),
     }
 }
@@ -731,7 +647,7 @@ fn public_v1_completion_authority(
     }
     let Some(program) = intent.program.as_ref() else {
         return Err(HostError::Corrupt(
-            "schema-11 completion lacks public authority".into(),
+            "replacement completion lacks public authority".into(),
         ));
     };
     Ok(match program {
@@ -775,7 +691,7 @@ fn public_v1_completion_authority(
 
 pub(crate) async fn public_v1_report(
     store: &dyn AgentStore,
-    identity: &PublicOperationPreviewIdentity,
+    identity: &PublicV1Identity,
     projection: PublicV1ReportProjection,
 ) -> Result<PublicV1AgentReport> {
     if !identity.is_public_v1() {
@@ -784,8 +700,8 @@ pub(crate) async fn public_v1_report(
         ));
     }
     let state = store.load_state().await?;
-    let preview = state.public_operation_preview.ok_or_else(|| {
-        HostError::CommandRejected("public-v1 report requires preview store".into())
+    let preview = state.public_v1_operation_state.ok_or_else(|| {
+        HostError::CommandRejected("Public V1 report requires replacement state".into())
     })?;
     if &preview.identity != identity {
         return Err(HostError::IdentityMismatch(
@@ -816,7 +732,7 @@ pub(crate) async fn public_v1_report(
                 PublicV1OperationResult::RebuildRequired(rebuild)
             } else {
                 match record.disposition.as_ref().ok_or_else(|| {
-                    HostError::Corrupt("schema-11 completed operation lacks a disposition".into())
+                    HostError::Corrupt("replacement operation lacks a disposition".into())
                 })? {
                     PublicOperationDisposition::Succeeded => PublicV1OperationResult::Succeeded,
                     PublicOperationDisposition::Failed(message) => {
@@ -832,10 +748,10 @@ pub(crate) async fn public_v1_report(
                 }
             };
             let history = record.accepted_history.clone().ok_or_else(|| {
-                HostError::Corrupt("schema-11 completion lacks accepted history".into())
+                HostError::Corrupt("replacement completion lacks accepted history".into())
             })?;
             let storage_incarnation = record.accepted_storage.clone().ok_or_else(|| {
-                HostError::Corrupt("schema-11 completion lacks accepted storage".into())
+                HostError::Corrupt("replacement completion lacks accepted storage".into())
             })?;
             let (
                 previous_configuration_id,
@@ -882,7 +798,7 @@ pub(crate) async fn public_v1_report(
                     }
                 })?;
                 Some(ServiceLocation {
-                    preview: identity.clone(),
+                    identity: identity.clone(),
                     resource_uid: state.identity.resource_uid.clone(),
                     operation_id: record.intent.operation_id.clone(),
                     replica: state.identity.local_identity.clone(),
@@ -901,6 +817,7 @@ pub(crate) async fn public_v1_report(
         resource_uid: state.identity.resource_uid,
         replica: state.identity.local_identity,
         process_session_id: projection.process_session_id,
+        replicator_creation_id: projection.replicator_creation_id,
         report_sequence: projection.report_sequence,
         role: projection.role,
         read_status: projection.read_status,

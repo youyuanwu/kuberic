@@ -1573,6 +1573,79 @@ impl Drop for PgInstanceManager {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{TestDataDir, find_pg_bin};
+    use kuberic_runtime::protocol::types::FaultType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn granted_primary_role_mismatch_reports_permanent_before_returning_error() {
+        let root = TestDataDir::new("role-mismatch-current");
+        let instance = PgInstanceManager::new(root.path().join("pgdata"), find_pg_bin(), 1);
+        let access_generation = instance.advance_access_generation().unwrap();
+        let reports = Arc::new(AtomicUsize::new(0));
+        let observed = reports.clone();
+        let result = instance
+            .handle_error(
+                PgError::Process("primary role mismatch".into())
+                    .with_generation(instance.generation_id()),
+                Some(access_generation),
+                move |fault, _| {
+                    let observed = observed.clone();
+                    async move {
+                        assert_eq!(fault, FaultType::Permanent);
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        kuberic_runtime::RuntimeError::Application(
+                            "permanent mismatch reported".into(),
+                        )
+                    }
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            kuberic_runtime::RuntimeError::Application(ref message)
+                if message == "permanent mismatch reported"
+        ));
+        assert_eq!(reports.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retired_role_mismatch_cannot_fault_successor() {
+        let root = TestDataDir::new("role-mismatch-retired");
+        let instance = PgInstanceManager::new(root.path().join("pgdata"), find_pg_bin(), 1);
+        let retired = instance.generation_id();
+        instance.prepare_native_build().await.unwrap();
+        let successor = instance.generation_id();
+        assert!(successor > retired);
+        let reports = Arc::new(AtomicUsize::new(0));
+        let observed = reports.clone();
+        let result = instance
+            .handle_error(
+                PgError::Process("retired role mismatch".into()).with_generation(retired),
+                None,
+                move |_, _| {
+                    let observed = observed.clone();
+                    async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        kuberic_runtime::RuntimeError::Application(
+                            "retired fault was reported".into(),
+                        )
+                    }
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            kuberic_runtime::RuntimeError::OperationCancelled
+        ));
+        assert_eq!(reports.load(Ordering::SeqCst), 0);
+        assert_eq!(instance.generation_id(), successor);
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PgError {
     #[error("generation exhausted: {0}")]

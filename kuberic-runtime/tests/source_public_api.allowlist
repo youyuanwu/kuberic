@@ -37,25 +37,27 @@ private-path documented field crate::host::process::ReplicaProcessConfig::replic
 private-path documented field crate::host::process::ReplicaProcessConfig::resource_uid: ResourceUid
 private-path documented field crate::host::process::ReplicaProcessConfig::rpc_deadline: Duration
 private-path documented field crate::host::process::ReplicaProcessConfig::transport_window_capacity: usize
-private-path documented impl crate::host::process::ReplicaHandle::async fn authorize_stateless_preview_session_renewal (& self , required : crate :: protocol :: public_operations :: ProcessSessionRenewalRequired ,) -> Result < crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus >
+private-path documented impl crate::host::process::ReplicaHandle::async fn authorize_public_v1_session_renewal (& self , required : crate :: protocol :: public_operations :: ProcessSessionRenewalRequired ,) -> Result < crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus >
 private-path documented impl crate::host::process::ReplicaHandle::async fn diagnostics (& self) -> Result < ReplicaDiagnostics >
-private-path documented impl crate::host::process::ReplicaHandle::async fn execute_stateless_preview (& self , intent : crate :: protocol :: public_operations :: PublicOperationIntent ,) -> Result < () >
-private-path documented impl crate::host::process::ReplicaHandle::async fn execute_stateless_preview_command (& self , command : crate :: protocol :: command :: ProtocolCommand ,) -> Result < () >
-private-path documented impl crate::host::process::ReplicaHandle::async fn fence_stateless_preview_access (& self)
-private-path documented impl crate::host::process::ReplicaHandle::async fn initialize_stateless_preview_history (& self , initialization_id : & crate :: protocol :: types :: HistoryInitializationId , history : & crate :: protocol :: types :: HistoryContext , storage : & crate :: protocol :: types :: ReplicaStorageIncarnationContext ,) -> Result < () >
-private-path documented impl crate::host::process::ReplicaHandle::async fn install_stateless_preview_inbound_build_authority (& self , authority : & crate :: protocol :: public_operations :: PublicInboundBuildAuthority ,) -> Result < () >
-private-path documented impl crate::host::process::ReplicaHandle::async fn persist_stateless_preview_session_renewal (& self , expected : Option < & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus > , next : & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus ,) -> Result < () >
-private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_next_operation_revision (& self) -> Result < u64 >
-private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_operation_intent (& self , operation_id : & crate :: protocol :: types :: OperationId ,) -> Result < Option < crate :: protocol :: public_operations :: PublicOperationIntent > >
-private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_process_endpoint (& self , role : crate :: protocol :: types :: ReplicaRole ,) -> Result < crate :: protocol :: types :: ProcessSessionEndpoint >
-private-path documented impl crate::host::process::ReplicaHandle::async fn stateless_preview_report (& self ,) -> Result < crate :: protocol :: public_operations :: PublicV1AgentReport >
+private-path documented impl crate::host::process::ReplicaHandle::async fn execute_public_v1 (& self , intent : crate :: protocol :: public_operations :: PublicOperationIntent ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn execute_public_v1_command (& self , command : crate :: protocol :: command :: ProtocolCommand ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn fence_public_v1_access (& self)
+private-path documented impl crate::host::process::ReplicaHandle::async fn initialize_public_v1_history (& self , initialization_id : & crate :: protocol :: types :: HistoryInitializationId , history : & crate :: protocol :: types :: HistoryContext , storage : & crate :: protocol :: types :: ReplicaStorageIncarnationContext ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn install_public_v1_inbound_build_authority (& self , authority : & crate :: protocol :: public_operations :: PublicInboundBuildAuthority ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn persist_public_v1_session_renewal (& self , expected : Option < & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus > , next : & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_next_operation_revision (& self) -> Result < u64 >
+private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_operation_intent (& self , operation_id : & crate :: protocol :: types :: OperationId ,) -> Result < Option < crate :: protocol :: public_operations :: PublicOperationIntent > >
+private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_process_endpoint (& self , role : crate :: protocol :: types :: ReplicaRole ,) -> Result < crate :: protocol :: types :: ProcessSessionEndpoint >
+private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_report (& self ,) -> Result < crate :: protocol :: public_operations :: PublicV1AgentReport >
+private-path documented impl crate::host::process::ReplicaHandle::async fn revoke_public_v1_inbound_build_authority (& self , authority : & crate :: protocol :: public_operations :: PublicInboundBuildAuthority ,) -> Result < () >
 private-path documented impl crate::host::process::ReplicaHandle::fn process_session_id (& self) -> crate :: protocol :: types :: ProcessSessionId
-private-path documented impl crate::host::process::ReplicaHandle::fn stateless_preview_provider_writer_count (& self) -> usize
+private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_provider_writer_count (& self) -> usize
+private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_raw_retained_task_cardinality (& self) -> Result < (usize , usize) >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start (self) -> Result < RunningReplica >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start_with_shutdown (self , mut startup_shutdown : watch :: Receiver < bool > ,) -> Result < Option < RunningReplica > >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn new (config : ReplicaProcessConfig , application : Arc < A > , application_storage : ApplicationStorageState , resolver : Arc < R > ,) -> Self
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn with_application_storage_paths (mut self , paths : BTreeMap < String , PathBuf >) -> Self
-private-path documented impl crate::host::process::ReplicaHost < A , R >::fn with_stateless_preview (mut self , binding : PreviewLifecycleBinding) -> Self
+private-path documented impl crate::host::process::ReplicaHost < A , R >::fn with_public_v1_binding (mut self , binding : PublicV1LifecycleBinding) -> Self
 private-path documented impl crate::host::process::RunningReplica::async fn wait (& mut self) -> Result < () >
 private-path documented impl crate::host::process::RunningReplica::fn handle (& self) -> ReplicaHandle
 private-path documented impl crate::host::process::RunningReplica::fn shutdown (& self)
@@ -95,7 +97,6 @@ private-path documented variant crate::error::RuntimeError::WriteClosed((AccessS
 private-path documented variant crate::error::RuntimeError::WriteCompletionClosed
 private-path documented variant crate::host::error::HostError::Backpressure((String))
 private-path documented variant crate::host::error::HostError::CommandRejected((String))
-private-path documented variant crate::host::error::HostError::Contract((String))
 private-path documented variant crate::host::error::HostError::Corrupt((String))
 private-path documented variant crate::host::error::HostError::DurableEffectConflict((String))
 private-path documented variant crate::host::error::HostError::IdentityMismatch((String))
@@ -142,7 +143,6 @@ public-path documented field crate::replicator::ReplicaSetConfiguration::configu
 public-path documented field crate::replicator::ReplicaSetConfiguration::replicas: Vec < ReplicaInformation >
 public-path documented field crate::replicator::ReplicatorCapabilities::catch_up_specific_quorum: bool
 public-path documented field crate::replicator::ReplicatorCapabilities::data_loss_replay: DataLossReplay
-public-path documented field crate::replicator::ReplicatorSettings::public_v1: bool
 public-path documented field crate::replicator::ReplicatorSettings::replication_address: String
 public-path documented field crate::replicator::stream::StreamOperation::data: Bytes
 public-path documented field crate::replicator::stream::StreamOperation::metadata: OperationMetadata
@@ -173,6 +173,7 @@ public-path documented impl crate::replicator::StatefulServicePartition::async f
 public-path documented impl crate::replicator::StatefulServicePartition::async fn report_load (& self , metrics : Vec < LoadMetric >) -> Result < () >
 public-path documented impl crate::replicator::StatefulServicePartition::fn get_partition_information (& self) -> PartitionInformation
 public-path documented impl crate::replicator::StatefulServicePartition::fn with_factory (& self , factory : Arc < dyn ReplicatorFactory >) -> Self
+public-path documented impl crate::replicator::stateless::StatelessReplicatorFactory::fn new (storage : Arc < dyn DurableState >) -> Self
 public-path documented impl crate::replicator::stream::OperationSender::async fn send (& self , metadata : OperationMetadata , data : Bytes ,) -> Result < DurableApplicationProgress >
 public-path documented impl crate::replicator::stream::OperationSender::fn close (& self)
 public-path documented impl crate::replicator::stream::OperationStream::async fn get_operation (& mut self) -> Result < Option < StreamOperation > >
@@ -183,6 +184,7 @@ public-path documented module crate::application
 public-path documented module crate::engine
 public-path documented module crate::host
 public-path documented module crate::replicator
+public-path documented module crate::replicator::stateless
 public-path documented module crate::replicator::stream
 public-path documented struct crate::application::ClientWrite
 public-path documented struct crate::application::CopyChunk
@@ -191,7 +193,6 @@ public-path documented struct crate::application::OpenContext
 public-path documented struct crate::application::Operation
 public-path documented struct crate::application::RoleChange
 public-path documented struct crate::application::WriteReceipt
-public-path documented struct crate::replicator::DefaultReplicator
 public-path documented struct crate::replicator::DefaultReplicatorFactory
 public-path documented struct crate::replicator::ReplicaInformation
 public-path documented struct crate::replicator::ReplicaSetConfiguration
@@ -200,6 +201,8 @@ public-path documented struct crate::replicator::ReplicatorFactoryContext
 public-path documented struct crate::replicator::ReplicatorInterfaces
 public-path documented struct crate::replicator::ReplicatorSettings
 public-path documented struct crate::replicator::StatefulServicePartition
+public-path documented struct crate::replicator::stateless::StatelessReplicator
+public-path documented struct crate::replicator::stateless::StatelessReplicatorFactory
 public-path documented struct crate::replicator::stream::OperationSender
 public-path documented struct crate::replicator::stream::OperationStream
 public-path documented struct crate::replicator::stream::StreamOperation
@@ -255,7 +258,7 @@ public-path documented use crate::error :: { Result , RuntimeError }
 public-path documented use crate::host::error :: { HostError , Result }
 public-path documented use crate::host::process :: { ApplicationStorageState , ReplicaBuildDiagnostics , ReplicaDiagnostics , ReplicaHandle , ReplicaHost , ReplicaProcessConfig , RunningReplica , }
 public-path documented use crate::host::transport :: { KubernetesDnsResolver , ReplicaEndpointResolver }
-public-path documented use crate::replicator :: { DefaultReplicator , DefaultReplicatorFactory , PrimaryReplicator , Replicator , ReplicatorFactory , ReplicatorInterfaces , StateReplicator , StatefulServicePartition , }
+public-path documented use crate::replicator :: { DefaultReplicatorFactory , PrimaryReplicator , Replicator , ReplicatorFactory , ReplicatorInterfaces , StateReplicator , StatefulServicePartition , }
 public-path documented variant crate::application::OpenMode::Existing
 public-path documented variant crate::application::OpenMode::New
 public-path documented variant crate::replicator::ReplicaSetQuorumMode::All

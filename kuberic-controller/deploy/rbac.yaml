@@ -1,7 +1,8 @@
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
   name: kuberic-controller
+  namespace: kuberic-system
 rules:
   - apiGroups:
       - operator.kuberic.io
@@ -31,12 +32,13 @@ rules:
       - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: kuberic-controller
+  namespace: kuberic-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: kuberic-controller
 subjects:
   - kind: ServiceAccount

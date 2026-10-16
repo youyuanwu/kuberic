@@ -3,48 +3,50 @@
 #![deny(clippy::disallowed_types)]
 
 mod command;
-mod coordinator;
 mod error;
 #[allow(clippy::disallowed_types)]
 pub(crate) mod hosting;
-mod observation;
-#[cfg(any(test, feature = "testing"))]
-#[allow(dead_code)]
 mod operation;
-#[cfg(any(test, feature = "testing"))]
-#[allow(dead_code)]
 mod operation_recovery;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;
 pub(crate) mod public_build_store;
-#[cfg(any(test, feature = "testing"))]
-#[allow(dead_code)]
 #[allow(clippy::disallowed_types)]
 pub(crate) mod public_lifecycle;
-mod recovery;
-mod removal;
-pub(crate) mod report;
-#[allow(clippy::disallowed_types)]
-pub(crate) mod runtime_adapter;
 #[allow(clippy::disallowed_types)]
 pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod sqlite_store;
 pub(crate) mod state;
 pub(crate) mod store;
-#[cfg(feature = "testing")]
-#[allow(clippy::disallowed_types)]
-pub(crate) mod testing;
 pub(crate) mod transport;
 
-#[cfg(test)]
-#[allow(clippy::disallowed_types)]
-mod tests;
-
 pub use error::{HostError, Result};
+
+pub(crate) use process::PUBLIC_V1_PROCESS_STARTUP_OWNERS;
 pub use process::{
     ApplicationStorageState, ReplicaBuildDiagnostics, ReplicaDiagnostics, ReplicaHandle,
     ReplicaHost, ReplicaProcessConfig, RunningReplica,
 };
 pub use transport::{KubernetesDnsResolver, ReplicaEndpointResolver};
+
+pub(crate) fn session_renewal_supersedes_local_journal(
+    next: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+    previous: &crate::protocol::public_operations::PublicV1SessionRenewalStatus,
+) -> bool {
+    next.required != previous.required
+        && next.required.resource_uid == previous.required.resource_uid
+        && next.required.history.resource_uid == previous.required.history.resource_uid
+        && next.required.history.protocol_generation
+            == previous.required.history.protocol_generation
+        && next.required.history.data_loss_number >= previous.required.history.data_loss_number
+        && next.required.previous_epoch >= previous.required.renewal_epoch
+}
+
+#[cfg(test)]
+mod tests {
+    pub(crate) fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        tempfile::tempdir()
+    }
+}

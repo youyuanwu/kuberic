@@ -1,7 +1,7 @@
 # Development
 
 Kuberic currently supports source builds and local/CI validation only. The
-classic v1 stack and its image publication were removed; v2 release
+classic stack and its image publication were removed; Public V1 release
 distribution is deferred.
 
 ## Rust Prerequisites
@@ -24,11 +24,10 @@ just nextest-list ordinary
 just nextest-list postgres
 just nextest-list kind
 just nextest-list dex-live
-just nextest-list helper
 ```
 
-The ordinary tier is bounded to four test processes and keeps the combined
-SQLite group serial. Run it whole or as the same four slices used by CI:
+The ordinary tier uses the repository profile and keeps the combined SQLite
+group serial. Run it whole or as the same four slices used by CI:
 
 ```bash
 just nextest-test
@@ -62,8 +61,8 @@ just level-triggered-diagnostics
 just delete-kind-cluster
 ```
 
-`just level-triggered-kind-test all` runs the ten-scenario matrix from fresh
-bootstrap. Run standalone failover on a separate fresh cluster. See
+`just level-triggered-kind-test all` runs bootstrap, replacement, and failover
+from the owned cluster. See
 [tests and diagnostics](features/kuberic/level-triggered-operator.md#tests-and-diagnostics)
 for selectors, ownership rules and cleanup.
 
@@ -88,12 +87,11 @@ cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 Use the smoke target for routine local checks. Its inventory prerequisite
 requires the exact Public V1 PostgreSQL conformance parent before starting
 PostgreSQL. The smoke covers that oracle plus real bootstrap and fencing,
-native build, failover, planned switchover, scale-up recovery and an explicit
-storage-failure oracle. CI-derived nextest profiles terminate an individual
-test at five minutes. Run the full target only in the dedicated validation
-path or when explicitly requested.
+native build, data-loss/history, and contained-close behavior in four Public V1
+scenarios. Run the full target only in the dedicated validation path or when
+explicitly requested.
 
-See the [PostgreSQL validation guide](features/kuberic/testing.md#postgresql-v2-host-local-validation)
+See the [PostgreSQL validation guide](features/kuberic/testing.md#postgresql)
 and [design](features/postgres/design.md).
 
 ## DEX Kubernetes Provider

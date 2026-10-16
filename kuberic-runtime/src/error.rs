@@ -47,25 +47,6 @@ pub enum RuntimeError {
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
-#[derive(Debug, Error)]
-pub(crate) enum ContractError {
-    #[error("authority mismatch: {0}")]
-    AuthorityMismatch(String),
-    #[error("persistence error: {0}")]
-    Persistence(String),
-}
-
-pub(crate) type ContractResult<T> = std::result::Result<T, ContractError>;
-
-impl From<ContractError> for RuntimeError {
-    fn from(error: ContractError) -> Self {
-        match error {
-            ContractError::AuthorityMismatch(message) => Self::AuthorityMismatch(message),
-            ContractError::Persistence(message) => Self::Application(message),
-        }
-    }
-}
-
 impl From<crate::protocol::validation::ValidationError> for RuntimeError {
     fn from(error: crate::protocol::validation::ValidationError) -> Self {
         Self::AuthorityMismatch(error.to_string())

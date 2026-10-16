@@ -13,7 +13,6 @@ pub(crate) struct PartitionOperationRecoveryOwner {
 }
 
 pub(crate) struct PartitionOperationRuntime {
-    registry: Arc<PartitionOperationRegistry>,
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
 }
@@ -24,14 +23,9 @@ impl PartitionOperationRuntime {
         let (shutdown, receiver) = watch::channel(false);
         let task = tokio::spawn(async move { owner.run(receiver).await });
         Self {
-            registry,
             shutdown,
             task: Some(task),
         }
-    }
-
-    pub(crate) fn registry(&self) -> Arc<PartitionOperationRegistry> {
-        self.registry.clone()
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<()> {

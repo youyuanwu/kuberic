@@ -4,28 +4,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kuberic_controller::evaluator::test_bridge::{
+use kuberic_controller::cluster_api::PublicV1Scope;
+use kuberic_controller::evaluator::testing::{
     PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus, PublicV1EvidenceConsumer,
     PublicV1EvidenceEffect, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1OperationApi,
     PublicV1ReconciliationOutcome, PublicV1ResourceAuthority, PublicV1ResourceDisposition,
-    PublicV1ResourceProof, execute_public_v1_operation, reconcile_public_v1_consumer,
+    PublicV1ResourceProof, execute_public_v1_operation, plan_persisted_public_v1_evidence,
+    reconcile_public_v1_consumer,
 };
 use kuberic_runtime::protocol::command::{ProtocolCommand, PublicV1OperationCommand};
 use kuberic_runtime::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, ProviderReplicaIdentity,
     PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicOperationClass,
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicOperationProgram,
-    PublicOperationReplayDisposition, PublicProgress, PublicProgressRole,
-    PublicV1AcceptedOperationCompletion, PublicV1AcceptedStatus, PublicV1AgentReport,
-    PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
+    PublicOperationIntent, PublicOperationProgram, PublicOperationReplayDisposition,
+    PublicProgress, PublicProgressRole, PublicV1AcceptedOperationCompletion,
+    PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1Identity,
+    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
     Epoch, OperationId, PodUid, ProcessSessionId, PublicProtocolGeneration, PvcUid, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity,
-    ReplicaStorageIncarnationContext, ResourceUid, StorageGeneration, derive_bootstrap_history,
-    derive_history_initialization_id,
+    ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, StorageGeneration,
+    derive_bootstrap_history, derive_history_initialization_id,
 };
 
 fn replica(id: i64) -> ReplicaIdentity {
@@ -52,7 +54,7 @@ fn accepted() -> PublicV1AcceptedStatus {
     let generation = PublicProtocolGeneration::new(42);
     let initialization = derive_history_initialization_id(&resource_uid, generation);
     PublicV1AcceptedStatus {
-        identity: PublicOperationPreviewIdentity::public_v1(generation.value()),
+        identity: PublicV1Identity::new(generation.value()),
         history_initialization_id: initialization.clone(),
         history: derive_bootstrap_history(&resource_uid, generation, &initialization),
         data_loss_recovery: None,
@@ -101,6 +103,7 @@ fn report(
         resource_uid: accepted.history.resource_uid.clone(),
         replica: replica(1),
         process_session_id: ProcessSessionId::new("session-1"),
+        replicator_creation_id: ReplicatorCreationId::new("creation-1"),
         report_sequence: 1,
         role: ReplicaRole::Primary,
         read_status: AccessStatus::NotPrimary,
@@ -182,11 +185,11 @@ async fn reconcile_to_effect(
     report: &PublicV1AgentReport,
 ) -> Result<(), String> {
     assert_eq!(
-        reconcile_public_v1_consumer(state, report).await?,
+        reconcile_public_v1_consumer(state, &test_scope(), report).await?,
         PublicV1ReconciliationOutcome::EvidencePersisted
     );
     assert_eq!(
-        reconcile_public_v1_consumer(state, report).await?,
+        reconcile_public_v1_consumer(state, &test_scope(), report).await?,
         PublicV1ReconciliationOutcome::EffectApplied
     );
     Ok(())
@@ -194,6 +197,7 @@ async fn reconcile_to_effect(
 
 fn call_for(consumer: PublicV1EvidenceConsumer) -> PublicV1CallKind {
     match consumer {
+        PublicV1EvidenceConsumer::Topology => PublicV1CallKind::Configuration,
         PublicV1EvidenceConsumer::Failover | PublicV1EvidenceConsumer::DataLoss => {
             PublicV1CallKind::FailoverPromotion
         }
@@ -217,12 +221,14 @@ struct DispatchProbe {
 impl PublicV1OperationApi for DispatchProbe {
     async fn observe_public_v1_operation(
         &self,
+        _scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
         Ok(self.observed.lock().unwrap().clone())
     }
 
     async fn dispatch_public_v1_operation(
         &self,
+        _scope: &PublicV1Scope,
         _expected: &PublicV1AcceptedTransitionStatus,
         _command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -232,9 +238,18 @@ impl PublicV1OperationApi for DispatchProbe {
 
     async fn observe_public_v1_operation_report(
         &self,
+        _scope: &PublicV1Scope,
         _expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String> {
         Err("dispatch probe does not publish runtime reports".into())
+    }
+}
+
+fn test_scope() -> PublicV1Scope {
+    PublicV1Scope {
+        namespace: "kuberic-system".into(),
+        name: "resource-1".into(),
+        resource_uid: ResourceUid::new("resource-1"),
     }
 }
 
@@ -254,7 +269,7 @@ fn operation_intent(
         _ => PublicOperationClass::Authority,
     };
     PublicOperationIntent {
-        preview: accepted.identity.clone(),
+        identity: accepted.identity.clone(),
         operation_id: OperationId::new(name),
         revision: 1,
         process_session_id: ProcessSessionId::new("source-session"),
@@ -416,7 +431,7 @@ async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_pro
                 intent,
             }));
 
-            let error = execute_public_v1_operation(&probe, &expected, command)
+            let error = execute_public_v1_operation(&probe, &test_scope(), &expected, command)
                 .await
                 .unwrap_err();
             assert!(error.contains("target differs from accepted source incarnation"));
@@ -491,7 +506,9 @@ async fn lost_accept_response_is_atomically_idempotent() {
 
     reconcile_to_effect(&state, &report).await.unwrap();
     assert_eq!(
-        reconcile_public_v1_consumer(&state, &report).await.unwrap(),
+        reconcile_public_v1_consumer(&state, &test_scope(), &report)
+            .await
+            .unwrap(),
         PublicV1ReconciliationOutcome::EffectApplied
     );
     assert_eq!(state.effects().len(), 1);
@@ -517,15 +534,16 @@ async fn concurrent_accept_reconciliation_commits_one_exact_effect() {
         ),
     ));
     assert_eq!(
-        reconcile_public_v1_consumer(state.as_ref(), report.as_ref())
+        reconcile_public_v1_consumer(state.as_ref(), &test_scope(), report.as_ref())
             .await
             .unwrap(),
         PublicV1ReconciliationOutcome::EvidencePersisted
     );
 
+    let scope = test_scope();
     let (first, second) = tokio::join!(
-        reconcile_public_v1_consumer(state.as_ref(), report.as_ref()),
-        reconcile_public_v1_consumer(state.as_ref(), report.as_ref()),
+        reconcile_public_v1_consumer(state.as_ref(), &scope, report.as_ref()),
+        reconcile_public_v1_consumer(state.as_ref(), &scope, report.as_ref()),
     );
     assert_eq!(first.unwrap(), PublicV1ReconciliationOutcome::EffectApplied);
     assert_eq!(
@@ -536,7 +554,7 @@ async fn concurrent_accept_reconciliation_commits_one_exact_effect() {
 }
 
 #[tokio::test]
-async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_session() {
+async fn hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let accepted = accepted();
         let completion = completion(
@@ -561,7 +579,9 @@ async fn hosted_preview_removal_drains_build_excludes_peer_and_rejects_stale_ses
         );
 
         reconcile_to_effect(&state, &report).await.unwrap();
-        reconcile_public_v1_consumer(&state, &report).await.unwrap();
+        reconcile_public_v1_consumer(&state, &test_scope(), &report)
+            .await
+            .unwrap();
 
         assert_eq!(state.effects().len(), 1);
         assert!(matches!(
@@ -602,7 +622,7 @@ fn rebuild(
         },
         operation: CapturedPublicOperationIdentity {
             resource_uid: accepted.history.resource_uid.clone(),
-            preview: accepted.identity.clone(),
+            identity: accepted.identity.clone(),
             epoch: Epoch::new(0, 7),
             operation_id: OperationId::new(operation_id),
             revision: 3,
@@ -639,7 +659,9 @@ async fn lost_local_provider_replacement_response_is_idempotent_and_replaces_sou
     );
 
     reconcile_to_effect(&state, &report).await.unwrap();
-    reconcile_public_v1_consumer(&state, &report).await.unwrap();
+    reconcile_public_v1_consumer(&state, &test_scope(), &report)
+        .await
+        .unwrap();
 
     assert_eq!(state.effects().len(), 1);
     assert!(matches!(
@@ -693,11 +715,13 @@ async fn consumer_reconciliation_rejects_stale_resource_versions_and_proof_free_
         ),
     );
     assert_eq!(
-        reconcile_public_v1_consumer(&stale, &report).await.unwrap(),
+        reconcile_public_v1_consumer(&stale, &test_scope(), &report)
+            .await
+            .unwrap(),
         PublicV1ReconciliationOutcome::EvidencePersisted
     );
     assert!(
-        reconcile_public_v1_consumer(&stale, &report)
+        reconcile_public_v1_consumer(&stale, &test_scope(), &report)
             .await
             .unwrap_err()
             .contains("stale public-v1 evidence resource version")
@@ -725,11 +749,11 @@ async fn consumer_reconciliation_rejects_stale_resource_versions_and_proof_free_
         ],
     )
     .unwrap();
-    reconcile_public_v1_consumer(&proof_free, &report)
+    reconcile_public_v1_consumer(&proof_free, &test_scope(), &report)
         .await
         .unwrap();
     assert!(
-        reconcile_public_v1_consumer(&proof_free, &report)
+        reconcile_public_v1_consumer(&proof_free, &test_scope(), &report)
             .await
             .unwrap_err()
             .contains("lacks accepted proof")
@@ -760,7 +784,7 @@ async fn consumer_reconciliation_rejects_predecessor_reports_and_substituted_aut
         ),
     );
     assert!(
-        reconcile_public_v1_consumer(&state, &predecessor)
+        reconcile_public_v1_consumer(&state, &test_scope(), &predecessor)
             .await
             .unwrap_err()
             .contains("accepted transition authority")
@@ -770,7 +794,7 @@ async fn consumer_reconciliation_rejects_predecessor_reports_and_substituted_aut
     substituted.completed_operations[0].current_configuration_id =
         Some(ConfigurationId::new("substituted"));
     assert!(
-        reconcile_public_v1_consumer(&state, &substituted)
+        reconcile_public_v1_consumer(&state, &test_scope(), &substituted)
             .await
             .unwrap_err()
             .contains("frozen accepted transition authority")
@@ -799,7 +823,7 @@ async fn consumer_reconciliation_waits_without_manufacturing_proof() {
     );
 
     assert_eq!(
-        reconcile_public_v1_consumer(&state, &empty_report)
+        reconcile_public_v1_consumer(&state, &test_scope(), &empty_report)
             .await
             .unwrap(),
         PublicV1ReconciliationOutcome::Waiting
@@ -835,9 +859,161 @@ async fn persisted_completion_must_remain_exact_on_later_reconciliation() {
     changed.revision += 1;
 
     assert!(
-        reconcile_public_v1_consumer(&state, &report(&accepted, changed))
+        reconcile_public_v1_consumer(&state, &test_scope(), &report(&accepted, changed))
             .await
             .is_err()
     );
     assert!(state.effects().is_empty());
+}
+
+#[tokio::test]
+async fn restarted_report_can_persist_exact_predecessor_completion() {
+    let accepted = accepted();
+    let completion = completion(
+        &accepted,
+        "predecessor-completion",
+        PublicV1CallKind::Role,
+        PublicV1OperationResult::Succeeded,
+    );
+    let state = state(
+        &accepted,
+        transition(
+            accepted.clone(),
+            PublicV1EvidenceConsumer::Topology,
+            &completion,
+            None,
+        ),
+    );
+    let mut restarted = report(&accepted, completion.clone());
+    restarted.process_session_id = ProcessSessionId::new("successor-session");
+
+    assert_eq!(
+        reconcile_public_v1_consumer(&state, &test_scope(), &restarted)
+            .await
+            .unwrap(),
+        PublicV1ReconciliationOutcome::EvidencePersisted
+    );
+    assert!(
+        state
+            .transition()
+            .evidence
+            .completed_operations
+            .iter()
+            .any(|accepted| {
+                accepted == &PublicV1AcceptedOperationCompletion::from_completion(&completion)
+            })
+    );
+}
+
+#[test]
+fn persisted_completion_plans_every_terminal_effect_without_a_live_report() {
+    let cases = [
+        (
+            PublicV1EvidenceConsumer::Topology,
+            PublicV1CallKind::Role,
+            PublicV1OperationResult::Succeeded,
+            "accept",
+        ),
+        (
+            PublicV1EvidenceConsumer::Removal,
+            PublicV1CallKind::Remove,
+            PublicV1OperationResult::Succeeded,
+            "retire",
+        ),
+        (
+            PublicV1EvidenceConsumer::Topology,
+            PublicV1CallKind::Role,
+            PublicV1OperationResult::Failed("failed".into()),
+            "retire",
+        ),
+    ];
+    for (index, (consumer, call_kind, result, expected)) in cases.into_iter().enumerate() {
+        let mut accepted = accepted();
+        let completion = completion(&accepted, &format!("persisted-{index}"), call_kind, result);
+        accepted
+            .completed_operations
+            .push(PublicV1AcceptedOperationCompletion::from_completion(
+                &completion,
+            ));
+        let target = (call_kind == PublicV1CallKind::Remove).then(|| PublicV1ResourceAuthority {
+            storage_incarnation: storage(2),
+            resource_version: "target-rv-1".into(),
+        });
+        let transition = transition(accepted, consumer, &completion, target);
+        let plan = plan_persisted_public_v1_evidence(&transition)
+            .unwrap()
+            .expect("persisted terminal completion");
+        assert!(
+            matches!(
+                (&plan, expected),
+                (kuberic_controller::evaluator::testing::PublicV1EvidencePlan::Accept { .. }, "accept")
+                    | (
+                        kuberic_controller::evaluator::testing::PublicV1EvidencePlan::RetireExactIncarnation { .. },
+                        "retire"
+                    )
+            ),
+            "unexpected persisted plan for {expected}: {plan:?}"
+        );
+    }
+
+    let mut rebuild_accepted = accepted();
+    let rebuild = rebuild(&rebuild_accepted, "persisted-rebuild");
+    let rebuild_completion = completion(
+        &rebuild_accepted,
+        "persisted-rebuild",
+        PublicV1CallKind::Build,
+        PublicV1OperationResult::RebuildRequired(Box::new(rebuild)),
+    );
+    rebuild_accepted.completed_operations.push(
+        PublicV1AcceptedOperationCompletion::from_completion(&rebuild_completion),
+    );
+    let rebuild_transition = transition(
+        rebuild_accepted,
+        PublicV1EvidenceConsumer::RepairReplacement,
+        &rebuild_completion,
+        Some(PublicV1ResourceAuthority {
+            storage_incarnation: storage(2),
+            resource_version: "target-rv-1".into(),
+        }),
+    );
+    assert!(matches!(
+        plan_persisted_public_v1_evidence(&rebuild_transition)
+            .unwrap()
+            .unwrap(),
+        kuberic_controller::evaluator::testing::PublicV1EvidencePlan::ProvisionReplacement { .. }
+    ));
+
+    let empty = transition(
+        accepted(),
+        PublicV1EvidenceConsumer::Topology,
+        &completion(
+            &accepted(),
+            "not-completed",
+            PublicV1CallKind::Role,
+            PublicV1OperationResult::Succeeded,
+        ),
+        None,
+    );
+    assert!(plan_persisted_public_v1_evidence(&empty).unwrap().is_none());
+
+    let mut crossed_operation = rebuild_transition.clone();
+    crossed_operation.evidence.completed_operations[0].operation_id =
+        OperationId::new("another-operation");
+    assert!(plan_persisted_public_v1_evidence(&crossed_operation).is_err());
+
+    let mut crossed_session = rebuild_transition.clone();
+    crossed_session.evidence.completed_operations[0].process_session_id =
+        ProcessSessionId::new("another-session");
+    assert!(plan_persisted_public_v1_evidence(&crossed_session).is_err());
+
+    let mut crossed_digest = rebuild_transition.clone();
+    crossed_digest.evidence.completed_operations[0].input_digest_sha256 = "ff".repeat(32);
+    assert!(plan_persisted_public_v1_evidence(&crossed_digest).is_err());
+
+    let mut crossed_result = rebuild_transition;
+    crossed_result.evidence.completed_operations[0].result =
+        kuberic_runtime::protocol::public_operations::PublicV1AcceptedResult::Failed;
+    crossed_result.evidence.completed_operations[0].rebuild_required = None;
+    crossed_result.evidence.completed_operations[0].failure_detail = None;
+    assert!(plan_persisted_public_v1_evidence(&crossed_result).is_err());
 }

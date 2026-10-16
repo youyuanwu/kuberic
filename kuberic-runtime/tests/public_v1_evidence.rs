@@ -5,7 +5,7 @@ use kuberic_runtime::control::{
     normalize_public_v1_agent_status_report, public_v1_agent_status_to_proto,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationPreviewIdentity, PublicProgress, PublicProgressRole,
+    PublicProgress, PublicProgressRole, PublicV1Identity,
 };
 use kuberic_runtime::protocol::types::{
     AccessStatus, AgentGeneration, EffectivePolicy, InitializationId, PodUid, ProcessSessionId,
@@ -14,7 +14,7 @@ use kuberic_runtime::protocol::types::{
     derive_bootstrap_history, derive_history_initialization_id,
 };
 use kuberic_runtime::testing::sqlite_store::{
-    PUBLIC_V1_PREVIEW_SCHEMA_VERSION, PublicV1ReportProjection, SqliteStore,
+    PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, PublicV1ReportProjection, SqliteStore,
 };
 use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
 
@@ -133,7 +133,7 @@ fn public_v1_source_uses_no_native_evidence() {
         }
         let hosting = std::fs::read_to_string(manifest.join("src/host/hosting.rs")).unwrap();
         let projection = hosting
-            .split("refresh_stateless_preview_projection")
+            .split("refresh_replacement_projection")
             .nth(1)
             .unwrap()
             .split("pub(crate) fn provider_writer_lease_count")
@@ -170,19 +170,19 @@ fn public_v1_source_uses_no_native_evidence() {
     ] {
         assert!(
             !build_record.contains(forbidden),
-            "schema-11 build record contains private evidence: {forbidden}"
+            "replacement-schema build record contains private evidence: {forbidden}"
         );
     }
 }
 
 #[tokio::test]
 async fn public_v1_evidence_report_is_structurally_public_only() {
-    assert_eq!(PUBLIC_V1_PREVIEW_SCHEMA_VERSION, 11);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
     let root = test_root("report");
     let path = SqliteStore::metadata_database_path(&root);
     let resource_uid = ResourceUid::new("evidence-resource");
     let generation = PublicProtocolGeneration::new(42);
-    let preview = PublicOperationPreviewIdentity::public_v1(generation.value());
+    let preview = PublicV1Identity::new(generation.value());
     let replica = replica();
     let store = SqliteStore::create_public_v1(
         &path,
@@ -226,15 +226,10 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
     let wire = public_v1_agent_status_to_proto(&report);
     assert_eq!(
         wire.protocol_version,
-        kuberic_runtime::protocol::public_operations::PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+        kuberic_runtime::protocol::public_operations::PUBLIC_V1_PROTOCOL_VERSION
     );
     assert!(wire.public_v1.is_some());
-    assert!(wire.verified_replication_lsn.is_none());
-    assert_eq!(wire.committed_lsn, 0);
-    assert_eq!(wire.current_configuration_quorum_progress, 0);
-    assert!(wire.catch_up_boundary.is_none());
-    assert!(!wire.catch_up_complete);
-    assert!(wire.builds.is_empty());
+    assert!(wire.public_v1.is_some());
     assert_eq!(
         normalize_public_v1_agent_status_report(wire).unwrap(),
         report
@@ -243,8 +238,8 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
 }
 
 #[test]
-fn public_v1_schema11_rejects_prior_preview_stores() {
-    let preview = PublicOperationPreviewIdentity::public_v1(42);
+fn public_v1_replacement_schema_rejects_prior_preview_stores() {
+    let preview = PublicV1Identity::new(42);
     for version in [8, 9, 10] {
         let root = test_root(&format!("reject-{version}"));
         let path = SqliteStore::metadata_database_path(&root);

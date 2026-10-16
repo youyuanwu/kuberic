@@ -20,8 +20,8 @@ pub mod proto {
     tonic::include_proto!("pgdata.v2");
 }
 
-#[cfg(feature = "testing")]
-pub mod testing;
+#[cfg(all(test, feature = "testing"))]
+mod testing;
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {
@@ -72,5 +72,31 @@ mod tests {
             "KSF-14",
             SCENARIO,
         );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_basebackup_cancellation_and_retry() {
+        crate::adapter::public_v1::tests::public_v1_postgres_basebackup_cancellation_and_retry()
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_stale_completion_cannot_mutate_successor() {
+        crate::adapter::public_v1::tests::
+            public_v1_postgres_stale_completion_cannot_mutate_successor()
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_production_factory_and_fault_boundary() {
+        crate::adapter::public_v1::tests::public_v1_postgres_production_factory_and_fault_boundary(
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_failover_switchover_and_replacement() {
+        crate::adapter::public_v1::tests::public_v1_postgres_failover_switchover_and_replacement()
+            .await;
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -16,7 +17,7 @@ use crate::application::{CopyChunk, Operation, OperationData, StateProvider};
 use crate::control::proto;
 use crate::engine::DurableState;
 use crate::protocol::public_operations::{
-    LocalProviderRebuildRequired, PUBLIC_V1_PREVIEW_PROTOCOL_VERSION, ProviderReplicaIdentity,
+    LocalProviderRebuildRequired, PUBLIC_V1_PROTOCOL_VERSION, ProviderReplicaIdentity,
     PublicInboundBuildAuthority, PublicInboundBuildReceipt, RemoteBuildTargetRebuildRequired,
     ReplicaRebuildReason, ReplicaRebuildRequired,
 };
@@ -123,7 +124,7 @@ fn notify_inbound_build_boundary_waiting() {
 }
 
 #[async_trait]
-impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
+impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
     async fn install_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
@@ -134,7 +135,7 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
         }
         match self
             .context
-            .classify_preview_inbound_build_authority(authority)
+            .classify_replacement_inbound_build_authority(authority)
             .await?
         {
             crate::host::store::PublicInboundBuildAdmission::Current => return Ok(()),
@@ -147,12 +148,109 @@ impl crate::replicator::StatelessPreviewControl for StatelessReplicator {
         let _effect_drain = self.provider_effect_gate.lock().await;
         self.state.lock().await.inbound_build = None;
         self.context
-            .install_preview_inbound_build_authority(authority)
+            .install_replacement_inbound_build_authority(authority)
             .await
+    }
+
+    async fn revoke_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let _admission = self.inbound_build_admission_gate.lock().await;
+        let current = self
+            .context
+            .replacement_inbound_build_authority(&authority.attempt.build_id)
+            .await?;
+        if current.as_ref() != Some(authority) {
+            let terminal = self
+                .context
+                .replacement_terminal_inbound_build_receipt(&authority.attempt.build_id)
+                .await?;
+            if terminal
+                .as_ref()
+                .is_some_and(|receipt| receipt.authority == *authority)
+            {
+                return Ok(());
+            }
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.revoke_generation();
+        self.cancel_inbound_effects();
+        let _effect_drain = self.provider_effect_gate.lock().await;
+        self.state.lock().await.inbound_build = None;
+        self.context
+            .revoke_replacement_inbound_build_authority()
+            .await
+    }
+
+    fn raw_retained_task_cardinality(&self) -> (usize, usize) {
+        self.raw_retained_task_cardinality()
     }
 }
 
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const LISTENER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicV1DataServiceRegistration {
+    ReplicationData,
+}
+
+impl PublicV1DataServiceRegistration {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::ReplicationData => "ReplicationDataServer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReplicationDataEndpoint;
+
+impl ReplicationDataEndpoint {
+    fn bind<S>(self, service: S) -> proto::replication_data_server::ReplicationDataServer<S>
+    where
+        S: proto::replication_data_server::ReplicationData,
+    {
+        proto::replication_data_server::ReplicationDataServer::new(service)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PublicV1DataServiceManifest {
+    replication_data: ReplicationDataEndpoint,
+}
+
+impl PublicV1DataServiceManifest {
+    pub(crate) const fn registrations(self) -> [PublicV1DataServiceRegistration; 1] {
+        [PublicV1DataServiceRegistration::ReplicationData]
+    }
+
+    fn replication_data<S>(
+        self,
+        service: S,
+    ) -> proto::replication_data_server::ReplicationDataServer<S>
+    where
+        S: proto::replication_data_server::ReplicationData,
+    {
+        self.replication_data.bind(service)
+    }
+}
+
+pub(crate) const PUBLIC_V1_DATA_SERVICES: PublicV1DataServiceManifest =
+    PublicV1DataServiceManifest {
+        replication_data: ReplicationDataEndpoint,
+    };
+
+pub(crate) fn validate_public_v1_data_services(
+    manifest: PublicV1DataServiceManifest,
+) -> Result<()> {
+    if manifest.registrations() != [PublicV1DataServiceRegistration::ReplicationData] {
+        return Err(RuntimeError::Application(
+            "Public V1 data service registrations changed".into(),
+        ));
+    }
+    Ok(())
+}
 
 pub struct StatelessReplicatorFactory {
     storage: Arc<dyn DurableState>,
@@ -160,6 +258,10 @@ pub struct StatelessReplicatorFactory {
 
 impl StatelessReplicatorFactory {
     pub fn new(storage: Arc<dyn DurableState>) -> Self {
+        super::PUBLIC_V1_FACTORIES.construct_stateless(storage)
+    }
+
+    pub(super) fn from_public_v1_manifest(storage: Arc<dyn DurableState>) -> Self {
         Self { storage }
     }
 }
@@ -172,26 +274,20 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
         state_provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        let binding = context.preview_binding()?.clone();
-        if !binding.preview.is_public_v1() || !settings.public_v1 {
+        let binding = context.public_v1_binding().clone();
+        if !binding.identity.is_public_v1() {
             return Err(RuntimeError::Application(
-                "stateless preview requires exact Public V1 process and bundle selection".into(),
+                "stateless replacement requires exact Public V1 process authority".into(),
             ));
         }
         if settings.replication_address.is_empty() {
             return Err(RuntimeError::Application(
-                "stateless preview requires a replication address".into(),
+                "stateless replacement requires a replication address".into(),
             ));
         }
-        if parse_bind_address(&settings.replication_address)?
-            != context.preview_replication_address()?
-        {
-            return Err(RuntimeError::Application(
-                "stateless preview bundle listener differs from process selection".into(),
-            ));
-        }
+        let bind_address = context.public_v1_replication_address();
         let provider = state_provider.ok_or_else(|| {
-            RuntimeError::Application("stateless preview requires a state provider".into())
+            RuntimeError::Application("stateless replacement requires a state provider".into())
         })?;
         let engine = Arc::new(StatelessReplicator::new(
             context.identity()?,
@@ -200,11 +296,12 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
             provider,
             self.storage.clone(),
             settings,
+            bind_address,
         ));
         engine
             .self_ref
             .set(Arc::downgrade(&engine))
-            .expect("stateless preview self reference is unset");
+            .expect("stateless replacement self reference is unset");
         let containment = engine.callback_containment();
         Ok(ReplicatorInterfaces::primary(
             engine.clone(),
@@ -216,7 +313,7 @@ impl ReplicatorFactory for StatelessReplicatorFactory {
             },
         )
         .with_callback_containment(containment)
-        .with_stateless_preview_control(engine))
+        .with_stateless_runtime_control(engine))
     }
 }
 
@@ -255,6 +352,91 @@ struct EngineState {
 struct ListenerOwner {
     shutdown: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<()>>,
+}
+
+async fn drain_listener(owner: ListenerOwner) -> Result<()> {
+    drain_listener_with_timeout(owner, LISTENER_SHUTDOWN_TIMEOUT).await
+}
+
+async fn drain_listener_with_timeout(mut owner: ListenerOwner, timeout: Duration) -> Result<()> {
+    owner.shutdown.send_replace(true);
+    match tokio::time::timeout(timeout, &mut owner.task).await {
+        Ok(result) => result.map_err(|error| RuntimeError::Application(error.to_string()))?,
+        Err(_) => {
+            owner.task.abort();
+            let _ = owner.task.await;
+            Err(RuntimeError::OperationCancelled)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TaskRegistry {
+    inner: Arc<TaskRegistryInner>,
+}
+
+struct TaskRegistryInner {
+    next_id: AtomicU64,
+    tasks: StdMutex<BTreeMap<u64, tokio::task::AbortHandle>>,
+}
+
+impl TaskRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(TaskRegistryInner {
+                next_id: AtomicU64::new(1),
+                tasks: StdMutex::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let inner = self.inner.clone();
+        let (start, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started.await;
+            let output = future.await;
+            inner
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            output
+        });
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, task.abort_handle());
+        let _ = start.send(());
+        task
+    }
+
+    fn abort_all(&self) {
+        for task in self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .split_off(&0)
+            .into_values()
+        {
+            task.abort();
+        }
+    }
+
+    fn raw_len(&self) -> usize {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
 }
 
 struct CallbackContainmentGuard {
@@ -311,6 +493,7 @@ pub struct StatelessReplicator {
     provider: Arc<dyn StateProvider>,
     storage: Arc<dyn DurableState>,
     settings: RwLock<ReplicatorSettings>,
+    bind_address: SocketAddr,
     streams: Arc<ServiceStreams>,
     state: Mutex<EngineState>,
     closed: AtomicBool,
@@ -321,14 +504,21 @@ pub struct StatelessReplicator {
     provider_effect_gate: Mutex<()>,
     inbound_build_admission_gate: Mutex<()>,
     listener: StdMutex<Option<ListenerOwner>>,
-    descendants: StdMutex<Vec<tokio::task::AbortHandle>>,
-    inbound_descendants: StdMutex<Vec<tokio::task::AbortHandle>>,
+    descendants: TaskRegistry,
+    inbound_descendants: TaskRegistry,
     callback_containment: watch::Sender<bool>,
     active_callbacks: std::sync::atomic::AtomicUsize,
     self_ref: OnceLock<Weak<StatelessReplicator>>,
 }
 
 impl StatelessReplicator {
+    fn raw_retained_task_cardinality(&self) -> (usize, usize) {
+        (
+            self.descendants.raw_len(),
+            self.inbound_descendants.raw_len(),
+        )
+    }
+
     fn new(
         identity: ReplicaIdentity,
         process_session: ProcessSessionId,
@@ -336,6 +526,7 @@ impl StatelessReplicator {
         provider: Arc<dyn StateProvider>,
         storage: Arc<dyn DurableState>,
         settings: ReplicatorSettings,
+        bind_address: SocketAddr,
     ) -> Self {
         let (callback_containment, _) = watch::channel(true);
         Self {
@@ -345,6 +536,7 @@ impl StatelessReplicator {
             provider,
             storage,
             settings: RwLock::new(settings),
+            bind_address,
             streams: Arc::new(ServiceStreams::new()),
             state: Mutex::new(EngineState {
                 opened: false,
@@ -368,8 +560,8 @@ impl StatelessReplicator {
             provider_effect_gate: Mutex::new(()),
             inbound_build_admission_gate: Mutex::new(()),
             listener: StdMutex::new(None),
-            descendants: StdMutex::new(Vec::new()),
-            inbound_descendants: StdMutex::new(Vec::new()),
+            descendants: TaskRegistry::new(),
+            inbound_descendants: TaskRegistry::new(),
             callback_containment,
             active_callbacks: std::sync::atomic::AtomicUsize::new(0),
             self_ref: OnceLock::new(),
@@ -411,10 +603,9 @@ impl StatelessReplicator {
     }
 
     async fn send_contained_build(&self, replica: ReplicaInformation) -> Result<()> {
-        let engine =
-            self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
-                RuntimeError::Application("preview creation is unattached".into())
-            })?;
+        let engine = self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
+            RuntimeError::Application("replacement creation is unattached".into())
+        })?;
         if engine
             .active_callbacks
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -457,15 +648,25 @@ impl StatelessReplicator {
         if self.abandoned_applied_floor.load(Ordering::Acquire) > 0 {
             return Err(RuntimeError::ReconfigurationPending);
         }
-        let authority = state
-            .authority
-            .clone()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        if state.role_epoch != Some(authority.epoch)
-            || state.updated_epoch != Some(authority.epoch)
-            || authority.current.primary_id != self.identity.replica_id
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
+        let authority = state.authority.clone().ok_or_else(|| {
+            RuntimeError::AuthorityMismatch("no static configuration authority is admitted".into())
+        })?;
+        if state.role_epoch != Some(authority.epoch) {
+            return Err(RuntimeError::AuthorityMismatch(format!(
+                "primary role epoch {:?} differs from admitted epoch {:?}",
+                state.role_epoch, authority.epoch
+            )));
+        }
+        if state.updated_epoch != Some(authority.epoch) {
+            return Err(RuntimeError::AuthorityMismatch(format!(
+                "updated epoch {:?} differs from admitted epoch {:?}",
+                state.updated_epoch, authority.epoch
+            )));
+        }
+        if authority.current.primary_id != self.identity.replica_id {
+            return Err(RuntimeError::AuthorityMismatch(
+                "admitted configuration selects another primary".into(),
+            ));
         }
         Ok(authority)
     }
@@ -483,7 +684,7 @@ impl StatelessReplicator {
             )
         };
         self.context
-            .publish_preview_progress(
+            .publish_replacement_progress(
                 applied_lsn,
                 committed_lsn,
                 ambiguous || local_rebuild_required,
@@ -575,19 +776,12 @@ impl StatelessReplicator {
     }
 
     fn cancel_inbound_effects(&self) {
-        for descendant in self
-            .inbound_descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain(..)
-        {
-            descendant.abort();
-        }
+        self.inbound_descendants.abort_all();
     }
 
     async fn revoke_inbound_effects(&self) -> Result<()> {
         self.context
-            .revoke_preview_inbound_build_authority()
+            .revoke_replacement_inbound_build_authority()
             .await?;
         self.cancel_inbound_effects();
         self.state.lock().await.inbound_build = None;
@@ -599,9 +793,9 @@ impl StatelessReplicator {
         item: proto::ReplicationItem,
     ) -> std::result::Result<proto::ReplicationAck, Status> {
         let _effect = self.provider_effect_gate.lock().await;
-        if item.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION {
+        if item.protocol_version != PUBLIC_V1_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
-                "stateless preview requires protocol 11",
+                "stateless replacement requires Public V1",
             ));
         }
         let sender: ReplicaIdentity = item
@@ -701,7 +895,7 @@ impl StatelessReplicator {
                 ));
             }
             return Ok(proto::ReplicationAck {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 sender: Some(sender.into()),
                 receiver: Some(receiver.into()),
                 epoch: Some(epoch.into()),
@@ -838,7 +1032,7 @@ impl StatelessReplicator {
             ));
         }
         Ok(proto::ReplicationAck {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             sender: Some(sender.into()),
             receiver: Some(receiver.into()),
             epoch: Some(epoch.into()),
@@ -896,7 +1090,7 @@ impl StatelessReplicator {
                     .await
                     .map_err(|error| ReplicationSendFailure::Unavailable(error.to_string()))?;
             let item = proto::ReplicationItem {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 sender: Some(self.identity.clone().into()),
                 receiver: Some(peer.identity.clone().into()),
                 epoch: Some(authority.epoch.into()),
@@ -952,7 +1146,7 @@ impl StatelessReplicator {
                 .epoch
                 .ok_or_else(|| ReplicationSendFailure::Rejected("ACK epoch is absent".into()))?
                 .into();
-            if acknowledgement.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+            if acknowledgement.protocol_version != PUBLIC_V1_PROTOCOL_VERSION
                 || acknowledgement_sender != self.identity
                 || acknowledgement_receiver != peer.identity
                 || acknowledgement_epoch != authority.epoch
@@ -972,7 +1166,7 @@ impl StatelessReplicator {
                 || acknowledgement.committed_lsn < committed_lsn
             {
                 return Err(ReplicationSendFailure::Rejected(
-                    "stateless preview ACK changed exact authority".into(),
+                    "stateless replacement ACK changed exact authority".into(),
                 ));
             }
             Ok(())
@@ -1249,7 +1443,11 @@ impl StatelessReplicator {
     }
 
     async fn send_build(&self, replica: &ReplicaInformation) -> Result<()> {
-        let authority = self.require_primary().await?;
+        let authority = self.require_primary().await.map_err(|error| {
+            RuntimeError::AuthorityMismatch(format!(
+                "build source primary authority is unavailable: {error}"
+            ))
+        })?;
         if replica.role != ReplicaRole::IdleSecondary
             || replica.build_id.is_empty()
             || replica.process_session_id.is_empty()
@@ -1287,12 +1485,21 @@ impl StatelessReplicator {
         }
         let build_authority = self
             .context
-            .preview_outbound_build_authority(
+            .replacement_outbound_build_authority(
                 &replica.build_id,
                 &authority.current.configuration_id,
             )
-            .await?
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            .await
+            .map_err(|error| {
+                RuntimeError::AuthorityMismatch(format!(
+                    "outbound build authority lookup failed: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                RuntimeError::AuthorityMismatch(
+                    "outbound build authority is not durably admitted".into(),
+                )
+            })?;
         if build_authority.attempt.build_id != replica.build_id
             || build_authority.attempt.source != self.identity
             || build_authority.attempt.source_session != self.process_session
@@ -1320,7 +1527,7 @@ impl StatelessReplicator {
         let mut sequence = 0_u64;
         while let Some(chunk) = copy.next().await {
             items.push(proto::CopyItem {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 build_id: replica.build_id.to_string(),
                 sender: Some(self.identity.clone().into()),
                 receiver: Some(replica.identity.clone().into()),
@@ -1350,7 +1557,7 @@ impl StatelessReplicator {
             sequence = sequence.saturating_add(1);
         }
         items.push(proto::CopyItem {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             build_id: replica.build_id.to_string(),
             sender: Some(self.identity.clone().into()),
             receiver: Some(replica.identity.clone().into()),
@@ -1399,7 +1606,7 @@ impl StatelessReplicator {
                     return Err(self.local_rebuild_required());
                 }
                 items.push(proto::CopyItem {
-                    protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                    protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                     build_id: replica.build_id.to_string(),
                     sender: Some(self.identity.clone().into()),
                     receiver: Some(replica.identity.clone().into()),
@@ -1434,7 +1641,7 @@ impl StatelessReplicator {
             }
         }
         items.push(proto::CopyItem {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             build_id: replica.build_id.to_string(),
             sender: Some(self.identity.clone().into()),
             receiver: Some(replica.identity.clone().into()),
@@ -1494,7 +1701,7 @@ impl StatelessReplicator {
             let mut final_ack = None;
             while let Some(acknowledgement) = acknowledgements.next().await {
                 let acknowledgement = acknowledgement.map_err(|_| remote_conflict())?;
-                if acknowledgement.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION
+                if acknowledgement.protocol_version != PUBLIC_V1_PROTOCOL_VERSION
                     || acknowledgement.build_id != replica.build_id.as_str()
                     || acknowledgement.sender_session_id != replica.process_session_id.as_str()
                     || acknowledgement.receiver_session_id != self.process_session.as_str()
@@ -1539,9 +1746,9 @@ impl StatelessReplicator {
         item: proto::CopyItem,
     ) -> std::result::Result<proto::CopyAck, Status> {
         let _effect = self.provider_effect_gate.lock().await;
-        if item.protocol_version != PUBLIC_V1_PREVIEW_PROTOCOL_VERSION {
+        if item.protocol_version != PUBLIC_V1_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
-                "stateless preview requires protocol 11",
+                "stateless replacement requires Public V1",
             ));
         }
         let build_id = crate::protocol::types::OperationId::new(item.build_id.clone());
@@ -1599,7 +1806,7 @@ impl StatelessReplicator {
             crate::protocol::types::ConfigurationId::new(item.current_configuration_id.clone());
         if let Some(receipt) = self
             .context
-            .preview_terminal_inbound_build_receipt(&build_id)
+            .replacement_terminal_inbound_build_receipt(&build_id)
             .await
             .map_err(runtime_status)?
         {
@@ -1628,7 +1835,7 @@ impl StatelessReplicator {
                 ));
             }
             return Ok(proto::CopyAck {
-                protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
                 build_id: build_id.to_string(),
                 sender: Some(receiver.into()),
                 receiver: Some(sender.into()),
@@ -1651,7 +1858,7 @@ impl StatelessReplicator {
         }
         let durable_authority = self
             .context
-            .preview_inbound_build_authority(&build_id)
+            .replacement_inbound_build_authority(&build_id)
             .await
             .map_err(runtime_status)?
             .ok_or_else(|| Status::failed_precondition("build lacks durable inbound authority"))?;
@@ -1740,7 +1947,7 @@ impl StatelessReplicator {
                 if self.generation() != generation
                     || self
                         .context
-                        .preview_inbound_build_authority(&build_id)
+                        .replacement_inbound_build_authority(&build_id)
                         .await
                         .map_err(runtime_status)?
                         .as_ref()
@@ -1786,7 +1993,7 @@ impl StatelessReplicator {
             if self.generation() != generation
                 || self
                     .context
-                    .preview_inbound_build_authority(&build_id)
+                    .replacement_inbound_build_authority(&build_id)
                     .await
                     .map_err(runtime_status)?
                     .as_ref()
@@ -1811,7 +2018,7 @@ impl StatelessReplicator {
                 if self.generation() != generation
                     || self
                         .context
-                        .preview_inbound_build_authority(&build_id)
+                        .replacement_inbound_build_authority(&build_id)
                         .await
                         .map_err(runtime_status)?
                         .as_ref()
@@ -1854,7 +2061,7 @@ impl StatelessReplicator {
                 if self.generation() != generation
                     || self
                         .context
-                        .preview_inbound_build_authority(&build_id)
+                        .replacement_inbound_build_authority(&build_id)
                         .await
                         .map_err(runtime_status)?
                         .as_ref()
@@ -1881,7 +2088,7 @@ impl StatelessReplicator {
         if self.generation() != generation
             || self
                 .context
-                .preview_inbound_build_authority(&build_id)
+                .replacement_inbound_build_authority(&build_id)
                 .await
                 .map_err(runtime_status)?
                 .as_ref()
@@ -1922,7 +2129,7 @@ impl StatelessReplicator {
         }
         if item.final_item {
             self.context
-                .complete_preview_inbound_build(&PublicInboundBuildReceipt {
+                .complete_replacement_inbound_build(&PublicInboundBuildReceipt {
                     authority: durable_authority.clone(),
                     final_sequence: item.sequence,
                     replication_boundary_lsn: item.replication_boundary_lsn,
@@ -1939,7 +2146,7 @@ impl StatelessReplicator {
             .await
             .map_err(runtime_status)?;
         Ok(proto::CopyAck {
-            protocol_version: PUBLIC_V1_PREVIEW_PROTOCOL_VERSION,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             build_id: build_id.to_string(),
             sender: Some(receiver.into()),
             receiver: Some(sender.into()),
@@ -1966,14 +2173,7 @@ impl StatelessReplicator {
             owner.shutdown.send_replace(true);
             owner.task.abort();
         }
-        for descendant in self
-            .descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain(..)
-        {
-            descendant.abort();
-        }
+        self.descendants.abort_all();
         self.cancel_inbound_effects();
     }
 
@@ -2031,21 +2231,19 @@ impl Replicator for StatelessReplicator {
             }
         }
         let address = self.settings.read().await.replication_address.clone();
-        let bind = parse_bind_address(&address)?;
-        let listener = TcpListener::bind(bind)
+        let listener = TcpListener::bind(self.bind_address)
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        validate_public_v1_data_services(PUBLIC_V1_DATA_SERVICES)?;
         let (shutdown, mut shutdown_rx) = watch::channel(false);
-        let service = PreviewReplicationService {
+        let service = ReplacementReplicationService {
             engine: self.self_ref.get().cloned().ok_or_else(|| {
-                RuntimeError::Application("preview creation is unattached".into())
+                RuntimeError::Application("replacement creation is unattached".into())
             })?,
         };
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(proto::replication_data_server::ReplicationDataServer::new(
-                    service,
-                ))
+                .add_service(PUBLIC_V1_DATA_SERVICES.replication_data(service))
                 .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                     while !*shutdown_rx.borrow_and_update() {
                         if shutdown_rx.changed().await.is_err() {
@@ -2175,6 +2373,7 @@ impl Replicator for StatelessReplicator {
 
     async fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
+        self.context.release_provider_writer();
         #[cfg(feature = "testing")]
         notify_inbound_build_boundary_waiting();
         let _admission = self.inbound_build_admission_gate.lock().await;
@@ -2196,24 +2395,15 @@ impl Replicator for StatelessReplicator {
             .take();
         self.abort_listener();
         self.streams.shutdown();
-        if let Some(mut owner) = owner {
-            owner.shutdown.send_replace(true);
-            match tokio::time::timeout(std::time::Duration::from_secs(5), &mut owner.task).await {
-                Ok(result) => {
-                    result.map_err(|error| RuntimeError::Application(error.to_string()))??
-                }
-                Err(_) => {
-                    owner.task.abort();
-                    let _ = owner.task.await;
-                    return Err(RuntimeError::OperationCancelled);
-                }
-            }
+        if let Some(owner) = owner {
+            drain_listener(owner).await?;
         }
         Ok(())
     }
 
     fn abort(&self) {
         self.closed.store(true, Ordering::Release);
+        self.context.release_provider_writer();
         self.revoke_generation();
         self.streams.shutdown();
         self.abort_listener();
@@ -2464,7 +2654,7 @@ impl StatelessReplicator {
         }
         for peer in peers.values() {
             if let Some(storage) = &peer.storage_incarnation
-                && self.context.preview_storage_is_retired(storage).await?
+                && self.context.replacement_storage_is_retired(storage).await?
             {
                 return Err(RuntimeError::AuthorityMismatch(
                     "static configuration readmits a durably retired storage incarnation".into(),
@@ -2492,6 +2682,7 @@ impl StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.reconcile_provider_committed_tail().await?;
         let mut state = self.state.lock().await;
         if state.role != local_role
             || (state.role_epoch != Some(authority.epoch)
@@ -2645,24 +2836,19 @@ impl StateReplicator for StatelessReplicator {
         {
             return Err(self.fence_stale_write(lsn).await);
         }
-        let engine =
-            self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
-                RuntimeError::Application("preview creation is unattached".into())
-            })?;
+        let engine = self.self_ref.get().and_then(Weak::upgrade).ok_or_else(|| {
+            RuntimeError::Application("replacement creation is unattached".into())
+        })?;
         for peer in authority.peers.values() {
             let engine = engine.clone();
             let authority = authority.clone();
             let operation = operation.clone();
             let peer = peer.clone();
-            let task = tokio::spawn(async move {
+            self.descendants.spawn(async move {
                 let _ = engine
                     .send_replication(&authority, &peer, &operation, lsn)
                     .await;
             });
-            self.descendants
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(task.abort_handle());
         }
         if !self
             .exact_authority_is_current(&authority, generation, ReplicaRole::Primary)
@@ -2683,17 +2869,12 @@ impl StateReplicator for StatelessReplicator {
     }
 
     async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()> {
-        if !settings.public_v1 {
-            return Err(RuntimeError::Application(
-                "stateless preview cannot disable Public V1".into(),
-            ));
-        }
         let mut current = self.settings.write().await;
         if self.state.lock().await.opened
             && current.replication_address != settings.replication_address
         {
             return Err(RuntimeError::Application(
-                "stateless preview listener address is immutable after Open".into(),
+                "stateless replacement listener address is immutable after Open".into(),
             ));
         }
         *current = settings;
@@ -2706,12 +2887,12 @@ type ReplicationResponseStream =
 type CopyResponseStream =
     Pin<Box<dyn Stream<Item = std::result::Result<proto::CopyAck, Status>> + Send>>;
 
-struct PreviewReplicationService {
+struct ReplacementReplicationService {
     engine: Weak<StatelessReplicator>,
 }
 
 #[tonic::async_trait]
-impl proto::replication_data_server::ReplicationData for PreviewReplicationService {
+impl proto::replication_data_server::ReplicationData for ReplacementReplicationService {
     type ReplicateStream = ReplicationResponseStream;
     type BuildStream = CopyResponseStream;
 
@@ -2722,11 +2903,11 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
         let engine = self
             .engine
             .upgrade()
-            .ok_or_else(|| Status::unavailable("stateless preview is closed"))?;
+            .ok_or_else(|| Status::unavailable("stateless replacement is closed"))?;
         let mut incoming = request.into_inner();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();
-        let task = tokio::spawn(async move {
+        engine.inbound_descendants.spawn(async move {
             while let Some(item) = incoming.next().await {
                 let result = match item {
                     Ok(item) => task_engine.accept_replication(item).await,
@@ -2737,11 +2918,6 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
                 }
             }
         });
-        engine
-            .inbound_descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(task.abort_handle());
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
@@ -2752,11 +2928,11 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
         let engine = self
             .engine
             .upgrade()
-            .ok_or_else(|| Status::unavailable("stateless preview is closed"))?;
+            .ok_or_else(|| Status::unavailable("stateless replacement is closed"))?;
         let mut incoming = request.into_inner();
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();
-        let task = tokio::spawn(async move {
+        engine.inbound_descendants.spawn(async move {
             while let Some(item) = incoming.next().await {
                 let result = match item {
                     Ok(item) => task_engine.accept_copy(item).await,
@@ -2767,21 +2943,8 @@ impl proto::replication_data_server::ReplicationData for PreviewReplicationServi
                 }
             }
         });
-        engine
-            .inbound_descendants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(task.abort_handle());
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
-}
-
-fn parse_bind_address(address: &str) -> Result<SocketAddr> {
-    address
-        .strip_prefix("http://")
-        .unwrap_or(address)
-        .parse()
-        .map_err(|error| RuntimeError::Application(format!("invalid replication address: {error}")))
 }
 
 fn runtime_status(error: RuntimeError) -> Status {
@@ -2791,5 +2954,57 @@ fn runtime_status(error: RuntimeError) -> Status {
             Status::cancelled(error.to_string())
         }
         _ => Status::failed_precondition(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod task_registry_tests {
+    use super::{
+        LISTENER_SHUTDOWN_TIMEOUT, ListenerOwner, RuntimeError, TaskRegistry,
+        drain_listener_with_timeout,
+    };
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn completed_and_aborted_tasks_leave_no_retained_entries() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let registry = TaskRegistry::new();
+            for _ in 0..2 {
+                let tasks = (0..1_000)
+                    .map(|_| registry.spawn(async {}))
+                    .collect::<Vec<_>>();
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                assert_eq!(registry.raw_len(), 0);
+            }
+
+            let tasks = (0..32)
+                .map(|_| registry.spawn(std::future::pending::<()>()))
+                .collect::<Vec<_>>();
+            assert_eq!(registry.raw_len(), tasks.len());
+            registry.abort_all();
+            assert_eq!(registry.raw_len(), 0);
+            for task in tasks {
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_uses_the_exact_five_second_deadline() {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(std::future::pending::<super::Result<()>>());
+        assert!(matches!(
+            drain_listener_with_timeout(
+                ListenerOwner { shutdown, task },
+                Duration::from_millis(10)
+            )
+            .await,
+            Err(RuntimeError::OperationCancelled)
+        ));
+        assert_eq!(LISTENER_SHUTDOWN_TIMEOUT, Duration::from_secs(5));
     }
 }

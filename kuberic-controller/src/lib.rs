@@ -19,22 +19,22 @@ pub mod cluster_api;
 pub mod crd;
 mod error;
 pub mod evaluator;
-mod exact_resources;
 pub mod executor;
-pub mod normalize;
 pub mod observation;
-pub mod plan;
 #[cfg(feature = "runtime-test-bridge")]
+mod public_v1_normalize;
 mod public_v1_reconciliation;
+mod public_v1_registration;
 pub mod reconciler;
 
 pub use error::{ControllerError, Result};
-pub use evaluator::{EvaluationConfig, evaluate};
+pub use evaluator::EvaluationConfig;
 pub use kuberic_runtime::{control, protocol};
-pub use plan::{Plan, UnsafeReason, WaitReason};
 
 #[derive(Debug, Parser)]
 struct Config {
+    #[arg(long, env = "KUBERIC_INSTALLATION_NAMESPACE")]
+    installation_namespace: String,
     #[arg(long, env = "KUBERIC_AGENT_BEARER_TOKEN")]
     agent_bearer_token: String,
     #[arg(long, env = "KUBERIC_STABLE_RESYNC_SECONDS", default_value_t = 30)]
@@ -67,8 +67,11 @@ struct Config {
 /// }
 /// ```
 pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let controller_manifest = public_v1_registration::PUBLIC_V1_CONTROLLER;
+    public_v1_registration::validate_public_v1_controller_registrations(controller_manifest)?;
     tracing_subscriber::fmt::init();
     let config = Config::parse();
+    validate_installation_namespace(&config.installation_namespace)?;
     let client = kube::Client::try_default().await?;
     let agents = Arc::new(cluster_api::GrpcAgentApi::new(Duration::from_secs(
         config.rpc_deadline_seconds,
@@ -77,25 +80,31 @@ pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error
         client.clone(),
         agents,
         config.agent_bearer_token,
+        config.installation_namespace.clone(),
     )?);
-    let reconciler = Arc::new(reconciler::Reconciler::new(
-        api,
-        production_evaluation_config(
-            config.stable_resync_seconds,
-            config.wait_requeue_seconds,
-            config.unsafe_requeue_seconds,
-        ),
-    ));
-    let sets = Api::<crd::KubericSet>::all(client.clone());
-    let pods = Api::<Pod>::all(client.clone());
-    let pvcs = Api::<PersistentVolumeClaim>::all(client.clone());
-    let services = Api::<Service>::all(client.clone());
-    let secrets = Api::<Secret>::all(client);
+    let reconciler = Arc::new(
+        controller_manifest.bind_reconciler(reconciler::Reconciler::new(
+            api,
+            production_evaluation_config(
+                config.stable_resync_seconds,
+                config.wait_requeue_seconds,
+                config.unsafe_requeue_seconds,
+            ),
+        )),
+    );
+    let namespace = config.installation_namespace;
+    let sets = Api::<crd::KubericSet>::namespaced(client.clone(), &namespace);
+    let owners = controller_manifest.bind_owners(
+        Api::<Pod>::namespaced(client.clone(), &namespace),
+        Api::<PersistentVolumeClaim>::namespaced(client.clone(), &namespace),
+        Api::<Service>::namespaced(client.clone(), &namespace),
+        Api::<Secret>::namespaced(client, &namespace),
+    );
     Controller::new(sets, watcher::Config::default())
-        .owns(pods, watcher::Config::default())
-        .owns(pvcs, watcher::Config::default())
-        .owns(services, watcher::Config::default())
-        .owns(secrets, watcher::Config::default())
+        .owns(owners.pods, watcher::Config::default())
+        .owns(owners.persistent_volume_claims, watcher::Config::default())
+        .owns(owners.services, watcher::Config::default())
+        .owns(owners.secrets, watcher::Config::default())
         .run(
             move |set: Arc<crd::KubericSet>, _| {
                 let reconciler = reconciler.clone();
@@ -122,34 +131,56 @@ pub async fn default_main() -> std::result::Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+fn validate_installation_namespace(namespace: &str) -> std::result::Result<(), ControllerError> {
+    let valid = !namespace.is_empty()
+        && namespace.len() <= 63
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && namespace
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && namespace
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if valid {
+        Ok(())
+    } else {
+        Err(ControllerError::Observation(
+            "KUBERIC_INSTALLATION_NAMESPACE must be a valid DNS label".to_string(),
+        ))
+    }
+}
+
 pub fn production_evaluation_config(
     stable_resync_seconds: u64,
     wait_requeue_seconds: u64,
     unsafe_requeue_seconds: u64,
 ) -> EvaluationConfig {
     EvaluationConfig {
-        enable_secondary_scale_down: true,
-        allow_scale_up: true,
-        supported_protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
         stable_resync_seconds,
         wait_requeue_seconds,
         unsafe_requeue_seconds,
-        #[cfg(feature = "runtime-test-bridge")]
-        public_operation_preview: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn installation_namespace_requires_one_valid_dns_label() {
+        for namespace in ["default", "kuberic-system", "ns1"] {
+            super::validate_installation_namespace(namespace).unwrap();
+        }
+        for namespace in ["", "-bad", "bad-", "Bad", "two.labels"] {
+            assert!(super::validate_installation_namespace(namespace).is_err());
+        }
+    }
+
+    #[test]
     fn production_enables_only_completed_membership_gates() {
         let config = super::production_evaluation_config(31, 7, 13);
-        assert!(config.enable_secondary_scale_down);
-        assert!(config.allow_scale_up);
-        assert_eq!(
-            config.supported_protocol_version,
-            kuberic_runtime::protocol::PROTOCOL_VERSION
-        );
         assert_eq!(config.stable_resync_seconds, 31);
         assert_eq!(config.wait_requeue_seconds, 7);
         assert_eq!(config.unsafe_requeue_seconds, 13);

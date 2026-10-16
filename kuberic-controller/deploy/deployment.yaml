@@ -5,6 +5,8 @@ metadata:
   namespace: kuberic-system
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: kuberic-controller
@@ -19,6 +21,10 @@ spec:
           image: ghcr.io/youyuanwu/kuberic-controller:latest
           imagePullPolicy: IfNotPresent
           env:
+            - name: KUBERIC_INSTALLATION_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: KUBERIC_AGENT_BEARER_TOKEN
               valueFrom:
                 secretKeyRef:

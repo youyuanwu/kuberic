@@ -1,52 +1,156 @@
+#[cfg(feature = "runtime-test-bridge")]
 use std::collections::BTreeMap;
+#[cfg(feature = "runtime-test-bridge")]
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::host::ReplicaHandle;
+use kuberic_runtime::protocol::command::ProtocolCommand;
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::command::{
-    ProtocolCommand, PublicV1HistoryCommand, PublicV1OperationCommand,
-    PublicV1SessionRenewalCommand,
+    PublicV1HistoryCommand, PublicV1OperationCommand, PublicV1SessionRenewalCommand,
 };
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::public_operations::{
     PublicBuildAttemptReference, PublicConfiguration, PublicInboundBuildAuthority,
-    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1AcceptedStatus,
-    PublicV1AgentReport, PublicV1CallKind, PublicV1SessionRenewalStatus,
+    PublicOperationClass, PublicV1SessionRenewalStatus,
 };
+use kuberic_runtime::protocol::public_operations::{
+    PublicOperationIntent, PublicOperationProgram, PublicV1AcceptedStatus, PublicV1AgentReport,
+    PublicV1CallKind,
+};
+use kuberic_runtime::protocol::types::{ConfigurationDescriptor, ConfigurationId};
+#[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::types::{OperationId, ReplicaIdentity};
 
+use super::PublicV1Scope;
+#[cfg(feature = "runtime-test-bridge")]
 use super::{
     PublicV1EvidenceApi, PublicV1EvidenceState, PublicV1HistoryApi, PublicV1SessionRenewalApi,
 };
-use crate::evaluator::public_v1_evidence::{
-    PublicV1AcceptedTransitionStatus, PublicV1ResourceAuthority,
-};
+use crate::evaluator::public_v1_evidence::PublicV1AcceptedTransitionStatus;
+#[cfg(feature = "runtime-test-bridge")]
+use crate::evaluator::public_v1_evidence::PublicV1ResourceAuthority;
 
 #[async_trait::async_trait]
 pub trait PublicV1OperationApi: Send + Sync {
+    async fn observe_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+    ) -> Result<Option<ConfigurationDescriptor>, String> {
+        Ok(None)
+    }
+
+    async fn persist_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: Option<&ConfigurationId>,
+        _next: &ConfigurationDescriptor,
+    ) -> Result<(), String> {
+        Err("public-v1 topology persistence is unsupported".into())
+    }
+
+    async fn persist_public_v1_primary_unavailable(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &ConfigurationId,
+        _unavailable: Option<(kuberic_runtime::protocol::types::ReplicaId, i64)>,
+    ) -> Result<(), String> {
+        Err("public-v1 primary availability persistence is unsupported".into())
+    }
+
+    async fn begin_public_v1_replacement(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_topology: &ConfigurationId,
+        _predecessor: &kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<(), String> {
+        Err("public-v1 replacement authority is unsupported".into())
+    }
+
+    async fn bind_public_v1_replacement(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_operation: &kuberic_runtime::protocol::types::OperationId,
+        _replacement: &kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<(), String> {
+        Err("public-v1 replacement binding is unsupported".into())
+    }
+
+    async fn complete_public_v1_replacement(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_operation: &kuberic_runtime::protocol::types::OperationId,
+    ) -> Result<(), String> {
+        Err("public-v1 replacement completion is unsupported".into())
+    }
+
+    async fn begin_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected_authority: &PublicV1AcceptedStatus,
+        _transition: &PublicV1AcceptedTransitionStatus,
+        _command: &kuberic_runtime::protocol::command::PublicV1OperationCommand,
+    ) -> Result<(), String> {
+        Err("public-v1 operation origination is unsupported".into())
+    }
+
+    async fn contain_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &PublicV1AcceptedTransitionStatus,
+        _command: &kuberic_runtime::protocol::command::ProtocolCommand,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn supersede_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &PublicV1AcceptedTransitionStatus,
+        _command: &kuberic_runtime::protocol::command::ProtocolCommand,
+    ) -> Result<(), String> {
+        Err("public-v1 operation supersession is unsupported".into())
+    }
+
+    async fn public_v1_operation_source_present(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: &PublicV1AcceptedTransitionStatus,
+    ) -> Result<bool, String> {
+        Ok(true)
+    }
+
     async fn observe_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String>;
 
     async fn dispatch_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String>;
 
     async fn observe_public_v1_operation_report(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String>;
 }
 
 #[derive(Clone)]
-pub struct HostedPreviewReplica {
+#[cfg(feature = "runtime-test-bridge")]
+pub struct HostedPublicV1Replica {
     pub identity: ReplicaIdentity,
     pub replication_address: String,
     pub handle: ReplicaHandle,
 }
 
-pub struct HostedPublicV1Adapter {
-    replicas: Vec<HostedPreviewReplica>,
+#[cfg(feature = "runtime-test-bridge")]
+pub struct HostedPublicV1Harness {
+    replicas: Vec<HostedPublicV1Replica>,
     history: Mutex<Option<PublicV1AcceptedStatus>>,
     renewal: Mutex<Option<PublicV1SessionRenewalStatus>>,
     evidence: Arc<PublicV1EvidenceState>,
@@ -55,9 +159,10 @@ pub struct HostedPublicV1Adapter {
     suboperation_cut: Mutex<Option<usize>>,
 }
 
-impl HostedPublicV1Adapter {
+#[cfg(feature = "runtime-test-bridge")]
+impl HostedPublicV1Harness {
     pub fn new(
-        replicas: Vec<HostedPreviewReplica>,
+        replicas: Vec<HostedPublicV1Replica>,
         history: Option<PublicV1AcceptedStatus>,
         renewal: Option<PublicV1SessionRenewalStatus>,
         evidence: Arc<PublicV1EvidenceState>,
@@ -102,7 +207,7 @@ impl HostedPublicV1Adapter {
     pub async fn report(&self, identity: &ReplicaIdentity) -> Result<PublicV1AgentReport, String> {
         self.replica(identity)?
             .handle
-            .stateless_preview_report()
+            .public_v1_report()
             .await
             .map_err(|error| error.to_string())
     }
@@ -132,7 +237,7 @@ impl HostedPublicV1Adapter {
             .await
     }
 
-    fn replica(&self, identity: &ReplicaIdentity) -> Result<&HostedPreviewReplica, String> {
+    fn replica(&self, identity: &ReplicaIdentity) -> Result<&HostedPublicV1Replica, String> {
         self.replicas
             .iter()
             .find(|replica| &replica.identity == identity)
@@ -153,7 +258,7 @@ impl HostedPublicV1Adapter {
             let remote = self.replica(&member.identity)?;
             let report = remote
                 .handle
-                .stateless_preview_report()
+                .public_v1_report()
                 .await
                 .map_err(|error| error.to_string())?;
             descriptors.push(
@@ -213,13 +318,14 @@ impl HostedPublicV1Adapter {
             existing
         } else if let Some(durable) = replica
             .handle
-            .stateless_preview_operation_intent(&operation_id)
+            .public_v1_operation_intent(&operation_id)
             .await
             .map_err(|error| error.to_string())?
         {
-            if durable.preview
-                != kuberic_runtime::protocol::public_operations::
-                    PublicOperationPreviewIdentity::public_v1(preview_generation)
+            if durable.identity
+                != kuberic_runtime::protocol::public_operations::PublicV1Identity::new(
+                    preview_generation,
+                )
                 || durable.process_session_id != process_session_id
                 || durable.class != PublicOperationClass::Authority
             {
@@ -234,12 +340,13 @@ impl HostedPublicV1Adapter {
         } else {
             let revision = replica
                 .handle
-                .stateless_preview_next_operation_revision()
+                .public_v1_next_operation_revision()
                 .await
                 .map_err(|error| error.to_string())?;
             let intent = PublicOperationIntent {
-                preview: kuberic_runtime::protocol::public_operations::
-                    PublicOperationPreviewIdentity::public_v1(preview_generation),
+                identity: kuberic_runtime::protocol::public_operations::PublicV1Identity::new(
+                    preview_generation,
+                ),
                 operation_id,
                 revision,
                 process_session_id,
@@ -258,7 +365,7 @@ impl HostedPublicV1Adapter {
         };
         replica
             .handle
-            .execute_stateless_preview(intent.clone())
+            .execute_public_v1(intent.clone())
             .await
             .map_err(|error| {
                 format!(
@@ -338,7 +445,7 @@ impl HostedPublicV1Adapter {
             PublicV1SessionRenewalCommand::CloseAccessAndIngress { accepted } => {
                 self.replica(&accepted.required.predecessor.identity)?
                     .handle
-                    .fence_stateless_preview_access()
+                    .fence_public_v1_access()
                     .await;
             }
             PublicV1SessionRenewalCommand::UpdateEpochBarrier {
@@ -373,7 +480,7 @@ impl HostedPublicV1Adapter {
                 if self
                     .replica(&replacement.identity)?
                     .handle
-                    .stateless_preview_provider_writer_count()
+                    .public_v1_provider_writer_count()
                     == 0
                 {
                     self.execute_authority_program(
@@ -426,7 +533,7 @@ impl HostedPublicV1Adapter {
         if let Some(replacement) = &next.required.replacement {
             self.replica(&replacement.identity)?
                 .handle
-                .persist_stateless_preview_session_renewal(expected, next)
+                .persist_public_v1_session_renewal(expected, next)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -452,11 +559,11 @@ impl HostedPublicV1Adapter {
         {
             self.replica(&member.identity)?
                 .handle
-                .fence_stateless_preview_access()
+                .fence_public_v1_access()
                 .await;
             self.execute_authority_program(
                 &member.identity,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!(
                     "{}-predecessor-epoch-{}",
                     operation.intent.operation_id, member.identity.replica_id
@@ -468,7 +575,7 @@ impl HostedPublicV1Adapter {
             .await?;
             self.execute_authority_program(
                 &member.identity,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!(
                     "{}-predecessor-role-{}",
                     operation.intent.operation_id, member.identity.replica_id
@@ -485,7 +592,7 @@ impl HostedPublicV1Adapter {
             configuration.previous = lifecycle.previous.clone();
             self.execute_authority_program(
                 &member.identity,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!(
                     "{}-predecessor-configuration-{}",
                     operation.intent.operation_id, member.identity.replica_id
@@ -499,26 +606,75 @@ impl HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
-impl PublicV1OperationApi for HostedPublicV1Adapter {
+#[cfg(feature = "runtime-test-bridge")]
+impl PublicV1OperationApi for HostedPublicV1Harness {
+    async fn observe_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+    ) -> Result<Option<ConfigurationDescriptor>, String> {
+        Ok(None)
+    }
+
+    async fn persist_public_v1_topology(
+        &self,
+        _scope: &PublicV1Scope,
+        _expected: Option<&ConfigurationId>,
+        next: &ConfigurationDescriptor,
+    ) -> Result<(), String> {
+        if next.configuration_id != next.expected_id() {
+            return Err("hosted public-v1 topology is invalid".into());
+        }
+        Ok(())
+    }
+
+    async fn begin_public_v1_operation(
+        &self,
+        _scope: &PublicV1Scope,
+        expected_authority: &PublicV1AcceptedStatus,
+        transition: &PublicV1AcceptedTransitionStatus,
+        command: &PublicV1OperationCommand,
+    ) -> Result<(), String> {
+        transition.validate()?;
+        command.validate().map_err(str::to_owned)?;
+        if &transition.evidence != expected_authority
+            || !operation_matches_transition(transition, &command.intent)
+            || command.target != transition.intent.source.storage_incarnation.replica
+        {
+            return Err("hosted public-v1 operation proposal is invalid".into());
+        }
+        self.dispatched
+            .lock()
+            .unwrap()
+            .push(ProtocolCommand::PublicV1Operation(Box::new(
+                command.clone(),
+            )));
+        Ok(())
+    }
+
     async fn observe_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
-        self.evidence.observe_public_v1_evidence_status().await
+        self.evidence.observe_public_v1_evidence_status(scope).await
     }
 
     async fn dispatch_public_v1_operation(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
         if self
             .evidence
-            .observe_public_v1_evidence_status()
+            .observe_public_v1_evidence_status(scope)
             .await?
             .as_ref()
             != Some(expected)
         {
             return Err("stale hosted public-v1 operation authority".into());
+        }
+        if scope.resource_uid != expected.evidence.history.resource_uid {
+            return Err("hosted public-v1 operation scope differs from authority".into());
         }
         let ProtocolCommand::PublicV1Operation(operation) = command else {
             return Err("hosted public-v1 adapter received another operation command".into());
@@ -552,7 +708,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
             }
             target_replica
                 .handle
-                .install_stateless_preview_inbound_build_authority(&PublicInboundBuildAuthority {
+                .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
                     operation_id: expected.intent.operation_id.clone(),
                     operation_revision: expected.intent.revision,
                     attempt: PublicBuildAttemptReference {
@@ -580,7 +736,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
         if let Some(PublicOperationProgram::Remove(build)) = operation.intent.program.as_ref() {
             self.execute_authority_program(
                 &build.replica,
-                operation.intent.preview.generation,
+                operation.intent.identity.generation,
                 OperationId::new(format!("{}-revoke-target", operation.intent.operation_id)),
                 PublicOperationProgram::Role {
                     epoch: build.epoch,
@@ -606,8 +762,8 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
             })?;
             self.replica(&operation.target)?
                 .handle
-                .execute_stateless_preview(PublicOperationIntent {
-                    preview: operation.intent.preview.clone(),
+                .execute_public_v1(PublicOperationIntent {
+                    identity: operation.intent.identity.clone(),
                     operation_id: OperationId::new(format!(
                         "{}-first-catch-up",
                         operation.intent.operation_id
@@ -630,11 +786,11 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
             {
                 self.replica(&member.identity)?
                     .handle
-                    .fence_stateless_preview_access()
+                    .fence_public_v1_access()
                     .await;
                 self.execute_authority_program(
                     &member.identity,
-                    operation.intent.preview.generation,
+                    operation.intent.identity.generation,
                     OperationId::new(format!(
                         "{}-target-epoch-{}",
                         operation.intent.operation_id, member.identity.replica_id
@@ -646,7 +802,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
                 .await?;
                 self.execute_authority_program(
                     &member.identity,
-                    operation.intent.preview.generation,
+                    operation.intent.identity.generation,
                     OperationId::new(format!(
                         "{}-target-role-{}",
                         operation.intent.operation_id, member.identity.replica_id
@@ -663,7 +819,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
                 );
                 self.execute_authority_program(
                     &member.identity,
-                    operation.intent.preview.generation,
+                    operation.intent.identity.generation,
                     OperationId::new(format!(
                         "{}-target-configuration-{}",
                         operation.intent.operation_id, member.identity.replica_id
@@ -675,7 +831,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
         }
         self.replica(&operation.target)?
             .handle
-            .execute_stateless_preview_command(command.clone())
+            .execute_public_v1_command(command.clone())
             .await
             .map_err(|error| error.to_string())?;
         if let Some(PublicOperationProgram::Swap {
@@ -723,6 +879,7 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
 
     async fn observe_public_v1_operation_report(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String> {
         self.report(&expected.intent.source.storage_incarnation.replica)
@@ -731,13 +888,18 @@ impl PublicV1OperationApi for HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
-impl PublicV1HistoryApi for HostedPublicV1Adapter {
-    async fn observe_public_v1_status(&self) -> Result<Option<PublicV1AcceptedStatus>, String> {
+#[cfg(feature = "runtime-test-bridge")]
+impl PublicV1HistoryApi for HostedPublicV1Harness {
+    async fn observe_public_v1_status(
+        &self,
+        _scope: &PublicV1Scope,
+    ) -> Result<Option<PublicV1AcceptedStatus>, String> {
         Ok(self.history.lock().unwrap().clone())
     }
 
     async fn persist_public_v1_status(
         &self,
+        _scope: &PublicV1Scope,
         expected: Option<&PublicV1AcceptedStatus>,
         next: &PublicV1AcceptedStatus,
     ) -> Result<(), String> {
@@ -752,6 +914,7 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
 
     async fn dispatch_public_v1_history(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1AcceptedStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -770,7 +933,7 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
             } => {
                 replica
                     .handle
-                    .initialize_stateless_preview_history(
+                    .initialize_public_v1_history(
                         &accepted.history_initialization_id,
                         &accepted.history,
                         storage,
@@ -781,11 +944,25 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
             PublicV1HistoryCommand::Recover { intent, .. } => {
                 replica
                     .handle
-                    .execute_stateless_preview(intent.as_ref().clone())
+                    .execute_public_v1(intent.as_ref().clone())
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            PublicV1HistoryCommand::SessionRenewal(_) => {
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                replica
+                    .handle
+                    .install_public_v1_inbound_build_authority(authority)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                replica
+                    .handle
+                    .revoke_public_v1_inbound_build_authority(authority)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::SessionRenewal { .. } => {
                 return Err("session-renewal command used the history API".into());
             }
         }
@@ -794,15 +971,18 @@ impl PublicV1HistoryApi for HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
-impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
+#[cfg(feature = "runtime-test-bridge")]
+impl PublicV1SessionRenewalApi for HostedPublicV1Harness {
     async fn observe_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1SessionRenewalStatus>, String> {
         Ok(self.renewal.lock().unwrap().clone())
     }
 
     async fn persist_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: Option<&PublicV1SessionRenewalStatus>,
         next: &PublicV1SessionRenewalStatus,
     ) -> Result<(), String> {
@@ -821,6 +1001,7 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
 
     async fn dispatch_public_v1_session_renewal(
         &self,
+        _scope: &PublicV1Scope,
         expected: &PublicV1SessionRenewalStatus,
         command: &ProtocolCommand,
     ) -> Result<(), String> {
@@ -830,7 +1011,9 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
         let ProtocolCommand::PublicV1History(public_command) = command else {
             return Err("hosted session renewal received another command".into());
         };
-        let PublicV1HistoryCommand::SessionRenewal(renewal_command) = public_command.as_ref()
+        let PublicV1HistoryCommand::SessionRenewal {
+            command: renewal_command,
+        } = public_command.as_ref()
         else {
             return Err("hosted session renewal received a history command".into());
         };
@@ -867,53 +1050,59 @@ impl PublicV1SessionRenewalApi for HostedPublicV1Adapter {
 }
 
 #[async_trait::async_trait]
-impl PublicV1EvidenceApi for HostedPublicV1Adapter {
+#[cfg(feature = "runtime-test-bridge")]
+impl PublicV1EvidenceApi for HostedPublicV1Harness {
     async fn observe_public_v1_evidence_status(
         &self,
+        scope: &PublicV1Scope,
     ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
-        self.evidence.observe_public_v1_evidence_status().await
+        self.evidence.observe_public_v1_evidence_status(scope).await
     }
 
     async fn persist_public_v1_evidence_status(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         next: &PublicV1AcceptedStatus,
     ) -> Result<(), String> {
         self.evidence
-            .persist_public_v1_evidence_status(expected, next)
+            .persist_public_v1_evidence_status(scope, expected, next)
             .await
     }
 
     async fn accept_public_v1_completion(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
     ) -> Result<(), String> {
         self.evidence
-            .accept_public_v1_completion(expected, completion)
+            .accept_public_v1_completion(scope, expected, completion)
             .await
     }
 
     async fn retire_public_v1_incarnation(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,
     ) -> Result<(), String> {
         self.evidence
-            .retire_public_v1_incarnation(expected, completion, target)
+            .retire_public_v1_incarnation(scope, expected, completion, target)
             .await
     }
 
     async fn provision_public_v1_replacement(
         &self,
+        scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
         completion: &kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion,
         target: &PublicV1ResourceAuthority,
         rebuild: &kuberic_runtime::protocol::public_operations::CanonicalReplicaRebuildRequired,
     ) -> Result<(), String> {
         self.evidence
-            .provision_public_v1_replacement(expected, completion, target, rebuild)
+            .provision_public_v1_replacement(scope, expected, completion, target, rebuild)
             .await
     }
 }

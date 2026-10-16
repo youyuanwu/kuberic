@@ -1,15 +1,22 @@
 use kuberic_runtime::protocol::public_operations::{
-    CanonicalOperationInputDigest, CanonicalReplicaRebuildRequired, PublicCatchUpMode,
-    PublicOperationReplayDisposition, PublicV1AcceptedStatus, PublicV1AgentReport,
-    PublicV1CallKind, PublicV1OperationCompletion, PublicV1OperationResult,
+    CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
+    CanonicalReplicaRebuildRequired, ProviderReplicaIdentity, PublicCatchUpMode,
+    PublicOperationReplayDisposition, PublicV1AcceptedOperationCompletion,
+    PublicV1AcceptedRebuildKind, PublicV1AcceptedReplayDisposition, PublicV1AcceptedResult,
+    PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1OperationCompletion,
+    PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{
     ConfigurationId, HistoryContext, OperationId, ProcessSessionId,
     ReplicaStorageIncarnationContext,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub enum PublicV1EvidenceConsumer {
+    Topology,
     Failover,
     Switchover,
     RepairReplacement,
@@ -20,7 +27,8 @@ pub enum PublicV1EvidenceConsumer {
     SessionRenewal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicV1ResourceAuthority {
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub resource_version: String,
@@ -36,7 +44,8 @@ impl PublicV1ResourceAuthority {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicV1AcceptedTransitionIntent {
     pub consumer: PublicV1EvidenceConsumer,
     pub operation_id: OperationId,
@@ -86,12 +95,34 @@ impl PublicV1AcceptedTransitionIntent {
             && completion.catch_up_specific_quorum == self.catch_up_specific_quorum
     }
 
+    pub(crate) fn matches_accepted(
+        &self,
+        completion: &PublicV1AcceptedOperationCompletion,
+    ) -> bool {
+        completion.operation_id == self.operation_id
+            && completion.revision == self.revision
+            && completion.call_kind == self.call_kind
+            && completion.history == self.history
+            && completion.storage_incarnation == self.source.storage_incarnation
+            && completion.process_session_id == self.process_session_id
+            && completion.input_digest_version == self.input_digest.version()
+            && completion.input_digest_sha256 == self.input_digest.sha256()
+            && completion.replay_disposition
+                == kuberic_runtime::protocol::public_operations::
+                    PublicV1AcceptedReplayDisposition::from(self.replay_disposition)
+            && completion.previous_configuration_id == self.previous_configuration_id
+            && completion.current_configuration_id == self.current_configuration_id
+            && completion.catch_up_mode == self.catch_up_mode
+            && completion.catch_up_specific_quorum == self.catch_up_specific_quorum
+    }
+
     pub(crate) fn effect_target(&self) -> &PublicV1ResourceAuthority {
         self.target.as_ref().unwrap_or(&self.source)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicV1AcceptedTransitionStatus {
     pub resource_version: String,
     pub evidence: PublicV1AcceptedStatus,
@@ -145,20 +176,20 @@ pub fn plan_public_v1_evidence(
     accepted.validate()?;
     report.validate().map_err(str::to_owned)?;
     let intent = &accepted.intent;
+    let completion = report
+        .completed_operations
+        .iter()
+        .find(|completion| completion.operation_id == intent.operation_id);
     if report.identity != accepted.evidence.identity
         || report.resource_uid != accepted.evidence.history.resource_uid
         || report.history != accepted.evidence.history
         || report.history != intent.history
         || report.storage_incarnation != intent.source.storage_incarnation
-        || report.process_session_id != intent.process_session_id
+        || (report.process_session_id != intent.process_session_id && completion.is_none())
     {
         return Err("public-v1 report differs from accepted transition authority".into());
     }
-    let Some(completion) = report
-        .completed_operations
-        .iter()
-        .find(|completion| completion.operation_id == intent.operation_id)
-    else {
+    let Some(completion) = completion else {
         return Ok(PublicV1EvidencePlan::Wait);
     };
     if !intent.matches(completion) {
@@ -166,25 +197,20 @@ pub fn plan_public_v1_evidence(
             "public-v1 completion differs from frozen accepted transition authority".into(),
         );
     }
+    let accepted_completion = PublicV1AcceptedOperationCompletion::from_completion(completion);
     if let Some(existing) = accepted
         .evidence
         .completed_operations
         .iter()
-        .find(|existing| existing.operation_id == completion.operation_id)
+        .find(|existing| existing.operation_id == accepted_completion.operation_id)
     {
-        if existing
-            != &kuberic_runtime::protocol::public_operations::
-                PublicV1AcceptedOperationCompletion::from_completion(completion)
-        {
+        if existing != &accepted_completion {
             return Err("accepted public-v1 completion changed after persistence".into());
         }
         return Ok(decide(accepted, completion));
     }
     let mut next = accepted.evidence.clone();
-    next.completed_operations.push(
-        kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::
-            from_completion(completion),
-    );
+    next.completed_operations.push(accepted_completion);
     next.validate_evidence().map_err(str::to_owned)?;
     if !next.is_evidence_successor_of(&accepted.evidence) {
         return Err("public-v1 completion persistence is not monotonic".into());
@@ -192,6 +218,130 @@ pub fn plan_public_v1_evidence(
     Ok(PublicV1EvidencePlan::PersistStatus {
         expected: Box::new(accepted.clone()),
         next: Box::new(next),
+    })
+}
+
+pub fn plan_persisted_public_v1_evidence(
+    accepted: &PublicV1AcceptedTransitionStatus,
+) -> Result<Option<PublicV1EvidencePlan>, String> {
+    accepted.validate()?;
+    let Some(completion) = accepted
+        .evidence
+        .completed_operations
+        .iter()
+        .find(|completion| completion.operation_id == accepted.intent.operation_id)
+    else {
+        return Ok(None);
+    };
+    if !accepted.intent.matches_accepted(completion) {
+        return Err(
+            "persisted public-v1 completion differs from accepted transition authority".into(),
+        );
+    }
+    let completion = accepted_completion(completion)?;
+    Ok(Some(decide(accepted, &completion)))
+}
+
+fn accepted_completion(
+    completion: &PublicV1AcceptedOperationCompletion,
+) -> Result<PublicV1OperationCompletion, String> {
+    let result = match completion.result {
+        PublicV1AcceptedResult::Succeeded => PublicV1OperationResult::Succeeded,
+        PublicV1AcceptedResult::Failed => PublicV1OperationResult::Failed(
+            completion
+                .failure_detail
+                .clone()
+                .ok_or_else(|| "accepted failed completion lacks detail".to_string())?,
+        ),
+        PublicV1AcceptedResult::Ambiguous => PublicV1OperationResult::Ambiguous(
+            completion
+                .failure_detail
+                .clone()
+                .ok_or_else(|| "accepted ambiguous completion lacks detail".to_string())?,
+        ),
+        PublicV1AcceptedResult::Cancelled => PublicV1OperationResult::Cancelled,
+        PublicV1AcceptedResult::RebuildRequired => {
+            let rebuild = completion
+                .rebuild_required
+                .as_ref()
+                .ok_or_else(|| "accepted rebuild completion lacks rebuild evidence".to_string())?;
+            let rebuild = match rebuild.kind {
+                PublicV1AcceptedRebuildKind::LocalProvider => {
+                    CanonicalReplicaRebuildRequired::LocalProvider {
+                        reason: rebuild.reason,
+                        provider: ProviderReplicaIdentity {
+                            replica: rebuild.provider_replica.clone().ok_or_else(|| {
+                                "accepted local rebuild lacks provider identity".to_string()
+                            })?,
+                        },
+                        operation: rebuild.operation.clone(),
+                        local_replica: rebuild.local_replica.clone().ok_or_else(|| {
+                            "accepted local rebuild lacks local replica".to_string()
+                        })?,
+                        local_storage: rebuild.local_storage.clone().ok_or_else(|| {
+                            "accepted local rebuild lacks local storage".to_string()
+                        })?,
+                    }
+                }
+                PublicV1AcceptedRebuildKind::RemoteBuildTarget => {
+                    CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+                        reason: rebuild.reason,
+                        operation: rebuild.operation.clone(),
+                        build: Box::new(rebuild.build.clone().ok_or_else(|| {
+                            "accepted remote rebuild lacks exact build identity".to_string()
+                        })?),
+                    }
+                }
+            };
+            PublicV1OperationResult::RebuildRequired(Box::new(rebuild))
+        }
+    };
+    Ok(PublicV1OperationCompletion {
+        operation_id: completion.operation_id.clone(),
+        revision: completion.revision,
+        call_kind: completion.call_kind,
+        process_session_id: completion.process_session_id.clone(),
+        input_digest: CanonicalOperationInputDigest::V1(CanonicalOperationInputDigestV1 {
+            sha256: completion.input_digest_sha256.clone(),
+        }),
+        replay_disposition: match completion.replay_disposition {
+            PublicV1AcceptedReplayDisposition::Convergent => {
+                PublicOperationReplayDisposition::Convergent
+            }
+            PublicV1AcceptedReplayDisposition::RepeatableRead => {
+                PublicOperationReplayDisposition::RepeatableRead
+            }
+            PublicV1AcceptedReplayDisposition::ReevaluateCatchUp => {
+                PublicOperationReplayDisposition::ReevaluateCatchUp
+            }
+            PublicV1AcceptedReplayDisposition::RetainBuildSuccessRetireAmbiguity => {
+                PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity
+            }
+            PublicV1AcceptedReplayDisposition::DataLossConvergent => {
+                PublicOperationReplayDisposition::DataLoss(
+                    kuberic_runtime::protocol::public_operations::DataLossReplay::Convergent,
+                )
+            }
+            PublicV1AcceptedReplayDisposition::DataLossReplaceOnAmbiguity => {
+                PublicOperationReplayDisposition::DataLoss(
+                    kuberic_runtime::protocol::public_operations::DataLossReplay::
+                        ReplaceOnAmbiguity,
+                )
+            }
+            PublicV1AcceptedReplayDisposition::ExactRemoval => {
+                PublicOperationReplayDisposition::ExactRemoval
+            }
+            PublicV1AcceptedReplayDisposition::Containment => {
+                PublicOperationReplayDisposition::Containment
+            }
+        },
+        history: completion.history.clone(),
+        storage_incarnation: completion.storage_incarnation.clone(),
+        previous_configuration_id: completion.previous_configuration_id.clone(),
+        current_configuration_id: completion.current_configuration_id.clone(),
+        catch_up_mode: completion.catch_up_mode,
+        catch_up_specific_quorum: completion.catch_up_specific_quorum,
+        result,
     })
 }
 
@@ -242,6 +392,15 @@ fn decide(
 
 fn consumer_accepts_call(consumer: PublicV1EvidenceConsumer, call: PublicV1CallKind) -> bool {
     match consumer {
+        PublicV1EvidenceConsumer::Topology => matches!(
+            call,
+            PublicV1CallKind::Open
+                | PublicV1CallKind::Role
+                | PublicV1CallKind::Epoch
+                | PublicV1CallKind::Configuration
+                | PublicV1CallKind::CatchUp
+                | PublicV1CallKind::Progress
+        ),
         PublicV1EvidenceConsumer::Failover => matches!(
             call,
             PublicV1CallKind::InitialPrimary | PublicV1CallKind::FailoverPromotion

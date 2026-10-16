@@ -1,34 +1,31 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::authority::{BuildAuthorityStore, BuildProgressStore, LocalWriteJournal};
 use crate::host::store::AgentStore;
-use crate::protocol::command::{
-    EnsureReplicaBuild, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
-};
+use crate::protocol::command::{PublicV1HistoryCommand, PublicV1SessionRenewalCommand};
 use crate::protocol::public_operations::{
-    DataLossAuthorization, PreviewLifecycleBinding, PublicDataLossRecoveryStatus,
-    PublicOperationPreviewIdentity, PublicProgress, PublicV1AgentReport, PublicV1OperationResult,
+    DataLossAuthorization, PublicDataLossRecoveryStatus, PublicProgress, PublicV1AgentReport,
+    PublicV1Identity, PublicV1LifecycleBinding, PublicV1OperationResult,
     PublicV1SessionRenewalStatus, StatePersistence,
 };
 use crate::protocol::types::{
-    AccessStatus, BuildAuthority, ConfigurationDescriptor, Epoch, OperationId,
-    ProcessSessionEndpoint, ProcessSessionId, ReplicaRole,
+    AccessStatus, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionEndpoint,
+    ProcessSessionId, ReplicaRole,
 };
 use crate::protocol::types::{
     HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
 };
 
-use super::authority::{DurableBuildProgress, DurableLocalWrite};
-use super::effects::{RuntimeEffect, RuntimeEffectResult};
 use super::state::{AgentState, StorageIdentity};
 
 pub struct SqliteStore {
     pub(super) inner: Arc<crate::host::sqlite_store::SqliteStore>,
 }
 
-pub const PUBLIC_V1_PREVIEW_SCHEMA_VERSION: u32 =
-    crate::host::state::PUBLIC_V1_PREVIEW_SCHEMA_VERSION;
+pub const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 =
+    crate::host::state::PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION;
+pub const PHASE6_PUBLIC_V1_SCHEMA_VERSION: u32 =
+    crate::host::state::PUBLIC_V1_PHASE6_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicV1HistorySnapshot {
@@ -129,21 +126,9 @@ impl SqliteStore {
         crate::host::sqlite_store::SqliteStore::metadata_database_path(root)
     }
 
-    pub fn create_authorized(
-        path: impl AsRef<Path>,
-        state: AgentState,
-    ) -> crate::host::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(crate::host::sqlite_store::SqliteStore::create_authorized(
-                path,
-                super::convert(state),
-            )?),
-        })
-    }
-
     pub fn create_public_v1(
         path: impl AsRef<Path>,
-        preview: PublicOperationPreviewIdentity,
+        preview: PublicV1Identity,
         identity: StorageIdentity,
     ) -> crate::host::Result<Self> {
         if !preview.is_public_v1() {
@@ -154,11 +139,44 @@ impl SqliteStore {
         let resource_uid = identity.resource_uid.clone();
         Ok(Self {
             inner: Arc::new(
-                crate::host::sqlite_store::SqliteStore::create_preview_bound_authorized(
+                crate::host::sqlite_store::SqliteStore::create_replacement_authorized(
                     path,
                     crate::host::state::AgentState::new(super::convert(identity)),
-                    PreviewLifecycleBinding {
-                        preview,
+                    PublicV1LifecycleBinding {
+                        identity: preview,
+                        resource_uid,
+                        spec_generation: 1,
+                        state_persistence: StatePersistence::Persisted,
+                    },
+                )?,
+            ),
+        })
+    }
+
+    pub fn create_public_v1_with_application_paths(
+        path: impl AsRef<Path>,
+        preview: PublicV1Identity,
+        identity: StorageIdentity,
+        paths: std::collections::BTreeMap<String, PathBuf>,
+    ) -> crate::host::Result<Self> {
+        if !preview.is_public_v1() {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "public-v1 store requires protocol 11".into(),
+            ));
+        }
+        let resource_uid = identity.resource_uid.clone();
+        let mut state = super::state::AgentState::new(identity);
+        state.application_storage = Some(super::state::ApplicationStorageBinding {
+            paths,
+            initializing: true,
+        });
+        Ok(Self {
+            inner: Arc::new(
+                crate::host::sqlite_store::SqliteStore::create_replacement_authorized(
+                    path,
+                    super::convert(state),
+                    PublicV1LifecycleBinding {
+                        identity: preview,
                         resource_uid,
                         spec_generation: 1,
                         state_persistence: StatePersistence::Persisted,
@@ -170,25 +188,14 @@ impl SqliteStore {
 
     pub fn open_public_v1(
         path: impl AsRef<Path>,
-        preview: &PublicOperationPreviewIdentity,
+        preview: &PublicV1Identity,
     ) -> crate::host::Result<Self> {
         Ok(Self {
             inner: Arc::new(
-                crate::host::sqlite_store::SqliteStore::open_preview_existing(path, None, preview)?,
+                crate::host::sqlite_store::SqliteStore::open_replacement_existing(
+                    path, None, preview,
+                )?,
             ),
-        })
-    }
-
-    pub fn open_existing(
-        path: impl AsRef<Path>,
-        identity: Option<&StorageIdentity>,
-    ) -> crate::host::Result<Self> {
-        let identity = identity.map(super::convert);
-        Ok(Self {
-            inner: Arc::new(crate::host::sqlite_store::SqliteStore::open_existing(
-                path,
-                identity.as_ref(),
-            )?),
         })
     }
 
@@ -213,7 +220,7 @@ impl SqliteStore {
 
     pub async fn public_v1_history_snapshot(&self) -> crate::host::Result<PublicV1HistorySnapshot> {
         let state = self.inner.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected("public-v1 preview state required".into())
         })?;
         Ok(PublicV1HistorySnapshot {
@@ -260,7 +267,7 @@ impl SqliteStore {
                     .inner
                     .load_state()
                     .await?
-                    .public_operation_preview
+                    .public_v1_operation_state
                     .and_then(|preview| preview.data_loss_recovery)
                     .is_some_and(|recovery| {
                         intent
@@ -276,7 +283,24 @@ impl SqliteStore {
                 }
                 Ok(())
             }
-            PublicV1HistoryCommand::SessionRenewal(_) => {
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                self.inner
+                    .install_public_v1_inbound_build_authority(authority)
+                    .await
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                let current = self
+                    .inner
+                    .public_v1_inbound_build_authority(&authority.attempt.build_id)
+                    .await?;
+                if current.as_ref() != Some(authority.as_ref()) {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "inbound build authority changed before revocation".into(),
+                    ));
+                }
+                self.inner.revoke_public_v1_inbound_build_authority().await
+            }
+            PublicV1HistoryCommand::SessionRenewal { .. } => {
                 Err(crate::host::HostError::CommandRejected(
                     "session-renewal commands require an attached public executor".into(),
                 ))
@@ -640,7 +664,7 @@ impl SqliteStore {
 
     pub async fn public_v1_build_records(&self) -> crate::host::Result<Vec<PublicV1BuildSnapshot>> {
         let state = self.inner.load_state().await?;
-        let preview = state.public_operation_preview.ok_or_else(|| {
+        let preview = state.public_v1_operation_state.ok_or_else(|| {
             crate::host::HostError::CommandRejected(
                 "public-v1 build store requires preview state".into(),
             )
@@ -690,7 +714,7 @@ impl SqliteStore {
             .inner
             .load_state()
             .await?
-            .public_operation_preview
+            .public_v1_operation_state
             .and_then(|preview| preview.session_renewal)
             .ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
@@ -811,13 +835,17 @@ impl SqliteStore {
 
     pub async fn public_v1_agent_report(
         &self,
-        identity: &PublicOperationPreviewIdentity,
+        identity: &PublicV1Identity,
         projection: PublicV1ReportProjection,
     ) -> crate::host::Result<PublicV1AgentReport> {
         crate::host::public_lifecycle::public_v1_report(
             self.inner.as_ref(),
             identity,
             crate::host::public_lifecycle::PublicV1ReportProjection {
+                replicator_creation_id: crate::protocol::types::ReplicatorCreationId::new(format!(
+                    "testing-{}",
+                    projection.process_session_id
+                )),
                 process_session_id: projection.process_session_id,
                 report_sequence: projection.report_sequence,
                 role: projection.role,
@@ -827,56 +855,5 @@ impl SqliteStore {
             },
         )
         .await
-    }
-
-    pub async fn journal_build(
-        &self,
-        command: &EnsureReplicaBuild,
-    ) -> crate::host::Result<EnsureReplicaBuild> {
-        self.inner.journal_build(command).await
-    }
-
-    pub async fn load_local_writes(&self) -> crate::host::Result<Vec<DurableLocalWrite>> {
-        Ok(super::convert(self.inner.load_local_writes().await?))
-    }
-
-    pub async fn load_local_write(
-        &self,
-        id: &OperationId,
-    ) -> crate::host::Result<Option<DurableLocalWrite>> {
-        Ok(super::convert(self.inner.load_local_write(id).await?))
-    }
-
-    pub async fn load_build(
-        &self,
-        id: &OperationId,
-    ) -> crate::host::Result<Option<BuildAuthority>> {
-        Ok(self.inner.load_build(id).await?)
-    }
-
-    pub async fn load_build_progress(
-        &self,
-        id: &OperationId,
-    ) -> crate::host::Result<Option<DurableBuildProgress>> {
-        Ok(super::convert(self.inner.load_build_progress(id).await?))
-    }
-
-    pub async fn begin_effect(&self, effect: &RuntimeEffect) -> crate::host::Result<()> {
-        self.inner.begin_effect(&super::convert(effect)).await?;
-        Ok(())
-    }
-
-    pub async fn mark_effect_applied(
-        &self,
-        effect: &RuntimeEffect,
-        result: &super::effects::RuntimeEffectResult,
-    ) -> crate::host::Result<()> {
-        self.inner
-            .mark_effect_applied(&super::convert(effect), &super::convert(result))
-            .await
-    }
-
-    pub async fn complete_effect(&self, result: &RuntimeEffectResult) -> crate::host::Result<()> {
-        self.inner.complete_effect(&super::convert(result)).await
     }
 }

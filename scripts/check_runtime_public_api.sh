@@ -3,7 +3,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-doc_root="target/doc/kuberic_runtime"
+target_dir="${CARGO_TARGET_DIR:-target}"
+if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+    doc_root="$target_dir/$CARGO_BUILD_TARGET/doc/kuberic_runtime"
+else
+    doc_root="$target_dir/doc/kuberic_runtime"
+fi
 allowlist="scripts/runtime_public_api.allowlist"
 fixture="scripts/fixtures/runtime-api-leak"
 scratch="target/runtime-api-check-$$"
@@ -33,7 +38,8 @@ for expected in \
     'struct `ReplicatorAttachment` is private' \
     'struct `ReplicatorCreationReservation` is private' \
     'trait `ReplicatorRegistration` is private' \
-    'module `authority` is private' \
+    'trait `PartitionAccessView` is private' \
+    'module `capabilities` is private' \
     'module `hosting` is private'; do
     if ! grep -Fq "$expected" "$fixture_output"; then
         cat "$fixture_output" >&2

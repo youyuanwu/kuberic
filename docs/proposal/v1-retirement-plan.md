@@ -47,21 +47,24 @@ outcomes.
 
 ### Workstream 2: Scale Up and Scale Down
 
-V2 supports sequential one-at-a-time scale-up and secondary-only scale-down.
+The level-triggered design includes sequential one-at-a-time scale-up and
+secondary-only scale-down.
 Move primary authority with planned switchover before reducing membership.
 
-### Workstream 3: SQLite on V2
+### Workstream 3: SQLite
 
 The existing SQLite application was migrated in place. It uses
 quorum-before-publication WAL-frame replication, durable committed snapshots,
-retained catch-up and restart/rebuild fencing. Fresh v2 storage is required.
+retained catch-up and restart/rebuild fencing. The current implementation uses
+fresh Public V1 provider state.
 
-### Workstream 4: PostgreSQL on V2
+### Workstream 4: PostgreSQL
 
 The existing PostgreSQL application was migrated in place as an SF-style
 custom replicator. PostgreSQL owns WAL, physical replication/recovery,
 synchronous policy, replay and promotion; Kuberic owns generic authority and
-lifecycle choreography. Fresh protocol-9/agent-schema-6 storage is required.
+lifecycle choreography. The current implementation uses fresh Public V1 agent
+and provider state.
 
 ### KVStore2 Conformance Application
 
@@ -76,21 +79,20 @@ The surviving repository validates:
 2. SQLite unit and in-process lifecycle/reconfiguration scenarios;
 3. PostgreSQL host-local process, recovery, fencing and scaling scenarios;
 4. DEX default, mocked-provider and isolated real-Kubernetes behavior;
-5. KVStore2 bootstrap, replacement, failover, quorum-loss, switchover,
-   scale-down, scale-up and adversarial KinD scenarios.
+5. retained KVStore2 bootstrap, replacement, and failover KinD scenarios.
 
 No current validation requires the removed classic stack.
 
 ## Distribution Status
 
-V2 controller/KVStore2 Dockerfiles, manifests and Just recipes are retained as
+Public V1 controller/KVStore2 Dockerfiles, manifests and Just recipes are retained as
 experimental local/CI assets. SQLite and PostgreSQL do not have supported
 application images or deployment manifests. Publishing immutable images,
 versioned installation assets and compatibility guidance remains deferred.
 
 ## Deferred Scale-Down Follow-Ups
 
-These remain v2 roadmap work, not prerequisites for the completed classic
+These remain optional roadmap work, not prerequisites for the completed classic
 source deletion. P1 identifies availability/status boundaries, P2 is
 maintainability or policy expansion, and P3 requires a new recovery protocol.
 
@@ -110,11 +112,11 @@ Compaction must preserve typed structural schemas, exact contextual evidence and
 late-member recovery. Opaque schemas, hash-only receipts and TTL evidence
 deletion are not substitutes for a coordinated redesign.
 
-Other deferred v2 work includes:
+Other deferred operator work includes:
 
 - configurable PVC retention and storage size;
 - automatic rolling image/protocol upgrades;
-- node-maintenance orchestration for v2;
+- node-maintenance orchestration;
 - application data import or resource conversion.
 
 ## Preserved Independent Components

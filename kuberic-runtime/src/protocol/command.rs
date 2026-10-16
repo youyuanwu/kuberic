@@ -1,11 +1,12 @@
 //! Fenced protocol commands and declarative Kubernetes changes.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "testing")]
 use crate::protocol::public_operations::{
-    PublicOperationIntent, PublicOperationPreviewIdentity, PublicSessionEpochBarrierStage,
-    PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1SessionRenewalStatus,
+    PublicInboundBuildAuthority, PublicOperationIntent, PublicSessionEpochBarrierStage,
+    PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1Identity,
+    PublicV1SessionRenewalStatus,
 };
 use crate::protocol::types::{
     AgentGeneration, BuildAuthority, ConfigurationDescriptor, EffectivePolicy, Epoch,
@@ -13,7 +14,6 @@ use crate::protocol::types::{
     ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverPreparationId,
     SwitchoverRequestId,
 };
-#[cfg(feature = "testing")]
 use crate::protocol::types::{
     HistoryContext, HistoryInitializationId, ReplicaStorageIncarnationContext,
     derive_bootstrap_history,
@@ -164,26 +164,11 @@ pub struct AcceptSecondaryRemovalCommit {
     pub local_recovery: bool,
 }
 
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RestartReplicaProcess {
-    pub action: crate::protocol::public_operations::PublicFaultAction,
-}
-
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DropReplicaIncarnation {
-    pub action: crate::protocol::public_operations::PublicFaultAction,
-}
-
-#[cfg(feature = "testing")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PublicV1HistoryCommand {
     Initialize {
-        preview: PublicOperationPreviewIdentity,
+        identity: PublicV1Identity,
         accepted: PublicV1AcceptedStatus,
         storage: ReplicaStorageIncarnationContext,
     },
@@ -191,10 +176,17 @@ pub enum PublicV1HistoryCommand {
         accepted: PublicV1AcceptedStatus,
         intent: Box<PublicOperationIntent>,
     },
-    SessionRenewal(Box<PublicV1SessionRenewalCommand>),
+    InstallInboundBuildAuthority {
+        authority: Box<PublicInboundBuildAuthority>,
+    },
+    RevokeInboundBuildAuthority {
+        authority: Box<PublicInboundBuildAuthority>,
+    },
+    SessionRenewal {
+        command: Box<PublicV1SessionRenewalCommand>,
+    },
 }
 
-#[cfg(feature = "testing")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PublicV1SessionRenewalCommand {
@@ -218,8 +210,26 @@ pub enum PublicV1SessionRenewalCommand {
     },
 }
 
-#[cfg(feature = "testing")]
 impl PublicV1SessionRenewalCommand {
+    fn configuration_journal_endpoint<'a>(
+        accepted: &'a PublicV1SessionRenewalStatus,
+        configuration: &ConfigurationDescriptor,
+    ) -> &'a crate::protocol::types::ProcessSessionEndpoint {
+        accepted.required.replacement.as_ref().unwrap_or_else(|| {
+            let primary = configuration
+                .members
+                .iter()
+                .find(|member| member.identity.replica_id == configuration.primary_id)
+                .expect("validated fresh configuration primary");
+            accepted
+                .required
+                .surviving_sessions
+                .iter()
+                .find(|endpoint| endpoint.identity == primary.identity)
+                .expect("validated fresh configuration primary endpoint")
+        })
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         self.accepted().validate()?;
         match self {
@@ -294,36 +304,49 @@ impl PublicV1SessionRenewalCommand {
                     .expect("validated session-renewal replacement")
                     .identity
             }
+
             Self::InstallFreshConfiguration {
-                accepted: _,
+                accepted,
                 configuration,
-            } => {
-                &configuration
-                    .members
-                    .iter()
-                    .find(|member| member.identity.replica_id == configuration.primary_id)
-                    .expect("validated fresh configuration primary")
-                    .identity
-            }
+            } => &Self::configuration_journal_endpoint(accepted, configuration).identity,
+        }
+    }
+
+    pub fn expected_endpoint(&self) -> &crate::protocol::types::ProcessSessionEndpoint {
+        match self {
+            Self::CloseAccessAndIngress { accepted } => accepted
+                .required
+                .replacement
+                .as_ref()
+                .unwrap_or(&accepted.required.predecessor),
+            Self::ReplayReplacementRole { accepted, .. } => accepted
+                .required
+                .replacement
+                .as_ref()
+                .expect("validated session-renewal replacement"),
+            Self::UpdateEpochBarrier { survivor, .. } => survivor,
+            Self::InstallFreshConfiguration {
+                accepted,
+                configuration,
+            } => Self::configuration_journal_endpoint(accepted, configuration),
         }
     }
 }
 
-#[cfg(feature = "testing")]
 impl PublicV1HistoryCommand {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Initialize {
-                preview,
+                identity,
                 accepted,
                 storage,
             } => {
                 storage.validate()?;
-                if !preview.is_public_v1()
-                    || accepted.identity != *preview
+                if !identity.is_public_v1()
+                    || accepted.identity != *identity
                     || accepted.data_loss_recovery.is_some()
                     || accepted.history.resource_uid.is_empty()
-                    || accepted.history.protocol_generation.value() != preview.generation
+                    || accepted.history.protocol_generation.value() != identity.generation
                     || accepted.history
                         != derive_bootstrap_history(
                             &accepted.history.resource_uid,
@@ -345,7 +368,7 @@ impl PublicV1HistoryCommand {
                     .as_ref()
                     .and_then(|input| input.data_loss_recovery.as_ref())
                     .ok_or("public-v1 recovery command lacks typed lifecycle recovery")?;
-                if accepted.identity != intent.preview
+                if accepted.identity != intent.identity
                     || recovery.stage
                         != crate::protocol::public_operations::PublicDataLossRecoveryStage::Invalidated
                     || recovery.logical_authorization() != input.authorization
@@ -354,7 +377,9 @@ impl PublicV1HistoryCommand {
                     return Err("public-v1 recovery command differs from accepted authority");
                 }
             }
-            Self::SessionRenewal(command) => command.validate()?,
+            Self::InstallInboundBuildAuthority { authority }
+            | Self::RevokeInboundBuildAuthority { authority } => authority.validate()?,
+            Self::SessionRenewal { command } => command.validate()?,
         }
         Ok(())
     }
@@ -362,7 +387,9 @@ impl PublicV1HistoryCommand {
     pub fn accepted(&self) -> Option<&PublicV1AcceptedStatus> {
         match self {
             Self::Initialize { accepted, .. } | Self::Recover { accepted, .. } => Some(accepted),
-            Self::SessionRenewal(_) => None,
+            Self::InstallInboundBuildAuthority { .. }
+            | Self::RevokeInboundBuildAuthority { .. } => None,
+            Self::SessionRenewal { .. } => None,
         }
     }
 
@@ -377,7 +404,20 @@ impl PublicV1HistoryCommand {
                     .provisional_primary
                     .replica
             }
-            Self::SessionRenewal(command) => command.target(),
+            Self::InstallInboundBuildAuthority { authority }
+            | Self::RevokeInboundBuildAuthority { authority } => &authority.attempt.target,
+            Self::SessionRenewal { command } => command.target(),
+        }
+    }
+
+    pub fn resource_uid(&self) -> &ResourceUid {
+        match self {
+            Self::Initialize { accepted, .. } | Self::Recover { accepted, .. } => {
+                &accepted.history.resource_uid
+            }
+            Self::InstallInboundBuildAuthority { authority }
+            | Self::RevokeInboundBuildAuthority { authority } => &authority.history.resource_uid,
+            Self::SessionRenewal { command } => &command.accepted().required.resource_uid,
         }
     }
 
@@ -396,20 +436,21 @@ impl PublicV1HistoryCommand {
                 &accepted.history,
                 storage,
             )),
-            Self::Recover { .. } | Self::SessionRenewal(_) => None,
+            Self::Recover { .. }
+            | Self::InstallInboundBuildAuthority { .. }
+            | Self::RevokeInboundBuildAuthority { .. }
+            | Self::SessionRenewal { .. } => None,
         }
     }
 }
 
-#[cfg(feature = "testing")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicV1OperationCommand {
     pub target: ReplicaIdentity,
     pub intent: PublicOperationIntent,
 }
 
-#[cfg(feature = "testing")]
 impl PublicV1OperationCommand {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.intent.validate()?;
@@ -436,19 +477,7 @@ impl PublicV1OperationCommand {
 /// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
     InitializeAgentStore(Box<InitializeAgentStore>),
-    PrepareSwitchover(Box<PrepareSwitchover>),
-    EnsureConfiguration(Box<EnsureConfiguration>),
-    EnsureReplicaBuild(Box<EnsureReplicaBuild>),
-    PrepareSecondaryRemoval(Box<PrepareSecondaryRemoval>),
-    RetireReplica(Box<RetireReplica>),
-    AcceptSecondaryRemovalCommit(Box<AcceptSecondaryRemovalCommit>),
-    #[cfg(feature = "testing")]
-    RestartReplicaProcess(Box<RestartReplicaProcess>),
-    #[cfg(feature = "testing")]
-    DropReplicaIncarnation(Box<DropReplicaIncarnation>),
-    #[cfg(feature = "testing")]
     PublicV1History(Box<PublicV1HistoryCommand>),
-    #[cfg(feature = "testing")]
     PublicV1Operation(Box<PublicV1OperationCommand>),
 }
 
@@ -456,17 +485,9 @@ impl ProtocolCommand {
     pub fn effect_class(&self) -> EffectClass {
         match self {
             Self::InitializeAgentStore(_) => EffectClass::ConvergentEnsure,
-            Self::PrepareSwitchover(_)
-            | Self::PrepareSecondaryRemoval(_)
-            | Self::RetireReplica(_)
-            | Self::AcceptSecondaryRemovalCommit(_)
-            | Self::EnsureConfiguration(_)
-            | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
-            #[cfg(feature = "testing")]
-            Self::RestartReplicaProcess(_)
-            | Self::DropReplicaIncarnation(_)
-            | Self::PublicV1History(_)
-            | Self::PublicV1Operation(_) => EffectClass::ReconfigurationAction,
+            Self::PublicV1History(_) | Self::PublicV1Operation(_) => {
+                EffectClass::ReconfigurationAction
+            }
         }
     }
 }
