@@ -356,4 +356,10 @@ page:replicator/trait.PrimaryReplicator.html
 page:replicator/trait.Replicator.html
 page:replicator/trait.ReplicatorFactory.html
 page:replicator/trait.StateReplicator.html
+page:replicator/traits/trait.PrimaryReplicator.html
+page:replicator/traits/trait.Replicator.html
+page:replicator/traits/trait.ReplicatorFactory.html
+page:replicator/traits/trait.StateReplicator.html
+page:traits/trait.StateProvider.html
+page:traits/trait.StatefulServiceReplica.html
 page:type.Result.html

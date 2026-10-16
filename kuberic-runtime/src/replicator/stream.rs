@@ -5,6 +5,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use crate::application::{DurableApplicationProgress, Lsn};
 use crate::{Result, RuntimeError};
 
+/// Identifies the kind of operation and its replication or copy progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationMetadata {
     Replication {
@@ -22,10 +23,18 @@ pub enum OperationMetadata {
     },
 }
 
+/// A copy or replication operation supplied by the primary for secondary
+/// application, corresponding to SF's `Operation`.
+///
 /// Acknowledge only after the operation and its progress are durably accepted.
 /// Dropping an operation is not an ACK and fails the waiting data-plane request.
+/// Unlike SF's optional implicit acknowledgement for volatile services, Kuberic
+/// requires an explicit acknowledgement for every successfully applied stream
+/// operation.
 pub struct StreamOperation {
+    /// The operation kind and the progress associated with its payload.
     pub metadata: OperationMetadata,
+    /// Opaque operation data supplied by the primary.
     pub data: Bytes,
     completion: oneshot::Sender<Result<DurableApplicationProgress>>,
 }
@@ -46,12 +55,20 @@ impl OperationCompletion {
 }
 
 impl StreamOperation {
+    /// Acknowledges successful durable application to the secondary's local
+    /// store, including the supplied applied and committed progress.
+    ///
+    /// The sender waits for this acknowledgement. It is a local completion,
+    /// not an independent quorum decision; the replicator aggregates replica
+    /// acknowledgements before completing a primary replication call.
     pub fn acknowledge(self, progress: DurableApplicationProgress) -> Result<()> {
         self.completion
             .send(Ok(progress))
             .map_err(|_| RuntimeError::Closed)
     }
 
+    /// Reports an application failure to the waiting sender instead of
+    /// acknowledging the operation.
     pub fn reject(self, error: RuntimeError) -> Result<()> {
         self.completion
             .send(Err(error))
@@ -59,6 +76,10 @@ impl StreamOperation {
     }
 }
 
+/// A stream of copy or replication operations sent from primary to secondary.
+///
+/// Each delivered [`StreamOperation`] carries metadata and opaque data and must
+/// be applied and explicitly acknowledged, or rejected on application failure.
 pub struct OperationStream {
     receiver: mpsc::Receiver<StreamOperation>,
     closed: watch::Receiver<bool>,
@@ -77,6 +98,11 @@ impl OperationStream {
         )
     }
 
+    /// Waits for the next copy or replication operation.
+    ///
+    /// Returns `Some` for a delivered operation and `None` when the stream is
+    /// closed or has ended, corresponding to SF's null end-of-stream operation.
+    /// A temporarily empty open stream waits rather than reporting completion.
     pub async fn get_operation(&mut self) -> Result<Option<StreamOperation>> {
         if *self.closed.borrow() {
             return Ok(None);
@@ -121,6 +147,9 @@ impl OperationSender {
         }
     }
 
+    /// Delivers an operation and waits for the recipient's durable application
+    /// acknowledgement or rejection. This local stream completion is not a
+    /// quorum decision.
     pub async fn send(
         &self,
         metadata: OperationMetadata,

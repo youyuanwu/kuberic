@@ -24,6 +24,8 @@ pub mod testing;
 
 #[cfg(feature = "host")]
 mod error;
+#[cfg(feature = "host")]
+mod traits;
 
 #[cfg(feature = "host")]
 pub use application::{StateProvider, StatefulServiceReplica};

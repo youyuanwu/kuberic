@@ -12,6 +12,22 @@ use kuberic_runtime::replicator::{
     PrimaryReplicator, Replicator, ReplicatorCapabilities, ReplicatorInterfaces,
 };
 
+fn supported_trait_reexports(
+    provider: &dyn kuberic_runtime::StateProvider,
+    service: &dyn kuberic_runtime::StatefulServiceReplica,
+    control: Arc<dyn kuberic_runtime::Replicator>,
+    primary: Arc<dyn kuberic_runtime::PrimaryReplicator>,
+    state: Arc<dyn kuberic_runtime::StateReplicator>,
+    factory: Arc<dyn kuberic_runtime::ReplicatorFactory>,
+) {
+    let _: &dyn kuberic_runtime::application::StateProvider = provider;
+    let _: &dyn kuberic_runtime::application::StatefulServiceReplica = service;
+    let _: Arc<dyn Replicator> = control;
+    let _: Arc<dyn PrimaryReplicator> = primary;
+    let _: Arc<dyn kuberic_runtime::replicator::StateReplicator> = state;
+    let _: Arc<dyn kuberic_runtime::replicator::ReplicatorFactory> = factory;
+}
+
 fn ordinary_application(control: Arc<dyn Replicator>, primary: Arc<dyn PrimaryReplicator>) {
     let _ = ReplicatorInterfaces::secondary(
         control,

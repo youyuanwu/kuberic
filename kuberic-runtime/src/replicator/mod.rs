@@ -1,4 +1,7 @@
 pub mod stateless;
+mod traits;
+
+pub use traits::{PrimaryReplicator, Replicator, ReplicatorFactory, StateReplicator};
 
 #[derive(Clone, Copy)]
 enum PublicV1FactoryConstructor {
@@ -108,8 +111,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
-    PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
+    AccessStatus, ConfigurationDescriptor, FaultType, LoadMetric, OperationId,
+    PartitionInformation, ProcessSessionId, ReplicaIdentity, ReplicaRole,
     ReplicaStorageIncarnationContext,
 };
 use async_trait::async_trait;
@@ -122,50 +125,6 @@ use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor
 use crate::protocol::public_operations::{PublicInboundBuildAuthority, PublicInboundBuildReceipt};
 use crate::{Result, RuntimeError};
 use stream::OperationStream;
-
-/// IFabricReplicator, with COM Begin/End pairs collapsed to async calls.
-#[async_trait]
-pub trait Replicator: Send + Sync {
-    async fn open(&self) -> Result<String>;
-    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()>;
-    async fn update_epoch(&self, epoch: Epoch) -> Result<()>;
-    async fn close(&self) -> Result<()>;
-    fn abort(&self);
-    /// Primary: locally durable quorum-committed progress. Secondary: highest
-    /// contiguous durably accepted progress. Recovery: election-only progress
-    /// while read/write access remains closed.
-    async fn current_progress(&self) -> Result<Lsn>;
-    /// Earliest retained public progress that can catch up an admitted peer.
-    /// `INVALID_LSN` means the capability is not currently known or applicable.
-    async fn catch_up_capability(&self) -> Result<Lsn>;
-}
-
-/// IFabricPrimaryReplicator; engine bookkeeping is deliberately not part of this API.
-#[async_trait]
-pub trait PrimaryReplicator: Replicator {
-    async fn on_data_loss(&self) -> Result<bool>;
-    async fn update_catch_up_replica_set_configuration(
-        &self,
-        current: ReplicaSetConfiguration,
-        previous: ReplicaSetConfiguration,
-    ) -> Result<()>;
-    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()>;
-    async fn update_current_replica_set_configuration(
-        &self,
-        current: ReplicaSetConfiguration,
-    ) -> Result<()>;
-    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()>;
-    async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()>;
-}
-
-#[async_trait]
-pub trait StateReplicator: Send + Sync {
-    /// Completes only after durable local acceptance and the admitted PC/CC write quorums.
-    async fn replicate(&self, data: OperationData) -> Result<Lsn>;
-    async fn get_replication_stream(&self) -> Result<OperationStream>;
-    async fn get_copy_stream(&self) -> Result<OperationStream>;
-    async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()>;
-}
 
 #[async_trait]
 pub(crate) trait StatelessRuntimeControl: Send + Sync {
@@ -184,7 +143,10 @@ pub(crate) trait StatelessRuntimeControl: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaSetQuorumMode {
+    /// Catch up a write quorum of each applicable configuration, including any
+    /// replica marked `must_catchup`.
     WriteQuorum,
+    /// Catch up all replicas participating in the applicable configurations.
     All,
 }
 
@@ -195,8 +157,13 @@ pub struct ReplicaInformation {
     pub replication_address: String,
     pub process_session_id: ProcessSessionId,
     pub role: ReplicaRole,
+    /// The replica's current LSN, or [`INVALID_LSN`] if unknown or inapplicable.
     pub current_progress: Lsn,
+    /// Earliest retained catch-up progress, or [`INVALID_LSN`] if unknown or
+    /// inapplicable.
     pub catch_up_capability: Lsn,
+    /// Requires this replica to catch up even in write-quorum mode, for example
+    /// when it is the next primary candidate.
     pub must_catchup: bool,
     pub storage_incarnation: Option<ReplicaStorageIncarnationContext>,
 }
@@ -952,16 +919,8 @@ pub(crate) trait ReplicatorRegistration: Send + Sync {
     ) -> Result<()>;
 }
 
-#[async_trait]
-pub trait ReplicatorFactory: Send + Sync {
-    async fn create_replicator(
-        &self,
-        context: ReplicatorFactoryContext,
-        state_provider: Option<Arc<dyn StateProvider>>,
-        settings: ReplicatorSettings,
-    ) -> Result<ReplicatorInterfaces>;
-}
-
+/// Access checks, partition information, replicator creation, and replica
+/// reporting corresponding to SF's `IStatefulServicePartition`.
 #[derive(Clone)]
 pub struct StatefulServicePartition {
     context: ReplicatorFactoryContext,
@@ -992,26 +951,39 @@ impl StatefulServicePartition {
         }
     }
 
+    /// Checks the partition's readiness for write operations. Check this before
+    /// servicing a client write request.
     pub async fn get_write_status(&self) -> Result<AccessStatus> {
         self.context.write_status().await
     }
 
+    /// Checks the replica's readiness for read operations. Check this before
+    /// servicing a client read request.
     pub async fn get_read_status(&self) -> Result<AccessStatus> {
         self.context.read_status().await
     }
 
+    /// Returns information identifying the service partition.
     pub fn get_partition_information(&self) -> PartitionInformation {
         self.context.partition_information()
     }
 
+    /// Reports load metrics for the current replica in the partition.
     pub async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
         self.context.report_load(metrics).await
     }
 
+    /// Reports a fault that requires the replica to be restarted or removed
+    /// rather than continuing to serve requests.
     pub async fn report_fault(&self, fault: FaultType) -> Result<()> {
         self.context.report_fault(fault).await
     }
 
+    /// Creates a replicator with the selected factory and settings, registers
+    /// its interfaces and optional state provider, and returns the interfaces
+    /// to the service replica.
+    ///
+    /// Select a factory with [`Self::with_factory`] during service open.
     pub async fn create_replicator(
         &self,
         state_provider: Option<Arc<dyn StateProvider>>,
