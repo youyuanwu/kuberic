@@ -95,6 +95,7 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
             first: 0,
             last: 0,
         },
+        replication_address: None,
         service_location: None,
         data_loss_recovery: None,
         completed_operations: Vec::new(),

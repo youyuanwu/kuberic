@@ -245,7 +245,13 @@ pub(super) async fn execute(
                 O::Done
             }
             ReplicatorOpen => match callbacks.replicator.open().await {
-                Ok(endpoint) => O::Endpoint(endpoint),
+                Ok(endpoint) if !endpoint.trim().is_empty() => O::Endpoint(endpoint),
+                Ok(_) => {
+                    callbacks.abort_once();
+                    return Err(HostError::CommandRejected(
+                        "Replicator Open returned an empty replication endpoint".into(),
+                    ));
+                }
                 Err(error) => {
                     callbacks.abort_once();
                     return Err(error.into());

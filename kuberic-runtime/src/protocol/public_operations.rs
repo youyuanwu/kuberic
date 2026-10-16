@@ -2362,6 +2362,9 @@ pub struct PublicV1AgentReport {
     pub history: HistoryContext,
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub progress: PublicProgress,
+    /// The current process's successful Replicator Open result, absent before Open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication_address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_location: Option<ServiceLocation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2400,6 +2403,13 @@ impl PublicV1AgentReport {
         }
         self.progress
             .validate(self.role, self.read_status, self.write_status)?;
+        if self
+            .replication_address
+            .as_ref()
+            .is_some_and(|address| address.trim().is_empty())
+        {
+            return Err("public-v1 replication endpoint is empty");
+        }
         if let Some(recovery) = &self.data_loss_recovery {
             recovery.validate_for_report(
                 &self.identity,

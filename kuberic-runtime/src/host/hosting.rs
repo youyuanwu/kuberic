@@ -770,6 +770,20 @@ impl PodRuntime {
     pub(crate) fn abort(&self) {
         self.host.abort();
     }
+
+    pub(crate) async fn shutdown_and_drain(&self) -> Result<()> {
+        self.abort();
+        if let Some(control) = self
+            .host
+            .registered
+            .get()
+            .and_then(|registered| registered.stateless_runtime_control.clone())
+        {
+            control.shutdown_and_drain().await
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl RuntimeHost {

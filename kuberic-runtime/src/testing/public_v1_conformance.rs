@@ -473,12 +473,10 @@ pub fn validate_replacement_ownership_inventory(
         return reject("table", &inventory.store_tables);
     }
     if inventory.startup_owners.len() != 2
-        || !inventory.startup_owners.iter().all(|name| {
-            matches!(
-                name.as_str(),
-                "PartitionOperationRuntime" | "serve_control_only"
-            )
-        })
+        || !inventory
+            .startup_owners
+            .iter()
+            .all(|name| matches!(name.as_str(), "PartitionOperationRuntime" | "serve_control"))
     {
         return reject("startup owner", &inventory.startup_owners);
     }

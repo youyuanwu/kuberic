@@ -26,7 +26,12 @@ fn ordinary_application(control: Arc<dyn Replicator>, primary: Arc<dyn PrimaryRe
     let _ = OpenMode::Existing;
 }
 
-fn host_application<A, R>(config: ReplicaProcessConfig, application: Arc<A>, resolver: Arc<R>)
+fn host_application<A, R>(
+    config: ReplicaProcessConfig,
+    control_listener: tokio::net::TcpListener,
+    application: Arc<A>,
+    resolver: Arc<R>,
+)
 where
     A: kuberic_runtime::StatefulServiceReplica + 'static,
     R: ReplicaEndpointResolver + 'static,
@@ -38,7 +43,7 @@ where
         resolver,
     )
     .with_application_storage_paths(Default::default());
-    let _ = host.start();
+    let _ = host.start(control_listener);
     let _ = KubernetesDnsResolver::new(
         kuberic_runtime::protocol::types::ResourceUid::new("resource"),
         "namespace",

@@ -21,7 +21,7 @@ use crate::host::sqlite_store::SqliteStore;
 use crate::host::store::AgentStore;
 use crate::host::transport::ReplicaEndpointResolver;
 
-pub(crate) const PUBLIC_V1_PROCESS_STARTUP_OWNERS: &[&str] = &["serve_control_only"];
+pub(crate) const PUBLIC_V1_PROCESS_STARTUP_OWNERS: &[&str] = &["serve_control"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplicationStorageState {
@@ -36,7 +36,6 @@ pub struct ReplicaProcessConfig {
     pub pod_uid: PodUid,
     pub pvc_uid: PvcUid,
     pub data_root: PathBuf,
-    pub control_address: SocketAddr,
     pub replication_address: SocketAddr,
     pub bearer_token: String,
     pub rpc_deadline: Duration,
@@ -579,6 +578,10 @@ impl RunningReplica {
         self.shutdown.send_replace(true);
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.completion.is_finished()
+    }
+
     pub async fn wait(&mut self) -> Result<()> {
         (&mut self.completion)
             .await
@@ -639,9 +642,10 @@ where
         self
     }
 
-    pub async fn start(self) -> Result<RunningReplica> {
+    /// Move a caller-bound control socket into the initialization and agent server task.
+    pub async fn start(self, control_listener: tokio::net::TcpListener) -> Result<RunningReplica> {
         let (_shutdown, receiver) = watch::channel(false);
-        self.start_with_shutdown(receiver)
+        self.start_with_shutdown(control_listener, receiver)
             .await?
             .ok_or(crate::host::HostError::Runtime(
                 crate::RuntimeError::OperationCancelled,
@@ -654,10 +658,115 @@ where
     /// Keep this future alive until completion, including after requesting shutdown.
     pub async fn start_with_shutdown(
         self,
+        control_listener: tokio::net::TcpListener,
         mut startup_shutdown: watch::Receiver<bool>,
     ) -> Result<Option<RunningReplica>> {
-        if *startup_shutdown.borrow() {
+        if *startup_shutdown.borrow() || startup_shutdown.has_changed().is_err() {
             return Ok(None);
+        }
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (ready, mut ready_rx) = watch::channel(false);
+        let (prepared, prepared_rx) = watch::channel(None);
+        let mut control_task =
+            tokio::spawn(self.serve_control(control_listener, prepared, ready, shutdown_rx));
+        let mut control_finished = false;
+        let mut startup_result = tokio::select! {
+            biased;
+            result = &mut control_task => {
+                control_finished = true;
+                match result {
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
+                    Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
+                        "control server stopped before becoming ready".into(),
+                    )),
+                }
+            }
+            result = async { ready_rx.wait_for(|ready| *ready).await.map(|_| ()) } => {
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(_) => {
+                        control_finished = true;
+                        match (&mut control_task).await {
+                            Ok(Err(error)) => Err(error),
+                            Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
+                            Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
+                                "control readiness channel closed".into(),
+                            )),
+                        }
+                    }
+                }
+            }
+            _ = async { let _ = startup_shutdown.wait_for(|stopped| *stopped).await; } => Ok(false),
+        };
+        if matches!(startup_result, Ok(true)) && prepared_rx.borrow().is_none() {
+            startup_result = Err(crate::host::HostError::CommandRejected(
+                "control server became ready without a replica handle".into(),
+            ));
+        }
+        if !matches!(startup_result, Ok(true)) {
+            shutdown.send_replace(true);
+            let cleanup = if control_finished {
+                Ok(())
+            } else {
+                finish_control(&mut control_task).await
+            };
+            let runtime = prepared_rx
+                .borrow()
+                .as_ref()
+                .map(|handle| handle.runtime.clone());
+            let drain = if let Some(runtime) = runtime {
+                runtime.abort();
+                drain_runtime(&runtime).await
+            } else {
+                Ok(())
+            };
+            let cleanup = with_shutdown_error(cleanup, drain, "replicator drain");
+            let cleanup =
+                match cleanup {
+                    Err(crate::host::HostError::Runtime(
+                        crate::RuntimeError::OperationCancelled,
+                    )) if matches!(startup_result, Ok(false)) => Ok(()),
+                    result => result,
+                };
+            with_shutdown_error(startup_result.map(|_| ()), cleanup, "control shutdown")?;
+            return Ok(None);
+        }
+        let handle = prepared_rx
+            .borrow()
+            .clone()
+            .expect("prepared before readiness");
+        let supervisor_shutdown = shutdown.clone();
+        let supervisor_runtime = handle.runtime.clone();
+        let completion = tokio::spawn(async move {
+            let first = (&mut control_task).await;
+            supervisor_shutdown.send_replace(true);
+            supervisor_runtime.abort();
+            let first = first
+                .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+                .and_then(|result| result);
+            with_shutdown_error(
+                first,
+                drain_runtime(&supervisor_runtime).await,
+                "replicator drain",
+            )
+        });
+        Ok(Some(RunningReplica {
+            handle,
+            shutdown,
+            completion,
+        }))
+    }
+
+    async fn serve_control(
+        self,
+        control_listener: tokio::net::TcpListener,
+        prepared: watch::Sender<Option<ReplicaHandle>>,
+        ready: watch::Sender<bool>,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return Ok(());
         }
         if self.config.replica_id.value() <= 0 {
             return Err(crate::host::HostError::CommandRejected(
@@ -677,12 +786,7 @@ where
                 "Public V1 binding differs from the selected process identity".into(),
             ));
         }
-        let observed = ObservedStorageIdentity {
-            resource_uid: self.config.resource_uid.clone(),
-            pod_uid: self.config.pod_uid.clone(),
-            pvc_uid: self.config.pvc_uid.clone(),
-            instance_id: ReplicaInstanceId::new(self.config.pod_uid.as_str()),
-        };
+        let observed = observed_storage_identity(&self.config);
         let paths = self
             .application_storage_paths
             .map(|paths| {
@@ -693,20 +797,22 @@ where
             })
             .transpose()?;
         let database_path = SqliteStore::metadata_database_path(&self.config.data_root);
-        if !database_path.is_file() {
+        let control_listener = if !database_path.is_file() {
             serve_initialization(
                 &self.config,
-                observed.clone(),
                 database_path.clone(),
                 self.application_storage == ApplicationStorageState::FreshEmpty,
                 paths.clone(),
-                startup_shutdown.clone(),
+                shutdown.clone(),
                 self.public_v1_binding.clone(),
+                control_listener,
             )
-            .await?;
-        }
-        if *startup_shutdown.borrow() || startup_shutdown.has_changed().is_err() {
-            return Ok(None);
+            .await?
+        } else {
+            control_listener
+        };
+        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+            return Ok(());
         }
 
         let store = Arc::new(SqliteStore::open_replacement_for_process(
@@ -734,87 +840,20 @@ where
         let replacement_registry = agent
             .public_operation_runtime(binding.identity.clone())
             .await?;
-        let (shutdown, shutdown_rx) = watch::channel(false);
-        let (ready, mut ready_rx) = watch::channel(false);
-        let mut agent_task = tokio::spawn(agent.serve_control_only(
-            self.config.control_address,
-            ready,
-            shutdown_rx.clone(),
-        ));
-        let mut agent_finished = false;
-        let startup_result = tokio::select! {
-            biased;
-            result = &mut agent_task => {
-                agent_finished = true;
-                match result {
-                    Ok(Err(error)) => Err(error),
-                    Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
-                    Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
-                        "agent service stopped before becoming ready".into(),
-                    )),
-                }
-            }
-            result = async { ready_rx.wait_for(|ready| *ready).await.map(|_| ()) } => {
-                match result {
-                    Ok(_) => Ok(true),
-                    Err(_) => {
-                        agent_finished = true;
-                        match (&mut agent_task).await {
-                            Ok(Err(error)) => Err(error),
-                            Err(error) => Err(crate::host::HostError::CommandRejected(error.to_string())),
-                            Ok(Ok(())) => Err(crate::host::HostError::CommandRejected(
-                                "agent readiness channel closed".into(),
-                            )),
-                        }
-                    }
-                }
-            }
-            _ = async { let _ = startup_shutdown.wait_for(|stopped| *stopped).await; } => Ok(false),
-        };
-        if !matches!(startup_result, Ok(true)) {
-            shutdown.send_replace(true);
-            let cleanup = if agent_finished {
-                Ok(())
-            } else {
-                finish_agent(&mut agent_task).await
-            };
-            runtime.abort();
-            let cleanup =
-                match cleanup {
-                    Err(crate::host::HostError::Runtime(
-                        crate::RuntimeError::OperationCancelled,
-                    )) if matches!(startup_result, Ok(false)) => Ok(()),
-                    result => result,
-                };
-            let result = with_shutdown_error(startup_result.map(|_| ()), cleanup, "agent shutdown");
-            result?;
-            return Ok(None);
-        }
-        let supervisor_shutdown = shutdown.clone();
-        let supervisor_runtime = runtime.clone();
-        let completion = tokio::spawn(async move {
-            let first = (&mut agent_task).await;
-            supervisor_shutdown.send_replace(true);
-            supervisor_runtime.abort();
-            first
-                .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
-                .and_then(|result| result)
-        });
-
-        Ok(Some(RunningReplica {
-            handle: ReplicaHandle {
-                runtime,
-                store,
-                process_session,
-                replacement: Some(ReplacementProcessHandle {
-                    binding: self.public_v1_binding.expect("validated Public V1 binding"),
-                    registry: replacement_registry,
-                    report_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-                }),
-            },
-            shutdown,
-            completion,
-        }))
+        prepared.send_replace(Some(ReplicaHandle {
+            runtime,
+            store,
+            process_session,
+            replacement: Some(ReplacementProcessHandle {
+                binding: self.public_v1_binding.expect("validated Public V1 binding"),
+                registry: replacement_registry,
+                report_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            }),
+        }));
+        drop(prepared);
+        agent
+            .serve_control_only(control_listener, ready, shutdown)
+            .await
     }
 }
 
@@ -846,11 +885,18 @@ fn with_shutdown_error(primary: Result<()>, cleanup: Result<()>, context: &str) 
 
 const AGENT_SHUTDOWN_TIMEOUT: Duration = SHUTDOWN_TIMEOUT.saturating_add(Duration::from_secs(1));
 
-async fn finish_agent(task: &mut tokio::task::JoinHandle<Result<()>>) -> Result<()> {
-    finish_agent_with_timeout(task, AGENT_SHUTDOWN_TIMEOUT).await
+async fn drain_runtime(runtime: &PodRuntime) -> Result<()> {
+    tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, runtime.shutdown_and_drain())
+        .await
+        .map_err(|_| crate::host::HostError::CommandRejected("replicator drain timed out".into()))?
+        .map_err(crate::host::HostError::Runtime)
 }
 
-async fn finish_agent_with_timeout(
+async fn finish_control(task: &mut tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    finish_control_with_timeout(task, AGENT_SHUTDOWN_TIMEOUT).await
+}
+
+async fn finish_control_with_timeout(
     task: &mut tokio::task::JoinHandle<Result<()>>,
     timeout: Duration,
 ) -> Result<()> {
@@ -862,24 +908,33 @@ async fn finish_agent_with_timeout(
             task.abort();
             let _ = task.await;
             Err(crate::host::HostError::CommandRejected(
-                "agent shutdown acknowledgement timed out".into(),
+                "control server shutdown acknowledgement timed out".into(),
             ))
         }
     }
 }
 
+fn observed_storage_identity(config: &ReplicaProcessConfig) -> ObservedStorageIdentity {
+    ObservedStorageIdentity {
+        resource_uid: config.resource_uid.clone(),
+        pod_uid: config.pod_uid.clone(),
+        pvc_uid: config.pvc_uid.clone(),
+        instance_id: ReplicaInstanceId::new(config.pod_uid.as_str()),
+    }
+}
+
 async fn serve_initialization(
     config: &ReplicaProcessConfig,
-    observed: ObservedStorageIdentity,
     database_path: PathBuf,
     fresh_application_state: bool,
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     mut startup_shutdown: watch::Receiver<bool>,
     public_v1_binding: Option<PublicV1LifecycleBinding>,
-) -> Result<()> {
+    listener: tokio::net::TcpListener,
+) -> Result<tokio::net::TcpListener> {
     let (initialized, mut initialized_rx) = watch::channel(false);
     let service = InitializationService::new(
-        observed,
+        observed_storage_identity(config),
         config.replica_id,
         database_path,
         config.bearer_token.clone(),
@@ -897,9 +952,7 @@ async fn serve_initialization(
         }
         shutdown.send_replace(true);
     });
-    let result = service
-        .serve(config.control_address, ready, shutdown_rx)
-        .await;
+    let result = service.serve(listener, ready, shutdown_rx).await;
     stop.abort();
     let _ = stop.await;
     result
@@ -959,7 +1012,7 @@ mod shutdown_tests {
                 "injected persistence failure".into(),
             ))
         });
-        let completion = finish_agent(&mut agent);
+        let completion = finish_control(&mut agent);
         tokio::pin!(completion);
         tokio::select! {
             biased;
@@ -981,7 +1034,7 @@ mod shutdown_tests {
         let mut agent = tokio::spawn(std::future::pending::<Result<()>>());
         agent.abort();
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), finish_agent(&mut agent))
+            tokio::time::timeout(Duration::from_secs(1), finish_control(&mut agent))
                 .await
                 .unwrap()
                 .is_err()
@@ -992,7 +1045,7 @@ mod shutdown_tests {
     async fn agent_shutdown_timeout_is_exactly_eleven_seconds() {
         let mut agent = tokio::spawn(std::future::pending::<Result<()>>());
         assert!(
-            finish_agent_with_timeout(&mut agent, Duration::from_millis(10))
+            finish_control_with_timeout(&mut agent, Duration::from_millis(10))
                 .await
                 .unwrap_err()
                 .to_string()

@@ -22,6 +22,7 @@ edition = "2024"
 
 [dependencies]
 kuberic-runtime = {{ path = {:?}, features = ["testing"] }}
+tokio = {{ version = "1", features = ["net"] }}
 
 [[bin]]
 name = "public"

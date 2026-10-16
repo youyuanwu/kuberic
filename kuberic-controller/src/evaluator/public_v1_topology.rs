@@ -57,7 +57,6 @@ pub fn plan_public_v1_topology(
                 && replica.report.resource_uid == accepted.history.resource_uid
                 && replica.report.history == accepted.history
                 && replica.report.replica.replica_id.value() > 0
-                && !replica.replication_address.is_empty()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -123,6 +122,46 @@ pub fn plan_public_v1_topology(
     } else {
         &eligible
     };
+    if let Some(replica) = operational_replicas
+        .iter()
+        .find(|replica| replica.replication_address.is_empty())
+    {
+        let open = PublicOperationProgram::Open {
+            replica: replica.report.replica.clone(),
+            existing: true,
+        };
+        let open_configuration_id = if current.is_some_and(|configuration| {
+            !configuration
+                .members
+                .iter()
+                .any(|member| member.identity == replica.report.replica)
+        }) {
+            &next.configuration_id
+        } else {
+            &operational_next.configuration_id
+        };
+        let open_id = content_addressed_operation_id(
+            format!(
+                "topology-{}-{}-{}-open",
+                open_configuration_id,
+                replica.report.replica.replica_id,
+                replica.report.process_session_id,
+            ),
+            &open,
+        );
+        if accepted.completed_operations.iter().any(|completion| {
+            completion.operation_id == open_id
+                && completion.result == PublicV1AcceptedResult::Succeeded
+        }) {
+            return Ok(PublicV1TopologyPlan::Wait);
+        }
+        return begin_operation(accepted, replica, open, open_id, resource_version).map(
+            |(transition, command)| PublicV1TopologyPlan::Begin {
+                transition: Box::new(transition),
+                command: Box::new(command),
+            },
+        );
+    }
     let ordinary_failover = current.is_some_and(|configuration| {
         configuration.primary_id != operational_next.primary_id
             && !observed.iter().any(|replica| {
@@ -791,6 +830,7 @@ fn configuration_is_admitted(
     configuration.members.iter().all(|member| {
         replicas.iter().any(|replica| {
             replica.report.replica == member.identity
+                && !replica.replication_address.is_empty()
                 && replica.report.role == member.role
                 && match member.role {
                     ReplicaRole::Primary => {
@@ -1146,6 +1186,7 @@ mod tests {
                     first: 0,
                     last: 0,
                 },
+                replication_address: Some(format!("http://10.0.0.{id}:50052")),
                 service_location: None,
                 data_loss_recovery: None,
                 completed_operations: Vec::new(),
@@ -1266,6 +1307,97 @@ mod tests {
     #[test]
     fn ordinary_failover_does_not_reopen_transiently_fenced_replica() {
         assert!(!should_reopen(ReplicaRole::None, false, false));
+    }
+
+    #[test]
+    fn bootstrap_opens_without_endpoints_then_waits_for_all_open_results() {
+        let mut replicas = vec![
+            replica(1, ReplicaRole::None),
+            replica(2, ReplicaRole::None),
+            replica(3, ReplicaRole::None),
+        ];
+        for replica in &mut replicas {
+            replica.replication_address.clear();
+            replica.report.replication_address = None;
+        }
+        let mut accepted = accepted(&replicas[0]);
+        for index in 0..replicas.len() {
+            let PublicV1TopologyPlan::Begin { command, .. } = plan_public_v1_topology(
+                &accepted,
+                None,
+                &replicas,
+                3,
+                None,
+                None,
+                "resource-version",
+            )
+            .unwrap() else {
+                panic!("bootstrap must authorize Open before discovering its endpoint");
+            };
+            assert_eq!(command.target, replicas[index].report.replica);
+            assert!(matches!(
+                command.intent.program,
+                Some(PublicOperationProgram::Open { .. })
+            ));
+            accept_command(&mut accepted, &mut replicas, &command);
+            assert_eq!(
+                plan_public_v1_topology(
+                    &accepted,
+                    None,
+                    &replicas,
+                    3,
+                    None,
+                    None,
+                    "resource-version",
+                )
+                .unwrap(),
+                PublicV1TopologyPlan::Wait,
+            );
+            let address = format!("http://127.0.0.1:{}", 41001 + index);
+            replicas[index].replication_address = address.clone();
+            replicas[index].report.replication_address = Some(address);
+        }
+        for _ in 0..20 {
+            let plan = plan_public_v1_topology(
+                &accepted,
+                None,
+                &replicas,
+                3,
+                None,
+                None,
+                "resource-version",
+            )
+            .unwrap();
+            match plan {
+                PublicV1TopologyPlan::Begin { command, .. } => {
+                    assert!(
+                        !matches!(
+                            command.intent.program,
+                            Some(PublicOperationProgram::Open { .. })
+                        ),
+                        "Open discovery and topology preparation must share the same operation ID"
+                    );
+                    if let Some(PublicOperationProgram::Configuration(configuration)) =
+                        command.intent.program.as_ref()
+                    {
+                        for peer in &configuration.replicas {
+                            let exact = replicas
+                                .iter()
+                                .find(|replica| replica.report.replica == peer.identity)
+                                .unwrap();
+                            assert_eq!(
+                                Some(&peer.replication_address),
+                                exact.report.replication_address.as_ref()
+                            );
+                        }
+                    }
+                    accept_command(&mut accepted, &mut replicas, &command);
+                }
+                PublicV1TopologyPlan::PersistTopology { .. } => return,
+                other => panic!("bootstrap did not progress after endpoint discovery: {other:?}"),
+            }
+        }
+        panic!("bootstrap did not admit the opened replicas");
     }
 
     #[test]

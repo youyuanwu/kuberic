@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2168,11 +2168,15 @@ fn renewal_topology_replicas(
                 .ok_or_else(|| {
                     "session-renewal configuration lacks a replication Service".to_string()
                 })?;
-            let pod_ip = observation
+            let pod = observation
                 .pods
                 .iter()
                 .find(|pod| pod.uid().as_deref() == Some(member.identity.instance_id.as_str()))
-                .and_then(|pod| pod.status.as_ref())
+                .ok_or_else(|| {
+                    "session-renewal configuration lacks its exact replica Pod".to_string()
+                })?;
+            pod.status
+                .as_ref()
                 .and_then(|status| status.pod_ip.as_deref())
                 .ok_or_else(|| {
                     "session-renewal configuration lacks a replica Pod address".to_string()
@@ -2183,10 +2187,10 @@ fn renewal_topology_replicas(
                 })?;
             Ok(PublicV1TopologyReplica {
                 report: report.clone(),
-                replication_address: format!(
-                    "http://{}",
-                    SocketAddr::new(pod_ip, REPLICATION_PORT as u16)
-                ),
+                replication_address: report.replication_address.clone().ok_or_else(|| {
+                    "session-renewal configuration lacks its current Replicator Open endpoint"
+                        .to_string()
+                })?,
             })
         })
         .collect()
@@ -3945,6 +3949,7 @@ impl ClusterApi for InMemoryClusterApi {
                                 first: 0,
                                 last: 0,
                             },
+                            replication_address: None,
                             service_location: None,
                             data_loss_recovery: None,
                             completed_operations: Vec::new(),
@@ -3999,6 +4004,12 @@ impl ClusterApi for InMemoryClusterApi {
                     }
                     if let Some(program) = operation.intent.program.as_ref() {
                         match program {
+                            kuberic_runtime::protocol::public_operations::PublicOperationProgram::Open { .. } => {
+                                report.replication_address = Some(format!(
+                                    "http://10.0.0.{}:50052",
+                                    report.replica.replica_id,
+                                ));
+                            }
                             kuberic_runtime::protocol::public_operations::PublicOperationProgram::Role {
                                 epoch,
                                 role,
@@ -5388,6 +5399,7 @@ mod corrective_replacement_tests {
                 first: 0,
                 last: 0,
             },
+            replication_address: Some("http://10.0.0.1:50052".into()),
             service_location: None,
             data_loss_recovery: None,
             completed_operations: vec![completion.clone()],
@@ -6104,6 +6116,10 @@ mod tests {
                     first: 0,
                     last: 0,
                 },
+                replication_address: Some(format!(
+                    "http://10.0.0.{}:50052",
+                    endpoint.identity.replica_id,
+                )),
                 service_location: None,
                 data_loss_recovery: None,
                 completed_operations: Vec::new(),
@@ -6145,8 +6161,11 @@ mod tests {
         assert!(should_observe_replica(&set, 110, ReplicaId::new(3)));
     }
 
-    #[test]
-    fn renewal_configuration_uses_exact_sessions_and_configures_primary_last() {
+    fn renewal_configuration_fixture() -> (
+        PublicV1AcceptedStatus,
+        PublicV1SessionRenewalStatus,
+        Vec<PublicV1TopologyReplica>,
+    ) {
         let resource_uid = ResourceUid::new("resource-renewal-configuration");
         let generation = PublicProtocolGeneration::new(1);
         let initialization = derive_history_initialization_id(&resource_uid, generation);
@@ -6249,6 +6268,12 @@ mod tests {
             ),
         ];
 
+        (authority, renewal, replicas)
+    }
+
+    #[test]
+    fn renewal_configuration_uses_exact_sessions_and_configures_primary_last() {
+        let (authority, renewal, replicas) = renewal_configuration_fixture();
         let commands = renewal_configuration_commands(&authority, &renewal, &replicas).unwrap();
 
         let targets = commands
@@ -6261,9 +6286,9 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                replacement.identity.replica_id,
-                secondary.identity.replica_id,
-                primary.identity.replica_id,
+                replicas[1].report.replica.replica_id,
+                replicas[2].report.replica.replica_id,
+                replicas[0].report.replica.replica_id,
             ]
         );
         for command in commands {
@@ -6283,6 +6308,174 @@ mod tests {
                         && expected.replication_address == replica.replication_address
                 })
             }));
+        }
+    }
+
+    fn endpoint_observation(replicas: &[PublicV1TopologyReplica]) -> RawObservation {
+        let mut set = KubericSet::new(
+            "sample",
+            crate::crd::KubericSetSpec {
+                replicas: replicas.len() as u32,
+                image: "example".into(),
+                failover_delay_seconds: 10,
+                switchover: None,
+            },
+        );
+        set.metadata.uid = Some(replicas[0].report.resource_uid.to_string());
+        set.metadata.namespace = Some("default".into());
+        RawObservation {
+            set,
+            pods: replicas
+                .iter()
+                .map(|replica| {
+                    serde_json::from_value(serde_json::json!({
+                        "metadata": {
+                            "name": format!("sample-{}", replica.report.replica.replica_id),
+                            "uid": replica.report.replica.instance_id.as_str(),
+                        },
+                        "status": {
+                            "podIP": format!("10.0.0.{}", replica.report.replica.replica_id),
+                        },
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+            services: replicas
+                .iter()
+                .map(|replica| {
+                    serde_json::from_value(serde_json::json!({
+                        "spec": {
+                            "selector": { INSTANCE_LABEL: replica.report.replica.instance_id.as_str() },
+                            "ports": [{ "name": "replication", "port": REPLICATION_PORT }],
+                        },
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+            agents: replicas
+                .iter()
+                .map(|replica| {
+                    (
+                        ReplicaObservationKey {
+                            replica_id: replica.report.replica.replica_id,
+                            instance_id: replica.report.replica.instance_id.clone(),
+                        },
+                        RawAgentObservation::PublicV1Report(Box::new(replica.report.clone())),
+                    )
+                })
+                .collect(),
+            pvcs: Vec::new(),
+            secrets: Vec::new(),
+            failures: Vec::new(),
+            now_unix_seconds: 0,
+        }
+    }
+
+    fn resolve_both_topology_paths(
+        observation: &RawObservation,
+        renewal: &PublicV1SessionRenewalStatus,
+    ) -> [std::result::Result<Vec<String>, String>; 2] {
+        let reports = observation
+            .agents
+            .values()
+            .filter_map(|agent| match agent {
+                RawAgentObservation::PublicV1Report(report) => Some(report.as_ref().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        [
+            crate::reconciler::topology_replicas(observation, None, &reports)
+                .map_err(|error| error.to_string()),
+            renewal_topology_replicas(observation, renewal),
+        ]
+        .map(|result| {
+            result.map(|replicas| {
+                replicas
+                    .into_iter()
+                    .map(|replica| replica.replication_address)
+                    .collect()
+            })
+        })
+    }
+
+    #[test]
+    fn replication_endpoint_uses_open_result_in_both_topology_paths() {
+        let (_, renewal, replicas) = renewal_configuration_fixture();
+        let mut observation = endpoint_observation(&replicas);
+        let expected = observation
+            .agents
+            .values_mut()
+            .enumerate()
+            .map(|(index, agent)| {
+                let RawAgentObservation::PublicV1Report(report) = agent else {
+                    unreachable!();
+                };
+                let address = format!("http://127.0.0.1:{}", 41001 + index);
+                report.replication_address = Some(address.clone());
+                address
+            })
+            .collect::<Vec<_>>();
+        for result in resolve_both_topology_paths(&observation, &renewal) {
+            assert_eq!(result.unwrap(), expected);
+        }
+        observation.pods[0].status.as_mut().unwrap().pod_ip = Some("::1".into());
+        for result in resolve_both_topology_paths(&observation, &renewal) {
+            assert_eq!(result.unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn replication_endpoint_absence_allows_open_but_blocks_renewal_configuration() {
+        let (_, renewal, replicas) = renewal_configuration_fixture();
+        let mut observation = endpoint_observation(&replicas);
+        for agent in observation.agents.values_mut() {
+            let RawAgentObservation::PublicV1Report(report) = agent else {
+                unreachable!();
+            };
+            report.replication_address = None;
+        }
+        let [ordinary, renewal] = resolve_both_topology_paths(&observation, &renewal);
+        assert_eq!(ordinary.unwrap(), vec![String::new(); replicas.len()]);
+        assert!(renewal.unwrap_err().contains("Replicator Open endpoint"));
+    }
+
+    #[test]
+    fn replication_endpoint_discovery_preserves_pod_service_and_session_validation() {
+        let (_, renewal, replicas) = renewal_configuration_fixture();
+        let observation = endpoint_observation(&replicas);
+        for invalid in 0..5 {
+            let mut stale = observation.clone();
+            match invalid {
+                0 => stale.pods[0].metadata.uid = Some("replacement-pod".into()),
+                1 => stale.services[0].spec.as_mut().unwrap().selector = None,
+                2 => stale.services[0].spec.as_mut().unwrap().ports = None,
+                3 => stale.pods[0].status.as_mut().unwrap().pod_ip = None,
+                4 => {
+                    stale.pods[0].status.as_mut().unwrap().pod_ip = Some("not-an-ip".into());
+                }
+                _ => unreachable!(),
+            }
+            for result in resolve_both_topology_paths(&stale, &renewal) {
+                assert!(result.is_err());
+            }
+        }
+        for invalid in 0..3 {
+            let mut stale = observation.clone();
+            let RawAgentObservation::PublicV1Report(report) =
+                stale.agents.values_mut().next().unwrap()
+            else {
+                unreachable!();
+            };
+            match invalid {
+                0 => report.process_session_id = ProcessSessionId::new("stale-session"),
+                1 => report.replicator_creation_id = ReplicatorCreationId::new("stale-creation"),
+                2 => {
+                    report.storage_incarnation.storage_generation =
+                        StorageGeneration::new("stale-storage");
+                }
+                _ => unreachable!(),
+            }
+            assert!(renewal_topology_replicas(&stale, &renewal).is_err());
         }
     }
 

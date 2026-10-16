@@ -194,6 +194,7 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
             first: 9,
             last: 9,
         },
+        replication_address: None,
         service_location: None,
         data_loss_recovery: None,
         completed_operations: Vec::new(),

@@ -115,6 +115,7 @@ fn report(
             first: 1,
             last: 1,
         },
+        replication_address: None,
         service_location: None,
         data_loss_recovery: None,
         completed_operations: vec![completion],

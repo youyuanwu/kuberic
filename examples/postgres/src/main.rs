@@ -211,7 +211,6 @@ async fn run() -> ProcessResult {
             pod_uid: PodUid::new(config.pod_uid),
             pvc_uid: PvcUid::new(config.pvc_uid),
             data_root: config.data_root,
-            control_address: config.control_address,
             replication_address: config.replication_address,
             bearer_token: config.bearer_token,
             rpc_deadline: Duration::from_secs(5),
@@ -225,7 +224,10 @@ async fn run() -> ProcessResult {
     let signal = shutdown_signal();
     tokio::pin!(signal);
     let (startup_shutdown, receiver) = tokio::sync::watch::channel(false);
-    let mut startup = tokio::spawn(host.start_with_shutdown(receiver));
+    let mut startup = tokio::spawn(host.start_with_shutdown(
+        tokio::net::TcpListener::bind(config.control_address).await?,
+        receiver,
+    ));
     let (started, trigger) = tokio::select! {
         result = &mut startup => (result, None),
         result = &mut signal => {

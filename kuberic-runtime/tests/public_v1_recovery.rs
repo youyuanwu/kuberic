@@ -955,7 +955,6 @@ impl HostedMemoryReplica {
                 pod_uid: PodUid::new(&pod_uid),
                 pvc_uid: PvcUid::new(&pvc_uid),
                 data_root: root.clone(),
-                control_address: free_address(),
                 replication_address: address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -971,7 +970,7 @@ impl HostedMemoryReplica {
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
         })
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         Self {
@@ -1153,6 +1152,174 @@ enum StoredCloseChild {
 }
 
 #[tokio::test]
+async fn public_v1_dynamic_open_endpoint_is_current_session_owned_and_cleared_on_close() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = test_root("dynamic-open-endpoint");
+        let resource_uid = ResourceUid::new("dynamic-open-endpoint");
+        let preview = PublicV1Identity::new(7);
+        let binding = PublicV1LifecycleBinding {
+            identity: preview.clone(),
+            resource_uid: resource_uid.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        drop(
+            SqliteStore::create_public_v1(
+                SqliteStore::metadata_database_path(&root),
+                preview.clone(),
+                store_identity(resource_uid.clone()),
+            )
+            .unwrap(),
+        );
+        let config = ReplicaProcessConfig {
+            resource_uid: resource_uid.clone(),
+            replica_id: ReplicaId::new(1),
+            pod_uid: PodUid::new("preview-pod-uid"),
+            pvc_uid: PvcUid::new("preview-pvc-uid"),
+            data_root: root.clone(),
+            replication_address: "127.0.0.1:0".parse().unwrap(),
+            bearer_token: "preview-token".into(),
+            rpc_deadline: Duration::from_secs(2),
+            transport_window_capacity: 8,
+        };
+        let storage = Arc::new(MemoryState::default());
+        let application = Arc::new(PreviewApplication::new(
+            storage.clone(),
+            "http://127.0.0.1:0".into(),
+        ));
+        let mut running = ReplicaHost::new(
+            config.clone(),
+            application.clone(),
+            ApplicationStorageState::FreshEmpty,
+            Arc::new(Resolver),
+        )
+        .with_public_v1_binding(binding.clone())
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+        .await
+        .unwrap();
+        let handle = running.handle();
+        let generation = PublicProtocolGeneration::new(7);
+        let initialization = derive_history_initialization_id(&resource_uid, generation);
+        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
+        handle
+            .initialize_public_v1_history(
+                &initialization,
+                &history,
+                &storage_incarnation(replica()),
+            )
+            .await
+            .unwrap();
+        assert!(handle.public_v1_report().await.unwrap().replication_address.is_none());
+        let open = intent(
+            &preview,
+            handle.process_session_id(),
+            1,
+            "dynamic-open",
+            PublicOperationProgram::Open {
+                replica: replica(),
+                existing: true,
+            },
+        );
+        handle.execute_public_v1(open.clone()).await.unwrap();
+        let opened = handle.public_v1_report().await.unwrap();
+        let endpoint: tonic::codegen::http::Uri = opened
+            .replication_address
+            .as_ref()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let address: std::net::SocketAddr = endpoint.authority().unwrap().as_str().parse().unwrap();
+        assert_ne!(address.port(), 0);
+        let control = application.control.read().await.clone().unwrap();
+        assert_eq!(
+            Some(control.open().await.unwrap()),
+            opened.replication_address,
+        );
+        assert!(tokio::net::TcpStream::connect(address).await.is_ok());
+        assert!(std::net::TcpListener::bind(address).is_err());
+        handle.execute_public_v1(open).await.unwrap();
+        assert_eq!(
+            handle.public_v1_report().await.unwrap().replication_address,
+            opened.replication_address,
+        );
+        running.shutdown();
+        running.wait().await.unwrap();
+        let reserved_old_endpoint = std::net::TcpListener::bind(address).unwrap();
+        let application = Arc::new(PreviewApplication::new(
+            storage,
+            "http://127.0.0.1:0".into(),
+        ));
+        let mut restarted = ReplicaHost::new(
+            config,
+            application,
+            ApplicationStorageState::Established,
+            Arc::new(Resolver),
+        )
+        .with_public_v1_binding(binding)
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+        .await
+        .unwrap();
+        let handle = restarted.handle();
+        let unopened = handle.public_v1_report().await.unwrap();
+        assert_ne!(unopened.process_session_id, opened.process_session_id);
+        assert!(unopened.replication_address.is_none());
+        assert!(unopened.completed_operations.is_empty());
+        handle
+            .execute_public_v1(intent(
+                &preview,
+                handle.process_session_id(),
+                2,
+                "dynamic-reopen",
+                PublicOperationProgram::Open {
+                    replica: replica(),
+                    existing: true,
+                },
+            ))
+            .await
+            .unwrap();
+        let reopened = handle.public_v1_report().await.unwrap();
+        assert!(reopened.replication_address.is_some());
+        assert_ne!(reopened.replication_address, opened.replication_address);
+        handle
+            .execute_public_v1(intent(
+                &preview,
+                handle.process_session_id(),
+                3,
+                "dynamic-close",
+                PublicOperationProgram::Close,
+            ))
+            .await
+            .unwrap();
+        let store = SqliteStore::open_public_v1(
+            SqliteStore::metadata_database_path(&root), &preview,
+        ).unwrap();
+        let closed = store.public_v1_agent_report(
+            &preview,
+            kuberic_runtime::testing::sqlite_store::PublicV1ReportProjection {
+                process_session_id: handle.process_session_id(),
+                report_sequence: 1,
+                role: ReplicaRole::None,
+                read_status: AccessStatus::NotPrimary,
+                write_status: AccessStatus::NotPrimary,
+                progress: kuberic_runtime::protocol::public_operations::PublicProgress {
+                    role: kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery,
+                    first: 0,
+                    last: 0,
+                },
+            },
+        ).await.unwrap();
+        assert!(closed.replication_address.is_none());
+        drop(store);
+        restarted.shutdown();
+        restarted.wait().await.unwrap();
+        drop(reserved_old_endpoint);
+        std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = test_root("open-once");
@@ -1192,7 +1359,6 @@ async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
                 pod_uid: PodUid::new("preview-pod-uid"),
                 pvc_uid: PvcUid::new("preview-pvc-uid"),
                 data_root: root.clone(),
-                control_address: free_address(),
                 replication_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1203,7 +1369,7 @@ async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let handle = running.handle();
@@ -1394,7 +1560,6 @@ async fn hosted_public_v1_contained_close_restarts_without_replaying_interrupted
                 pod_uid: PodUid::new("contained-close-pod"),
                 pvc_uid: PvcUid::new("contained-close-pvc"),
                 data_root: root.clone(),
-                control_address: free_address(),
                 replication_address: address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1410,7 +1575,7 @@ async fn hosted_public_v1_contained_close_restarts_without_replaying_interrupted
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
         })
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         assert_eq!(replay_application.opens.load(Ordering::SeqCst), 0);
@@ -2243,7 +2408,6 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
                 pod_uid: PodUid::new("preview-pod-uid"),
                 pvc_uid: PvcUid::new("preview-pvc-uid"),
                 data_root: root.clone(),
-                control_address,
                 replication_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -2254,7 +2418,11 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(
+            tokio::net::TcpListener::bind(control_address)
+                .await
+                .unwrap(),
+        )
         .await
         .unwrap();
         let handle = running.handle();
@@ -2409,7 +2577,6 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
                 pod_uid: PodUid::new("preview-pod-uid"),
                 pvc_uid: PvcUid::new("preview-pvc-uid"),
                 data_root: root.clone(),
-                control_address: free_address(),
                 replication_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -2423,7 +2590,7 @@ async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let handle = running.handle();
@@ -2498,7 +2665,6 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
                 pod_uid: PodUid::new("preview-pod-uid"),
                 pvc_uid: PvcUid::new("preview-pvc-uid"),
                 data_root: root.clone(),
-                control_address: free_address(),
                 replication_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -2509,7 +2675,7 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let handle = running.handle();
@@ -2657,6 +2823,8 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
             storage,
             format!("http://{replication_address}"),
         ));
+        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = control_listener.local_addr().unwrap();
         let result = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid,
@@ -2664,7 +2832,6 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
                 pod_uid: PodUid::new("preview-pod-uid"),
                 pvc_uid: PvcUid::new("preview-pvc-uid"),
                 data_root: root.clone(),
-                control_address: free_address(),
                 replication_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -2675,11 +2842,90 @@ async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(control_listener)
         .await;
         assert!(result.is_err(), "schema 6 must not fall back to legacy");
+        tokio::net::TcpListener::bind(control_address)
+            .await
+            .unwrap();
         std::net::TcpListener::bind(replication_address).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn caller_bound_control_listener_is_released_on_startup_cancellation() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for (cancel_before_start, drop_sender) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let root = test_root("cancel-caller-bound-control");
+            let resource_uid = ResourceUid::new("cancel-caller-bound-control");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let application = Arc::new(PreviewApplication::new(
+                Arc::new(MemoryState::default()),
+                "http://127.0.0.1:0".into(),
+            ));
+            let host = ReplicaHost::new(
+                ReplicaProcessConfig {
+                    resource_uid: resource_uid.clone(),
+                    replica_id: ReplicaId::new(1),
+                    pod_uid: PodUid::new("cancel-pod"),
+                    pvc_uid: PvcUid::new("cancel-pvc"),
+                    data_root: root.clone(),
+                    replication_address: "127.0.0.1:0".parse().unwrap(),
+                    bearer_token: "preview-token".into(),
+                    rpc_deadline: Duration::from_secs(2),
+                    transport_window_capacity: 8,
+                },
+                application.clone(),
+                ApplicationStorageState::FreshEmpty,
+                Arc::new(Resolver),
+            );
+            assert!(tokio::net::TcpListener::bind(address).await.is_err());
+            let (shutdown, receiver) =
+                tokio::sync::watch::channel(cancel_before_start && !drop_sender);
+            let mut shutdown = Some(shutdown);
+            if cancel_before_start && drop_sender {
+                drop(shutdown.take());
+            }
+            let startup = tokio::spawn(host.start_with_shutdown(listener, receiver));
+            if !cancel_before_start {
+                let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
+                    "http://{address}"
+                ))
+                .await
+                .unwrap();
+                let report = client
+                    .get_status(authorized(proto::GetAgentStatusRequest {
+                        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                        resource_uid: resource_uid.to_string(),
+                        replica_id: 1,
+                        expected_instance_id: "cancel-pod".into(),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(
+                    report.storage_state,
+                    proto::AgentStorageState::Uninitialized as i32
+                );
+                drop(client);
+                if drop_sender {
+                    drop(shutdown.take());
+                } else {
+                    shutdown.as_ref().unwrap().send_replace(true);
+                }
+            }
+            assert!(startup.await.unwrap().unwrap().is_none());
+            tokio::net::TcpListener::bind(address).await.unwrap();
+            assert!(!SqliteStore::metadata_database_path(&root).exists());
+            assert_eq!(application.opens.load(Ordering::SeqCst), 0);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     })
     .await
     .unwrap();
@@ -2697,7 +2943,8 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
         };
-        let control_address = free_address();
+        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = control_listener.local_addr().unwrap();
         let replication_address = free_address();
         let application = Arc::new(PreviewApplication::new(
             Arc::new(MemoryState::default()),
@@ -2711,7 +2958,6 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
                     pod_uid: PodUid::new("fresh-pod"),
                     pvc_uid: PvcUid::new("fresh-pvc"),
                     data_root: root.clone(),
-                    control_address,
                     replication_address,
                     bearer_token: "preview-token".into(),
                     rpc_deadline: Duration::from_secs(2),
@@ -2722,7 +2968,7 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
                 Arc::new(Resolver),
             )
             .with_public_v1_binding(binding)
-            .start(),
+            .start(control_listener),
         );
         let mut client = loop {
             match proto::agent_control_client::AgentControlClient::connect(format!(
@@ -2822,6 +3068,11 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
             kuberic_runtime::control::normalize_public_v1_agent_status_report(report).unwrap();
         assert_eq!(report.replica, identity);
         assert_eq!(report.role, ReplicaRole::None);
+        assert!(
+            tokio::net::TcpListener::bind(control_address)
+                .await
+                .is_err()
+        );
         let database = SqliteStore::metadata_database_path(&root);
         let connection = rusqlite::Connection::open(&database).unwrap();
         let schema: u32 = connection
@@ -2832,6 +3083,9 @@ async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
         drop(SqliteStore::open_public_v1(&database, &preview).unwrap());
         running.shutdown();
         running.wait().await.unwrap();
+        tokio::net::TcpListener::bind(control_address)
+            .await
+            .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     })
     .await
@@ -3605,7 +3859,6 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
                 pod_uid: PodUid::new("primary-pod"),
                 pvc_uid: PvcUid::new("primary-pvc"),
                 data_root: primary_root.clone(),
-                control_address: free_address(),
                 replication_address: primary_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -3616,7 +3869,7 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut secondary = ReplicaHost::new(
@@ -3626,7 +3879,6 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
                 pod_uid: PodUid::new("secondary-pod"),
                 pvc_uid: PvcUid::new("secondary-pvc"),
                 data_root: secondary_root.clone(),
-                control_address: free_address(),
                 replication_address: secondary_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -3637,7 +3889,7 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let primary_handle = primary.handle();
@@ -4226,7 +4478,6 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
                 pod_uid: PodUid::new("primary-pod"),
                 pvc_uid: PvcUid::new("primary-pvc"),
                 data_root: primary_root.clone(),
-                control_address: free_address(),
                 replication_address: primary_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -4237,7 +4488,7 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             Arc::new(Resolver),
         )
         .with_public_v1_binding(restart_binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut restarted_secondary = ReplicaHost::new(
@@ -4247,7 +4498,6 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
                 pod_uid: PodUid::new("secondary-pod"),
                 pvc_uid: PvcUid::new("secondary-pvc"),
                 data_root: secondary_root.clone(),
-                control_address: free_address(),
                 replication_address: secondary_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -4258,7 +4508,7 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
             Arc::new(Resolver),
         )
         .with_public_v1_binding(restart_binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let restarted_primary_handle = restarted_primary.handle();
@@ -4768,7 +5018,6 @@ async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_
                 pod_uid: PodUid::new("build-source-pod"),
                 pvc_uid: PvcUid::new("build-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: free_address(),
                 replication_address: source_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -4779,7 +5028,7 @@ async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut target = ReplicaHost::new(
@@ -4789,7 +5038,6 @@ async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_
                 pod_uid: PodUid::new("build-target-pod"),
                 pvc_uid: PvcUid::new("build-target-pvc"),
                 data_root: target_root.clone(),
-                control_address: free_address(),
                 replication_address: target_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -4800,7 +5048,7 @@ async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -7209,7 +7457,6 @@ async fn hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement() {
                 pod_uid: PodUid::new("controller-fresh-pod"),
                 pvc_uid: PvcUid::new("controller-fresh-pvc"),
                 data_root: fresh_root.clone(),
-                control_address: free_address(),
                 replication_address: restarted_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -7225,7 +7472,7 @@ async fn hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement() {
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
         })
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let restarted_handle = restarted.handle();
@@ -7420,7 +7667,6 @@ async fn hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement() {
                 pod_uid: PodUid::new("controller-source-pod"),
                 pvc_uid: PvcUid::new("controller-source-pvc"),
                 data_root: source_root,
-                control_address: free_address(),
                 replication_address: source.address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -7436,7 +7682,7 @@ async fn hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement() {
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
         })
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let post_restart_epoch = Epoch::new(0, 4);
@@ -7678,7 +7924,6 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                     pod_uid: PodUid::new(format!("{case}-primary-pod")),
                     pvc_uid: PvcUid::new(format!("{case}-primary-pvc")),
                     data_root: primary_root.clone(),
-                    control_address: free_address(),
                     replication_address: primary_address,
                     bearer_token: "preview-token".into(),
                     rpc_deadline: Duration::from_secs(2),
@@ -7689,7 +7934,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 Arc::new(Resolver),
             )
             .with_public_v1_binding(binding.clone())
-            .start()
+            .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
             .await
             .unwrap();
             let mut secondary = ReplicaHost::new(
@@ -7699,7 +7944,6 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                     pod_uid: PodUid::new(format!("{case}-secondary-pod")),
                     pvc_uid: PvcUid::new(format!("{case}-secondary-pvc")),
                     data_root: secondary_root.clone(),
-                    control_address: free_address(),
                     replication_address: secondary_address,
                     bearer_token: "preview-token".into(),
                     rpc_deadline: Duration::from_secs(2),
@@ -7713,7 +7957,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                 Arc::new(Resolver),
             )
             .with_public_v1_binding(binding)
-            .start()
+            .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
             .await
             .unwrap();
             let primary_handle = primary.handle();

@@ -223,7 +223,6 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("kv-source-pod"),
                 pvc_uid: PvcUid::new("kv-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -234,7 +233,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut replacement = ReplicaHost::new(
@@ -244,7 +243,6 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("kv-replacement-pod"),
                 pvc_uid: PvcUid::new("kv-replacement-pvc"),
                 data_root: replacement_root.clone(),
-                control_address: address(),
                 replication_address: replacement_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -255,7 +253,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut divergent = ReplicaHost::new(
@@ -265,7 +263,6 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("kv-divergent-pod"),
                 pvc_uid: PvcUid::new("kv-divergent-pvc"),
                 data_root: retired_root.clone(),
-                control_address: address(),
                 replication_address: divergent_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -276,7 +273,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -523,7 +520,6 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("kv-source-pod"),
                 pvc_uid: PvcUid::new("kv-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -534,7 +530,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -845,7 +841,6 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("kv-replacement-pod"),
                 pvc_uid: PvcUid::new("kv-replacement-pvc"),
                 data_root: replacement_root.clone(),
-                control_address: address(),
                 replication_address: replacement_restart_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -856,7 +851,7 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let replacement_restart_handle = restarted_replacement.handle();
@@ -1191,7 +1186,6 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("kv-composite-source-pod"),
                 pvc_uid: PvcUid::new("kv-composite-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1202,7 +1196,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut secondary = ReplicaHost::new(
@@ -1212,7 +1206,6 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("kv-composite-secondary-pod"),
                 pvc_uid: PvcUid::new("kv-composite-secondary-pvc"),
                 data_root: secondary_root.clone(),
-                control_address: address(),
                 replication_address: secondary_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1223,7 +1216,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -1418,7 +1411,6 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("kv-composite-source-pod"),
                 pvc_uid: PvcUid::new("kv-composite-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1429,7 +1421,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut secondary = ReplicaHost::new(
@@ -1439,7 +1431,6 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("kv-composite-secondary-pod"),
                 pvc_uid: PvcUid::new("kv-composite-secondary-pvc"),
                 data_root: secondary_root.clone(),
-                control_address: address(),
                 replication_address: secondary_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1450,7 +1441,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -1939,7 +1930,6 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 pod_uid: PodUid::new("kv-failover-source-pod"),
                 pvc_uid: PvcUid::new("kv-failover-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1950,7 +1940,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut survivor = ReplicaHost::new(
@@ -1960,7 +1950,6 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 pod_uid: PodUid::new("kv-failover-survivor-pod"),
                 pvc_uid: PvcUid::new("kv-failover-survivor-pvc"),
                 data_root: survivor_root.clone(),
-                control_address: address(),
                 replication_address: survivor_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1971,7 +1960,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding.clone())
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -2205,7 +2194,6 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 pod_uid: PodUid::new("kv-failover-source-pod"),
                 pvc_uid: PvcUid::new("kv-failover-source-pvc"),
                 data_root: source_root,
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "preview-token".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -2216,7 +2204,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             Arc::new(Resolver),
         )
         .with_public_v1_binding(binding)
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         assert_ne!(

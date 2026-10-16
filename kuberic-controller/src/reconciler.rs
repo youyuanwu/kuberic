@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1235,7 +1235,7 @@ fn observed_or_derived_identity(
     })
 }
 
-fn topology_replicas(
+pub(crate) fn topology_replicas(
     raw: &crate::observation::RawObservation,
     current: Option<&ConfigurationDescriptor>,
     reports: &[kuberic_runtime::protocol::public_operations::PublicV1AgentReport],
@@ -1282,18 +1282,20 @@ fn topology_replicas(
                     })
                 })
                 .ok_or(ControllerError::ObservationStale)?;
-            let pod_ip = raw
+            let pod = raw
                 .pods
                 .iter()
                 .find(|pod| pod.uid().as_deref() == Some(report.replica.instance_id.as_str()))
-                .and_then(|pod| pod.status.as_ref())
+                .ok_or(ControllerError::ObservationStale)?;
+            pod.status
+                .as_ref()
                 .and_then(|status| status.pod_ip.as_deref())
                 .ok_or(ControllerError::ObservationStale)?
                 .parse::<IpAddr>()
                 .map_err(|_| ControllerError::ObservationStale)?;
             Ok(PublicV1TopologyReplica {
                 report: report.clone(),
-                replication_address: format!("http://{}", SocketAddr::new(pod_ip, 50052)),
+                replication_address: report.replication_address.clone().unwrap_or_default(),
             })
         })
         .collect()

@@ -28,7 +28,6 @@ private-path documented field crate::host::process::ReplicaDiagnostics::scale_up
 private-path documented field crate::host::process::ReplicaDiagnostics::verified_replication_lsn: Option < i64 >
 private-path documented field crate::host::process::ReplicaDiagnostics::write_status: String
 private-path documented field crate::host::process::ReplicaProcessConfig::bearer_token: String
-private-path documented field crate::host::process::ReplicaProcessConfig::control_address: SocketAddr
 private-path documented field crate::host::process::ReplicaProcessConfig::data_root: PathBuf
 private-path documented field crate::host::process::ReplicaProcessConfig::pod_uid: PodUid
 private-path documented field crate::host::process::ReplicaProcessConfig::pvc_uid: PvcUid
@@ -53,13 +52,14 @@ private-path documented impl crate::host::process::ReplicaHandle::async fn revok
 private-path documented impl crate::host::process::ReplicaHandle::fn process_session_id (& self) -> crate :: protocol :: types :: ProcessSessionId
 private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_provider_writer_count (& self) -> usize
 private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_raw_retained_task_cardinality (& self) -> Result < (usize , usize) >
-private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start (self) -> Result < RunningReplica >
-private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start_with_shutdown (self , mut startup_shutdown : watch :: Receiver < bool > ,) -> Result < Option < RunningReplica > >
+private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start (self , control_listener : tokio :: net :: TcpListener) -> Result < RunningReplica >
+private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start_with_shutdown (self , control_listener : tokio :: net :: TcpListener , mut startup_shutdown : watch :: Receiver < bool > ,) -> Result < Option < RunningReplica > >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn new (config : ReplicaProcessConfig , application : Arc < A > , application_storage : ApplicationStorageState , resolver : Arc < R > ,) -> Self
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn with_application_storage_paths (mut self , paths : BTreeMap < String , PathBuf >) -> Self
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn with_public_v1_binding (mut self , binding : PublicV1LifecycleBinding) -> Self
 private-path documented impl crate::host::process::RunningReplica::async fn wait (& mut self) -> Result < () >
 private-path documented impl crate::host::process::RunningReplica::fn handle (& self) -> ReplicaHandle
+private-path documented impl crate::host::process::RunningReplica::fn is_finished (& self) -> bool
 private-path documented impl crate::host::process::RunningReplica::fn shutdown (& self)
 private-path documented impl crate::host::process::RunningReplica::fn shutdown_signal (& self) -> watch :: Receiver < bool >
 private-path documented impl crate::host::transport::KubernetesDnsResolver::fn new (resource_uid : ResourceUid , namespace : impl Into < Arc < str > >) -> Self

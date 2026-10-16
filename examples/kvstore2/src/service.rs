@@ -9,7 +9,8 @@ use kuberic_runtime::replicator::{
     StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
+use tokio::task::JoinSet;
 
 use crate::persistence::KvPersistence;
 use crate::state::{CopyGate, KvStateProvider};
@@ -21,6 +22,14 @@ pub struct KvService {
     control: RwLock<Option<Arc<dyn Replicator>>>,
     partition: RwLock<Option<StatefulServicePartition>>,
     role: Mutex<ReplicaRole>,
+    stream_stop: watch::Sender<bool>,
+    streams: AsyncMutex<StreamConsumers>,
+}
+
+#[derive(Default)]
+struct StreamConsumers {
+    tasks: JoinSet<Result<()>>,
+    errors: Vec<String>,
 }
 
 impl KvService {
@@ -36,6 +45,8 @@ impl KvService {
             control: RwLock::new(None),
             partition: RwLock::new(None),
             role: Mutex::new(ReplicaRole::None),
+            stream_stop: watch::channel(false).0,
+            streams: AsyncMutex::new(StreamConsumers::default()),
         }
     }
 
@@ -65,6 +76,32 @@ impl KvService {
         require_read_access(status)?;
         Ok(self.persistence().get(key))
     }
+
+    /// Stop and await this instance's operation-stream consumers.
+    ///
+    /// Call after stopping the replica host/replicator. `close` and `abort` request
+    /// cancellation without discarding completion ownership; this method remains
+    /// usable afterward. It is terminal, repeatable, and cancellation-safe.
+    /// Unexpected consumer errors or panics are retained and returned after all
+    /// consumers terminate. Provider operation errors still reject their operation.
+    pub async fn shutdown_and_drain(&self) -> Result<()> {
+        self.close().await?;
+        let mut streams = self.streams.lock().await;
+        while let Some(result) = streams.tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => streams.errors.push(error.to_string()),
+                Err(error) => streams
+                    .errors
+                    .push(format!("KVStore2 stream consumer task failed: {error}")),
+            }
+        }
+        if streams.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Application(streams.errors.join("; ")))
+        }
+    }
 }
 
 fn require_read_access(status: kuberic_runtime::protocol::types::AccessStatus) -> Result<()> {
@@ -78,6 +115,10 @@ fn require_read_access(status: kuberic_runtime::protocol::types::AccessStatus) -
 #[async_trait]
 impl StatefulServiceReplica for KvService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        let mut streams = self.streams.lock().await;
+        if *self.stream_stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
         if let Some(control) = self.control.read().await.clone() {
             return Ok(control);
         }
@@ -101,11 +142,21 @@ impl StatefulServiceReplica for KvService {
             .expect("default operation/copy capability");
         let replication = state_replicator.get_replication_stream().await?;
         let copy = state_replicator.get_copy_stream().await?;
-        tokio::spawn(consume_stream(
+        if *self.stream_stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
+        spawn_stream_consumer(
+            &mut streams,
+            &self.stream_stop,
             self.provider.persistence().clone(),
             replication,
-        ));
-        tokio::spawn(consume_stream(self.provider.persistence().clone(), copy));
+        );
+        spawn_stream_consumer(
+            &mut streams,
+            &self.stream_stop,
+            self.provider.persistence().clone(),
+            copy,
+        );
         *self.state_replicator.write().await = Some(state_replicator);
         *self.control.write().await = Some(control.clone());
         Ok(control)
@@ -120,6 +171,8 @@ impl StatefulServiceReplica for KvService {
     }
 
     async fn close(&self) -> Result<()> {
+        self.stream_stop.send_replace(true);
+        let _streams = self.streams.lock().await;
         self.state_replicator.write().await.take();
         self.control.write().await.take();
         self.partition.write().await.take();
@@ -128,6 +181,13 @@ impl StatefulServiceReplica for KvService {
     }
 
     fn abort(&self) {
+        self.stream_stop.send_replace(true);
+        if let Ok(mut state_replicator) = self.state_replicator.try_write() {
+            state_replicator.take();
+        }
+        if let Ok(mut control) = self.control.try_write() {
+            control.take();
+        }
         if let Ok(mut partition) = self.partition.try_write() {
             partition.take();
         }
@@ -137,9 +197,28 @@ impl StatefulServiceReplica for KvService {
     }
 }
 
-async fn consume_stream(persistence: Arc<KvPersistence>, mut stream: OperationStream) {
+fn spawn_stream_consumer(
+    streams: &mut StreamConsumers,
+    stop: &watch::Sender<bool>,
+    persistence: Arc<KvPersistence>,
+    stream: OperationStream,
+) {
+    let mut stop = stop.subscribe();
+    streams.tasks.spawn(async move {
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => Ok(()),
+            result = consume_stream(persistence, stream) => result,
+        }
+    });
+}
+
+async fn consume_stream(
+    persistence: Arc<KvPersistence>,
+    mut stream: OperationStream,
+) -> Result<()> {
     use kuberic_runtime::engine::DurableState;
-    while let Ok(Some(operation)) = stream.get_operation().await {
+    while let Some(operation) = stream.get_operation().await? {
         let result = match &operation.metadata {
             OperationMetadata::Replication { lsn, committed_lsn } => {
                 persistence
@@ -184,5 +263,172 @@ async fn consume_stream(persistence: Arc<KvPersistence>, mut stream: OperationSt
                 let _ = operation.reject(error);
             }
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use kuberic_runtime::replicator::stream::OperationSender;
+
+    fn service() -> (tempfile::TempDir, KvService) {
+        let directory = tempfile::Builder::new()
+            .prefix("kvstore2-stream-test-")
+            .tempdir_in(".")
+            .unwrap();
+        let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
+        let service = KvService::new(
+            persistence,
+            "http://127.0.0.1:50052".into(),
+            CopyGate::disabled(),
+        );
+        (directory, service)
+    }
+
+    async fn attach_streams(service: &KvService) -> [OperationSender; 2] {
+        let mut streams = service.streams.lock().await;
+        std::array::from_fn(|_| {
+            let (sender, stream) = OperationStream::channel(1);
+            spawn_stream_consumer(
+                &mut streams,
+                &service.stream_stop,
+                service.persistence().clone(),
+                stream,
+            );
+            sender
+        })
+    }
+
+    #[tokio::test]
+    async fn close_and_abort_preserve_stream_completion_for_drain() {
+        for abort in [false, true] {
+            let (_directory, service) = service();
+            let senders = attach_streams(&service).await;
+            assert_eq!(Arc::strong_count(service.persistence()), 3);
+            if abort {
+                service.abort();
+            } else {
+                service.close().await.unwrap();
+            }
+            assert_eq!(service.streams.lock().await.tasks.len(), 2);
+            tokio::time::timeout(Duration::from_secs(5), service.shutdown_and_drain())
+                .await
+                .expect("consumers must stop even with live stream senders")
+                .unwrap();
+            assert!(service.streams.lock().await.tasks.is_empty());
+            assert_eq!(Arc::strong_count(service.persistence()), 1);
+            service.shutdown_and_drain().await.unwrap();
+            drop(senders);
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_before_open_is_repeatable() {
+        let (_directory, service) = service();
+        service.shutdown_and_drain().await.unwrap();
+        service.abort();
+        service.shutdown_and_drain().await.unwrap();
+        assert!(matches!(
+            service.get("key").await,
+            Err(RuntimeError::NotOpen)
+        ));
+        assert!(matches!(
+            service.replicate_put("key".into(), "value".into()).await,
+            Err(RuntimeError::NotOpen)
+        ));
+    }
+
+    #[tokio::test]
+    async fn drain_awaits_all_consumers_and_retains_unexpected_failures() {
+        let (_directory, service) = service();
+        let finished = Arc::new(AtomicBool::new(false));
+        {
+            let mut streams = service.streams.lock().await;
+            streams.tasks.spawn(async {
+                Err(RuntimeError::Application(
+                    "unexpected consumer error".into(),
+                ))
+            });
+            streams.tasks.spawn(async {
+                panic!("unexpected consumer panic");
+            });
+            let finished = finished.clone();
+            streams.tasks.spawn(async move {
+                finished.store(true, Ordering::Release);
+                Ok(())
+            });
+        }
+        let error = service.shutdown_and_drain().await.unwrap_err().to_string();
+        assert!(error.contains("unexpected consumer error"));
+        assert!(error.contains("unexpected consumer panic"));
+        assert!(finished.load(Ordering::Acquire));
+        assert!(service.streams.lock().await.tasks.is_empty());
+        assert_eq!(
+            service.shutdown_and_drain().await.unwrap_err().to_string(),
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_drain_keeps_join_ownership_and_errors() {
+        let (_directory, service) = service();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut streams = service.streams.lock().await;
+            streams.tasks.spawn(async {
+                Err(RuntimeError::Application(
+                    "retained consumer failure".into(),
+                ))
+            });
+            streams.tasks.spawn(async move {
+                started.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(())
+            });
+        }
+        {
+            let drain = service.shutdown_and_drain();
+            tokio::pin!(drain);
+            tokio::select! {
+                result = &mut drain => panic!("drain completed before task release: {result:?}"),
+                result = started_rx => result.unwrap(),
+            }
+        }
+        assert!(!service.streams.lock().await.tasks.is_empty());
+        release.send(()).unwrap();
+        let error = service.shutdown_and_drain().await.unwrap_err().to_string();
+        assert!(error.contains("retained consumer failure"));
+        assert!(service.streams.lock().await.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_rejection_does_not_terminate_stream_consumers() {
+        let (_directory, service) = service();
+        let senders = attach_streams(&service).await;
+        let metadata = OperationMetadata::Replication {
+            lsn: 1,
+            committed_lsn: 0,
+        };
+        assert!(matches!(
+            senders[0]
+                .send(metadata.clone(), bytes::Bytes::from_static(b"invalid"))
+                .await,
+            Err(RuntimeError::Application(_))
+        ));
+        let progress = senders[0]
+            .send(
+                metadata,
+                KvPersistence::encode_put("key".into(), "value".into()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(progress.applied_lsn, 1);
+        assert_eq!(service.persistence().get("key").as_deref(), Some("value"));
+        service.shutdown_and_drain().await.unwrap();
     }
 }

@@ -99,7 +99,6 @@ async fn main() -> Result<()> {
             pod_uid: PodUid::new(&config.pod_uid),
             pvc_uid: PvcUid::new(&config.pvc_uid),
             data_root: config.data_root.clone(),
-            control_address: config.control_address,
             replication_address: config.replication_address,
             bearer_token: config.bearer_token.clone(),
             rpc_deadline: Duration::from_secs(5),
@@ -112,11 +111,11 @@ async fn main() -> Result<()> {
             config.namespace.clone(),
         )),
     )
-    .start()
+    .start(tokio::net::TcpListener::bind(config.control_address).await?)
     .await?;
     let shutdown_rx = replica.shutdown_signal();
     let http_state = HttpState {
-        application,
+        application: application.clone(),
         replica: replica.handle(),
     };
     let router = application_router(http_state);
@@ -139,14 +138,35 @@ async fn main() -> Result<()> {
         }
     });
 
-    tokio::select! {
-        result = replica.wait() => result?,
-        result = &mut http_task => result??,
-        result = &mut live_test_task => result??,
-        result = tokio::signal::ctrl_c() => result?,
-    }
+    let mut host_finished = false;
+    let result: Result<()> = tokio::select! {
+        result = replica.wait() => {
+            host_finished = true;
+            result.map_err(Into::into)
+        },
+        result = &mut http_task => result.map_err(anyhow::Error::from)
+            .and_then(|result| result.map_err(Into::into)),
+        result = &mut live_test_task => result.map_err(anyhow::Error::from)
+            .and_then(|result| result.map_err(Into::into)),
+        result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+    };
 
     replica.shutdown();
+    let host_cleanup = if host_finished {
+        Ok(())
+    } else {
+        replica.wait().await
+    };
+    let application_cleanup = application.shutdown_and_drain().await;
+    let errors = [
+        result.err().map(|error| error.to_string()),
+        host_cleanup.err().map(|error| error.to_string()),
+        application_cleanup.err().map(|error| error.to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
     Ok(())
 }
 

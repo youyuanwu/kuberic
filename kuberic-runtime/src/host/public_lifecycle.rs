@@ -776,6 +776,38 @@ pub(crate) async fn public_v1_report(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let replication_address = preview
+        .operations
+        .values()
+        .filter(|record| {
+            record.stage == PublicOperationStage::Completed
+                && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                && record.intent.process_session_id == projection.process_session_id
+                && matches!(
+                    record.intent.program,
+                    Some(
+                        PublicOperationProgram::Open { .. }
+                            | PublicOperationProgram::Close
+                            | PublicOperationProgram::Abort
+                    )
+                )
+        })
+        .max_by_key(|record| (&record.intent.revision, &record.intent.operation_id))
+        .filter(|record| {
+            matches!(
+                record.intent.program,
+                Some(PublicOperationProgram::Open { .. })
+            )
+        })
+        .and_then(|record| {
+            record.lifecycle.outcomes.iter().find_map(|outcome| {
+                if let PublicInstructionOutcome::Endpoint(address) = outcome {
+                    Some(address.clone())
+                } else {
+                    None
+                }
+            })
+        });
     let service_location = if projection.role == ReplicaRole::Primary
         && projection.write_status == AccessStatus::Granted
     {
@@ -825,6 +857,7 @@ pub(crate) async fn public_v1_report(
         history,
         storage_incarnation,
         progress: projection.progress,
+        replication_address,
         service_location,
         data_loss_recovery,
         completed_operations,

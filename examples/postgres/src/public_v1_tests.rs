@@ -854,7 +854,6 @@ async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionServ
             pod_uid,
             pvc_uid,
             data_root: root,
-            control_address: host_address(),
             replication_address: host_address(),
             bearer_token: "unused".into(),
             rpc_deadline: Duration::from_secs(2),
@@ -865,7 +864,7 @@ async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionServ
         Arc::new(ProductionResolver),
     )
     .with_application_storage_paths(application_paths)
-    .start()
+    .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
     .await
     .unwrap();
     let handle = running.handle();
