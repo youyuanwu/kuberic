@@ -61,8 +61,8 @@ surface. Extra endpoint, alternate protocol, and alternate controller-owner
 fixtures are injected through the same discovery path and must fail the same
 validator.
 
-The current test inventory contains 394 tests:
-347 ordinary, 41 PostgreSQL, three KinD, two build-only, and one DEX.
+The current test inventory contains 301 tests:
+255 ordinary, 41 PostgreSQL, three KinD, and two build-only.
 
 ## Deliberate Differences
 

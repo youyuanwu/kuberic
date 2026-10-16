@@ -27,14 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 347 |
+| ordinary | 255 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| DEX live | 1 |
-| **total** | **394** |
+| **total** | **301** |
 
-Ordinary partition counts are `87, 87, 87, 86`. PostgreSQL partition counts
+Ordinary partition counts are `64, 64, 64, 63`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 

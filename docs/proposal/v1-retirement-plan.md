@@ -78,8 +78,7 @@ The surviving repository validates:
 1. protocol, wire, runtime, agent and controller unit/model/durable behavior;
 2. SQLite unit and in-process lifecycle/reconfiguration scenarios;
 3. PostgreSQL host-local process, recovery, fencing and scaling scenarios;
-4. DEX default, mocked-provider and isolated real-Kubernetes behavior;
-5. retained KVStore2 bootstrap, replacement, and failover KinD scenarios.
+4. retained KVStore2 bootstrap, replacement, and failover KinD scenarios.
 
 No current validation requires the removed classic stack.
 
@@ -122,8 +121,7 @@ Other deferred operator work includes:
 ## Preserved Independent Components
 
 SQL Server observation moved to
-[kuberic-mssql](https://github.com/youyuanwu/kuberic-mssql). DEX never depended
-on the classic implementation and remains a supported source component.
+[kuberic-mssql](https://github.com/youyuanwu/kuberic-mssql).
 Independent protobuf namespaces containing `v1`, Service Fabric V1 terminology,
-DEX `kuberic.io` metadata and local `level-triggered-v1` development image tags
-do not represent classic Kuberic compatibility.
+and local `level-triggered-v1` development image tags do not represent classic
+Kuberic compatibility.

@@ -4,7 +4,7 @@ Application and replication runtime for the experimental Public V1 Kuberic
 stack.
 
 Together with `kuberic-controller`, this is one of two public production
-crates. Examples, DEX, and level tests are unpublished workspace packages.
+crates. Examples and level tests are unpublished workspace packages.
 
 ```toml
 kuberic-runtime = "0.0.1"

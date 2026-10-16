@@ -21,7 +21,7 @@ include = [
 
 [profile.ordinary]
 inherits = "ci"
-default-filter = 'not package(=postgres-replicated) and not binary(=kubernetes_checkpoint_real) and not binary_id(=kuberic-runtime::public_api_privacy)'
+default-filter = 'not package(=postgres-replicated) and not binary_id(=kuberic-runtime::public_api_privacy)'
 
 [profile.build-only]
 inherits = "ci"
@@ -36,11 +36,6 @@ test-threads = 1
 [profile.kind]
 inherits = "ci"
 default-filter = 'package(=kuberic-level-tests) and test(/^level_triggered_k8s::(bootstrap_reaches_three_member_topology_and_quorum_write|replacement_preserves_quorum_write_and_retires_old_incarnation|failover_fences_old_primary_and_preserves_committed_data)$/)'
-test-threads = 1
-
-[profile.dex-live]
-inherits = "ci"
-default-filter = 'binary(=kubernetes_checkpoint_real)'
 test-threads = 1
 
 [test-groups]

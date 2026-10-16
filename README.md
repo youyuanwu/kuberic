@@ -21,7 +21,6 @@ history and lifecycle authority.
 kuberic-runtime/           Application/replicator API, host, protocol, control
 kuberic-controller/        CRDs, reconciliation policy and Kubernetes controller
 kuberic-level-tests/       Unpublished isolated KinD scenario harness
-kuberic-dex/               Unpublished durable execution and checkpoint kernel
 
 examples/kvstore2/         Level-triggered conformance application
 examples/sqlite/           SQLite Public V1 application
@@ -29,7 +28,7 @@ examples/postgres/         PostgreSQL-native Public V1 custom replicator
 ```
 
 There are exactly two public production crates: `kuberic-runtime` and
-`kuberic-controller`. DEX, every example, and level tests remain separate,
+`kuberic-controller`. The examples and level tests remain separate,
 unpublished workspace packages (`publish = false`).
 Applications depend only on `kuberic-runtime`; its default `host` feature supplies
 `host::ReplicaHost`. Shared contracts are under `protocol` and `control`.
@@ -75,12 +74,11 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The complete tier inventory, shard commands and DEX Kubernetes-provider
-commands are documented in the
+The complete tier inventory and shard commands are documented in the
 [test strategy](docs/features/kuberic/testing.md).
 
-The current test inventory contains 394 tests: 347 ordinary, 41 PostgreSQL,
-three KinD, two build-only, and one DEX.
+The current test inventory contains 301 tests: 255 ordinary, 41 PostgreSQL,
+three KinD, and two build-only.
 
 ## Experimental Kubernetes Validation
 
@@ -150,7 +148,6 @@ the isolated development/CI assets above.
 - [Testing strategy](docs/features/kuberic/testing.md)
 - [SQLite design](docs/features/sqlite/design.md)
 - [PostgreSQL design](docs/features/postgres/design.md)
-- [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md)
 - [V1 removal record](docs/proposal/v1-retirement-plan.md)
 - [Archived classic architecture](docs/archive/v1/README.md)
 
