@@ -397,7 +397,8 @@ identities, and live access grants. Do not use a status-only assertion as a
 substitute for a successful application write.
 
 Shared readiness additionally requires no pending accepted operation,
-transition, replacement, or session renewal. Compare the complete current
+transition, replacement, session renewal, or planned transfer, and equal
+committed/applied progress for every admitted host. Compare the complete current
 admitted/live identity, storage, process-session and replicator-creation tuple,
 plus canonical configuration and peer descriptors from real successful journal
 inputs. Session-renewal configuration authority is observed from its persisted
@@ -421,6 +422,13 @@ as must-catchup successor; false selects All; missing capability waits. Final
 target-last Role/Configuration/CatchUp precedes topology/routing/request
 completion. Completed stage identities are stable across mutable progress and
 advance only from accepted exact-session/storage/history/configuration evidence.
+
+Before the first transfer command, topology status freezes the request alongside
+its starting configuration and exact admitted sessions. Removing or retargeting
+the spec after durable peer preparation does not abandon the accepted transfer.
+Controller recreation resumes it; final publication records the frozen request
+ID and clears it before a newer request is considered. Unavailable or changed
+frozen participants wait instead of being silently substituted.
 
 Same-primary quorum restoration uses accepted All catch-up for an established
 current-session configuration. Returning primary Build preparation advances
@@ -480,7 +488,7 @@ rather than adding listener transfer to the factory context or another public
 lifecycle framework. Do not expose a production fake-cluster API or add test-only
 lifecycle capabilities to protected interfaces.
 
-The twenty journey/assertion tests run without cluster environment variables in the ordinary
+The twenty-three journey/assertion tests run without cluster environment variables in the ordinary
 nextest tier:
 
 ```bash

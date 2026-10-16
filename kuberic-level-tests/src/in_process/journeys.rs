@@ -387,6 +387,25 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
         ensure!(Harness::configurations_settled(
             &status, &reports, &evidence
         ));
+        let mut pending_transfer = status.clone();
+        let topology = pending_transfer.public_v1_topology.as_mut().unwrap();
+        topology.pending_switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+            request_id: "pending-transfer".into(),
+            target_replica_id: topology
+                .sessions
+                .iter()
+                .find(|session| session.identity.replica_id != topology.primary_id)
+                .unwrap()
+                .identity
+                .replica_id
+                .value() as u32,
+        });
+        ensure!(!Harness::settled(&pending_transfer, &reports, 3));
+        ensure!(!Harness::configurations_settled(
+            &pending_transfer,
+            &reports,
+            &evidence
+        ));
         let (altered_status, altered_evidence) =
             rewrite_detached_configuration(&status, &evidence, |program| {
                 if let PublicOperationProgram::Configuration(public)
@@ -479,6 +498,16 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
             .unwrap();
         primary.write_status = kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
         ensure!(!Harness::settled(&status, &altered, 3));
+        for index in 0..reports.len() {
+            let mut altered = reports.clone();
+            altered[index].progress.last = altered[index].progress.first + 1;
+            ensure!(
+                !Harness::settled(&status, &altered, 3)
+                    && !Harness::configurations_settled(&status, &altered, &evidence),
+                "uncommitted progress accepted for {:?}",
+                altered[index].role
+            );
+        }
         let mut outsider = reports[0].clone();
         outsider.replica.instance_id =
             kuberic_runtime::protocol::types::ReplicaInstanceId::new("excluded-predecessor");
@@ -743,6 +772,15 @@ async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_primary_failover_preserves_acknowledged_data() -> Result<()> {
+    stopped_primary_failover(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unaccepted_switchover_does_not_block_unavailable_primary_failover() -> Result<()> {
+    stopped_primary_failover(true).await
+}
+
+async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
     let mut harness = Harness::new().await?;
     let result = async {
         harness.write("failover", "before").await?;
@@ -750,8 +788,50 @@ async fn stopped_primary_failover_preserves_acknowledged_data() -> Result<()> {
         let primary = harness.ready().await?;
         let old_service = harness.service(primary).await?;
         harness.stop(primary, false).await?;
+        let target = (1..=3).find(|id| *id != primary).unwrap();
+        if request_transfer {
+            let mut set = harness.set().await?;
+            set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+                request_id: "unaccepted-transfer".into(),
+                target_replica_id: target as u32,
+            });
+            Api::<kuberic_controller::crd::KubericSet>::namespaced(
+                harness.api.client(),
+                "in-process",
+            )
+            .replace("sample", &kube::api::PostParams::default(), &set)
+            .await?;
+            ensure!(
+                set.status
+                    .unwrap()
+                    .public_v1_topology
+                    .unwrap()
+                    .pending_switchover
+                    .is_none()
+            );
+        }
         let promoted = harness.ready_members(2).await?;
         ensure!(promoted != primary, "failover did not promote a survivor");
+        if request_transfer {
+            let set = harness.set().await?;
+            ensure!(
+                promoted == target
+                    && set
+                        .spec
+                        .switchover
+                        .as_ref()
+                        .is_some_and(|request| request.request_id == "unaccepted-transfer")
+            );
+            ensure!(
+                set.status
+                    .unwrap()
+                    .public_v1_topology
+                    .unwrap()
+                    .completed_switchover_request_id
+                    .as_deref()
+                    == Some("unaccepted-transfer")
+            );
+        }
         ensure!(
             old_service
                 .replicate_put("stale".into(), "rejected".into())
@@ -962,6 +1042,170 @@ async fn switchover_recreation_after_catch_up_resumes_accepted_handoff() -> Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn switchover_recreation_after_durable_handoff_resumes_promotion() -> Result<()> {
     switchover(Some(true)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switchover_cancellation_after_peer_preparation_finishes_frozen_request() -> Result<()> {
+    changed_switchover(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switchover_retarget_after_peer_preparation_serializes_frozen_requests() -> Result<()> {
+    changed_switchover(true).await
+}
+
+async fn changed_switchover(retarget: bool) -> Result<()> {
+    let mut harness = Harness::new().await?;
+    let result =
+        async {
+            harness.write("frozen-before", "acknowledged").await?;
+            harness
+                .assert_values("frozen-before", "acknowledged")
+                .await?;
+            let old = harness.ready().await?;
+            let old_service = harness.service(old).await?;
+            let target = if old == 2 { 3 } else { 2 };
+            let last_peer = (1..=3).find(|id| *id != old && *id != target).unwrap();
+            ensure!(target < last_peer, "fixture must prepare target first");
+            let initial = harness
+                .set()
+                .await?
+                .status
+                .unwrap()
+                .public_v1_topology
+                .unwrap();
+            let mut barrier = harness.api.arm_matching(
+                "sample",
+                true,
+                Some("configuration"),
+                Some(&format!("-prepare-{last_peer}-")),
+            )?;
+            let sets = Api::<kuberic_controller::crd::KubericSet>::namespaced(
+                harness.api.client(),
+                "in-process",
+            );
+            let mut set = harness.set().await?;
+            let request = kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+                request_id: "frozen-transfer".into(),
+                target_replica_id: target as u32,
+            };
+            set.spec.switchover = Some(request.clone());
+            sets.replace("sample", &kube::api::PostParams::default(), &set)
+                .await?;
+            let frozen = loop {
+                tokio::select! {
+                    frozen = barrier.entered() => break frozen?,
+                    step = harness.step() => step?,
+                }
+            };
+            let completed = assert_exact_completion(&harness, &frozen).await?;
+            let mut set = harness.set().await?;
+            let topology = set
+                .status
+                .as_ref()
+                .unwrap()
+                .public_v1_topology
+                .as_ref()
+                .unwrap();
+            ensure!(
+                topology.pending_switchover.as_ref() == Some(&request)
+                    && topology.configuration_id == initial.configuration_id
+                    && topology.sessions == initial.sessions
+            );
+            set.spec.switchover =
+                retarget.then(|| kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+                    request_id: "superseding-transfer".into(),
+                    target_replica_id: last_peer as u32,
+                });
+            let updated = sets
+                .replace("sample", &kube::api::PostParams::default(), &set)
+                .await?;
+            ensure!(
+                updated.status == set.status,
+                "spec edit changed frozen authority"
+            );
+            harness.recreate_controller()?;
+            barrier.release();
+            loop {
+                let set = harness.set().await?;
+                let topology = set
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .public_v1_topology
+                    .as_ref()
+                    .unwrap();
+                if topology.completed_switchover_request_id.as_deref() == Some("frozen-transfer") {
+                    ensure!(
+                        topology.primary_id.value() == target
+                            && topology.pending_switchover.is_none(),
+                        "completion identified the edited request instead of the accepted transfer"
+                    );
+                    for session in &topology.sessions {
+                        ensure!(initial.sessions.iter().any(|old| old.identity
+                            == session.identity
+                            && old.process_session_id == session.process_session_id
+                            && old.replicator_creation_id == session.replicator_creation_id
+                            && old.storage_incarnation == session.storage_incarnation));
+                    }
+                    break;
+                }
+                harness.step().await?;
+            }
+            ensure!(harness.ready().await? == target);
+            let status = harness.set().await?.status.unwrap();
+            ensure!(
+                status
+                    .public_v1_authority
+                    .unwrap()
+                    .authority()
+                    .map_err(anyhow::Error::msg)?
+                    .completed_operations
+                    .iter()
+                    .filter(|entry| **entry == completed)
+                    .count()
+                    == 1
+            );
+            reject_write(&old_service, "frozen-stale").await?;
+            harness
+                .assert_values("frozen-before", "acknowledged")
+                .await?;
+            harness.write("frozen-after", "continued").await?;
+            harness.assert_values("frozen-after", "continued").await?;
+            if retarget {
+                loop {
+                    let set = harness.set().await?;
+                    if set
+                        .status
+                        .as_ref()
+                        .unwrap()
+                        .public_v1_topology
+                        .as_ref()
+                        .unwrap()
+                        .completed_switchover_request_id
+                        .as_deref()
+                        == Some("superseding-transfer")
+                    {
+                        break;
+                    }
+                    harness.step().await?;
+                }
+                ensure!(harness.ready().await? == last_peer);
+                let superseded_service = harness.service(target).await?;
+                reject_write(&superseded_service, "superseded-stale").await?;
+                harness
+                    .assert_values("frozen-before", "acknowledged")
+                    .await?;
+                harness.assert_values("frozen-after", "continued").await?;
+                harness.write("superseding-after", "serialized").await?;
+                harness
+                    .assert_values("superseding-after", "serialized")
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+    harness.finish(result).await
 }
 
 async fn switchover(cut: Option<bool>) -> Result<()> {

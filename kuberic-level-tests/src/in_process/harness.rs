@@ -511,6 +511,9 @@ impl Harness {
         let Some(topology) = &status.public_v1_topology else {
             return false;
         };
+        if !Self::settled(status, reports, topology.member_count as usize) {
+            return false;
+        }
         let Ok(configuration) = topology.configuration() else {
             return false;
         };
@@ -651,6 +654,9 @@ impl Harness {
         let Some(topology) = &status.public_v1_topology else {
             return false;
         };
+        if topology.pending_switchover.is_some() {
+            return false;
+        }
         let Ok(configuration) = topology.configuration() else {
             return false;
         };
@@ -684,7 +690,7 @@ impl Harness {
                 || report.read_status != AccessStatus::Granted
                 || (report.write_status == AccessStatus::Granted)
                     != (session.role == ReplicaRole::Primary)
-                || report.progress.first > report.progress.last
+                || report.progress.first != report.progress.last
                 || !report.completed_operations.iter().any(|completion| {
                     completion.process_session_id == session.process_session_id
                         && completion.storage_incarnation == session.storage_incarnation

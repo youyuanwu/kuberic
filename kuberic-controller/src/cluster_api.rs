@@ -26,7 +26,7 @@ use kuberic_runtime::protocol::public_operations::{
     PublicV1OperationCompletion, PublicV1OperationResult, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, ConfigurationId, EffectivePolicy, OperationId, PodUid,
+    ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, PodUid,
     ProcessSessionEndpoint, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRole, ReplicaStorageIncarnationContext, ResourceUid,
     derive_agent_generation, derive_initialization_id, derive_replacement_resource_name,
@@ -2098,18 +2098,63 @@ fn topology_state_with_switchover_completion(
     sessions: &[ProcessSessionEndpoint],
 ) -> std::result::Result<PublicV1TopologyState, String> {
     let mut topology = PublicV1TopologyState::from_configuration(configuration, sessions)?;
-    topology.completed_switchover_request_id = set
-        .spec
-        .switchover
-        .as_ref()
-        .filter(|request| i64::from(request.target_replica_id) == configuration.primary_id.value())
-        .map(|request| request.request_id.clone())
-        .or_else(|| {
-            status
-                .public_v1_topology
-                .as_ref()
-                .and_then(|topology| topology.completed_switchover_request_id.clone())
-        });
+    let previous = status.public_v1_topology.as_ref();
+    topology.completed_switchover_request_id =
+        previous.and_then(|previous| previous.completed_switchover_request_id.clone());
+    if let Some(previous) = previous
+        && let Some(request) = &previous.pending_switchover
+    {
+        let starting = previous.configuration()?;
+        let target = ReplicaId::new(i64::from(request.target_replica_id));
+        let finishing = ConfigurationDescriptor::new(
+            Epoch::new(
+                starting.epoch.data_loss_number,
+                starting.epoch.configuration_number + 1,
+            ),
+            target,
+            starting
+                .members
+                .iter()
+                .cloned()
+                .map(|mut member| {
+                    member.role = if member.identity.replica_id == target {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    };
+                    member
+                })
+                .collect(),
+            starting.write_quorum,
+        );
+        if configuration == &starting && sessions == previous.sessions {
+            topology.pending_switchover = Some(request.clone());
+        } else if configuration == &finishing
+            && sessions.iter().all(|session| {
+                previous.sessions.iter().any(|old| {
+                    let mut expected = old.clone();
+                    expected.role = session.role;
+                    expected == *session
+                })
+            })
+        {
+            topology.completed_switchover_request_id = Some(request.request_id.clone());
+        } else {
+            return Err("pending switchover cannot publish unrelated topology or sessions".into());
+        }
+    } else if let Some(request) = set.spec.switchover.as_ref().filter(|request| {
+        topology.completed_switchover_request_id.as_deref() != Some(request.request_id.as_str())
+    }) {
+        if i64::from(request.target_replica_id) == configuration.primary_id.value() {
+            topology.completed_switchover_request_id = Some(request.request_id.clone());
+        } else if previous.is_some_and(|previous| {
+            previous.configuration_id == configuration.configuration_id
+                && previous.sessions == sessions
+        }) {
+            topology.pending_switchover = Some(request.clone());
+            topology.configuration()?;
+        }
+    }
     Ok(topology)
 }
 
@@ -6151,6 +6196,7 @@ mod tests {
                 unavailable_primary_id: Some(ReplicaId::new(1)),
                 unavailable_since_unix_seconds: Some(100),
                 completed_switchover_request_id: None,
+                pending_switchover: None,
                 canonical_configuration_json: "{}".into(),
             }),
             ..Default::default()

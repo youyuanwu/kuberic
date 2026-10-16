@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 308 |
+| ordinary | 311 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **354** |
+| **total** | **357** |
 
-Ordinary partition counts are `77, 77, 77, 77`. PostgreSQL partition counts
+Ordinary partition counts are `78, 78, 78, 77`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -64,7 +64,7 @@ hosted KVStore2 replicas, TCP replication, and durable files. Only Kubernetes
 resource storage, Pod/PVC realization, and explicit socket faults are simulated. It requires no cluster,
 containers, kubeconfig, or application binaries.
 
-Twenty ordinary-tier journey/assertion tests cover bootstrap/status conflict,
+Twenty-three ordinary-tier journey/assertion tests cover bootstrap/status conflict,
 support Service/Secret repair, contained restart, replacement with delayed exact
 cleanup, replacement followed by same-storage restart, stopped-primary failover,
 live-primary isolation/reconnection, quorum loss/restoration, and spec-driven
@@ -74,10 +74,11 @@ and completed switchover handoff. Provider LSNs/snapshots detect duplicate logic
 effects; exact accepted completions must be consumed once. Scenarios call
 `KvService` directly rather than its HTTP router.
 
-Readiness requires no pending accepted operation, transition, replacement, or
-session renewal; exact admitted/live session, creation and storage agreement;
+Readiness requires no pending accepted operation, transition, replacement,
+session renewal, or planned transfer; exact admitted/live session, creation and storage agreement;
 canonical configuration evidence; and settled access for all live hosts,
-including excluded predecessors. Survivor observations explicitly exclude only
+including excluded predecessors. Admitted committed and applied progress must
+agree. Survivor observations explicitly exclude only
 acknowledged isolated hosts. Rejected real application writes, not stale
 inaccessible reports, establish stale-writer safety. Timed-out writes remain
 ambiguous; restored members must agree on an absent or attempted value.
@@ -88,6 +89,11 @@ control traffic, without replacing the isolated host/service/session. Unrelated
 connections survive cuts and restoration. Fresh-Build fault probes verify zero
 provider effects while blocked and transport reconnection, not automatic retry
 of a failed Build. Negative-path tests drain active cuts and entered barriers.
+
+Switchover cancellation/retargeting after durable peer preparation and controller
+recreation must complete the frozen transfer before considering the edited spec.
+Completion identifies that original request; both transfers preserve receipts.
+An unaccepted request must not block failover when its source is already absent.
 
 Each scenario owns dynamically allocated loopback listeners, resources, and
 storage. Callers pass a bound control socket at startup, not host construction.

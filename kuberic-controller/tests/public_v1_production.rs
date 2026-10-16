@@ -1398,14 +1398,26 @@ async fn production_reconciler_finishes_accepted_operation_before_replacement() 
             target_replica_id: u32::try_from(target.value()).unwrap(),
         });
         api.set_observation(observed).await;
-        assert_eq!(
-            reconciler
-                .reconcile("default", "sample")
+        for _ in 0..4 {
+            if api
+                .observation()
                 .await
-                .unwrap()
-                .kind,
-            ReconcileKind::Applied
-        );
+                .set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_transition.is_some())
+            {
+                break;
+            }
+            assert_eq!(
+                reconciler
+                    .reconcile("default", "sample")
+                    .await
+                    .unwrap()
+                    .kind,
+                ReconcileKind::Applied
+            );
+        }
 
         let mut observed = api.observation().await;
         assert!(
