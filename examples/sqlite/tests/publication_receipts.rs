@@ -97,7 +97,6 @@ impl Fixture {
                 pod_uid: PodUid::new(format!("{name}-pod")),
                 pvc_uid: PvcUid::new(format!("{name}-pvc")),
                 data_root: root.clone(),
-                control_address: address(),
                 replication_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -107,7 +106,7 @@ impl Fixture {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let handle = running.handle();

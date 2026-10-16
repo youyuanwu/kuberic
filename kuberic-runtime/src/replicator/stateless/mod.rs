@@ -125,6 +125,43 @@ fn notify_inbound_build_boundary_waiting() {
 
 #[async_trait]
 impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
+    async fn shutdown_and_drain(&self) -> Result<()> {
+        self.abort();
+        self.descendants.stop();
+        self.inbound_descendants.stop();
+        let owner = self
+            .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let listener = async {
+            if let Some(mut owner) = owner {
+                owner.shutdown.send_replace(true);
+                match (&mut owner.task).await {
+                    Ok(result) => result,
+                    Err(error) if error.is_cancelled() => Ok(()),
+                    Err(error) => Err(RuntimeError::Application(error.to_string())),
+                }
+            } else {
+                Ok(())
+            }
+        };
+        let (listener, outbound, inbound) = tokio::join!(
+            listener,
+            self.descendants.drain(),
+            self.inbound_descendants.drain()
+        );
+        let failures = [listener, outbound, inbound]
+            .into_iter()
+            .filter_map(|result| result.err().map(|error| error.to_string()))
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Application(failures.join("; ")))
+        }
+    }
+
     async fn install_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
@@ -378,6 +415,33 @@ struct TaskRegistry {
 struct TaskRegistryInner {
     next_id: AtomicU64,
     tasks: StdMutex<BTreeMap<u64, tokio::task::AbortHandle>>,
+    stopped: AtomicBool,
+    failure: StdMutex<Option<String>>,
+    completed: tokio::sync::Notify,
+}
+
+struct TaskCompletion {
+    id: u64,
+    inner: Arc<TaskRegistryInner>,
+}
+
+impl Drop for TaskCompletion {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            *self
+                .inner
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(format!("replicator descendant {} panicked", self.id));
+        }
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+        self.inner.completed.notify_waiters();
+    }
 }
 
 impl TaskRegistry {
@@ -386,6 +450,9 @@ impl TaskRegistry {
             inner: Arc::new(TaskRegistryInner {
                 next_id: AtomicU64::new(1),
                 tasks: StdMutex::new(BTreeMap::new()),
+                stopped: AtomicBool::new(false),
+                failure: StdMutex::new(None),
+                completed: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -396,23 +463,26 @@ impl TaskRegistry {
         F::Output: Send + 'static,
     {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let inner = self.inner.clone();
+        let completion = TaskCompletion {
+            id,
+            inner: self.inner.clone(),
+        };
         let (start, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            let _completion = completion;
             let _ = started.await;
-            let output = future.await;
-            inner
-                .tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id);
-            output
+            future.await
         });
-        self.inner
+        let mut tasks = self
+            .inner
             .tasks
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, task.abort_handle());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.insert(id, task.abort_handle());
+        if self.inner.stopped.load(Ordering::Acquire) {
+            task.abort();
+        }
+        drop(tasks);
         let _ = start.send(());
         task
     }
@@ -423,10 +493,35 @@ impl TaskRegistry {
             .tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .split_off(&0)
-            .into_values()
+            .values()
         {
             task.abort();
+        }
+    }
+
+    fn stop(&self) {
+        self.inner.stopped.store(true, Ordering::Release);
+        self.abort_all();
+    }
+
+    async fn drain(&self) -> Result<()> {
+        loop {
+            let completed = self.inner.completed.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            if self.raw_len() == 0 {
+                return match self
+                    .inner
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                {
+                    Some(error) => Err(RuntimeError::Application(error.clone())),
+                    None => Ok(()),
+                };
+            }
+            completed.await;
         }
     }
 
@@ -467,7 +562,8 @@ impl Drop for AppliedWriteGuard {
         engine
             .abandoned_applied_floor
             .fetch_max(lsn, Ordering::AcqRel);
-        tokio::spawn(async move {
+        let descendants = engine.descendants.clone();
+        descendants.spawn(async move {
             engine.contain_ambiguous_suffix(lsn).await;
         });
     }
@@ -2168,7 +2264,7 @@ impl StatelessReplicator {
             .listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .as_ref()
         {
             owner.shutdown.send_replace(true);
             owner.task.abort();
@@ -2230,10 +2326,20 @@ impl Replicator for StatelessReplicator {
                 ));
             }
         }
-        let address = self.settings.read().await.replication_address.clone();
         let listener = TcpListener::bind(self.bind_address)
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let address = {
+            let mut settings = self.settings.write().await;
+            if self.bind_address.port() == 0 {
+                let bound = listener
+                    .local_addr()
+                    .map_err(|error| RuntimeError::Application(error.to_string()))?;
+                settings.replication_address =
+                    bound_replication_endpoint(&settings.replication_address, bound.port())?;
+            }
+            settings.replication_address.clone()
+        };
         validate_public_v1_data_services(PUBLIC_V1_DATA_SERVICES)?;
         let (shutdown, mut shutdown_rx) = watch::channel(false);
         let service = ReplacementReplicationService {
@@ -2947,6 +3053,24 @@ impl proto::replication_data_server::ReplicationData for ReplacementReplicationS
     }
 }
 
+fn bound_replication_endpoint(advertised: &str, port: u16) -> Result<String> {
+    let endpoint = tonic::transport::Endpoint::from_shared(advertised.to_owned())
+        .map_err(|error| RuntimeError::Application(error.to_string()))?;
+    let mut parts = endpoint.uri().clone().into_parts();
+    let authority = parts.authority.as_ref().ok_or_else(|| {
+        RuntimeError::Application("replication endpoint lacks an authority".into())
+    })?;
+    if authority.port_u16() != Some(0) {
+        return Ok(advertised.to_owned());
+    }
+    parts.authority = Some(format!("{}:{port}", authority.host()).parse().map_err(
+        |error: tonic::codegen::http::uri::InvalidUri| RuntimeError::Application(error.to_string()),
+    )?);
+    tonic::codegen::http::Uri::from_parts(parts)
+        .map(|uri| uri.to_string())
+        .map_err(|error| RuntimeError::Application(error.to_string()))
+}
+
 fn runtime_status(error: RuntimeError) -> Status {
     match error {
         RuntimeError::Application(detail) => Status::unavailable(detail),
@@ -2964,6 +3088,26 @@ mod task_registry_tests {
         drain_listener_with_timeout,
     };
     use std::time::Duration;
+
+    #[test]
+    fn dynamic_replication_endpoint_keeps_advertised_host_and_explicit_fixed_port() {
+        for advertised in [
+            "http://127.0.0.1:0",
+            "http://[::1]:0",
+            "http://replica.test:0",
+        ] {
+            let endpoint = super::bound_replication_endpoint(advertised, 41001).unwrap();
+            let before: tonic::codegen::http::Uri = advertised.parse().unwrap();
+            let after: tonic::codegen::http::Uri = endpoint.parse().unwrap();
+            assert_eq!(before.host(), after.host());
+            assert_eq!(after.port_u16(), Some(41001));
+        }
+        assert_eq!(
+            super::bound_replication_endpoint("https://advertised.test:443", 41001).unwrap(),
+            "https://advertised.test:443",
+        );
+        assert!(super::bound_replication_endpoint("not an endpoint", 41001).is_err());
+    }
 
     #[tokio::test]
     async fn completed_and_aborted_tasks_leave_no_retained_entries() {
@@ -2984,13 +3128,39 @@ mod task_registry_tests {
                 .collect::<Vec<_>>();
             assert_eq!(registry.raw_len(), tasks.len());
             registry.abort_all();
-            assert_eq!(registry.raw_len(), 0);
             for task in tasks {
                 assert!(task.await.unwrap_err().is_cancelled());
             }
+            registry.drain().await.unwrap();
+            assert_eq!(registry.raw_len(), 0);
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_drain_observes_cancelled_work_and_panics() {
+        let registry = TaskRegistry::new();
+        let task = registry.spawn(std::future::pending::<()>());
+        registry.stop();
+        registry.drain().await.unwrap();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(registry.raw_len(), 0);
+        let late = registry.spawn(std::future::pending::<()>());
+        assert!(late.await.unwrap_err().is_cancelled());
+        registry.drain().await.unwrap();
+
+        let registry = TaskRegistry::new();
+        let task = registry.spawn(async { panic!("descendant failed") });
+        assert!(task.await.unwrap_err().is_panic());
+        assert!(
+            registry
+                .drain()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("panicked")
+        );
     }
 
     #[tokio::test]

@@ -227,6 +227,7 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
             first: 7,
             last: 7,
         },
+        replication_address: None,
         service_location: None,
         data_loss_recovery: None,
         completed_operations: Vec::new(),
@@ -630,6 +631,31 @@ fn ordinary_replacement_report_validates_and_round_trips_without_data_loss_autho
         )
         .is_err()
     );
+}
+
+#[test]
+fn replication_open_endpoint_round_trips_and_rejects_empty_advertisement() {
+    let required = ordinary_required(Epoch::new(0, 10), Epoch::new(0, 11));
+    let mut report = replacement_report(&required);
+    report.replication_address = Some("http://127.0.0.1:41001".into());
+    report.validate().unwrap();
+    assert_eq!(
+        kuberic_runtime::control::normalize_public_v1_agent_status_report(
+            kuberic_runtime::control::public_v1_agent_status_to_proto(&report),
+        )
+        .unwrap(),
+        report,
+    );
+    for address in ["", " \t"] {
+        report.replication_address = Some(address.into());
+        assert!(report.validate().is_err());
+        assert!(
+            kuberic_runtime::control::normalize_public_v1_agent_status_report(
+                kuberic_runtime::control::public_v1_agent_status_to_proto(&report),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[tokio::test]

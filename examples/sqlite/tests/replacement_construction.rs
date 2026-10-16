@@ -165,7 +165,6 @@ async fn seed_retired_provider(
             pod_uid: PodUid::new("sqlite-retired-seed-pod"),
             pvc_uid: PvcUid::new("sqlite-retired-seed-pvc"),
             data_root: root.to_path_buf(),
-            control_address: address(),
             replication_address,
             bearer_token: "unused".into(),
             rpc_deadline: Duration::from_secs(2),
@@ -175,7 +174,7 @@ async fn seed_retired_provider(
         ApplicationStorageState::FreshEmpty,
         Arc::new(Resolver),
     )
-    .start()
+    .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
     .await
     .unwrap();
     let handle = running.handle();
@@ -355,7 +354,6 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("sqlite-source-pod"),
                 pvc_uid: PvcUid::new("sqlite-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -365,7 +363,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut replacement = ReplicaHost::new(
@@ -375,7 +373,6 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("sqlite-replacement-pod"),
                 pvc_uid: PvcUid::new("sqlite-replacement-pvc"),
                 data_root: replacement_root.clone(),
-                control_address: address(),
                 replication_address: replacement_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -385,7 +382,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut divergent = ReplicaHost::new(
@@ -395,7 +392,6 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("sqlite-divergent-pod"),
                 pvc_uid: PvcUid::new("sqlite-divergent-pvc"),
                 data_root: retired_root.clone(),
-                control_address: address(),
                 replication_address: divergent_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -405,7 +401,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -657,7 +653,6 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("sqlite-source-pod"),
                 pvc_uid: PvcUid::new("sqlite-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -667,7 +662,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -994,7 +989,6 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 pod_uid: PodUid::new("sqlite-replacement-pod"),
                 pvc_uid: PvcUid::new("sqlite-replacement-pvc"),
                 data_root: replacement_root.clone(),
-                control_address: address(),
                 replication_address: replacement_restart_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1004,7 +998,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let replacement_restart_handle = restarted_replacement.handle();
@@ -1313,7 +1307,6 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("sqlite-composite-source-pod"),
                 pvc_uid: PvcUid::new("sqlite-composite-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1323,7 +1316,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut secondary = ReplicaHost::new(
@@ -1333,7 +1326,6 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("sqlite-composite-secondary-pod"),
                 pvc_uid: PvcUid::new("sqlite-composite-secondary-pvc"),
                 data_root: secondary_root.clone(),
-                control_address: address(),
                 replication_address: secondary_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1343,7 +1335,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();
@@ -1584,7 +1576,6 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("sqlite-composite-source-pod"),
                 pvc_uid: PvcUid::new("sqlite-composite-source-pvc"),
                 data_root: source_root.clone(),
-                control_address: address(),
                 replication_address: source_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1594,7 +1585,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let mut secondary = ReplicaHost::new(
@@ -1604,7 +1595,6 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 pod_uid: PodUid::new("sqlite-composite-secondary-pod"),
                 pvc_uid: PvcUid::new("sqlite-composite-secondary-pvc"),
                 data_root: secondary_root.clone(),
-                control_address: address(),
                 replication_address: secondary_address,
                 bearer_token: "unused".into(),
                 rpc_deadline: Duration::from_secs(2),
@@ -1614,7 +1604,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .start()
+        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
         .await
         .unwrap();
         let source_handle = source.handle();

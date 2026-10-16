@@ -1,7 +1,6 @@
 //! Public V1 control and peer services.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -185,26 +184,27 @@ impl InitializationService {
 
     pub(crate) async fn serve(
         self,
-        control_address: SocketAddr,
+        listener: TcpListener,
         ready: watch::Sender<bool>,
         mut shutdown: watch::Receiver<bool>,
-    ) -> Result<()> {
-        let listener = TcpListener::bind(control_address).await?;
+    ) -> Result<TcpListener> {
         let services = PUBLIC_V1_CONTROL_SERVICES;
         validate_public_v1_control_services(services)?;
         let control = self.clone();
         let peer = self;
+        let mut incoming = TcpListenerStream::new(listener);
         ready.send_replace(true);
         let result = tonic::transport::Server::builder()
             .add_service(services.agent_control(control))
             .add_service(services.replica_peer(peer))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            .serve_with_incoming_shutdown(&mut incoming, async move {
                 wait_for_shutdown(&mut shutdown).await;
             })
             .await
             .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()));
         ready.send_replace(false);
-        result
+        result?;
+        Ok(incoming.into_inner())
     }
 
     fn authorize<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
@@ -613,14 +613,13 @@ where
 
     pub(crate) async fn serve_control_only(
         self,
-        control_address: SocketAddr,
+        listener: TcpListener,
         ready: watch::Sender<bool>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let state = self.store.load_state().await?;
         self.runtime
             .bind_replica_session(state.identity.resource_uid, self.session.id().clone())?;
-        let listener = TcpListener::bind(control_address).await?;
         let services = PUBLIC_V1_CONTROL_SERVICES;
         validate_public_v1_control_services(services)?;
         let control = self.clone();
@@ -1075,6 +1074,75 @@ mod tests {
         derive_agent_generation, derive_initialization_id,
     };
     use crate::replicator::Replicator;
+
+    #[tokio::test]
+    async fn dynamic_control_listener_reserves_port_until_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        assert_ne!(address.port(), 0);
+        assert!(TcpListener::bind(address).await.is_err());
+        drop(listener);
+        TcpListener::bind(address).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialization_returns_the_same_bound_listener_for_reuse() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let root = tempfile::tempdir().unwrap();
+            let mut listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            for _ in 0..2 {
+                let (initialized, _) = watch::channel(false);
+                let service = InitializationService::new(
+                    ObservedStorageIdentity {
+                        resource_uid: ResourceUid::new("listener-resource"),
+                        pod_uid: PodUid::new("listener-pod"),
+                        pvc_uid: PvcUid::new("listener-pvc"),
+                        instance_id: ReplicaInstanceId::new("listener-pod"),
+                    },
+                    ReplicaId::new(1),
+                    root.path().join("agent.sqlite3"),
+                    "test-token",
+                    initialized,
+                    true,
+                )
+                .unwrap();
+                let (ready, mut ready_rx) = watch::channel(false);
+                let (shutdown, shutdown_rx) = watch::channel(false);
+                let server = tokio::spawn(service.serve(listener, ready, shutdown_rx));
+                ready_rx.wait_for(|ready| *ready).await.unwrap();
+                assert!(TcpListener::bind(address).await.is_err());
+                let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
+                    "http://{address}"
+                ))
+                .await
+                .unwrap();
+                let mut request = Request::new(proto::GetAgentStatusRequest {
+                    protocol_version: crate::protocol::PROTOCOL_VERSION,
+                    resource_uid: "listener-resource".into(),
+                    replica_id: 1,
+                    expected_instance_id: "listener-pod".into(),
+                });
+                request
+                    .metadata_mut()
+                    .insert(AUTHORIZATION_HEADER, "Bearer test-token".parse().unwrap());
+                let report = client.get_status(request).await.unwrap().into_inner();
+                assert_eq!(
+                    report.storage_state,
+                    proto::AgentStorageState::Uninitialized as i32
+                );
+                drop(client);
+                shutdown.send_replace(true);
+                listener = server.await.unwrap().unwrap();
+                assert_eq!(listener.local_addr().unwrap(), address);
+                assert!(TcpListener::bind(address).await.is_err());
+            }
+            drop(listener);
+            TcpListener::bind(address).await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     #[derive(Default)]
     struct RenewalReplicator {

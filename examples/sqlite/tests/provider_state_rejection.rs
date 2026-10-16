@@ -207,7 +207,6 @@ fn replacement_request(
 fn config(
     root: &Path,
     resource_uid: &ResourceUid,
-    control_address: std::net::SocketAddr,
     replication_address: std::net::SocketAddr,
 ) -> ReplicaProcessConfig {
     ReplicaProcessConfig {
@@ -216,7 +215,6 @@ fn config(
         pod_uid: PodUid::new("replacement-pod"),
         pvc_uid: PvcUid::new("replacement-pvc"),
         data_root: root.to_path_buf(),
-        control_address,
         replication_address,
         bearer_token: TOKEN.into(),
         rpc_deadline: Duration::from_secs(2),
@@ -261,12 +259,17 @@ async fn phase6_sqlite_provider_state_rejects_replacement_admission_without_muta
         let (shutdown, receiver) = watch::channel(false);
         let startup = tokio::spawn(
             ReplicaHost::new(
-                config(&root, &resource_uid, control_address, replication_address),
+                config(&root, &resource_uid, replication_address),
                 application,
                 ApplicationStorageState::Established,
                 Arc::new(Resolver),
             )
-            .start_with_shutdown(receiver),
+            .start_with_shutdown(
+                tokio::net::TcpListener::bind(control_address)
+                    .await
+                    .unwrap(),
+                receiver,
+            ),
         );
         let mut client = connect!(control_address);
         let report = client
@@ -332,12 +335,16 @@ async fn fresh_and_replacement_created_sqlite_state_open_and_reopen() {
         );
         let startup = tokio::spawn(
             ReplicaHost::new(
-                config(&root, &resource_uid, control_address, replication_address),
+                config(&root, &resource_uid, replication_address),
                 application,
                 ApplicationStorageState::FreshEmpty,
                 Arc::new(Resolver),
             )
-            .start(),
+            .start(
+                tokio::net::TcpListener::bind(control_address)
+                    .await
+                    .unwrap(),
+            ),
         );
         let mut client = connect!(control_address);
         let report = client
@@ -392,12 +399,16 @@ async fn fresh_and_replacement_created_sqlite_state_open_and_reopen() {
             .unwrap(),
         );
         let mut restarted = ReplicaHost::new(
-            config(&root, &resource_uid, control_address, replication_address),
+            config(&root, &resource_uid, replication_address),
             application,
             ApplicationStorageState::Established,
             Arc::new(Resolver),
         )
-        .start()
+        .start(
+            tokio::net::TcpListener::bind(control_address)
+                .await
+                .unwrap(),
+        )
         .await
         .unwrap();
         restarted.shutdown();

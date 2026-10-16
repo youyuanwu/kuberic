@@ -1055,6 +1055,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::progress: PublicProgress
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::read_status: AccessStatus
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::replica: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::replication_address: Option < String >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::replicator_creation_id: ReplicatorCreationId
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::report_sequence: u64
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::resource_uid: ResourceUid

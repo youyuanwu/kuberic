@@ -1362,13 +1362,19 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "form_urlencoded",
+ "http",
+ "k8s-openapi",
  "kube",
  "kuberic-controller",
  "kuberic-runtime",
+ "kvstore2",
  "serde_json",
  "tempfile",
  "tokio",
  "tonic",
+ "tower",
+ "uuid",
 ]
 
 [[package]]

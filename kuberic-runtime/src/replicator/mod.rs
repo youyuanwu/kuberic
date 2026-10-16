@@ -169,6 +169,7 @@ pub trait StateReplicator: Send + Sync {
 
 #[async_trait]
 pub(crate) trait StatelessRuntimeControl: Send + Sync {
+    async fn shutdown_and_drain(&self) -> Result<()>;
     async fn install_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,

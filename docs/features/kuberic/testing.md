@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 255 |
+| ordinary | 291 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **301** |
+| **total** | **337** |
 
-Ordinary partition counts are `64, 64, 64, 63`. PostgreSQL partition counts
+Ordinary partition counts are `73, 73, 73, 72`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -50,6 +50,35 @@ the structural KSF catalog.
 
 Timeout-sensitive hosted recovery tests should use the repository nextest
 profile rather than an ad-hoc highly parallel `cargo test` invocation.
+
+### In-Process Controller/Application Journeys
+
+```bash
+cargo nextest run -p kuberic-level-tests --all-features --profile ordinary \
+  -E 'test(in_process::journeys)'
+```
+
+The [in-process harness](../../proposal/in-process-system-test-harness.md)
+connects the production reconciler and Kubernetes adapter to real agent RPCs,
+hosted KVStore2 replicas, TCP replication, and durable files. Only Kubernetes
+resource storage and Pod/PVC realization are simulated. It requires no cluster,
+containers, kubeconfig, or application binaries.
+
+Five ordinary-tier journeys cover bootstrap with a status conflict, contained
+restart/session renewal, secondary replacement with delayed deletion,
+stopped-primary failover, and controller recreation after an operation is
+persisted. Scenarios call `KvService` directly rather than its HTTP router.
+Failover admits the surviving two-member quorum; it does not prove fencing of
+a frozen or partitioned process.
+
+Each scenario owns dynamically allocated loopback listeners, resources, and
+storage. Callers pass a bound control socket at startup, not host construction.
+One server task owns it across initialization and established agent serving,
+with no close/rebind or shared listener ownership. The replicator binds during
+Open and the controller discovers its returned endpoint through the real agent
+report. Teardown drains hosts and application consumers before releasing storage;
+failures retain the data directory and report its path. Deployment, Service
+networking, watch delivery, and process pause/resume remain KinD concerns.
 
 ## Build-Only Tier
 
