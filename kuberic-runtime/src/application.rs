@@ -24,12 +24,8 @@ pub type Lsn = i64;
 /// invalid and `INVALID_LSN` must never be reported as completed progress.
 pub const INVALID_LSN: Lsn = crate::protocol::public_operations::INVALID_LSN;
 /// Opaque bytes representing a state change, copy state, or copy context.
-///
-/// Corresponds to SF's `OperationData`; Kuberic uses a single [`Bytes`] buffer
-/// rather than a separate buffer-access interface.
 pub type OperationData = Bytes;
-/// Asynchronous sequence of provider-defined operation data, corresponding to
-/// SF's `OperationDataStream`.
+/// Asynchronous sequence of provider-defined operation data.
 ///
 /// Stream completion (`None`) marks the end of the transfer. An error item
 /// reports a failed transfer rather than successful completion.

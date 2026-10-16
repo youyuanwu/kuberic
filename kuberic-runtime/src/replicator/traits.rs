@@ -11,8 +11,6 @@ use crate::Result;
 use crate::application::{Lsn, OperationData, StateProvider};
 use crate::protocol::types::{Epoch, ReplicaId, ReplicaRole};
 
-/// IFabricReplicator, with COM Begin/End pairs collapsed to async calls.
-///
 /// Controls replication lifecycle, role and epoch changes, and reports progress
 /// used for primary selection and catch-up.
 #[async_trait]
@@ -34,9 +32,8 @@ pub trait Replicator: Send + Sync {
     /// segment operations by primary configuration; replicas must fence
     /// operations from an older epoch.
     ///
-    /// SF calls this on active or idle secondaries and supplies the primary's
-    /// epoch through `change_role`. Kuberic also replays explicit epoch barriers
-    /// on the primary, so implementations must not assume a secondary-only call.
+    /// The runtime can replay explicit epoch barriers on the primary as well as
+    /// secondaries, so implementations must not assume a secondary-only call.
     async fn update_epoch(&self, epoch: Epoch) -> Result<()>;
 
     /// Closes the replicator gracefully when it is being shut down.
@@ -61,7 +58,7 @@ pub trait Replicator: Send + Sync {
     async fn catch_up_capability(&self) -> Result<Lsn>;
 }
 
-/// IFabricPrimaryReplicator; engine bookkeeping is deliberately not part of this API.
+/// Manages replica-set configuration, catch-up, and replica building on the primary.
 ///
 /// There is always a current voting configuration and there may also be a
 /// previous configuration during reconfiguration. When both exist, writes must
@@ -135,18 +132,17 @@ pub trait PrimaryReplicator: Replicator {
     /// has gone down. Stop sending operations to it and release its resources.
     ///
     /// Active replicas are removed through a configuration update that omits
-    /// them, rather than this callback. In SF this callback is not issued while
-    /// `build_replica` is still running.
+    /// them, rather than this callback. This callback concerns an idle replica
+    /// whose build has completed.
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()>;
 }
 
-/// Application-facing replication and operation-stream interface corresponding
-/// to SF's `IStateReplicator`.
+/// Application-facing replication and operation-stream interface.
 ///
 /// Services use this interface to replicate state changes for high availability
 /// and consume secondary copy and replication operations.
 ///
-/// The stream methods describe the SF service-delivery contract. The built-in
+/// The stream methods describe service-owned operation delivery. The built-in
 /// replicator currently applies incoming data directly through
 /// [`DurableState`](crate::engine::DurableState) rather than delivering it
 /// through these service streams.
@@ -161,9 +157,8 @@ pub trait StateReplicator: Send + Sync {
     /// before servicing a client write; primary role alone does not grant write
     /// access.
     ///
-    /// Unlike SF's early-LSN/receiver interface, Kuberic returns the LSN only
-    /// when this async call completes. Dropping the future is not proof that
-    /// no replica accepted the operation's bytes.
+    /// The LSN becomes available only when this async call completes. Dropping
+    /// the future is not proof that no replica accepted the operation's bytes.
     async fn replicate(&self, data: OperationData) -> Result<Lsn>;
 
     /// Returns the stream of replicated operations for the service to apply
@@ -178,7 +173,7 @@ pub trait StateReplicator: Send + Sync {
 
     /// Returns the stream of copy operations used to initialize a replica's state.
     ///
-    /// In SF, these payloads originate from the primary provider's
+    /// These payloads originate from the primary provider's
     /// [`StateProvider::get_copy_state`] stream. The secondary obtains the
     /// stream, applies its operations, and explicitly acknowledges them while
     /// participating in the copy-context exchange.
@@ -188,9 +183,8 @@ pub trait StateReplicator: Send + Sync {
     /// Updates replication settings without changing the registered replication
     /// address or replica identity.
     ///
-    /// SF permits runtime updates to security credentials. Kuberic's
-    /// [`ReplicatorSettings`] currently exposes no credential fields and this
-    /// interface has no counterpart to SF's settings-retrieval method.
+    /// [`ReplicatorSettings`] currently exposes only the replication address.
+    /// Runtime credential updates and settings retrieval are not exposed.
     async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()>;
 }
 

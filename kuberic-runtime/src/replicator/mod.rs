@@ -259,7 +259,7 @@ impl From<PublicReplicaDescriptor> for ReplicaInformation {
     }
 }
 
-/// SF ReplicaSetConfiguration: voting policy plus exact replica descriptions.
+/// Voting policy plus exact replica descriptions.
 /// Idle replicas may be described without belonging to the voting configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaSetConfiguration {
@@ -287,7 +287,7 @@ impl ReplicatorSettings {
     }
 }
 
-/// Rust's explicit counterpart of obtaining coherent interfaces from CreateReplicator.
+/// Coherent replication interfaces created and registered as one bundle.
 pub struct ReplicatorInterfaces {
     replicator: Arc<dyn Replicator>,
     state_replicator: Option<Arc<dyn StateReplicator>>,
@@ -919,8 +919,7 @@ pub(crate) trait ReplicatorRegistration: Send + Sync {
     ) -> Result<()>;
 }
 
-/// Access checks, partition information, replicator creation, and replica
-/// reporting corresponding to SF's `IStatefulServicePartition`.
+/// Access checks, partition information, replicator creation, and replica reporting.
 #[derive(Clone)]
 pub struct StatefulServicePartition {
     context: ReplicatorFactoryContext,

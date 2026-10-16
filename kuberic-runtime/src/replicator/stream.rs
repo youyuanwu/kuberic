@@ -24,13 +24,12 @@ pub enum OperationMetadata {
 }
 
 /// A copy or replication operation supplied by the primary for secondary
-/// application, corresponding to SF's `Operation`.
+/// application.
 ///
 /// Acknowledge only after the operation and its progress are durably accepted.
 /// Dropping an operation is not an ACK and fails the waiting data-plane request.
-/// Unlike SF's optional implicit acknowledgement for volatile services, Kuberic
-/// requires an explicit acknowledgement for every successfully applied stream
-/// operation.
+/// Every successfully applied stream operation requires an explicit
+/// acknowledgement.
 pub struct StreamOperation {
     /// The operation kind and the progress associated with its payload.
     pub metadata: OperationMetadata,
@@ -101,7 +100,7 @@ impl OperationStream {
     /// Waits for the next copy or replication operation.
     ///
     /// Returns `Some` for a delivered operation and `None` when the stream is
-    /// closed or has ended, corresponding to SF's null end-of-stream operation.
+    /// closed or has ended.
     /// A temporarily empty open stream waits rather than reporting completion.
     pub async fn get_operation(&mut self) -> Result<Option<StreamOperation>> {
         if *self.closed.borrow() {
@@ -115,7 +114,7 @@ impl OperationStream {
     }
 }
 
-/// Non-COM producer side for replication engines implementing service delivery.
+/// Producer side for replication engines implementing service delivery.
 #[derive(Clone)]
 pub struct OperationSender {
     sender: mpsc::Sender<StreamOperation>,

@@ -1,7 +1,7 @@
-//! Non-COM persistence integration for the default replication engine.
+//! Persistence integration for the default replication engine.
 //!
-//! These are storage/recovery hooks, not additions to IFabricStateProvider.
-//! Secondary delivery is through service-owned, explicitly acknowledged streams.
+//! Storage and recovery hooks for application-owned state, retained history,
+//! copy snapshots, and applied/committed progress.
 
 use std::pin::Pin;
 

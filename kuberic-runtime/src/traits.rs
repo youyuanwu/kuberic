@@ -11,8 +11,7 @@ use crate::replicator::Replicator;
 /// such as startup, initialization, role changes, and shutdown.
 ///
 /// Stateful service types implement this interface for behavior invoked on
-/// both primary and secondary replicas. Corresponds to SF's
-/// `IStatefulServiceReplica`.
+/// both primary and secondary replicas.
 #[async_trait]
 pub trait StatefulServiceReplica: Send + Sync {
     /// Opens an initialized service replica so that additional actions can be taken.
@@ -44,8 +43,6 @@ pub trait StatefulServiceReplica: Send + Sync {
 
 /// Defines the behavior a service implements to interact with its replicator:
 /// application-owned state, progress, copy, and data-loss callbacks.
-///
-/// Corresponds to SF's `IStateProvider`.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
     /// Notifies the provider of a new replica-set epoch after a change or
@@ -67,15 +64,14 @@ pub trait StateProvider: Send + Sync {
     /// Returns provider-defined context used by [`Self::get_copy_state`] to
     /// determine the state needed to build a secondary.
     ///
-    /// In SF, this is called on a newly created and opened idle secondary. Its
-    /// context stream is sent to the primary, which analyzes it and responds
-    /// with a copy-state stream. This enables a bidirectional conversation
-    /// about state the secondary already has. SF does not need this exchange
-    /// for an empty in-memory secondary that requires all state.
+    /// Copy context lets a newly created and opened idle secondary describe
+    /// state it already has. The primary analyzes that context and responds
+    /// with a copy-state stream. An empty secondary that requires all state
+    /// does not need to supply context.
     ///
     /// Providers that do not need context can return an empty stream.
     /// Kuberic's built-in replicator currently obtains this context from the
-    /// source provider; it does not perform SF's secondary-to-primary exchange.
+    /// source provider; it does not perform a secondary-to-primary exchange.
     async fn get_copy_context(&self) -> Result<OperationDataStream>;
 
     /// Obtains state on the primary that is needed to build a secondary,
@@ -84,10 +80,10 @@ pub trait StateProvider: Send + Sync {
     /// `up_to_lsn` is the maximum operation LSN represented by this copy.
     /// Operations beyond that boundary belong to subsequent replication.
     /// `copy_context` contains provider-defined context for selecting the
-    /// required state; see [`Self::get_copy_context`] for the SF exchange and
-    /// Kuberic's current source-local context behavior.
+    /// required state; see [`Self::get_copy_context`] for the context exchange
+    /// and Kuberic's current source-local behavior.
     ///
-    /// In SF's stream model, the output is delivered through the secondary's
+    /// With service-stream delivery, the output goes through the secondary's
     /// [`get_copy_stream`](crate::replicator::StateReplicator::get_copy_stream).
     /// Repeating an authorized build, including after restart, must reproduce
     /// identical bytes from the same frozen boundary while later replication
