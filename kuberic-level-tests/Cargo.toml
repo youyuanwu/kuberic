@@ -22,7 +22,7 @@ k8s-openapi.workspace = true
 kube.workspace = true
 kuberic-controller.workspace = true
 kuberic-runtime = { workspace = true, features = ["host", "testing"] }
-kvstore2 = { path = "../examples/kvstore2" }
+kvstore2 = { path = "../examples/kvstore2", features = ["testing"] }
 tonic.workspace = true
 tower = { version = "0.5", features = ["util"] }
 uuid = { workspace = true, features = ["v4"] }

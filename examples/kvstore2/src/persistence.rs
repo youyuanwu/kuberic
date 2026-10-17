@@ -47,13 +47,65 @@ pub struct KvPersistence {
     root: PathBuf,
     state_path: PathBuf,
     state: Mutex<PersistedState>,
+    #[cfg(feature = "testing")]
+    apply_pause: Mutex<Option<ApplyPause>>,
     #[cfg(test)]
     fail_next_persist: AtomicBool,
     #[cfg(test)]
     stream_calls: (AtomicU64, AtomicU64),
 }
 
+#[cfg(feature = "testing")]
+struct ApplyPause {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<bool>,
+}
+
+/// One-shot test gate after a durable mutation is visible, before apply returns.
+/// Dropping the gate cancels the paused apply rather than detaching work.
+#[cfg(feature = "testing")]
+#[allow(dead_code)] // The binary compiles this module too; integration tests use the library.
+pub struct ApplyGate {
+    entered: tokio::sync::oneshot::Receiver<()>,
+    release: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[cfg(feature = "testing")]
+#[allow(dead_code)]
+impl ApplyGate {
+    pub async fn entered(&mut self) {
+        (&mut self.entered)
+            .await
+            .expect("apply did not enter the gate");
+    }
+
+    pub fn release(self, fail: bool) {
+        let _ = self.release.send(fail);
+    }
+
+    pub async fn cancelled(&mut self) {
+        self.release.closed().await;
+    }
+}
+
 impl KvPersistence {
+    #[cfg(feature = "testing")]
+    #[allow(dead_code)]
+    pub fn pause_next_apply(&self) -> ApplyGate {
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, resumed) = tokio::sync::oneshot::channel();
+        let mut pause = self.apply_pause.lock().unwrap();
+        assert!(pause.is_none(), "an apply gate is already armed");
+        *pause = Some(ApplyPause {
+            entered,
+            release: resumed,
+        });
+        ApplyGate {
+            entered: observed,
+            release,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_persist_for_test(&self) {
         self.fail_next_persist.store(true, Ordering::SeqCst);
@@ -101,6 +153,8 @@ impl KvPersistence {
             root,
             state_path,
             state: Mutex::new(state),
+            #[cfg(feature = "testing")]
+            apply_pause: Mutex::new(None),
             #[cfg(test)]
             fail_next_persist: AtomicBool::new(false),
             #[cfg(test)]
@@ -346,40 +400,60 @@ impl DurableState for KvPersistence {
         self.stream_calls.0.fetch_add(1, Ordering::AcqRel);
         let mutation: Mutation = serde_json::from_slice(&operation.data)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        let mut state = self.state.lock().unwrap();
-        if let Some(existing) = state.operations.get(&operation.lsn) {
-            if existing.data == operation.data && existing.committed_lsn == operation.committed_lsn
-            {
-                return Ok(DurableApplicationProgress {
-                    applied_lsn: state.applied_lsn,
-                    committed_lsn: state.committed_lsn,
-                });
+        let progress = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(existing) = state.operations.get(&operation.lsn) {
+                if existing.data == operation.data
+                    && existing.committed_lsn == operation.committed_lsn
+                {
+                    return Ok(DurableApplicationProgress {
+                        applied_lsn: state.applied_lsn,
+                        committed_lsn: state.committed_lsn,
+                    });
+                }
+                return Err(RuntimeError::AuthorityMismatch(
+                    "LSN was reused with different application data".into(),
+                ));
             }
-            return Err(RuntimeError::AuthorityMismatch(
-                "LSN was reused with different application data".into(),
-            ));
-        }
-        let mut candidate = state.clone();
-        match mutation {
-            Mutation::Put { key, value } => {
-                candidate.values.insert(key, value);
+            let mut candidate = state.clone();
+            match mutation {
+                Mutation::Put { key, value } => {
+                    candidate.values.insert(key, value);
+                }
+            }
+            candidate.operations.insert(
+                operation.lsn,
+                OperationRecord {
+                    committed_lsn: operation.committed_lsn,
+                    data: operation.data.to_vec(),
+                },
+            );
+            candidate.applied_lsn = candidate.applied_lsn.max(operation.lsn);
+            candidate.committed_lsn = candidate.committed_lsn.max(operation.committed_lsn);
+            self.persist(&candidate)?;
+            *state = candidate;
+            DurableApplicationProgress {
+                applied_lsn: state.applied_lsn,
+                committed_lsn: state.committed_lsn,
+            }
+        };
+        #[cfg(feature = "testing")]
+        {
+            let pause = self.apply_pause.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(());
+                if pause
+                    .release
+                    .await
+                    .map_err(|_| RuntimeError::OperationCancelled)?
+                {
+                    return Err(RuntimeError::Application(
+                        "injected failure after visible apply".into(),
+                    ));
+                }
             }
         }
-        candidate.operations.insert(
-            operation.lsn,
-            OperationRecord {
-                committed_lsn: operation.committed_lsn,
-                data: operation.data.to_vec(),
-            },
-        );
-        candidate.applied_lsn = candidate.applied_lsn.max(operation.lsn);
-        candidate.committed_lsn = candidate.committed_lsn.max(operation.committed_lsn);
-        self.persist(&candidate)?;
-        *state = candidate;
-        Ok(DurableApplicationProgress {
-            applied_lsn: state.applied_lsn,
-            committed_lsn: state.committed_lsn,
-        })
+        Ok(progress)
     }
 
     async fn durable_progress(&self) -> Result<DurableApplicationProgress> {
