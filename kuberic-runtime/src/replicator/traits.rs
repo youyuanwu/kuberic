@@ -48,10 +48,16 @@ pub trait Replicator: Send + Sync {
     /// Primary: locally durable quorum-committed progress. Secondary: highest
     /// contiguous durably accepted progress. Recovery: election-only progress
     /// while read/write access remains closed.
+    ///
+    /// Known mismatch (SF-D02): the built-in implementation returns its applied
+    /// tail in every role, which can precede quorum commitment on a primary.
+    /// That result is not a committed watermark or an access grant. The primary
+    /// contract above remains unresolved, not relaxed by this description.
     async fn current_progress(&self) -> Result<Lsn>;
 
     /// Earliest retained public progress that can catch up an admitted peer.
-    /// `INVALID_LSN` means the capability is not currently known or applicable.
+    /// As a query result, `INVALID_LSN` means the capability is not currently
+    /// known or applicable, unlike omitted known-replica configuration input.
     ///
     /// Together with the peer's current progress, this determines whether
     /// retained history can catch the peer up or a fresh copy is required.
@@ -86,8 +92,11 @@ pub trait PrimaryReplicator: Replicator {
     /// A secondary selected as the next primary is marked `must_catchup` in
     /// the current configuration and must catch up before promotion. Replica
     /// progress and catch-up capability describe the remote replica's retained
-    /// history; [`INVALID_LSN`](crate::application::INVALID_LSN) denotes unknown
-    /// or inapplicable progress.
+    /// history. In SF configuration input,
+    /// [`INVALID_LSN`](crate::application::INVALID_LSN) can omit progress for a
+    /// replica already configured or built: use the replicator's known progress,
+    /// not zero or a new history. Unknown or inapplicable progress also uses the
+    /// sentinel; reuse must preserve exact identity, session, and storage checks.
     async fn update_catch_up_replica_set_configuration(
         &self,
         current: ReplicaSetConfiguration,

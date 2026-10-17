@@ -10,6 +10,15 @@ SF trait-semantics follow-up: 2026-10-17, against Kuberic
 SF-18 through SF-21 use this follow-up baseline; earlier source references
 retain their historical baseline below.
 
+Lifecycle/control-plane follow-up: 2026-10-17, against Kuberic
+`1496fd8a21c25ec4c53257b633b1d8f0f3281e18` and
+[`service-fabric-rs` stateful traits at `7c1ea4e`](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs).
+This comparison adds SF-D02 and clarifies known-replica `-1` configuration
+input. The upstream primary-replicator comments identify themselves as
+unofficial and subject to correction. That file does not define
+`StateProvider`, `StateReplicator`, or operation-stream/ACK interfaces;
+SF-18 through SF-21 retain their separate `mssf-ext` evidence.
+
 Audited baseline: `243f622b6eacc0c30d6ba59fb909e92270531ff3`, including the
 documentation-only additions to the SF-aligned traits in the working tree.
 Source line references below describe that audited state; use the named
@@ -34,7 +43,8 @@ Initial inventory: **17 implementation findings: 10 P1 and 7 P2**, plus
 This initial inventory describes the historical audit, not current status.
 
 Current inventory: **21 implementation findings: 3 fixed / 18 open**
-(8 open P1 and 10 open P2), plus the still-open documentation mismatch.
+(8 open P1 and 10 open P2), plus **two open documentation/behavior
+mismatches** (SF-D01 and SF-D02).
 SF-04/SF-05 were fixed by PR #151; SF-14 is fixed by the implementation
 published in PR #154 and recorded below. Original failure traces remain
 historical evidence. SF-18 through SF-21 track the remaining stream, context,
@@ -102,6 +112,7 @@ fixing capability admission does not fix swap staging.
 | [SF-20](#sf-20-primary-replication-lacks-the-sf-early-lsn-and-local-commit-pipeline) | P2 | Open | Primary replication lacks the SF early-LSN and local-commit pipeline |
 | [SF-21](#sf-21-acknowledgement-requires-kuberic-progress-and-always-explicit-ack) | P2 | Open | Acknowledgement requires Kuberic progress and always-explicit ACK |
 | [SF-D01](#sf-d01-catch-up-capability-is-a-tail-not-a-retained-floor) | Documentation | Open | Catch-up capability is a tail, not a retained floor |
+| [SF-D02](#sf-d02-primary-progress-promise-exceeds-the-built-in-query-result) | Documentation | Open | Primary progress promise exceeds the built-in query result |
 
 ## P1 Findings
 
@@ -714,10 +725,68 @@ The actual catch-up range uses peer current progress, not this capability.
 **Evidence:** `kuberic-runtime/src/replicator/mod.rs:173-178` and
 `kuberic-runtime/src/replicator/stateless/mod.rs:2532-2541,1384-1392`.
 
+The lifecycle/control-plane follow-up confirms the same mismatch:
+[upstream lines 110-116](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs#L110-L116)
+describe the beginning of the log, while Kuberic at `1496fd8` returns
+`state.committed_lsn` in
+`kuberic-runtime/src/replicator/stateless/mod.rs:2690-2701`.
+SF-D01 remains open.
+
 **Closure:** Decide and document the scalar's meaning, including empty,
 snapshot-only, and pruned history and `INVALID_LSN`. Align behavior or record
 an intentional conservative deviation. Returning a conservative tail is not,
 by itself, evidence of unsafe quorum acknowledgement or data corruption.
+
+### SF-D02: Primary progress promise exceeds the built-in query result
+
+**Mismatch:** Kuberic's `Replicator::current_progress` contract promises locally
+durable quorum-committed progress on a primary, but the built-in query returns
+`state.applied_lsn` without a role distinction. Primary replication publishes
+that applied tail before collecting quorum acknowledgements or committing it.
+The result can therefore exceed the primary's quorum-committed boundary.
+
+**Evidence:** At the lifecycle/control-plane baseline `1496fd8`, the promise is
+in `kuberic-runtime/src/replicator/traits.rs:45-51`, the query is in
+`replicator/stateless/mod.rs:2682-2688`, and primary apply/publication precedes
+quorum collection at `:2997-3023`, with commitment at `:3073-3098`.
+The upstream
+[current-progress description, lines 105-108](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs#L105-L108)
+describes a secondary's end-of-log for selection and catch-up. It does not
+establish Kuberic's additional primary quorum-committed guarantee.
+
+**Qualification:** This is a source-confirmed local contract/behavior mismatch,
+not a dynamically reproduced unsafe election, read, or data-loss finding.
+Durably accepted secondary progress and applied progress used only during
+access-closed recovery must not be mislabeled as unsafe primary commitment.
+SF-01 separately tracks visible application state before the read fence.
+Rustdoc now exposes the mismatch without changing the primary guarantee.
+
+**Closure:** Reconcile the primary query with its documented commitment
+contract, and define role-specific and access-closed recovery semantics.
+Hold peer ACKs after local durable apply and inspect the query on primary and
+secondary paths, then complete quorum and repeat across cancellation, epoch,
+and recovery boundaries. Preserve separate committed-watermark and access
+checks. Merely describing the current applied-tail return does not close this
+entry or authorize using it as readable committed state.
+
+### Known-Replica Configuration Sentinel Clarification
+
+The upstream
+[configuration-input description, lines 161-165](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs#L161-L165)
+allows `-1` when the replicator already knows a configured or built replica.
+This can omit a value already known to the replicator; it does not mean that
+the replica has empty history. Kuberic's earlier wording described only unknown
+or inapplicable progress and omitted that input-specific meaning.
+
+The sentinel and descriptor Rustdoc now distinguish omitted known-replica
+configuration input from unknown/inapplicable query results. Zero remains the
+valid empty-history boundary; `INVALID_LSN` is not completed progress and
+cannot authorize reuse across different process sessions or storage
+incarnations. Idle build targets continue to use the sentinel.
+
+This wording clarification does not prove that every built-in path resolves
+omitted progress correctly, and no new runtime defect or conformance closure
+is claimed. SF-10 retains its known-peer `INVALID_LSN` closure case.
 
 ## Audit Boundaries and Intentional Differences
 
@@ -733,8 +802,8 @@ through SF-21, not intentional exceptions covered by this boundary statement.
 Other distinctions remain explicit rather than being counted as extra findings:
 
 - Built-in applied progress during access-closed recovery is not automatically
-  unsafe primary committed progress. Clarify the recovery wording separately
-  from SF-01's visibility interval.
+  unsafe primary committed progress. SF-D02 tracks the primary-query promise
+  separately from SF-01's visibility interval.
 - PostgreSQL physical copy is not a deterministic StateProvider byte stream;
   byte differences across base backups alone do not prove a copy safety bug.
 - PostgreSQL's conservative PC/CC synchronous policy can deny some otherwise
@@ -818,3 +887,11 @@ Kuberic source at the follow-up baseline. They are open requirements with
 specific closure criteria, not implemented changes or dynamically executed
 failure reproductions. Existing SF-14 regression results establish delivery
 and ACK ownership only; they do not satisfy these additional alignment gates.
+
+The lifecycle/control-plane comparison at `1496fd8` and upstream `7c1ea4e`
+confirms that the intended role ordering, idle-build admission, PC/CC quorums,
+required-successor catch-up, and double-catch-up comments largely agree.
+It does not close SF-06 or SF-D01. SF-D02 and the known-replica sentinel
+clarification come from source inspection, not new behavioral reproductions.
+This documentation follow-up changes neither runtime behavior nor protected
+trait signatures.
