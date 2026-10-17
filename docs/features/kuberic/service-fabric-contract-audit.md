@@ -94,6 +94,26 @@ fixing capability admission does not fix swap staging.
 
 ## Inventory
 
+### Coordinated Semantic-Alignment Roadmap
+
+The [faithful SF V1 Rust async/tonic port plan](sf-v1-semantic-alignment-plan.md)
+supersedes choosing the next implementation solely from this inventory or
+repairing the bespoke algorithm one item at a time.
+Native-source research covers additional differences in catch-up targets,
+receive-versus-service-ACK progress, access timing, epoch callbacks and outer
+Close outcomes. They are explicit compatibility obligations in that roadmap,
+not closures or retroactive renumbering of these historical findings.
+
+Port native queue/session and primary/secondary/copy state machines first,
+prepare service/host adapters, then atomically switch the engine, public API,
+reports/controller and lifecycle while removing the old path. SF-18 through
+SF-21, SF-D01 and other gaps are closure checks against that port, not independent
+replacement algorithms. Open application/custom-replicator findings remain
+mapped to later phases. Fixed findings retain their historical evidence,
+but affected contracts (including SF-01/SF-D02/SF-10) must be requalified rather
+than treated as proof of native equivalence. No status/count changes are made
+by this documentation-only planning update.
+
 | ID | Priority | Status | Finding |
 |---|---|---|---|
 | [SF-01](#sf-01-applied-kv-state-is-visible-before-the-read-fence) | P1 | Fixed | Applied KV state is visible before the read fence |
@@ -800,6 +820,13 @@ then start replication and complete build/catch-up. Cover empty and nonempty
 copies, a later authorized build, role transitions, terminal shutdown, and
 parallel consumption. No timeout, shutdown, or mandatory concurrent consumer
 may be used to manufacture normal end-of-copy.
+
+**Native lifetime refinement (planning, not closure):** test a later build only
+in a valid new native-compatible receiver lifetime. Native idle-to-active retains
+the receiver, repeated getters share its queue without rewinding, and duplicate
+Build on an already-known replica is rejected; normal EOF does not imply arbitrary
+in-place stream renewal. Ordinary EOF and configured explicit EOS-ACK mode are
+distinct. See the [source-backed receiver design](sf-v1-semantic-alignment-plan.md#3-receiver-lifetime-streams-and-target-context).
 
 ### SF-19: Copy context comes from the primary instead of the secondary
 

@@ -3,6 +3,13 @@
 Kuberic hosts built-in and application-owned Replicators through the same
 Service Fabric-shaped public interfaces.
 
+This page describes today's ownership. The
+[faithful native V1 Rust async/tonic port design](sf-v1-semantic-alignment-plan.md)
+plans source-guided queue/session/state-machine replacement with service-owned
+primary commit, independent assignment/completion and receiver-lifetime streams.
+Those changes are not implemented yet; the existing
+engine-owned primary persistence and durable-ACK rules below remain current.
+
 ## Public Interfaces
 
 - `ReplicatorFactory` / `ReplicatorFactoryContext`;

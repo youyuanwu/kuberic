@@ -6,6 +6,13 @@ This document summarizes the Service Fabric V1 semantics implemented by
 Kuberic's Public V1 runtime. It does not define the Service Fabric V2
 Transactional Replicator.
 
+**Current behavior versus target:** this page records the current Kuberic
+contract, including its qualified native differences; it is not a full native
+conformance claim. The [faithful SF V1 Rust async/tonic port plan](sf-v1-semantic-alignment-plan.md)
+defines the future source-guided target and dependency order. Stronger current
+durability/access rules are not automatically SF-equivalent, and historical fix
+status does not exempt those rules from reassessment.
+
 ## Ownership
 
 | Owner | Responsibility |

@@ -144,6 +144,7 @@ the isolated development/CI assets above.
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
 - [Stateless default Replicator](docs/features/kuberic/stateless-default-replicator.md)
 - [Service Fabric alignment](docs/features/kuberic/service-fabric-alignment.md)
+- [Faithful SF V1 replicator port design and plan](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
 - [V2 transactional Replicator design](docs/features/kuberic/v2-transactional-replicator-design.md)
 - [Replicator boundary and native proof](docs/features/kuberic/replicator-boundary.md)
 - [Testing strategy](docs/features/kuberic/testing.md)
