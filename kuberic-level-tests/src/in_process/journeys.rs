@@ -1071,6 +1071,75 @@ async fn quorum_loss_rejects_acknowledgements_and_recovers_ambiguous_suffix() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sf01_primary_visible_apply_is_fenced_during_physical_quorum_loss() -> Result<()> {
+    use kuberic_runtime::RuntimeError;
+    use kuberic_runtime::engine::DurableState;
+    use kuberic_runtime::protocol::types::AccessStatus;
+    use std::time::Duration;
+
+    let mut harness = Harness::new().await?;
+    let result = async {
+        harness.write("sf01-before", "committed").await?;
+        harness.assert_values("sf01-before", "committed").await?;
+        let primary = harness.ready().await?;
+        let service = harness.service(primary).await?;
+        let before = harness.report(primary).await?;
+        let mut isolated = Vec::new();
+        for id in 1..=3 {
+            if id != primary {
+                let uid = harness.report(id).await?.replica.instance_id.to_string();
+                harness.isolate_uid(&uid, true).await?;
+                isolated.push(uid);
+            }
+        }
+        let mut gate = service.persistence().pause_next_apply();
+        let mut writes = tokio::task::JoinSet::new();
+        let writer = service.clone();
+        writes.spawn(async move {
+            writer
+                .replicate_put("sf01-visible".into(), "uncommitted".into())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), gate.entered()).await?;
+        ensure!(service.persistence().get("sf01-visible").as_deref() == Some("uncommitted"));
+        let raw = service.persistence().durable_progress().await?;
+        ensure!(raw.applied_lsn == 2 && raw.committed_lsn == 1);
+        ensure!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), service.get("sf01-visible")).await?,
+            Err(RuntimeError::ReadClosed(AccessStatus::NotPrimary))
+        ));
+        let during = harness.report(primary).await?;
+        ensure!(
+            during.process_session_id == before.process_session_id
+                && during.replicator_creation_id == before.replicator_creation_id
+                && during.progress.last == 1
+                && during.progress.first == 1,
+            "fence must not fabricate progress or replace the host"
+        );
+        gate.release(false);
+        ensure!(
+            tokio::time::timeout(Duration::from_secs(10), writes.join_next())
+                .await?
+                .context("writer missing")??
+                .is_err()
+        );
+        ensure!(matches!(
+            service.get("sf01-visible").await,
+            Err(RuntimeError::ReadClosed(AccessStatus::NotPrimary))
+        ));
+        for uid in isolated {
+            harness.isolate_uid(&uid, false).await?;
+        }
+        ensure!(harness.ready().await? == primary);
+        harness.assert_values("sf01-visible", "uncommitted").await?;
+        harness.write("sf01-after", "committed").await?;
+        harness.assert_values("sf01-after", "committed").await
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn specification_switchover_preserves_data_and_fences_old_writer() -> Result<()> {
     switchover(None).await
 }

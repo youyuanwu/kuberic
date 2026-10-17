@@ -2,6 +2,9 @@
 
 // Hosted Public V1 replacement lifecycle and recovery journeys.
 
+#[path = "support/read_fencing.rs"]
+mod read_fencing;
+
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9589,6 +9592,7 @@ async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised
                     .await
                     .unwrap();
             }
+
             let epoch = Epoch::new(0, 1);
             let descriptor = ConfigurationDescriptor::new(
                 epoch,

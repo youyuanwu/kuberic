@@ -45,6 +45,37 @@ swap recipes retain that ordering
 Existing completion, coherent authority, and applied/committed progress gates
 still govern access reopening; a role callback is not an access grant.
 
+## Read Visibility and Admission
+
+The built-in runtime conservatively denies **new normal reads** before primary
+provider apply can expose a mutation. It publishes ambiguity with existing
+applied/committed counters, then revalidates authority before entering the
+provider. The abandonment guard cannot claim the allocated LSN before that
+entry. Secondary ingress already publishes the same conservative fence before
+service delivery, without crediting unacknowledged persistence
+([primary:3076-3092](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L3076-L3092);
+[secondary:1186-1205](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1186-L1205)).
+
+Provider return, gate release, equal raw counters or caller cancellation is not
+quorum commitment. Ambiguous/error/dropped work stays fenced until verified
+current-authority settlement; late progress cannot clear a separate
+authority/fault fence. Genuine commitment and compatible public projection
+refresh restore Primary read/write and ActiveSecondary read-only admission
+([host publication:957-987](../../../kuberic-runtime/src/host/hosting.rs#L957-L987);
+[projection readiness:545-605](../../../kuberic-runtime/src/host/hosting.rs#L545-L605)).
+
+This is **Kuberic's conservative admission policy**, not identical SF access
+timing or application transaction isolation. Normal
+[`KvService::get`:68-77](../../../examples/kvstore2/src/service.rs#L68-L77)
+checks status and then separately reads the applied map. A read admitted
+before a later fence, raw provider access, or a custom application that bypasses
+admission needs service-owned isolation. Polling partition status does not
+universally contain application views. Kuberic's readable ActiveSecondary
+policy also differs from the inspected classic SF partition path below.
+SF-01's [exact regressions and closure](service-fabric-contract-audit.md#sf-01-applied-kv-state-is-visible-before-the-read-fence)
+do not resolve SF-D02: the primary progress query still returns the applied
+tail, not the quorum-committed result promised by its trait.
+
 ## Configuration and Quorum
 
 Public configuration contains exact current and optional previous
@@ -159,9 +190,11 @@ registry cardinality returns to baseline after bounded batches.
 ### Verified Service Fabric Source and Qualifications
 
 The local read-only Service Fabric checkout was verified at
-`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`. These are production-source
-observations, not guarantees inferred from Rust-binding comments. Paths below
-are under `src/prod/src/Reliability/` at that exact revision.
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` and remained clean during SF-01
+revalidation. These are source observations, not guarantees inferred from
+Rust-binding comments. The lifecycle rows below are production paths under
+`src/prod/src/Reliability/`; the final rows explicitly identify the inspected
+production Store pipeline and FabricTest service example.
 
 | Subject | Source evidence and boundary |
 |---|---|
@@ -171,6 +204,11 @@ are under `src/prod/src/Reliability/` at that exact revision.
 | Failed Close | [FailoverUnitProxy.CloseAsyncOperation.cpp:206-219,262-275](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.CloseAsyncOperation.cpp#L206-L275) aborts failed Close children, but its [outer completion:94-105](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.CloseAsyncOperation.cpp#L94-L105) returns success. Kuberic deliberately preserves the failed outer Close instead. |
 | Owned Abort work | [Replication/PrimaryReplicator.cpp:275-315](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.cpp#L275-L315) cancels catch-up and synchronously waits for replication callbacks. This supports an owned completion boundary, not wait-free Abort or forced termination of arbitrary application code. |
 | Catch-up access timing | [ReadWriteStatusCalculator.cpp:73-81,116-125,312-345](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L73-L345) permits reads during catch-up and phases write denial. Kuberic denies both read/write access at program launch, a more conservative policy, not identical SF timing. |
+| Read admission is not per-apply isolation | [ReadWriteStatusCalculator.cpp:58-99](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L58-L99) grants ReadyPrimary reads, keeps reads during demotion/no-primary-change catch-up, and denies idle-to-active secondary reads on this classic path. This is lifecycle/reconfiguration calculation, not Kuberic's per-write applied/committed fence. |
+| Public status observation | [ComStatefulServicePartition.cpp:75-147](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComStatefulServicePartition.cpp#L75-L147) reads cached access under a lock, checks openness and adjusts for lease expiry. It does not lock an arbitrary service's data view. |
+| Replication admission/completion | [Replicator.ReplicateAsyncOperation.cpp:43-64](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.ReplicateAsyncOperation.cpp#L43-L64) checks partition write access before internal primary state and starts replication; [completion:103-108](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.ReplicateAsyncOperation.cpp#L103-L108) ends replication. This is not generic application-memory commit or universal read isolation. |
+| Service-owned visibility example (test service) | [src/prod/test/FabricTest/TestStoreService.cpp:108-155](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/test/FabricTest/TestStoreService.cpp#L108-L155) stages next value/version separately from its locked readable value; [791-817](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/test/FabricTest/TestStoreService.cpp#L791-L817) commits after successful EndReplicate or rolls back. [866-883](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/test/FabricTest/TestStoreService.cpp#L866-L883) separately checks partition read status. This illustrates that service, not a universal SF application guarantee. |
+| Production service local commit | [src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp:719-731](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp#L719-L731) checks replication success before starting local commit; [848-857](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp#L848-L857) begins the local transaction commit. This establishes this Store pipeline, not arbitrary provider isolation. |
 
 SF's symbolic `CatchupReplicaSetAll` action can select WriteQuorum when specific
 quorum is supported, otherwise All

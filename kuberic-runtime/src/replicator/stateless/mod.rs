@@ -32,6 +32,9 @@ use crate::replicator::{
 };
 use crate::{Result, RuntimeError};
 
+#[cfg(test)]
+mod read_fence_tests;
+
 enum ReplicationSendFailure {
     Unavailable(String),
     Rejected(String),
@@ -665,7 +668,7 @@ struct CallbackContainmentGuard {
 
 struct AppliedWriteGuard {
     engine: Weak<StatelessReplicator>,
-    lsn: i64,
+    applied_floor: i64,
     armed: bool,
 }
 
@@ -683,7 +686,7 @@ impl Drop for AppliedWriteGuard {
         let Some(engine) = self.engine.upgrade() else {
             return;
         };
-        let lsn = self.lsn;
+        let lsn = self.applied_floor;
         engine
             .abandoned_applied_floor
             .fetch_max(lsn, Ordering::AcqRel);
@@ -3072,9 +3075,20 @@ impl StateReplicator for StatelessReplicator {
         };
         let mut applied_guard = AppliedWriteGuard {
             engine: self.self_ref.get().cloned().unwrap_or_default(),
-            lsn,
+            applied_floor: lsn - 1,
             armed: true,
         };
+        // Close normal read admission before the provider can expose a mutation.
+        // Until provider entry, abandonment must not claim the allocated LSN.
+        self.state.lock().await.ambiguous_suffix = true;
+        self.publish_progress(true).await?;
+        if !self
+            .exact_authority_is_current(&authority, generation, ReplicaRole::Primary)
+            .await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        applied_guard.applied_floor = lsn;
         let applied = match self.storage.apply(operation.clone()).await {
             Ok(applied) => applied,
             Err(error) => {
