@@ -1,12 +1,19 @@
 Third-Party Notices
 ===================
 
-Service Fabric classic V1 source and scenario ledger
----------------------------------------------------
+Service Fabric classic V1 queue translation and source ledger
+------------------------------------------------------------
 
 The source-derived acceptance scenarios and selected native test expectations
 documented in docs/features/kuberic/sf-v1-port-ledger.md derive from Microsoft
 Service Fabric at commit 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
+
+The internal Rust OperationQueue and its component tests in
+kuberic-runtime/src/replicator/v1/operation_queue.rs and
+kuberic-runtime/src/replicator/v1/operation_queue/tests.rs translate selected
+Microsoft OperationQueue.h/.cpp algorithms and OperationQueue.Test.cpp
+assertions at that same pin, with Rust ownership/storage adaptations and
+additional production-source-derived cases. They are not factory-selected.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 

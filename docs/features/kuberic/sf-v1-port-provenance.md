@@ -7,8 +7,10 @@ scenarios and selected native test expectations, derives from Microsoft Service
 Fabric at immutable commit
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`](https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d).
 The authorized reference checkout was reviewed read-only and clean at that pin.
-No native binary or native test was run. No native production implementation,
-transport library or test harness was copied into the runtime.
+No native binary or native test was run. P1 incorporated no implementation;
+the OperationQueue slice below now translates selected native production
+algorithms and test assertions into Rust. No native transport library or test
+harness is incorporated.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 
@@ -21,6 +23,42 @@ See also [`THIRD-PARTY-NOTICES`](../../../THIRD-PARTY-NOTICES).
 Kuberic's root license and existing API-documentation notices are unchanged.
 
 ## Concrete material register
+
+### OperationQueue implementation slice (P2, not all of P2)
+
+Rust destinations:
+[`operation_queue.rs`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs)
+and its
+[`component tests`](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs).
+Both retain the selected Microsoft copyright/MIT header; the complete
+permission/disclaimer is retained in the license file linked above.
+
+| Selected native material at the pin above (`R/` prefix below) | Translation / representation changes |
+|---|---|
+| `OperationQueue.h:21–188`; `OperationQueue.cpp:26–180,194–203,214–236` | Internal synchronous owned queue, configuration, four cursors, transfer and callback installation. `Arc`/`Bytes` replace COM references/data accessor; a dynamic atomic needs-ACK predicate is a dependency, not a receiver ACK implementation. No public alias changes. |
+| `OperationQueue.cpp:256–668,670–987,990–1306,1347–1389` | Actual admission, span/count/byte limits, native resize/convergence, contiguous commit/complete, retention/trim, rewinds/discards/reset. Ordered owned map replaces ring allocation while preserving positional capacity policy. Out-of-retained-range ring aliasing is not an API capability. |
+| `OperationQueue.Test.cpp:403–426,435–605,607–615,867–901,995–1095` | Selected growth/history/memory/gap/commit/trim assertions adapted into descriptive real-component tests; randomized fixtures reduced to deterministic arrivals. The earlier-hole case uses the actual 598-byte call at 490–493, not the stale neighboring comment. Q1–Q4/L2 IDs are ancestry only, not a second test catalog. |
+| Production `OperationQueue.cpp:93–180,214–236,677–987,1128–1306` | Additional tests of service-ACK eligibility, callback call-point progress/self-disable/replay, targeted prerequisites, transfer non-normalization, reset and externally retained lifetime. These derive from production; native queue tests do not directly exercise ACK-required/callback mode. |
+
+The callback takes an immutable progress snapshot at the native call point
+and returns keep/disable instead of permitting arbitrary reentrant mutation.
+Ordinary commit calls back before advancing commit; ignore-commit completion
+advances commit first and completion afterward. Lifecycle timestamp refresh,
+trace/performance sinks and description/partition diagnostics are omitted,
+not replaced with provider/ACK effects. Resize averaging remains algorithmic;
+its power-of-two result is computed on demand rather than cached. Valid
+representable LSN/capacity intervals and allocatable storage are prerequisites;
+no allocator/extreme-number recovery contract is claimed.
+
+Selected files' Microsoft MIT headers and root `LICENSE` were reviewed.
+No Boost/Common/Transport/KTL utility implementation, fixture, third-party
+asset or dependency graph was translated. The heterogeneous umbrella notices
+therefore do not become a blanket license for this selection. No new
+third-party dependency is introduced. Queue components remain internal and
+unselected; component execution is not native execution, differential parity,
+full P2, or P5 acceptance.
+
+### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The
 [ledger](sf-v1-port-ledger.md#deterministic-scenario-inventory) records each
@@ -74,7 +112,7 @@ the Boost Software License. Root MIT alone does not license every vendored file.
 The selected Microsoft production/test assertion material above was reviewed
 for its own headers/origin. No third-party utility, vendored asset, Boost test
 framework, Common/Transport/KTL source or native dependency build graph is
-incorporated by P1. Linking of the *upstream* tests to those dependencies does
+incorporated by P1 or the queue slice. Linking of the *upstream* tests to those dependencies does
 not mean those sources were translated here. Conversely, a future selection of
 such material requires checking its exact origin/license and preserving every
 applicable notice. Do not blindly copy all unrelated umbrella notices, omit
