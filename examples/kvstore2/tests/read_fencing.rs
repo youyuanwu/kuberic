@@ -55,9 +55,11 @@ struct Fixture {
 
 impl Fixture {
     async fn start(name: &str) -> Self {
+        let scratch = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&scratch).unwrap();
         let root = tempfile::Builder::new()
             .prefix(name)
-            .tempdir_in(std::env::current_dir().unwrap().join("target"))
+            .tempdir_in(&scratch)
             .unwrap();
         let resource = ResourceUid::new(name);
         let preview = PublicV1Identity::new(51);
