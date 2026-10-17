@@ -10,6 +10,15 @@ SF trait-semantics follow-up: 2026-10-17, against Kuberic
 SF-18 through SF-21 use this follow-up baseline; earlier source references
 retain their historical baseline below.
 
+Lifecycle/control-plane follow-up: 2026-10-17, against Kuberic
+`1496fd8a21c25ec4c53257b633b1d8f0f3281e18` and
+[`service-fabric-rs` stateful traits at `7c1ea4e`](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs).
+This comparison adds SF-D02 and clarifies known-replica `-1` configuration
+input. The upstream primary-replicator comments identify themselves as
+unofficial and subject to correction. That file does not define
+`StateProvider`, `StateReplicator`, or operation-stream/ACK interfaces;
+SF-18 through SF-21 retain their separate `mssf-ext` evidence.
+
 Audited baseline: `243f622b6eacc0c30d6ba59fb909e92270531ff3`, including the
 documentation-only additions to the SF-aligned traits in the working tree.
 Source line references below describe that audited state; use the named
@@ -33,13 +42,15 @@ Initial inventory: **17 implementation findings: 10 P1 and 7 P2**, plus
 **one documentation/behavior mismatch**. All entries are initially open.
 This initial inventory describes the historical audit, not current status.
 
-Current inventory: **21 implementation findings: 3 fixed / 18 open**
-(8 open P1 and 10 open P2), plus the still-open documentation mismatch.
+Current inventory: **21 implementation findings: 4 fixed / 17 open**
+(7 open P1 and 10 open P2), plus **two open documentation/behavior
+mismatches** (SF-D01 and SF-D02).
 SF-04/SF-05 were fixed by PR #151; SF-14 is fixed by the implementation
 published in PR #154 and recorded below. Original failure traces remain
 historical evidence. SF-18 through SF-21 track the remaining stream, context,
-primary-completion, and acknowledgement alignment requirements. In particular
-SF-06 and SF-15 remain open.
+primary-completion, and acknowledgement alignment requirements. SF-06 is
+fixed by local commits `ac16f97` and `d73db99`, as recorded below; SF-15
+remains open.
 
 **Alignment decision:** The user requested alignment with the linked SF
 semantics on 2026-10-17. SF-18 through SF-21 are required changes, not accepted
@@ -85,7 +96,7 @@ fixing capability admission does not fix swap staging.
 | [SF-03](#sf-03-postgresql-sql-admission-ignores-partition-denial) | P1 | Open | PostgreSQL SQL admission ignores partition denial |
 | [SF-04](#sf-04-controller-swap-capability-conflicts-with-runtime-admission) | P1 | Fixed | Controller swap capability conflicts with runtime admission |
 | [SF-05](#sf-05-swap-installs-the-final-role-layout-before-source-catch-up) | P1 | Fixed | Swap installs the final role layout before source catch-up |
-| [SF-06](#sf-06-access-revocation-can-block-teardown-and-violate-role-ordering) | P1 | Open | Access revocation can block teardown and violate role ordering |
+| [SF-06](#sf-06-access-revocation-can-block-teardown-and-violate-role-ordering) | P1 | Fixed | Access revocation can block teardown and violate role ordering |
 | [SF-07](#sf-07-idle-postgresql-removal-globally-drains-the-partition) | P1 | Open | Idle PostgreSQL removal globally drains the partition |
 | [SF-08](#sf-08-retired-postgresql-grants-leak-persistent-slots) | P1 | Open | Retired PostgreSQL grants leak persistent slots |
 | [SF-09](#sf-09-postgresql-epoch-fencing-regresses-reported-progress) | P1 | Open | PostgreSQL epoch fencing regresses reported progress |
@@ -102,6 +113,7 @@ fixing capability admission does not fix swap staging.
 | [SF-20](#sf-20-primary-replication-lacks-the-sf-early-lsn-and-local-commit-pipeline) | P2 | Open | Primary replication lacks the SF early-LSN and local-commit pipeline |
 | [SF-21](#sf-21-acknowledgement-requires-kuberic-progress-and-always-explicit-ack) | P2 | Open | Acknowledgement requires Kuberic progress and always-explicit ACK |
 | [SF-D01](#sf-d01-catch-up-capability-is-a-tail-not-a-retained-floor) | Documentation | Open | Catch-up capability is a tail, not a retained floor |
+| [SF-D02](#sf-d02-primary-progress-promise-exceeds-the-built-in-query-result) | Documentation | Open | Primary progress promise exceeds the built-in query result |
 
 ## P1 Findings
 
@@ -257,7 +269,8 @@ and a new-primary write
 (`kuberic-level-tests/src/in_process/journeys.rs:1253-1409`).
 Restart and edited-request cuts retain exact accepted completion
 (`:1097-1249`). Successful switchover does **not** prove that a blocked or
-failing Revoke application callback reaches Abort; SF-06 remains open.
+failing Revoke application callback reaches Abort; that separate SF-06
+closure is recorded below.
 
 ### SF-06: Access revocation can block teardown and violate role ordering
 
@@ -265,7 +278,10 @@ failing Revoke application callback reaches Abort; SF-06 remains open.
 must reach abort containment. Actual application role changes follow the
 corresponding replicator role change.
 
-**Failure:** Close and Abort first execute Revoke, which awaits application
+**Status:** Fixed by local implementation commits `ac16f97` and `d73db99`
+(2026-10-17). No publication is implied.
+
+**Historical failure:** Close and Abort first execute Revoke, which awaits application
 `change_role(None)` with error propagation. A failure skips later teardown;
 a hung callback prevents Abort from being reached. During swap, the same
 instruction sends application None while the replicator remains Primary for
@@ -281,6 +297,67 @@ without invoking abort. Separate access fencing already occurs at
 not prevent terminal containment. Record both objects' roles during swap:
 access revocation must not synthesize an unpaired application None transition,
 and actual application demotion must follow replicator demotion.
+
+**Implemented closure:** Revoke retains the access-only journal instruction,
+without a role callback. Final catch-up keeps source replication authority;
+actual demotion remains replication-before-application. Close child failures
+invoke ordered Abort, skip later graceful callbacks, retain the first failure
+across replay, and report failed Close after cleanup. Terminal cleanup has a
+separately retained owner and initially-false witness; built-in drainage joins
+listener, inbound/outbound tasks and entered stream effects. Listener join
+ownership survives cancelled Close rather than being removed into its root.
+See [lifecycle and task semantics](service-fabric-api-semantics.md#lifecycle-ordering)
+and [Close/Abort implementation references](service-fabric-api-semantics.md#close-abort-and-tasks).
+
+**Regression evidence:** Tests under `kuberic-runtime/src/host/` and
+`kuberic-runtime/tests/public_v1_recovery.rs` exercise the actual executor.
+Post-review targeted ordinary validation passed 53/53 tests, including 14
+`sf06_` regressions and six real switchover/failover journeys:
+
+- `sf06_abort_and_close_never_call_erroring_or_blocked_synthetic_none` and
+  `hosted_sf06_terminal_access_denial_never_calls_synthetic_none`: both hostile
+  None modes have zero callback entry; terminal partition access stays denied
+  ([executor test:323-359](../../../kuberic-runtime/src/host/public_lifecycle_tests.rs#L323-L359);
+  [hosted test:2548-2605](../../../kuberic-runtime/tests/public_v1_recovery.rs#L2548-L2605)).
+- `sf06_swap_retains_primary_through_catchup_then_pairs_actual_roles`: both
+  swap recipes retain primary replication through paused catch-up, then trace
+  real replication demotion before application demotion, with no None callback.
+  Existing production-planner switchover journeys retain late-write transfer,
+  session continuity, successor writes and stale-writer rejection
+  ([role trace:634-743](../../../kuberic-runtime/src/host/public_lifecycle_tests.rs#L634-L743);
+  [real journey:1252-1409](../../../kuberic-level-tests/src/in_process/journeys.rs#L1252-L1409)).
+- `sf06_close_child_failures_abort_skip_graceful_work_and_preserve_errors`,
+  `sf06_failed_close_and_cancelled_abort_cannot_outrun_owned_cleanup`, and
+  `hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children`:
+  both Close children reach abort fallback; failure remains visible/durable,
+  and later graceful work cannot obstruct already-requested containment
+  ([child failures:362-411](../../../kuberic-runtime/src/host/public_lifecycle_tests.rs#L362-L411);
+  [pending cleanup:577-631](../../../kuberic-runtime/src/host/public_lifecycle_tests.rs#L577-L631);
+  [hosted restart:3038-3187](../../../kuberic-runtime/tests/public_v1_recovery.rs#L3038-L3187)).
+- `hosted_sf06_public_abort_waits_for_owned_synchronous_effect_after_waiter_drop`
+  and `sf06_listener_join_survives_close_supersession_and_registry_shutdown`:
+  entered synchronous effects/listener polls hold containment pending until
+  released and joined, including request drop, Abort supersession and shutdown;
+  real built-in task counts reach zero and the listener endpoint is released
+  ([real effect:2430-2545](../../../kuberic-runtime/tests/public_v1_recovery.rs#L2430-L2545);
+  [listener cut:482-556](../../../kuberic-runtime/src/host/public_lifecycle_tests.rs#L482-L556)).
+- Additional `sf06_` tests cover first-error/cleanup-error replay at Revoke,
+  failed-child and Cleanup cuts, actual role errors, idempotent Abort replay,
+  and lost custom witnesses remaining uncontained
+  ([role errors, witness and replay:746-943](../../../kuberic-runtime/src/host/public_lifecycle_tests.rs#L746-L943)).
+
+**Source verification and limits:** Actual SF checkout revision
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, not only binding comments,
+supports access/role separation, direct Abort, failed-Close abort fallback,
+and final-catch-up-before-demotion. The
+[pinned file:line evidence](service-fabric-api-semantics.md#verified-service-fabric-source-and-qualifications)
+also records that SF's outer shutdown wrapper may return success, primary
+Abort synchronously waits, a distinct Abort action list includes setup/roles,
+and catch-up read/write status timing differs. Kuberic preserves failed outer
+Close and conservatively denies both access modes. This closure does not prove
+wait-free native Abort, arbitrary custom/application-consumer joining (SF-15),
+client access enforcement (SF-02/SF-03), or primary progress correctness
+(SF-D02); those findings remain open.
 
 ### SF-07: Idle PostgreSQL removal globally drains the partition
 
@@ -714,10 +791,68 @@ The actual catch-up range uses peer current progress, not this capability.
 **Evidence:** `kuberic-runtime/src/replicator/mod.rs:173-178` and
 `kuberic-runtime/src/replicator/stateless/mod.rs:2532-2541,1384-1392`.
 
+The lifecycle/control-plane follow-up confirms the same mismatch:
+[upstream lines 110-116](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs#L110-L116)
+describe the beginning of the log, while Kuberic at `1496fd8` returns
+`state.committed_lsn` in
+`kuberic-runtime/src/replicator/stateless/mod.rs:2690-2701`.
+SF-D01 remains open.
+
 **Closure:** Decide and document the scalar's meaning, including empty,
 snapshot-only, and pruned history and `INVALID_LSN`. Align behavior or record
 an intentional conservative deviation. Returning a conservative tail is not,
 by itself, evidence of unsafe quorum acknowledgement or data corruption.
+
+### SF-D02: Primary progress promise exceeds the built-in query result
+
+**Mismatch:** Kuberic's `Replicator::current_progress` contract promises locally
+durable quorum-committed progress on a primary, but the built-in query returns
+`state.applied_lsn` without a role distinction. Primary replication publishes
+that applied tail before collecting quorum acknowledgements or committing it.
+The result can therefore exceed the primary's quorum-committed boundary.
+
+**Evidence:** At the lifecycle/control-plane baseline `1496fd8`, the promise is
+in `kuberic-runtime/src/replicator/traits.rs:45-51`, the query is in
+`replicator/stateless/mod.rs:2682-2688`, and primary apply/publication precedes
+quorum collection at `:2997-3023`, with commitment at `:3073-3098`.
+The upstream
+[current-progress description, lines 105-108](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs#L105-L108)
+describes a secondary's end-of-log for selection and catch-up. It does not
+establish Kuberic's additional primary quorum-committed guarantee.
+
+**Qualification:** This is a source-confirmed local contract/behavior mismatch,
+not a dynamically reproduced unsafe election, read, or data-loss finding.
+Durably accepted secondary progress and applied progress used only during
+access-closed recovery must not be mislabeled as unsafe primary commitment.
+SF-01 separately tracks visible application state before the read fence.
+Rustdoc now exposes the mismatch without changing the primary guarantee.
+
+**Closure:** Reconcile the primary query with its documented commitment
+contract, and define role-specific and access-closed recovery semantics.
+Hold peer ACKs after local durable apply and inspect the query on primary and
+secondary paths, then complete quorum and repeat across cancellation, epoch,
+and recovery boundaries. Preserve separate committed-watermark and access
+checks. Merely describing the current applied-tail return does not close this
+entry or authorize using it as readable committed state.
+
+### Known-Replica Configuration Sentinel Clarification
+
+The upstream
+[configuration-input description, lines 161-165](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs#L161-L165)
+allows `-1` when the replicator already knows a configured or built replica.
+This can omit a value already known to the replicator; it does not mean that
+the replica has empty history. Kuberic's earlier wording described only unknown
+or inapplicable progress and omitted that input-specific meaning.
+
+The sentinel and descriptor Rustdoc now distinguish omitted known-replica
+configuration input from unknown/inapplicable query results. Zero remains the
+valid empty-history boundary; `INVALID_LSN` is not completed progress and
+cannot authorize reuse across different process sessions or storage
+incarnations. Idle build targets continue to use the sentinel.
+
+This wording clarification does not prove that every built-in path resolves
+omitted progress correctly, and no new runtime defect or conformance closure
+is claimed. SF-10 retains its known-peer `INVALID_LSN` closure case.
 
 ## Audit Boundaries and Intentional Differences
 
@@ -733,8 +868,8 @@ through SF-21, not intentional exceptions covered by this boundary statement.
 Other distinctions remain explicit rather than being counted as extra findings:
 
 - Built-in applied progress during access-closed recovery is not automatically
-  unsafe primary committed progress. Clarify the recovery wording separately
-  from SF-01's visibility interval.
+  unsafe primary committed progress. SF-D02 tracks the primary-query promise
+  separately from SF-01's visibility interval.
 - PostgreSQL physical copy is not a deterministic StateProvider byte stream;
   byte differences across base backups alone do not prove a copy safety bug.
 - PostgreSQL's conservative PC/CC synchronous policy can deny some otherwise
@@ -818,3 +953,11 @@ Kuberic source at the follow-up baseline. They are open requirements with
 specific closure criteria, not implemented changes or dynamically executed
 failure reproductions. Existing SF-14 regression results establish delivery
 and ACK ownership only; they do not satisfy these additional alignment gates.
+
+The lifecycle/control-plane comparison at `1496fd8` and upstream `7c1ea4e`
+confirms that the intended role ordering, idle-build admission, PC/CC quorums,
+required-successor catch-up, and double-catch-up comments largely agree.
+That documentation-only comparison did not close SF-06 or SF-D01. SF-D02 and the known-replica sentinel
+clarification come from source inspection, not new behavioral reproductions.
+This documentation follow-up changes neither runtime behavior nor protected
+trait signatures.

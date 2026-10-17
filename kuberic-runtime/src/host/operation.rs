@@ -794,6 +794,7 @@ pub(crate) struct PartitionOperationRegistry {
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     terminal_fence: std::sync::atomic::AtomicBool,
     control_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    terminal_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     abort_guard: Arc<std::sync::Mutex<bool>>,
 }
 
@@ -825,6 +826,7 @@ impl PartitionOperationRegistry {
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             terminal_fence: std::sync::atomic::AtomicBool::new(false),
             control_tasks: std::sync::Mutex::new(Vec::new()),
+            terminal_tasks: std::sync::Mutex::new(Vec::new()),
             abort_guard: Arc::new(std::sync::Mutex::new(false)),
         }))
     }
@@ -951,6 +953,13 @@ impl PartitionOperationRegistry {
         self.control_tasks
             .lock()
             .expect("control task lock")
+            .push(tokio::spawn(future));
+    }
+
+    pub(crate) fn own_terminal_task(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.terminal_tasks
+            .lock()
+            .expect("terminal task lock")
             .push(tokio::spawn(future));
     }
 
@@ -1351,16 +1360,6 @@ impl PartitionOperationRegistry {
         }
         let admission = self.admission.lock().await;
         let mut first_error = None;
-        let coordination = std::mem::take(&mut *self.coordination.lock().await);
-        for task in coordination {
-            if let Err(error) = task.await {
-                first_error.get_or_insert_with(|| {
-                    HostError::CommandRejected(format!(
-                        "public-operation coordination join failed: {error}"
-                    ))
-                });
-            }
-        }
         let operations = self
             .state
             .lock()
@@ -1376,6 +1375,25 @@ impl PartitionOperationRegistry {
             ) && let Err(error) = operation.cancel_root().await
             {
                 first_error.get_or_insert(error);
+            }
+        }
+        let terminals =
+            std::mem::take(&mut *self.terminal_tasks.lock().expect("terminal task lock"));
+        for task in terminals {
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!("terminal cleanup join failed: {error}"))
+                });
+            }
+        }
+        let coordination = std::mem::take(&mut *self.coordination.lock().await);
+        for task in coordination {
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!(
+                        "public-operation coordination join failed: {error}"
+                    ))
+                });
             }
         }
         drop(admission);

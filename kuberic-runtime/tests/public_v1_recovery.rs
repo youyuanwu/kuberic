@@ -623,6 +623,9 @@ struct PreviewApplication {
     metadata_database: Option<PathBuf>,
     instruction_seen_before_open: AtomicBool,
     fail_close: AtomicBool,
+    none_behavior: AtomicU64,
+    none_calls: AtomicU64,
+    abort_entered: Notify,
     abort_calls: AtomicU64,
     replicator_released_before_application_close: AtomicBool,
     lifecycle_events: Mutex<Vec<&'static str>>,
@@ -654,6 +657,9 @@ impl PreviewApplication {
             metadata_database: None,
             instruction_seen_before_open: AtomicBool::new(false),
             fail_close: AtomicBool::new(false),
+            none_behavior: AtomicU64::new(0),
+            none_calls: AtomicU64::new(0),
+            abort_entered: Notify::new(),
             abort_calls: AtomicU64::new(0),
             replicator_released_before_application_close: AtomicBool::new(false),
             lifecycle_events: Mutex::new(Vec::new()),
@@ -838,6 +844,14 @@ impl StatefulServiceReplica for PreviewApplication {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        if role == ReplicaRole::None {
+            self.none_calls.fetch_add(1, Ordering::SeqCst);
+            match self.none_behavior.load(Ordering::Acquire) {
+                1 => return Err(RuntimeError::Application("synthetic None injected".into())),
+                2 => std::future::pending::<()>().await,
+                _ => {}
+            }
+        }
         Ok(RoleChange {
             service_address: (role == ReplicaRole::Primary)
                 .then(|| "http://127.0.0.1:8080".to_string()),
@@ -883,6 +897,7 @@ impl StatefulServiceReplica for PreviewApplication {
 
     fn abort(&self) {
         self.abort_calls.fetch_add(1, Ordering::SeqCst);
+        self.abort_entered.notify_one();
         for task in self.stream_tasks.lock().unwrap().iter() {
             task.abort();
         }
@@ -1254,6 +1269,23 @@ async fn delivered(
         .await
         .expect("built-in delivery timed out")
         .expect("service consumer stopped")
+}
+
+fn stored_public_operation(
+    replica: &HostedMemoryReplica,
+    operation: &OperationId,
+) -> serde_json::Value {
+    let connection =
+        rusqlite::Connection::open(SqliteStore::metadata_database_path(&replica.root)).unwrap();
+    let json: String = connection
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+    state["publicV1OperationState"]["operations"][operation.as_str()].clone()
 }
 
 async fn pending_ack<T: prost::Message + Default + 'static>(response: &mut tonic::Streaming<T>) {
@@ -2362,6 +2394,7 @@ async fn hosted_operation_stream_epoch_and_configuration_cancel_active_persisten
                 .await
                 .unwrap();
         }
+
         assert!(
             tokio::time::timeout(Duration::from_secs(5), effect)
                 .await
@@ -2393,6 +2426,185 @@ async fn hosted_operation_stream_epoch_and_configuration_cancel_active_persisten
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_sf06_public_abort_waits_for_owned_synchronous_effect_after_waiter_drop() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for drop_waiter in [false, true] {
+            let fixture = StreamBuildFixture::start("sf06-abort-sync-drain", false, 1).await;
+            fixture
+                .target
+                .application
+                .none_behavior
+                .store(2, Ordering::Release);
+            let mut operations = fixture.target.application.control_operations();
+            let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+            let operation = delivered(&mut operations).await;
+            let state = fixture.target.state.clone();
+            let build_id = fixture.authority.attempt.build_id.clone();
+            let entered = Arc::new(Notify::new());
+            let entered_effect = entered.clone();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let effect = tokio::spawn(async move {
+                let result = operation
+                    .execute(async move {
+                        entered_effect.notify_one();
+                        blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                        state.finish_copy(&build_id, 1, 1).await
+                    })
+                    .await;
+                assert!(operation.acknowledge(result.unwrap_or_default()).is_err());
+            });
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            let handle = fixture.target.handle();
+            let operation_id = OperationId::new("sf06-abort-sync");
+            let terminal = intent(
+                &handle.public_v1_report().await.unwrap().identity,
+                handle.process_session_id(),
+                handle.public_v1_next_operation_revision().await.unwrap(),
+                operation_id.as_str(),
+                PublicOperationProgram::Abort,
+            );
+            let waiter_handle = handle.clone();
+            let mut waiter =
+                tokio::spawn(async move { waiter_handle.execute_public_v1(terminal).await });
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.target.application.abort_entered.notified(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), response.message())
+                    .await
+                    .unwrap()
+                    .unwrap_or(None)
+                    .is_none()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), &mut waiter)
+                    .await
+                    .is_err()
+            );
+            let diagnostics = handle.diagnostics().await.unwrap();
+            assert_eq!(diagnostics.read_status, "NotPrimary");
+            assert_eq!(diagnostics.write_status, "NotPrimary");
+            assert_ne!(
+                stored_public_operation(&fixture.target, &operation_id)["stage"],
+                "completed"
+            );
+            assert_eq!(
+                fixture.target.application.none_calls.load(Ordering::SeqCst),
+                0
+            );
+            if drop_waiter {
+                waiter.abort();
+                assert!(waiter.await.unwrap_err().is_cancelled());
+            } else {
+                // The waiter is retained below; dropping a request is not root cancellation.
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), waiter)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                effect.await.unwrap();
+                assert_eq!(
+                    handle.public_v1_raw_retained_task_cardinality().unwrap(),
+                    (0, 0)
+                );
+                assert!(std::net::TcpListener::bind(fixture.target.address).is_ok());
+                fixture.cleanup().await;
+                continue;
+            }
+            release.send(()).unwrap();
+            effect.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if stored_public_operation(&fixture.target, &operation_id)["stage"]
+                        == "completed"
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                handle.public_v1_raw_retained_task_cardinality().unwrap(),
+                (0, 0)
+            );
+            assert!(std::net::TcpListener::bind(fixture.target.address).is_ok());
+            fixture.cleanup().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_sf06_terminal_access_denial_never_calls_synthetic_none() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        for behavior in [1, 2] {
+            for abort in [false, true] {
+                let pair = AuthorizedHostedPair::start("sf06-terminal-none", 6).await;
+                let handle = pair.primary.handle();
+                pair.primary
+                    .application
+                    .none_behavior
+                    .store(behavior, Ordering::Release);
+                let program = if abort {
+                    PublicOperationProgram::Abort
+                } else {
+                    PublicOperationProgram::Close
+                };
+                handle
+                    .execute_public_v1(intent(
+                        &pair.identity,
+                        handle.process_session_id(),
+                        handle.public_v1_next_operation_revision().await.unwrap(),
+                        "sf06-terminal-none",
+                        program,
+                    ))
+                    .await
+                    .unwrap();
+                let diagnostics = handle.diagnostics().await.unwrap();
+                assert_eq!(diagnostics.read_status, "NotPrimary");
+                assert_eq!(diagnostics.write_status, "NotPrimary");
+                let partition = pair
+                    .primary
+                    .application
+                    .partition
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap();
+                assert_ne!(
+                    partition.get_read_status().await.unwrap(),
+                    AccessStatus::Granted
+                );
+                assert_ne!(
+                    partition.get_write_status().await.unwrap(),
+                    AccessStatus::Granted
+                );
+                assert_eq!(
+                    pair.primary.application.none_calls.load(Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    handle.public_v1_raw_retained_task_cardinality().unwrap(),
+                    (0, 0)
+                );
+                assert!(std::net::TcpListener::bind(pair.primary.address).is_ok());
+                pair.cleanup().await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
 #[tokio::test]
 async fn hosted_operation_stream_close_and_abort_drain_without_a_consumer() {
     for stream_mode in [1, 2] {
@@ -2858,7 +3070,7 @@ async fn hosted_public_v1_contained_close_restarts_without_replaying_interrupted
 
         replica.application.fail_next_close();
         let close_id = OperationId::new("preview-contained-close");
-        replica
+        let error = replica
             .handle()
             .execute_public_v1(intent(
                 &preview,
@@ -2868,7 +3080,12 @@ async fn hosted_public_v1_contained_close_restarts_without_replaying_interrupted
                 PublicOperationProgram::Close,
             ))
             .await
-            .expect("child close failure must normalize to outer success");
+            .expect_err("child close failure must remain visible after containment");
+        assert!(
+            error
+                .to_string()
+                .contains("injected application close failure")
+        );
 
         assert!(
             replica
@@ -2905,8 +3122,8 @@ async fn hosted_public_v1_contained_close_restarts_without_replaying_interrupted
         let close = &state["publicV1OperationState"]["operations"][close_id.as_str()];
         assert_eq!(
             close["disposition"]["kind"],
-            serde_json::Value::String("succeeded".into()),
-            "normalized outer close result was not retained as success"
+            serde_json::Value::String("failed".into()),
+            "contained close failure was not retained as failure"
         );
         let outcomes = close["lifecycle"]["outcomes"]
             .as_array()

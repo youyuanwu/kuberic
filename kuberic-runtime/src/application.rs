@@ -18,7 +18,12 @@ pub enum OpenMode {
 
 /// Logical sequence number identifying an operation's position in replicated history.
 pub type Lsn = i64;
-/// Public sentinel for progress that is not yet known or does not apply.
+/// Public sentinel for omitted, unknown, or inapplicable progress.
+///
+/// In SF configuration input, progress may be omitted for a replica already
+/// configured or built: use the replicator's known progress for that exact
+/// replica, not an empty-history boundary. This does not authorize reuse of
+/// progress across different process sessions or storage incarnations.
 ///
 /// Zero is a valid empty-history boundary. Values below `INVALID_LSN` are
 /// invalid and `INVALID_LSN` must never be reported as completed progress.

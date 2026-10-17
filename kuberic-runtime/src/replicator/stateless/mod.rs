@@ -160,15 +160,11 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
             .listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+            .clone();
         let listener = async {
-            if let Some(mut owner) = owner {
+            if let Some(owner) = owner {
                 owner.shutdown.send_replace(true);
-                match (&mut owner.task).await {
-                    Ok(result) => result,
-                    Err(error) if error.is_cancelled() => Ok(()),
-                    Err(error) => Err(RuntimeError::Application(error.to_string())),
-                }
+                owner.join().await.result(true)
             } else {
                 Ok(())
             }
@@ -434,23 +430,106 @@ struct EngineState {
 
 struct ListenerOwner {
     shutdown: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<Result<()>>,
+    abort: tokio::task::AbortHandle,
+    join: Mutex<ListenerJoin>,
 }
 
-async fn drain_listener(owner: ListenerOwner) -> Result<()> {
+struct ListenerJoin {
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    completed: Option<ListenerCompletion>,
+}
+
+#[derive(Clone)]
+enum ListenerCompletion {
+    Success,
+    Cancelled,
+    Failed(String),
+}
+
+impl ListenerCompletion {
+    fn result(self, aborting: bool) -> Result<()> {
+        match self {
+            Self::Success => Ok(()),
+            Self::Cancelled if aborting => Ok(()),
+            Self::Cancelled => Err(RuntimeError::OperationCancelled),
+            Self::Failed(error) => Err(RuntimeError::Application(error)),
+        }
+    }
+}
+
+impl ListenerOwner {
+    fn new(shutdown: watch::Sender<bool>, task: tokio::task::JoinHandle<Result<()>>) -> Arc<Self> {
+        Arc::new(Self {
+            shutdown,
+            abort: task.abort_handle(),
+            join: Mutex::new(ListenerJoin {
+                task: Some(task),
+                completed: None,
+            }),
+        })
+    }
+
+    async fn join(&self) -> ListenerCompletion {
+        let mut join = self.join.lock().await;
+        if let Some(completed) = &join.completed {
+            return completed.clone();
+        }
+        // Poll in the retained slot. Cancelling this waiter must not drop the
+        // sole JoinHandle; another terminal owner must still be able to join it.
+        let completed = match join.task.as_mut().expect("listener join owner").await {
+            Ok(Ok(())) => ListenerCompletion::Success,
+            Ok(Err(error)) => ListenerCompletion::Failed(error.to_string()),
+            Err(error) if error.is_cancelled() => ListenerCompletion::Cancelled,
+            Err(error) => ListenerCompletion::Failed(error.to_string()),
+        };
+        join.task.take();
+        join.completed = Some(completed.clone());
+        completed
+    }
+}
+
+async fn drain_listener(owner: Arc<ListenerOwner>) -> Result<()> {
     drain_listener_with_timeout(owner, LISTENER_SHUTDOWN_TIMEOUT).await
 }
 
-async fn drain_listener_with_timeout(mut owner: ListenerOwner, timeout: Duration) -> Result<()> {
+async fn drain_listener_with_timeout(owner: Arc<ListenerOwner>, timeout: Duration) -> Result<()> {
     owner.shutdown.send_replace(true);
-    match tokio::time::timeout(timeout, &mut owner.task).await {
-        Ok(result) => result.map_err(|error| RuntimeError::Application(error.to_string()))?,
+    match tokio::time::timeout(timeout, owner.join()).await {
+        Ok(result) => result.result(false),
         Err(_) => {
-            owner.task.abort();
-            let _ = owner.task.await;
+            owner.abort.abort();
+            let _ = owner.join().await;
             Err(RuntimeError::OperationCancelled)
         }
     }
+}
+
+#[cfg(all(test, feature = "testing"))]
+pub(crate) fn sf06_listener_test_hooks(
+    shutdown: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<()>>,
+) -> (
+    crate::host::public_lifecycle::TerminalDrain,
+    crate::host::public_lifecycle::TerminalDrain,
+    Arc<dyn Fn() + Send + Sync>,
+) {
+    let owner = ListenerOwner::new(shutdown, task);
+    let close_owner = owner.clone();
+    let close = Arc::new(move || {
+        let owner = close_owner.clone();
+        Box::pin(drain_listener(owner)) as futures::future::BoxFuture<'static, Result<()>>
+    });
+    let drain_owner = owner.clone();
+    let drain = Arc::new(move || {
+        let owner = drain_owner.clone();
+        Box::pin(async move {
+            owner.shutdown.send_replace(true);
+            owner.abort.abort();
+            owner.join().await.result(true)
+        }) as futures::future::BoxFuture<'static, Result<()>>
+    });
+    let abort = Arc::new(move || owner.abort.abort());
+    (close, drain, abort)
 }
 
 #[derive(Clone)]
@@ -645,7 +724,7 @@ pub struct StatelessReplicator {
     write_gate: Mutex<()>,
     provider_effect_gate: Mutex<()>,
     inbound_build_admission_gate: Mutex<()>,
-    listener: StdMutex<Option<ListenerOwner>>,
+    listener: StdMutex<Option<Arc<ListenerOwner>>>,
     descendants: TaskRegistry,
     inbound_descendants: TaskRegistry,
     callback_containment: watch::Sender<bool>,
@@ -2422,7 +2501,7 @@ impl StatelessReplicator {
             .as_ref()
         {
             owner.shutdown.send_replace(true);
-            owner.task.abort();
+            owner.abort.abort();
         }
         self.descendants.abort_all();
         self.cancel_inbound_effects();
@@ -2519,7 +2598,7 @@ impl Replicator for StatelessReplicator {
             .listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(ListenerOwner { shutdown, task });
+            Some(ListenerOwner::new(shutdown, task));
         let mut state = self.state.lock().await;
         if state.closed {
             drop(state);
@@ -2656,8 +2735,9 @@ impl Replicator for StatelessReplicator {
             .listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.abort_listener();
+            .clone();
+        self.descendants.abort_all();
+        self.cancel_inbound_effects();
         self.streams.shutdown();
         if let Some(owner) = owner {
             drain_listener(owner).await?;
@@ -3340,7 +3420,7 @@ mod task_registry_tests {
         let task = tokio::spawn(std::future::pending::<super::Result<()>>());
         assert!(matches!(
             drain_listener_with_timeout(
-                ListenerOwner { shutdown, task },
+                ListenerOwner::new(shutdown, task),
                 Duration::from_millis(10)
             )
             .await,

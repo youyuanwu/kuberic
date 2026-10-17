@@ -27,9 +27,16 @@ use crate::replicator::{
 
 #[path = "public_lifecycle_program.rs"]
 mod program;
+#[path = "public_lifecycle_terminal.rs"]
+mod terminal;
 pub(crate) use program::{operation_instructions, repeatable, replayable};
+#[cfg(all(test, feature = "testing"))]
+#[path = "public_lifecycle_tests.rs"]
+mod tests;
 
 type ApplicationControlMatch = Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>;
+pub(crate) type TerminalDrain =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, crate::Result<()>> + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct PublicLifecycleCallbacks {
@@ -42,6 +49,8 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) open_context: Option<crate::application::OpenContext>,
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) wait_for_containment: bool,
+    pub(crate) terminal_drain: TerminalDrain,
+    pub(super) terminal_cleanup: Option<Arc<terminal::TerminalCleanup>>,
     pub(crate) aborted: Arc<std::sync::Mutex<bool>>,
     #[cfg(all(test, feature = "testing"))]
     pub(crate) cut: Option<Arc<PublicOperationCut>>,
@@ -178,21 +187,44 @@ pub(crate) async fn launch(
     if intent.class.is_terminal() {
         registry.fence();
     }
+    let terminal_registry = registry.clone();
     let dispatch = {
         let operation = operation.clone();
         async move {
             if !operation.wait_until_ready().await? {
                 return Ok::<(), HostError>(());
             }
-            if let Some(witness) = callbacks.containment.clone() {
+            let terminal_guard = if intent.class.is_terminal() {
+                let (cleanup, owner) = terminal::bind(callbacks.clone());
+                callbacks.terminal_cleanup = Some(cleanup);
+                terminal_registry.own_terminal_task(owner);
+                Some(terminal::TerminalRootGuard(callbacks.clone()))
+            } else {
+                None
+            };
+            if let Some(witness) = callbacks
+                .terminal_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.witness())
+                .or_else(|| callbacks.containment.clone())
+            {
                 operation
-                    .track_containment(witness, callbacks.wait_for_containment)
+                    .track_containment(
+                        witness,
+                        intent.class.is_terminal() || callbacks.wait_for_containment,
+                    )
                     .await?;
             }
             #[cfg(all(test, feature = "testing"))]
             operation.track_cut(callbacks.cut.clone()).await;
+            let containment = if intent.class.is_terminal() {
+                CallbackContainment::RootTask
+            } else {
+                CallbackContainment::ObjectOwnedOnInterruption
+            };
             operation
-                .spawn_root(CallbackContainment::ObjectOwnedOnInterruption, async move {
+                .spawn_root(containment, async move {
+                    let _terminal_guard = terminal_guard;
                     if intent.program.is_some() {
                         program::execute(store, intent, callbacks).await
                     } else {

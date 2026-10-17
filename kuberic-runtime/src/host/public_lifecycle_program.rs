@@ -183,6 +183,13 @@ pub(super) async fn execute(
         .find(|record| record.intent == intent)
         .ok_or_else(|| HostError::Corrupt("missing public program".into()))?;
     let start = record.lifecycle.outcomes.len();
+    let mut close_failure = record.lifecycle.outcomes.iter().find_map(|outcome| {
+        if let O::CloseFailure { child, error } = outcome {
+            Some(format!("{child:?} Close failed: {error}"))
+        } else {
+            None
+        }
+    });
     // An interrupted close that already recorded a child failure still needs
     // process-local abort containment; the durable diagnostic is not a proof.
     if record
@@ -429,24 +436,29 @@ pub(super) async fn execute(
                 O::Done
             }
             ReplicatorClose | ApplicationClose => {
-                let (child, result) = if instruction == ReplicatorClose {
-                    (
-                        PublicCloseChild::Replicator,
-                        callbacks.replicator.close().await,
-                    )
+                if close_failure.is_some() {
+                    O::Done
                 } else {
-                    (
-                        PublicCloseChild::Application,
-                        callbacks.application.close().await,
-                    )
-                };
-                match result {
-                    Ok(()) => O::Done,
-                    Err(error) => {
-                        callbacks.abort_once();
-                        O::CloseFailure {
-                            child,
-                            error: error.to_string(),
+                    let (child, result) = if instruction == ReplicatorClose {
+                        (
+                            PublicCloseChild::Replicator,
+                            callbacks.replicator.close().await,
+                        )
+                    } else {
+                        (
+                            PublicCloseChild::Application,
+                            callbacks.application.close().await,
+                        )
+                    };
+                    match result {
+                        Ok(()) => O::Done,
+                        Err(error) => {
+                            callbacks.abort_once();
+                            close_failure = Some(format!("{child:?} Close failed: {error}"));
+                            O::CloseFailure {
+                                child,
+                                error: error.to_string(),
+                            }
                         }
                     }
                 }
@@ -456,20 +468,18 @@ pub(super) async fn execute(
                 O::Done
             }
             Cleanup => {
-                if let Some(mut witness) = callbacks.containment.clone() {
-                    witness
-                        .wait_for(|contained| *contained)
-                        .await
-                        .map_err(|_| {
-                            HostError::CommandRejected("terminal containment witness lost".into())
-                        })?;
+                let cleanup = callbacks.terminal_cleanup.as_ref().ok_or_else(|| {
+                    HostError::CommandRejected("terminal cleanup is not bound".into())
+                })?;
+                if let Err(error) = cleanup.wait().await {
+                    return Err(HostError::CommandRejected(match &close_failure {
+                        Some(failure) => format!("{failure}; cleanup failed: {error}"),
+                        None => format!("terminal cleanup failed: {error}"),
+                    }));
                 }
                 O::Done
             }
-            Revoke => {
-                callbacks.application.change_role(ReplicaRole::None).await?;
-                O::Done
-            }
+            Revoke => O::Done,
             _ => unreachable!("role instruction in public program"),
         };
         #[cfg(all(test, feature = "testing"))]
@@ -488,5 +498,8 @@ pub(super) async fn execute(
             return Err(HostError::CommandRejected(message.into()));
         }
     }
-    Ok(())
+    match close_failure {
+        Some(error) => Err(HostError::CommandRejected(error)),
+        None => Ok(()),
+    }
 }

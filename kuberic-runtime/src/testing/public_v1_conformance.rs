@@ -715,13 +715,13 @@ const GATES: [Gate; 16] = [
     },
     Gate {
         id: "KSF-14",
-        name: "contained_close_failure_completes_outer_close",
+        name: "contained_close_failure_remains_failed",
         owner: "close",
         postgres_scenarios: &["public_v1_postgres_contained_close"],
         replacement_scenarios: &[
             "hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children",
         ],
-        expected: "child diagnostics do not change normalized outer close",
+        expected: "failed close preserves child diagnostics after abort containment",
         eligibility: contract_gate,
     },
     Gate {

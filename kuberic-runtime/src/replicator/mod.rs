@@ -158,10 +158,13 @@ pub struct ReplicaInformation {
     pub replication_address: String,
     pub process_session_id: ProcessSessionId,
     pub role: ReplicaRole,
-    /// The replica's current LSN, or [`INVALID_LSN`] if unknown or inapplicable.
+    /// The replica's current LSN, or [`INVALID_LSN`] if omitted, unknown, or
+    /// inapplicable. For an already configured or built replica, SF uses omitted
+    /// input to refer to the replicator's known progress, not empty history.
     pub current_progress: Lsn,
-    /// Earliest retained catch-up progress, or [`INVALID_LSN`] if unknown or
-    /// inapplicable.
+    /// Earliest retained catch-up progress, or [`INVALID_LSN`] if omitted,
+    /// unknown, or inapplicable. Omitted known-replica input has the same meaning
+    /// as for [`Self::current_progress`].
     pub catch_up_capability: Lsn,
     /// Requires this replica to catch up even in write-quorum mode, for example
     /// when it is the next primary candidate.
