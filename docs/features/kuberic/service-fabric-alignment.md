@@ -122,9 +122,11 @@ compatibility. In particular:
 - The built-in catch-up capability reports a committed tail rather than the
   retained floor described by the contract. SF-D01 tracks the required
   documentation/behavior reconciliation.
-- The primary current-progress contract promises quorum-committed progress,
-  but the built-in query returns its applied tail. SF-D02 records this mismatch;
-  that tail is not a committed watermark or permission to serve reads.
+- SF-D02 is fixed: the built-in primary scalar reports acknowledged locally
+  durable committed progress, even with access closed. Secondary and opened
+  role-None recovery retain accepted-tail semantics; independent two-boundary
+  reports preserve election/suffix information. Neither a tail nor a committed
+  scalar grants access. See [role-specific semantics and pinned native evidence](service-fabric-api-semantics.md#role-specific-progress-and-recovery).
 
 In SF configuration input, `INVALID_LSN` can omit progress for a replica
 already configured or built, referring to the replicator's known progress.
@@ -156,8 +158,8 @@ timing; see [read visibility and pinned SF evidence](service-fabric-api-semantic
 SF-11's previously implemented committed-prefix repair is also exactly
 revalidated, including genuine divergent/missing-history rejection. The audit
 now records **6 fixed / 15 open implementation findings** (6 P1 / 9 P2 open)
-and **two open documentation mismatches**. SF-D02 and the other unaddressed
-findings remain open; this work does not change their runtime contracts.
+and **one open documentation mismatch**, SF-D01. SF-D02's query reconciliation
+does not change those implementation counts or close other findings.
 
 ## KSF Conformance
 
@@ -180,8 +182,8 @@ surface. Extra endpoint, alternate protocol, and alternate controller-owner
 fixtures are injected through the same discovery path and must fail the same
 validator.
 
-The current test inventory contains 408 tests:
-362 ordinary, 41 PostgreSQL, three KinD, and two build-only.
+The current test inventory contains 410 tests:
+364 ordinary, 41 PostgreSQL, three KinD, and two build-only.
 
 ## Deliberate Differences
 

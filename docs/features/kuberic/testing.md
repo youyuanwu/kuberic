@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 362 |
+| ordinary | 364 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **408** |
+| **total** | **410** |
 
-Ordinary partition counts are `91, 91, 90, 90`. PostgreSQL partition counts
+Ordinary partition counts are `91, 91, 91, 91`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -90,6 +90,27 @@ The exact SF-11 matrix records primary `(11,10)`, peer `(5,5)` replay of
 See the [audit's evidence and scope](service-fabric-contract-audit.md#sf-01-and-sf-11-revalidation);
 these tests establish new normal-read admission, not isolation of already
 admitted reads or arbitrary application data views.
+
+### Role-Specific Scalar Progress
+
+```bash
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test-threads 1 \
+  -E 'test(sf_d02_) or test(sf11_committed_prefix_) or test(primary_write_) or test(=commit_failure_permanently_contains_the_ambiguous_suffix) or test(=hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome)'
+```
+
+Two new hosted tests query the actual public control and a journalled Progress
+outcome while a real peer service ACK is held after local apply, then while local
+commit is held after quorum. They cover success, joined caller cancellation,
+a completed epoch barrier, secondary pre/post-service-ACK acceptance and gap
+rejection. No elapsed-time assertion supplies the safety proof. The existing
+SF-11 matrix also queries opened None, secondary-to-primary promotion and all
+successful/failed suffix-settlement outcomes. Extended commit-error, close/epoch
+and nonempty typed Preserve recovery cases distinguish scalar commitment from
+independent report tails and access. These memory-backed tests prove protocol
+sequencing, not fsync; existing real-provider SF-01 regressions remain separate.
+See [SF-D02 closure](service-fabric-contract-audit.md#sf-d02-primary-progress-promise-exceeds-the-built-in-query-result)
+and the [role/native-source qualifications](service-fabric-api-semantics.md#role-specific-progress-and-recovery).
 
 ### In-Process Controller/Application Journeys
 
