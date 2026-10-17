@@ -1,113 +1,47 @@
 # SQLite on a V2 Transactional Replicator
 
-## Status
+## Status and Scope
 
-Proposed architecture. This document describes how the existing replicated
-SQLite application could use a future Kuberic transactional replicator modeled
-after the Service Fabric V2 Transactional Replicator. It does not describe
-behavior that is currently implemented.
+Proposed application integration with the
+[faithful Rust port of SF V2](../kuberic/v2-transactional-replicator-design.md).
+No V2 transactional engine or SQLite V2 provider is implemented by this
+document. The [current SQLite application](design.md) remains on Kuberic's
+Public V1 durability path.
 
-The term **transactional replicator** in this document is distinct from the
-existing SQLite application's migration to Kuberic's level-triggered **v2
-runtime stack**. The current application still uses the default V1-shaped
-replicator and implements its own durable frame log, recovery and copy
-protocol.
+Here transactional V2 is distinct from the existing level-triggered v2
+host/operator. The shared design preserves native SF component boundaries,
+transaction processing, barriers, checkpoint/recovery and copy semantics.
+SQLite must fit those semantics; it must not turn the engine into a
+committed-only, full-copy-only application-specific scheduler.
 
-## Overview
+SQLite can use one provider and one atomic redo operation per SQL transaction.
+That is an application choice, not a limit on the engine's regular
+transactions, undo-capable providers, dynamic registry or copy modes.
 
-The current SQLite application already implements many responsibilities that
-an SF-style V2 Transactional Replicator would provide:
+## Goals and Non-Goals
 
-- an application-owned durable log of WAL-frame operations;
-- applied and committed LSN tracking;
-- retained redo history;
-- a base image and post-base recovery suffix;
-- durable copy staging and retry evidence;
-- reconciliation after ambiguous commit boundaries;
-- committed-image materialization before SQLite opens.
+Move generic logging, transaction/operation identity, retained history,
+recovery, progress vectors, checkpoint coordination, copy selection and
+backup/restore into the ported V2 components. Keep deterministic WAL-frame
+interpretation, SQLite image creation, materialization, SQL connection
+management and local WAL publication in the provider/service.
 
-These mechanisms are necessary with the current V1-shaped default replicator,
-because that replicator deliberately does not own a durable transaction log.
-They should not remain duplicated if Kuberic adds an explicit V2 layer.
+The SQL success boundary remains successful V2 atomic completion **and**
+successful local SQLite publication under current authority. Success does not
+add a requirement to wait for SF's last stable LSN.
 
-SQLite should be the first application migrated to that layer. Each SQLite
-transaction naturally produces one atomic redo payload, while a SQLite
-database image naturally forms a provider checkpoint and full-copy image. The
-transactional replicator can own ordering, durable logging, quorum commitment,
-recovery replay, retained history and checkpoint coordination. The SQLite
-provider can then focus on translating between transactional-replicator
-operations and SQLite database state.
+Non-goals are SQL replay on secondaries, multi-primary SQLite, arbitrary
+attached-database/extension replication, cross-partition transactions,
+automatic client exactly-once execution, and retaining the old frame log as
+an independent recovery authority.
 
-The intended boundary is:
+Preserve `Replicator`, `PrimaryReplicator`, and `StateProvider` unchanged.
+SQLite implements a separate `StateProvider2`-equivalent Rust interface.
 
-```text
-SQL transaction
-    -> capture complete WAL-frame transaction
-    -> submit one V2 atomic redo operation
-    -> durably log and replicate through V1
-    -> reach required quorum and stable commit
-    -> apply/publish frames to the SQLite provider
-    -> return SQL success
-```
+## Current and Target Ownership
 
-The V2 log becomes the replicated recovery authority. SQLite files become
-provider checkpoint and materialized serving state. The design must not add a
-V2 log underneath the existing application-owned durable frame log.
-
-## Goals
-
-1. Use SQLite as the first production-quality consumer of a Kuberic V2
-   Transactional Replicator.
-2. Map one committing SQLite transaction to one atomic redo-only V2
-   transaction.
-3. Move generic durable logging, LSN assignment, commit tracking, retained
-   history, replay and copy-suffix handling out of the SQLite application.
-4. Retain SQLite-specific WAL capture, frame validation, application,
-   checkpoint creation and checkpoint installation in the SQLite provider.
-5. Recover by opening a provider checkpoint and replaying committed V2 log
-   records before serving SQL.
-6. Coordinate SQLite checkpoints with the V2 stable LSN and log-truncation
-   protocol.
-7. Support full and incremental backup through V2 checkpoint and log
-   boundaries.
-8. Preserve agent ownership of topology, epochs, roles, builds, removal and
-   retirement.
-9. Preserve the existing `Replicator`, `PrimaryReplicator` and `StateProvider`
-   interfaces.
-
-## Non-Goals
-
-- Turning SQLite into a multi-primary database.
-- Replicating SQL text or re-executing SQL on secondaries.
-- Making arbitrary SQLite extensions, attached databases or virtual tables
-  safe for replication.
-- Retaining both the current application frame log and a new V2 log as
-  independent recovery authorities.
-- Replacing the V1 replication transport, quorum protocol or RA-facing
-  lifecycle.
-- Moving topology or reconfiguration durability into the V2 log.
-- Changing the existing protected `StateProvider` interface into a V2 provider
-  interface.
-- Providing cross-partition transactions.
-- Treating a V2 commit as client success before local SQLite publication has
-  completed.
-
-## Current SQLite Ownership
-
-The current implementation divides state between the agent and
-`SqlitePersistence`.
-
-| Current component | Responsibility |
-|---|---|
-| Agent SQLite | Identity, authority, role and configuration intent, effects, local-write recovery and builds |
-| Commit-barrier VFS | Capture a complete WAL transaction and prevent its local publication before replication |
-| `DurableFrameLog` | Base image, retained operations, applied/committed progress, copy staging and recovery state |
-| `SqlitePersistence` | `DurableState` implementation, snapshot generation, apply, commit and materialization |
-| Default replicator | Transport, operation LSNs, quorum acknowledgement, copy and peer sessions |
-| Live SQLite database | Primary SQL execution and materialized committed view |
-
-The application manifest and history log are not merely a SQLite checkpoint.
-Together they form a specialized transactional-replicator log:
+The existing application has an immutable base plus durable WAL-frame history,
+progress/copy metadata, and live serving files:
 
 ```text
 application/
@@ -119,522 +53,331 @@ application/
   db.sqlite-shm
 ```
 
-`state-v2.json`, the immutable base and retained history establish durable
-application progress independently of the live database. That is appropriate
-for the current V1-shaped replicator, but it would duplicate the central
-responsibility of a future V2 Logging Replicator.
+`SqlitePersistence` implements `DurableState`; `DurableFrameLog` owns retained
+history, progress and copy staging. The commit-barrier VFS captures complete
+WAL transactions and withholds their commit frames while replication runs.
+See `examples/sqlite/src/state.rs:210-303`,
+`examples/sqlite/src/service.rs:25-69`, and
+`examples/sqlite/src/commit_barrier/mod.rs:1-59`.
 
-## Target Architecture
-
-### Layering
-
-```text
-Replica agent
-  owns topology, epoch, role, access, build intent and lifecycle effects
-
-V1 default replicator
-  owns transport, replica sessions, quorum ACKs and RA-facing configuration
-
-V2 transactional replicator
-  owns transactions, durable logical/physical log, LSN stability,
-  checkpoint coordination, replay, retained suffixes, copy and backup
-
-SQLite V2 state provider
-  owns WAL-frame interpretation, database pages, provider checkpoints,
-  checkpoint installation, redo application and SQLite lifecycle
-```
-
-V2 is layered over V1 rather than replacing it. The replica agent continues to
-drive V1 roles, epochs and configurations. The service receives a separate
-transactional handle for submitting operations and managing V2 providers.
-
-### Durable ownership
-
-| State | Target owner |
+| Concern | Target owner |
 |---|---|
-| Replica identity, epoch, PC/CC configuration and role intent | Agent |
-| V2 transaction records, stable-prefix evidence and abort outcomes | Transactional replicator log |
-| Stable LSN, progress vector and physical checkpoint records | Transactional replicator log |
-| SQLite database checkpoint image | SQLite V2 state provider |
-| Post-checkpoint committed redo | Transactional replicator log |
-| Incomplete transaction records | Transactional replicator; ignored or undone during recovery |
-| SQL connection, live WAL and VFS buffers | SQLite process memory and materialized files |
-| Client request completion | Hosting process; not reconstructed after process failure |
+| Identity, topology, epochs, configuration and serving authority | Existing agent/controller |
+| Transport sessions, PC/CC quorums and V1 lifecycle | Existing V1 engine through private V2 bridge |
+| Transaction records, append/flush, transaction map, barriers and progress vectors | Ported `txnreplicator::loggingreplicator` / `logrecordlib` |
+| Provider name/ID/type, transactional membership and hierarchy | Ported `txnreplicator::statemanager` |
+| SQLite page interpretation, candidate materialization and checkpoint images | SQLite `StateProvider2` |
+| Recovery cutoff, replay, copy mode, truncation and backup log chain | Ported V2 framework |
+| Client SQL execution, request gate and live WAL publication | SQLite service/commit-barrier VFS |
 
-There must be one authoritative path for every durable fact. In particular,
-SQLite must not report an operation durable from its old frame log while V2
-reports a different transaction boundary.
+The old application history/manifest must stop deciding V2 transactions.
+Provider checkpoint or candidate files may cache materialized state, but
+cannot independently decide whether a transaction belongs to selected history.
+There is one V2 recovery log, not a new V2 log beneath the old frame log.
 
-## SQLite Provider Contract
-
-Kuberic should introduce a new internal or public V2 provider contract modeled
-after SF `IStateProvider2`. It should be separate from the protected V1
-`StateProvider` interface.
-
-The SQLite implementation requires these capability groups:
-
-### Lifecycle
-
-- initialize with provider identity, work directory and transactional handle;
-- open provider checkpoint state;
-- change role without selecting its own authority;
-- close or abort all SQL and provider work;
-- remove local provider state only after agent-authorized lifecycle removal.
-
-### Apply and unlock
-
-- apply redo at the transaction's commit LSN;
-- distinguish primary, secondary and recovery application contexts;
-- reject invalid WAL-frame geometry or conflicting bytes;
-- return an operation context if resources must remain held until transaction
-  completion;
-- release those resources through an explicit unlock callback.
-
-SQLite initially needs only atomic redo operations. Undo payloads are
-unnecessary because uncommitted SQL is still controlled by SQLite and
-uncommitted V2 redo must not become provider-visible.
-
-### Checkpoint
-
-- prepare a checkpoint at a captured stable LSN;
-- produce an immutable SQLite image for that exact version;
-- atomically promote the completed image;
-- recover the current image on restart;
-- delete obsolete images only after V2 makes them unreachable.
-
-### Copy
-
-- enumerate a provider checkpoint image from the source;
-- begin target-side installation into staging;
-- accept numbered and retryable copy records;
-- atomically complete installation;
-- abandon incomplete staging when copy does not complete.
-
-### Backup and restore
-
-- copy the current provider checkpoint into a backup directory;
-- restore a validated checkpoint into staging;
-- atomically promote restored state only as part of V2 restore;
-- leave log-suffix selection and replay to the transactional replicator.
-
-## Transaction and Commit Path
-
-### Primary operation
-
-The commit-barrier VFS continues to capture the exact WAL-frame set before its
-commit frame becomes locally recoverable. Instead of calling
-`StateReplicator::replicate` directly, it submits one atomic redo-only
-operation to the V2 transaction manager.
+## Target Composition
 
 ```text
-SQLite/VFS       V2 transaction       V1 replicator      V2 logging adapter       SQLite provider
-    |                  |                    |                     |                      |
-    |-- frame set ---->|                    |                     |                      |
-    |                  |-- transaction --->|                     |                      |
-    |                  |                    |-- assigned op ----->|                      |
-    |                  |                    |                     |-- flush intent       |
-    |                  |                    |<-- durable accept --|                      |
-    |                  |                    |-- replicate/ACKs -->|                      |
-    |                  |                    |-- commit boundary ->|                      |
-    |                  |                    |                     |-- apply committed -->|
-    |                  |<-- committed LSN --|                     |<-- apply complete ---|
-    |<-- publish ------|                    |                     |                      |
+SQL thread + commit-barrier VFS
+             |
+complete WalFrameSet -> AtomicRedoOperation
+             |
+common transaction API -> loggingreplicator managers
+             |                         |
+private early-LSN V1 bridge       State Manager
+             |                         |
+transport quorum                 SQLite StateProvider2
+                                       |
+                         provider images / materialization
 ```
 
-The redo payload remains the current deterministic `WalFrameSet`, not SQL
-text. It contains page images, database geometry and final database size.
-Non-deterministic SQL therefore still executes only on the primary.
+The service receives one V1-compatible lifecycle bundle for the host and a
+transactional handle to that same composition. It does not assemble a second
+transport or directly drive the V2 dispatcher from SQL callbacks.
 
-### V1 logging bridge
+Ported State Manager recovers or creates the SQLite provider through its
+factory descriptor. Bootstrap provider creation uses the normal transactional
+registry path under admitted primary authority before SQL serving; recovery
+and copy reconstruct the same persistent ID. One database per service does
+not justify bypassing provider registration or replacing it with a fixed
+engine configuration entry.
 
-The existing `StateReplicator::replicate` returns an LSN only after durable
-local acceptance and the admitted PC/CC quorums. V2 must not assume that it can
-receive that LSN first and flush its log afterward.
+## Provider Contract
 
-Kuberic V2 instead follows SF's layering pattern: the V2 Logging Replicator
-wraps the inner V1 transport and supplies a V2 logging adapter at V1's
-application-durability boundary. The submitted V1 payload contains a stable V2
-transaction identity and redo bytes, but not a caller-chosen LSN.
+### Lifecycle and identity
 
-- V1 assigns the operation LSN.
-- The adapter's durable-apply path appends and flushes the V2 logical record
-  with that assigned LSN before returning local acceptance.
-- Secondary adapters append and flush the same record before acknowledging
-  replication.
-- V1 gathers PC/CC acknowledgements using its unchanged quorum protocol.
-- V1's durable-commit callback advances the adapter's candidate stable
-  boundary and permits committed provider processing.
-- `StateReplicator::replicate` returns the committed LSN to the V2 transaction
-  manager only after those steps complete.
+Implement naming/factory reconstruction, initialize/open, role changes,
+close/abort, prepare-for-remove and local state removal. Provider identity is
+a persistent ID plus descriptor, not just a database path.
 
-This bridge is private composition between V1 and V2. It does not change
-`Replicator`, `PrimaryReplicator`, `StateProvider`, or the public completion
-contract of `StateReplicator`. Cancellation before V1 acceptance leaves no
-record; cancellation after durable acceptance leaves an unresolved V2 record
-that recovery must settle rather than deleting it.
+The host/agent selects role and authority. Provider readiness cannot reopen
+SQL after authority loss. Shutdown and copy replacement must close SQL
+connections before changing files; asynchronous checkpoint/copy tasks remain
+under the creation's writer reservation until contained.
 
-### Success boundary
+### Apply and resource ownership
 
-A successful V2 transaction means that V1 has completed the required
-replication quorum, V2 has durably advanced its stable committed prefix through
-the transaction, and the operation has been applied according to the V2
-operation-processing contract. The SQL request must additionally wait for
-successful local SQLite publication.
+Apply receives operation LSN, transaction/commit sequence, role/kind,
+metadata/data and returns an optional owned context. For atomic redo the
+operation and commit LSN may coincide; do not generalize that equality to
+all engine transactions.
 
-A locally durable transaction record is only an accepted intent. Its presence
-does not prove quorum commitment. V2 separately tracks:
+Validate `WalFrameSet` geometry, payload identity, page data and final size.
+Primary, secondary and recovery materialization must represent the same
+operation sequence, but may use different resources.
 
-- the local accepted tail;
-- the locally recorded stable committed boundary;
-- provider-applied progress;
-- the history/progress vector used to validate those boundaries after role
-  change.
+**Apply can run before primary replication completion or global stability.**
+A failed own replication result can occur after provider Apply. Therefore
+Apply must not publish the primary's live SQL WAL or release its serving gate
+as though it were a commit-success notification.
 
-The stable record is a durable lower bound produced after V1 quorum completion,
-not an infallible answer to every crash race. If quorum completes but the
-primary crashes before recording the stable advance, recovery may recertify
-the identical record from current replica histories. If only local acceptance
-occurred, recovery must not expose the record as committed.
+Original operation contexts, Apply-returned contexts and transaction locks
+follow the ported ownership rules. Unlock releases resources; it is not proof
+of success, can occur during failure cleanup, and can occur without Apply.
+Do not write the SQL commit frame from Unlock.
 
-If V2 commits but local WAL publication fails:
+### Isolation and materialized views
 
-1. the replica is behind its own committed V2 state;
-2. the service closes write and read access for that process;
-3. the client receives an ambiguous failure, never a rollback claim;
-4. recovery selects or recertifies the committed prefix, reopens the provider
-   checkpoint and replays the record if it belongs to that prefix;
-5. SQL serving resumes only after materialized state reaches the V2 committed
-   LSN.
+Use a provider-owned candidate materialization/page overlay or equivalent
+private view for primary Apply. It derives from the V2 log and is not another
+transaction journal. The service's SQL request/publication gate remains held
+until the atomic result and local publication are known.
 
-This preserves the current conservative failure contract without an
-application-owned reconciliation journal.
+Initially secondaries do not expose client SQL. They may materialize locally
+applied atomic records before stability while the framework's read/copy/role
+gates remain in force. On promotion, validate/recover the selected history
+before opening a serving connection. A numerically higher local image is not
+automatically the authoritative database.
 
-### Secondary and recovery apply
+The provider must state which lock/version protects checkpoint capture and
+source copy from a concurrently changing materialization. Merely routing
+callbacks through one provider ID is not isolation.
 
-Secondaries do not need a continuously open client-facing SQLite connection.
-They apply committed redo into provider state under V2 ordering. An
-implementation may maintain either:
+## Primary Transaction Path
 
-- an incrementally updated database image; or
-- checkpoint state plus replayable log records, materializing SQLite when role
-  change or checkpoint policy requires it.
+1. Execute SQL on the primary. The VFS buffers the complete transaction
+   through its final commit frame and captures one deterministic `WalFrameSet`.
+2. Submit that payload as one atomic redo operation through the ported
+   transactional API.
+3. The ported managers start V1 replication, obtain an early LSN, and append
+   the record to the V2 physical log. Replication and local flush/dispatch are
+   independent dependencies.
+4. Local flushed processing invokes provider Apply. It validates/stages the
+   candidate version using resources independent of the blocked SQL
+   connection.
+5. The transaction path joins Apply and own replication, invokes engine
+   resource release, and returns its atomic result. There is no extra stable
+   watermark wait.
+6. Only on successful completion and current serving authority does the SQL
+   thread publish its already captured WAL frames.
+7. Confirm local publication before SQL success and release the service gate.
 
-The initial implementation should prefer correctness and simple checkpoint
-semantics over minimizing secondary writes. Provider state must be equivalent
-at a given committed LSN regardless of whether redo was applied during normal
-replication or recovery replay.
+```text
+                       +-> V1 replication completion -----+
+capture -> submit/LSN -+                                  +-> atomic result
+                       +-> log flush -> provider Apply ----+        |
+                                                                  |
+                                              successful + current authority
+                                                                  |
+                                                 SQL thread publishes WAL
+                                                                  |
+                                                        SQL success
+```
 
-## Checkpoints and Log Truncation
+The VFS thread holds the live connection while awaiting V2. Primary Apply
+must not reacquire that connection, perform recursive SQL, or wait for local
+WAL publication: any of those would deadlock the completion it is meant to
+satisfy. Unlock also cannot wait for the VFS to resume.
 
-The current base image becomes a provider checkpoint managed under V2's
-three-stage protocol:
+This is a provider adaptation to SF's processing model, not a rewrite of
+`OperationProcessor` to postpone Apply until quorum. The private early-LSN,
+stream and ACK bridge belongs to the runtime; SQLite does not emulate it by
+blocking around public `StateReplicator::replicate`.
 
-1. **Prepare:** capture the stable LSN and freeze the logical database version.
-2. **Perform:** create and fsync an immutable SQLite image for that version.
-3. **Complete:** atomically promote the image and make older provider files
-   eligible for deletion.
+## Failure and Client Outcomes
 
-V2 must not truncate log records required by:
+| Boundary | Required SQLite behavior |
+|---|---|
+| Rejection before submission | Do not publish captured WAL; ordinary local rollback remains possible |
+| Apply completed, own replication fails or outcome is interrupted | Do not publish or serve the candidate; retain framework recovery evidence and fence the instance as required |
+| Own replication succeeds, local Apply fails | No SQL success; fault/fence and recover through V2 |
+| Atomic completion succeeds, live WAL publication fails | No rollback claim; fence, preserve V2 log and rematerialize selected history |
+| WAL publication succeeds, response is lost | Client outcome is ambiguous; do not execute a retry as exactly-once without an application request ledger |
+| Authority changes at any asynchronous boundary | Old tasks cannot publish or reopen SQL for a newer generation |
 
-- the current provider checkpoint;
-- a checkpoint still being performed or completed;
-- an active replica copy;
-- an incremental backup;
-- a replica whose retained-history requirements are still admitted.
+An error does not by itself prove that an atomic record will never belong to
+selected history. The port's history/copy/recovery rules decide that outcome.
+Do not delete an applied redo record or invent a durable “aborted SQL” marker
+outside the transaction log to settle ambiguity.
 
-SQLite automatic WAL checkpoints remain disabled for client-visible storage
-unless they are proven compatible with the provider checkpoint protocol.
-SQLite WAL maintenance is an implementation detail; the V2 stable LSN and
-provider checkpoint define recovery retention.
+The SQL gate and current-generation state protect against a late Apply/Unlock
+callback after failure. Reopening is a lifecycle/recovery action, not merely
+clearing a Boolean when a future completes.
 
-## Restart Recovery
+## Secondary ACK and Recovery
 
-A persisted replica recovers in this order:
+Secondary durable ACK means V2 log flush, with optional commit-classified
+Apply acknowledgement as defined by the shared port. It does not inherently
+mean SQLite Unlock or client-read publication. SQLite must not request a
+global engine rule that delays all secondary Apply until a later committed
+watermark.
 
-1. The agent validates replica identity and opens topology authority.
-2. V2 opens and validates its durable physical/logical log.
-3. V2 reconstructs the accepted tail, local stable boundary, progress vector
-   and any unresolved suffix.
-4. The agent replays role, epoch and configuration through V1 while access
-   remains closed.
-5. V1/V2 compare current replica histories and select or recertify the
-   authoritative stable prefix through normal quorum and data-loss rules.
-6. V2 performs false-progress truncation or provider replacement for records
-   outside the selected history.
-7. The SQLite provider opens its latest completed checkpoint at or below the
-   selected stable prefix.
-8. V2 replays committed redo after the checkpoint LSN.
-9. Accepted-but-unresolved, aborted and false-progress records remain
-   provider-invisible.
-10. The provider materializes and validates the recovered SQLite database.
-11. Read or write access remains closed until V1 authority and V2/provider
-   recovery are both complete.
+Recovery is framework-driven:
 
-Recovery must produce the same database bytes and logical contents as applying
-the same committed redo during normal operation. Corrupt provider checkpoints
-or missing acknowledged log records fail closed and require an authorized
-rebuild or data-loss workflow.
+1. With access closed, validate storage identity and V2 format.
+2. Recover State Manager/provider checkpoint state, completing interrupted
+   checkpoint publication if required.
+3. Reconstruct transaction/log history and replay using the port's
+   recovered/copied checkpoint cutoff.
+4. Apply self-committing atomic redo in the local recovered history. Its
+   presence is not a new authorization to serve SQL.
+5. Complete agent-authorized role/history/copy reconciliation.
+6. If local redo-only history is false progress, perform the selected full
+   copy before opening a serving database.
+7. Materialize/validate the selected provider image and open SQL only when
+   both framework readiness and partition access permit it.
 
-The current application-owned `RecoveryState::ReconciliationRequired` state
-should disappear because V2 owns reconciliation. Reconciliation itself does
-not disappear: a local V2 log cannot determine every distributed commit race
-without comparing admitted replica histories. A rebuild-required fence remains
-necessary when neither a valid provider checkpoint nor sufficient V2 log
-history can recover the selected prefix.
+Do not filter log replay using the old application's applied/committed
+manifest or a newly invented V2 per-operation quorum-commit marker.
+Recovery can reconstruct candidate local state later replaced by full copy.
 
-## Replica Copy and Divergent History
+Redo must be replay-safe from its declared checkpoint: use a fresh
+materialized generation or exact provider operation evidence. Crash after
+mutation but before local progress persistence must not apply a logical
+increment twice. Validate page contents/geometry and database state; temporary
+filenames alone are not durable completion evidence.
 
-V2 selects copy mode from the source and target progress histories:
+## Checkpoints and Retention
 
-- no copy when the target already has the selected history;
-- log-only copy when the target checkpoint and retained suffix are compatible;
-- full SQLite checkpoint plus log suffix when they are not;
-- false-progress correction when the target contains a divergent suffix.
+Implement the native-equivalent phases under the ported checkpoint managers:
+
+| Phase | SQLite action |
+|---|---|
+| Prepare | Synchronously capture/pin the database version at the supplied checkpoint LSN and dispatch boundary; it may not yet be stable |
+| Perform | After the framework's stability gate, write/flush the captured immutable image while preserving its exact version |
+| Complete | Retry-safe promotion/cleanup coordinated with framework end/complete-checkpoint records and copy-log publication |
+| Recover | Reopen the selected image; tolerate Complete on a reconstructed instance before Recover without same-instance Prepare/Perform |
+
+Do not substitute the live connection's newest database for the captured
+version. If it cannot provide the required snapshot concurrently, the provider
+must retain a separate immutable view or explicitly synchronize capture,
+without changing the engine's checkpoint boundary.
+
+SQLite automatic WAL maintenance remains separate from V2 checkpoint
+authority. Preserve the checkpoint/log suffix needed for recovery,
+copy/backup readers, pending/unstable framework transactions and active
+versions. Do not truncate solely because the live database has flushed or a
+single SQL transaction returned success.
+
+## Copy and False Progress
+
+Use the port's progress-vector/context exchange and none/partial/full mode
+selection. SQLite does not independently choose its suffix from numeric LSNs.
+
+Atomic redo-only has no provider undo path. If correcting the target history
+would cross an applied/recovered SQLite atomic redo record, preserve SF's full
+copy fallback. Partial copy is still valid for compatible histories that do
+not require unsupported rollback; SQLite's use of redo-only does not make
+every build full-copy-only.
 
 For full copy:
 
-1. the source enumerates an immutable SQLite checkpoint;
-2. the target installs it through numbered, retry-safe copy records;
-3. V2 transfers the required committed log suffix;
-4. the target replays that suffix;
-5. the provider validates and materializes the resulting database;
-6. V1 admits the built replica only after it reaches the authorized boundary.
+1. Enumerate the framework-selected immutable provider state and retain its
+   snapshot resources.
+2. Install numbered records into a target staging generation. Exact build
+   retries verify identity and bytes.
+3. Transfer/replay the framework-selected log range and checkpoint/history
+   metadata; do not replace it with an application-selected suffix.
+4. Complete provider installation/checkpoint phases and copy-log publication
+   under V2 ordering.
+5. Finish retained catch-up and independent agent admission before SQL serving.
 
-Provider copy staging remains application-specific, but build identity,
-progress-vector comparison and suffix selection belong to V2. Exact retry
-evidence does not need to remain indefinitely in the promoted SQLite
-checkpoint after V2 has durably completed or abandoned the copy session.
+Begin/Set/End is not a guaranteed cleanup pair. Interrupted copy need not call
+End, and an existing provider instance can be reused. Explicit staging
+ownership, recovery and Close/Abort must release incomplete resources without
+altering a newer selected generation.
 
-False-progress correction must never mutate a live primary SQLite connection.
-The replica is fenced, divergent provider state is restored or undone under
-V2 control, and SQLite is reopened only at a valid selected history.
+Never attempt false-progress repair against a live serving primary
+connection, synthesize SQLite undo bytes for a redo-only operation, or merely
+truncate the log while retaining a divergent serving database.
 
 ## Backup and Restore
 
-A full backup contains:
+Provider BackupCheckpoint copies its selected image. Provider
+RestoreCheckpoint installs an image but does not itself perform recovery.
+The framework separately handles registry, history, retained log range,
+lineage and the subsequent provider/log recovery.
 
-- the V2 metadata needed to identify its stable recovery boundary;
-- the SQLite provider checkpoint at that boundary;
-- any V2 log suffix required to reach the backup LSN;
-- checksums and provider identity metadata.
+Full and incremental backup follow the ported protocol. A successful
+destination callback alone is not complete backup success: V2 still processes
+its replicated backup completion record/barrier. Incremental means a
+framework-validated log continuation, not arbitrary changes to live SQLite
+files.
 
-An incremental backup contains only V2/provider artifacts after an accepted
-parent backup boundary. Backup completion is reported only after all artifacts
-are durable in the user-selected destination.
+Restore is offline for SQL and permitted only in the authorized data-loss
+window. Validate chain/schema, restore the provider image and framework log,
+recover, preserve data-loss epoch rules and remove in-progress restore
+evidence only at the correct terminal boundary. A backup directory is not
+authority to replace a current replica.
 
-Restore is a lifecycle operation, not a live SQL file replacement:
+## Migration and Activation
 
-1. close SQL access and provider activity;
-2. validate backup identity, chain and checksums;
-3. stage the provider checkpoint and V2 log;
-4. atomically select the restored generation;
-5. run normal V2 recovery and redo replay;
-6. require agent-authorized data-loss/restore policy before granting access.
+Initially require fresh V2 storage, consistent with the shared design.
+Conversion of old base/history state is separately scoped; do not infer V2
+progress from `state-v2.json`, a live database, or partially converted files.
 
-Copy and backup may share provider checkpoint encoding, but they have different
-retention, authorization and destination semantics.
+| Phase | Deliverable |
+|---|---|
+| Provider fixture | Deterministic frame provider using the port's real transaction/Apply/Unlock semantics; no production SQL serving |
+| Inactive integration | VFS submits atomic redo, independent primary staging, correct publication gate, V2-only checkpoint/recovery/copy |
+| Fault qualification | Apply-before-quorum, failure/Unlock races, redo-only full copy, alias cutover and provider image replay tests |
+| Activation | Complete faithful-port integration, fresh-format admission and real restart/build/failover/swap evidence |
+| Old storage retirement | Stop old frame-log authority; reclaim only explicit obsolete files after the new storage lifecycle is established |
 
-## State-Provider Registry
+The old complete V1 stack can remain usable for separate test deployments
+while V2 is developed. No serving instance mixes its old log with new V2
+decisions. After a V2-backed write, never fall back to old history, recovery
+or copy.
 
-The first implementation should register exactly one SQLite provider for one
-partition. V2's replicated provider registry is still useful because it makes
-provider identity and reconstruction explicit, but dynamic creation and
-removal need not be exposed through the SQL API initially.
+## Verification and Invariants
 
-Future services could use V2 transactions across multiple providers within the
-same partition. SQLite should not claim atomicity with another provider until
-the primary apply/publication sequence and recovery behavior are defined for
-all participants.
+Port engine tests separately; SQLite tests verify its provider contract:
 
-## API Boundary
+| Scenario | Required observation |
+|---|---|
+| Apply before own replication finishes | Candidate staging succeeds without SQL publication or connection deadlock |
+| Replication failure after Apply | No SQL success; Unlock releases resources without publishing WAL |
+| Completion while stable LSN lags | SQL may finish after valid completion/publication; no unintended stable wait |
+| Crash after V2 completion before WAL publish | Recovery/copy reconstructs the selected V2 history, not the old frame log |
+| Publication/response failure | Conservative client outcome and fenced/recoverable local materialization |
+| Recovery of divergent atomic redo | Full-copy fallback, no fabricated provider undo and no pre-repair SQL serving |
+| Compatible log-only copy | Correct image through framework-selected suffix, including quiet builds |
+| Checkpoint Prepare before stability | Captured image is exact; Perform waits framework gate; restart Complete is safe |
+| Copy interruption/provider reuse | No guaranteed End dependency; partial staging remains unserved |
+| Callback after replacement/Abort | Cannot publish into, delete, or reopen a newer generation |
+| Backup callback succeeds but final marker fails | Do not report completed backup prematurely |
+| Old/unknown storage | Reject before mutation; no mixed authority or implicit migration |
 
-The existing interfaces remain unchanged:
+SQL success requires quorum-backed atomic completion, current authority, and
+local WAL publication. Provider Apply, Unlock, physical flush, stable barrier,
+and SQL visibility remain distinct milestones. Engine recovery and normal
+application must yield equivalent selected database state; no secondary,
+copied, or recovered candidate becomes client-visible merely because its
+files exist.
 
-- `Replicator`;
-- `PrimaryReplicator`;
-- `StateProvider`.
+## Limitations and References
 
-The V2 feature should add separate interfaces, tentatively:
-
-- `TransactionalReplicator`;
-- `Transaction` and `AtomicRedoOperation`;
-- `TransactionalStateProvider`;
-- `TransactionalStateProviderFactory`;
-- provider checkpoint, copy, backup and apply contexts.
-
-Names are illustrative rather than final API commitments. The important
-constraint is that V2 provider concerns must not be added incrementally to the
-V1 `StateProvider` or `DurableState` contracts.
-
-The SQLite service should receive:
-
-- the V1-compatible primary-replicator handle used by the host and agent; and
-- a V2 transactional handle used by the SQL commit barrier.
-
-## Migration Plan
-
-### Phase 1: Define V2 contracts
-
-- Add the transactional-replicator and V2 provider abstractions.
-- Layer V2 over the existing V1 transport and lifecycle.
-- Implement durable transaction records, atomic redo operations, recovery and
-  checkpoint coordination with a test provider.
-
-### Phase 2: Add a SQLite V2 provider
-
-- Reuse `WalFrameSet` as the provider redo format.
-- Implement lifecycle, redo apply, checkpoint and copy callbacks.
-- Keep the current application durable frame log available as the active path
-  while validating equivalent provider state in isolated tests.
-
-### Phase 3: Complete the inactive V2 storage path
-
-- Change the commit barrier to submit one atomic redo-only V2 operation.
-- Define the V2 commit plus local publication success boundary.
-- Preserve ambiguous client outcomes after dispatch.
-- Recover from V2 log plus provider checkpoint.
-- Move retained suffix selection and replay into V2.
-- Replace `SqlitePersistence` copy-progress metadata with V2-managed copy.
-- Add a durable storage-generation selector that chooses either the complete
-  old stack or the complete V2 stack, never individual mechanisms from both.
-- Keep this path non-serving or shadow-only until crash-boundary equivalence is
-  proven.
-
-### Phase 4: Atomically activate V2
-
-- Fence SQL and replica access.
-- Finish or reject any old-stack in-flight operation.
-- Convert a validated old checkpoint and boundary, or require fresh storage.
-- Durably select the V2 storage generation only after V2 logging, recovery,
-  copy, checkpoint and false-progress correction are all ready.
-- Reopen through normal V2 recovery before accepting the first V2-backed
-  write.
-- Stop creating application-frame-log operations only after the generation
-  switch commits.
-- Never fall back to old recovery or copy after a V2-backed write is accepted.
-
-### Phase 5: Remove obsolete storage
-
-- Remove `state-v2.json` and `history-<generation>.log` as transactional
-  authorities.
-- Retain only provider checkpoint/materialized files required by the new
-  design.
-- Provide an explicit one-time migration or require fresh storage; never infer
-  V2 progress from partially converted files.
-
-## Safety Invariants
-
-1. SQL success is impossible before V2 quorum commitment and successful local
-   SQLite publication.
-2. A committed V2 transaction is recovered even if the primary crashes before
-   replying to the client.
-3. An incomplete or aborted V2 transaction cannot become visible in SQLite.
-4. Normal apply and recovery replay produce equivalent SQLite state.
-5. The provider checkpoint LSN never exceeds V2's stable committed boundary.
-6. V2 never truncates the only log suffix required by a checkpoint, copy or
-   backup.
-7. A copied or restored database is not served before its required log suffix
-   has been replayed.
-8. Provider corruption or missing acknowledged log data fails closed.
-9. Agent authority remains necessary for role and access; possession of a
-   recoverable V2 log cannot self-promote a replica.
-10. The old application frame log and the V2 log are never simultaneous,
-    conflicting authorities for new writes.
-11. A locally accepted V2 record is not provider-visible until it belongs to
-    the selected stable committed prefix.
-12. V2-backed writes cannot activate before V2 recovery, copy, checkpoint and
-    storage-generation selection activate together.
-
-## Testing Strategy
-
-### Transaction boundaries
-
-- crash before V2 log append;
-- crash after append but before quorum commitment;
-- crash after quorum commitment but before provider apply;
-- crash after quorum commitment but before local stable-prefix persistence and
-  recover the record through fresh history recertification;
-- retain but do not apply a locally accepted record that cannot be
-  recertified;
-- crash after provider apply but before local WAL publication;
-- crash after publication but before client response;
-- verify exact database contents and conservative client outcomes.
-
-### Recovery
-
-- recover from a checkpoint with no suffix;
-- replay one and many committed transactions;
-- ignore incomplete and aborted transactions;
-- reconcile an accepted tail above the local stable boundary;
-- correct divergent false progress before opening the provider;
-- reject a corrupted checkpoint or acknowledged log record;
-- verify repeated recovery is idempotent.
-
-### Checkpoints
-
-- crash at prepare, perform and complete boundaries;
-- checkpoint while writes continue;
-- retain the suffix required by an older active copy or backup;
-- verify promotion and obsolete-file cleanup are atomic.
-
-### Copy and reconfiguration
-
-- log-only and full copy;
-- source and target restart during every copy stage;
-- divergent target history and false-progress correction;
-- failover immediately before and after checkpoint completion;
-- planned switchover with an ambiguous old-primary response.
-
-### Backup and restore
-
-- full backup followed by restore;
-- incremental backup chains;
-- interrupted or corrupt backup;
-- restore authorization and identity mismatch;
-- recovery from checkpoint plus backup log suffix.
-
-### Compatibility
-
-- ensure the existing V1 SQLite application remains usable while V2 is
-  experimental;
-- prove no serving phase routes writes to V2 while recovery or copy still uses
-  the old frame log;
-- reject mixed storage generations without an explicit migration marker;
-- verify old application-frame-log files are never mistaken for V2 log state.
-
-## Operational Consequences
-
-- The V2 log adds deliberate replicated-log storage and checkpoint management
-  to each SQLite replica.
-- The SQLite provider becomes smaller conceptually, but V2 itself is a
-  substantial new storage engine requiring independent corruption, retention
-  and recovery testing.
-- Checkpoint and backup policies affect disk usage and replica-build cost.
-- Client write outcomes remain ambiguous across process loss after dispatch;
-  applications still need idempotency or result verification.
-- A singleton still has no redundancy even though its local V2 log is durable.
-
-## Limitations and Future Work
-
-The initial SQLite integration should support one provider, one database and
-atomic redo-only transactions. Multi-provider transactions, online restore,
-provider hierarchy, dynamic provider creation, group commit and incremental
-provider checkpoints can follow after the single-provider recovery model is
-proven.
-
-The current SQLite implementation is valuable evidence for the V2 design, but
-it is not itself a reusable transactional replicator. Generic behavior should
-move into V2 only when its contracts also work for a second state-provider
-implementation; SQLite-specific WAL and image rules must remain in the
-provider.
-
-## References
+The first SQLite consumer can remain one database, one provider and atomic
+redo-only, with no secondary SQL endpoint. Cross-provider SQL atomicity,
+online SQL restore, attached databases and extension/VFS compatibility require
+separate application contracts. They do not justify weakening the shared
+engine's SF fidelity.
 
 - [Current SQLite design](design.md)
-- [SF V2 Transactional Replicator](../../background/service-fabric/v2-transactional-replicator.md)
-- [SF state management and persistence](../../background/service-fabric/state-management.md)
-- [Kuberic stateless default replicator](../kuberic/stateless-default-replicator.md)
+- [Kuberic faithful V2 port design](../kuberic/v2-transactional-replicator-design.md)
+- [SF V2 source study](../../background/service-fabric/v2-transactional-replicator.md)
+- [Replicator boundary](../kuberic/replicator-boundary.md)
 - [`SqliteService`](../../../examples/sqlite/src/service.rs)
 - [`SqlitePersistence`](../../../examples/sqlite/src/state.rs)
 - [`DurableFrameLog`](../../../examples/sqlite/src/framelog/durable.rs)
-- [SQLite commit-barrier VFS](../../../examples/sqlite/src/commit_barrier/mod.rs)
+- [Commit-barrier VFS](../../../examples/sqlite/src/commit_barrier/mod.rs)

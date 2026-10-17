@@ -154,6 +154,10 @@ continuation records are not a V2 implementation and must not be restored
 under a new name.
 
 V2 remains optional and separately scoped after the Public V1 replacement.
+See the [source-backed SF V2 study](../../background/service-fabric/v2-transactional-replicator.md)
+and [Kuberic V2 design](v2-transactional-replicator-design.md) for the proposed
+faithful Rust port, preserving SF component boundaries and semantics while
+replacing its platform machinery with Rust/Kuberic equivalents.
 
 ## Operational Boundary
 

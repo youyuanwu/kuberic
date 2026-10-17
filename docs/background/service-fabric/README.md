@@ -5,7 +5,8 @@ failover for stateful services — covering the system architecture, the
 replicator protocol, reconfiguration phases, and the Rust API surface from
 [service-fabric-rs](https://github.com/Azure/service-fabric-rs).
 
-Source code reference: `build/service-fabric/` (depth-1 clone).
+The V2 source study identifies its local checkout and pinned revision in the
+document; older studies used `build/service-fabric/` (depth-1 clone).
 
 ---
 
@@ -17,7 +18,7 @@ Source code reference: `build/service-fabric/` (depth-1 clone).
 | [Replication Protocol](replication-protocol.md) | Replicator protocol (copy/replication streams, LSN tracking), quorum mechanics, building new replicas, scale-down |
 | [Failover and Recovery](failover.md) | Failover reconfiguration, switchover (swap primary), epoch-based fencing, failure detection, quorum loss and data loss |
 | [State Management and Persistence](state-management.md) | Reliable Collections, V1 vs V2 replicator architecture, IStateProvider vs IStateProvider2, shared/dedicated log (Windows vs Linux), ReadStatus/WriteStatus |
-| [V2 Transactional Replicator](v2-transactional-replicator.md) | V2 layering over V1, transaction and commit path, durable log, checkpoints, recovery, copy modes, and ITransactionalReplicator/IStateProvider2 APIs |
+| [V2 Transactional Replicator](v2-transactional-replicator.md) | Source-backed V2 API/provider contracts, commit/apply/ACK/stability ordering, durable recovery, checkpoints, copy, version retention, and backup/restore |
 | [API Surface and References](references.md) | Rust API bindings (service-fabric-rs), comparison with CloudNativePG, key source code references |
 
 ## Related Kuberic Documents
@@ -25,6 +26,7 @@ Source code reference: `build/service-fabric/` (depth-1 clone).
 - [Stateful API Semantics and Kuberic Conformance](../../features/kuberic/service-fabric-api-semantics.md)
 - [Service Fabric Alignment and Runtime Simplification](../../features/kuberic/service-fabric-alignment.md)
 - [Stateless Default Replicator](../../features/kuberic/stateless-default-replicator.md)
+- [Kuberic V2 Transactional Replicator Design](../../features/kuberic/v2-transactional-replicator-design.md)
 - [SQLite on a V2 Transactional Replicator](../../features/sqlite/v2-transactional-replicator.md)
 - [Replicator Boundary and Native Proof](../../features/kuberic/replicator-boundary.md)
 - [Archived Kuberic Replication Protocols](../../archive/v1/protocols.md)
