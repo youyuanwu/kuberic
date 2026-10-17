@@ -318,6 +318,21 @@ impl PodRuntime {
     pub(crate) fn public_lifecycle_callbacks(
         &self,
     ) -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks> {
+        let drain_host = Arc::downgrade(&self.host);
+        let terminal_drain: crate::host::public_lifecycle::TerminalDrain = Arc::new(move || {
+            let host = drain_host.upgrade();
+            Box::pin(async move {
+                let host = host.ok_or(RuntimeError::Closed)?;
+                if let Some(runtime) = host
+                    .registered
+                    .get()
+                    .and_then(|registered| registered.stateless_runtime_control.clone())
+                {
+                    runtime.shutdown_and_drain().await?;
+                }
+                Ok(())
+            })
+        });
         if let Some(registered) = self.host.registered.get() {
             return Ok(crate::host::public_lifecycle::PublicLifecycleCallbacks {
                 application: self.host.application.clone(),
@@ -329,6 +344,8 @@ impl PodRuntime {
                 open_context: None,
                 containment: registered.callback_containment.clone(),
                 wait_for_containment: registered.callback_containment.is_some(),
+                terminal_drain,
+                terminal_cleanup: None,
                 aborted: Arc::new(std::sync::Mutex::new(false)),
                 #[cfg(all(test, feature = "testing"))]
                 cut: None,
@@ -384,6 +401,8 @@ impl PodRuntime {
             open_context: None,
             containment: None,
             wait_for_containment: false,
+            terminal_drain,
+            terminal_cleanup: None,
             aborted: Arc::new(std::sync::Mutex::new(false)),
             #[cfg(all(test, feature = "testing"))]
             cut: None,
