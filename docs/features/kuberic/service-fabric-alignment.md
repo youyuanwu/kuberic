@@ -9,6 +9,16 @@ engine plus a dormant replacement.
 This document records the resulting architecture, explicit extensions, and
 open SF-alignment requirements. It is not a cutover or migration runbook.
 
+**Target and roadmap update (2026-10-17):** the target is complete observable
+classic SF V1 service semantics, not just SF-shaped interfaces or stricter
+Kuberic substitutes. The [faithful SF V1 port design and plan](sf-v1-semantic-alignment-plan.md)
+now governs future implementation order: port native state machines, queues,
+primary/secondary managers, sessions/ACK/retry and copy algorithms into Rust
+async with tonic transport. Prepare service/host/report/controller adapters, then
+replace the current engine in one coherent cutover, with no permanent second
+engine or fallback. This is planning, not an implemented compatibility claim;
+the current differences below remain.
+
 ## Aligned Ownership
 
 | Concern | Kuberic owner | Service Fabric analogue |
@@ -39,6 +49,12 @@ provider-owned, and topology/lifecycle durability remains agent-owned.
 
 The public `Replicator`, `PrimaryReplicator`, `StateReplicator`,
 `StateProvider`, and `DurableState` method sets remain stable.
+
+That describes the completed replacement's API inventory. For future semantic
+alignment, only `Replicator`, `PrimaryReplicator`, and `StateProvider` are
+protected; `StateReplicator`, stream/types/settings and persistence helpers may
+need reviewed breaking changes. Native behavior also requires reassessing
+current durability/access comments without changing those protected signatures.
 
 ## Stateful API and Trait Compatibility
 

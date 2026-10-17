@@ -13,7 +13,7 @@ procedure.
 
 ## Ownership Model
 
-The replacement follows the Service Fabric V1 ownership boundary:
+The replacement uses a Service Fabric V1-shaped ownership boundary:
 
 | State or behavior | Owner |
 |---|---|
@@ -35,6 +35,13 @@ and optional `StateReplicator`.
 
 The protected method sets of `Replicator`, `PrimaryReplicator`,
 `StateReplicator`, `StateProvider`, and `DurableState` are unchanged.
+
+Those method inventories describe the completed replacement, not proof of
+native semantic parity. The [faithful Rust async/tonic port roadmap](sf-v1-semantic-alignment-plan.md)
+replaces this algorithm using native V1 state machines, with corresponding
+service/persistence ownership and unprotected public surface changes;
+only `Replicator`, `PrimaryReplicator`, and `StateProvider` must retain their
+signatures. The runtime behavior described on this page is unchanged by planning.
 
 There is no engine selector or legacy fallback:
 

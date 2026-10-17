@@ -3,6 +3,16 @@
 Kuberic validation is split into exact nextest tiers, workspace checks,
 provider-backed smoke tests, and explicitly owned Kubernetes scenarios.
 
+The [faithful SF V1 Rust async/tonic port plan](sf-v1-semantic-alignment-plan.md)
+adds native-source/test-vector mapping and a future behavior/capability matrix:
+persisted/volatile services, service-owned primary commit, receiver lifetimes,
+progress/quorum/status, terminal outcomes and real tonic retry/reconnect/
+backpressure scenarios. Existing KSF inventory and current-contract regressions do
+not establish complete native parity. Planned cases do not exist in the test
+inventory yet; add selectors/counts only with actual implementations. Preserve
+safety outcomes while revising assertions that encode intentionally different
+current contracts.
+
 ## Workspace Checks
 
 ```bash
