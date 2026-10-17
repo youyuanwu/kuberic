@@ -73,8 +73,100 @@ admission needs service-owned isolation. Polling partition status does not
 universally contain application views. Kuberic's readable ActiveSecondary
 policy also differs from the inspected classic SF partition path below.
 SF-01's [exact regressions and closure](service-fabric-contract-audit.md#sf-01-applied-kv-state-is-visible-before-the-read-fence)
-do not resolve SF-D02: the primary progress query still returns the applied
-tail, not the quorum-committed result promised by its trait.
+establish admission separately from the
+[SF-D02 progress-query closure](service-fabric-contract-audit.md#sf-d02-primary-progress-promise-exceeds-the-built-in-query-result).
+
+## Role-Specific Progress and Recovery
+
+The built-in scalar `Replicator::current_progress` uses the **internal
+replicator role**, not the host's serving-role projection or access status
+([query:2765-2775](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2765-L2775);
+[contract:45-58](../../../kuberic-runtime/src/replicator/traits.rs#L45-L58)):
+
+| Internal state | Successful scalar result | Meaning |
+|---|---|---|
+| Primary, including access-closed writes, promotion and data-loss recovery | Acknowledged locally durable committed boundary | Not a locally applied tail awaiting quorum; not an access grant |
+| Active/idle secondary | Highest contiguous durably accepted boundary | May exceed commitment; does not certify readable data |
+| Opened role None | Validated durable retained applied tail, including a suffix | Election-only recovery observation with read/write access closed |
+| Closed | `Closed` error | No progress observation |
+
+Primary local apply/publication precedes peer quorum; the acknowledged committed
+cache advances only after applicable PC/CC quorum, local durable commit, progress
+validation and exact-authority revalidation
+([write:3103-3195](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L3103-L3195)).
+Cancellation or commit error can leave a retained applied suffix without advancing
+the scalar. Conversely a failed caller can have a real durable committed effect:
+drained epoch/configuration reconciliation validates and adopts provider commitment
+([reconcile:1012-1030](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1012-L1030)).
+The query is conservative acknowledged engine progress, not a fresh read of
+arbitrarily changed provider counters.
+
+**Host reports are a separate two-boundary observation**, not two scalar calls.
+Built-in reporting retains `first=committed,last=applied/accepted`; internal
+Primary reporting reads provider commitment while secondary reporting uses
+service-acknowledged counters
+([report pair:130-155](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L130-L155);
+[public report:669-712](../../../kuberic-runtime/src/host/hosting.rs#L669-L712)).
+An access-fenced internal Primary may therefore report Recovery with a retained
+tail larger than its scalar. Election/configuration use these reports, preserving
+the tail; they do not infer serving permission from it.
+
+Open validates the retained suffix. Role change does not commit or truncate it;
+catch-up settlement uses the separate cached pair and exact retained operations
+([open:2532-2564](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2532-L2564);
+[role:2624-2675](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2624-L2675);
+[settlement:1562-1675](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1562-L1675)).
+Thus retained `(applied=11,committed=10)` reports scalar 11 in opened None or
+secondary, 10 after internal promotion, and 11 only after successful settlement.
+The typed data-loss recipe samples progress after becoming internally Primary
+but before catch-up/admission. Its persisted Recovery scalar snapshot `(10,10)`
+is not proof of retained-tail equality; the independent report remains `(10,11)`
+until settlement
+([recipe:134-166](../../../kuberic-runtime/src/host/public_lifecycle.rs#L134-L166);
+[observation:1829-1839](../../../kuberic-runtime/src/host/sqlite_store.rs#L1829-L1839);
+[nonempty regression:4990-5054](../../../kuberic-runtime/tests/public_v1_recovery.rs#L4990-L5054)).
+Committed-watermark propagation and coherent read/write admission remain
+independent requirements. SF-D01's catch-up-capability mismatch is unchanged.
+
+### Native SF Progress Is Role-Specific, Not a Universal Durability Promise
+
+The read-only local SF checkout was reverified clean at
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` for SF-D02.
+Paths below are under `src/prod/src/` at that pin:
+
+- Native V1 dispatches primary, secondary and initially opened queries separately
+  ([Replication/Replicator.cpp:296-358](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.cpp#L296-L358)).
+  Primary delegates through
+  [PrimaryReplicator.cpp:319-326](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.cpp#L319-L326)
+  and [ReplicaManager.cpp:1025-1034](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicaManager.cpp#L1025-L1034)
+  to queue commitment, normally derived from apply ACK quorums
+  ([ReplicaManager.cpp:2467-2528](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicaManager.cpp#L2467-L2528)).
+- Persisted SF secondary progress is contiguous **received** progress and can
+  precede service ACK; it is not Kuberic's stronger durably accepted boundary
+  ([SecondaryReplicationReceiver.cpp:177-192](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/SecondaryReplicationReceiver.cpp#L177-L192)).
+- Initial primary progress inherits provider recovery progress. Promotion drains
+  the secondary and transfers its queue; the new queue treats its retained prefix
+  as committed before subsequent reconfiguration catch-up
+  ([ChangeRole:130-194,369-485](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.ChangeRoleAsyncOperation.cpp#L130-L485);
+  [ReplicationQueueManager.cpp:29-91](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicationQueueManager.cpp#L29-L91)).
+  Data-loss reset re-reads provider progress
+  ([OnDataloss:82-126](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.OnDatalossAsyncOperation.cpp#L82-L126)).
+  None of those inherited values proves a fresh peer quorum or serving access.
+- The native transactional COM wrapper delegates `GetCurrentProgress` to V1
+  ([ComTransactionalReplicator.cpp:508-512](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/data/txnreplicator/ComTransactionalReplicator.cpp#L508-L512)).
+  The separately named logging `GetLastCommittedSequenceNumber` returns current
+  log tail, while the stable query returns a different boundary
+  ([LoggingReplicatorImpl.cpp:435-445](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/data/txnreplicator/loggingreplicator/LoggingReplicatorImpl.cpp#L435-L445)).
+  Names are not interchangeable transaction durability predicates.
+- Native access is separately calculated during promotion/catch-up
+  ([ReadWriteStatusCalculator.cpp:58-139](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L58-L139)).
+
+The pinned Rust description
+([stateful_traits.rs:105-108](https://github.com/Azure/service-fabric-rs/blob/7c1ea4e5f9ab5fbe4cfa0b3e9bfaf37169d2b43f/crates/libs/core/src/runtime/stateful_traits.rs#L105-L108))
+describes a secondary end-of-log query for selection and catch-up. It does not
+establish Kuberic's additional locally durable primary quorum guarantee.
+The Kuberic role table above is a deliberate local contract, not a claim of
+identical native behavior or full SF compliance.
 
 ## Configuration and Quorum
 

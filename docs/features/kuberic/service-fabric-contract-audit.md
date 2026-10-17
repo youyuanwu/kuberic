@@ -43,8 +43,8 @@ Initial inventory: **17 implementation findings: 10 P1 and 7 P2**, plus
 This initial inventory describes the historical audit, not current status.
 
 Current inventory: **21 implementation findings: 6 fixed / 15 open**
-(6 open P1 and 9 open P2), plus **two open documentation/behavior
-mismatches** (SF-D01 and SF-D02).
+(6 open P1 and 9 open P2), plus **one open documentation/behavior
+mismatch** (SF-D01). SF-D02 is fixed independently of implementation counts.
 SF-04/SF-05 were fixed by PR #151; SF-14 is fixed by the implementation
 published in PR #154 and recorded below. Original failure traces remain
 historical evidence. SF-18 through SF-21 track the remaining stream, context,
@@ -116,7 +116,7 @@ fixing capability admission does not fix swap staging.
 | [SF-20](#sf-20-primary-replication-lacks-the-sf-early-lsn-and-local-commit-pipeline) | P2 | Open | Primary replication lacks the SF early-LSN and local-commit pipeline |
 | [SF-21](#sf-21-acknowledgement-requires-kuberic-progress-and-always-explicit-ack) | P2 | Open | Acknowledgement requires Kuberic progress and always-explicit ACK |
 | [SF-D01](#sf-d01-catch-up-capability-is-a-tail-not-a-retained-floor) | Documentation | Open | Catch-up capability is a tail, not a retained floor |
-| [SF-D02](#sf-d02-primary-progress-promise-exceeds-the-built-in-query-result) | Documentation | Open | Primary progress promise exceeds the built-in query result |
+| [SF-D02](#sf-d02-primary-progress-promise-exceeds-the-built-in-query-result) | Documentation | Fixed | Primary progress promise exceeds the built-in query result |
 
 ## P1 Findings
 
@@ -415,7 +415,7 @@ and catch-up read/write status timing differs. Kuberic preserves failed outer
 Close and conservatively denies both access modes. This closure does not prove
 wait-free native Abort, arbitrary custom/application-consumer joining (SF-15),
 client access enforcement (SF-02/SF-03), or primary progress correctness
-(SF-D02); those findings remain open.
+(SF-D02); those require separate evidence. SF-D02's later closure is below.
 
 ### SF-07: Idle PostgreSQL removal globally drains the partition
 
@@ -890,8 +890,12 @@ by itself, evidence of unsafe quorum acknowledgement or data corruption.
 
 ### SF-D02: Primary progress promise exceeds the built-in query result
 
-**Mismatch:** Kuberic's `Replicator::current_progress` contract promises locally
-durable quorum-committed progress on a primary, but the built-in query returns
+**Status: Fixed.** Behavioral reconciliation at `697f281`, with failed-settlement
+query coverage completed at `ae499ff`, closes this documentation/behavior
+mismatch only. The 21 implementation findings remain 6 fixed / 15 open.
+
+**Original mismatch:** Kuberic's `Replicator::current_progress` contract promises locally
+durable quorum-committed progress on a primary, but the built-in query returned
 `state.applied_lsn` without a role distinction. Primary replication publishes
 that applied tail before collecting quorum acknowledgements or committing it.
 The result can therefore exceed the primary's quorum-committed boundary.
@@ -905,20 +909,54 @@ The upstream
 describes a secondary's end-of-log for selection and catch-up. It does not
 establish Kuberic's additional primary quorum-committed guarantee.
 
-**Qualification:** This is a source-confirmed local contract/behavior mismatch,
+**Qualification:** The original entry was a source-confirmed local contract/behavior mismatch,
 not a dynamically reproduced unsafe election, read, or data-loss finding.
 Durably accepted secondary progress and applied progress used only during
 access-closed recovery must not be mislabeled as unsafe primary commitment.
 SF-01 separately tracks visible application state before the read fence.
-Rustdoc now exposes the mismatch without changing the primary guarantee.
 
-**Closure:** Reconcile the primary query with its documented commitment
-contract, and define role-specific and access-closed recovery semantics.
-Hold peer ACKs after local durable apply and inspect the query on primary and
-secondary paths, then complete quorum and repeat across cancellation, epoch,
-and recovery boundaries. Preserve separate committed-watermark and access
-checks. Merely describing the current applied-tail return does not close this
-entry or authorize using it as readable committed state.
+**Implemented closure:** Internal Primary now selects the acknowledged committed
+cache, including access-closed writes and recovery. Opened role None returns the
+validated retained applied tail for election only; secondary retains contiguous
+durably acknowledged acceptance. A closed access gate never changes a Primary
+query into an applied-tail query
+([query:2765-2775](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2765-L2775);
+[contract:45-58](../../../kuberic-runtime/src/replicator/traits.rs#L45-L58)).
+The independent host report still carries accepted/applied and committed
+boundaries; suffix recovery and committed-watermark propagation remain separate
+from access admission. Typed recovery's historical equal-field scalar snapshot
+is not proof that its retained tail was committed. See the
+[exact role table, consumer distinctions and pinned local SF source](service-fabric-api-semantics.md#role-specific-progress-and-recovery).
+
+**Executed evidence:** The actual public scalar and journalled Progress outcome
+remain 0 after local apply while the real peer service ACK is held, and remain 0
+after quorum while local commit is held. Successful local commitment advances
+the scalar to 1. Joined cancellation and completed epoch barriers retain scalar
+0 with report `(0,1)` and access denied. Secondary scalar stays 0 before service
+ACK and becomes 1 after ACK `(1,0)`, without asserting committed/readable data;
+gaps are rejected
+([ACK/cancel/epoch:17-134](../../../kuberic-runtime/tests/support/read_fencing.rs#L17-L134);
+[secondary:138-165](../../../kuberic-runtime/tests/support/read_fencing.rs#L138-L165)).
+Temporarily restoring only the old query made the held-ACK assertion fail
+with actual 1 versus expected 0; the fix was restored before passing checks.
+
+The SF-11 matrix verifies opened None scalar 11, internal Primary scalar 10,
+independent report `(10,11)`, actual secondary-to-primary promotion, exact
+committed-prefix-before-suffix replay and final scalar 11. Divergent/missing
+history and unavailable peers keep scalar 10
+([matrix:168-341](../../../kuberic-runtime/tests/support/read_fencing.rs#L168-L341)).
+The typed Preserve data-loss recipe uses a real retained `(11,10)` suffix,
+observes committed scalar `(10,10)` as Recovery while independent report
+remains `(10,11)` with access denied, then settles/adopts history without
+losing payload
+([recovery:4771-4782,4990-5054](../../../kuberic-runtime/tests/public_v1_recovery.rs#L4771-L5054)).
+Commit failure, Closed errors, and drained epoch reconciliation after a real
+committed effect are separately asserted
+([close/epoch:3449-3536](../../../kuberic-runtime/tests/public_v1_recovery.rs#L3449-L3536);
+[commit error:4353-4409](../../../kuberic-runtime/tests/public_v1_recovery.rs#L4353-L4409)).
+Memory-backed cases establish sequencing, not fsync; provider-backed SF-01
+regressions remain unchanged. No unsafe election or data-loss reproduction
+is claimed.
 
 ### Known-Replica Configuration Sentinel Clarification
 
@@ -1098,3 +1136,52 @@ The smoke recipe's non-testing binary build emitted existing feature-gated
 unused-code warnings; the all-features warnings-denied clippy selection passed.
 No full PostgreSQL suite or live KinD run was performed. These checks do not
 close unrelated provider/application findings or SF-D02.
+
+### SF-D02 Query Reconciliation
+
+2026-10-17, implementation `697f281` and required-review coverage fix `ae499ff`,
+based on merged SF-01 baseline `f569499`. The local SF reference was verified
+clean at `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` before/after research.
+The [role/native-source section](service-fabric-api-semantics.md#role-specific-progress-and-recovery)
+distinguishes normal quorum-derived native primary queue commitment, received
+persisted-secondary progress, inherited recovery/promotion prefixes, transactional
+wrapper delegation and separately calculated access. Kuberic's stronger local
+durability promise is not inferred from the pinned Rust secondary-log comment.
+
+Focused semantic/SF-01/SF-11/error/epoch/recovery/API union passed **23/23**,
+run `f8406317-9ffe-4295-8586-11c51094e456`. The old-query negative control
+failed at the held-ACK public scalar, actual 1 versus expected 0, run
+`021cf94d-3e78-46a9-9306-113b94a9637e`; restored code passed.
+The documented [focused selector](testing.md#role-specific-scalar-progress)
+reproduces the progress-specific coverage.
+
+```sh
+cargo nextest run --workspace --all-features --profile ordinary --test-threads 2
+just nextest-validate
+just nextest-postgres-smoke
+just nextest-archive
+just nextest-validate-archive
+```
+
+Complete ordinary tier: **364/364 passed**, run
+`a85cacbc-b316-4848-bb0b-d5890307d974` (419.681 seconds).
+Both inventory validators measured **410 = 364 ordinary + 41 PostgreSQL +
+3 KinD + 2 build-only**, ordinary slices `91,91,91,91`, PostgreSQL hashes
+`11,13,8,9`, exact-once accounting passed.
+Archive build includes passing rustdoc/source-public/private-capability guards
+and build-only conformance. A fresh-source archive consumer with no package
+target directories passed **18/18** semantic/SF-01/SF-11/epoch/recovery cases,
+run `ed8b63e6-2757-4308-9778-ce5d4b60a990` (53.052 seconds).
+
+Routine PostgreSQL smoke passed **8/8**, run
+`0544fa79-3bc3-4105-bf3c-567739902b6e` (113.542 seconds), using
+`KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR=/data/code/kuberic/.pg`.
+An initial archive/API attempt exhausted disk; the concurrent initial smoke
+was 7 passed/1 failed with explicit WAL ENOSPC and catch-up timeout.
+After removing inactive regeneratable incremental build cache, complete
+archive/API and eight-test smoke retries passed without source changes.
+The smoke binary build emitted existing feature-gated unused-code warnings;
+all-target/all-feature runtime clippy with warnings denied, formatting,
+runtime doctests and diff checks passed.
+No full PostgreSQL or live KinD suite was run. SF-D01 and the 15 open
+implementation findings remain open; SF-01/SF-11 regression coverage remains green.

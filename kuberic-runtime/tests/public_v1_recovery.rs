@@ -3446,6 +3446,15 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
             }
         });
         close_pair.primary.state.commit_entered.notified().await;
+        let closed_control = close_pair
+            .primary
+            .application
+            .control
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        assert_eq!(closed_control.current_progress().await.unwrap(), 0);
         let close = tokio::spawn({
             let handle = close_pair.primary.handle();
             let preview = close_pair.identity.clone();
@@ -3465,6 +3474,10 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
         close_pair.primary.state.release_commit.notify_waiters();
         assert!(write.await.unwrap().is_err());
         close.await.unwrap().unwrap();
+        assert!(matches!(
+            closed_control.current_progress().await,
+            Err(RuntimeError::Closed)
+        ));
         assert!(
             close_pair
                 .primary
@@ -3486,6 +3499,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
             }
         });
         epoch_pair.primary.state.commit_entered.notified().await;
+        assert_eq!(read_fencing::scalar_progress(&epoch_pair.primary).await, 0);
         let next_epoch = Epoch::new(0, 2);
         let epoch_update = tokio::spawn({
             let handle = epoch_pair.primary.handle();
@@ -3506,6 +3520,7 @@ async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
         epoch_pair.primary.state.release_commit.notify_waiters();
         assert!(write.await.unwrap().is_err());
         epoch_update.await.unwrap().unwrap();
+        assert_eq!(read_fencing::scalar_progress(&epoch_pair.primary).await, 1);
         assert_eq!(
             epoch_pair
                 .primary
@@ -4335,6 +4350,18 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
                 committed_lsn: 0,
             }
         );
+        assert_eq!(
+            application
+                .control
+                .read()
+                .await
+                .clone()
+                .unwrap()
+                .current_progress()
+                .await
+                .unwrap(),
+            0
+        );
         let fenced = handle.public_v1_report().await.unwrap();
         assert_eq!(
             fenced.read_status,
@@ -4364,6 +4391,19 @@ async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
             .await
             .unwrap();
         let still_fenced = handle.public_v1_report().await.unwrap();
+        assert_eq!(
+            application
+                .control
+                .read()
+                .await
+                .clone()
+                .unwrap()
+                .current_progress()
+                .await
+                .unwrap(),
+            0,
+            "raw provider commitment does not bypass acknowledged engine progress"
+        );
         assert_eq!(still_fenced.progress.first, 1);
         assert_eq!(still_fenced.progress.last, 1);
         assert_eq!(
@@ -4728,6 +4768,16 @@ async fn hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome()
             replica
                 .initialize_history(&initialization, &predecessor)
                 .await;
+            if matches!(outcome, Outcome::Unchanged) {
+                for lsn in 1..=11 {
+                    replica.state.apply(Operation {
+                        lsn,
+                        committed_lsn: lsn - 1,
+                        data: Bytes::from(format!("sf-d02-recovery-{lsn}")),
+                    }).await.unwrap();
+                }
+                replica.state.commit(10).await.unwrap();
+            }
             replica
                 .handle()
                 .execute_public_v1(intent(
@@ -4937,9 +4987,13 @@ async fn hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome()
                     replica.state.rebuild_on_data_loss(replica.identity.clone());
                 }
             }
-            let dispatched = execute_public_v1_history(
+            if matches!(outcome, Outcome::Unchanged) {
+                replica.state.block_commit();
+            }
+            let scope = test_scope(&resource_uid);
+            let dispatch = execute_public_v1_history(
                 &adapter,
-                &test_scope(&resource_uid),
+                &scope,
                 plan_public_v1_data_loss_recovery(
                     &invalidated,
                     &before,
@@ -4949,8 +5003,24 @@ async fn hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome()
                     false,
                 )
                 .unwrap(),
-            )
-            .await;
+            );
+            tokio::pin!(dispatch);
+            if matches!(outcome, Outcome::Unchanged) {
+                tokio::select! {
+                    _ = replica.state.commit_entered.notified() => {}
+                    result = &mut dispatch => panic!("recovery did not reach held suffix commitment: {result:?}"),
+                }
+                assert_eq!(read_fencing::scalar_progress(&replica).await, 10);
+                let pending = replica.handle().public_v1_report().await.unwrap();
+                assert_eq!((pending.progress.first, pending.progress.last), (10, 11));
+                assert_ne!(pending.read_status, AccessStatus::Granted);
+                assert_ne!(pending.write_status, AccessStatus::Granted);
+                let observation = pending.data_loss_recovery.unwrap().observed_progress.unwrap();
+                assert_eq!((observation.first, observation.last), (10, 10));
+                assert_eq!(observation.role, kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery);
+                replica.state.release_commit.notify_one();
+            }
+            let dispatched = dispatch.await;
             assert_eq!(adapter.dispatched().len(), 1);
             assert_eq!(
                 replica.state.data_loss_calls.load(Ordering::SeqCst),
@@ -4975,6 +5045,12 @@ async fn hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome()
                         kuberic_runtime::protocol::public_operations::
                             PublicDataLossRecoveryStage::Admitted
                     );
+                    if matches!(outcome, Outcome::Unchanged) {
+                        assert_eq!(read_fencing::scalar_progress(&replica).await, 11);
+                        assert_eq!((report.progress.first, report.progress.last), (11, 11));
+                        assert_eq!(replica.state.operations.lock().unwrap().last().unwrap().data,
+                            Bytes::from_static(b"sf-d02-recovery-11"));
+                    }
                 }
                 Outcome::Error => {
                     assert!(dispatched.is_err());

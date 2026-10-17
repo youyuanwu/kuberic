@@ -2767,7 +2767,11 @@ impl Replicator for StatelessReplicator {
         if state.closed {
             return Err(RuntimeError::Closed);
         }
-        Ok(state.applied_lsn)
+        Ok(if state.role == ReplicaRole::Primary {
+            state.committed_lsn
+        } else {
+            state.applied_lsn
+        })
     }
 
     async fn catch_up_capability(&self) -> Result<i64> {

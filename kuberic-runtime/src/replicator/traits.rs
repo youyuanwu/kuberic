@@ -45,14 +45,16 @@ pub trait Replicator: Send + Sync {
     /// Returns the current LSN used for primary selection and supplied to the
     /// primary's catch-up configuration.
     ///
-    /// Primary: locally durable quorum-committed progress. Secondary: highest
-    /// contiguous durably accepted progress. Recovery: election-only progress
-    /// while read/write access remains closed.
+    /// Primary: locally durable quorum-committed progress, even while serving
+    /// access is closed. Secondary: highest contiguous durably accepted progress,
+    /// which may exceed commitment and is not a readable-data assertion.
     ///
-    /// Known mismatch (SF-D02): the built-in implementation returns its applied
-    /// tail in every role, which can precede quorum commitment on a primary.
-    /// That result is not a committed watermark or an access grant. The primary
-    /// contract above remains unresolved, not relaxed by this description.
+    /// In the built-in engine, opened role-None recovery returns the validated
+    /// durable retained applied tail for election only, with read/write access
+    /// closed. Once internally Primary, recovery returns committed progress,
+    /// not that tail. Internal role, not access status, selects these semantics.
+    /// Independent host reports retain both applied/accepted and committed
+    /// boundaries for election and suffix recovery. No scalar is an access grant.
     async fn current_progress(&self) -> Result<Lsn>;
 
     /// Earliest retained public progress that can catch up an admitted peer.
