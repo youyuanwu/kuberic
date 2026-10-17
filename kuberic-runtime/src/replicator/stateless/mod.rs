@@ -1759,12 +1759,6 @@ impl StatelessReplicator {
         if expected <= through_lsn {
             return Err(self.local_rebuild_required());
         }
-        if !self
-            .exact_authority_is_current(authority, generation, ReplicaRole::Primary)
-            .await
-        {
-            return Err(RuntimeError::OperationCancelled);
-        }
         Ok(through_lsn)
     }
 
@@ -3036,12 +3030,13 @@ impl PrimaryReplicator for StatelessReplicator {
 
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
         let generation = self.generation();
-        let authority = {
+        let (authority, role_epoch) = {
             let state = self.state.lock().await;
-            state
+            let authority = state
                 .authority
                 .clone()
-                .ok_or(RuntimeError::AuthorityNotAdmitted)?
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            (authority, state.role_epoch)
         };
         let peer_progress = self.settle_applied_suffix(&authority, mode).await?;
         let state = self.state.lock().await;
@@ -3050,7 +3045,7 @@ impl PrimaryReplicator for StatelessReplicator {
             || state.closed
             || !state.opened
             || state.role != ReplicaRole::Primary
-            || state.role_epoch != Some(authority.epoch)
+            || state.role_epoch != role_epoch
             || state.updated_epoch != Some(authority.epoch)
             || state.authority.as_ref() != Some(&authority)
         {
