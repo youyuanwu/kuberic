@@ -193,6 +193,56 @@ Missing source history requires replacement of the source incarnation.
 Conflicting target state is target evidence. A retired incarnation is never
 readmitted by higher numeric progress.
 
+### Completed Snapshot Prefix Proof
+
+A snapshot provider need not retain the original operation at its copied
+boundary. After successful Build, the source retains an exact session-scoped
+completed-build anchor. Active catch-up can ask the live target to certify
+that completed committed prefix, including when the configured known peer
+omits progress with `INVALID_LSN`. Advertised progress alone grants no credit.
+
+The read-only proof carries the original terminal copy identity separately
+from current replication authority. The target requires its exact durable
+terminal receipt, live source/target sessions, current active-secondary and
+primary/configuration authority, matching history/storage/endpoint and
+nonretired storage. Provider commitment, durable applied/committed state and
+replicator progress must agree and cover the prefix. The ACK echoes the exact
+proof; the source also rechecks its current primary authority before credit
+and final quorum success. No application operation is delivered or ACKed by
+this proof.
+
+Credit stops at completed catch-up boundary C, bounded by source commitment;
+records above C still require contiguous operation-exact replay. Ordinary data
+duplicates still require retained matching payloads. A historical final-copy
+ACK alone is not a live readiness proof. The source anchor survives activation,
+not process replacement; session, epoch, history, storage or endpoint mismatch
+prevents its use. A cache miss retains the operation-exact fallback, including
+its rebuild-required errors; this is not a general restart-persistent progress
+cache or a change to retained-floor semantics.
+
+Native SF's classic V1 replicator supplies copy through S-1 and starts the
+replication queue at S. Build waits jointly for final copy completion and its
+required replication apply-ACK boundary, then promotion reuses the session's
+ACK cursors for catch-up. It does not demand the original record S-1. At pin
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`, see
+[BuildIdleAsyncOperation.cpp:112-166](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.BuildIdleAsyncOperation.cpp#L112-L166),
+[CopySender.cpp:267-400,524-581](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/CopySender.cpp#L267-L400),
+[ReplicaManager.cpp:1671-1785](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicaManager.cpp#L1671-L1785)
+and [CatchupAsyncOperation.cpp:42-104](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.CatchupAsyncOperation.cpp#L42-L104).
+
+Native receiver queue “committed”/received progress is a dispatch cursor,
+distinct from service-completed/apply ACK and primary quorum commitment.
+Persisted mode requires service ACK; its acknowledgement does not carry
+Kuberic's durable application progress or exact storage/history assertion.
+See [SecondaryCopyReceiver.cpp:160-287,377-427](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/SecondaryCopyReceiver.cpp#L160-L287)
+and [ReliableOperationSender.cpp:601-679](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReliableOperationSender.cpp#L601-L679).
+Kuberic aligns the completion invariant, not these differing ACK/durability
+models or native copy EOF behavior.
+
+Implementation: `replicator/stateless/mod.rs:441-472,1160-1234,1625-1764,2174-2203,3032-3057`
+and `host/hosting.rs:1084-1115`, under `kuberic-runtime/src/`, at `dbceb59`.
+Regression command and scope: [Quiet Snapshot Boundary Proof](testing.md#quiet-snapshot-boundary-proof).
+
 ## Service Operation Delivery
 
 Built-in receivers deliver copy chunks, explicit copy completion, and

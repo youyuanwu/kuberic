@@ -157,9 +157,16 @@ Kuberic admission rule, not universal application read isolation or identical SF
 timing; see [read visibility and pinned SF evidence](service-fabric-api-semantics.md#read-visibility-and-admission).
 SF-11's previously implemented committed-prefix repair is also exactly
 revalidated, including genuine divergent/missing-history rejection. The audit
-now records **6 fixed / 15 open implementation findings** (6 P1 / 9 P2 open)
+now records **7 fixed / 14 open implementation findings** (5 P1 / 9 P2 open)
 and **one open documentation mismatch**, SF-D01. SF-D02's query reconciliation
 does not change those implementation counts or close other findings.
+
+SF-10 now proves completed snapshot prefixes through exact live durable
+receipts, allowing quiet nonzero snapshot-only activation and both catch-up
+modes, including omitted known-peer progress. This follows native SF's
+copy/apply completion invariant without equating native queue ACKs with
+Kuberic durable storage/history proof; see
+[snapshot-prefix semantics](service-fabric-api-semantics.md#completed-snapshot-prefix-proof).
 
 ## KSF Conformance
 
@@ -182,8 +189,8 @@ surface. Extra endpoint, alternate protocol, and alternate controller-owner
 fixtures are injected through the same discovery path and must fail the same
 validator.
 
-The current test inventory contains 410 tests:
-364 ordinary, 41 PostgreSQL, three KinD, and two build-only.
+The current test inventory contains 415 tests:
+369 ordinary, 41 PostgreSQL, three KinD, and two build-only.
 
 ## Deliberate Differences
 

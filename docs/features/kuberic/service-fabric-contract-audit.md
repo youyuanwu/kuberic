@@ -42,8 +42,8 @@ Initial inventory: **17 implementation findings: 10 P1 and 7 P2**, plus
 **one documentation/behavior mismatch**. All entries are initially open.
 This initial inventory describes the historical audit, not current status.
 
-Current inventory: **21 implementation findings: 6 fixed / 15 open**
-(6 open P1 and 9 open P2), plus **one open documentation/behavior
+Current inventory: **21 implementation findings: 7 fixed / 14 open**
+(5 open P1 and 9 open P2), plus **one open documentation/behavior
 mismatch** (SF-D01). SF-D02 is fixed independently of implementation counts.
 SF-04/SF-05 were fixed by PR #151; SF-14 is fixed by the implementation
 published in PR #154 and recorded below. Original failure traces remain
@@ -54,6 +54,8 @@ remains open.
 SF-01 is fixed by local commit `434cd18`; SF-11's pre-existing prefix repair
 in `05f69bee` (PR #151) is now revalidated by an exact regression in
 `434cd18`. No additional SF-11 runtime change was needed.
+SF-10 is fixed by local commits `53038e3` and `dbceb59`, with source-backed native comparison
+and quiet snapshot-only regressions recorded below.
 
 **Alignment decision:** The user requested alignment with the linked SF
 semantics on 2026-10-17. SF-18 through SF-21 are required changes, not accepted
@@ -103,7 +105,7 @@ fixing capability admission does not fix swap staging.
 | [SF-07](#sf-07-idle-postgresql-removal-globally-drains-the-partition) | P1 | Open | Idle PostgreSQL removal globally drains the partition |
 | [SF-08](#sf-08-retired-postgresql-grants-leak-persistent-slots) | P1 | Open | Retired PostgreSQL grants leak persistent slots |
 | [SF-09](#sf-09-postgresql-epoch-fencing-regresses-reported-progress) | P1 | Open | PostgreSQL epoch fencing regresses reported progress |
-| [SF-10](#sf-10-quiet-snapshot-builds-fail-boundary-proof) | P1 | Open | Quiet snapshot builds fail boundary proof |
+| [SF-10](#sf-10-quiet-snapshot-builds-fail-boundary-proof) | P1 | Fixed | Quiet snapshot builds fail boundary proof |
 | [SF-11](#sf-11-suffix-reconciliation-skips-a-missing-committed-prefix) | P2 | Fixed | Suffix reconciliation skips a missing committed prefix |
 | [SF-12](#sf-12-minority-rejection-makes-specific-quorum-catch-up-order-dependent) | P2 | Open | Minority rejection makes specific-quorum catch-up order-dependent |
 | [SF-13](#sf-13-postgresql-writequorum-ignores-the-required-peer) | P2 | Open | PostgreSQL WriteQuorum ignores the required peer |
@@ -481,16 +483,20 @@ two survivors whose post-admission tails differ.
 
 ### SF-10: Quiet snapshot builds fail boundary proof
 
+**Status: Fixed.** Local implementation commits `53038e3` and `dbceb59`. Closure is limited
+to completed-build snapshot-prefix proof; SF-18/19, SF-D01 and SF-20/21 remain
+open and their contracts are unchanged.
+
 **Contract:** A valid copied snapshot can become active and catch up without
 manufacturing the original operation record at its snapshot boundary.
 
-**Failure:** Build S through committed LSN 1 without concurrent writes.
+**Historical failure:** Build S through committed LSN 1 without concurrent writes.
 Copy transfers no retained operation 1, but final catch-up resends operation 1
 as live proof. Duplicate verification requires the missing retained record
 and requests a rebuild. A provider restoring the exact record can mask this;
 the valid snapshot-only provider contract does not require it.
 
-**Evidence:** Copy range and completion at
+**Historical evidence:** Copy range and completion at
 `kuberic-runtime/src/replicator/stateless/mod.rs:1684-1696,2102-2136`;
 boundary proof at `1384-1414`; duplicate verification at `1032-1038,802-805`.
 The snapshot-only fixture is in
@@ -500,6 +506,41 @@ The snapshot-only fixture is in
 activate it, and perform both catch-up modes without rebuilding. Exercise
 known progress and the already-known-peer `INVALID_LSN` sentinel while
 retaining exact history, session, and storage validation.
+
+**Implemented closure:** Successful source Build retains an exact completed
+anchor. A separate read-only replication proof validates the target's terminal
+receipt against live durable history/storage, sessions, active configuration,
+endpoint and provider/cached progress, and echoes the exact proof. Original
+build configuration and current active configuration are checked separately.
+Source authority is rechecked after awaited proof work and before final quorum
+success. The general final guard preserves the unchanged entry role epoch
+across Swap's supported epoch-before-role sequence (`dbceb59`), rather than
+requiring premature role replay. Prefix credit is capped at completed C and primary commitment; later
+records and ordinary duplicates retain operation-exact verification. No
+protected public trait changed. See `kuberic-runtime/src/replicator/stateless/mod.rs:441-472,1160-1234,1625-1764,2174-2203,3032-3057`
+and `kuberic-runtime/src/host/hosting.rs:1084-1115` at `dbceb59`.
+
+**Native comparison:** Fresh read-only source pin
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d` was clean. Native Build's copy
+through S-1 plus replication-start S, combined final-copy/service completion
+and replication apply-ACK gate, preserved session progress on promotion and
+apply-ACK catch-up predicates do not require retransmitting original record
+S-1. The [pinned native references and ACK qualifications](service-fabric-api-semantics.md#completed-snapshot-prefix-proof)
+distinguish received/queue/service progress from Kuberic's stronger durable
+provider/exact identity model. No native tests were executed and no
+architecture or EOF equivalence is claimed.
+
+**Regression evidence:** Five public factory/host tests selected by `test(sf10_)`
+cover empty/nonzero quiet Build → activation → WriteQuorum and All, explicit
+and already-known-peer `-1`, missing boundary records on target and source,
+concurrent/later suffix, exact read-only retries, wrong/stale proof identity,
+live progress/history/storage loss and source abort during delayed proof.
+See `kuberic-runtime/tests/public_v1_recovery.rs:1645-1919` at `53038e3` and
+[the focused command](testing.md#quiet-snapshot-boundary-proof).
+Disabling only the new receipt-proof path reproduces both nonzero quiet
+failures as RemoteBuildTarget / IncompatibleRetainedHistory; restored code
+passes. These memory-backed cases establish sequencing, not fsync. Existing
+SF-01/SF-11/SF-D02, service ACK and cancellation regressions remain separate.
 
 ## P2 Findings
 
@@ -892,7 +933,7 @@ by itself, evidence of unsafe quorum acknowledgement or data corruption.
 
 **Status: Fixed.** Behavioral reconciliation at `697f281`, with failed-settlement
 query coverage completed at `ae499ff`, closes this documentation/behavior
-mismatch only. The 21 implementation findings remain 6 fixed / 15 open.
+mismatch only. At that closure, the 21 implementation findings were 6 fixed / 15 open.
 
 **Original mismatch:** Kuberic's `Replicator::current_progress` contract promises locally
 durable quorum-committed progress on a primary, but the built-in query returned
@@ -1183,5 +1224,5 @@ archive/API and eight-test smoke retries passed without source changes.
 The smoke binary build emitted existing feature-gated unused-code warnings;
 all-target/all-feature runtime clippy with warnings denied, formatting,
 runtime doctests and diff checks passed.
-No full PostgreSQL or live KinD suite was run. SF-D01 and the 15 open
-implementation findings remain open; SF-01/SF-11 regression coverage remains green.
+No full PostgreSQL or live KinD suite was run. At that revalidation, SF-D01 and
+15 implementation findings remained open; SF-01/SF-11 regression coverage was green.

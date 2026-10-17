@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 364 |
+| ordinary | 369 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **410** |
+| **total** | **415** |
 
-Ordinary partition counts are `91, 91, 91, 91`. PostgreSQL partition counts
+Ordinary partition counts are `93, 92, 92, 92`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -111,6 +111,30 @@ independent report tails and access. These memory-backed tests prove protocol
 sequencing, not fsync; existing real-provider SF-01 regressions remain separate.
 See [SF-D02 closure](service-fabric-contract-audit.md#sf-d02-primary-progress-promise-exceeds-the-built-in-query-result)
 and the [role/native-source qualifications](service-fabric-api-semantics.md#role-specific-progress-and-recovery).
+
+### Quiet Snapshot Boundary Proof
+
+```bash
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test-threads 1 -E 'test(sf10_)'
+```
+
+Five public factory/host tests complete quiet empty/nonzero snapshot-only
+Build, activate, and run both catch-up modes without another write or rebuild.
+They cover explicit progress and already-known-peer `INVALID_LSN`, including
+no retained boundary record on either side. Other cases cover concurrent and
+later exact suffixes, conflicting later payload, exact read-only proof retries,
+mixed proof/data rejection, wrong receipt/session/configuration/history/storage,
+missing live durable progress, and source abort during delayed proof work.
+The source-abort barrier delays the outbound proof, not a service operation:
+the prefix proof intentionally performs no application mutation.
+
+Disabling only the receipt-proof branch makes both quiet nonzero journeys
+fail with `IncompatibleRetainedHistory`; empty cases pass. Memory-backed
+fixtures prove protocol sequencing, not fsync. Existing real-provider,
+service-ACK/cancellation and SF-01/SF-11/SF-D02 regressions remain independent.
+See [SF-10 closure](service-fabric-contract-audit.md#sf-10-quiet-snapshot-builds-fail-boundary-proof)
+and [proof semantics](service-fabric-api-semantics.md#completed-snapshot-prefix-proof).
 
 ### In-Process Controller/Application Journeys
 
