@@ -8,8 +8,9 @@ adds native-source/test-vector mapping and a future behavior/capability matrix:
 persisted/volatile services, service-owned primary commit, receiver lifetimes,
 progress/quorum/status, terminal outcomes and real tonic retry/reconnect/
 backpressure scenarios. Existing KSF inventory and current-contract regressions do
-not establish complete native parity. Planned cases do not exist in the test
-inventory yet; add selectors/counts only with actual implementations. Preserve
+not establish complete native parity. P1's documented acceptance scenarios are
+separate from future executable port-component/hosted cases; add selectors and
+counts for those only with actual implementations. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
 
@@ -60,6 +61,38 @@ the structural KSF catalog.
 
 Timeout-sensitive hosted recovery tests should use the repository nextest
 profile rather than an ad-hoc highly parallel `cargo test` invocation.
+
+### SF V1 P1 Foundation
+
+```bash
+scripts/check_runtime_public_api.sh
+```
+
+P1 adds source-backed acceptance scenarios in the
+[port ledger](sf-v1-port-ledger.md): 11 source families, 15 contract mappings,
+33 deterministic scenarios and 29 capability/settings cases. They are
+documented expectations for future tests of actual ported components, not new
+ordinary tests or executable formula checks. The strengthened existing external
+API fixture above checks real protected-interface compatibility. The existing
+16 KSF entries remain structural/current-contract evidence; no new KSF ID or
+native-parity claim is introduced.
+
+The separate current-engine counterexample selection is:
+
+```bash
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test-threads 1 --test public_v1_recovery \
+  -E 'test(=read_fencing::sf_d02_primary_scalar_waits_for_quorum_and_local_commit_across_cancel_and_epoch) or test(=read_fencing::sf_d02_secondary_scalar_is_contiguous_service_acknowledged_not_committed) or test(=hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children)'
+```
+
+These three existing real-engine tests preserve current held-ACK/held-local-
+commit and contained-Close assertions. They do not execute expected native
+algorithms. Five further current-source counterexamples in the ledger remain
+source-only. Memory-backed current-engine witnesses prove ordering, not fsync.
+The strengthened existing external API fixture pins Bytes, boxed `Stream<Item = Result<Bytes>>
++ Send`, i64 and all protected methods; it remains one of the **existing two**
+build-only guards run by `scripts/check_runtime_public_api.sh`, not a new
+ordinary or archive-only Cargo invocation.
 
 ### Built-In Service Operation Delivery
 
