@@ -147,6 +147,18 @@ for ownership, cancellation, and stream lifetime requirements.
 The tracker also records SF-04/SF-05's earlier PR #151 switchover fixes;
 these closures do not resolve the other behavioral gaps.
 
+SF-01 now fences newly initiated normal reads before primary provider apply;
+secondary ingress already fences before service delivery. Exact hosted KV and
+physical quorum-loss regressions prove denial of a visible uncommitted mutation
+and restoration after genuine commitment. This is a custom conservative
+Kuberic admission rule, not universal application read isolation or identical SF
+timing; see [read visibility and pinned SF evidence](service-fabric-api-semantics.md#read-visibility-and-admission).
+SF-11's previously implemented committed-prefix repair is also exactly
+revalidated, including genuine divergent/missing-history rejection. The audit
+now records **6 fixed / 15 open implementation findings** (6 P1 / 9 P2 open)
+and **two open documentation mismatches**. SF-D02 and the other unaddressed
+findings remain open; this work does not change their runtime contracts.
+
 ## KSF Conformance
 
 The shared KSF catalog contains exactly KSF-01 through KSF-16. It combines
@@ -168,8 +180,8 @@ surface. Extra endpoint, alternate protocol, and alternate controller-owner
 fixtures are injected through the same discovery path and must fail the same
 validator.
 
-The current test inventory contains 396 tests:
-350 ordinary, 41 PostgreSQL, three KinD, and two build-only.
+The current test inventory contains 408 tests:
+362 ordinary, 41 PostgreSQL, three KinD, and two build-only.
 
 ## Deliberate Differences
 

@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 350 |
+| ordinary | 362 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **396** |
+| **total** | **408** |
 
-Ordinary partition counts are `88, 88, 87, 87`. PostgreSQL partition counts
+Ordinary partition counts are `91, 91, 90, 90`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -71,6 +71,26 @@ A real SQLite factory/service build preserves an intact uncommitted suffix
 over copy, verifies per-frame ACK/retry without reapplication, and prevents
 post-commit rejection from supplying successful replay or terminal proof.
 
+### Built-In Read Visibility and Prefix Repair
+
+```bash
+cargo nextest run -p kuberic-runtime -p kvstore2 -p kuberic-level-tests \
+  --all-features --profile ordinary --test-threads 1 \
+  -E 'test(sf01_) or test(sf11_committed_prefix_)'
+```
+
+Twelve focused tests cover pre-provider publication failure/drop/revocation,
+real normal KV reads behind primary/secondary post-visible apply barriers,
+unavailable required quorum, genuine settlement, mutate-then-error, caller
+cancellation, terminal authority and equal raw counters without settlement.
+The hosted quorum-three fixture injects third-member socket-route failure;
+the in-process primary fixture physically cuts both peers' TCP routes.
+The exact SF-11 matrix records primary `(11,10)`, peer `(5,5)` replay of
+6-11 before suffix commitment and genuine divergent/missing-history rejection.
+See the [audit's evidence and scope](service-fabric-contract-audit.md#sf-01-and-sf-11-revalidation);
+these tests establish new normal-read admission, not isolation of already
+admitted reads or arbitrary application data views.
+
 ### In-Process Controller/Application Journeys
 
 ```bash
@@ -84,7 +104,7 @@ hosted KVStore2 replicas, TCP replication, and durable files. Only Kubernetes
 resource storage, Pod/PVC realization, and explicit socket faults are simulated. It requires no cluster,
 containers, kubeconfig, or application binaries.
 
-Twenty-four ordinary-tier journey/assertion tests cover bootstrap/status conflict,
+Twenty-five ordinary-tier journey/assertion tests cover bootstrap/status conflict,
 support Service/Secret repair, contained restart, replacement with delayed exact
 cleanup, replacement followed by same-storage restart, stopped-primary failover,
 live-primary isolation/reconnection, quorum loss/restoration, and spec-driven

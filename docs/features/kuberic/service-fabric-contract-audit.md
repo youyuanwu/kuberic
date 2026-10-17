@@ -42,8 +42,8 @@ Initial inventory: **17 implementation findings: 10 P1 and 7 P2**, plus
 **one documentation/behavior mismatch**. All entries are initially open.
 This initial inventory describes the historical audit, not current status.
 
-Current inventory: **21 implementation findings: 4 fixed / 17 open**
-(7 open P1 and 10 open P2), plus **two open documentation/behavior
+Current inventory: **21 implementation findings: 6 fixed / 15 open**
+(6 open P1 and 9 open P2), plus **two open documentation/behavior
 mismatches** (SF-D01 and SF-D02).
 SF-04/SF-05 were fixed by PR #151; SF-14 is fixed by the implementation
 published in PR #154 and recorded below. Original failure traces remain
@@ -51,6 +51,9 @@ historical evidence. SF-18 through SF-21 track the remaining stream, context,
 primary-completion, and acknowledgement alignment requirements. SF-06 is
 fixed by local commits `ac16f97` and `d73db99`, as recorded below; SF-15
 remains open.
+SF-01 is fixed by local commit `434cd18`; SF-11's pre-existing prefix repair
+in `05f69bee` (PR #151) is now revalidated by an exact regression in
+`434cd18`. No additional SF-11 runtime change was needed.
 
 **Alignment decision:** The user requested alignment with the linked SF
 semantics on 2026-10-17. SF-18 through SF-21 are required changes, not accepted
@@ -91,7 +94,7 @@ fixing capability admission does not fix swap staging.
 
 | ID | Priority | Status | Finding |
 |---|---|---|---|
-| [SF-01](#sf-01-applied-kv-state-is-visible-before-the-read-fence) | P1 | Open | Applied KV state is visible before the read fence |
+| [SF-01](#sf-01-applied-kv-state-is-visible-before-the-read-fence) | P1 | Fixed | Applied KV state is visible before the read fence |
 | [SF-02](#sf-02-kv-writes-bypass-partition-write-denial) | P1 | Open | KV writes bypass partition write denial |
 | [SF-03](#sf-03-postgresql-sql-admission-ignores-partition-denial) | P1 | Open | PostgreSQL SQL admission ignores partition denial |
 | [SF-04](#sf-04-controller-swap-capability-conflicts-with-runtime-admission) | P1 | Fixed | Controller swap capability conflicts with runtime admission |
@@ -101,7 +104,7 @@ fixing capability admission does not fix swap staging.
 | [SF-08](#sf-08-retired-postgresql-grants-leak-persistent-slots) | P1 | Open | Retired PostgreSQL grants leak persistent slots |
 | [SF-09](#sf-09-postgresql-epoch-fencing-regresses-reported-progress) | P1 | Open | PostgreSQL epoch fencing regresses reported progress |
 | [SF-10](#sf-10-quiet-snapshot-builds-fail-boundary-proof) | P1 | Open | Quiet snapshot builds fail boundary proof |
-| [SF-11](#sf-11-suffix-reconciliation-skips-a-missing-committed-prefix) | P2 | Open | Suffix reconciliation skips a missing committed prefix |
+| [SF-11](#sf-11-suffix-reconciliation-skips-a-missing-committed-prefix) | P2 | Fixed | Suffix reconciliation skips a missing committed prefix |
 | [SF-12](#sf-12-minority-rejection-makes-specific-quorum-catch-up-order-dependent) | P2 | Open | Minority rejection makes specific-quorum catch-up order-dependent |
 | [SF-13](#sf-13-postgresql-writequorum-ignores-the-required-peer) | P2 | Open | PostgreSQL WriteQuorum ignores the required peer |
 | [SF-14](#sf-14-built-in-operation-streams-are-disconnected-from-delivery) | P2 | Fixed | Built-in operation streams are disconnected from delivery |
@@ -119,27 +122,82 @@ fixing capability admission does not fix swap staging.
 
 ### SF-01: Applied KV state is visible before the read fence
 
-**Contract:** Applied-only state must not become readable as though it were
-committed; partition read readiness must protect the application's read view.
+**Contract:** For Kuberic's built-in engine, close normal read admission before
+provider work can expose an applied-only mutation. This is a conservative
+Kuberic admission guarantee, not a claim that Service Fabric partition status
+isolates every application read/view. Already-admitted reads and raw provider
+access require service-owned isolation; see
+[read visibility qualifications](service-fabric-api-semantics.md#read-visibility-and-admission).
 
-**Failure:** Primary replication calls provider `apply` before publishing the
+**Historical failure:** Primary replication calls provider `apply` before publishing the
 applied/committed disagreement that closes read access. KV application changes
 its visible map inside `apply`. A concurrent read can pass the still-granted
-gate and see the new value before peer quorum work starts. The analogous
-post-apply ordering also exists on secondary ingress. A provider with a separate
+gate and see the new value before peer quorum work starts. The original audit
+also described analogous secondary post-apply ordering; that description is
+stale for the current service-stream receiver. A provider with a separate
 committed read view can avoid this exposure; KV does not have that protection.
 
-**Evidence:** Built-in `replicate` at
+**Historical evidence (audited baseline):** Built-in `replicate` at
 `kuberic-runtime/src/replicator/stateless/mod.rs:2839-2862`, with peer work
 starting at `2880-2895`; secondary apply/publication at `1024-1084`.
 KV visibility is in `examples/kvstore2/src/persistence.rs:344-359` and
 `examples/kvstore2/src/service.rs:68-77`. Host fencing follows progress
 publication at `kuberic-runtime/src/host/hosting.rs:917-953`.
 
-**Closure:** Hold a barrier after visible provider mutation but before apply
+**Closure condition:** Hold a barrier after visible provider mutation but before apply
 returns, with a required peer unavailable. Normal primary and secondary reads
 must not return the uncommitted value. Also verify commitment restores the
 intended read access.
+
+**Status: Fixed.** Local implementation/regressions:
+`434cd18d70af5d907c97bc93ca7505308208635f`. Current source references below
+describe that revision, not the historical audit:
+
+- Primary `replicate` publishes ambiguity with existing counters **before**
+  provider entry, keeps its abandonment guard armed, and rechecks exact
+  authority after the new await
+  ([stateless/mod.rs:3076-3092](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L3076-L3092)).
+  The guard credits only the already-applied floor until provider entry.
+  Publication failure/drop/revocation therefore cannot manufacture an applied
+  LSN just to close admission.
+- Secondary ingress already publishes ambiguity **before service delivery**,
+  then requires durable, verified, current-authority service ACK
+  ([stateless/mod.rs:1186-1205,1255-1278](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1186-L1278)).
+  Its older post-apply description is not a second current defect.
+- Real KV provider barriers persist/install the visible mutation, release the
+  map mutex, then pause before apply returns
+  ([persistence.rs:403-456](../../../examples/kvstore2/src/persistence.rs#L403-L456)).
+  Normal reads use the unchanged partition-admitted
+  [`KvService::get`:68-77](../../../examples/kvstore2/src/service.rs#L68-L77).
+  The hosted fixture uses three real replicas with quorum three, injects
+  `ConnectionRefused` for the independently indispensable third member, and
+  leaves the observed secondary connected. A separate in-process regression
+  physically isolates both peers of a majority primary.
+
+**Regression evidence:** `sf01_primary_visible_apply_denies_normal_reads_until_quorum_settlement`
+and `sf01_secondary_visible_apply_denies_normal_reads_with_required_peer_unavailable`
+hold the post-visible/pre-return barrier, prove raw `(2,1)` mutation and old
+acknowledged counters, and require exact normal-read
+`ReadClosed(NotPrimary)`. Gate release while quorum is unavailable does not
+restore access. Real CatchUp, durable commitment/ACK and public projection
+refresh restore normal reads of the exact value on all three replicas
+([hosted tests:403-483](../../../examples/kvstore2/tests/read_fencing.rs#L403-L483)).
+`sf01_primary_visible_apply_is_fenced_during_physical_quorum_loss` supplies
+the physical disconnection/recovery observation
+([in-process journey:1073-1140](../../../kuberic-level-tests/src/in_process/journeys.rs#L1073-L1140)).
+
+The five additional hosted tests cover primary mutate-then-error, equal raw
+counters plus Progress without valid settlement, actual caller drop, Abort
+completion before late apply return, and secondary error/cancellation with
+fresh replay/ACK recovery
+([tests:492-662](../../../examples/kvstore2/tests/read_fencing.rs#L492-L662)).
+After Abort the service removes its partition, so the normal read is `NotOpen`;
+before Abort it is exact `ReadClosed(NotPrimary)`. Three private
+`sf01_*preapply_publication*` tests prove failure/drop/revocation during
+publication never enters the provider or advances counters
+([read_fence_tests.rs:167-282](../../../kuberic-runtime/src/replicator/stateless/read_fence_tests.rs#L167-L282)).
+See the [verification record](#sf-01-and-sf-11-revalidation) for commands and
+the negative control that returned the uncommitted value with the old ordering.
 
 ### SF-02: KV writes bypass partition write denial
 
@@ -447,17 +505,44 @@ retaining exact history, session, and storage validation.
 
 ### SF-11: Suffix reconciliation skips a missing committed prefix
 
-**Failure:** With primary applied/committed progress (11,10), compatible peer C
+**Historical failure:** With primary applied/committed progress (11,10), compatible peer C
 at (5,5), and retained operations 6-11 available, suffix reconciliation sends
 11 before repairing 6-10. C correctly rejects the gap, which is classified as
 incompatible history requiring rebuild.
 
-**Evidence:** `kuberic-runtime/src/replicator/stateless/mod.rs:1435-1443,1325-1329`;
+**Historical evidence (audited baseline):** `kuberic-runtime/src/replicator/stateless/mod.rs:1435-1443,1325-1329`;
 gap rejection at `1012-1017` and rebuild conversion at `1343-1344`.
 
-**Closure:** Repair the compatible committed prefix, then verify and settle the
+**Closure condition:** Repair the compatible committed prefix, then verify and settle the
 suffix without replacement. Continue rejecting genuinely mismatching or
 unavailable retained history.
+
+**Status: Fixed (pre-existing repair, now exactly revalidated).**
+`05f69bee820cc6393842d34b45ae82e2ced32981` (PR #151) changed suffix
+verification to replay the missing committed prefix first. That implementation
+was already present at `9c0dcf0`; SF-01's runtime patch does not change it.
+`434cd18` adds the exact positive/rejection evidence:
+
+- [`verify_peer_applied_suffix`:1472-1490](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1472-L1490)
+  caps peer progress by primary commitment, then
+  [`catch_up_peer`:1522-1559](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1522-L1559)
+  replays through the applied tail.
+- `read_fencing::sf11_committed_prefix_6_through_10_precedes_ambiguous_11_and_rejects_bad_history`
+  seeds actual primary `(11,10)`, compatible peer `(5,5)` and retained 6-11
+  before Open. Original service operations apply and ACK ordered
+  `(LSN, watermark)` deliveries `(6,6)` through `(10,10)`, `(11,10)`, then
+  `(11,11)`. Both commit 11 without logically reapplying the final watermark
+  ([fixture and success:21-108](../../../kuberic-runtime/tests/support/read_fencing.rs#L21-L108)).
+- A distinct peer with truthful durable `(6,5)`, stale advertised 5 and genuinely
+  conflicting retained bytes at 6 gets typed remote incompatible-history
+  rejection. Missing primary retained 6 gets typed local incompatible-history
+  rejection with no delivery. Neither advances primary commitment beyond 10.
+  A stopped peer instead leaves `ReconfigurationPending`, not a false history
+  diagnosis
+  ([negative cases:110-130](../../../kuberic-runtime/tests/support/read_fencing.rs#L110-L130)).
+
+This closes the historical prefix-skipping finding only, not SF-12, SF-D02 or
+other catch-up/primary-progress requirements.
 
 ### SF-12: Minority rejection makes specific-quorum catch-up order-dependent
 
@@ -961,3 +1046,55 @@ That documentation-only comparison did not close SF-06 or SF-D01. SF-D02 and the
 clarification come from source inspection, not new behavioral reproductions.
 This documentation follow-up changes neither runtime behavior nor protected
 trait signatures.
+
+### SF-01 and SF-11 Revalidation
+
+2026-10-17, implementation/regression revision
+`434cd18d70af5d907c97bc93ca7505308208635f`, based on `9c0dcf0`.
+Only SF-01 runtime admission and SF-11's evidence-backed status were changed
+by this follow-up. Secondary service-stream fencing was already present.
+The SF source checkout was read-only, clean and pinned to
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`; exact production and test-service
+paths and their limitations are recorded in
+[source qualifications](service-fabric-api-semantics.md#verified-service-fabric-source-and-qualifications).
+
+Mandatory implementation review passed. Fresh reviewer selections:
+
+```sh
+cargo nextest run -p kuberic-runtime -p kvstore2 -p kuberic-level-tests \
+  --all-features --profile ordinary --test-threads 1 \
+  -E 'test(sf01_) or test(sf11_committed_prefix_) or test(sf06_) or binary_id(=kuberic-runtime::lifecycle_capability_boundaries) or binary_id(=kuberic-runtime::public_api_inventory)'
+```
+
+**33/33 passed**, run `a3573a17-05b4-4978-b77a-804f57f56b13`, including all
+12 new regressions, existing SF-06 roots/listeners/terminal ownership and seven
+protected-interface/source-API guards. A separate adjacent selection passed
+**19/19**, run `7777c855-710d-4df6-9961-ae66616ac937`: primary revocation,
+Close/drop, commit failure, prior suffix matrix, hosted stream ACK/cancellation,
+real KV restart/handoff and physical quorum-loss recovery.
+
+The primary negative control temporarily restored old post-apply-only fencing:
+
+```sh
+cargo nextest run -p kvstore2 --all-features --profile ordinary --test-threads 1 \
+  -E 'test(=sf01_primary_visible_apply_denies_normal_reads_until_quorum_settlement)'
+```
+
+It failed as intended with actual normal-read `Ok(Some("uncommitted"))`
+while apply was held (run `7edbf220-2c3a-4f28-a8e6-cce69bda6650`).
+The fix was restored before subsequent passing verification and commit.
+This is a visibility reproduction, not a dynamically reproduced data-loss claim.
+
+Targeted all-target/all-feature check and warnings-denied clippy for runtime,
+KV and level-tests, workspace formatting, API inventories/privacy guard and
+diff checks passed. `just nextest-validate` measured **408 = 362 ordinary +
+41 PostgreSQL + 3 KinD + 2 build-only**, with ordinary slices `91,91,90,90`
+and PostgreSQL hashes `11,13,8,9`; exact-once tier/partition accounting passed.
+
+Routine `just nextest-postgres-smoke` passed **8/8**, run
+`5ea307e5-dc98-4d0c-b502-7f642ee22951` (87.875 seconds), with the short local
+socket root `KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR=/data/code/kuberic/.pg`.
+The smoke recipe's non-testing binary build emitted existing feature-gated
+unused-code warnings; the all-features warnings-denied clippy selection passed.
+No full PostgreSQL suite or live KinD run was performed. These checks do not
+close unrelated provider/application findings or SF-D02.
