@@ -11,7 +11,7 @@ use futures::{StreamExt, stream};
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::engine::DurableState;
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
-use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
+use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
     StatefulServicePartition,
@@ -346,39 +346,7 @@ impl StatefulServiceReplica for SqliteService {
 
 async fn consume_stream(persistence: Arc<SqlitePersistence>, mut stream: OperationStream) {
     while let Ok(Some(operation)) = stream.get_operation().await {
-        let result = match &operation.metadata {
-            OperationMetadata::Replication { lsn, committed_lsn } => {
-                persistence
-                    .apply(kuberic_runtime::application::Operation {
-                        lsn: *lsn,
-                        committed_lsn: *committed_lsn,
-                        data: operation.data.clone(),
-                    })
-                    .await
-            }
-            OperationMetadata::Copy { build_id, sequence } => match persistence
-                .apply_copy_chunk(
-                    build_id,
-                    *sequence,
-                    kuberic_runtime::application::CopyChunk {
-                        data: operation.data.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(()) => persistence.durable_progress().await,
-                Err(error) => Err(error),
-            },
-            OperationMetadata::CopyComplete {
-                build_id,
-                up_to_lsn,
-                committed_lsn,
-            } => {
-                persistence
-                    .finish_copy(build_id, *up_to_lsn, *committed_lsn)
-                    .await
-            }
-        };
+        let result = operation.apply_to(persistence.as_ref()).await;
         match result {
             Ok(progress) => {
                 let _ = operation.acknowledge(progress);
@@ -387,5 +355,117 @@ async fn consume_stream(persistence: Arc<SqlitePersistence>, mut stream: Operati
                 let _ = operation.reject(error);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::frames::{WalFrame, WalFrameSet};
+    use crate::state::PersistenceFault;
+    use kuberic_runtime::replicator::stream::OperationMetadata;
+
+    #[tokio::test]
+    async fn stream_cancellation_after_durable_apply_does_not_commit() {
+        let directory = tempfile::Builder::new()
+            .prefix("sqlite-stream-cancel-")
+            .tempdir_in(".")
+            .unwrap();
+        let persistence =
+            Arc::new(SqlitePersistence::open(directory.path().to_path_buf()).unwrap());
+        let (sender, stream) = OperationStream::channel(1);
+        let consumer = tokio::spawn(consume_stream(persistence.clone(), stream));
+        let frames = vec![WalFrame {
+            page_number: 1,
+            data: vec![9; 512],
+        }];
+        let payload: Bytes = serde_json::to_vec(&WalFrameSet {
+            checksum: WalFrameSet::compute_checksum(&frames),
+            frames,
+            db_size_pages: 1,
+        })
+        .unwrap()
+        .into();
+        persistence.after_apply.arm();
+        let request = tokio::spawn({
+            let sender = sender.clone();
+            async move {
+                sender
+                    .send(
+                        OperationMetadata::Replication {
+                            lsn: 1,
+                            committed_lsn: 1,
+                        },
+                        payload,
+                    )
+                    .await
+            }
+        });
+        persistence.after_apply.wait_entered().await;
+        request.abort();
+        let _ = request.await;
+        sender.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), consumer)
+            .await
+            .unwrap()
+            .unwrap();
+        persistence.after_apply.release();
+        let progress = persistence.durable_progress().await.unwrap();
+        assert_eq!((progress.applied_lsn, progress.committed_lsn), (1, 0));
+        assert_eq!(persistence.stream_calls.0.load(Ordering::Acquire), 1);
+        assert_eq!(persistence.stream_calls.1.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_replication_commits_without_reapplying_duplicate_payload() {
+        let directory = tempfile::Builder::new()
+            .prefix("sqlite-stream-")
+            .tempdir_in(".")
+            .unwrap();
+        let persistence =
+            Arc::new(SqlitePersistence::open(directory.path().to_path_buf()).unwrap());
+        let (sender, stream) = OperationStream::channel(1);
+        let consumer = tokio::spawn(consume_stream(persistence.clone(), stream));
+        let frames = vec![WalFrame {
+            page_number: 1,
+            data: vec![7; 512],
+        }];
+        let payload: Bytes = serde_json::to_vec(&WalFrameSet {
+            checksum: WalFrameSet::compute_checksum(&frames),
+            frames,
+            db_size_pages: 1,
+        })
+        .unwrap()
+        .into();
+        let send = |committed_lsn, data| {
+            sender.send(
+                OperationMetadata::Replication {
+                    lsn: 1,
+                    committed_lsn,
+                },
+                data,
+            )
+        };
+        assert_eq!(send(0, payload.clone()).await.unwrap().committed_lsn, 0);
+        persistence.fail_once(PersistenceFault::AfterCommit);
+        assert!(
+            send(1, payload.clone()).await.is_err(),
+            "after-commit failure must not ACK"
+        );
+        assert_eq!(
+            persistence.durable_progress().await.unwrap().committed_lsn,
+            1
+        );
+        assert_eq!(send(1, payload.clone()).await.unwrap().committed_lsn, 1);
+        assert!(send(1, Bytes::from_static(b"corrupt")).await.is_err());
+        let inspection = persistence.inspect_for_test().unwrap();
+        assert_eq!(persistence.stream_calls.0.load(Ordering::Acquire), 1);
+        assert_eq!(persistence.stream_calls.1.load(Ordering::Acquire), 1);
+        assert_eq!(inspection.operations.len(), 1);
+        assert_eq!(inspection.operations[0].committed_lsn, 0);
+        assert_eq!(inspection.operations[0].data, payload);
+        assert_eq!(inspection.image, vec![7; 512]);
+        sender.close();
+        consumer.await.unwrap();
     }
 }

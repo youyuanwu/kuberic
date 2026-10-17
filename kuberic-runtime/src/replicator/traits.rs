@@ -142,10 +142,11 @@ pub trait PrimaryReplicator: Replicator {
 /// Services use this interface to replicate state changes for high availability
 /// and consume secondary copy and replication operations.
 ///
-/// The stream methods describe service-owned operation delivery. The built-in
-/// replicator currently applies incoming data directly through
-/// [`DurableState`](crate::engine::DurableState) rather than delivering it
-/// through these service streams.
+/// Built-in receivers deliver copy and replication through these streams and
+/// wait for explicit durable service acknowledgement before completing ingress.
+/// Services may use [`super::stream::StreamOperation::apply_to`] with their
+/// durable store, or cancellation-aware execution with their own persistence.
+/// Primary-local persistence remains owned by the replicator.
 #[async_trait]
 pub trait StateReplicator: Send + Sync {
     /// Replicates `data`, representing a primary's state change, to secondaries
@@ -165,10 +166,12 @@ pub trait StateReplicator: Send + Sync {
     /// and durably acknowledge on a secondary.
     ///
     /// Operations originate from the primary's [`Self::replicate`] calls.
-    /// Normally drain the copy stream before applying replication operations.
-    /// Consuming both concurrently requires the service to preserve correct
-    /// copy/replication ordering and is intended for advanced implementations.
-    /// [`OperationStream::get_operation`] returns `None` at the end of a stream.
+    /// Keep both consumers alive: the built-in engine waits for acknowledged
+    /// copy completion before delivering retained build replication. Replication
+    /// metadata requests a committed watermark as well as payload application;
+    /// duplicate payloads may advance commitment without being applied twice.
+    /// `None` from [`OperationStream::get_operation`] means terminal shutdown,
+    /// not temporary emptiness or completion of one build.
     async fn get_replication_stream(&self) -> Result<OperationStream>;
 
     /// Returns the stream of copy operations used to initialize a replica's state.
@@ -176,8 +179,9 @@ pub trait StateReplicator: Send + Sync {
     /// These payloads originate from the primary provider's
     /// [`StateProvider::get_copy_state`] stream. The secondary obtains the
     /// stream, applies its operations, and explicitly acknowledges them while
-    /// participating in the copy-context exchange.
-    /// [`OperationStream::get_operation`] returns `None` at the end of a stream.
+    /// participating in the copy-context exchange. Each build includes an
+    /// explicit copy-complete operation, including an empty snapshot.
+    /// `None` from [`OperationStream::get_operation`] means terminal shutdown.
     async fn get_copy_stream(&self) -> Result<OperationStream>;
 
     /// Updates replication settings without changing the registered replication

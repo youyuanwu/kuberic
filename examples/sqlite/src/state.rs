@@ -16,6 +16,8 @@ pub struct SqlitePersistence {
     root: PathBuf,
     log: OnceLock<Mutex<DurableFrameLog>>,
     opening: Mutex<()>,
+    #[cfg(test)]
+    pub(crate) stream_calls: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64),
     #[cfg(any(test, feature = "testing"))]
     fault: std::sync::atomic::AtomicU8,
     #[cfg(any(test, feature = "testing"))]
@@ -64,6 +66,8 @@ impl SqlitePersistence {
             root: std::path::absolute(root)?,
             log: OnceLock::new(),
             opening: Mutex::new(()),
+            #[cfg(test)]
+            stream_calls: Default::default(),
             #[cfg(any(test, feature = "testing"))]
             fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -261,6 +265,10 @@ impl DurableState for SqlitePersistence {
     }
 
     async fn apply(&self, operation: Operation) -> kuberic_runtime::Result<DurableApplicationAck> {
+        #[cfg(test)]
+        self.stream_calls
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         #[cfg(any(test, feature = "testing"))]
         self.fault_at(PersistenceFault::BeforeApply)?;
         let progress = self
@@ -288,6 +296,10 @@ impl DurableState for SqlitePersistence {
         &self,
         committed_lsn: i64,
     ) -> kuberic_runtime::Result<DurableApplicationProgress> {
+        #[cfg(test)]
+        self.stream_calls
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let progress = self
             .lock()
             .and_then(|mut log| log.commit(committed_lsn))

@@ -24,7 +24,7 @@ use crate::protocol::public_operations::{
 use crate::protocol::types::{
     ConfigurationDescriptor, Epoch, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
 };
-use crate::replicator::stream::{OperationStream, ServiceStreams};
+use crate::replicator::stream::{OperationMetadata, OperationStream, ServiceStreams};
 use crate::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator, ReplicatorCapabilities, ReplicatorFactory, ReplicatorFactoryContext,
@@ -125,6 +125,33 @@ fn notify_inbound_build_boundary_waiting() {
 
 #[async_trait]
 impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
+    async fn reported_progress(&self) -> Result<(i64, i64)> {
+        let state = self.state.lock().await;
+        if state.closed || self.closed.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        if state.role != ReplicaRole::Primary {
+            return Ok((state.applied_lsn, state.committed_lsn));
+        }
+        // Primary-local persistence retains its historical reporting contract.
+        // Read commitment first so a concurrent local write cannot pair newer
+        // commitment with an older applied snapshot.
+        drop(state);
+        let committed = self.provider.last_committed_lsn().await?;
+        let state = self.state.lock().await;
+        if state.closed || self.closed.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        Ok((
+            state.applied_lsn,
+            if state.role == ReplicaRole::Primary {
+                committed
+            } else {
+                state.committed_lsn
+            },
+        ))
+    }
+
     async fn shutdown_and_drain(&self) -> Result<()> {
         self.abort();
         self.descendants.stop();
@@ -146,10 +173,11 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
                 Ok(())
             }
         };
-        let (listener, outbound, inbound) = tokio::join!(
+        let (listener, outbound, inbound, ()) = tokio::join!(
             listener,
             self.descendants.drain(),
-            self.inbound_descendants.drain()
+            self.inbound_descendants.drain(),
+            self.streams.drain()
         );
         let failures = [listener, outbound, inbound]
             .into_iter()
@@ -183,6 +211,7 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
         self.revoke_generation();
         self.cancel_inbound_effects();
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         self.state.lock().await.inbound_build = None;
         self.context
             .install_replacement_inbound_build_authority(authority)
@@ -214,6 +243,7 @@ impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
         self.revoke_generation();
         self.cancel_inbound_effects();
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         self.state.lock().await.inbound_build = None;
         self.context
             .revoke_replacement_inbound_build_authority()
@@ -383,6 +413,7 @@ struct InboundBuild {
     catch_up_boundary_lsn: Option<i64>,
     next_sequence: u64,
     copy_finished: bool,
+    retained_lsn: i64,
 }
 
 struct EngineState {
@@ -903,6 +934,7 @@ impl StatelessReplicator {
         item: proto::ReplicationItem,
     ) -> std::result::Result<proto::ReplicationAck, Status> {
         let _effect = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         if item.protocol_version != PUBLIC_V1_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
                 "stateless replacement requires Public V1",
@@ -1030,85 +1062,71 @@ impl StatelessReplicator {
                 "replication progress is not contiguous",
             ));
         }
-        let operation = Operation {
-            lsn: item.lsn,
-            committed_lsn: prior_committed,
-            data: item.data.clone().into(),
-        };
-        let applied = if item.lsn > prior_applied {
-            match self.storage.apply(operation).await {
-                Ok(applied) => applied,
-                Err(error) => {
-                    self.contain_ambiguous_suffix(item.lsn).await;
-                    return Err(runtime_status(error));
-                }
-            }
-        } else {
-            if let Err(error) = self
+        if item.lsn <= prior_applied
+            && let Err(error) = self
                 .verify_retained_payload(item.lsn, item.data.as_slice())
                 .await
-            {
-                self.contain_ambiguous_suffix(prior_applied).await;
-                return Err(runtime_status(error));
-            }
-            match self.storage.durable_progress().await {
-                Ok(progress) => progress,
-                Err(error) => {
-                    self.contain_ambiguous_suffix(prior_applied).await;
-                    return Err(runtime_status(error));
-                }
-            }
-        };
-        if applied.applied_lsn < item.lsn
-            || applied.committed_lsn > applied.applied_lsn
-            || applied.committed_lsn < prior_committed
         {
-            self.contain_ambiguous_suffix(item.lsn).await;
-            return Err(Status::failed_precondition(
-                "provider returned inconsistent durable apply progress",
-            ));
-        }
-        {
-            if !self
-                .exact_authority_is_current(&authority, generation, ReplicaRole::ActiveSecondary)
-                .await
-            {
-                self.contain_ambiguous_suffix(item.lsn).await;
-                return Err(Status::failed_precondition(
-                    "replication authority changed during provider durability",
-                ));
-            }
-            let mut state = self.state.lock().await;
-            state.applied_lsn = state.applied_lsn.max(applied.applied_lsn);
-            state.ambiguous_suffix = state.applied_lsn > state.committed_lsn;
-        }
-        let ambiguous = {
-            let state = self.state.lock().await;
-            state.ambiguous_suffix
-        };
-        if let Err(error) = self.publish_progress(ambiguous).await {
-            self.contain_ambiguous_suffix(item.lsn).await;
+            self.contain_ambiguous_suffix(prior_applied).await;
             return Err(runtime_status(error));
         }
-        let committed = if item.committed_lsn > prior_committed {
-            match self.storage.commit(item.committed_lsn).await {
-                Ok(committed) => committed,
-                Err(error) => {
-                    self.contain_ambiguous_suffix(item.lsn).await;
-                    return Err(runtime_status(error));
-                }
-            }
-        } else {
-            applied
-        };
-        if committed.committed_lsn < item.committed_lsn
+        // Service execution outlives the ingress future. Fence access before
+        // delivery, without crediting any applied/committed progress. A dropped
+        // request leaves this fence in place until verified ACK or recovery.
+        self.state.lock().await.ambiguous_suffix = true;
+        self.publish_progress(true).await.map_err(runtime_status)?;
+        let committed = self
+            .streams
+            .deliver(
+                OperationMetadata::Replication {
+                    lsn: item.lsn,
+                    committed_lsn: item.committed_lsn,
+                },
+                item.data.clone().into(),
+            )
+            .await
+            .map_err(runtime_status)?;
+        if committed.committed_lsn < prior_committed.max(item.committed_lsn)
             || committed.committed_lsn > committed.applied_lsn
-            || committed.applied_lsn < item.lsn
+            || committed.applied_lsn < prior_applied.max(item.lsn)
+            || self
+                .storage
+                .durable_progress()
+                .await
+                .map_err(runtime_status)?
+                != committed
         {
-            self.contain_ambiguous_suffix(item.lsn).await;
             return Err(Status::failed_precondition(
                 "provider returned inconsistent durable commit progress",
             ));
+        }
+        self.verify_retained_payload(item.lsn, item.data.as_slice())
+            .await
+            .map_err(runtime_status)?;
+        if committed.applied_lsn > prior_applied.max(item.lsn) {
+            let mut verified = prior_applied.max(item.lsn);
+            let mut retained = self
+                .storage
+                .get_replication_operations(verified + 1, committed.applied_lsn)
+                .await
+                .map_err(runtime_status)?;
+            while let Some(operation) = retained.next().await {
+                let operation = operation.map_err(runtime_status)?;
+                if Some(operation.lsn) != verified.checked_add(1)
+                    || operation.committed_lsn < 0
+                    || operation.committed_lsn > operation.lsn
+                {
+                    return Err(Status::failed_precondition(
+                        "ACK lacks contiguous durable retained history",
+                    ));
+                }
+                verified = operation.lsn;
+            }
+            if verified != committed.applied_lsn {
+                return Err(Status::failed_precondition(
+                    "ACK exceeds verified durable retained history",
+                ));
+            }
         }
         {
             if !self
@@ -1154,7 +1172,7 @@ impl StatelessReplicator {
                 }),
             current_configuration_id: authority.current.configuration_id.to_string(),
             received_lsn: item.lsn,
-            applied_lsn: applied.applied_lsn,
+            applied_lsn: committed.applied_lsn,
             committed_lsn: committed.committed_lsn,
             sender_session_id: item.sender_session_id,
             receiver_session_id: item.receiver_session_id,
@@ -1856,6 +1874,7 @@ impl StatelessReplicator {
         item: proto::CopyItem,
     ) -> std::result::Result<proto::CopyAck, Status> {
         let _effect = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         if item.protocol_version != PUBLIC_V1_PROTOCOL_VERSION {
             return Err(Status::failed_precondition(
                 "stateless replacement requires Public V1",
@@ -2013,6 +2032,7 @@ impl StatelessReplicator {
                 catch_up_boundary_lsn: item.catch_up_boundary_lsn,
                 next_sequence: 0,
                 copy_finished: false,
+                retained_lsn: item.replication_boundary_lsn,
             };
             match &state.inbound_build {
                 Some(existing)
@@ -2095,16 +2115,42 @@ impl StatelessReplicator {
                     "snapshot chunk arrived after copy completion",
                 ));
             }
-            self.storage
-                .apply_copy_chunk(
-                    &build_id,
-                    item.sequence,
-                    CopyChunk {
-                        data: item.data.clone().into(),
+            let progress = self
+                .streams
+                .deliver(
+                    OperationMetadata::Copy {
+                        build_id: build_id.clone(),
+                        sequence: item.sequence,
                     },
+                    item.data.clone().into(),
                 )
                 .await
                 .map_err(runtime_status)?;
+            if progress
+                != self
+                    .storage
+                    .durable_progress()
+                    .await
+                    .map_err(runtime_status)?
+                || progress.applied_lsn < 0
+                || progress.committed_lsn < 0
+                || progress.committed_lsn > progress.applied_lsn
+                || !self
+                    .storage
+                    .verify_copy_chunk(
+                        &build_id,
+                        item.sequence,
+                        &CopyChunk {
+                            data: item.data.clone().into(),
+                        },
+                    )
+                    .await
+                    .map_err(runtime_status)?
+            {
+                return Err(Status::failed_precondition(
+                    "invalid durable copy acknowledgement",
+                ));
+            }
             if self.generation() != generation
                 || self
                     .context
@@ -2122,11 +2168,14 @@ impl StatelessReplicator {
         } else {
             if !build.copy_finished {
                 let progress = self
-                    .storage
-                    .finish_copy(
-                        &build_id,
-                        build.replication_boundary_lsn,
-                        build.replication_boundary_lsn,
+                    .streams
+                    .deliver(
+                        OperationMetadata::CopyComplete {
+                            build_id: build_id.clone(),
+                            up_to_lsn: build.replication_boundary_lsn,
+                            committed_lsn: build.replication_boundary_lsn,
+                        },
+                        bytes::Bytes::new(),
                     )
                     .await
                     .map_err(runtime_status)?;
@@ -2143,8 +2192,14 @@ impl StatelessReplicator {
                         "build authority changed during copy completion",
                     ));
                 }
-                if progress.applied_lsn < build.replication_boundary_lsn
-                    || progress.committed_lsn < build.replication_boundary_lsn
+                if progress.applied_lsn != build.replication_boundary_lsn
+                    || progress.committed_lsn != build.replication_boundary_lsn
+                    || progress
+                        != self
+                            .storage
+                            .durable_progress()
+                            .await
+                            .map_err(runtime_status)?
                 {
                     return Err(Status::failed_precondition(
                         "copy completion did not reach the frozen boundary",
@@ -2153,24 +2208,35 @@ impl StatelessReplicator {
                 build.copy_finished = true;
             }
             if !item.final_item && item.lsn > build.replication_boundary_lsn {
-                let operation = Operation {
-                    lsn: item.lsn,
-                    committed_lsn: item.committed_lsn.saturating_sub(1),
-                    data: item.data.clone().into(),
-                };
+                if Some(item.lsn) != build.retained_lsn.checked_add(1) {
+                    return Err(Status::failed_precondition("retained build LSN has a gap"));
+                }
                 let progress = self
-                    .storage
-                    .apply(operation)
+                    .streams
+                    .deliver(
+                        OperationMetadata::Replication {
+                            lsn: item.lsn,
+                            committed_lsn: item.committed_lsn,
+                        },
+                        item.data.clone().into(),
+                    )
                     .await
                     .map_err(runtime_status)?;
-                if progress.applied_lsn < item.lsn {
+                if progress.applied_lsn != item.lsn
+                    || progress.committed_lsn != item.committed_lsn
+                    || progress.committed_lsn > progress.applied_lsn
+                    || progress
+                        != self
+                            .storage
+                            .durable_progress()
+                            .await
+                            .map_err(runtime_status)?
+                {
                     return Err(Status::failed_precondition(
                         "retained build operation was not durable",
                     ));
                 }
-                let progress = self
-                    .storage
-                    .commit(item.committed_lsn)
+                self.verify_retained_payload(item.lsn, item.data.as_slice())
                     .await
                     .map_err(runtime_status)?;
                 if self.generation() != generation
@@ -2191,6 +2257,7 @@ impl StatelessReplicator {
                         "retained build operation was not committed",
                     ));
                 }
+                build.retained_lsn = item.lsn;
             }
             build.catch_up_boundary_lsn = item.catch_up_boundary_lsn;
             build.next_sequence = build.next_sequence.saturating_add(1);
@@ -2229,7 +2296,9 @@ impl StatelessReplicator {
                 ));
             }
             if item.final_item {
-                if item.catch_up_boundary_lsn != Some(item.lsn) || progress.committed_lsn < item.lsn
+                if item.catch_up_boundary_lsn != Some(item.lsn)
+                    || item.lsn != build.retained_lsn
+                    || progress.committed_lsn < item.lsn
                 {
                     return Err(Status::failed_precondition(
                         "build final admission precedes retained gap closure",
@@ -2425,6 +2494,7 @@ impl Replicator for StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         let mut state = self.state.lock().await;
         if role == ReplicaRole::None {
             state.role = role;
@@ -2484,6 +2554,7 @@ impl Replicator for StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         let previous_epoch_last_lsn = self.reconcile_provider_committed_tail().await?;
         self.provider
             .update_epoch(epoch, previous_epoch_last_lsn)
@@ -2513,6 +2584,7 @@ impl Replicator for StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         let owner = self
             .listener
             .lock()
@@ -2807,6 +2879,7 @@ impl StatelessReplicator {
         self.revoke_inbound_effects().await?;
         let _drain = self.write_gate.lock().await;
         let _effect_drain = self.provider_effect_gate.lock().await;
+        self.streams.drain().await;
         self.reconcile_provider_committed_tail().await?;
         let mut state = self.state.lock().await;
         if state.role != local_role
@@ -3033,6 +3106,10 @@ impl proto::replication_data_server::ReplicationData for ReplacementReplicationS
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();
         engine.inbound_descendants.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = sender.closed() => {},
+                _ = async {
             while let Some(item) = incoming.next().await {
                 let result = match item {
                     Ok(item) => task_engine.accept_replication(item).await,
@@ -3041,6 +3118,8 @@ impl proto::replication_data_server::ReplicationData for ReplacementReplicationS
                 if sender.send(result).await.is_err() {
                     break;
                 }
+            }
+                } => {},
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
@@ -3058,6 +3137,10 @@ impl proto::replication_data_server::ReplicationData for ReplacementReplicationS
         let (sender, receiver) = tokio::sync::mpsc::channel(16);
         let task_engine = engine.clone();
         engine.inbound_descendants.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = sender.closed() => {},
+                _ = async {
             while let Some(item) = incoming.next().await {
                 let result = match item {
                     Ok(item) => task_engine.accept_copy(item).await,
@@ -3066,6 +3149,8 @@ impl proto::replication_data_server::ReplicationData for ReplacementReplicationS
                 if sender.send(result).await.is_err() {
                     break;
                 }
+            }
+                } => {},
             }
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))

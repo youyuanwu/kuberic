@@ -211,6 +211,8 @@ public-path documented impl crate::replicator::stream::OperationSender::async fn
 public-path documented impl crate::replicator::stream::OperationSender::fn close (& self)
 public-path documented impl crate::replicator::stream::OperationStream::async fn get_operation (& mut self) -> Result < Option < StreamOperation > >
 public-path documented impl crate::replicator::stream::OperationStream::fn channel (capacity : usize) -> (OperationSender , Self)
+public-path documented impl crate::replicator::stream::StreamOperation::async fn apply_to (& self , storage : & dyn crate :: engine :: DurableState ,) -> Result < DurableApplicationProgress >
+public-path documented impl crate::replicator::stream::StreamOperation::async fn execute < T > (& self , effect : impl Future < Output = Result < T > >) -> Result < T >
 public-path documented impl crate::replicator::stream::StreamOperation::fn acknowledge (self , progress : DurableApplicationProgress) -> Result < () >
 public-path documented impl crate::replicator::stream::StreamOperation::fn reject (self , error : RuntimeError) -> Result < () >
 public-path documented module crate::application
