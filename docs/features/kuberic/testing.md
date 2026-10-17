@@ -8,7 +8,7 @@ adds native-source/test-vector mapping and a future behavior/capability matrix:
 persisted/volatile services, service-owned primary commit, receiver lifetimes,
 progress/quorum/status, terminal outcomes and real tonic retry/reconnect/
 backpressure scenarios. Existing KSF inventory and current-contract regressions do
-not establish complete native parity. P1's expected-scenario inventory is now
+not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. Preserve
 safety outcomes while revising assertions that encode intentionally different
@@ -38,13 +38,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 376 |
+| ordinary | 369 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **422** |
+| **total** | **415** |
 
-Ordinary partition counts are `94, 94, 94, 94`. PostgreSQL partition counts
+Ordinary partition counts are `93, 92, 92, 92`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -65,20 +65,17 @@ profile rather than an ad-hoc highly parallel `cargo test` invocation.
 ### SF V1 P1 Foundation
 
 ```bash
-cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
-  --test-threads 1 --test sf_v1_foundation
+scripts/check_runtime_public_api.sh
 ```
 
-Seven ordinary tests validate the
-[native-derived expectation inventory/oracle](sf-v1-port-ledger.md): 11 source
-families, 15 contract mappings, 33 deterministic scenario vectors and 29
-capability/settings cases. These execute fixture/predicate checks, **not** a
-ported or native replicator. Source-derived role/transport/lifecycle vectors
-remain inventory where no executable predicate exists. The existing 16 KSF
-entries remain structural/current-contract evidence, with no new KSF ID or
-native-parity claim. The new binary is automatically ordinary-tier and included
-in the all-features reusable archive; it needs neither native source nor Cargo
-at execution time.
+P1 adds source-backed acceptance scenarios in the
+[port ledger](sf-v1-port-ledger.md): 11 source families, 15 contract mappings,
+33 deterministic scenarios and 29 capability/settings cases. They are
+documented expectations for future tests of actual ported components, not new
+ordinary tests or executable formula checks. The strengthened existing external
+API fixture above checks real protected-interface compatibility. The existing
+16 KSF entries remain structural/current-contract evidence; no new KSF ID or
+native-parity claim is introduced.
 
 The separate current-engine counterexample selection is:
 
@@ -91,8 +88,8 @@ cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
 These three existing real-engine tests preserve current held-ACK/held-local-
 commit and contained-Close assertions. They do not execute expected native
 algorithms. Five further current-source counterexamples in the ledger remain
-source-only. Memory fixtures prove ordering, not fsync. The strengthened
-existing external API fixture pins Bytes, boxed `Stream<Item = Result<Bytes>>
+source-only. Memory-backed current-engine witnesses prove ordering, not fsync.
+The strengthened existing external API fixture pins Bytes, boxed `Stream<Item = Result<Bytes>>
 + Send`, i64 and all protected methods; it remains one of the **existing two**
 build-only guards run by `scripts/check_runtime_public_api.sh`, not a new
 ordinary or archive-only Cargo invocation.

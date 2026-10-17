@@ -2,11 +2,9 @@
 
 ## Selected upstream and license
 
-The P1 [port ledger](sf-v1-port-ledger.md) and
-[test-private expected scenarios](../../../kuberic-runtime/tests/support/sf_v1_vectors.rs),
-with selected assertions in
-[`sf_v1_foundation.rs`](../../../kuberic-runtime/tests/sf_v1_foundation.rs),
-derive from Microsoft Service Fabric at immutable commit
+The P1 [port ledger](sf-v1-port-ledger.md), including its documented acceptance
+scenarios and selected native test expectations, derives from Microsoft Service
+Fabric at immutable commit
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`](https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d).
 The authorized reference checkout was reviewed read-only and clean at that pin.
 No native binary or native test was run. No native production implementation,
@@ -24,18 +22,18 @@ Kuberic's root license and existing API-documentation notices are unchanged.
 
 ## Concrete material register
 
-`R/` is `src/prod/src/Reliability/Replication/`. Every scenario's exact
-production source path/range is recorded in
-[`SCENARIOS`](../../../kuberic-runtime/tests/support/sf_v1_vectors.rs); the
-[ledger](sf-v1-port-ledger.md#deterministic-scenario-inventory) supplies immutable
-source links. The listed selected native files' copyright headers identify
-Microsoft MIT. This register includes translated test material, not just
-production algorithm descriptions.
+`R/` is `src/prod/src/Reliability/Replication/`. The
+[ledger](sf-v1-port-ledger.md#deterministic-scenario-inventory) records each
+scenario's source ranges and immutable links. The listed selected native files'
+copyright headers identify Microsoft MIT. This register covers documented native
+test expectations, not just production algorithm descriptions. The scenarios
+are acceptance criteria for future actual component tests, not translated
+executable tests or checks of a locally redefined formula.
 
 | Material selected / vectors | Exact native test source and case where translated | Transformation / what is not incorporated |
 |---|---|---|
 | Enqueue/assignment and API error A1 | `R/PublicApi.Test.cpp:454–504`, `BeginReplicateReturnsSOKIfAsyncOperationFails`; production `ReplicationQueueManager.cpp:369–408`, `ReplicaManager.cpp:349–390` | Preserve Begin S_OK / End NotPrimary expected split; chosen numeric progress10/11/full12 from production, not native test constants |
-| Gap/contiguous queue Q1 | `R/OperationQueue.Test.cpp:1049–1095`, `TestOutOfOrderOperations1/2` ancestry | Reduce randomized 1024-item permutations to fixed receive2,1 / ACK2,1; no random/Boost fixture copied |
+| Gap/contiguous queue Q1 | `R/OperationQueue.Test.cpp:1049–1095`, `TestOutOfOrderOperations1/2` ancestry | Document a fixed receive2,1 / ACK2,1 expectation reduced from randomized 1024-item permutations; no queue, predicate implementation or random/Boost fixture copied |
 | Memory retention Q2 | `R/OperationQueue.Test.cpp:435–461`, `TestEnqueueOperationsWithMemoryLimit`; production `OperationQueue.cpp:256–318` | Selected 4×100, retained100, reject301/accept100 assertions; production-derived add300 neighbor evicts completed100 and totals600; sufficient count growth, no pending-suffix drop; no C++ queue/harness |
 | Commit-before-complete Q3 | `R/OperationQueue.Test.cpp:607–615`, `TestCompleteBeforeCommit` | Selected false/true assertions; empty retained capability100→0 is separate production-derived scenario |
 | Secondary trim Q4 | `R/OperationQueue.Test.cpp:867–901`, `TestSecondaryQueueTrim`; duplicate production `OperationQueue.cpp:371–399` | Selected completed-head sequence and count/history limits; no ring/allocator implementation |
@@ -44,7 +42,7 @@ production algorithm descriptions.
 | Full-copy cancellation C3 | `R/CopyAsyncOperation.Test.cpp:418–449`, `CopyAsync_QueueFull_Cancelled`; production `CopyAsyncOperation.cpp:42–49`, `SecondaryCopyReceiver.cpp:388–395` | Native 15/15/4 and cancel-at12 identified; P1 reduced full/parked/cancel outcome, not complete replay; copy count limits with no maximum-memory limit |
 | Demux T1 | `R/ReplicationTransport.Test.cpp:594–617`, `TestDropMessageToNotMatch` | Routing assertions only; remove sockets and Sleep(100); incarnation scenario derived separately from production session lookup |
 | Batched health H3 | `R/BatchedHealthReporter.Test.cpp:107–135`, `TestWarningsWithinIntervalReport` | Temp2/latest warning and total2 after Close preserved; timer fire is named input, not sleep or SF report sink |
-| Production-derived scenarios M2–M5, S1–S3, R2–R3, C1–C2, C4–C6, T2, D1, L1–L3, E1–E2, H1–H2 | Exact production paths/ranges in each fixture/ledger row: queue/manager, secondary/receiver/stream, session/sender/ACK, copy/establishment, facade/settings, headers, RA lifecycle/access | Small chosen deterministic inputs and expected observations; not wholesale native tests or executed state machines |
+| Production-derived scenarios M2–M5, S1–S3, R2–R3, C1–C2, C4–C6, T2, D1, L1–L3, E1–E2, H1–H2 | Exact production paths/ranges in the ledger: queue/manager, secondary/receiver/stream, session/sender/ACK, copy/establishment, facade/settings, headers, RA lifecycle/access | Documented deterministic inputs and expected observations; not executable formula checks, wholesale native tests or executed state machines |
 | Capability/settings cases | `ComReplicator.h:12–35`; `ComReplicator.cpp:53–83,490–808,1002–1118`; `ComOperationStream.h:12–24`, `.cpp:48–78`; `OperationStream.cpp:66–85`; `reconfig.h:12–17`; `src/prod/src/ServiceModel/reliability/replication/REConfigMacros.h:136–207`; public `FabricTypes.idl:2910–2960` | Classification/default/update facts including legacy flags/EX3 precedence; managed Buffer/Count validation, no attributed Offset bounds check; no COM ABI, credentials implementation or settings parser copied |
 | Protected resolved fixtures | Existing Kuberic `application.rs:31–37`, protected traits and external positive/privacy infrastructure | Kuberic-authored compiler identities and trait implementations; no native segmented codec or COM implementation |
 

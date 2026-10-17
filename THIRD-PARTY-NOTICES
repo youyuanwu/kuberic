@@ -1,19 +1,17 @@
 Third-Party Notices
 ===================
 
-Service Fabric classic V1 foundation vectors and source ledger
--------------------------------------------------------------
+Service Fabric classic V1 source and scenario ledger
+---------------------------------------------------
 
-The source-derived expected scenarios and selected translated native test
-assertions in kuberic-runtime/tests/support/sf_v1_vectors.rs and
-kuberic-runtime/tests/sf_v1_foundation.rs, and their explanatory tables in
-docs/features/kuberic/sf-v1-port-ledger.md, derive from Microsoft Service Fabric
-at commit 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
+The source-derived acceptance scenarios and selected native test expectations
+documented in docs/features/kuberic/sf-v1-port-ledger.md derive from Microsoft
+Service Fabric at commit 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.
-The selected production/test material, exact source references, translation
+The selected production/test material, exact source references, adaptation
 changes and third-party boundaries are recorded in
 docs/features/kuberic/sf-v1-port-provenance.md. No native implementation binary,
 Boost test harness or Common/Transport/KTL dependency source is incorporated.

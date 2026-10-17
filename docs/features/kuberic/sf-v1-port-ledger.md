@@ -19,27 +19,29 @@ These statuses apply to **every family, contract and scenario row** below:
 | Port implementation/review | **pending P2+ / no component implementation to review** |
 | Native binary/test execution | **not run** |
 | Ported component execution / native differential comparison | **not implemented / not run** |
-| P1 fixture execution | ordinary expectation-validator tests, not native behavior execution |
+| P1 compiler guards | existing external API fixture pins the protected resolved interfaces; no new replicator behavior tests |
 | Current-engine execution | only separately named existing Rust witnesses, below |
 | KSF | existing structural/current-contract evidence, not native parity |
 
-The [test-private data](../../../kuberic-runtime/tests/support/sf_v1_vectors.rs)
-contains **11 families, 15 contracts, 33 scenario vectors, 29 capability/settings
-cases and 8 current-evidence entries**. The
-[ordinary oracle](../../../kuberic-runtime/tests/sf_v1_foundation.rs) has seven
-tests: structural completeness/evidence separation; direct catch-up predicate
-slices; selected queue/sender expected assertions; ACK/default/exposure policies;
-copy expected gates; and buffer-shape distinctions. Fixed traces are expectations,
-not an independently implemented native engine. Not every inventoried transition
-has an executable predicate: role/epoch/full lifecycle, transport, retry scheduling
-and most capability behavior remain expected-vector inventory pending P2+.
-No timing sleeps, native checkout dependency, wire codec or queue simulator is
-needed to execute these fixtures, including from an archive.
+This document records **11 families, 15 contracts, 33 acceptance scenarios,
+29 capability/settings cases and 8 current-evidence entries**. The scenarios
+are source-backed inputs and expected observations for future component tests,
+not executable behavior coverage. P2+ tests must invoke the actual ported
+queue, sender, session and other components against these expectations.
+Tests that only compare these descriptions, constants or locally defined
+formulas do not establish replicator correctness and are not retained.
+
+The strengthened existing
+[external compiler fixture](../../../kuberic-runtime/tests/fixtures/public_api.rs)
+checks real protected-interface compatibility. Existing current-engine witnesses
+remain separately identified below; neither those witnesses nor the compiler
+fixture establishes native or ported-engine parity.
 
 The [provenance register](sf-v1-port-provenance.md) identifies selected
 translations, changes and notices. Source citations below are pinned. `R/`
-means `src/prod/src/Reliability/Replication/` in that repository; exact ranges
-also live alongside each fixture, including additional supporting sources.
+means `src/prod/src/Reliability/Replication/` in that repository. Sources and
+selected native test cases are recorded in the tables below and the provenance
+register.
 
 ## Source families, transitions and substitutions
 
@@ -88,7 +90,7 @@ its named families, not an assertion that the contract is implemented.
 **D** = selected native test assertions translated/simplified; **S** =
 production-source-derived small scenario. D does not mean the entire upstream
 test/harness was ported. All are source-reviewed expected vectors; sources and
-named native cases are preserved in the linked Rust data and provenance table.
+named native cases are preserved in this ledger and the provenance table.
 
 | ID / derivation | Fixed input/actions → expected native observations | Native evidence |
 |---|---|---|

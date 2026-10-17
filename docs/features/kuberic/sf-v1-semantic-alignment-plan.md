@@ -6,6 +6,9 @@
 The separately delivered [P1 foundation ledger](sf-v1-port-ledger.md) and
 [provenance/notices](sf-v1-port-provenance.md) record source-derived scenarios
 and protected-type guards, not ported engine behavior or complete alignment.
+Scenarios remain documented acceptance criteria until tests can exercise the
+actual ported components; checking a locally redefined formula is not behavior
+coverage.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
