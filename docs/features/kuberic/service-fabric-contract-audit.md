@@ -185,7 +185,7 @@ Runtime exact capability admission is not relaxed. The built-in regression
 path is **true/WriteQuorum**, not a downgrade to false/All.
 
 **Regression evidence:** The five real-stack journeys listed under SF-05
-passed in ordinary run `7193207a-f265-4c5c-856c-17e517072aec` (331/331).
+passed in ordinary run `67074f25-598e-4f16-8fad-7c53cdcc2584` (336/336).
 Their shared real hosted KV/built-in path explicitly asserts `Some(true)`
 (`kuberic-level-tests/src/in_process/journeys.rs:1253-1269`), submits the
 production planner's swap, and completes data-preserving handoff. This is
@@ -223,7 +223,7 @@ relax the engine's role comparison.
 
 **Regression evidence:** All five existing
 `kuberic-level-tests` `in_process::journeys::` cases passed in final serial
-ordinary run `7193207a-f265-4c5c-856c-17e517072aec`:
+ordinary run `67074f25-598e-4f16-8fad-7c53cdcc2584`:
 
 - `specification_switchover_preserves_data_and_fences_old_writer`
 - `switchover_recreation_after_catch_up_resumes_accepted_handoff`
@@ -415,9 +415,12 @@ successful permanently empty delivery handles. Preserve protected interfaces.
 **Resolution — Fixed:** Local production revision
 `284a46fce46e0c94d6b3255c75e24273c79e7c06`
 (`fix(runtime): honor service operation delivery and durable acknowledgements`).
+Final-review corrections are in
+`30953372ab15021f40971229b0b4bec6c404c5fe`
+(`fix(runtime): fence copy replay proofs and cancelled effect admission`).
 Built-in ingress now delivers through `ServiceStreams` and waits for durable
-service ACK (`kuberic-runtime/src/replicator/stream.rs:314-329`;
-`kuberic-runtime/src/replicator/stateless/mod.rs:1073-1136,2120-2327`).
+service ACK (`kuberic-runtime/src/replicator/stream.rs:329-344`;
+`kuberic-runtime/src/replicator/stateless/mod.rs:1105-1168,2099-2417`).
 CopyComplete, including empty snapshots, is explicit; retained catch-up
 requires acknowledged contiguous LSNs and an exact terminal boundary.
 Post-ACK checks verify actual durable progress and exact payload/history
@@ -425,19 +428,21 @@ under current authority. Queueing or physical persistence before explicit
 ACK cannot complete ingress or publish successful receiver progress.
 
 The optional service-invoked `apply_to`/`execute` helpers
-(`replicator/stream.rs:72-160`) cover apply, duplicate-byte verification,
+(`replicator/stream.rs:74-176`) cover apply, duplicate-byte verification,
 requested commitment, cancellation and actual-effect drainage. KV/SQLite
 consumers explicitly ACK/reject those results
 (`examples/kvstore2/src/service.rs:216-233`;
-`examples/sqlite/src/service.rs:347-360`). There is no automatic factory
+`examples/sqlite/src/service.rs:390-403`). There is no automatic factory
 consumer or double-apply receiver fallback. Primary-local apply/commit
 ownership is unchanged.
 
-**Regression evidence:** Eleven real hosted factory/service tests in
-`kuberic-runtime/tests/public_v1_recovery.rs:1463-2328` passed in final
-ordinary run `7193207a-f265-4c5c-856c-17e517072aec`:
+**Regression evidence:** Thirteen real hosted factory/service tests in
+`kuberic-runtime/tests/public_v1_recovery.rs:1480-2488` passed in final
+ordinary run `67074f25-598e-4f16-8fad-7c53cdcc2584`:
 
 - `hosted_operation_stream_copy_and_completion_wait_for_durable_ack`
+- `hosted_operation_stream_live_final_requires_exact_sequence_and_copy_complete_ack`
+- `hosted_operation_stream_copy_complete_requires_verified_existing_suffix`
 - `hosted_operation_stream_replication_waits_for_durable_ack`
 - `hosted_operation_stream_duplicate_commit_advancement_reaches_service`
 - `hosted_operation_stream_reject_drop_and_invalid_ack_do_not_complete`
@@ -457,12 +462,27 @@ effect drainage. MemoryState proves sequencing, not fsync.
 Real KV/SQLite `stream_replication_commits_without_reapplying_duplicate_payload`
 tests count provider apply/commit calls and inspect persisted records
 (`examples/kvstore2/src/service.rs:375-451`;
-`examples/sqlite/src/service.rs:420-474`).
+`examples/sqlite/src/service.rs:463-517`).
 SQLite `stream_cancellation_after_durable_apply_does_not_commit` verifies
-cancellation plus stream closure against the real paused provider (`:369-415`).
-All passed in the targeted 52-test recovery/provider/stream run and the final
-331-test ordinary run. Cancellation does not promise rollback; this closure
+cancellation plus stream closure against the real paused provider (`:412-458`).
+All passed in the final focused 26-test selection and the final 336-test
+ordinary run. Cancellation does not promise rollback; this closure
 does not resolve the distinct SF-15 trait-Close task-join finding.
+
+The correction tests reproduce the cancellation-admission race and malformed
+old-sequence terminal bypass before fixing them. Deterministic same-poll
+request/close races verify under-lease admission checks
+(`replicator/stream.rs:379-439`). Terminal-negative tests prove no receipt
+appears before a real CopyComplete ACK, including contradictory flags.
+Real SQLite `sqlite_operation_stream_copy_preserves_verified_uncommitted_suffix`
+uses the Default factory, TCP ingress, actual service streams and persisted
+WAL/snapshot data (`examples/sqlite/tests/replacement_construction.rs:269-862`).
+Truthful `(2,1)` and `(3,1)` targets retain their intact suffixes over copy,
+then individually ACK retained frames without a second apply. AfterCommit
+rejection may leave physical commitment ahead: acknowledged build commitment
+separately bounds replay admission, replies, and terminal receipts
+(`stateless/mod.rs:2140-2149,2209-2323,2334-2417`).
+Exact retry with a held fresh service ACK is required to restore those proofs.
 
 ### SF-15: KV Close does not join owned consumers
 
@@ -585,7 +605,7 @@ conformance catalog or controller completion fakes as blanket proof.
 
 ### Resolution Verification
 
-Final state, run `7193207a-f265-4c5c-856c-17e517072aec`:
+Final state, run `67074f25-598e-4f16-8fad-7c53cdcc2584`:
 
 ```sh
 cargo nextest run -p kuberic-runtime -p kuberic-controller \
@@ -593,23 +613,30 @@ cargo nextest run -p kuberic-runtime -p kuberic-controller \
     --all-features --profile ordinary --test-threads 1
 ```
 
-**331 passed, 4 skipped**, 555.581 seconds, including all named regressions
-above. Final targeted recovery/provider/stream selection: **52 passed**
-(`c3ed69bd-ac9a-4383-8f26-0e65f46f580f`).
+**336 passed, 4 skipped**, 580.588 seconds, including all named regressions
+above. Final focused contract/provider selection: **26 passed**, 63.106s
+(`0ecd1799-4e5f-45b3-ac45-759c6837a712`).
+Earlier Phase 1 runs passed 331 ordinary and 52 recovery/provider/stream
+tests; these precede the final-review corrections and are not substituted
+for the final-state runs.
 Workspace format/check/all-features clippy with warnings denied, doctests
 (2), source API inventory (4), privacy (1), and executable built-in
-conformance (1; `just nextest-build-only`) passed.
+conformance (1; `just nextest-build-only`, run
+`f0fc49cc-47f4-4577-9a10-8e5fe8305f0d`, 71.074s) passed.
 
 The approved `just nextest-postgres-smoke` passed **8 tests** (run
 `00cd4814-b216-4cdf-b3c7-3437d1c27aac`, 116.480 seconds) with
 `KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR=/tmp`. An initial long checkout-local socket
 root failed all eight before readiness; the standard short root resolved
 that environment limit. Earlier ordinary iterations exposed retry, retained
-boundary, and primary-report regressions; they were corrected before the
-final passing runs. These results do not close unrelated PostgreSQL findings.
+boundary, and primary-report regressions. Final Astra review additionally
+found the admission race, malformed terminal bypass, and real SQLite suffix
+regression; all were corrected and reviewed before the definitive passing
+runs. These results do not close unrelated PostgreSQL findings.
 
-Exact inventory validation measured **377 = 331 ordinary + 41 PostgreSQL +
+Exact inventory validation measured **382 = 336 ordinary + 41 PostgreSQL +
 3 KinD live + 2 build-only**; all tier lists and configured partition unions
-passed. Full PostgreSQL, live KinD, and archive rebuild were not executed.
+passed (ordinary slices `84,84,84,84`; PostgreSQL hashes `11,13,8,9`).
+Full PostgreSQL, live KinD, and archive rebuild were not executed.
 SF-14's implementation revision is local; no push, PR, or merge was performed
 as part of this resolution.

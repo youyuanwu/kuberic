@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 331 |
+| ordinary | 336 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **377** |
+| **total** | **382** |
 
-Ordinary partition counts are `83, 83, 83, 82`. PostgreSQL partition counts
+Ordinary partition counts are `84, 84, 84, 84`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -56,16 +56,20 @@ profile rather than an ad-hoc highly parallel `cargo test` invocation.
 ```bash
 cargo nextest run -p kuberic-runtime -p kvstore2 -p sqlite-replicated \
   --all-features --profile ordinary --test-threads 1 \
-  -E 'test(hosted_operation_stream_) or test(stream_)'
+  -E 'test(hosted_operation_stream_) or test(stream_) or test(sqlite_operation_stream_copy_preserves_verified_uncommitted_suffix)'
 ```
 
-Eleven hosted factory/service tests hold real copy, copy-complete, active and
+Thirteen hosted factory/service tests hold real copy, copy-complete, active and
 retained replication operations. They cover delayed durable ACK, duplicate
 commitment, rejection/drop/invalid history, exact retries, cancellation,
 authority/role/epoch/configuration fencing, synchronous-effect drainage,
 shutdown without consumers, and primary-local no-redelivery. Memory-backed
 hosted tests prove sequencing, not fsync; real KV/SQLite consumer tests verify
 durable commitment without duplicate application and SQLite cancellation.
+Deterministic admission-race tests complement hosted active-effect drainage.
+A real SQLite factory/service build preserves an intact uncommitted suffix
+over copy, verifies per-frame ACK/retry without reapplication, and prevents
+post-commit rejection from supplying successful replay or terminal proof.
 
 ### In-Process Controller/Application Journeys
 

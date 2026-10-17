@@ -78,6 +78,12 @@ commitment before returning; it never ACKs implicitly. A duplicate may need
 commit without another apply. Custom persistence can use `execute` for the
 same cancellation/drain accounting, but must make its own durable assertion.
 
+Copy may preserve an existing intact retained suffix. A truthful larger
+CopyComplete progress is accepted only with bounded, contiguous durable
+history proof; each retained frame still needs its own validated service ACK.
+Physical commitment after rejection is not acknowledged commitment: replay
+replies and terminal receipts cannot credit it.
+
 Cancellation invalidates queued work, active cooperative effects, and late
 ACKs. Service effects must stay inside the execution lifetime, not detach.
 Successor admission and graceful close drain actual active effects; synchronous
@@ -91,8 +97,8 @@ can prove historical replay without reapplying. The exact zero-LSN
 empty-history probe has no application payload. Neither exception permits
 fresh work to bypass service ACK or stale authority to succeed.
 
-Implementation references: `replicator/stream.rs:72-160`,
-`replicator/stateless/mod.rs:1073-1136,2120-2327`, and
+Implementation references: `replicator/stream.rs:74-176`,
+`replicator/stateless/mod.rs:1105-1168,2099-2417`, and
 `host/hosting.rs:71-84` under `kuberic-runtime/src/`.
 
 ## Data Loss and History
