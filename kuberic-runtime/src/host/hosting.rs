@@ -1081,6 +1081,39 @@ impl PartitionAccessView for HostAccessView {
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
+    async fn replacement_build_storage_is_current(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<bool> {
+        let state = self
+            .bridge()
+            .await?
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let Some(preview) = state.public_v1_operation_state else {
+            return Ok(false);
+        };
+        let attempt = &authority.attempt;
+        let storage = if state.identity.local_identity == attempt.source {
+            &attempt.source_storage
+        } else if state.identity.local_identity == attempt.target {
+            &attempt.target_storage
+        } else {
+            return Ok(false);
+        };
+        Ok(state.identity.resource_uid == attempt.resource_uid
+            && preview.history.as_ref() == Some(&authority.history)
+            && preview.storage_incarnation.as_ref() == Some(storage)
+            && !preview
+                .retired_storage_incarnations
+                .contains(&attempt.source_storage)
+            && !preview
+                .retired_storage_incarnations
+                .contains(&attempt.target_storage))
+    }
+
     fn release_provider_writer(&self) {
         if let Some(host) = self.host.upgrade()
             && let Some(registered) = host.registered.get()

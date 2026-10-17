@@ -1232,6 +1232,7 @@ impl AuthorizedHostedPair {
             2,
         );
         proto::ReplicationItem {
+            completed_build: None,
             protocol_version: 11,
             sender: Some(self.primary.identity.clone().into()),
             receiver: Some(self.secondary.identity.clone().into()),
@@ -1322,6 +1323,212 @@ struct StreamBuildFixture {
 }
 
 impl StreamBuildFixture {
+    async fn build_from_source(&mut self, concurrent_suffix: bool) {
+        self.authority.operation_revision = 4;
+        self.target
+            .handle()
+            .install_public_v1_inbound_build_authority(&self.authority)
+            .await
+            .unwrap();
+        let preview = PublicV1Identity::new(401);
+        let authority = &self.authority;
+        if self.source.state.progress.lock().unwrap().committed_lsn > 0 {
+            self.source
+                .state
+                .copy_chunks
+                .lock()
+                .unwrap()
+                .push(Bytes::from_static(b"snapshot-bytes"));
+        }
+        let program = PublicOperationProgram::Build(PublicBuildInput {
+            attempt: authority.attempt.build_id.clone(),
+            epoch: authority.attempt.epoch,
+            current_configuration_id: Some(authority.current_configuration_id.clone()),
+            replica: authority.attempt.target.clone(),
+            target_storage: authority.attempt.target_storage.clone(),
+            process_session_id: authority.attempt.target_session.clone(),
+            replication_address: authority.target_address.clone(),
+            history: Some(authority.history.clone()),
+        });
+        let build_intent = intent(
+            &preview,
+            self.source.handle().process_session_id(),
+            authority.operation_revision,
+            authority.operation_id.as_str(),
+            program,
+        );
+        if concurrent_suffix {
+            self.source.state.block_copy();
+            let entered = self.source.state.copy_entered.notified();
+            let mut build = tokio::spawn({
+                let handle = self.source.handle();
+                async move { handle.execute_public_v1(build_intent).await }
+            });
+            tokio::select! {
+                _ = entered => {}
+                result = &mut build => panic!("build did not wait for copy: {result:?}"),
+            }
+            assert_eq!(
+                self.source
+                    .application
+                    .replicate(Bytes::from_static(b"suffix"))
+                    .await
+                    .unwrap(),
+                2
+            );
+            self.source.state.release_copy.notify_one();
+            build.await.unwrap().unwrap();
+        } else {
+            self.source
+                .handle()
+                .execute_public_v1(build_intent)
+                .await
+                .unwrap();
+        }
+        assert!(self.terminal_receipt().is_some());
+    }
+
+    async fn activate(&self, progress: i64) {
+        let preview = PublicV1Identity::new(401);
+        let epoch = self.authority.attempt.epoch;
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            self.source.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: self.source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: self.target.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        self.target
+            .handle()
+            .execute_public_v1(intent(
+                &preview,
+                self.target.handle().process_session_id(),
+                5,
+                "sf10-activate",
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ))
+            .await
+            .unwrap();
+        for (local, remote, role) in [
+            (&self.target, &self.source, ReplicaRole::Primary),
+            (&self.source, &self.target, ReplicaRole::ActiveSecondary),
+        ] {
+            local
+                .handle()
+                .execute_public_v1(intent(
+                    &preview,
+                    local.handle().process_session_id(),
+                    6,
+                    "sf10-configuration",
+                    PublicOperationProgram::Configuration(PublicConfiguration {
+                        current: configuration.clone(),
+                        previous: None,
+                        replicas: vec![PublicReplicaDescriptor {
+                            build_id: OperationId::default(),
+                            identity: remote.identity.clone(),
+                            replication_address: format!("http://{}", remote.address),
+                            process_session_id: remote.handle().process_session_id(),
+                            storage_incarnation: Some(remote.storage.clone()),
+                            role,
+                            current_progress: progress,
+                            catch_up_capability: 0,
+                            must_catchup: false,
+                        }],
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn catch_up_both(&self) {
+        let primary = self
+            .source
+            .application
+            .primary
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        for mode in [
+            kuberic_runtime::replicator::ReplicaSetQuorumMode::WriteQuorum,
+            kuberic_runtime::replicator::ReplicaSetQuorumMode::All,
+        ] {
+            primary.wait_for_catch_up_quorum(mode).await.unwrap();
+        }
+    }
+
+    fn prefix_proof(&self) -> proto::ReplicationItem {
+        let receipt: kuberic_runtime::protocol::public_operations::PublicInboundBuildReceipt =
+            serde_json::from_value(self.terminal_receipt().unwrap()).unwrap();
+        let terminal = self.frame(
+            receipt.final_sequence,
+            false,
+            true,
+            receipt.replication_boundary_lsn,
+            receipt.catch_up_boundary_lsn,
+        );
+        let configuration = ConfigurationDescriptor::new(
+            self.authority.attempt.epoch,
+            self.source.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: self.source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: self.target.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        proto::ReplicationItem {
+            protocol_version: 11,
+            sender: Some(self.source.identity.clone().into()),
+            receiver: Some(self.target.identity.clone().into()),
+            epoch: Some(self.authority.attempt.epoch.into()),
+            previous_configuration_id: String::new(),
+            current_configuration_id: configuration.configuration_id.to_string(),
+            lsn: receipt.catch_up_boundary_lsn,
+            committed_lsn: receipt.catch_up_boundary_lsn,
+            data: vec![],
+            sender_session_id: self.source.handle().process_session_id().to_string(),
+            receiver_session_id: self.target.handle().process_session_id().to_string(),
+            completed_build: Some(terminal),
+        }
+    }
+
+    async fn send_proof(
+        &self,
+        proof: proto::ReplicationItem,
+    ) -> std::result::Result<proto::ReplicationAck, tonic::Status> {
+        proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{}",
+            self.target.address
+        ))
+        .await
+        .unwrap()
+        .replicate(Request::new(stream::iter([proof])))
+        .await
+        .unwrap()
+        .into_inner()
+        .next()
+        .await
+        .unwrap()
+    }
+
     async fn start(name: &str, default_factory: bool, boundary: i64) -> Self {
         let resource = ResourceUid::new(name);
         let preview = PublicV1Identity::new(401);
@@ -1433,7 +1640,282 @@ impl StreamBuildFixture {
             authority,
         }
     }
+}
 
+#[tokio::test]
+async fn sf10_quiet_snapshot_only_build_activates_and_catches_up_without_writes() {
+    sf10_quiet_snapshot_journey(false).await;
+}
+
+#[tokio::test]
+async fn sf10_quiet_snapshot_only_known_peer_invalid_lsn_catches_up() {
+    sf10_quiet_snapshot_journey(true).await;
+}
+
+async fn sf10_quiet_snapshot_journey(omitted: bool) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for boundary in [0, 1] {
+            let mut fixture = StreamBuildFixture::start("sf10-quiet", false, boundary).await;
+            fixture.build_from_source(false).await;
+            assert!(fixture.target.state.operations.lock().unwrap().is_empty());
+            fixture.activate(if omitted { -1 } else { boundary }).await;
+            fixture.catch_up_both().await;
+            // Neither side needs the operation-shaped snapshot boundary.
+            fixture.source.state.operations.lock().unwrap().clear();
+            fixture.catch_up_both().await;
+            assert_eq!(
+                fixture.source.state.progress.lock().unwrap().committed_lsn,
+                boundary
+            );
+            assert_eq!(
+                fixture.target.state.progress.lock().unwrap().committed_lsn,
+                boundary
+            );
+            assert!(fixture.target.state.operations.lock().unwrap().is_empty());
+            fixture.cleanup().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sf10_snapshot_prefix_preserves_concurrent_and_later_exact_suffix() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for concurrent in [false, true] {
+            let mut fixture = StreamBuildFixture::start("sf10-suffix", false, 1).await;
+            fixture.build_from_source(concurrent).await;
+            fixture.activate(-1).await;
+            if !concurrent {
+                assert_eq!(
+                    fixture
+                        .source
+                        .application
+                        .replicate(Bytes::from_static(b"later-suffix"))
+                        .await
+                        .unwrap(),
+                    2
+                );
+            }
+            fixture.catch_up_both().await;
+            let retained = fixture.target.state.operations.lock().unwrap().clone();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0].lsn, 2);
+            assert_eq!(
+                retained[0].data.as_ref(),
+                if concurrent {
+                    b"suffix".as_slice()
+                } else {
+                    b"later-suffix".as_slice()
+                }
+            );
+            assert_eq!(
+                fixture.target.state.progress.lock().unwrap().committed_lsn,
+                2
+            );
+            if !concurrent {
+                fixture.target.state.operations.lock().unwrap()[0].data =
+                    Bytes::from_static(b"wrong-suffix");
+                assert!(
+                    fixture
+                        .source
+                        .application
+                        .wait_for_write_quorum()
+                        .await
+                        .is_err(),
+                    "snapshot prefix proof hid a mismatching later operation"
+                );
+            }
+            fixture.cleanup().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sf10_live_prefix_proof_is_exact_read_only_and_rejects_stale_identity() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut fixture = StreamBuildFixture::start("sf10-proof", false, 1).await;
+        fixture.build_from_source(false).await;
+        fixture.activate(1).await;
+        let proof = fixture.prefix_proof();
+        let before = (
+            fixture.target.state.apply_calls.load(Ordering::Acquire),
+            fixture.target.state.commit_calls.load(Ordering::Acquire),
+            fixture.target.state.copy_chunks.lock().unwrap().clone(),
+        );
+        for _ in 0..2 {
+            let ack = fixture.send_proof(proof.clone()).await.unwrap();
+            assert_eq!(ack.completed_build, proof.completed_build);
+            assert_eq!(
+                (ack.received_lsn, ack.applied_lsn, ack.committed_lsn),
+                (1, 1, 1)
+            );
+        }
+        let mut invalid = vec![];
+        let mut changed = proof.clone();
+        changed.data = b"not-a-proof".to_vec();
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed.receiver_session_id = "stale-process".into();
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed.current_configuration_id = "stale-configuration".into();
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed
+            .completed_build
+            .as_mut()
+            .unwrap()
+            .history
+            .as_mut()
+            .unwrap()
+            .history_id = "wrong-history".into();
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed.completed_build.as_mut().unwrap().source_storage =
+            Some(storage_proto(&fixture.target.storage));
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed.completed_build.as_mut().unwrap().target_storage =
+            Some(storage_proto(&fixture.source.storage));
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed.completed_build.as_mut().unwrap().build_id = "unknown-copy".into();
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed.completed_build.as_mut().unwrap().sender_session_id = "stale-source".into();
+        invalid.push(changed);
+        let mut changed = proof.clone();
+        changed.completed_build.as_mut().unwrap().lsn = 2;
+        changed.lsn = 2;
+        changed.committed_lsn = 2;
+        invalid.push(changed);
+        for changed in invalid {
+            assert_eq!(
+                fixture.send_proof(changed).await.unwrap_err().code(),
+                tonic::Code::FailedPrecondition
+            );
+        }
+        // A receipt is insufficient if live durable provider progress disappeared.
+        *fixture.target.state.progress.lock().unwrap() = DurableApplicationProgress::default();
+        assert!(fixture.send_proof(proof.clone()).await.is_err());
+        *fixture.target.state.progress.lock().unwrap() = DurableApplicationProgress {
+            applied_lsn: 1,
+            committed_lsn: 1,
+        };
+        // A historical receipt cannot certify a different live history/storage.
+        let connection =
+            rusqlite::Connection::open(SqliteStore::metadata_database_path(&fixture.target.root))
+                .unwrap();
+        let original: String = connection
+            .query_row(
+                "SELECT state_json FROM agent_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for field in ["history", "storageIncarnation"] {
+            let mut state: serde_json::Value = serde_json::from_str(&original).unwrap();
+            let preview = &mut state["publicV1OperationState"];
+            if field == "history" {
+                preview[field]["historyId"] = serde_json::json!("different-live-history");
+            } else {
+                preview[field]["storageGeneration"] = serde_json::json!("different-live-storage");
+            }
+            connection
+                .execute(
+                    "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                    [serde_json::to_string(&state).unwrap()],
+                )
+                .unwrap();
+            assert!(fixture.send_proof(proof.clone()).await.is_err());
+            connection
+                .execute(
+                    "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                    [&original],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        fixture.catch_up_both().await;
+        assert_eq!(
+            before,
+            (
+                fixture.target.state.apply_calls.load(Ordering::Acquire),
+                fixture.target.state.commit_calls.load(Ordering::Acquire),
+                fixture.target.state.copy_chunks.lock().unwrap().clone(),
+            )
+        );
+        assert!(fixture.target.state.operations.lock().unwrap().is_empty());
+        fixture.cleanup().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sf10_delayed_prefix_proof_cannot_succeed_after_source_abort() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut fixture = StreamBuildFixture::start("sf10-source-fence", false, 1).await;
+        fixture.build_from_source(false).await;
+        fixture.activate(-1).await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
+            fixture.source.identity.instance_id.to_string(),
+            {
+                let entered = entered.clone();
+                let release = release.clone();
+                move |_, endpoint| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(endpoint)
+                    })
+                }
+            },
+        )
+        .unwrap();
+        let primary = fixture
+            .source
+            .application
+            .primary
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        let pending = tokio::spawn(async move {
+            primary
+                .wait_for_catch_up_quorum(kuberic_runtime::replicator::ReplicaSetQuorumMode::All)
+                .await
+        });
+        entered.notified().await;
+        fixture
+            .source
+            .application
+            .control
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .abort();
+        release.notify_one();
+        assert!(
+            pending.await.unwrap().is_err(),
+            "delayed genuine proof credited revoked source authority"
+        );
+        drop(route);
+        fixture.cleanup().await;
+    })
+    .await
+    .unwrap();
+}
+
+impl StreamBuildFixture {
     fn frame(
         &self,
         sequence: u64,
@@ -3652,6 +4134,7 @@ async fn replication_ingress_accepts_only_exact_current_primary_in_three_replica
         )
         .await;
         let send = |sender: &HostedMemoryReplica, data: &'static [u8]| proto::ReplicationItem {
+            completed_build: None,
             protocol_version: 11,
             sender: Some(sender.identity.clone().into()),
             receiver: Some(receiver.identity.clone().into()),
@@ -5433,6 +5916,7 @@ async fn hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_ret
         .await
         .unwrap();
         let stale = proto::ReplicationItem {
+            completed_build: None,
             protocol_version: 11,
             sender: Some(primary.identity.clone().into()),
             receiver: Some(retired_identity.into()),
@@ -5720,6 +6204,7 @@ async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matchin
         .await
         .unwrap();
         let stale = kuberic_runtime::control::proto::ReplicationItem {
+            completed_build: None,
             protocol_version: 11,
             sender: Some(primary_identity.clone().into()),
             receiver: Some(secondary_identity.clone().into()),
@@ -8405,6 +8890,7 @@ async fn hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_s
         .await
         .unwrap();
         let stale = proto::ReplicationItem {
+            completed_build: None,
             protocol_version: 11,
             sender: Some(source.identity.clone().into()),
             receiver: Some(target.identity.clone().into()),
@@ -9303,6 +9789,7 @@ async fn hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement() {
         .await
         .unwrap();
         let stale_item = proto::ReplicationItem {
+            completed_build: None,
             protocol_version: 11,
             sender: Some(source.identity.clone().into()),
             receiver: Some(retired_identity.into()),

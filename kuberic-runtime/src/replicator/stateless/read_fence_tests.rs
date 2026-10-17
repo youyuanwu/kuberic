@@ -95,6 +95,12 @@ impl PartitionAccessView for Publication {
     ) -> Result<bool> {
         unreachable!()
     }
+    async fn replacement_build_storage_is_current(
+        &self,
+        _: &PublicInboundBuildAuthority,
+    ) -> Result<bool> {
+        unreachable!()
+    }
     fn release_provider_writer(&self) {}
     async fn report_load(&self, _: Vec<LoadMetric>) -> Result<()> {
         unreachable!()

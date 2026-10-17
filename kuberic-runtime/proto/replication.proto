@@ -17,6 +17,9 @@ message ReplicationItem {
   string sender_session_id = 10;
   string receiver_session_id = 11;
   reserved 12;
+  // Read-only live proof of this exact completed copy prefix, not an operation.
+  // Current replication authority above is separate from original build authority.
+  CopyItem completed_build = 13;
 }
 
 message ReplicationAck {
@@ -32,6 +35,8 @@ message ReplicationAck {
   string sender_session_id = 10;
   string receiver_session_id = 11;
   reserved 12;
+  // Echoed exactly only after live durable prefix validation.
+  CopyItem completed_build = 13;
 }
 
 message CopyItem {
