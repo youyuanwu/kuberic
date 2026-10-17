@@ -68,6 +68,21 @@ impl RegisteredReplicator {
         self.control.current_progress().await
     }
 
+    async fn reported_progress(&self) -> Result<(i64, i64)> {
+        if let Some(runtime) = &self.stateless_runtime_control {
+            // Built-in service persistence may be ahead of its explicit ACK.
+            // Only the engine can publish acknowledged receiver progress.
+            return runtime.reported_progress().await;
+        }
+        Ok((
+            self.current_progress().await?,
+            match self.provider.as_ref() {
+                Some(provider) => provider.last_committed_lsn().await?,
+                None => 0,
+            },
+        ))
+    }
+
     fn abort(&self) {
         self.control.abort();
     }
@@ -509,13 +524,7 @@ impl PodRuntime {
             role = Some((renewal.required.renewal_epoch, member.role));
         }
         let (applied, committed) = match self.host.registered.get() {
-            Some(registered) => (
-                registered.current_progress().await?,
-                match registered.provider.as_ref() {
-                    Some(provider) => provider.last_committed_lsn().await?,
-                    None => 0,
-                },
-            ),
+            Some(registered) => registered.reported_progress().await?,
             None => (0, 0),
         };
         let (role_epoch, selected_role) = role.unwrap_or((Epoch::default(), ReplicaRole::None));
@@ -642,13 +651,7 @@ impl PodRuntime {
         use crate::protocol::public_operations::{PublicProgress, PublicProgressRole};
 
         let (applied, committed) = match self.host.registered.get() {
-            Some(registered) => (
-                registered.current_progress().await?,
-                match registered.provider.as_ref() {
-                    Some(provider) => provider.last_committed_lsn().await?,
-                    None => 0,
-                },
-            ),
+            Some(registered) => registered.reported_progress().await?,
             None => (0, 0),
         };
         let state = self.host.state.read().await;

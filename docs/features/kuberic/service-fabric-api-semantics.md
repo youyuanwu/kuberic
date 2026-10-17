@@ -57,6 +57,50 @@ Missing source history requires replacement of the source incarnation.
 Conflicting target state is target evidence. A retired incarnation is never
 readmitted by higher numeric progress.
 
+## Service Operation Delivery
+
+Built-in receivers deliver copy chunks, explicit copy completion, and
+replication through the service's `StateReplicator` streams. Queue insertion
+is not success: ingress completion requires the service's durable ACK, exact
+storage/history verification, and still-current authority. Primary-local
+apply/commit remains engine-owned and is not echoed to its service stream.
+
+The service takes each stream once and keeps both consumers alive.
+CopyComplete ends one snapshot, including an empty snapshot; retained build
+replication follows its ACK. `get_operation() == None` means terminal
+replica-stream shutdown, not completion of one build or temporary emptiness.
+No built-in fallback applies or acknowledges work for an absent consumer.
+
+Services can explicitly call `StreamOperation::apply_to` with their durable
+store, then acknowledge its progress or reject its error. This adapter
+applies new payloads, verifies duplicate bytes, and advances requested
+commitment before returning; it never ACKs implicitly. A duplicate may need
+commit without another apply. Custom persistence can use `execute` for the
+same cancellation/drain accounting, but must make its own durable assertion.
+
+Copy may preserve an existing intact retained suffix. A truthful larger
+CopyComplete progress is accepted only with bounded, contiguous durable
+history proof; each retained frame still needs its own validated service ACK.
+Physical commitment after rejection is not acknowledged commitment: replay
+replies and terminal receipts cannot credit it.
+
+Cancellation invalidates queued work, active cooperative effects, and late
+ACKs. Service effects must stay inside the execution lifetime, not detach.
+Successor admission and graceful close drain actual active effects; synchronous
+work cannot be preempted and durable effects are not rolled back. Pending or
+uncertain replication remains access-fenced until a valid current ACK or
+verified recovery. Provider durability alone does not publish acknowledged
+receiver progress. Rejecting or dropping work never produces transport success.
+
+Exact previously acknowledged copy cursors and durable terminal receipts
+can prove historical replay without reapplying. The exact zero-LSN
+empty-history probe has no application payload. Neither exception permits
+fresh work to bypass service ACK or stale authority to succeed.
+
+Implementation references: `replicator/stream.rs:74-176`,
+`replicator/stateless/mod.rs:1105-1168,2099-2417`, and
+`host/hosting.rs:71-84` under `kuberic-runtime/src/`.
+
 ## Data Loss and History
 
 `on_data_loss` is not trusted as an isolated boolean. Admission validates

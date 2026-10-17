@@ -42,6 +42,18 @@ The Replicator owns live queues, peers, ACK aggregation, copy/replication
 streams, and authority-scoped tasks. Those process-local objects are rebuilt
 after restart.
 
+Receiver copy/replication effects belong to the service consuming the built-in
+streams, not a second direct engine persistence path. Explicit durable service
+ACK and exact post-ACK verification precede successful transport completion.
+Primary-local persistence remains engine-owned. The optional
+`StreamOperation::apply_to` adapter is explicitly service-invoked; missing
+consumers never receive an implicit success fallback.
+
+Both streams live for the replica lifetime. CopyComplete is a per-build
+operation, not EOF. Service effects use cancellation-aware execution and
+remain owned until drained; cancelled requests do not imply durable rollback.
+See [service operation delivery](service-fabric-api-semantics.md#service-operation-delivery).
+
 ## Public Completion Evidence
 
 Successful public calls certify their documented postconditions. Kuberic may

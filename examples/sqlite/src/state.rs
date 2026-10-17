@@ -17,6 +17,8 @@ pub struct SqlitePersistence {
     log: OnceLock<Mutex<DurableFrameLog>>,
     opening: Mutex<()>,
     #[cfg(any(test, feature = "testing"))]
+    pub(crate) stream_calls: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64),
+    #[cfg(any(test, feature = "testing"))]
     fault: std::sync::atomic::AtomicU8,
     #[cfg(any(test, feature = "testing"))]
     pub after_apply: crate::testing::PauseGate,
@@ -64,6 +66,8 @@ impl SqlitePersistence {
             root: std::path::absolute(root)?,
             log: OnceLock::new(),
             opening: Mutex::new(()),
+            #[cfg(any(test, feature = "testing"))]
+            stream_calls: Default::default(),
             #[cfg(any(test, feature = "testing"))]
             fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -140,6 +144,15 @@ impl SqlitePersistence {
             operations: log.retained(base_lsn + 1, progress.applied_lsn)?,
             image: log.image_at(progress.applied_lsn)?,
         })
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stream_calls_for_test(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.stream_calls.0.load(Ordering::Acquire),
+            self.stream_calls.1.load(Ordering::Acquire),
+        )
     }
 
     /// Requires that the caller has closed every connection to the materialized database.
@@ -262,6 +275,10 @@ impl DurableState for SqlitePersistence {
 
     async fn apply(&self, operation: Operation) -> kuberic_runtime::Result<DurableApplicationAck> {
         #[cfg(any(test, feature = "testing"))]
+        self.stream_calls
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(any(test, feature = "testing"))]
         self.fault_at(PersistenceFault::BeforeApply)?;
         let progress = self
             .lock()
@@ -288,6 +305,10 @@ impl DurableState for SqlitePersistence {
         &self,
         committed_lsn: i64,
     ) -> kuberic_runtime::Result<DurableApplicationProgress> {
+        #[cfg(any(test, feature = "testing"))]
+        self.stream_calls
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let progress = self
             .lock()
             .and_then(|mut log| log.commit(committed_lsn))

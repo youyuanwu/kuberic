@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -49,9 +49,24 @@ pub struct KvPersistence {
     state: Mutex<PersistedState>,
     #[cfg(test)]
     fail_next_persist: AtomicBool,
+    #[cfg(test)]
+    stream_calls: (AtomicU64, AtomicU64),
 }
 
 impl KvPersistence {
+    #[cfg(test)]
+    pub(crate) fn fail_next_persist_for_test(&self) {
+        self.fail_next_persist.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stream_call_counts(&self) -> (u64, u64) {
+        (
+            self.stream_calls.0.load(Ordering::Acquire),
+            self.stream_calls.1.load(Ordering::Acquire),
+        )
+    }
+
     pub fn is_fresh_empty(root: impl AsRef<Path>) -> Result<bool> {
         let root = root.as_ref();
         if !root.exists() {
@@ -88,6 +103,8 @@ impl KvPersistence {
             state: Mutex::new(state),
             #[cfg(test)]
             fail_next_persist: AtomicBool::new(false),
+            #[cfg(test)]
+            stream_calls: (AtomicU64::new(0), AtomicU64::new(0)),
         })
     }
 
@@ -325,6 +342,8 @@ impl DurableState for KvPersistence {
     }
 
     async fn apply(&self, operation: Operation) -> Result<DurableApplicationAck> {
+        #[cfg(test)]
+        self.stream_calls.0.fetch_add(1, Ordering::AcqRel);
         let mutation: Mutation = serde_json::from_slice(&operation.data)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
         let mut state = self.state.lock().unwrap();
@@ -384,6 +403,8 @@ impl DurableState for KvPersistence {
     }
 
     async fn commit(&self, committed_lsn: i64) -> Result<DurableApplicationProgress> {
+        #[cfg(test)]
+        self.stream_calls.1.fetch_add(1, Ordering::AcqRel);
         let mut state = self.state.lock().unwrap();
         if committed_lsn > state.applied_lsn {
             return Err(RuntimeError::Application(

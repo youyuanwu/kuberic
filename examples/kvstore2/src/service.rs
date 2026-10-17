@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceReplica};
 use kuberic_runtime::protocol::types::ReplicaRole;
-use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
+use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
     StatefulServicePartition,
@@ -217,44 +217,8 @@ async fn consume_stream(
     persistence: Arc<KvPersistence>,
     mut stream: OperationStream,
 ) -> Result<()> {
-    use kuberic_runtime::engine::DurableState;
     while let Some(operation) = stream.get_operation().await? {
-        let result = match &operation.metadata {
-            OperationMetadata::Replication { lsn, committed_lsn } => {
-                persistence
-                    .apply(kuberic_runtime::application::Operation {
-                        lsn: *lsn,
-                        committed_lsn: *committed_lsn,
-                        data: operation.data.clone(),
-                    })
-                    .await
-            }
-
-            OperationMetadata::Copy { build_id, sequence } => {
-                match persistence
-                    .apply_copy_chunk(
-                        build_id,
-                        *sequence,
-                        kuberic_runtime::application::CopyChunk {
-                            data: operation.data.clone(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(()) => persistence.durable_progress().await,
-                    Err(error) => Err(error),
-                }
-            }
-            OperationMetadata::CopyComplete {
-                build_id,
-                up_to_lsn,
-                committed_lsn,
-            } => {
-                persistence
-                    .finish_copy(build_id, *up_to_lsn, *committed_lsn)
-                    .await
-            }
-        };
+        let result = operation.apply_to(persistence.as_ref()).await;
         match result {
             Ok(progress) => {
                 let _ = operation.acknowledge(progress);
@@ -273,6 +237,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use kuberic_runtime::replicator::stream::OperationMetadata;
     use kuberic_runtime::replicator::stream::OperationSender;
 
     fn service() -> (tempfile::TempDir, KvService) {
@@ -404,6 +369,62 @@ mod tests {
         let error = service.shutdown_and_drain().await.unwrap_err().to_string();
         assert!(error.contains("retained consumer failure"));
         assert!(service.streams.lock().await.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_replication_commits_without_reapplying_duplicate_payload() {
+        use futures::TryStreamExt;
+        use kuberic_runtime::engine::DurableState;
+        let (_directory, service) = service();
+        let senders = attach_streams(&service).await;
+        let payload = KvPersistence::encode_put("key".into(), "value".into()).unwrap();
+        let send = |committed_lsn, data| {
+            senders[0].send(
+                OperationMetadata::Replication {
+                    lsn: 1,
+                    committed_lsn,
+                },
+                data,
+            )
+        };
+        assert_eq!(send(0, payload.clone()).await.unwrap().committed_lsn, 0);
+        service.persistence().fail_next_persist_for_test();
+        assert!(send(1, payload.clone()).await.is_err());
+        assert_eq!(
+            service
+                .persistence()
+                .durable_progress()
+                .await
+                .unwrap()
+                .committed_lsn,
+            0
+        );
+        assert_eq!(send(1, payload.clone()).await.unwrap().committed_lsn, 1);
+        assert_eq!(send(1, payload).await.unwrap().committed_lsn, 1);
+        assert!(
+            send(
+                1,
+                KvPersistence::encode_put("key".into(), "corrupt".into()).unwrap()
+            )
+            .await
+            .is_err()
+        );
+        let retained: Vec<_> = service
+            .persistence()
+            .get_replication_operations(1, 1)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(service.persistence().stream_call_counts(), (1, 2));
+        assert_eq!(
+            retained[0].committed_lsn, 0,
+            "immutable applied payload was rewritten"
+        );
+        assert_eq!(service.persistence().get("key").as_deref(), Some("value"));
+        service.shutdown_and_drain().await.unwrap();
     }
 
     #[tokio::test]

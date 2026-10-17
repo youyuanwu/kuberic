@@ -273,6 +273,10 @@ fn store_identity_named(
 
 #[derive(Default)]
 struct MemoryState {
+    default_factory: AtomicBool,
+    stream_mode: AtomicU64,
+    apply_calls: AtomicU64,
+    commit_calls: AtomicU64,
     progress: Mutex<DurableApplicationProgress>,
     operations: Mutex<Vec<Operation>>,
     copy_chunks: Mutex<Vec<Bytes>>,
@@ -504,6 +508,7 @@ impl DurableState for MemoryState {
     }
 
     async fn apply(&self, operation: Operation) -> Result<DurableApplicationProgress> {
+        self.apply_calls.fetch_add(1, Ordering::AcqRel);
         let result = {
             let mut operations = self.operations.lock().unwrap();
             if let Some(existing) = operations
@@ -537,6 +542,7 @@ impl DurableState for MemoryState {
     }
 
     async fn commit(&self, committed_lsn: i64) -> Result<DurableApplicationProgress> {
+        self.commit_calls.fetch_add(1, Ordering::AcqRel);
         if self.block_commit.load(Ordering::Acquire) {
             self.commit_entered.notify_one();
             self.release_commit.notified().await;
@@ -570,6 +576,13 @@ impl ReplicatorFactory for CountingStatelessFactory {
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.storage.default_factory.load(Ordering::Acquire) {
+            return kuberic_runtime::replicator::DefaultReplicatorFactory::new(
+                self.storage.clone(),
+            )
+            .create_replicator(context, state_provider, settings)
+            .await;
+        }
         StatelessReplicatorFactory::new(self.storage.clone())
             .create_replicator(context, state_provider, settings)
             .await
@@ -613,6 +626,16 @@ struct PreviewApplication {
     abort_calls: AtomicU64,
     replicator_released_before_application_close: AtomicBool,
     lifecycle_events: Mutex<Vec<&'static str>>,
+    stream_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    controlled_operations: Arc<
+        Mutex<
+            Option<
+                tokio::sync::mpsc::UnboundedSender<
+                    kuberic_runtime::replicator::stream::StreamOperation,
+                >,
+            >,
+        >,
+    >,
 }
 
 impl PreviewApplication {
@@ -634,6 +657,8 @@ impl PreviewApplication {
             abort_calls: AtomicU64::new(0),
             replicator_released_before_application_close: AtomicBool::new(false),
             lifecycle_events: Mutex::new(Vec::new()),
+            stream_tasks: Mutex::new(Vec::new()),
+            controlled_operations: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -649,6 +674,15 @@ impl PreviewApplication {
 
     fn fail_next_close(&self) {
         self.fail_close.store(true, Ordering::Release);
+    }
+
+    fn control_operations(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<kuberic_runtime::replicator::stream::StreamOperation>
+    {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.controlled_operations.lock().unwrap() = Some(sender);
+        receiver
     }
 
     async fn duplicate_creation(&self) -> Result<()> {
@@ -762,6 +796,41 @@ impl StatefulServiceReplica for PreviewApplication {
             )
             .await?;
         let control = interfaces.replicator();
+        let state = interfaces
+            .state_replicator()
+            .expect("built-in state replicator");
+        if self.storage.stream_mode.load(Ordering::Acquire) != 1 {
+            for mut stream in [
+                state.get_copy_stream().await?,
+                state.get_replication_stream().await?,
+            ] {
+                if self.storage.stream_mode.load(Ordering::Acquire) == 2 {
+                    continue;
+                }
+                let storage = self.storage.clone();
+                let controlled = self.controlled_operations.clone();
+                self.stream_tasks
+                    .lock()
+                    .unwrap()
+                    .push(tokio::spawn(async move {
+                        while let Ok(Some(operation)) = stream.get_operation().await {
+                            let control = controlled.lock().unwrap().clone();
+                            if let Some(control) = control {
+                                let _ = control.send(operation);
+                                continue;
+                            }
+                            match operation.apply_to(storage.as_ref()).await {
+                                Ok(progress) => {
+                                    let _ = operation.acknowledge(progress);
+                                }
+                                Err(error) => {
+                                    let _ = operation.reject(error);
+                                }
+                            }
+                        }
+                    }));
+            }
+        }
         *self.primary.write().await = interfaces.primary_replicator();
         *self.state_replicator.write().await = interfaces.state_replicator();
         *self.control.write().await = Some(control.clone());
@@ -793,6 +862,13 @@ impl StatefulServiceReplica for PreviewApplication {
         self.state_replicator.write().await.take();
         self.primary.write().await.take();
         self.control.write().await.take();
+        let tasks = std::mem::take(&mut *self.stream_tasks.lock().unwrap());
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
         self.lifecycle_events
             .lock()
             .unwrap()
@@ -807,6 +883,9 @@ impl StatefulServiceReplica for PreviewApplication {
 
     fn abort(&self) {
         self.abort_calls.fetch_add(1, Ordering::SeqCst);
+        for task in self.stream_tasks.lock().unwrap().iter() {
+            task.abort();
+        }
         self.lifecycle_events
             .lock()
             .unwrap()
@@ -1018,6 +1097,10 @@ struct AuthorizedHostedPair {
 
 impl AuthorizedHostedPair {
     async fn start(name: &str, generation: u64) -> Self {
+        Self::start_mode(name, generation, 0).await
+    }
+
+    async fn start_mode(name: &str, generation: u64, stream_mode: u64) -> Self {
         let resource_uid = ResourceUid::new(format!("{name}-resource"));
         let preview = PublicV1Identity::new(generation);
         let primary =
@@ -1026,6 +1109,10 @@ impl AuthorizedHostedPair {
         let secondary =
             HostedMemoryReplica::start(&format!("{name}-secondary"), &resource_uid, &preview, 2)
                 .await;
+        secondary
+            .state
+            .stream_mode
+            .store(stream_mode, Ordering::Release);
         let protocol_generation = PublicProtocolGeneration::new(generation);
         let initialization = derive_history_initialization_id(&resource_uid, protocol_generation);
         let history = derive_bootstrap_history(&resource_uid, protocol_generation, &initialization);
@@ -1109,6 +1196,1299 @@ impl AuthorizedHostedPair {
         self.primary.cleanup();
         self.secondary.cleanup();
     }
+
+    fn replication_frame(&self, lsn: i64, committed_lsn: i64) -> proto::ReplicationItem {
+        let configuration = ConfigurationDescriptor::new(
+            self.epoch,
+            self.primary.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: self.primary.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: self.secondary.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        proto::ReplicationItem {
+            protocol_version: 11,
+            sender: Some(self.primary.identity.clone().into()),
+            receiver: Some(self.secondary.identity.clone().into()),
+            epoch: Some(self.epoch.into()),
+            previous_configuration_id: String::new(),
+            current_configuration_id: configuration.configuration_id.to_string(),
+            lsn,
+            committed_lsn,
+            data: b"stream-value".to_vec(),
+            sender_session_id: self.primary.handle().process_session_id().to_string(),
+            receiver_session_id: self.secondary.handle().process_session_id().to_string(),
+        }
+    }
+
+    async fn send_frame(
+        &self,
+        frame: proto::ReplicationItem,
+    ) -> tonic::Streaming<proto::ReplicationAck> {
+        proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{}",
+            self.secondary.address
+        ))
+        .await
+        .unwrap()
+        .replicate(Request::new(stream::iter([frame])))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+}
+
+use kuberic_runtime::replicator::stream::{OperationMetadata, StreamOperation};
+
+async fn delivered(
+    operations: &mut tokio::sync::mpsc::UnboundedReceiver<StreamOperation>,
+) -> StreamOperation {
+    tokio::time::timeout(Duration::from_secs(5), operations.recv())
+        .await
+        .expect("built-in delivery timed out")
+        .expect("service consumer stopped")
+}
+
+async fn pending_ack<T: prost::Message + Default + 'static>(response: &mut tonic::Streaming<T>) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), response.message())
+            .await
+            .is_err(),
+        "transport completed before durable service ACK"
+    );
+}
+
+async fn assert_receiver_pending(replica: &HostedMemoryReplica, prior_lsn: i64) {
+    let report = replica.handle().public_v1_report().await.unwrap();
+    assert_ne!(report.read_status, AccessStatus::Granted);
+    assert_ne!(report.write_status, AccessStatus::Granted);
+    assert_eq!(
+        report.progress.last, prior_lsn,
+        "unacknowledged service progress was published"
+    );
+    let partition = replica.application.partition.read().await.clone().unwrap();
+    assert_ne!(
+        partition.get_read_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+}
+
+struct StreamBuildFixture {
+    source: HostedMemoryReplica,
+    target: HostedMemoryReplica,
+    authority: PublicInboundBuildAuthority,
+}
+
+impl StreamBuildFixture {
+    async fn start(name: &str, default_factory: bool, boundary: i64) -> Self {
+        let resource = ResourceUid::new(name);
+        let preview = PublicV1Identity::new(401);
+        let source =
+            HostedMemoryReplica::start(&format!("{name}-source"), &resource, &preview, 1).await;
+        let target =
+            HostedMemoryReplica::start(&format!("{name}-target"), &resource, &preview, 2).await;
+        target
+            .state
+            .default_factory
+            .store(default_factory, Ordering::Release);
+        let initialization =
+            derive_history_initialization_id(&resource, PublicProtocolGeneration::new(401));
+        let history = derive_bootstrap_history(
+            &resource,
+            PublicProtocolGeneration::new(401),
+            &initialization,
+        );
+        source.initialize_history(&initialization, &history).await;
+        target.initialize_history(&initialization, &history).await;
+        let epoch = Epoch::new(0, 1);
+        let configuration = ConfigurationDescriptor::new(
+            epoch,
+            source.identity.replica_id,
+            vec![ConfigurationMember {
+                identity: source.identity.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        install_static_authority(
+            &source.handle(),
+            &preview,
+            source.identity.clone(),
+            ReplicaRole::Primary,
+            epoch,
+            PublicConfiguration {
+                current: configuration.clone(),
+                previous: None,
+                replicas: vec![],
+            },
+        )
+        .await;
+        if boundary > 0 {
+            assert_eq!(
+                source
+                    .application
+                    .replicate(Bytes::from_static(b"snapshot"))
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        for (revision, program) in [
+            (
+                1,
+                PublicOperationProgram::Open {
+                    replica: target.identity.clone(),
+                    existing: true,
+                },
+            ),
+            (
+                2,
+                PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::IdleSecondary,
+                },
+            ),
+            (3, PublicOperationProgram::Epoch { epoch }),
+        ] {
+            target
+                .handle()
+                .execute_public_v1(intent(
+                    &preview,
+                    target.handle().process_session_id(),
+                    revision,
+                    &format!("stream-target-{revision}"),
+                    program,
+                ))
+                .await
+                .unwrap();
+        }
+        let authority = PublicInboundBuildAuthority {
+            operation_id: OperationId::new("stream-build"),
+            operation_revision: 1,
+            attempt: PublicBuildAttemptReference {
+                resource_uid: resource,
+                epoch,
+                build_id: OperationId::new("stream-build"),
+                source: source.identity.clone(),
+                source_storage: source.storage.clone(),
+                source_session: source.handle().process_session_id(),
+                target: target.identity.clone(),
+                target_storage: target.storage.clone(),
+                target_session: target.handle().process_session_id(),
+            },
+            history,
+            current_configuration_id: configuration.configuration_id,
+            target_address: format!("http://{}", target.address),
+        };
+        target
+            .handle()
+            .install_public_v1_inbound_build_authority(&authority)
+            .await
+            .unwrap();
+        Self {
+            source,
+            target,
+            authority,
+        }
+    }
+
+    fn frame(
+        &self,
+        sequence: u64,
+        snapshot: bool,
+        final_item: bool,
+        boundary: i64,
+        lsn: i64,
+    ) -> proto::CopyItem {
+        let attempt = &self.authority.attempt;
+        proto::CopyItem {
+            protocol_version: 11,
+            build_id: attempt.build_id.to_string(),
+            sender: Some(attempt.source.clone().into()),
+            receiver: Some(attempt.target.clone().into()),
+            epoch: Some(attempt.epoch.into()),
+            current_configuration_id: self.authority.current_configuration_id.to_string(),
+            sequence,
+            lsn,
+            committed_lsn: lsn,
+            replication_boundary_lsn: boundary,
+            final_item,
+            data: if snapshot {
+                b"snapshot-bytes".to_vec()
+            } else if lsn > boundary && !final_item {
+                b"retained-value".to_vec()
+            } else {
+                vec![]
+            },
+            snapshot_chunk: snapshot,
+            sender_session_id: attempt.source_session.to_string(),
+            receiver_session_id: attempt.target_session.to_string(),
+            catch_up_boundary_lsn: final_item.then_some(lsn),
+            source_storage: Some(storage_proto(&attempt.source_storage)),
+            target_storage: Some(storage_proto(&attempt.target_storage)),
+            history: Some(history_proto(&self.authority.history)),
+            target_address: self.authority.target_address.clone(),
+        }
+    }
+
+    async fn send(&self, frame: proto::CopyItem) -> tonic::Streaming<proto::CopyAck> {
+        proto::replication_data_client::ReplicationDataClient::connect(format!(
+            "http://{}",
+            self.target.address
+        ))
+        .await
+        .unwrap()
+        .build(Request::new(stream::iter([frame])))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    fn terminal_receipt(&self) -> Option<serde_json::Value> {
+        let connection =
+            rusqlite::Connection::open(SqliteStore::metadata_database_path(&self.target.root))
+                .unwrap();
+        let json: String = connection
+            .query_row(
+                "SELECT state_json FROM agent_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+        state["publicV1OperationState"]["terminalInboundBuildReceipts"]
+            .get(self.authority.attempt.build_id.as_str())
+            .cloned()
+    }
+
+    async fn cleanup(mut self) {
+        self.source.stop().await;
+        self.target.stop().await;
+        self.source.cleanup();
+        self.target.cleanup();
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_copy_and_completion_wait_for_durable_ack() {
+    for (default_factory, boundary) in [(false, 1), (true, 0)] {
+        let fixture = StreamBuildFixture::start("stream-copy", default_factory, boundary).await;
+        let mut operations = fixture.target.application.control_operations();
+        let mut sequence = 0;
+        if boundary != 0 {
+            let mut response = fixture
+                .send(fixture.frame(sequence, true, false, boundary, boundary))
+                .await;
+            let operation = delivered(&mut operations).await;
+            assert_eq!(
+                operation.metadata,
+                OperationMetadata::Copy {
+                    build_id: fixture.authority.attempt.build_id.clone(),
+                    sequence
+                }
+            );
+            assert_eq!(operation.data.as_ref(), b"snapshot-bytes");
+            assert!(fixture.target.state.copy_chunks.lock().unwrap().is_empty());
+            pending_ack(&mut response).await;
+            let progress = operation
+                .apply_to(fixture.target.state.as_ref())
+                .await
+                .unwrap();
+            pending_ack(&mut response).await;
+            operation.acknowledge(progress).unwrap();
+            assert!(response.message().await.unwrap().is_some());
+            sequence += 1;
+        }
+        let mut response = fixture
+            .send(fixture.frame(sequence, false, false, boundary, boundary))
+            .await;
+        let operation = delivered(&mut operations).await;
+        assert_eq!(
+            operation.metadata,
+            OperationMetadata::CopyComplete {
+                build_id: fixture.authority.attempt.build_id.clone(),
+                up_to_lsn: boundary,
+                committed_lsn: boundary,
+            }
+        );
+        pending_ack(&mut response).await;
+        let progress = operation
+            .apply_to(fixture.target.state.as_ref())
+            .await
+            .unwrap();
+        pending_ack(&mut response).await;
+        operation.acknowledge(progress).unwrap();
+        assert!(response.message().await.unwrap().is_some());
+        let mut final_response = fixture
+            .send(fixture.frame(sequence + 1, false, true, boundary, boundary))
+            .await;
+        assert!(final_response.message().await.unwrap().unwrap().final_item);
+        assert!(
+            operations.try_recv().is_err(),
+            "terminal frame must not redeliver CopyComplete"
+        );
+        let mut replay = fixture
+            .send(fixture.frame(sequence + 1, false, true, boundary, boundary))
+            .await;
+        assert!(replay.message().await.unwrap().unwrap().final_item);
+        assert!(
+            operations.try_recv().is_err(),
+            "exact terminal receipt must be replayable"
+        );
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_live_final_requires_exact_sequence_and_copy_complete_ack() {
+    for malformed_kind in 0..4 {
+        let fixture = StreamBuildFixture::start("stream-final-admission", false, 0).await;
+        let mut operations = fixture.target.application.control_operations();
+        let mut snapshot = fixture.send(fixture.frame(0, true, false, 0, 0)).await;
+        let operation = delivered(&mut operations).await;
+        let progress = operation
+            .apply_to(fixture.target.state.as_ref())
+            .await
+            .unwrap();
+        operation.acknowledge(progress).unwrap();
+        snapshot.message().await.unwrap().unwrap();
+
+        let mut malformed = fixture.frame(
+            if malformed_kind == 0 { 0 } else { 1 },
+            malformed_kind == 1,
+            true,
+            0,
+            0,
+        );
+        if malformed_kind == 2 {
+            malformed.data = b"nonempty-final".to_vec();
+        } else if malformed_kind == 3 {
+            malformed.committed_lsn = 1;
+        }
+        for _ in 0..2 {
+            let mut response = fixture.send(malformed.clone()).await;
+            if malformed_kind == 1 {
+                // Also exercise an actual Copy ACK if this malformed frame is delivered.
+                tokio::select! {
+                    result = response.message() => assert!(result.is_err()),
+                    operation = delivered(&mut operations) => {
+                        let progress = operation.apply_to(fixture.target.state.as_ref()).await.unwrap();
+                        operation.acknowledge(progress).unwrap();
+                        assert!(response.message().await.is_err(), "snapshot/final frame completed the build");
+                    }
+                }
+            } else {
+                assert!(
+                    response.message().await.is_err(),
+                    "malformed live final frame bypassed CopyComplete"
+                );
+            }
+            assert!(fixture.terminal_receipt().is_none());
+            assert!(operations.try_recv().is_err());
+        }
+        let final_frame = fixture.frame(1, false, true, 0, 0);
+        let mut response = fixture.send(final_frame.clone()).await;
+        let complete = delivered(&mut operations).await;
+        assert!(matches!(
+            complete.metadata,
+            OperationMetadata::CopyComplete { .. }
+        ));
+        pending_ack(&mut response).await;
+        let progress = complete
+            .apply_to(fixture.target.state.as_ref())
+            .await
+            .unwrap();
+        pending_ack(&mut response).await;
+        assert!(fixture.terminal_receipt().is_none());
+        complete.acknowledge(progress).unwrap();
+        assert!(response.message().await.unwrap().unwrap().final_item);
+        assert_eq!(fixture.terminal_receipt().unwrap()["finalSequence"], 1);
+        let mut replay = fixture.send(final_frame).await;
+        assert!(replay.message().await.unwrap().unwrap().final_item);
+        assert!(operations.try_recv().is_err());
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_copy_complete_requires_verified_existing_suffix() {
+    for malformed_kind in 0..5 {
+        let fixture = StreamBuildFixture::start("stream-complete-suffix", false, 1).await;
+        let mut operations = fixture.target.application.control_operations();
+        let applied_lsn = if malformed_kind == 4 { 2 } else { 3 };
+        *fixture.target.state.progress.lock().unwrap() = DurableApplicationProgress {
+            applied_lsn,
+            committed_lsn: 1,
+        };
+        let retained = match malformed_kind {
+            0 => vec![],
+            1 => vec![Operation {
+                lsn: 3,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"missing-lsn-two"),
+            }],
+            2 => vec![Operation {
+                lsn: 2,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"missing-lsn-three"),
+            }],
+            3 => vec![
+                Operation {
+                    lsn: 2,
+                    committed_lsn: -1,
+                    data: Bytes::from_static(b"invalid-retained-metadata"),
+                },
+                Operation {
+                    lsn: 3,
+                    committed_lsn: 1,
+                    data: Bytes::from_static(b"last-operation"),
+                },
+            ],
+            _ => vec![Operation {
+                lsn: 2,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"existing-suffix"),
+            }],
+        };
+        *fixture.target.state.operations.lock().unwrap() = retained;
+        let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        assert!(matches!(
+            operation.metadata,
+            OperationMetadata::CopyComplete { .. }
+        ));
+        // Deliberately malformed ACKs must fail even when they match storage.
+        if malformed_kind == 4 {
+            fixture
+                .target
+                .state
+                .apply(Operation {
+                    lsn: 3,
+                    committed_lsn: 1,
+                    data: Bytes::from_static(b"invented-during-copy-complete"),
+                })
+                .await
+                .unwrap();
+        }
+        operation
+            .acknowledge(fixture.target.state.durable_progress().await.unwrap())
+            .unwrap();
+        assert!(response.message().await.is_err());
+        assert!(fixture.terminal_receipt().is_none());
+        let mut final_response = fixture.send(fixture.frame(1, false, true, 1, 1)).await;
+        assert!(final_response.message().await.is_err());
+        assert!(fixture.terminal_receipt().is_none());
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_replication_waits_for_durable_ack() {
+    let pair = AuthorizedHostedPair::start("stream-replication", 402).await;
+    let mut operations = pair.secondary.application.control_operations();
+    let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    assert_eq!(
+        operation.metadata,
+        OperationMetadata::Replication {
+            lsn: 1,
+            committed_lsn: 1
+        }
+    );
+    assert_eq!(operation.data.as_ref(), b"stream-value");
+    assert_eq!(
+        pair.secondary.state.durable_progress().await.unwrap(),
+        DurableApplicationProgress::default()
+    );
+    pending_ack(&mut response).await;
+    let progress = operation
+        .apply_to(pair.secondary.state.as_ref())
+        .await
+        .unwrap();
+    assert_receiver_pending(&pair.secondary, 0).await;
+    pending_ack(&mut response).await;
+    operation.acknowledge(progress).unwrap();
+    let ack = response.message().await.unwrap().unwrap();
+    assert_eq!((ack.applied_lsn, ack.committed_lsn), (1, 1));
+    pair.cleanup().await;
+
+    let fixture = StreamBuildFixture::start("stream-retained", false, 1).await;
+    let mut operations = fixture.target.application.control_operations();
+    let mut copy = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+    let complete = delivered(&mut operations).await;
+    assert!(matches!(
+        complete.metadata,
+        OperationMetadata::CopyComplete { .. }
+    ));
+    pending_ack(&mut copy).await;
+    let progress = complete
+        .apply_to(fixture.target.state.as_ref())
+        .await
+        .unwrap();
+    complete.acknowledge(progress).unwrap();
+    copy.message().await.unwrap().unwrap();
+    let mut retained = fixture.send(fixture.frame(1, false, false, 1, 2)).await;
+    let operation = delivered(&mut operations).await;
+    assert_eq!(
+        operation.metadata,
+        OperationMetadata::Replication {
+            lsn: 2,
+            committed_lsn: 2
+        }
+    );
+    assert_eq!(operation.data.as_ref(), b"retained-value");
+    pending_ack(&mut retained).await;
+    let progress = operation
+        .apply_to(fixture.target.state.as_ref())
+        .await
+        .unwrap();
+    pending_ack(&mut retained).await;
+    operation.acknowledge(progress).unwrap();
+    assert_eq!(retained.message().await.unwrap().unwrap().durable_lsn, 2);
+    let mut final_response = fixture.send(fixture.frame(2, false, true, 1, 2)).await;
+    assert!(final_response.message().await.unwrap().unwrap().final_item);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_duplicate_commit_advancement_reaches_service() {
+    let pair = AuthorizedHostedPair::start("stream-duplicate", 403).await;
+    let mut operations = pair.secondary.application.control_operations();
+    for committed in [0, 1, 1] {
+        let mut response = pair.send_frame(pair.replication_frame(1, committed)).await;
+        let operation = delivered(&mut operations).await;
+        pending_ack(&mut response).await;
+        let progress = operation
+            .apply_to(pair.secondary.state.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(pair.secondary.state.operations.lock().unwrap().len(), 1);
+        assert_eq!(pair.secondary.state.apply_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            pair.secondary.state.operations.lock().unwrap()[0].committed_lsn,
+            0
+        );
+        pending_ack(&mut response).await;
+        operation.acknowledge(progress).unwrap();
+        assert_eq!(
+            response.message().await.unwrap().unwrap().committed_lsn,
+            committed
+        );
+    }
+    let mut corrupt = pair.replication_frame(1, 1);
+    corrupt.data = b"changed".to_vec();
+    let mut response = pair.send_frame(corrupt).await;
+    assert!(response.message().await.is_err());
+    assert!(operations.try_recv().is_err());
+    pair.cleanup().await;
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_reject_drop_and_invalid_ack_do_not_complete() {
+    for outcome in 0..7 {
+        let pair = AuthorizedHostedPair::start("stream-negative", 410 + outcome).await;
+        let mut operations = pair.secondary.application.control_operations();
+        let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        match outcome {
+            0 => {
+                operation
+                    .reject(RuntimeError::Application("service rejected".into()))
+                    .unwrap();
+            }
+            1 => drop(operation),
+            _ => {
+                let progress = match outcome {
+                    2 => DurableApplicationProgress {
+                        applied_lsn: -1,
+                        committed_lsn: -1,
+                    },
+                    3 => DurableApplicationProgress::default(),
+                    4 => DurableApplicationProgress {
+                        applied_lsn: 1,
+                        committed_lsn: 2,
+                    },
+                    5 => DurableApplicationProgress {
+                        applied_lsn: 99,
+                        committed_lsn: 99,
+                    },
+                    _ => DurableApplicationProgress {
+                        applied_lsn: 1,
+                        committed_lsn: 1,
+                    },
+                };
+                operation.acknowledge(progress).unwrap();
+            }
+        }
+        assert!(response.message().await.is_err());
+        assert_eq!(
+            pair.secondary.state.durable_progress().await.unwrap(),
+            DurableApplicationProgress::default()
+        );
+        assert_receiver_pending(&pair.secondary, 0).await;
+        let mut retry = pair.send_frame(pair.replication_frame(1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        let progress = operation
+            .apply_to(pair.secondary.state.as_ref())
+            .await
+            .unwrap();
+        operation.acknowledge(progress).unwrap();
+        assert_eq!(retry.message().await.unwrap().unwrap().applied_lsn, 1);
+        assert_eq!(pair.secondary.state.apply_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            pair.secondary
+                .handle()
+                .public_v1_report()
+                .await
+                .unwrap()
+                .read_status,
+            AccessStatus::Granted
+        );
+        pair.cleanup().await;
+    }
+    for copy_complete in [false, true] {
+        for reject in [false, true] {
+            let fixture = StreamBuildFixture::start("stream-copy-failure", false, 1).await;
+            let mut operations = fixture.target.application.control_operations();
+            let mut response = fixture
+                .send(fixture.frame(0, !copy_complete, false, 1, 1))
+                .await;
+            let operation = delivered(&mut operations).await;
+            if reject {
+                operation
+                    .reject(RuntimeError::Application("copy rejected".into()))
+                    .unwrap();
+            } else {
+                drop(operation);
+            }
+            assert!(response.message().await.is_err());
+            assert_eq!(
+                fixture.target.state.durable_progress().await.unwrap(),
+                DurableApplicationProgress::default()
+            );
+            fixture.cleanup().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_invalid_history_and_copy_complete_acks_are_fenced() {
+    let fixture = StreamBuildFixture::start("stream-retained-gap", false, 0).await;
+    let mut operations = fixture.target.application.control_operations();
+    let mut copy = fixture.send(fixture.frame(0, false, false, 0, 0)).await;
+    let operation = delivered(&mut operations).await;
+    let progress = operation
+        .apply_to(fixture.target.state.as_ref())
+        .await
+        .unwrap();
+    operation.acknowledge(progress).unwrap();
+    copy.message().await.unwrap().unwrap();
+    let mut gap = fixture.send(fixture.frame(1, false, false, 0, 2)).await;
+    assert!(
+        gap.message().await.is_err(),
+        "build sequence continuity is not retained LSN continuity"
+    );
+    assert!(
+        operations.try_recv().is_err(),
+        "a skipped LSN must be rejected before service effects or ACK"
+    );
+    for sequence in [1, 2, 1] {
+        let mut final_response = fixture
+            .send(fixture.frame(sequence, false, true, 0, 2))
+            .await;
+        assert!(
+            final_response.message().await.is_err(),
+            "a retained gap produced cursor/terminal replay proof"
+        );
+    }
+    assert_eq!(fixture.target.state.apply_calls.load(Ordering::Acquire), 0);
+    fixture.cleanup().await;
+
+    let fixture = StreamBuildFixture::start("stream-retained-mismatch", false, 1).await;
+    let mut operations = fixture.target.application.control_operations();
+    let mut copy = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    let progress = operation
+        .apply_to(fixture.target.state.as_ref())
+        .await
+        .unwrap();
+    operation.acknowledge(progress).unwrap();
+    copy.message().await.unwrap().unwrap();
+    let mut retained = fixture.send(fixture.frame(1, false, false, 1, 2)).await;
+    let operation = delivered(&mut operations).await;
+    // Deliberately malformed service ACK: real durable watermarks, wrong bytes.
+    let progress = operation
+        .execute(async {
+            fixture
+                .target
+                .state
+                .apply(Operation {
+                    lsn: 2,
+                    committed_lsn: 1,
+                    data: Bytes::from_static(b"wrong-history"),
+                })
+                .await?;
+            fixture.target.state.commit(2).await
+        })
+        .await
+        .unwrap();
+    operation.acknowledge(progress).unwrap();
+    assert!(retained.message().await.is_err());
+    let mut final_response = fixture.send(fixture.frame(2, false, true, 1, 2)).await;
+    assert!(
+        final_response.message().await.is_err(),
+        "rejected retained ACK advanced the cursor"
+    );
+    let mut replay = fixture.send(fixture.frame(1, false, false, 1, 2)).await;
+    let operation = delivered(&mut operations).await;
+    assert!(
+        operation
+            .apply_to(fixture.target.state.as_ref())
+            .await
+            .is_err()
+    );
+    operation
+        .reject(RuntimeError::InvalidReplication(
+            "wrong retained bytes".into(),
+        ))
+        .unwrap();
+    assert!(replay.message().await.is_err());
+    fixture.cleanup().await;
+
+    for progress in [
+        DurableApplicationProgress::default(),
+        DurableApplicationProgress {
+            applied_lsn: -1,
+            committed_lsn: -1,
+        },
+        DurableApplicationProgress {
+            applied_lsn: 1,
+            committed_lsn: 2,
+        },
+        DurableApplicationProgress {
+            applied_lsn: 2,
+            committed_lsn: 2,
+        },
+    ] {
+        let fixture = StreamBuildFixture::start("stream-complete-invalid", false, 1).await;
+        let mut operations = fixture.target.application.control_operations();
+        let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        operation.acknowledge(progress).unwrap();
+        assert!(response.message().await.is_err());
+        let mut final_response = fixture.send(fixture.frame(1, false, true, 1, 1)).await;
+        assert!(final_response.message().await.is_err());
+        fixture.cleanup().await;
+    }
+
+    let pair = AuthorizedHostedPair::start("stream-regressing-ack", 426).await;
+    let mut first = pair.send_frame(pair.replication_frame(1, 1)).await;
+    first.message().await.unwrap().unwrap();
+    let mut operations = pair.secondary.application.control_operations();
+    let mut response = pair.send_frame(pair.replication_frame(2, 2)).await;
+    let operation = delivered(&mut operations).await;
+    operation
+        .acknowledge(DurableApplicationProgress {
+            applied_lsn: 1,
+            committed_lsn: 0,
+        })
+        .unwrap();
+    assert!(response.message().await.is_err());
+    assert_ne!(
+        pair.secondary
+            .handle()
+            .public_v1_report()
+            .await
+            .unwrap()
+            .read_status,
+        AccessStatus::Granted
+    );
+    pair.cleanup().await;
+
+    let pair = AuthorizedHostedPair::start("stream-post-ack-history", 427).await;
+    let mut operations = pair.secondary.application.control_operations();
+    let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    let progress = operation
+        .apply_to(pair.secondary.state.as_ref())
+        .await
+        .unwrap();
+    pair.secondary.state.operations.lock().unwrap()[0].data =
+        Bytes::from_static(b"corrupted-after-apply");
+    operation.acknowledge(progress).unwrap();
+    assert!(response.message().await.is_err());
+    assert_receiver_pending(&pair.secondary, 0).await;
+    pair.cleanup().await;
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_caller_cancellation_fences_queued_and_delivered_operations() {
+    let pair = AuthorizedHostedPair::start("stream-caller-cancel", 421).await;
+    let mut operations = pair.secondary.application.control_operations();
+    let response = pair.send_frame(pair.replication_frame(1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if pair
+                .secondary
+                .handle()
+                .public_v1_raw_retained_task_cardinality()
+                .unwrap()
+                .1
+                == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        operation
+            .apply_to(pair.secondary.state.as_ref())
+            .await
+            .is_err()
+    );
+    assert!(
+        operation
+            .acknowledge(DurableApplicationProgress::default())
+            .is_err()
+    );
+    assert!(pair.secondary.state.operations.lock().unwrap().is_empty());
+    let response = pair.send_frame(pair.replication_frame(1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    pair.secondary.state.block_commit();
+    let state = pair.secondary.state.clone();
+    let effect = tokio::spawn(async move {
+        let result = operation.apply_to(state.as_ref()).await;
+        assert!(result.is_err());
+        assert!(
+            operation
+                .acknowledge(DurableApplicationProgress {
+                    applied_lsn: 1,
+                    committed_lsn: 1
+                })
+                .is_err()
+        );
+    });
+    pair.secondary.state.commit_entered.notified().await;
+    assert_receiver_pending(&pair.secondary, 0).await;
+    drop(response);
+    tokio::time::timeout(Duration::from_secs(5), effect)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_receiver_pending(&pair.secondary, 0).await;
+    assert_eq!(
+        pair.secondary
+            .state
+            .durable_progress()
+            .await
+            .unwrap()
+            .committed_lsn,
+        0
+    );
+    // A current exact replay can safely finish the already-applied payload,
+    // but access stays closed until the service's fresh durable ACK.
+    pair.secondary
+        .state
+        .block_commit
+        .store(false, Ordering::Release);
+    let mut replay = pair.send_frame(pair.replication_frame(1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    let progress = operation
+        .apply_to(pair.secondary.state.as_ref())
+        .await
+        .unwrap();
+    assert_receiver_pending(&pair.secondary, 0).await;
+    operation.acknowledge(progress).unwrap();
+    replay.message().await.unwrap().unwrap();
+    assert_eq!(
+        pair.secondary
+            .handle()
+            .public_v1_report()
+            .await
+            .unwrap()
+            .read_status,
+        AccessStatus::Granted
+    );
+    pair.cleanup().await;
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_authority_changes_cancel_effects_and_fence_late_ack() {
+    let fixture = StreamBuildFixture::start("stream-authority", false, 1).await;
+    let mut operations = fixture.target.application.control_operations();
+    let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    fixture.target.state.block_finish_copy();
+    let state = fixture.target.state.clone();
+    let effect = tokio::spawn(async move { operation.apply_to(state.as_ref()).await });
+    fixture.target.state.finish_copy_entered.notified().await;
+    fixture
+        .target
+        .handle()
+        .install_public_v1_inbound_build_authority(&fixture.authority)
+        .await
+        .unwrap();
+    let mut stale = fixture.authority.clone();
+    stale.operation_revision = 0;
+    assert!(
+        fixture
+            .target
+            .handle()
+            .install_public_v1_inbound_build_authority(&stale)
+            .await
+            .is_err()
+    );
+    assert!(
+        !effect.is_finished(),
+        "exact reinstall/stale request interrupted current effect"
+    );
+    fixture
+        .target
+        .handle()
+        .revoke_public_v1_inbound_build_authority(&fixture.authority)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), effect)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert!(response.message().await.unwrap_or(None).is_none());
+    fixture.target.state.release_finish_copy.notify_one();
+    assert_eq!(
+        fixture.target.state.durable_progress().await.unwrap(),
+        DurableApplicationProgress::default()
+    );
+    fixture.cleanup().await;
+
+    let pair = AuthorizedHostedPair::start("stream-role-fence", 422).await;
+    let mut operations = pair.secondary.application.control_operations();
+    let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
+    let operation = delivered(&mut operations).await;
+    let control = pair
+        .secondary
+        .application
+        .control
+        .read()
+        .await
+        .clone()
+        .unwrap();
+    control
+        .change_role(pair.epoch, ReplicaRole::None)
+        .await
+        .unwrap();
+    assert!(
+        operation
+            .apply_to(pair.secondary.state.as_ref())
+            .await
+            .is_err()
+    );
+    assert!(
+        operation
+            .acknowledge(DurableApplicationProgress::default())
+            .is_err()
+    );
+    assert!(response.message().await.unwrap_or(None).is_none());
+    pair.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_operation_stream_successor_and_close_wait_for_synchronous_effects() {
+    for close in [false, true] {
+        let fixture = StreamBuildFixture::start("stream-sync-drain", false, 1).await;
+        let mut operations = fixture.target.application.control_operations();
+        let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        let state = fixture.target.state.clone();
+        let build_id = fixture.authority.attempt.build_id.clone();
+        let entered = Arc::new(Notify::new());
+        let entered_effect = entered.clone();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let effect = tokio::spawn(async move {
+            let result = operation
+                .execute(async move {
+                    entered_effect.notify_one();
+                    // Deliberately synchronous provider section: cancellation is
+                    // not proof of quiescence until this section actually exits.
+                    blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                    state.finish_copy(&build_id, 1, 1).await
+                })
+                .await;
+            assert!(operation.acknowledge(result.unwrap_or_default()).is_err());
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let handle = fixture.target.handle();
+        let control = fixture
+            .target
+            .application
+            .control
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        let mut successor = fixture.authority.clone();
+        successor.operation_id = OperationId::new("stream-sync-successor");
+        successor.operation_revision = 2;
+        successor.attempt.build_id = OperationId::new("stream-sync-successor");
+        let transition = tokio::spawn(async move {
+            if close {
+                control.close().await.map_err(|error| error.to_string())
+            } else {
+                handle
+                    .install_public_v1_inbound_build_authority(&successor)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        });
+        // EOF proves invalidation has reached the real ingress owner.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), response.message())
+                .await
+                .unwrap()
+                .unwrap_or(None)
+                .is_none()
+        );
+        tokio::pin!(transition);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), &mut transition)
+                .await
+                .is_err(),
+            "successor/close returned while synchronous persistence was still running"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), transition)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        effect.await.unwrap();
+        assert_eq!(
+            fixture
+                .target
+                .state
+                .durable_progress()
+                .await
+                .unwrap()
+                .committed_lsn,
+            1,
+            "cancellation does not roll back a synchronous durable effect"
+        );
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_epoch_and_configuration_cancel_active_persistence() {
+    for epoch_change in [false, true] {
+        let pair = AuthorizedHostedPair::start("stream-authority-effect", 428).await;
+        let mut operations = pair.secondary.application.control_operations();
+        let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        pair.secondary.state.block_commit();
+        let state = pair.secondary.state.clone();
+        let effect = tokio::spawn(async move { operation.apply_to(state.as_ref()).await });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pair.secondary.state.commit_entered.notified(),
+        )
+        .await
+        .unwrap();
+        if epoch_change {
+            pair.secondary
+                .application
+                .control
+                .read()
+                .await
+                .clone()
+                .unwrap()
+                .update_epoch(Epoch::new(0, 2))
+                .await
+                .unwrap();
+        } else {
+            let configuration = ConfigurationDescriptor::new(
+                pair.epoch,
+                pair.primary.identity.replica_id,
+                vec![
+                    ConfigurationMember {
+                        identity: pair.primary.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: pair.secondary.identity.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                    },
+                ],
+                1,
+            );
+            pair.secondary
+                .handle()
+                .execute_public_v1(intent(
+                    &pair.identity,
+                    pair.secondary.handle().process_session_id(),
+                    5,
+                    "stream-config-replacement",
+                    PublicOperationProgram::Configuration(PublicConfiguration {
+                        current: configuration,
+                        previous: None,
+                        replicas: vec![PublicReplicaDescriptor {
+                            build_id: OperationId::default(),
+                            identity: pair.primary.identity.clone(),
+                            replication_address: format!("http://{}", pair.primary.address),
+                            process_session_id: pair.primary.handle().process_session_id(),
+                            storage_incarnation: Some(pair.primary.storage.clone()),
+                            role: ReplicaRole::Primary,
+                            current_progress: 0,
+                            catch_up_capability: 0,
+                            must_catchup: false,
+                        }],
+                    }),
+                ))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), effect)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(response.message().await.unwrap_or(None).is_none());
+        pair.secondary.state.release_commit.notify_one();
+        assert_eq!(
+            pair.secondary
+                .state
+                .durable_progress()
+                .await
+                .unwrap()
+                .committed_lsn,
+            0
+        );
+        assert_ne!(
+            pair.secondary
+                .handle()
+                .public_v1_report()
+                .await
+                .unwrap()
+                .read_status,
+            AccessStatus::Granted
+        );
+        pair.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_close_and_abort_drain_without_a_consumer() {
+    for stream_mode in [1, 2] {
+        for abort in [false, true] {
+            let pair =
+                AuthorizedHostedPair::start_mode("stream-no-consumer", 425, stream_mode).await;
+            let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
+            if stream_mode == 1 {
+                pending_ack(&mut response).await;
+            }
+            let control = pair
+                .secondary
+                .application
+                .control
+                .read()
+                .await
+                .clone()
+                .unwrap();
+            if abort {
+                control.abort();
+            } else {
+                control.close().await.unwrap();
+            }
+            assert!(response.message().await.unwrap_or(None).is_none());
+            assert!(pair.secondary.state.operations.lock().unwrap().is_empty());
+            pair.cleanup().await;
+        }
+    }
+    for abort in [false, true] {
+        let pair = AuthorizedHostedPair::start("stream-shutdown", 423).await;
+        let mut operations = pair.secondary.application.control_operations();
+        let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        let control = pair
+            .secondary
+            .application
+            .control
+            .read()
+            .await
+            .clone()
+            .unwrap();
+        if abort {
+            control.abort();
+        } else {
+            control.close().await.unwrap();
+        }
+        assert!(
+            operation
+                .apply_to(pair.secondary.state.as_ref())
+                .await
+                .is_err()
+        );
+        assert!(
+            operation
+                .acknowledge(DurableApplicationProgress::default())
+                .is_err()
+        );
+        assert!(response.message().await.unwrap_or(None).is_none());
+        pair.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_primary_local_apply_is_not_redelivered() {
+    let pair = AuthorizedHostedPair::start("stream-primary-local", 424).await;
+    let mut primary_operations = pair.primary.application.control_operations();
+    assert_eq!(
+        pair.primary
+            .application
+            .replicate(Bytes::from_static(b"primary-once"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(primary_operations.try_recv().is_err());
+    assert_eq!(pair.primary.state.operations.lock().unwrap().len(), 1);
+    assert_eq!(pair.primary.state.apply_calls.load(Ordering::Acquire), 1);
+    assert_eq!(pair.primary.state.commit_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        pair.primary
+            .state
+            .durable_progress()
+            .await
+            .unwrap()
+            .committed_lsn,
+        1
+    );
+    assert_eq!(pair.secondary.state.operations.lock().unwrap().len(), 1);
+    assert_eq!(pair.secondary.state.apply_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        pair.secondary.state.operations.lock().unwrap()[0]
+            .data
+            .as_ref(),
+        b"primary-once"
+    );
+    pair.cleanup().await;
 }
 
 #[tokio::test]

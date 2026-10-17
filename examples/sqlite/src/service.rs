@@ -11,7 +11,7 @@ use futures::{StreamExt, stream};
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::engine::DurableState;
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
-use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
+use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
     StatefulServicePartition,
@@ -81,6 +81,14 @@ pub struct SqliteService {
     control: Mutex<Option<Arc<dyn Replicator>>>,
     replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
     streams: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    #[cfg(any(test, feature = "testing"))]
+    controlled_operations: Mutex<
+        Option<
+            tokio::sync::mpsc::UnboundedSender<
+                kuberic_runtime::replicator::stream::StreamOperation,
+            >,
+        >,
+    >,
     replication_address: String,
 }
 
@@ -126,6 +134,8 @@ impl SqliteService {
             control: Mutex::new(None),
             replicator: Mutex::new(None),
             streams: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "testing"))]
+            controlled_operations: Mutex::new(None),
             replication_address,
         })
     }
@@ -142,6 +152,20 @@ impl SqliteService {
     #[cfg(any(test, feature = "testing"))]
     pub fn copy_snapshot_gate(&self) -> &crate::testing::PauseGate {
         &self.provider.copy_snapshot
+    }
+    /// Let a test service explicitly persist and ACK actual factory deliveries.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn control_stream_operations_for_test(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<kuberic_runtime::replicator::stream::StreamOperation>
+    {
+        assert!(self.control.lock().expect("control").is_none());
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .controlled_operations
+            .lock()
+            .expect("controlled operations") = Some(sender);
+        receiver
     }
     pub fn vfs_name(&self) -> &str {
         &self.vfs_name
@@ -258,7 +282,26 @@ impl StatefulServiceReplica for SqliteService {
             replicator.get_copy_stream().await?,
             replicator.get_replication_stream().await?,
         ] {
-            let task = tokio::spawn(consume_stream(self.persistence.clone(), stream));
+            #[cfg(any(test, feature = "testing"))]
+            let controlled = self
+                .controlled_operations
+                .lock()
+                .expect("controlled operations")
+                .clone();
+            let persistence = self.persistence.clone();
+            let task = tokio::spawn(async move {
+                #[cfg(any(test, feature = "testing"))]
+                if let Some(controlled) = controlled {
+                    let mut stream = stream;
+                    while let Ok(Some(operation)) = stream.get_operation().await {
+                        if controlled.send(operation).is_err() {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                consume_stream(persistence, stream).await;
+            });
             self.streams.lock().expect("streams").push(task);
         }
         *self.replicator.lock().expect("replicator") = Some(replicator);
@@ -346,39 +389,7 @@ impl StatefulServiceReplica for SqliteService {
 
 async fn consume_stream(persistence: Arc<SqlitePersistence>, mut stream: OperationStream) {
     while let Ok(Some(operation)) = stream.get_operation().await {
-        let result = match &operation.metadata {
-            OperationMetadata::Replication { lsn, committed_lsn } => {
-                persistence
-                    .apply(kuberic_runtime::application::Operation {
-                        lsn: *lsn,
-                        committed_lsn: *committed_lsn,
-                        data: operation.data.clone(),
-                    })
-                    .await
-            }
-            OperationMetadata::Copy { build_id, sequence } => match persistence
-                .apply_copy_chunk(
-                    build_id,
-                    *sequence,
-                    kuberic_runtime::application::CopyChunk {
-                        data: operation.data.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(()) => persistence.durable_progress().await,
-                Err(error) => Err(error),
-            },
-            OperationMetadata::CopyComplete {
-                build_id,
-                up_to_lsn,
-                committed_lsn,
-            } => {
-                persistence
-                    .finish_copy(build_id, *up_to_lsn, *committed_lsn)
-                    .await
-            }
-        };
+        let result = operation.apply_to(persistence.as_ref()).await;
         match result {
             Ok(progress) => {
                 let _ = operation.acknowledge(progress);
@@ -387,5 +398,117 @@ async fn consume_stream(persistence: Arc<SqlitePersistence>, mut stream: Operati
                 let _ = operation.reject(error);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::frames::{WalFrame, WalFrameSet};
+    use crate::state::PersistenceFault;
+    use kuberic_runtime::replicator::stream::OperationMetadata;
+
+    #[tokio::test]
+    async fn stream_cancellation_after_durable_apply_does_not_commit() {
+        let directory = tempfile::Builder::new()
+            .prefix("sqlite-stream-cancel-")
+            .tempdir_in(".")
+            .unwrap();
+        let persistence =
+            Arc::new(SqlitePersistence::open(directory.path().to_path_buf()).unwrap());
+        let (sender, stream) = OperationStream::channel(1);
+        let consumer = tokio::spawn(consume_stream(persistence.clone(), stream));
+        let frames = vec![WalFrame {
+            page_number: 1,
+            data: vec![9; 512],
+        }];
+        let payload: Bytes = serde_json::to_vec(&WalFrameSet {
+            checksum: WalFrameSet::compute_checksum(&frames),
+            frames,
+            db_size_pages: 1,
+        })
+        .unwrap()
+        .into();
+        persistence.after_apply.arm();
+        let request = tokio::spawn({
+            let sender = sender.clone();
+            async move {
+                sender
+                    .send(
+                        OperationMetadata::Replication {
+                            lsn: 1,
+                            committed_lsn: 1,
+                        },
+                        payload,
+                    )
+                    .await
+            }
+        });
+        persistence.after_apply.wait_entered().await;
+        request.abort();
+        let _ = request.await;
+        sender.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), consumer)
+            .await
+            .unwrap()
+            .unwrap();
+        persistence.after_apply.release();
+        let progress = persistence.durable_progress().await.unwrap();
+        assert_eq!((progress.applied_lsn, progress.committed_lsn), (1, 0));
+        assert_eq!(persistence.stream_calls.0.load(Ordering::Acquire), 1);
+        assert_eq!(persistence.stream_calls.1.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_replication_commits_without_reapplying_duplicate_payload() {
+        let directory = tempfile::Builder::new()
+            .prefix("sqlite-stream-")
+            .tempdir_in(".")
+            .unwrap();
+        let persistence =
+            Arc::new(SqlitePersistence::open(directory.path().to_path_buf()).unwrap());
+        let (sender, stream) = OperationStream::channel(1);
+        let consumer = tokio::spawn(consume_stream(persistence.clone(), stream));
+        let frames = vec![WalFrame {
+            page_number: 1,
+            data: vec![7; 512],
+        }];
+        let payload: Bytes = serde_json::to_vec(&WalFrameSet {
+            checksum: WalFrameSet::compute_checksum(&frames),
+            frames,
+            db_size_pages: 1,
+        })
+        .unwrap()
+        .into();
+        let send = |committed_lsn, data| {
+            sender.send(
+                OperationMetadata::Replication {
+                    lsn: 1,
+                    committed_lsn,
+                },
+                data,
+            )
+        };
+        assert_eq!(send(0, payload.clone()).await.unwrap().committed_lsn, 0);
+        persistence.fail_once(PersistenceFault::AfterCommit);
+        assert!(
+            send(1, payload.clone()).await.is_err(),
+            "after-commit failure must not ACK"
+        );
+        assert_eq!(
+            persistence.durable_progress().await.unwrap().committed_lsn,
+            1
+        );
+        assert_eq!(send(1, payload.clone()).await.unwrap().committed_lsn, 1);
+        assert!(send(1, Bytes::from_static(b"corrupt")).await.is_err());
+        let inspection = persistence.inspect_for_test().unwrap();
+        assert_eq!(persistence.stream_calls.0.load(Ordering::Acquire), 1);
+        assert_eq!(persistence.stream_calls.1.load(Ordering::Acquire), 1);
+        assert_eq!(inspection.operations.len(), 1);
+        assert_eq!(inspection.operations[0].committed_lsn, 0);
+        assert_eq!(inspection.operations[0].data, payload);
+        assert_eq!(inspection.image, vec![7; 512]);
+        sender.close();
+        consumer.await.unwrap();
     }
 }

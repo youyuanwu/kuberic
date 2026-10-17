@@ -4,6 +4,12 @@
 
 Audit date: 2026-10-16.
 
+SF trait-semantics follow-up: 2026-10-17, against Kuberic
+`e81e6c3f7cce36df1e0d0107040034e38d3acad7` and
+[`mssf-ext` traits at `615da9a`](https://github.com/youyuanwu/service-fabric-apps-rs/blob/615da9a886d0d1d68af63f9c3916024986309673/crates/libs/mssf-ext/src/traits.rs).
+SF-18 through SF-21 use this follow-up baseline; earlier source references
+retain their historical baseline below.
+
 Audited baseline: `243f622b6eacc0c30d6ba59fb909e92270531ff3`, including the
 documentation-only additions to the SF-aligned traits in the working tree.
 Source line references below describe that audited state; use the named
@@ -25,11 +31,26 @@ factory-selected Public V1 path satisfies a contract.
 
 Initial inventory: **17 implementation findings: 10 P1 and 7 P2**, plus
 **one documentation/behavior mismatch**. All entries are initially open.
-No implementation fix is recorded by this audit.
+This initial inventory describes the historical audit, not current status.
 
-These findings have source-level execution traces. They are not claims of
-dynamically reproduced data loss, resource exhaustion, or incorrect elections.
-Those consequences remain qualified in the relevant entries.
+Current inventory: **21 implementation findings: 3 fixed / 18 open**
+(8 open P1 and 10 open P2), plus the still-open documentation mismatch.
+SF-04/SF-05 were fixed by PR #151; SF-14 is fixed by the implementation
+published in PR #154 and recorded below. Original failure traces remain
+historical evidence. SF-18 through SF-21 track the remaining stream, context,
+primary-completion, and acknowledgement alignment requirements. In particular
+SF-06 and SF-15 remain open.
+
+**Alignment decision:** The user requested alignment with the linked SF
+semantics on 2026-10-17. SF-18 through SF-21 are required changes, not accepted
+Kuberic deviations or documentation-only differences. SF-14's closure is
+limited to real service delivery and ACK-dependent completion; it does not
+establish full SF trait-semantic compatibility.
+
+These findings have source-level execution traces or interface-contract
+comparisons. They are not claims of dynamically reproduced data loss,
+resource exhaustion, or incorrect elections. Those consequences remain
+qualified in the relevant entries.
 
 For the API-surface comparison, see
 [Stateful API and Trait Compatibility](service-fabric-alignment.md#stateful-api-and-trait-compatibility).
@@ -62,8 +83,8 @@ fixing capability admission does not fix swap staging.
 | [SF-01](#sf-01-applied-kv-state-is-visible-before-the-read-fence) | P1 | Open | Applied KV state is visible before the read fence |
 | [SF-02](#sf-02-kv-writes-bypass-partition-write-denial) | P1 | Open | KV writes bypass partition write denial |
 | [SF-03](#sf-03-postgresql-sql-admission-ignores-partition-denial) | P1 | Open | PostgreSQL SQL admission ignores partition denial |
-| [SF-04](#sf-04-controller-swap-capability-conflicts-with-runtime-admission) | P1 | Open | Controller swap capability conflicts with runtime admission |
-| [SF-05](#sf-05-swap-installs-the-final-role-layout-before-source-catch-up) | P1 | Open | Swap installs the final role layout before source catch-up |
+| [SF-04](#sf-04-controller-swap-capability-conflicts-with-runtime-admission) | P1 | Fixed | Controller swap capability conflicts with runtime admission |
+| [SF-05](#sf-05-swap-installs-the-final-role-layout-before-source-catch-up) | P1 | Fixed | Swap installs the final role layout before source catch-up |
 | [SF-06](#sf-06-access-revocation-can-block-teardown-and-violate-role-ordering) | P1 | Open | Access revocation can block teardown and violate role ordering |
 | [SF-07](#sf-07-idle-postgresql-removal-globally-drains-the-partition) | P1 | Open | Idle PostgreSQL removal globally drains the partition |
 | [SF-08](#sf-08-retired-postgresql-grants-leak-persistent-slots) | P1 | Open | Retired PostgreSQL grants leak persistent slots |
@@ -72,10 +93,14 @@ fixing capability admission does not fix swap staging.
 | [SF-11](#sf-11-suffix-reconciliation-skips-a-missing-committed-prefix) | P2 | Open | Suffix reconciliation skips a missing committed prefix |
 | [SF-12](#sf-12-minority-rejection-makes-specific-quorum-catch-up-order-dependent) | P2 | Open | Minority rejection makes specific-quorum catch-up order-dependent |
 | [SF-13](#sf-13-postgresql-writequorum-ignores-the-required-peer) | P2 | Open | PostgreSQL WriteQuorum ignores the required peer |
-| [SF-14](#sf-14-built-in-operation-streams-are-disconnected-from-delivery) | P2 | Open | Built-in operation streams are disconnected from delivery |
+| [SF-14](#sf-14-built-in-operation-streams-are-disconnected-from-delivery) | P2 | Fixed | Built-in operation streams are disconnected from delivery |
 | [SF-15](#sf-15-kv-close-does-not-join-owned-consumers) | P2 | Open | KV Close does not join owned consumers |
 | [SF-16](#sf-16-postgresql-abort-leaves-gateway-grants-armed) | P2 | Open | PostgreSQL Abort leaves gateway grants armed |
 | [SF-17](#sf-17-dynamic-open-leaves-settings-guards-inconsistent) | P2 | Open | Dynamic Open leaves settings guards inconsistent |
+| [SF-18](#sf-18-copy-stream-lifetime-prevents-sf-sequential-consumption) | P2 | Open | Copy stream lifetime prevents SF sequential consumption |
+| [SF-19](#sf-19-copy-context-comes-from-the-primary-instead-of-the-secondary) | P2 | Open | Copy context comes from the primary instead of the secondary |
+| [SF-20](#sf-20-primary-replication-lacks-the-sf-early-lsn-and-local-commit-pipeline) | P2 | Open | Primary replication lacks the SF early-LSN and local-commit pipeline |
+| [SF-21](#sf-21-acknowledgement-requires-kuberic-progress-and-always-explicit-ack) | P2 | Open | Acknowledgement requires Kuberic progress and always-explicit ACK |
 | [SF-D01](#sf-d01-catch-up-capability-is-a-tail-not-a-retained-floor) | Documentation | Open | Catch-up capability is a tail, not a retained floor |
 
 ## P1 Findings
@@ -169,6 +194,23 @@ bundle. Conservative `All` selection must have coherent capability metadata
 and pass admission. A fake that manufactures operation completions is not
 sufficient. Retain a separate regression for SF-05.
 
+**Resolution — Fixed:** [PR #151](https://github.com/youyuanwu/kuberic/pull/151),
+merge revision `05f69bee820cc6393842d34b45ae82e2ced32981`.
+The evaluator now reads the actual optional source report capability, waits
+if absent, selects true/WriteQuorum or false/All, and marks the successor
+required for specific quorum
+(`kuberic-controller/src/evaluator/public_v1_topology.rs:334-361`).
+Runtime exact capability admission is not relaxed. The built-in regression
+path is **true/WriteQuorum**, not a downgrade to false/All.
+
+**Regression evidence:** The five real-stack journeys listed under SF-05
+passed in ordinary run `67074f25-598e-4f16-8fad-7c53cdcc2584` (336/336).
+Their shared real hosted KV/built-in path explicitly asserts `Some(true)`
+(`kuberic-level-tests/src/in_process/journeys.rs:1253-1269`), submits the
+production planner's swap, and completes data-preserving handoff. This is
+not a manufactured controller completion. No executed capability-false
+hosted swap is claimed by this resolution.
+
 ### SF-05: Swap installs the final role layout before source catch-up
 
 **Contract:** The source primary must finish mandatory post-revocation catch-up
@@ -188,6 +230,34 @@ at `kuberic-runtime/src/replicator/stateless/mod.rs:2701-2711,2793-2800,727-767`
 **Closure:** After resolving SF-04, prove the source can install a coherent
 staging configuration and perform second catch-up with writes denied, then
 demote and activate the successor in the final configuration.
+
+**Resolution — Fixed:** [PR #151](https://github.com/youyuanwu/kuberic/pull/151),
+merge revision `05f69bee820cc6393842d34b45ae82e2ced32981`.
+The evaluator preserves the source Primary in an intermediate descriptor,
+completes first catch-up, and prepares peer epoch/role/configuration before
+issuing source Swap
+(`kuberic-controller/src/evaluator/public_v1_topology.rs:238-361`).
+This permits final source catch-up before source demotion; it does not merely
+relax the engine's role comparison.
+
+**Regression evidence:** All five existing
+`kuberic-level-tests` `in_process::journeys::` cases passed in final serial
+ordinary run `67074f25-598e-4f16-8fad-7c53cdcc2584`:
+
+- `specification_switchover_preserves_data_and_fences_old_writer`
+- `switchover_recreation_after_catch_up_resumes_accepted_handoff`
+- `switchover_recreation_after_durable_handoff_resumes_promotion`
+- `switchover_cancellation_after_peer_preparation_finishes_frozen_request`
+- `switchover_retarget_after_peer_preparation_serializes_frozen_requests`
+
+The shared journey commits an additional real write after first catch-up,
+proves the prepared target lacks it, and then verifies transfer of that
+missing committed prefix, unchanged host sessions, old-writer rejection,
+and a new-primary write
+(`kuberic-level-tests/src/in_process/journeys.rs:1253-1409`).
+Restart and edited-request cuts retain exact accepted completion
+(`:1097-1249`). Successful switchover does **not** prove that a blocked or
+failing Revoke application callback reaches Abort; SF-06 remains open.
 
 ### SF-06: Access revocation can block teardown and violate role ordering
 
@@ -361,6 +431,83 @@ obtained from a real built-in factory. Alternatively, explicitly resolve and
 document the supported direct-persistence contract rather than returning
 successful permanently empty delivery handles. Preserve protected interfaces.
 
+**Resolution — Fixed:** Local production revision
+`284a46fce46e0c94d6b3255c75e24273c79e7c06`
+(`fix(runtime): honor service operation delivery and durable acknowledgements`).
+Final-review corrections are in
+`30953372ab15021f40971229b0b4bec6c404c5fe`
+(`fix(runtime): fence copy replay proofs and cancelled effect admission`).
+Built-in ingress now delivers through `ServiceStreams` and waits for durable
+service ACK (`kuberic-runtime/src/replicator/stream.rs:329-344`;
+`kuberic-runtime/src/replicator/stateless/mod.rs:1105-1168,2099-2417`).
+CopyComplete, including empty snapshots, is explicit; retained catch-up
+requires acknowledged contiguous LSNs and an exact terminal boundary.
+Post-ACK checks verify actual durable progress and exact payload/history
+under current authority. Queueing or physical persistence before explicit
+ACK cannot complete ingress or publish successful receiver progress.
+
+The optional service-invoked `apply_to`/`execute` helpers
+(`replicator/stream.rs:74-176`) cover apply, duplicate-byte verification,
+requested commitment, cancellation and actual-effect drainage. KV/SQLite
+consumers explicitly ACK/reject those results
+(`examples/kvstore2/src/service.rs:216-233`;
+`examples/sqlite/src/service.rs:390-403`). There is no automatic factory
+consumer or double-apply receiver fallback. Primary-local apply/commit
+ownership is unchanged.
+
+**Regression evidence:** Thirteen real hosted factory/service tests in
+`kuberic-runtime/tests/public_v1_recovery.rs:1480-2488` passed in final
+ordinary run `67074f25-598e-4f16-8fad-7c53cdcc2584`:
+
+- `hosted_operation_stream_copy_and_completion_wait_for_durable_ack`
+- `hosted_operation_stream_live_final_requires_exact_sequence_and_copy_complete_ack`
+- `hosted_operation_stream_copy_complete_requires_verified_existing_suffix`
+- `hosted_operation_stream_replication_waits_for_durable_ack`
+- `hosted_operation_stream_duplicate_commit_advancement_reaches_service`
+- `hosted_operation_stream_reject_drop_and_invalid_ack_do_not_complete`
+- `hosted_operation_stream_invalid_history_and_copy_complete_acks_are_fenced`
+- `hosted_operation_stream_caller_cancellation_fences_queued_and_delivered_operations`
+- `hosted_operation_stream_authority_changes_cancel_effects_and_fence_late_ack`
+- `hosted_operation_stream_successor_and_close_wait_for_synchronous_effects`
+- `hosted_operation_stream_epoch_and_configuration_cancel_active_persistence`
+- `hosted_operation_stream_close_and_abort_drain_without_a_consumer`
+- `hosted_operation_stream_primary_local_apply_is_not_redelivered`
+
+These exercise actual delivery and held durable ACKs, not send-only channels
+or fabricated factory completion. They prove exact retry after seven
+reject/drop/invalid ACK outcomes, reject skipped retained LSNs and corrupted
+durable bytes, check access/report fencing, and observe real synchronous
+effect drainage. MemoryState proves sequencing, not fsync.
+Real KV/SQLite `stream_replication_commits_without_reapplying_duplicate_payload`
+tests count provider apply/commit calls and inspect persisted records
+(`examples/kvstore2/src/service.rs:375-451`;
+`examples/sqlite/src/service.rs:463-517`).
+SQLite `stream_cancellation_after_durable_apply_does_not_commit` verifies
+cancellation plus stream closure against the real paused provider (`:412-458`).
+All passed in the final focused 26-test selection and the final 336-test
+ordinary run. Cancellation does not promise rollback; this closure
+does not resolve the distinct SF-15 trait-Close task-join finding.
+
+The correction tests reproduce the cancellation-admission race and malformed
+old-sequence terminal bypass before fixing them. Deterministic same-poll
+request/close races verify under-lease admission checks
+(`replicator/stream.rs:379-439`). Terminal-negative tests prove no receipt
+appears before a real CopyComplete ACK, including contradictory flags.
+Real SQLite `sqlite_operation_stream_copy_preserves_verified_uncommitted_suffix`
+uses the Default factory, TCP ingress, actual service streams and persisted
+WAL/snapshot data (`examples/sqlite/tests/replacement_construction.rs:269-862`).
+Truthful `(2,1)` and `(3,1)` targets retain their intact suffixes over copy,
+then individually ACK retained frames without a second apply. AfterCommit
+rejection may leave physical commitment ahead: acknowledged build commitment
+separately bounds replay admission, replies, and terminal receipts
+(`stateless/mod.rs:2140-2149,2209-2323,2334-2417`).
+Exact retry with a held fresh service ACK is required to restore those proofs.
+
+**Scope of closure:** PR #154 resolves disconnected delivery and missing
+service-ACK ownership. Its replica-lifetime streams, source-local copy context,
+primary-local persistence pipeline, and ACK shape/policy are not evidence of
+SF compatibility; SF-18 through SF-21 track their required alignment.
+
 ### SF-15: KV Close does not join owned consumers
 
 **Failure:** Trait Close signals cancellation and clears references but retains
@@ -414,6 +561,147 @@ and inner guard at
 effective settings successfully without rebinding or changing identity.
 Continue rejecting a genuinely different endpoint.
 
+### SF-18: Copy stream lifetime prevents SF sequential consumption
+
+**Contract:** The SF description supports consuming the copy stream to its end
+before consuming replication. Parallel consumption is supported, but is not a
+requirement imposed on every service. End of stream is represented by a null
+operation, distinct from a temporarily empty open stream.
+
+**Failure:** Kuberic exposes single-take, replica-lifetime copy and replication
+streams. Snapshot completion is an explicit `CopyComplete` operation; the
+copy stream remains open afterward. A service following the documented SF
+copy-until-EOF-then-replication pattern waits for replica shutdown instead of
+starting replication. Existing concurrent consumers avoid this mismatch but
+do not establish compatibility with the sequential pattern.
+
+**Evidence:** SF
+[`StateReplicator` stream descriptions, lines 100-122](https://github.com/youyuanwu/service-fabric-apps-rs/blob/615da9a886d0d1d68af63f9c3916024986309673/crates/libs/mssf-ext/src/traits.rs#L100-L122)
+and
+[`OperationStream`, lines 176-185](https://github.com/youyuanwu/service-fabric-apps-rs/blob/615da9a886d0d1d68af63f9c3916024986309673/crates/libs/mssf-ext/src/traits.rs#L176-L185).
+Kuberic explicitly requires both consumers to stay alive and defines `None`
+as terminal shutdown in `kuberic-runtime/src/replicator/traits.rs:165-185`.
+`ServiceStreams` retains the copy sender until shutdown in
+`kuberic-runtime/src/replicator/stream.rs:304-367`; copy completion precedes
+retained replication in `replicator/stateless/mod.rs:2211-2282`.
+
+**Required alignment:** Make snapshot-copy completion observable through the
+SF stream-end contract and support sequential consumption. An internal
+copy-complete marker may remain an implementation detail, not a mandatory
+replacement for the service-visible end of copy. Define stream acquisition
+and renewal across builds and role changes without shutting down unrelated
+replication or confusing temporary emptiness with EOF.
+
+**Closure:** Through a real hosted factory, consume and ACK copy until `None`,
+then start replication and complete build/catch-up. Cover empty and nonempty
+copies, a later authorized build, role transitions, terminal shutdown, and
+parallel consumption. No timeout, shutdown, or mandatory concurrent consumer
+may be used to manufacture normal end-of-copy.
+
+### SF-19: Copy context comes from the primary instead of the secondary
+
+**Contract:** A newly opened idle secondary supplies provider-defined context
+to the primary. The primary passes that target context to `get_copy_state` to
+select the required state. Providers that need no context may use an empty
+exchange; that does not remove the secondary-origin requirement for providers
+that do need it.
+
+**Failure:** The built-in primary invokes its own provider's
+`get_copy_context`, then passes that result to its own `get_copy_state`.
+No target-to-source provider-context exchange occurs. Providers that rely on
+the target's existing state therefore receive context from the wrong replica.
+
+**Evidence:** SF
+[`StateProvider`, lines 35-73](https://github.com/youyuanwu/service-fabric-apps-rs/blob/615da9a886d0d1d68af63f9c3916024986309673/crates/libs/mssf-ext/src/traits.rs#L35-L73).
+Kuberic source-local calls are in
+`kuberic-runtime/src/replicator/stateless/mod.rs:1673-1677`; the current
+limitation is documented in `kuberic-runtime/src/traits.rs:64-95`.
+
+**Required alignment:** Obtain context from the exact admitted idle secondary
+and transport it to the source provider. Preserve build/session/storage/history
+binding, cancellation, and the frozen copy boundary. Do not replace the exchange
+with source context or a silent empty-context fallback.
+
+**Closure:** Use distinct source and target providers whose context bytes are
+observably different. Prove that source `get_copy_state` receives the target's
+context and builds the correct state. Cover empty context, streamed context,
+context failure/cancellation, and replacement of the target process/session
+without accepting obsolete context.
+
+### SF-20: Primary replication lacks the SF early-LSN and local-commit pipeline
+
+**Contract:** SF returns the assigned LSN immediately, separately from eventual
+quorum completion. This enables the service to prepare its local write while
+replication is pending and commit when completion permits. Application-local
+persistence remains a service responsibility rather than a prerequisite
+engine-driven `DurableState` pipeline.
+
+**Failure:** Kuberic's async `replicate` exposes the LSN only after completion.
+The built-in engine additionally applies the primary's operation and commits
+its store around quorum collection. A service using SF's early-LSN/local-write
+pipeline cannot preserve that behavior by implementing only the corresponding
+service/provider contract.
+
+**Evidence:** SF
+[`StateReplicator::replicate`, lines 79-98](https://github.com/youyuanwu/service-fabric-apps-rs/blob/615da9a886d0d1d68af63f9c3916024986309673/crates/libs/mssf-ext/src/traits.rs#L79-L98).
+Kuberic's completion-only result and primary persistence ownership are explicit
+in `kuberic-runtime/src/replicator/traits.rs:140-163`. Engine-driven apply and
+commit are in `replicator/stateless/mod.rs:2997-3013,3073-3098`.
+The SF interface does not prescribe Kuberic's additional `DurableState`
+integration; the local ownership contrast is also recorded in
+[Stateful API and Trait Compatibility](service-fabric-alignment.md#stateful-api-and-trait-compatibility).
+
+**Required alignment:** Expose operation assignment separately from eventual
+completion and support service-owned primary preparation/commit ordering.
+Reconcile the existing built-in persistence dependency rather than adding an
+early number while retaining a conflicting automatic local-write owner.
+Preserve exact authority, contiguous history, PC/CC quorum predicates, and
+honest ambiguous outcomes. `Replicator`, `PrimaryReplicator`, and
+`StateProvider` remain protected interfaces; this finding does not authorize
+changing them.
+
+**Closure:** Hold secondary ACKs and obtain the assigned LSN while completion
+remains pending. Let the real service prepare its local write using that LSN,
+then release quorum and verify the intended local commit without double
+application. Cover concurrent assignments, quorum failure, cancellation, and
+epoch change without claiming rollback of already durable effects.
+
+### SF-21: Acknowledgement requires Kuberic progress and always-explicit ACK
+
+**Contract:** SF operation ACK reports successful local application without an
+applied/committed progress argument. Persisted services require explicit ACK.
+Volatile services can use implicit acknowledgement on receipt unless configured
+to require service ACK. Successful replication still requires the applicable
+replica quorum.
+
+**Failure:** `StreamOperation::acknowledge` requires a
+`DurableApplicationProgress` payload and every operation requires explicit
+service ACK. There is no volatile implicit-ACK policy. This is a stricter
+Kuberic-specific contract, not evidence of unsafe persisted ACKs, but it does
+not expose the SF application-facing ACK semantics selected for alignment.
+
+**Evidence:** SF
+[`Operation::acknowledge`, lines 161-173](https://github.com/youyuanwu/service-fabric-apps-rs/blob/615da9a886d0d1d68af63f9c3916024986309673/crates/libs/mssf-ext/src/traits.rs#L161-L173).
+Kuberic's explicit-only requirement and ACK payload are in
+`kuberic-runtime/src/replicator/stream.rs:27-34,178-194`; receiver delivery
+waits on this progress-bearing completion in
+`replicator/stateless/mod.rs:1110-1140`.
+
+**Required alignment:** Support the SF service-facing ACK contract without
+requiring its caller to supply Kuberic-specific progress, and distinguish
+persisted explicit ACK from the supported volatile implicit/required-ACK
+policies. Retain necessary progress/history validation internally; do not
+weaken persisted durability or credit a missing persisted-service ACK merely
+to reproduce a method signature.
+
+**Closure:** A persisted service can apply and explicitly ACK without supplying
+progress in the ACK call; withholding or dropping that ACK prevents successful
+completion. A volatile service configured for implicit ACK can complete on
+receipt, while required-service-ACK mode stays pending until ACK. Verify
+quorum, authority changes, rejection/failure handling, and progress reporting
+for each supported policy without misrepresenting volatile ACK as durable
+persistence.
+
 ## Documentation and Contract Reconciliation
 
 ### SF-D01: Catch-up capability is a tail, not a retained floor
@@ -437,6 +725,11 @@ The audit did not count async signatures, omission of COM cancellation tokens,
 explicit primary epoch replay, or exact Public V1 identity/session/storage
 authority as violations merely because they differ from SF.
 
+The 2026-10-17 follow-up explicitly selects SF alignment for copy stream
+completion, secondary-origin copy context, early-LSN/service-owned primary
+completion, and service ACK policy. Those differences are now open SF-18
+through SF-21, not intentional exceptions covered by this boundary statement.
+
 Other distinctions remain explicit rather than being counted as extra findings:
 
 - Built-in applied progress during access-closed recovery is not automatically
@@ -455,6 +748,8 @@ Other distinctions remain explicit rather than being counted as extra findings:
   reconfiguration safety were not exhaustively proved by this audit.
 
 ## Verification Record
+
+### Original Audit
 
 The audit ran these existing targeted selections successfully:
 
@@ -477,3 +772,49 @@ PostgreSQL verification should use `just nextest-postgres-smoke`; the full
 `just nextest-postgres` suite requires an explicit request. Add focused
 regressions for each closure condition rather than using the existing
 conformance catalog or controller completion fakes as blanket proof.
+
+### Resolution Verification
+
+Final state, run `67074f25-598e-4f16-8fad-7c53cdcc2584`:
+
+```sh
+cargo nextest run -p kuberic-runtime -p kuberic-controller \
+    -p kuberic-level-tests -p kvstore2 -p sqlite-replicated \
+    --all-features --profile ordinary --test-threads 1
+```
+
+**336 passed, 4 skipped**, 580.588 seconds, including all named regressions
+above. Final focused contract/provider selection: **26 passed**, 63.106s
+(`0ecd1799-4e5f-45b3-ac45-759c6837a712`).
+Earlier Phase 1 runs passed 331 ordinary and 52 recovery/provider/stream
+tests; these precede the final-review corrections and are not substituted
+for the final-state runs.
+Workspace format/check/all-features clippy with warnings denied, doctests
+(2), source API inventory (4), privacy (1), and executable built-in
+conformance (1; `just nextest-build-only`, run
+`f0fc49cc-47f4-4577-9a10-8e5fe8305f0d`, 71.074s) passed.
+
+The approved `just nextest-postgres-smoke` passed **8 tests** (run
+`00cd4814-b216-4cdf-b3c7-3437d1c27aac`, 116.480 seconds) with
+`KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR=/tmp`. An initial long checkout-local socket
+root failed all eight before readiness; the standard short root resolved
+that environment limit. Earlier ordinary iterations exposed retry, retained
+boundary, and primary-report regressions. Final Astra review additionally
+found the admission race, malformed terminal bypass, and real SQLite suffix
+regression; all were corrected and reviewed before the definitive passing
+runs. These results do not close unrelated PostgreSQL findings.
+
+Exact inventory validation measured **382 = 336 ordinary + 41 PostgreSQL +
+3 KinD live + 2 build-only**; all tier lists and configured partition unions
+passed (ordinary slices `84,84,84,84`; PostgreSQL hashes `11,13,8,9`).
+Full PostgreSQL, live KinD, and archive rebuild were not executed.
+SF-14's original resolution was verified locally without publication. It was
+subsequently published in PR #154.
+
+### SF Trait-Semantics Follow-Up
+
+SF-18 through SF-21 were documented from the pinned upstream descriptions and
+Kuberic source at the follow-up baseline. They are open requirements with
+specific closure criteria, not implemented changes or dynamically executed
+failure reproductions. Existing SF-14 regression results establish delivery
+and ACK ownership only; they do not satisfy these additional alignment gates.

@@ -128,6 +128,7 @@ use stream::OperationStream;
 
 #[async_trait]
 pub(crate) trait StatelessRuntimeControl: Send + Sync {
+    async fn reported_progress(&self) -> Result<(i64, i64)>;
     async fn shutdown_and_drain(&self) -> Result<()>;
     async fn install_inbound_build_authority(
         &self,
