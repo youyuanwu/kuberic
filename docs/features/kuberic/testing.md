@@ -27,13 +27,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 313 |
+| ordinary | 331 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **359** |
+| **total** | **377** |
 
-Ordinary partition counts are `79, 78, 78, 78`. PostgreSQL partition counts
+Ordinary partition counts are `83, 83, 83, 82`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -50,6 +50,22 @@ the structural KSF catalog.
 
 Timeout-sensitive hosted recovery tests should use the repository nextest
 profile rather than an ad-hoc highly parallel `cargo test` invocation.
+
+### Built-In Service Operation Delivery
+
+```bash
+cargo nextest run -p kuberic-runtime -p kvstore2 -p sqlite-replicated \
+  --all-features --profile ordinary --test-threads 1 \
+  -E 'test(hosted_operation_stream_) or test(stream_)'
+```
+
+Eleven hosted factory/service tests hold real copy, copy-complete, active and
+retained replication operations. They cover delayed durable ACK, duplicate
+commitment, rejection/drop/invalid history, exact retries, cancellation,
+authority/role/epoch/configuration fencing, synchronous-effect drainage,
+shutdown without consumers, and primary-local no-redelivery. Memory-backed
+hosted tests prove sequencing, not fsync; real KV/SQLite consumer tests verify
+durable commitment without duplicate application and SQLite cancellation.
 
 ### In-Process Controller/Application Journeys
 

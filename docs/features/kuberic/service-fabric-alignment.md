@@ -91,10 +91,6 @@ compatibility. In particular:
 - SF obtains copy context on an idle secondary and sends it to the primary.
   The built-in Kuberic engine currently obtains context from the source
   provider instead; it does not implement that bidirectional exchange.
-- Copy/replication stream getters exist, but the built-in engine currently
-  delivers incoming operations directly to `DurableState`, not through those
-  service streams. This is the open SF-14 contract gap, not proof that the
-  documented service-delivery interface works.
 - The built-in catch-up capability reports a committed tail rather than the
   retained floor described by the contract. SF-D01 tracks the required
   documentation/behavior reconciliation.
@@ -104,6 +100,14 @@ numbered findings and the other open implementation violations. Documentation
 alignment alone does not close them or establish full SF compliance. The
 protected `Replicator`, `PrimaryReplicator`, and `StateProvider` interfaces
 remain unchanged.
+
+Built-in copy/replication now reaches service-owned streams and requires
+explicit durable service ACK before ingress completion (SF-14 fixed).
+Primary-local persistence remains engine-owned. See
+[operation delivery semantics](service-fabric-api-semantics.md#service-operation-delivery)
+for ownership, cancellation, and stream lifetime requirements.
+The tracker also records SF-04/SF-05's earlier PR #151 switchover fixes;
+these closures do not resolve the other behavioral gaps.
 
 ## KSF Conformance
 
@@ -126,8 +130,8 @@ surface. Extra endpoint, alternate protocol, and alternate controller-owner
 fixtures are injected through the same discovery path and must fail the same
 validator.
 
-The current test inventory contains 337 tests:
-291 ordinary, 41 PostgreSQL, three KinD, and two build-only.
+The current test inventory contains 377 tests:
+331 ordinary, 41 PostgreSQL, three KinD, and two build-only.
 
 ## Deliberate Differences
 
