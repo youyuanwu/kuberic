@@ -828,6 +828,15 @@ impl ReplicatorFactoryContext {
         self.access.replacement_storage_is_retired(storage).await
     }
 
+    pub(crate) async fn replacement_build_storage_is_current(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<bool> {
+        self.access
+            .replacement_build_storage_is_current(authority)
+            .await
+    }
+
     pub(crate) fn release_provider_writer(&self) {
         self.access.release_provider_writer();
     }
@@ -884,6 +893,11 @@ pub(crate) trait PartitionAccessView: Send + Sync {
     async fn replacement_storage_is_retired(
         &self,
         storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+    ) -> Result<bool>;
+
+    async fn replacement_build_storage_is_current(
+        &self,
+        authority: &PublicInboundBuildAuthority,
     ) -> Result<bool>;
 
     fn release_provider_writer(&self);

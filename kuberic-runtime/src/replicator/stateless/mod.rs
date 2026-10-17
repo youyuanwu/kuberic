@@ -424,11 +424,51 @@ struct EngineState {
     authority: Option<ConfigurationAuthority>,
     retired: BTreeSet<ReplicaIdentity>,
     inbound_build: Option<InboundBuild>,
+    completed_builds: BTreeMap<ReplicaIdentity, CompletedBuild>,
     applied_lsn: i64,
     committed_lsn: i64,
     ambiguous_suffix: bool,
     local_rebuild_required: bool,
     closed: bool,
+}
+
+#[derive(Clone)]
+struct CompletedBuild {
+    authority: PublicInboundBuildAuthority,
+    terminal: proto::CopyItem,
+}
+
+fn terminal_matches_receipt(item: &proto::CopyItem, receipt: &PublicInboundBuildReceipt) -> bool {
+    let authority = &receipt.authority;
+    item.protocol_version == PUBLIC_V1_PROTOCOL_VERSION
+        && item.build_id == authority.attempt.build_id.as_str()
+        && item.sender.as_ref() == Some(&authority.attempt.source.clone().into())
+        && item.receiver.as_ref() == Some(&authority.attempt.target.clone().into())
+        && item.sender_session_id == authority.attempt.source_session.as_str()
+        && item.receiver_session_id == authority.attempt.target_session.as_str()
+        && item.epoch == Some(authority.attempt.epoch.into())
+        && item.current_configuration_id == authority.current_configuration_id.as_str()
+        && item.source_storage
+            == Some(crate::control::convert::public_v1_storage_to_proto(
+                &authority.attempt.source_storage,
+            ))
+        && item.target_storage
+            == Some(crate::control::convert::public_v1_storage_to_proto(
+                &authority.attempt.target_storage,
+            ))
+        && item.history
+            == Some(crate::control::convert::public_v1_history_to_proto(
+                &authority.history,
+            ))
+        && item.target_address == authority.target_address
+        && item.final_item
+        && !item.snapshot_chunk
+        && item.data.is_empty()
+        && item.sequence == receipt.final_sequence
+        && item.replication_boundary_lsn == receipt.replication_boundary_lsn
+        && item.catch_up_boundary_lsn == Some(receipt.catch_up_boundary_lsn)
+        && item.lsn == receipt.catch_up_boundary_lsn
+        && item.committed_lsn == receipt.catch_up_boundary_lsn
 }
 
 struct ListenerOwner {
@@ -770,6 +810,7 @@ impl StatelessReplicator {
                 authority: None,
                 retired: BTreeSet::new(),
                 inbound_build: None,
+                completed_builds: BTreeMap::new(),
                 applied_lsn: 0,
                 committed_lsn: 0,
                 ambiguous_suffix: false,
@@ -1117,6 +1158,81 @@ impl StatelessReplicator {
             }
             (authority, state.applied_lsn, state.committed_lsn)
         };
+        if let Some(terminal) = item.completed_build.as_ref() {
+            let receipt = self
+                .context
+                .replacement_terminal_inbound_build_receipt(
+                    &crate::protocol::types::OperationId::new(terminal.build_id.clone()),
+                )
+                .await
+                .map_err(runtime_status)?
+                .ok_or_else(|| Status::failed_precondition("copy prefix receipt is absent"))?;
+            let build = &receipt.authority;
+            if !terminal_matches_receipt(terminal, &receipt)
+                || build.attempt.source != sender
+                || build.attempt.target != receiver
+                || build.attempt.source_session.as_str() != item.sender_session_id
+                || build.attempt.target_session.as_str() != item.receiver_session_id
+                || build.attempt.epoch != epoch
+                || build.target_address != self.settings.read().await.replication_address
+                || authority.peers.get(&sender).is_none_or(|peer| {
+                    peer.storage_incarnation.as_ref() != Some(&build.attempt.source_storage)
+                })
+                || item.lsn != receipt.catch_up_boundary_lsn
+                || item.committed_lsn != item.lsn
+                || !item.data.is_empty()
+                || !self
+                    .context
+                    .replacement_build_storage_is_current(build)
+                    .await
+                    .map_err(runtime_status)?
+            {
+                return Err(Status::failed_precondition(
+                    "copy prefix proof changed exact live identity",
+                ));
+            }
+            let progress = self
+                .storage
+                .durable_progress()
+                .await
+                .map_err(runtime_status)?;
+            let provider_committed = self
+                .provider
+                .last_committed_lsn()
+                .await
+                .map_err(runtime_status)?;
+            if progress.applied_lsn != prior_applied
+                || progress.committed_lsn != prior_committed
+                || provider_committed != progress.committed_lsn
+                || progress.committed_lsn < item.lsn
+                || progress.applied_lsn < progress.committed_lsn
+                || !self
+                    .exact_authority_is_current(
+                        &authority,
+                        generation,
+                        ReplicaRole::ActiveSecondary,
+                    )
+                    .await
+            {
+                return Err(Status::failed_precondition(
+                    "copy prefix proof lacks current durable progress",
+                ));
+            }
+            return Ok(proto::ReplicationAck {
+                protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
+                sender: Some(sender.into()),
+                receiver: Some(receiver.into()),
+                epoch: Some(epoch.into()),
+                previous_configuration_id: item.previous_configuration_id,
+                current_configuration_id: item.current_configuration_id,
+                received_lsn: item.lsn,
+                applied_lsn: progress.applied_lsn,
+                committed_lsn: progress.committed_lsn,
+                sender_session_id: item.sender_session_id,
+                receiver_session_id: item.receiver_session_id,
+                completed_build: item.completed_build,
+            });
+        }
         if item.lsn == 0 {
             if item.committed_lsn != 0 || !item.data.is_empty() {
                 return Err(Status::failed_precondition(
@@ -1167,6 +1283,7 @@ impl StatelessReplicator {
                 committed_lsn: 0,
                 sender_session_id: item.sender_session_id,
                 receiver_session_id: item.receiver_session_id,
+                completed_build: None,
             });
         }
         if item.lsn > prior_applied.saturating_add(1)
@@ -1290,6 +1407,7 @@ impl StatelessReplicator {
             committed_lsn: committed.committed_lsn,
             sender_session_id: item.sender_session_id,
             receiver_session_id: item.receiver_session_id,
+            completed_build: None,
         })
     }
 
@@ -1318,6 +1436,18 @@ impl StatelessReplicator {
         peer: &ReplicaInformation,
         operation: &Operation,
         committed_lsn: i64,
+    ) -> std::result::Result<(), ReplicationSendFailure> {
+        self.send_replication_frame(authority, peer, operation, committed_lsn, None)
+            .await
+    }
+
+    async fn send_replication_frame(
+        &self,
+        authority: &ConfigurationAuthority,
+        peer: &ReplicaInformation,
+        operation: &Operation,
+        committed_lsn: i64,
+        completed_build: Option<&proto::CopyItem>,
     ) -> std::result::Result<(), ReplicationSendFailure> {
         let endpoint = if peer.replication_address.starts_with("http://")
             || peer.replication_address.starts_with("https://")
@@ -1356,6 +1486,7 @@ impl StatelessReplicator {
                 data: operation.data.to_vec(),
                 sender_session_id: self.process_session.to_string(),
                 receiver_session_id: peer.process_session_id.to_string(),
+                completed_build: completed_build.cloned(),
             };
             let response = client
                 .replicate(Request::new(stream::iter([item])))
@@ -1414,6 +1545,7 @@ impl StatelessReplicator {
                 || acknowledgement.received_lsn != operation.lsn
                 || acknowledgement.applied_lsn < operation.lsn
                 || acknowledgement.committed_lsn < committed_lsn
+                || acknowledgement.completed_build.as_ref() != completed_build
             {
                 return Err(ReplicationSendFailure::Rejected(
                     "stateless replacement ACK changed exact authority".into(),
@@ -1497,8 +1629,77 @@ impl StatelessReplicator {
         through_lsn: i64,
         committed_lsn: i64,
     ) -> Result<i64> {
+        let generation = self.generation();
         if through_lsn < 0 {
             return Err(RuntimeError::ReconfigurationPending);
+        }
+        let completed = self
+            .state
+            .lock()
+            .await
+            .completed_builds
+            .get(&peer.identity)
+            .cloned();
+        let mut prefix = None;
+        if let Some(build) = completed {
+            let attempt = &build.authority.attempt;
+            if attempt.source == self.identity
+                && attempt.source_session == self.process_session
+                && attempt.target == peer.identity
+                && attempt.target_session == peer.process_session_id
+                && peer.storage_incarnation.as_ref() == Some(&attempt.target_storage)
+                && build.authority.target_address == peer.replication_address
+                && attempt.epoch == authority.epoch
+                && build.terminal.lsn <= through_lsn.min(committed_lsn)
+                && self
+                    .context
+                    .replacement_build_storage_is_current(&build.authority)
+                    .await?
+            {
+                let proof = Operation {
+                    lsn: build.terminal.lsn,
+                    committed_lsn: build.terminal.lsn,
+                    data: OperationData::default(),
+                };
+                let mut result = self
+                    .send_replication_frame(
+                        authority,
+                        peer,
+                        &proof,
+                        proof.lsn,
+                        Some(&build.terminal),
+                    )
+                    .await;
+                if matches!(result, Err(ReplicationSendFailure::Unavailable(_))) {
+                    result = self
+                        .send_replication_frame(
+                            authority,
+                            peer,
+                            &proof,
+                            proof.lsn,
+                            Some(&build.terminal),
+                        )
+                        .await;
+                }
+                if !self
+                    .exact_authority_is_current(authority, generation, ReplicaRole::Primary)
+                    .await
+                {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                match result {
+                    Ok(()) => prefix = Some(proof.lsn),
+                    Err(ReplicationSendFailure::Unavailable(detail)) => {
+                        return Err(RuntimeError::Application(detail));
+                    }
+                    Err(ReplicationSendFailure::Rejected(_)) => {
+                        return Err(Self::remote_rebuild_required(authority, peer));
+                    }
+                }
+            }
+        }
+        if prefix == Some(through_lsn) {
+            return Ok(through_lsn);
         }
         if through_lsn == 0 {
             let proof = Operation {
@@ -1519,7 +1720,9 @@ impl StatelessReplicator {
                 }
             };
         }
-        let first = if peer.current_progress >= through_lsn {
+        let first = if let Some(prefix) = prefix {
+            prefix + 1
+        } else if peer.current_progress >= through_lsn {
             through_lsn
         } else {
             peer.current_progress.saturating_add(1).max(1)
@@ -1677,6 +1880,7 @@ impl StatelessReplicator {
     }
 
     async fn send_build(&self, replica: &ReplicaInformation) -> Result<()> {
+        let generation = self.generation();
         let authority = self.require_primary().await.map_err(|error| {
             RuntimeError::AuthorityMismatch(format!(
                 "build source primary authority is unavailable: {error}"
@@ -1903,6 +2107,7 @@ impl StatelessReplicator {
             target_address: build_authority.target_address.clone(),
         });
 
+        let terminal = items.last().expect("build has a terminal frame").clone();
         let endpoint = if replica.replication_address.starts_with("http://")
             || replica.replication_address.starts_with("https://")
         {
@@ -1968,6 +2173,8 @@ impl StatelessReplicator {
         .map_err(|_| RuntimeError::OperationCancelled)??;
         if final_ack.durable_lsn < catch_up_boundary_lsn
             || final_ack.catch_up_boundary_lsn != Some(catch_up_boundary_lsn)
+            || final_ack.sequence != terminal.sequence
+            || final_ack.snapshot_chunk
         {
             return Err(RuntimeError::ReplicaRebuildRequired(Box::new(
                 ReplicaRebuildRequired::RemoteBuildTarget(Box::new(
@@ -1980,6 +2187,19 @@ impl StatelessReplicator {
                 )),
             )));
         }
+        if !self
+            .exact_authority_is_current(&authority, generation, ReplicaRole::Primary)
+            .await
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
+        self.state.lock().await.completed_builds.insert(
+            replica.identity.clone(),
+            CompletedBuild {
+                authority: build_authority,
+                terminal,
+            },
+        );
         Ok(())
     }
 
@@ -2809,15 +3029,28 @@ impl PrimaryReplicator for StatelessReplicator {
     }
 
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
-        let authority = {
+        let generation = self.generation();
+        let (authority, role_epoch) = {
             let state = self.state.lock().await;
-            state
+            let authority = state
                 .authority
                 .clone()
-                .ok_or(RuntimeError::AuthorityNotAdmitted)?
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            (authority, state.role_epoch)
         };
         let peer_progress = self.settle_applied_suffix(&authority, mode).await?;
         let state = self.state.lock().await;
+        if self.closed.load(Ordering::Acquire)
+            || self.generation() != generation
+            || state.closed
+            || !state.opened
+            || state.role != ReplicaRole::Primary
+            || state.role_epoch != role_epoch
+            || state.updated_epoch != Some(authority.epoch)
+            || state.authority.as_ref() != Some(&authority)
+        {
+            return Err(RuntimeError::OperationCancelled);
+        }
         let ready = std::iter::once(&self.identity)
             .chain(
                 authority
