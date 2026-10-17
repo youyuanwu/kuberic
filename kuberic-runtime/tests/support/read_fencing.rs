@@ -299,8 +299,6 @@ async fn sf11_committed_prefix_6_through_10_precedes_ambiguous_11_and_rejects_ba
                         while secondary.state.durable_progress().await.unwrap().committed_lsn != 11 {
                             tokio::task::yield_now().await;
                         }
-                        assert_eq!(scalar_progress(&primary).await,
-                            if matches!(case, "exact" | "promotion") { 11 } else { 10 });
                     }).await.unwrap();
                     assert_eq!(*delivered.lock().unwrap(),
                         vec![(6, 6), (7, 7), (8, 8), (9, 9), (10, 10), (11, 10), (11, 11)]);
@@ -332,6 +330,8 @@ async fn sf11_committed_prefix_6_through_10_precedes_ambiguous_11_and_rejects_ba
                 }
                 _ => unreachable!(),
             }
+            assert_eq!(scalar_progress(&primary).await,
+                if matches!(case, "exact" | "promotion") { 11 } else { 10 });
             primary.stop().await;
             if case != "unavailable" { secondary.stop().await; }
             consumers.abort_all();
