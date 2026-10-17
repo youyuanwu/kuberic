@@ -77,6 +77,16 @@ route `update_epoch` to active/idle secondaries and give the new primary its
 epoch through `change_role`. Kuberic also explicitly replays a primary epoch
 barrier; similar method names do not imply identical callback scheduling.
 
+SF-06 separates partition access revocation from lifecycle roles: terminal
+containment no longer depends on synthetic application None callbacks, and
+source final catch-up precedes actual replicator/application demotion. The
+implementation and regressions are recorded in the
+[SF-06 audit closure](service-fabric-contract-audit.md#sf-06-access-revocation-can-block-teardown-and-violate-role-ordering).
+Actual local SF source at `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`
+supports that separation/order, with qualified differences in Close failure
+reporting, synchronous Abort waits, and catch-up access timing; see the
+[pinned source evidence](service-fabric-api-semantics.md#verified-service-fabric-source-and-qualifications).
+
 Application-facing trait definitions are in
 [`traits.rs`](../../../kuberic-runtime/src/traits.rs), and replication trait
 definitions are in
