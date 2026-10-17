@@ -145,6 +145,7 @@ the isolated development/CI assets above.
 - [Stateless default Replicator](docs/features/kuberic/stateless-default-replicator.md)
 - [Service Fabric alignment](docs/features/kuberic/service-fabric-alignment.md)
 - [Faithful SF V1 replicator port design and plan](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
+- [SF V1 P1 source/scenario ledger](docs/features/kuberic/sf-v1-port-ledger.md) and [provenance/notices](docs/features/kuberic/sf-v1-port-provenance.md)
 - [V2 transactional Replicator design](docs/features/kuberic/v2-transactional-replicator-design.md)
 - [Replicator boundary and native proof](docs/features/kuberic/replicator-boundary.md)
 - [Testing strategy](docs/features/kuberic/testing.md)

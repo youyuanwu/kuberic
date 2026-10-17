@@ -8,8 +8,9 @@ adds native-source/test-vector mapping and a future behavior/capability matrix:
 persisted/volatile services, service-owned primary commit, receiver lifetimes,
 progress/quorum/status, terminal outcomes and real tonic retry/reconnect/
 backpressure scenarios. Existing KSF inventory and current-contract regressions do
-not establish complete native parity. Planned cases do not exist in the test
-inventory yet; add selectors/counts only with actual implementations. Preserve
+not establish complete native parity. P1's expected-scenario inventory is now
+separate from future executable port-component/hosted cases; add selectors and
+counts for those only with actual implementations. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
 
@@ -37,13 +38,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 369 |
+| ordinary | 376 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **415** |
+| **total** | **422** |
 
-Ordinary partition counts are `93, 92, 92, 92`. PostgreSQL partition counts
+Ordinary partition counts are `94, 94, 94, 94`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -60,6 +61,41 @@ the structural KSF catalog.
 
 Timeout-sensitive hosted recovery tests should use the repository nextest
 profile rather than an ad-hoc highly parallel `cargo test` invocation.
+
+### SF V1 P1 Foundation
+
+```bash
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test-threads 1 --test sf_v1_foundation
+```
+
+Seven ordinary tests validate the
+[native-derived expectation inventory/oracle](sf-v1-port-ledger.md): 11 source
+families, 15 contract mappings, 33 deterministic scenario vectors and 29
+capability/settings cases. These execute fixture/predicate checks, **not** a
+ported or native replicator. Source-derived role/transport/lifecycle vectors
+remain inventory where no executable predicate exists. The existing 16 KSF
+entries remain structural/current-contract evidence, with no new KSF ID or
+native-parity claim. The new binary is automatically ordinary-tier and included
+in the all-features reusable archive; it needs neither native source nor Cargo
+at execution time.
+
+The separate current-engine counterexample selection is:
+
+```bash
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test-threads 1 --test public_v1_recovery \
+  -E 'test(=read_fencing::sf_d02_primary_scalar_waits_for_quorum_and_local_commit_across_cancel_and_epoch) or test(=read_fencing::sf_d02_secondary_scalar_is_contiguous_service_acknowledged_not_committed) or test(=hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children)'
+```
+
+These three existing real-engine tests preserve current held-ACK/held-local-
+commit and contained-Close assertions. They do not execute expected native
+algorithms. Five further current-source counterexamples in the ledger remain
+source-only. Memory fixtures prove ordering, not fsync. The strengthened
+existing external API fixture pins Bytes, boxed `Stream<Item = Result<Bytes>>
++ Send`, i64 and all protected methods; it remains one of the **existing two**
+build-only guards run by `scripts/check_runtime_public_api.sh`, not a new
+ordinary or archive-only Cargo invocation.
 
 ### Built-In Service Operation Delivery
 

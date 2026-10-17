@@ -3,6 +3,9 @@
 ## Status and Compatibility Target
 
 **Planning only, 2026-10-17. No runtime behavior changes in this document.**
+The separately delivered [P1 foundation ledger](sf-v1-port-ledger.md) and
+[provenance/notices](sf-v1-port-provenance.md) record source-derived scenarios
+and protected-type guards, not ported engine behavior or complete alignment.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -517,7 +520,7 @@ Native links use the verified pin above; some rows need multiple paths as noted.
   [manager ownership](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicaManager.h#L285-L349),
   [queue contract](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/OperationQueue.h#L21-L92),
   [session ownership](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/RemoteSession.h#L202-L259).
-- [N13]: [transport/demux](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicationTransport.cpp#L880-L945),
+- [N13]: [transport/demux](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicationTransport.cpp#L880-L937),
   [reliable sender](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReliableOperationSender.cpp#L543-L817),
   [ACK processing order](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/RemoteSession.cpp#L492-L670).
 - [N14]: [production interface exposure](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ComReplicator.h#L12-L35),
