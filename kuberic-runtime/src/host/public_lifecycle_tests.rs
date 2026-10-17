@@ -25,6 +25,8 @@ struct Probe {
     block_application_close: AtomicBool,
     fail_role: AtomicBool,
     fail_application_role: AtomicBool,
+    listener_close: Mutex<Option<TerminalDrain>>,
+    listener_abort: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     role: Mutex<Option<ReplicaRole>>,
     close_entered: Notify,
     catchup_entered: Notify,
@@ -109,6 +111,10 @@ impl Replicator for Replication {
     }
     async fn close(&self) -> crate::Result<()> {
         self.0.event("replicator.close");
+        let listener_close = self.0.listener_close.lock().unwrap().clone();
+        if let Some(close) = listener_close {
+            close().await?;
+        }
         if self.0.fail_replicator_close.load(Ordering::Acquire) {
             return Err(RuntimeError::Application(
                 "replicator close injected".into(),
@@ -118,6 +124,9 @@ impl Replicator for Replication {
     }
     fn abort(&self) {
         self.0.event("replicator.abort");
+        if let Some(abort) = self.0.listener_abort.lock().unwrap().as_ref() {
+            abort();
+        }
     }
     async fn current_progress(&self) -> crate::Result<i64> {
         Ok(0)
@@ -467,6 +476,83 @@ async fn sf06_shutdown_cancels_roots_before_joining_terminal_owners() {
         .unwrap()
         .unwrap();
     assert_eq!(close.snapshot().stage, PublicOperationStage::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sf06_listener_join_survives_close_supersession_and_registry_shutdown() {
+    for shutdown_registry in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let entered = Arc::new(Notify::new());
+        let entered_task = entered.clone();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            entered_task.notify_one();
+            // Model a listener poll in non-preemptible native code. Abort is
+            // requested promptly but actual termination must still be joined.
+            blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+            std::future::pending::<crate::Result<()>>().await
+        });
+        let listener = task.abort_handle();
+        entered.notified().await;
+        let (shutdown, mut closing) = tokio::sync::watch::channel(false);
+        let (close_hook, drain_hook, abort_hook) =
+            crate::replicator::stateless::sf06_listener_test_hooks(shutdown, task);
+        *fixture.probe.listener_close.lock().unwrap() = Some(close_hook);
+        *fixture.probe.listener_abort.lock().unwrap() = Some(abort_hook);
+        fixture.callbacks.terminal_drain = drain_hook;
+        let close = fixture.launch(PublicOperationProgram::Close, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), closing.wait_for(|closing| *closing))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut shutdown = None;
+        let mut successor = None;
+        if shutdown_registry {
+            let registry = fixture.registry.clone();
+            shutdown = Some(tokio::spawn(async move { registry.shutdown().await }));
+        } else {
+            successor = Some(fixture.launch(PublicOperationProgram::Abort, 2).await);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while close.snapshot().stage != PublicOperationStage::ContainmentPending {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!listener.is_finished());
+        assert!(close.complete_containment().await.is_err());
+        if let Some(successor) = &successor {
+            assert_eq!(
+                successor.snapshot().stage,
+                PublicOperationStage::WaitingForContainment
+            );
+        }
+        if let Some(shutdown) = &mut shutdown {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), shutdown)
+                    .await
+                    .is_err()
+            );
+        }
+        release.send(()).unwrap();
+        if let Some(successor) = successor {
+            assert_eq!(
+                completed(&successor).await.stage,
+                PublicOperationStage::Completed
+            );
+            fixture.registry.shutdown().await.unwrap();
+        }
+        if let Some(shutdown) = shutdown {
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert!(listener.is_finished());
+        assert_eq!(close.snapshot().stage, PublicOperationStage::Completed);
+    }
 }
 
 #[tokio::test]
