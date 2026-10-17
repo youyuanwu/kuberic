@@ -1451,6 +1451,23 @@ impl StreamBuildFixture {
         .into_inner()
     }
 
+    fn terminal_receipt(&self) -> Option<serde_json::Value> {
+        let connection =
+            rusqlite::Connection::open(SqliteStore::metadata_database_path(&self.target.root))
+                .unwrap();
+        let json: String = connection
+            .query_row(
+                "SELECT state_json FROM agent_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+        state["publicV1OperationState"]["terminalInboundBuildReceipts"]
+            .get(self.authority.attempt.build_id.as_str())
+            .cloned()
+    }
+
     async fn cleanup(mut self) {
         self.source.stop().await;
         self.target.stop().await;
@@ -1525,6 +1542,149 @@ async fn hosted_operation_stream_copy_and_completion_wait_for_durable_ack() {
             operations.try_recv().is_err(),
             "exact terminal receipt must be replayable"
         );
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_live_final_requires_exact_sequence_and_copy_complete_ack() {
+    for malformed_kind in 0..4 {
+        let fixture = StreamBuildFixture::start("stream-final-admission", false, 0).await;
+        let mut operations = fixture.target.application.control_operations();
+        let mut snapshot = fixture.send(fixture.frame(0, true, false, 0, 0)).await;
+        let operation = delivered(&mut operations).await;
+        let progress = operation
+            .apply_to(fixture.target.state.as_ref())
+            .await
+            .unwrap();
+        operation.acknowledge(progress).unwrap();
+        snapshot.message().await.unwrap().unwrap();
+
+        let mut malformed = fixture.frame(
+            if malformed_kind == 0 { 0 } else { 1 },
+            malformed_kind == 1,
+            true,
+            0,
+            0,
+        );
+        if malformed_kind == 2 {
+            malformed.data = b"nonempty-final".to_vec();
+        } else if malformed_kind == 3 {
+            malformed.committed_lsn = 1;
+        }
+        for _ in 0..2 {
+            let mut response = fixture.send(malformed.clone()).await;
+            if malformed_kind == 1 {
+                // Also exercise an actual Copy ACK if this malformed frame is delivered.
+                tokio::select! {
+                    result = response.message() => assert!(result.is_err()),
+                    operation = delivered(&mut operations) => {
+                        let progress = operation.apply_to(fixture.target.state.as_ref()).await.unwrap();
+                        operation.acknowledge(progress).unwrap();
+                        assert!(response.message().await.is_err(), "snapshot/final frame completed the build");
+                    }
+                }
+            } else {
+                assert!(
+                    response.message().await.is_err(),
+                    "malformed live final frame bypassed CopyComplete"
+                );
+            }
+            assert!(fixture.terminal_receipt().is_none());
+            assert!(operations.try_recv().is_err());
+        }
+        let final_frame = fixture.frame(1, false, true, 0, 0);
+        let mut response = fixture.send(final_frame.clone()).await;
+        let complete = delivered(&mut operations).await;
+        assert!(matches!(
+            complete.metadata,
+            OperationMetadata::CopyComplete { .. }
+        ));
+        pending_ack(&mut response).await;
+        let progress = complete
+            .apply_to(fixture.target.state.as_ref())
+            .await
+            .unwrap();
+        pending_ack(&mut response).await;
+        assert!(fixture.terminal_receipt().is_none());
+        complete.acknowledge(progress).unwrap();
+        assert!(response.message().await.unwrap().unwrap().final_item);
+        assert_eq!(fixture.terminal_receipt().unwrap()["finalSequence"], 1);
+        let mut replay = fixture.send(final_frame).await;
+        assert!(replay.message().await.unwrap().unwrap().final_item);
+        assert!(operations.try_recv().is_err());
+        fixture.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_copy_complete_requires_verified_existing_suffix() {
+    for malformed_kind in 0..5 {
+        let fixture = StreamBuildFixture::start("stream-complete-suffix", false, 1).await;
+        let mut operations = fixture.target.application.control_operations();
+        let applied_lsn = if malformed_kind == 4 { 2 } else { 3 };
+        *fixture.target.state.progress.lock().unwrap() = DurableApplicationProgress {
+            applied_lsn,
+            committed_lsn: 1,
+        };
+        let retained = match malformed_kind {
+            0 => vec![],
+            1 => vec![Operation {
+                lsn: 3,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"missing-lsn-two"),
+            }],
+            2 => vec![Operation {
+                lsn: 2,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"missing-lsn-three"),
+            }],
+            3 => vec![
+                Operation {
+                    lsn: 2,
+                    committed_lsn: -1,
+                    data: Bytes::from_static(b"invalid-retained-metadata"),
+                },
+                Operation {
+                    lsn: 3,
+                    committed_lsn: 1,
+                    data: Bytes::from_static(b"last-operation"),
+                },
+            ],
+            _ => vec![Operation {
+                lsn: 2,
+                committed_lsn: 1,
+                data: Bytes::from_static(b"existing-suffix"),
+            }],
+        };
+        *fixture.target.state.operations.lock().unwrap() = retained;
+        let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
+        let operation = delivered(&mut operations).await;
+        assert!(matches!(
+            operation.metadata,
+            OperationMetadata::CopyComplete { .. }
+        ));
+        // Deliberately malformed ACKs must fail even when they match storage.
+        if malformed_kind == 4 {
+            fixture
+                .target
+                .state
+                .apply(Operation {
+                    lsn: 3,
+                    committed_lsn: 1,
+                    data: Bytes::from_static(b"invented-during-copy-complete"),
+                })
+                .await
+                .unwrap();
+        }
+        operation
+            .acknowledge(fixture.target.state.durable_progress().await.unwrap())
+            .unwrap();
+        assert!(response.message().await.is_err());
+        assert!(fixture.terminal_receipt().is_none());
+        let mut final_response = fixture.send(fixture.frame(1, false, true, 1, 1)).await;
+        assert!(final_response.message().await.is_err());
+        assert!(fixture.terminal_receipt().is_none());
         fixture.cleanup().await;
     }
 }

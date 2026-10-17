@@ -267,6 +267,600 @@ async fn seed_retired_provider(
 }
 
 #[tokio::test]
+async fn sqlite_operation_stream_copy_preserves_verified_uncommitted_suffix() {
+    use kuberic_runtime::application::DurableApplicationProgress;
+    use kuberic_runtime::control::proto as wire;
+    use kuberic_runtime::replicator::stream::{OperationMetadata, StreamOperation};
+    use sqlite_replicated::state::PersistenceFault;
+
+    async fn send(
+        client: &mut wire::replication_data_client::ReplicationDataClient<
+            tonic::transport::Channel,
+        >,
+        frame: wire::CopyItem,
+    ) -> tonic::Streaming<wire::CopyAck> {
+        client
+            .build(tonic::Request::new(futures::stream::iter([frame])))
+            .await
+            .unwrap()
+            .into_inner()
+    }
+
+    async fn delivered(
+        operations: &mut tokio::sync::mpsc::UnboundedReceiver<StreamOperation>,
+    ) -> StreamOperation {
+        tokio::time::timeout(Duration::from_secs(5), operations.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn pending(response: &mut tonic::Streaming<wire::CopyAck>) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), response.message())
+                .await
+                .is_err(),
+            "build completed before explicit durable service ACK"
+        );
+    }
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        for (last_lsn, first_retained_commitment) in [(2, 2), (3, 2), (3, 1)] {
+            let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("target/sqlite-stream-retained-copy")
+                .join(format!(
+                    "{}-{last_lsn}-{first_retained_commitment}",
+                    std::process::id()
+                ));
+            let _ = std::fs::remove_dir_all(&root);
+            let resource = ResourceUid::new("sqlite-stream-retained-copy");
+            let preview = PublicV1Identity::new(1);
+            let source_identity = identity(1, "stream-source");
+            let target_identity = identity(2, "stream-target");
+            let source_storage = storage(source_identity.clone(), "stream-source");
+            let target_storage = storage(target_identity.clone(), "stream-target");
+            let source_address = address();
+            let target_address = address();
+            let source_state =
+                Arc::new(SqlitePersistence::open(root.join("source/application")).unwrap());
+            let target_state =
+                Arc::new(SqlitePersistence::open(root.join("target/application")).unwrap());
+            let source_service = Arc::new(
+                SqliteService::new(source_state.clone(), format!("http://{source_address}"))
+                    .unwrap(),
+            );
+            let target_service = Arc::new(
+                SqliteService::new(target_state.clone(), format!("http://{target_address}"))
+                    .unwrap(),
+            );
+            let mut operations = target_service.control_stream_operations_for_test();
+            let mut running = Vec::new();
+            for (name, local, service, replication_address) in [
+                (
+                    "stream-source",
+                    source_identity.clone(),
+                    source_service.clone(),
+                    source_address,
+                ),
+                (
+                    "stream-target",
+                    target_identity.clone(),
+                    target_service.clone(),
+                    target_address,
+                ),
+            ] {
+                let data_root = root.join(if name == "stream-source" {
+                    "source"
+                } else {
+                    "target"
+                });
+                drop(
+                    SqliteStore::create_public_v1(
+                        SqliteStore::metadata_database_path(&data_root),
+                        preview.clone(),
+                        store_identity(resource.clone(), local.clone(), name),
+                    )
+                    .unwrap(),
+                );
+                running.push(
+                    ReplicaHost::new(
+                        ReplicaProcessConfig {
+                            resource_uid: resource.clone(),
+                            replica_id: local.replica_id,
+                            pod_uid: PodUid::new(format!("{name}-pod")),
+                            pvc_uid: PvcUid::new(format!("{name}-pvc")),
+                            data_root,
+                            replication_address,
+                            bearer_token: "unused".into(),
+                            rpc_deadline: Duration::from_secs(2),
+                            transport_window_capacity: 8,
+                        },
+                        service,
+                        ApplicationStorageState::FreshEmpty,
+                        Arc::new(Resolver),
+                    )
+                    .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+                    .await
+                    .unwrap(),
+                );
+            }
+            let source = running[0].handle();
+            let target = running[1].handle();
+            let generation = PublicProtocolGeneration::new(1);
+            let initialization = derive_history_initialization_id(&resource, generation);
+            let history = derive_bootstrap_history(&resource, generation, &initialization);
+            for (handle, local_storage) in [(&source, &source_storage), (&target, &target_storage)]
+            {
+                handle
+                    .initialize_public_v1_history(&initialization, &history, local_storage)
+                    .await
+                    .unwrap();
+            }
+            let epoch = Epoch::new(0, 1);
+            let configuration = ConfigurationDescriptor::new(
+                epoch,
+                source_identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: source_identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            );
+            for (revision, program) in [
+                (
+                    1,
+                    PublicOperationProgram::Open {
+                        replica: source_identity.clone(),
+                        existing: true,
+                    },
+                ),
+                (
+                    2,
+                    PublicOperationProgram::Role {
+                        epoch,
+                        role: ReplicaRole::Primary,
+                    },
+                ),
+                (3, PublicOperationProgram::Epoch { epoch }),
+            ] {
+                source
+                    .execute_public_v1(intent(
+                        &preview,
+                        source.process_session_id(),
+                        revision,
+                        &format!("stream-open-{revision}"),
+                        program,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            source
+                .execute_public_v1(intent(
+                    &preview,
+                    source.process_session_id(),
+                    4,
+                    "stream-source-configuration",
+                    PublicOperationProgram::Configuration(PublicConfiguration {
+                        current: configuration.clone(),
+                        previous: None,
+                        replicas: vec![],
+                    }),
+                ))
+                .await
+                .unwrap();
+            let server = SqliteServer::new(source_service.clone());
+            assert_eq!(
+                execute(
+                    &server,
+                    "CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT)"
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                execute(&server, "INSERT INTO data VALUES(1,'retained')").await,
+                2
+            );
+            if last_lsn == 3 {
+                assert_eq!(
+                    execute(&server, "INSERT INTO data VALUES(2,'later-retained')").await,
+                    3
+                );
+            }
+            let retained = source_state
+                .get_replication_operations(1, last_lsn)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            target_state.apply(retained[0].clone()).await.unwrap();
+            target_state.commit(1).await.unwrap();
+            for operation in &retained[1..] {
+                let mut operation = operation.clone();
+                operation.committed_lsn = 1;
+                target_state.apply(operation).await.unwrap();
+            }
+            let seeded_suffix = target_state
+                .get_replication_operations(2, last_lsn)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let suffix_progress = DurableApplicationProgress {
+                applied_lsn: last_lsn,
+                committed_lsn: 1,
+            };
+            assert_eq!(target_state.progress().unwrap(), suffix_progress);
+            assert_eq!(target_state.stream_calls_for_test(), (last_lsn as u64, 1));
+            assert_eq!(
+                source_state.snapshot(1).unwrap(),
+                target_state.snapshot(1).unwrap()
+            );
+            for (revision, program) in [
+                (
+                    1,
+                    PublicOperationProgram::Open {
+                        replica: target_identity.clone(),
+                        existing: true,
+                    },
+                ),
+                (
+                    2,
+                    PublicOperationProgram::Role {
+                        epoch,
+                        role: ReplicaRole::IdleSecondary,
+                    },
+                ),
+                (3, PublicOperationProgram::Epoch { epoch }),
+            ] {
+                target
+                    .execute_public_v1(intent(
+                        &preview,
+                        target.process_session_id(),
+                        revision,
+                        &format!("stream-open-{revision}"),
+                        program,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let authority = PublicInboundBuildAuthority {
+                operation_id: OperationId::new("sqlite-stream-build"),
+                operation_revision: 1,
+                attempt: PublicBuildAttemptReference {
+                    resource_uid: resource,
+                    epoch,
+                    build_id: OperationId::new("sqlite-stream-build"),
+                    source: source_identity,
+                    source_storage,
+                    source_session: source.process_session_id(),
+                    target: target_identity,
+                    target_storage,
+                    target_session: target.process_session_id(),
+                },
+                history,
+                current_configuration_id: configuration.configuration_id,
+                target_address: format!("http://{target_address}"),
+            };
+            target
+                .install_public_v1_inbound_build_authority(&authority)
+                .await
+                .unwrap();
+            let terminal_receipt = || {
+                let database = rusqlite::Connection::open(SqliteStore::metadata_database_path(
+                    &root.join("target"),
+                ))
+                .unwrap();
+                let json: String = database
+                    .query_row(
+                        "SELECT state_json FROM agent_state WHERE singleton = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+                state["publicV1OperationState"]["terminalInboundBuildReceipts"]
+                    .get(authority.attempt.build_id.as_str())
+                    .cloned()
+            };
+            let wire_storage = |storage: &ReplicaStorageIncarnationContext| {
+                let ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } = &storage.storage
+                else {
+                    unreachable!()
+                };
+                wire::PublicV1StorageIncarnation {
+                    replica: Some(storage.replica.clone().into()),
+                    kind: wire::PublicV1StorageKind::Persistent as i32,
+                    pod_uid: pod_uid.to_string(),
+                    pvc_uid: pvc_uid.to_string(),
+                    volatile_identity: String::new(),
+                    storage_generation: storage.storage_generation.to_string(),
+                }
+            };
+            let frame = |sequence, snapshot_chunk, final_item, lsn, data| wire::CopyItem {
+                protocol_version: 11,
+                build_id: authority.attempt.build_id.to_string(),
+                sender: Some(authority.attempt.source.clone().into()),
+                receiver: Some(authority.attempt.target.clone().into()),
+                epoch: Some(epoch.into()),
+                current_configuration_id: authority.current_configuration_id.to_string(),
+                sequence,
+                lsn,
+                committed_lsn: lsn,
+                replication_boundary_lsn: 1,
+                final_item,
+                data,
+                snapshot_chunk,
+                sender_session_id: authority.attempt.source_session.to_string(),
+                receiver_session_id: authority.attempt.target_session.to_string(),
+                catch_up_boundary_lsn: final_item.then_some(lsn),
+                source_storage: Some(wire_storage(&authority.attempt.source_storage)),
+                target_storage: Some(wire_storage(&authority.attempt.target_storage)),
+                history: Some(wire::PublicV1HistoryContext {
+                    resource_uid: authority.history.resource_uid.to_string(),
+                    protocol_generation: authority.history.protocol_generation.value(),
+                    history_id: authority.history.history_id.to_string(),
+                    data_loss_number: authority.history.data_loss_number,
+                }),
+                target_address: authority.target_address.clone(),
+            };
+            let mut client = wire::replication_data_client::ReplicationDataClient::connect(
+                format!("http://{target_address}"),
+            )
+            .await
+            .unwrap();
+            let mut snapshot = send(
+                &mut client,
+                frame(0, true, false, 1, source_state.snapshot(1).unwrap()),
+            )
+            .await;
+            let operation = delivered(&mut operations).await;
+            assert!(matches!(
+                operation.metadata,
+                OperationMetadata::Copy { sequence: 0, .. }
+            ));
+            let progress = operation.apply_to(target_state.as_ref()).await.unwrap();
+            assert_eq!(progress, suffix_progress);
+            operation.acknowledge(progress).unwrap();
+            assert_eq!(snapshot.message().await.unwrap().unwrap().durable_lsn, 1);
+
+            let complete_frame = frame(1, false, false, 1, vec![]);
+            let mut failed = send(&mut client, complete_frame.clone()).await;
+            let complete = delivered(&mut operations).await;
+            target_state.fail_once(PersistenceFault::AfterCopyInstall);
+            let error = complete.apply_to(target_state.as_ref()).await.unwrap_err();
+            complete.reject(error).unwrap();
+            assert!(failed.message().await.is_err());
+            assert_eq!(target_state.inspect_for_test().unwrap().base_lsn, 1);
+            assert_eq!(target_state.progress().unwrap(), suffix_progress);
+
+            let mut completion = send(&mut client, complete_frame.clone()).await;
+            let complete = delivered(&mut operations).await;
+            assert_eq!(
+                complete.metadata,
+                OperationMetadata::CopyComplete {
+                    build_id: authority.attempt.build_id.clone(),
+                    up_to_lsn: 1,
+                    committed_lsn: 1,
+                }
+            );
+            pending(&mut completion).await;
+            let progress = complete.apply_to(target_state.as_ref()).await.unwrap();
+            assert_eq!(progress, suffix_progress);
+            pending(&mut completion).await;
+            complete.acknowledge(progress).unwrap();
+            assert_eq!(completion.message().await.unwrap().unwrap().durable_lsn, 1);
+            let mut retry = send(&mut client, complete_frame.clone()).await;
+            assert_eq!(retry.message().await.unwrap().unwrap().durable_lsn, 1);
+            assert!(operations.try_recv().is_err());
+            let mut unacknowledged_replay = send(
+                &mut client,
+                frame(
+                    1,
+                    false,
+                    false,
+                    last_lsn,
+                    retained.last().unwrap().data.to_vec(),
+                ),
+            )
+            .await;
+            assert!(unacknowledged_replay.message().await.is_err());
+            assert!(operations.try_recv().is_err());
+
+            for retained_operation in &retained[1..] {
+                let lsn = retained_operation.lsn;
+                let committed_lsn = if lsn == 2 {
+                    first_retained_commitment
+                } else {
+                    lsn
+                };
+                let mut retained_frame = frame(
+                    lsn as u64,
+                    false,
+                    false,
+                    lsn,
+                    retained_operation.data.to_vec(),
+                );
+                retained_frame.committed_lsn = committed_lsn;
+                let expected_calls = (
+                    last_lsn as u64,
+                    (lsn - i64::from(first_retained_commitment == 1)) as u64,
+                );
+                if lsn == 3 {
+                    let mut failed = send(&mut client, retained_frame.clone()).await;
+                    let operation = delivered(&mut operations).await;
+                    assert_eq!(
+                        operation.metadata,
+                        OperationMetadata::Replication { lsn, committed_lsn }
+                    );
+                    pending(&mut failed).await;
+                    target_state.fail_once(PersistenceFault::AfterCommit);
+                    let error = operation.apply_to(target_state.as_ref()).await.unwrap_err();
+                    assert_eq!(
+                        target_state.progress().unwrap(),
+                        DurableApplicationProgress {
+                            applied_lsn: 3,
+                            committed_lsn: 3,
+                        }
+                    );
+                    assert_eq!(target_state.stream_calls_for_test(), expected_calls);
+                    operation.reject(error).unwrap();
+                    assert!(failed.message().await.is_err());
+                    assert!(terminal_receipt().is_none());
+
+                    let mut old_frame = frame(2, false, false, 2, retained[1].data.to_vec());
+                    old_frame.committed_lsn = first_retained_commitment;
+                    for replay in [old_frame, complete_frame.clone()] {
+                        let mut response = send(&mut client, replay).await;
+                        assert_eq!(
+                            response.message().await.unwrap().unwrap().durable_lsn,
+                            first_retained_commitment,
+                            "exact replay advertised rejected physical commitment"
+                        );
+                        assert!(operations.try_recv().is_err());
+                        assert!(terminal_receipt().is_none());
+                        assert_eq!(target_state.stream_calls_for_test(), expected_calls);
+                    }
+
+                    let mut premature = send(&mut client, frame(3, false, true, 2, vec![])).await;
+                    assert!(
+                        premature.message().await.is_err(),
+                        "live final admitted a rejected physical commitment"
+                    );
+                    assert!(operations.try_recv().is_err());
+                    assert!(terminal_receipt().is_none());
+                    assert_eq!(target_state.stream_calls_for_test(), expected_calls);
+                    assert!(
+                        target.public_v1_report().await.unwrap().progress.first
+                            <= first_retained_commitment
+                    );
+                    assert!(
+                        target.diagnostics().await.unwrap().committed_lsn
+                            <= first_retained_commitment
+                    );
+
+                    for commitment in (first_retained_commitment + 1)..=3 {
+                        let mut altered = frame(2, false, false, 2, retained[1].data.to_vec());
+                        altered.committed_lsn = commitment;
+                        let mut rejected = send(&mut client, altered).await;
+                        assert!(
+                            rejected.message().await.is_err(),
+                            "retained replay credited rejected physical commitment {commitment}"
+                        );
+                        assert!(operations.try_recv().is_err());
+                        assert!(terminal_receipt().is_none());
+                        assert_eq!(target_state.stream_calls_for_test(), expected_calls);
+                    }
+                }
+                let mut response = send(&mut client, retained_frame.clone()).await;
+                let operation = delivered(&mut operations).await;
+                assert_eq!(
+                    operation.metadata,
+                    OperationMetadata::Replication { lsn, committed_lsn }
+                );
+                pending(&mut response).await;
+                let progress = operation.apply_to(target_state.as_ref()).await.unwrap();
+                assert_eq!(
+                    progress,
+                    DurableApplicationProgress {
+                        applied_lsn: last_lsn,
+                        committed_lsn
+                    }
+                );
+                assert_eq!(target_state.stream_calls_for_test(), expected_calls);
+                pending(&mut response).await;
+                assert!(terminal_receipt().is_none());
+                if lsn == 3 {
+                    assert!(
+                        target.public_v1_report().await.unwrap().progress.first
+                            <= first_retained_commitment
+                    );
+                }
+                operation.acknowledge(progress).unwrap();
+                assert_eq!(
+                    response.message().await.unwrap().unwrap().durable_lsn,
+                    committed_lsn
+                );
+                let mut retry = send(&mut client, retained_frame.clone()).await;
+                assert_eq!(
+                    retry.message().await.unwrap().unwrap().durable_lsn,
+                    committed_lsn
+                );
+                assert!(operations.try_recv().is_err());
+                assert_eq!(target_state.stream_calls_for_test(), expected_calls);
+                for changed_commitment in [false, true] {
+                    let mut corrupt = retained_frame.clone();
+                    if changed_commitment {
+                        corrupt.committed_lsn += 1;
+                    } else {
+                        corrupt.data.push(0);
+                    }
+                    let mut rejected = send(&mut client, corrupt).await;
+                    assert!(rejected.message().await.is_err());
+                    assert!(operations.try_recv().is_err());
+                }
+            }
+            let inspection = target_state.inspect_for_test().unwrap();
+            assert_eq!(inspection.operations, seeded_suffix);
+            assert_eq!(
+                inspection.image,
+                source_state.image_at_for_test(last_lsn).unwrap()
+            );
+            assert_eq!(
+                target_state.stream_calls_for_test(),
+                (
+                    last_lsn as u64,
+                    (last_lsn - i64::from(first_retained_commitment == 1)) as u64
+                )
+            );
+            let final_frame = frame(last_lsn as u64 + 1, false, true, last_lsn, vec![]);
+            for _ in 0..2 {
+                let mut final_response = send(&mut client, final_frame.clone()).await;
+                let ack = final_response.message().await.unwrap().unwrap();
+                assert!(ack.final_item);
+                assert_eq!(ack.durable_lsn, last_lsn);
+                assert!(operations.try_recv().is_err());
+                assert_eq!(terminal_receipt().unwrap()["durableLsn"], last_lsn);
+                assert_eq!(
+                    target.public_v1_report().await.unwrap().progress.first,
+                    last_lsn
+                );
+            }
+            let database =
+                rusqlite::Connection::open(target_state.materialize_committed().unwrap()).unwrap();
+            assert_eq!(
+                values(&database),
+                if last_lsn == 2 {
+                    vec!["retained"]
+                } else {
+                    vec!["retained", "later-retained"]
+                }
+            );
+            drop(database);
+            for replica in &mut running {
+                replica.shutdown();
+                replica.wait().await.unwrap();
+            }
+            drop(running);
+            drop(server);
+            drop(source_service);
+            drop(target_service);
+            drop(source_state);
+            drop(target_state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

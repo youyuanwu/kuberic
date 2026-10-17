@@ -414,6 +414,7 @@ struct InboundBuild {
     next_sequence: u64,
     copy_finished: bool,
     retained_lsn: i64,
+    acknowledged_committed_lsn: i64,
 }
 
 struct EngineState {
@@ -855,6 +856,37 @@ impl StatelessReplicator {
         {
             return Err(RuntimeError::InvalidReplication(
                 "committed watermark changed retained operation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn verify_retained_suffix(&self, boundary: i64, applied_lsn: i64) -> Result<()> {
+        if applied_lsn <= boundary {
+            return Ok(());
+        }
+        let mut verified = boundary;
+        let mut retained = self
+            .storage
+            .get_replication_operations(boundary + 1, applied_lsn)
+            .await?;
+        while let Some(operation) = retained.next().await {
+            let operation = operation?;
+            if Some(operation.lsn) != verified.checked_add(1)
+                || operation.lsn > applied_lsn
+                || operation.committed_lsn < 0
+                || operation.committed_lsn > operation.lsn
+                || !self.storage.verify_applied(&operation).await?
+            {
+                return Err(RuntimeError::InvalidReplication(
+                    "copy ACK lacks exact contiguous durable retained history".into(),
+                ));
+            }
+            verified = operation.lsn;
+        }
+        if verified != applied_lsn {
+            return Err(RuntimeError::InvalidReplication(
+                "copy ACK exceeds verified durable retained history".into(),
             ));
         }
         Ok(())
@@ -1924,7 +1956,9 @@ impl StatelessReplicator {
             || item.sender_session_id.is_empty()
             || item.current_configuration_id.is_empty()
             || item.replication_boundary_lsn < 0
+            || item.lsn < 0
             || item.committed_lsn < 0
+            || item.committed_lsn > item.lsn
             || item.target_address != self.settings.read().await.replication_address
         {
             return Err(Status::failed_precondition(
@@ -2033,6 +2067,7 @@ impl StatelessReplicator {
                 next_sequence: 0,
                 copy_finished: false,
                 retained_lsn: item.replication_boundary_lsn,
+                acknowledged_committed_lsn: 0,
             };
             match &state.inbound_build {
                 Some(existing)
@@ -2061,6 +2096,16 @@ impl StatelessReplicator {
                 }
             }
         };
+        if item.final_item
+            && (item.snapshot_chunk
+                || !item.data.is_empty()
+                || item.sequence != build.next_sequence
+                || item.committed_lsn != item.lsn)
+        {
+            return Err(Status::failed_precondition(
+                "live build final frame changed shape or sequence",
+            ));
+        }
         if item.sequence > build.next_sequence {
             return Err(Status::failed_precondition("build sequence has a gap"));
         }
@@ -2093,21 +2138,18 @@ impl StatelessReplicator {
                     ));
                 }
             } else if !item.final_item && item.lsn > build.replication_boundary_lsn {
-                let operation = Operation {
-                    lsn: item.lsn,
-                    committed_lsn: item.committed_lsn.saturating_sub(1),
-                    data: item.data.clone().into(),
-                };
-                if !self
-                    .storage
-                    .verify_applied(&operation)
-                    .await
-                    .map_err(runtime_status)?
+                if item.lsn > build.retained_lsn
+                    || item.committed_lsn > build.acknowledged_committed_lsn
                 {
                     return Err(Status::failed_precondition(
-                        "replayed retained build operation changed bytes",
+                        "retained replay exceeds acknowledged build progress",
                     ));
                 }
+                // The stored operation keeps its original committed field;
+                // replaying a newer commitment must not rewrite that metadata.
+                self.verify_retained_payload(item.lsn, item.data.as_slice())
+                    .await
+                    .map_err(runtime_status)?;
             }
         } else if item.snapshot_chunk {
             if build.copy_finished {
@@ -2164,6 +2206,7 @@ impl StatelessReplicator {
                     "build authority changed during copy apply",
                 ));
             }
+            build.acknowledged_committed_lsn = progress.committed_lsn;
             build.next_sequence = build.next_sequence.saturating_add(1);
         } else {
             if !build.copy_finished {
@@ -2179,6 +2222,32 @@ impl StatelessReplicator {
                     )
                     .await
                     .map_err(runtime_status)?;
+                if progress.applied_lsn < build.replication_boundary_lsn
+                    || progress.committed_lsn
+                        != build
+                            .replication_boundary_lsn
+                            .max(target_progress.committed_lsn)
+                    || progress.committed_lsn > progress.applied_lsn
+                    || progress.applied_lsn
+                        > build
+                            .replication_boundary_lsn
+                            .max(target_progress.applied_lsn)
+                    || progress
+                        != self
+                            .storage
+                            .durable_progress()
+                            .await
+                            .map_err(runtime_status)?
+                {
+                    return Err(Status::failed_precondition(
+                        "copy completion did not reach the frozen boundary",
+                    ));
+                }
+                // A provider may preserve an intact suffix over this snapshot.
+                // Prove that progress without crediting its frames to the build.
+                self.verify_retained_suffix(build.replication_boundary_lsn, progress.applied_lsn)
+                    .await
+                    .map_err(runtime_status)?;
                 if self.generation() != generation
                     || self
                         .context
@@ -2192,20 +2261,8 @@ impl StatelessReplicator {
                         "build authority changed during copy completion",
                     ));
                 }
-                if progress.applied_lsn != build.replication_boundary_lsn
-                    || progress.committed_lsn != build.replication_boundary_lsn
-                    || progress
-                        != self
-                            .storage
-                            .durable_progress()
-                            .await
-                            .map_err(runtime_status)?
-                {
-                    return Err(Status::failed_precondition(
-                        "copy completion did not reach the frozen boundary",
-                    ));
-                }
                 build.copy_finished = true;
+                build.acknowledged_committed_lsn = progress.committed_lsn;
             }
             if !item.final_item && item.lsn > build.replication_boundary_lsn {
                 if Some(item.lsn) != build.retained_lsn.checked_add(1) {
@@ -2222,8 +2279,10 @@ impl StatelessReplicator {
                     )
                     .await
                     .map_err(runtime_status)?;
-                if progress.applied_lsn != item.lsn
-                    || progress.committed_lsn != item.committed_lsn
+                if progress.applied_lsn < item.lsn
+                    || progress.applied_lsn > target_progress.applied_lsn.max(item.lsn)
+                    || progress.committed_lsn
+                        != target_progress.committed_lsn.max(item.committed_lsn)
                     || progress.committed_lsn > progress.applied_lsn
                     || progress
                         != self
@@ -2237,6 +2296,9 @@ impl StatelessReplicator {
                     ));
                 }
                 self.verify_retained_payload(item.lsn, item.data.as_slice())
+                    .await
+                    .map_err(runtime_status)?;
+                self.verify_retained_suffix(item.lsn, progress.applied_lsn)
                     .await
                     .map_err(runtime_status)?;
                 if self.generation() != generation
@@ -2258,6 +2320,7 @@ impl StatelessReplicator {
                     ));
                 }
                 build.retained_lsn = item.lsn;
+                build.acknowledged_committed_lsn = progress.committed_lsn;
             }
             build.catch_up_boundary_lsn = item.catch_up_boundary_lsn;
             build.next_sequence = build.next_sequence.saturating_add(1);
@@ -2267,6 +2330,8 @@ impl StatelessReplicator {
             .durable_progress()
             .await
             .map_err(runtime_status)?;
+        // Rejected persistence can advance storage without granting build credit.
+        let durable_lsn = progress.committed_lsn.min(build.acknowledged_committed_lsn);
         if self.generation() != generation
             || self
                 .context
@@ -2296,17 +2361,19 @@ impl StatelessReplicator {
                 ));
             }
             if item.final_item {
-                if item.catch_up_boundary_lsn != Some(item.lsn)
+                if !build.copy_finished
+                    || item.catch_up_boundary_lsn != Some(item.lsn)
                     || item.lsn != build.retained_lsn
-                    || progress.committed_lsn < item.lsn
+                    || durable_lsn < item.lsn
+                    || progress.committed_lsn > build.acknowledged_committed_lsn
                 {
                     return Err(Status::failed_precondition(
-                        "build final admission precedes retained gap closure",
+                        "build final admission precedes acknowledged retained gap closure",
                     ));
                 }
                 state.applied_lsn = progress.applied_lsn;
-                state.committed_lsn = progress.committed_lsn;
-                state.ambiguous_suffix = progress.applied_lsn > progress.committed_lsn;
+                state.committed_lsn = durable_lsn;
+                state.ambiguous_suffix = progress.applied_lsn > durable_lsn;
             } else {
                 state.inbound_build = Some(build.clone());
             }
@@ -2320,13 +2387,13 @@ impl StatelessReplicator {
                     catch_up_boundary_lsn: item
                         .catch_up_boundary_lsn
                         .expect("validated final catch-up boundary"),
-                    durable_lsn: progress.committed_lsn,
+                    durable_lsn,
                 })
                 .await
                 .map_err(runtime_status)?;
             self.state.lock().await.inbound_build = None;
         }
-        self.publish_progress(progress.applied_lsn > progress.committed_lsn)
+        self.publish_progress(progress.applied_lsn > durable_lsn)
             .await
             .map_err(runtime_status)?;
         Ok(proto::CopyAck {
@@ -2337,7 +2404,7 @@ impl StatelessReplicator {
             epoch: Some(epoch.into()),
             current_configuration_id: current_configuration_id.to_string(),
             sequence: item.sequence,
-            durable_lsn: progress.committed_lsn,
+            durable_lsn,
             replication_boundary_lsn: item.replication_boundary_lsn,
             final_item: item.final_item,
             snapshot_chunk: item.snapshot_chunk,

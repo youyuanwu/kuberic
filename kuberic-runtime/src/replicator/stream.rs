@@ -40,6 +40,8 @@ pub struct StreamOperation {
     cancelled: watch::Receiver<bool>,
     closed: watch::Receiver<bool>,
     effects: Arc<Mutex<()>>,
+    #[cfg(test)]
+    admission_boundary: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 pub(crate) struct OperationCompletion {
@@ -151,8 +153,19 @@ impl StreamOperation {
             _ = cancelled.changed() => Err(RuntimeError::OperationCancelled),
             _ = closed.changed() => Err(RuntimeError::Closed),
             result = async {
+                #[cfg(test)]
+                if let Some(boundary) = &self.admission_boundary {
+                    boundary();
+                }
                 let _active = self.effects.lock().await;
-                // The cancellation branches also cover waiting for this gate.
+                // Cancellation may have won and drained before this branch
+                // acquired its lease in the same select poll.
+                if *self.cancelled.borrow() {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                if *self.closed.borrow() {
+                    return Err(RuntimeError::Closed);
+                }
                 effect.await
             } => result,
         }
@@ -265,6 +278,8 @@ impl OperationSender {
             cancelled: cancellation,
             closed: closed.clone(),
             effects: self.effects.clone(),
+            #[cfg(test)]
+            admission_boundary: None,
         };
         tokio::select! {
             biased;
@@ -359,6 +374,69 @@ mod tests {
             lsn: 1,
             committed_lsn: 0,
         }
+    }
+
+    async fn cancelled_admission_cannot_outlive_drain(terminal: bool) {
+        let streams = ServiceStreams::new();
+        let mut stream = streams.take_replication().await.unwrap();
+        let completion = streams
+            .replication_tx
+            .enqueue(metadata(), Bytes::new())
+            .await
+            .unwrap();
+        let mut operation = stream.get_operation().await.unwrap().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        operation.admission_boundary = Some(Box::new({
+            let entered = entered.clone();
+            let resume = resume.clone();
+            move || {
+                entered.notify_one();
+                // Suspend the same select poll, after cancellation was Pending.
+                resume.wait();
+            }
+        }));
+        let polled = Arc::new(AtomicBool::new(false));
+        let consumer = tokio::spawn({
+            let polled = polled.clone();
+            async move {
+                operation
+                    .execute(async {
+                        polled.store(true, Ordering::Release);
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let mut completion = Some(completion);
+        if terminal {
+            streams.shutdown();
+        } else {
+            drop(completion.take());
+        }
+        let drained = tokio::time::timeout(Duration::from_secs(2), streams.drain()).await;
+        // Successor admission has completed before the old worker resumes.
+        resume.wait();
+        let result = tokio::time::timeout(Duration::from_secs(2), consumer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(drained.is_ok(), "unstarted effect blocked successor drain");
+        assert!(!polled.load(Ordering::Acquire), "stale effect was polled");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_request_cancellation_before_lease_cannot_outlive_drain() {
+        cancelled_admission_cannot_outlive_drain(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_terminal_close_before_lease_cannot_outlive_drain() {
+        cancelled_admission_cannot_outlive_drain(true).await;
     }
 
     #[tokio::test]

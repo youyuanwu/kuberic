@@ -81,6 +81,14 @@ pub struct SqliteService {
     control: Mutex<Option<Arc<dyn Replicator>>>,
     replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
     streams: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    #[cfg(any(test, feature = "testing"))]
+    controlled_operations: Mutex<
+        Option<
+            tokio::sync::mpsc::UnboundedSender<
+                kuberic_runtime::replicator::stream::StreamOperation,
+            >,
+        >,
+    >,
     replication_address: String,
 }
 
@@ -126,6 +134,8 @@ impl SqliteService {
             control: Mutex::new(None),
             replicator: Mutex::new(None),
             streams: Mutex::new(Vec::new()),
+            #[cfg(any(test, feature = "testing"))]
+            controlled_operations: Mutex::new(None),
             replication_address,
         })
     }
@@ -142,6 +152,20 @@ impl SqliteService {
     #[cfg(any(test, feature = "testing"))]
     pub fn copy_snapshot_gate(&self) -> &crate::testing::PauseGate {
         &self.provider.copy_snapshot
+    }
+    /// Let a test service explicitly persist and ACK actual factory deliveries.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn control_stream_operations_for_test(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<kuberic_runtime::replicator::stream::StreamOperation>
+    {
+        assert!(self.control.lock().expect("control").is_none());
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .controlled_operations
+            .lock()
+            .expect("controlled operations") = Some(sender);
+        receiver
     }
     pub fn vfs_name(&self) -> &str {
         &self.vfs_name
@@ -258,7 +282,26 @@ impl StatefulServiceReplica for SqliteService {
             replicator.get_copy_stream().await?,
             replicator.get_replication_stream().await?,
         ] {
-            let task = tokio::spawn(consume_stream(self.persistence.clone(), stream));
+            #[cfg(any(test, feature = "testing"))]
+            let controlled = self
+                .controlled_operations
+                .lock()
+                .expect("controlled operations")
+                .clone();
+            let persistence = self.persistence.clone();
+            let task = tokio::spawn(async move {
+                #[cfg(any(test, feature = "testing"))]
+                if let Some(controlled) = controlled {
+                    let mut stream = stream;
+                    while let Ok(Some(operation)) = stream.get_operation().await {
+                        if controlled.send(operation).is_err() {
+                            break;
+                        }
+                    }
+                    return;
+                }
+                consume_stream(persistence, stream).await;
+            });
             self.streams.lock().expect("streams").push(task);
         }
         *self.replicator.lock().expect("replicator") = Some(replicator);
