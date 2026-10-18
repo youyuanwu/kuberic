@@ -364,6 +364,24 @@ impl ReplicaManager {
         self.builds.get(&replica_id).cloned()
     }
 
+    pub(super) fn contains_session(&self, replica_id: i64) -> bool {
+        self.is_idle(replica_id)
+            || self.current.iter().chain(self.previous.iter()).any(|set| {
+                set.members
+                    .iter()
+                    .any(|member| member.replica_id == replica_id)
+            })
+    }
+
+    pub(super) fn is_idle(&self, replica_id: i64) -> bool {
+        self.idle.iter().any(|idle| idle.replica_id == replica_id)
+            && !self.current.iter().chain(self.previous.iter()).any(|set| {
+                set.members
+                    .iter()
+                    .any(|member| member.replica_id == replica_id)
+            })
+    }
+
     pub(super) fn build_identity(
         &self,
         route: &Route,

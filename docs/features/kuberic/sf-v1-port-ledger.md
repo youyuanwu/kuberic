@@ -577,8 +577,9 @@ retries after establishment. Ingress and manager enqueue wake it to resample
 new deadlines; interrupted polls retain the actual acquisition/stream.
 Successful builds remain idle and continue receiving replication. Their
 registry samples the live actual CopySender target for retention, keeping the
-terminal target after the driver is released. Subsequent ordinary session
-timer/ingress ownership belongs to the future primary coordinator.
+terminal target after the driver is released. At that slice boundary,
+subsequent ordinary session timer/ingress ownership remained pending; the
+primary lifecycle slice below now supplies that bounded owner.
 
 Native BuildIdle cancellation cleans incoming context and is checked before
 source provider acquisition; it is not session removal or an unconditional
@@ -654,25 +655,72 @@ discovery is **995 = 949 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**.
 See [validation](testing.md#sf-v1-secondary-lifecycle-slice) and
 [source provenance](sf-v1-port-provenance.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11).
 
-**Remaining owners:** full primary/session/role composition, externally
+**Remaining owners at that slice:** full primary/session/role composition, externally
 requested epoch reconfiguration, promotion/queue transfer, periodic/slow-peer
 policy, provider monitoring/host health and P4/P5 adapters/atomic activation.
 All components remain private/unselected. No protected API, selected production
 wiring, dependencies, native execution, differential/hosted/provider-fsync
 parity, full ordinary execution or full P2/P3 completion claim is introduced.
 
+### Primary Lifecycle Slice (P3, Bounded F02/F06/F07/F08/F09/F11)
+
+Private [`Primary`](../../../kuberic-runtime/src/replicator/v1/primary.rs)
+composes the actual ReplicaManager, bound sessions and retained BuildIdle
+drivers under one explicit caller-driven lifetime. Builds are published before
+reentrant pending-replay/StartCopy sends. Existing provider futures and
+CopySender/context owners survive interrupted polls; no alternate queue,
+provider acquisition, sender algorithm or ACK arithmetic is introduced.
+
+While BuildIdle owns build timers, the primary drives ordinary replication
+retry/RequestAck timers for terminal builds and caller-established sessions.
+Bound endpoint/incarnation/address lookup precedes ACK/context admission.
+Idle sessions receive copy/context handoffs; active sessions receive
+replication-only ACK processing. Shared delivery preserves the actual rooted
+sender -> copy replication gate -> primary quorum progress -> idle copy ACK
+order, including reentrant/coalesced ACKs and selected work after Close.
+Configuration remains the existing caller-established seam, not native
+UpdateConfiguration/session creation or a claim of promotion.
+
+Ordinary Close optionally prewaits actual pending replicate quorum completion.
+Timeout continues Close without fabricated ACKs or a timeout-shaped Close
+failure. Actual manager Close cancels remaining writes/catchup and builds,
+closes senders, then selected synchronous effect/oneshot deliveries drain.
+Client waiter-body consumption is not native callback dispatch and is not
+awaited. Abort skips/preempts the prewait and has an independent abnormal
+outcome. Pending provider build calls are retained, not silently declared
+drained; explicit continued build driving can await their actual callbacks.
+Weak ingress reports abandonment, not successful Close.
+
+There are **42 new actual tests**, including finished-build retransmission and
+actual subsequent quorum completion, finished-idle nonvoting behavior,
+receive/apply and RequestAck, shared CC/PC timers, queue-full retry, stale
+identity, removal/replacement, interrupted acquisition, actual provider errors,
+reentrant callbacks, selected-delivery drainage and finite/infinite quorum
+prewait/Abort. Native CC/PC lookup takes precedence over retained idle membership.
+V1 is **622**, runtime **679/679**, non-V1 unchanged **57**.
+Discovery is **1037 = 991 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**.
+See [validation](testing.md#sf-v1-primary-lifecycle-slice) and
+[source provenance](sf-v1-port-provenance.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11).
+
+**Remaining owners:** full native configuration/session creation, role and
+external epoch orchestration, promotion/drained queue transfer,
+periodic/slow-peer/MustCatchup policy, monitoring/host health and P4/P5
+adapters/atomic activation. Protected interfaces, selected wiring,
+dependencies/tier policy remain unchanged. No native binary/differential/
+hosted/provider-fsync parity, full ordinary execution or full P2/P3 claim.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
 | F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | `v1/replicator.rs`, `state.rs`, existing facade | COM/refcounts → owned Rust, not altered role outcomes | A1, C1, L1 |
-| F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`; full `primary.rs` remains pending | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle admission/pending-build capture delivered | A1, M1–M5, E1 |
+| F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`, `primary.rs`; full configuration/role owner pending | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle lifecycle and bounded primary/session timer/ACK/ordinary Close/Abort composition delivered | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`, `copy_establishment.rs`, `secondary.rs`; full role owner pending | async queues/executor; required/optimistic ACK, shared StartCopy receiver, copy receipt, provider callbacks and bounded ordinary Close/drain/Abort delivered; role/promotion/external epoch owner pending | S1–S3, E2 |
 | F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams, `copy_async_operation.rs`, `copy_establishment.rs` | protected Bytes/boxed stream/i64 unchanged; shared receipt, terminal adapters, serial polling and bounded copy provider acquisition delivered; public facade/full provider lifecycle pending | D1, S2–S3, C1–C2 |
-| F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs` | tasks/injected clocks, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
+| F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs`, bounded `primary.rs` | tasks/injected clocks and lasting post-build session timer/ordered ACK ownership, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
 | F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`, `copy_sender.rs`, `copy_establishment.rs`, `build_idle.rs`; full role composition pending | context acquisition/receipt, reliable StartCopy, serial enumeration/sending, EOF-issued target, copy/replication gates/pending retarget and idle lifecycle delivered; no fixed snapshot-only build substitute | C2–C5 |
-| F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; host/role demux integration pending | T1–T2, D1 |
+| F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, bounded primary session ACK/context lookup, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; full host/role demux integration pending | T1–T2, D1 |
 | F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | `v1` + existing host/controller adapters | no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
 | F11 async lifetime/diagnostics ([drain:56–102][drain], [health:62–125][health]) | retain owners through cancel/drain, outside-lock dispatch, batched/cleared warnings | Rust async ownership/clock + host reporting | no Common/Transport/KTL/Boost copy; preserve algorithm-affecting policy, not platform plumbing | R3, C3, H3 |
@@ -821,10 +869,13 @@ BuildIdle/idle-session lifecycle: admission/frozen-boundary/pending replication,
 ordered orchestration, removal/cancellation and completion cleanup.
 The bounded secondary lifetime now composes the actual receivers,
 establishment/context/ACK and provider epoch owners, including cross-receiver
-faults and ordinary legacy/EOS Close/drain/Abort. Next is primary coordinator
-ownership, including ordinary session timers/ACK ingress after BuildIdle,
-followed by role/external-epoch orchestration and drained queue transfer.
-Periodic/slow-peer policy and promotion remain explicit separate owners.
+faults and ordinary legacy/EOS Close/drain/Abort. The bounded primary lifetime
+now retains BuildIdle drivers, session timers/ordered ACK ingress beyond build
+completion, quorum prewait and ordinary Close/Abort effect drainage. Native
+configuration/session creation remains a caller-established seam. Next is
+role/external-epoch orchestration and drained queue transfer, including the
+missing native configuration/session-creation and promotion responsibilities.
+Periodic/slow-peer/MustCatchup policy remains an explicit separate owner.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the

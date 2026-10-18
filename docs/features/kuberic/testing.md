@@ -12,8 +12,8 @@ not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
-copy-receiver, enumeration, CopySender build-gate, copy-establishment, BuildIdle
-and secondary lifecycle slices have
+copy-receiver, enumeration, CopySender build-gate, copy-establishment, BuildIdle,
+secondary and primary lifecycle slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -42,18 +42,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 949 |
+| ordinary | 991 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **995** |
+| **total** | **1037** |
 
-Ordinary partition counts are `238, 237, 237, 237`. PostgreSQL partition counts
+Ordinary partition counts are `248, 248, 248, 247`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the secondary lifecycle slice: 995 =
-949 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the primary lifecycle slice: 1037 =
+991 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -484,7 +484,7 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
 
 This slice adds **41 actual tests**: 39 secondary lifetime cases and two
 shared-dispatch lifecycle observations. Combined V1 is **580**, runtime
-**637** including 57 unchanged non-V1 cases. Current discovery is **995 =
+**637** including 57 unchanged non-V1 cases. Discovery at that slice was **995 =
 949 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**, with ordinary slices
 **238/237/237/237** and unchanged PostgreSQL hashes **11/13/8/9**.
 
@@ -515,6 +515,51 @@ PostgreSQL/KinD bodies, native execution, differential/hosted parity and
 provider-fsync are not run or claimed. Earlier counts/exclusions remain
 historical. See the [ledger](sf-v1-port-ledger.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11)
 and [provenance](sf-v1-port-provenance.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11).
+
+### SF V1 Primary Lifecycle Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::primary::)' -j 2
+```
+
+This slice adds **42 actual primary-component tests**. Combined V1 is **622**,
+runtime **679/679** including 57 unchanged non-V1 cases. Exact discovery is
+**1037 = 991 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**, ordinary
+partitions **248/248/248/247**, PostgreSQL hashes **11/13/8/9**.
+
+The decisive case finishes an actual BuildIdle, supplies that same session
+through the explicit caller-established configuration seam, then admits more
+replication, observes actual retransmission and completes the actual quorum
+waiter through bound ACK ingress. Separate cases keep a finished build idle
+without inventing a quorum vote. Other cases exercise receive-only versus apply
+ACKs/RequestAck, CC/PC session deduplication, queue-full retry, stale route and
+incarnation rejection, atomic configuration failure, reentrant/coalesced ACK
+handoffs and timer deadlines installed into a continuously pinned driver.
+CC/PC lookup takes precedence over retained idle membership, preserving
+replication-only ACK ingress before and after removal from the idle set.
+
+Ordinary Close optionally waits actual pending replicate quorum completion;
+timeout continues native Close, never fabricates an ACK or fails Close solely
+for the prewait timeout. Infinite waits avoid monotonic-clock overflow. Abort
+skips/preempts the prewait and remains independently observable. Selected
+send/ACK/manager effects drain before primary terminal completion; client
+oneshot consumption is not required. Actual pending provider build acquisition
+survives interrupted driver polls, removal and primary Close; explicit build
+drainage waits its real callback and preserves actual provider errors.
+Weak ingress rejects owner abandonment; removed builds/providers are released
+after actual completion without aliasing a replacement with the same replica ID.
+
+Workspace check/Clippy, no-default/API/privacy, workspace doctests and exact
+inventory gates pass. All components remain private/unselected. Configuration
+is still a caller-established seam, not native UpdateConfiguration/session
+creation or promotion. Role/external-epoch orchestration, queue transfer,
+slow-peer/MustCatchup policy, host health and P4/P5 activation remain pending.
+No full ordinary execution, PostgreSQL/KinD bodies, native binary execution,
+differential/hosted parity or provider-fsync is run/claimed. Earlier counts and
+exclusions are historical. See the
+[ledger](sf-v1-port-ledger.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11)
+and [provenance](sf-v1-port-provenance.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11).
 
 ### Built-In Service Operation Delivery
 

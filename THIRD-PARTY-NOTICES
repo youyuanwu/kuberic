@@ -142,10 +142,27 @@ plumbing. Cleanup callback tokens retain the actual provider without a
 receiver/root cycle. Legacy containment, EOS initialized-stream drain, distinct
 provider/stream fault aftermath and independent Abort are not conflated. Tests
 execute actual Rust components and protected provider implementations, not a
-native harness. Primary/session/role orchestration, external epoch
-reconfiguration, promotion, monitoring/health and production activation remain
-pending; arbitrary provider GetNext drainage is not asserted. Components remain
-private and production-unselected.
+native harness. At that slice boundary, primary/session/role orchestration,
+external epoch reconfiguration, promotion, monitoring/health and production
+activation remained pending; arbitrary provider GetNext drainage is not
+asserted. Components remain private and production-unselected.
+
+The private primary.rs and its component tests translate selected
+PrimaryReplicator.cpp ordinary lifetime and bound ACK/context lookup,
+PrimaryReplicator.CloseAsyncOperation.cpp quorum prewait/Close,
+ReplicaManager.cpp cancellation/callback-drain and RemoteSession.cpp rooted
+ordered ACK processing responsibilities at the same pin. Existing actual
+queue/quorum, session, BuildIdle, CopySender and provider owners are composed,
+not replaced. Split guarded build preparation publishes routes before
+reentrant sends; shared handoff delivery preserves ACK ordering and continues
+after failures. Retained Rust build futures, weak ingress, outside-guard effects,
+Tokio deadlines/Notify and rooted activity accounting replace COM/job/callback
+queue plumbing. Oneshot delivery drainage does not assert client waiter
+execution or arbitrary pending provider-call drain. Configuration is an explicit
+caller-established seam, not native session creation or promotion. Full role/
+external-epoch/queue-transfer, slow-peer/MustCatchup policy, monitoring/health and
+production activation remain pending. Tests execute actual Rust components,
+not native binaries or a native harness. Components remain private/unselected.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 

@@ -28,8 +28,8 @@ use super::copy_async_operation::{CopyConfig, CopyError, CopyFault, CopySendActi
 use super::copy_context_receiver::{ContextObservation, CopyContextAck, CopyContextConfig};
 use super::copy_establishment::{EstablishError, PrimaryEstablishment, PrimaryEstablishmentHandle};
 use super::copy_sender::CopySenderHandle;
-use super::replica_manager::{EstablishedIdle, ManagerError, ReplicaManager};
-use super::session::{AckAction, ReplicationSession, SendIntent};
+use super::replica_manager::{EstablishedIdle, ManagerEffects, ManagerError, ReplicaManager};
+use super::session::{AckAction, AckProcessor, ReplicationSession, SendIntent, SessionSendBatch};
 use super::transport::{ProtocolError, Route, wire};
 
 pub(super) struct BuildConfig {
@@ -147,6 +147,14 @@ impl Root {
 pub(super) struct BuildIdleHandle(Arc<Root>);
 
 impl BuildIdleHandle {
+    pub(super) fn session(&self) -> ReplicationSession {
+        self.0.session.clone()
+    }
+
+    pub(super) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub(super) fn wake_timers(&self) {
         self.0.wake.notify_one();
     }
@@ -198,6 +206,15 @@ impl BuildIdleHandle {
     /// Continue EVERY handoff even if an owner rejects one. Otherwise the
     /// session remains processing and silently coalesces all future ACKs.
     pub(super) fn receive_ack(&self, envelope: &wire::Envelope) -> Result<(), BuildError> {
+        self.receive_ack_for_role(envelope, true, || self.0.update_progress())
+    }
+
+    pub(super) fn receive_ack_for_role(
+        &self,
+        envelope: &wire::Envelope,
+        process_copy: bool,
+        progress: impl FnMut() -> Result<(), BuildError>,
+    ) -> Result<(), BuildError> {
         if let Some(wire::envelope::Body::ReplicationAck(body)) = &envelope.body {
             let manager = self.0.manager.upgrade().ok_or(BuildError::ManagerDropped)?;
             let latest = manager.lock().unwrap().last_sequence_number()?;
@@ -207,7 +224,7 @@ impl BuildIdleHandle {
                 ))
                 .into());
             }
-            if body.error == 0 {
+            if process_copy && body.error == 0 {
                 self.0
                     .copy
                     .snapshot()?
@@ -216,50 +233,57 @@ impl BuildIdleHandle {
         }
         // The notification marks ordering; the fallible manager transition is
         // performed at PrimaryProgress below, not hidden in a unit callback.
-        let processor = self
-            .0
-            .establishment
-            .receive_ack_with_progress(envelope, Some(Arc::new(|| {})))?;
-        let mut failure = None;
-        if let Some(mut processor) = processor {
-            while let Some(handoff) = processor.next(self.0.clock.now()) {
-                processor = handoff.deliver(|action| {
-                    let result = match action {
-                        AckAction::ReplicationSends(batch) => {
-                            batch.dispatch();
-                            Ok(())
-                        }
-                        AckAction::CopyReplicationGate {
-                            copy_applied,
-                            replication_applied,
-                        } => self
-                            .0
-                            .copy
-                            .process_replication_ack(copy_applied, replication_applied)
-                            .map(|_| ())
-                            .map_err(BuildError::from),
-                        AckAction::PrimaryProgress(notification) => {
-                            notification.dispatch();
-                            self.0.update_progress()
-                        }
-                        AckAction::CopyAck { received, applied } => self
-                            .0
-                            .copy
-                            .process_copy_ack(received, applied)
-                            .map(|_| ())
-                            .map_err(BuildError::from),
-                    };
-                    if let Err(error) = result
-                        && failure.is_none()
-                    {
-                        failure = Some(error);
-                    }
-                });
-            }
-        }
+        let processor = self.0.establishment.receive_ack_for_role(
+            envelope,
+            process_copy,
+            Some(Arc::new(|| {})),
+        )?;
+        let result = deliver_ack(processor, &self.0.copy, &self.0.clock, progress);
         self.wake_timers();
-        failure.map_or(Ok(()), Err)
+        result
     }
+}
+
+pub(super) fn deliver_ack(
+    processor: Option<AckProcessor>,
+    copy: &CopySenderHandle,
+    clock: &Clock,
+    mut progress: impl FnMut() -> Result<(), BuildError>,
+) -> Result<(), BuildError> {
+    let mut failure = None;
+    if let Some(mut processor) = processor {
+        while let Some(handoff) = processor.next(clock.now()) {
+            processor = handoff.deliver(|action| {
+                let result = match action {
+                    AckAction::ReplicationSends(batch) => {
+                        batch.dispatch();
+                        Ok(())
+                    }
+                    AckAction::CopyReplicationGate {
+                        copy_applied,
+                        replication_applied,
+                    } => copy
+                        .process_replication_ack(copy_applied, replication_applied)
+                        .map(|_| ())
+                        .map_err(BuildError::from),
+                    AckAction::PrimaryProgress(notification) => {
+                        notification.dispatch();
+                        progress()
+                    }
+                    AckAction::CopyAck { received, applied } => copy
+                        .process_copy_ack(received, applied)
+                        .map(|_| ())
+                        .map_err(BuildError::from),
+                };
+                if let Err(error) = result
+                    && failure.is_none()
+                {
+                    failure = Some(error);
+                }
+            });
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 pub(super) struct BuildIdle {
@@ -276,6 +300,21 @@ impl BuildIdle {
         callbacks: BuildCallbacks,
         clock: Clock,
     ) -> Result<Self, BuildError> {
+        let (owner, pending, start) =
+            Self::prepare(manager, config, provider, callbacks, clock.clone())?;
+        pending.dispatch(clock.now())?;
+        start.dispatch();
+        Ok(owner)
+    }
+
+    /// Publish the returned owner before delivering either reentrant send batch.
+    pub(super) fn prepare(
+        manager: &Arc<Mutex<ReplicaManager>>,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        clock: Clock,
+    ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
         config.route.validate().map_err(EstablishError::from)?;
         if config.route.source.partition != config.route.destination.partition {
             return Err(EstablishError::from(ProtocolError::Shape("cross-partition build")).into());
@@ -327,9 +366,7 @@ impl BuildIdle {
             establishment,
             send_copy: callbacks.copy,
         };
-        pending.dispatch(clock.now())?;
-        start.dispatch();
-        Ok(owner)
+        Ok((owner, pending, start))
     }
 
     pub(super) fn handle(&self) -> BuildIdleHandle {

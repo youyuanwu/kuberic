@@ -51,9 +51,15 @@ ordered build orchestration and removal/cancellation/completion cleanup
 (41 actual tests, 539 combined V1). The [secondary lifecycle slice](sf-v1-port-ledger.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11)
 adds one shared receiver/establishment/context/ACK lifetime, actual provider
 epoch callbacks, cross-receiver faults and ordinary legacy/EOS Close/drain/Abort
-(41 actual tests, 580 combined V1). These supersede preceding slice-boundary
-omissions, not pending full primary/session/role, external epoch reconfiguration,
-promotion, monitoring/health or policy owners.
+(41 actual tests, 580 combined V1). The [primary lifecycle slice](sf-v1-port-ledger.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11)
+adds retained build/session lifetime, post-build retry/RequestAck timers,
+bound role-aware ordered ACK/quorum delivery and ordinary quorum prewait/
+Close/Abort effect drainage (42 actual tests, 622 combined V1).
+Configuration/session creation remains an explicit caller-established seam,
+not native promotion or full UpdateConfiguration. These supersede preceding
+slice-boundary omissions, not pending full native configuration/session
+creation and role, external epoch reconfiguration, promotion, monitoring/health
+or policy owners.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
