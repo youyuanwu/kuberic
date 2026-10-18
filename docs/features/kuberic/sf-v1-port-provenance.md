@@ -239,6 +239,48 @@ controller code is imported or changed. See the [remaining-owner ledger](sf-v1-p
 This is bounded preparatory ownership, not full F04/F05, P2/P3 completion,
 native/differential/hosted parity or production activation.
 
+### Copy Receivers Slice (P3, Bounded F04/F05/F07)
+
+Rust destinations, each retaining Microsoft copyright/MIT attribution:
+[`secondary_copy_receiver.rs`](../../../kuberic-runtime/src/replicator/v1/secondary_copy_receiver.rs),
+[`copy_context_receiver.rs`](../../../kuberic-runtime/src/replicator/v1/copy_context_receiver.rs)
+and their adjacent component `tests.rs` suites;
+[`copy_receiver_integration.rs`](../../../kuberic-runtime/src/replicator/v1/copy_receiver_integration.rs)
+adds actual cross-component boundary witnesses. The existing received-operation
+implementation/tests add a checked numbered network-EOS constructor.
+`R/` remains `src/prod/src/Reliability/Replication/` at the immutable pin above.
+
+| Selected native material | Translation / representation changes |
+|---|---|
+| `R/SecondaryCopyReceiver.h:40–54,72`; `.cpp:24–184,186–285,302–455` | Actual count-only ordering/dispatch, required/optimistic ACK progress, last-marker/gap/full/duplicate behavior, copyDone, final sentinels, queue close, local cleanup differences and EOS/root lifetime. Existing Rust queue/callback/shared-stream primitives replace native pointers/ReaderQueue. ACK/copy-sender checks are explicit obligations, not executed sends or build completion. The legacy terminal/wait predicate is preserved rather than guessed away. |
+| `R/CopyContextReceiver.h:12–85`; `.cpp:27–63,80–97,105–145,147–234` | Primary-side target-context receipt, no-service-ACK queue, numbered terminal bookkeeping, strict pending threshold, current issuance snapshot and close/error/final ACK ordering. Caller-serialized transitions replace the receiver lock. Small snapshot/close Arcs let selected ACKs and data-only streams outlive the receiver without copying native root cycles. |
+| `R/ComOperationDataAsyncEnumerator.cpp:59–75,90–157,188–196` | Data-only shared consuming stream; successful explicit close permits an already-pending dequeue, subsequent calls fail, error close fails pending reads. Rust polling replaces Begin/End; cancellation does not undo the handle's pending registration. Shared close state across handles and one error followed by terminal EOF are explicit Rust policies. Error close immediately retires inaccessible data rather than retaining COM wrappers until failed dequeue/destruction. |
+| `R/ReplicationTransport.cpp:722–752,776–802`; `R/ComFromBytesOperation.cpp:11–24`; `R/Constants.cpp:15–19` | Native last-message conversion preserves positive protocol LSN, marks copy/context EOS independent of policy and uses invalid operation epoch `(0,0)`. A small shared checked constructor preserves those distinctions from zero-LSN local EOS. Terminal classification uses logical payload length, not framed buffer-adapter overhead. No transport implementation is imported here. |
+| `R/AckSender.cpp:98–208`; `R/ReplicationSession.cpp:466–509`; `R/SecondaryReplicator.cpp:681–825,1500–1570,1967–2055,2087–2108`; `R/RemoteSession.cpp:585–627` | Existing real scheduler/current-state ACK callback, combined copy+replication pending threshold, ordered session handoff and explicit copy-context-sender/drain obligations. Rust effects stage callbacks, wakers, ACK finishes and retired/rejected input destruction outside caller guards. No copy sender, provider/drain or host-report success is fabricated. |
+| `R/ReplicationSecondary.Test.cpp:1726–1911`; `R/ReplicateCopyOperations.Test.cpp:430–438,744–807,1049–1108,1972–2013` | Selected out-of-order/duplicate/capacity/last/zero-context/batching/EOS expectations adapted to actual receivers and existing primitives. Deterministic input and injected time replace wrappers, network fixtures, random ACKs, sleeps and Boost harnesses. Other identity, frame, reentrant-drop/wake, terminal and close regressions derive from production branches and Rust ownership obligations. No native tests execute. |
+
+Integration review corrected canonical network-EOS admission in legacy copy
+mode and in context terminal handling, and made framed terminal validation use
+logical bytes. Numbered terminal metadata cannot become service data or a
+replication-LSN claim. Selected/late callbacks retain exact receiver identity
+after cleanup. Replaced EOS handles and rejected input/work roots retire only
+through outside-guard effects.
+
+**Measured scope:** 31 secondary-copy + 33 copy-context + two numbered-EOS
+constructor + two actual pair/session witnesses = **68 new tests**, **361
+combined v1**. The integrated runtime library passed **418/418**, including
+57 other library cases. Exact workspace discovery is **776 = 730 ordinary +
+41 PostgreSQL + 3 KinD + 2 build-only**; discovery does not execute provider/
+cluster/native bodies.
+
+The [bounded ledger](sf-v1-port-ledger.md#copy-receivers-slice-p3-bounded-f04f05f07)
+names remaining provider/context acquisition, copy enumeration/sending/build,
+establishment, cross-receiver fault/report/drain and role owners. No new
+dependency, native Common/Transport/KTL/Boost utility or test harness,
+protected type, selected production factory/listener/wire or service/host/
+controller change is introduced. This is not full F04/F05/F07 or P2/P3,
+native/differential/hosted/provider-fsync parity or production activation.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

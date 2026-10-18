@@ -84,6 +84,55 @@ fn already_released_queue_entry_cannot_start_a_new_received_lifecycle() {
 }
 
 #[test]
+fn numbered_copy_eos_keeps_terminal_identity_metadata_and_real_queue_ack_predicate() {
+    for callback_required in [false, true] {
+        let eos = ReceivedOperation::copy_end_of_stream(1, callback_required).unwrap();
+        assert!(eos.is_end_of_stream());
+        assert_eq!(eos.queue_operation().lsn(), 1);
+        assert!(eos.queue_operation().data().is_empty());
+        assert_eq!(eos.epoch(), Epoch::new(0, 0));
+        assert_eq!(eos.callback_required(), callback_required);
+        assert_state(&eos, AckState::NotCalled, true);
+        let (owner, weak) = owner();
+        eos.ignore_ack_and_keep_owner(owner);
+        assert_state(&eos, AckState::NotCalled, true);
+        assert!(weak.upgrade().is_some());
+
+        let mut queue = queue(callback_required, !callback_required);
+        queue.try_enqueue(eos.queue_operation().clone()).unwrap();
+        if callback_required {
+            assert!(queue.commit());
+            assert!(!queue.complete());
+            let mut work = selected(&eos);
+            assert!(!queue.complete());
+            work.start().unwrap();
+            assert!(queue.complete());
+            assert!(weak.upgrade().is_some());
+            work.finish().unwrap();
+        } else {
+            assert!(queue.complete());
+            assert!(eos.acknowledge().unwrap().is_none());
+        }
+        assert_state(&eos, AckState::Completed, false);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
+fn numbered_copy_eos_rejects_nonqueueable_lsns_without_changing_local_eos_sentinel() {
+    for lsn in [Lsn::MIN, -1, 0, Lsn::MAX] {
+        assert!(matches!(
+            ReceivedOperation::copy_end_of_stream(lsn, true),
+            Err(AckError::InvalidCopySequenceNumber)
+        ));
+    }
+    let eos = ReceivedOperation::end_of_stream(true);
+    assert!(eos.is_end_of_stream());
+    assert_eq!(eos.queue_operation().lsn(), 0);
+    assert_state(&eos, AckState::NotCalled, true);
+}
+
+#[test]
 fn equal_lsn_does_not_alias_callback_instances_or_replace_queued_operation() {
     let original = operation(1, true);
     let replacement = operation(1, true);
@@ -479,6 +528,9 @@ fn concurrent_duplicate_acks_select_exactly_one_callback() {
                 assert!(selected.replace(work).is_none());
             }
             Err(AckError::InvalidOperation) => invalid += 1,
+            Err(AckError::InvalidCopySequenceNumber) => {
+                panic!("an ACK transition cannot validate a new copy sequence number")
+            }
             Ok(None) => panic!("an unretired callback-required ACK cannot disappear"),
         }
     }

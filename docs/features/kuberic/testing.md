@@ -11,7 +11,8 @@ backpressure scenarios. Existing KSF inventory and current-contract regressions 
 not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
-bounded sender/session/ACK, async/tonic, primary queue/quorum and secondary receiver/ACK slices have
+bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
+and copy-receiver slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -40,18 +41,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 662 |
+| ordinary | 730 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **708** |
+| **total** | **776** |
 
-Ordinary partition counts are `166, 166, 165, 165`. PostgreSQL partition counts
+Ordinary partition counts are `183, 183, 182, 182`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the secondary receiver/ACK slice: 708 =
-662 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the copy-receiver slice: 776 =
+730 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -266,6 +267,42 @@ ignored test or duplicate executable scenario catalog is added. Native binary/
 test/differential, provider-fsync and hosted parity are not established.
 See the [bounded ledger](sf-v1-port-ledger.md#secondary-receiver-and-ack-slice-p3-bounded-f04f05f06f09)
 and [source provenance](sf-v1-port-provenance.md#secondary-receiver-and-ack-slice-p3-bounded-f04f05f06f09).
+
+### SF V1 Copy Receivers Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::secondary_copy_receiver::) or test(replicator::v1::copy_context_receiver::) or test(replicator::v1::copy_receiver_integration::) or test(numbered_copy_eos_)' -j 2
+```
+
+The slice adds **68 actual tests**: 31 secondary-copy, 33 copy-context, two
+numbered-EOS constructor and two pair/session integration cases. Combined V1
+coverage is **361**; the integrated runtime library passed **418/418**, including
+57 other library tests. Workspace all-target/all-feature check, warnings-denied
+Clippy, no-default runtime, doctests, external API/privacy and the exact
+776-test tier/partition inventory passed. Full ordinary, PostgreSQL and KinD
+test bodies were not rerun.
+
+Actual secondary-copy/context receivers reuse OperationQueue, ReceivedOperation,
+SharedDispatchQueue and AckSender. Cases exercise count-bound gaps/duplicates/
+retries, required versus optimistic completion, canonical numbered network EOS,
+legacy last markers, logical-empty framed payloads, shared consumption and
+terminal reacquisition. Callback selection/entry/completion, late exact identity,
+root/destructor/waker reentry, local cleanup differences and rejected inputs
+are exercised on real owners, not a copied ledger/formula model.
+
+Context cases exercise target-to-source data receipt without service ACK,
+strict pending threshold, current issuance snapshots, final error ACK and
+explicit-close versus protocol-EOF outcomes. Pair/session witnesses exercise
+the actual combined copy+replication pending threshold and terminal ACK
+sentinels, stopping before the missing copy-build owner.
+
+Provider invocation, context acquisition/copy enumeration/sending/build,
+StartCopy establishment, cross-receiver fault/report/EOS/drains and full role
+integration remain future owners. No protected type, selected production path,
+dependency, ignore/exemption or native/differential/hosted parity claim changes.
+See the [bounded ledger](sf-v1-port-ledger.md#copy-receivers-slice-p3-bounded-f04f05f07)
+and [source provenance](sf-v1-port-provenance.md#copy-receivers-slice-p3-bounded-f04f05f07).
 
 ### Built-In Service Operation Delivery
 
