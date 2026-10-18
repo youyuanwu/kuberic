@@ -396,8 +396,13 @@ fn request_ack_is_infinite_and_does_not_invent_epoch_or_hint_payload() {
         ms(1),
     );
     assert_eq!(*requests.lock().unwrap(), 0);
-    session.on_timer(ms(11)).dispatch();
+    assert_eq!(session.retry_deadline(), Some(ms(11)));
+    session
+        .on_timer(session.retry_deadline().unwrap())
+        .dispatch();
     assert_eq!(*requests.lock().unwrap(), 1);
+    session.close();
+    assert_eq!(session.retry_deadline(), None);
 }
 
 #[test]

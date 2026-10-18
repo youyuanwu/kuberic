@@ -194,6 +194,10 @@ impl ReplicationSession {
         self.root_batch(batch)
     }
 
+    pub(super) fn retry_deadline(&self) -> Option<Duration> {
+        self.state.lock().unwrap().sender.deadline()
+    }
+
     fn root_batch(&self, batch: SendBatch) -> SessionSendBatch {
         SessionSendBatch {
             session: self.clone(),

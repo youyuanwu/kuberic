@@ -1,20 +1,21 @@
 # SF V1 Port Foundation Ledger
 
-**P1 foundation plus the unselected OperationQueue slice of P2; no selected
+**P1 foundation plus unselected queue and sender/session/ACK slices of P2; no selected
 production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
 The current bespoke engine is the migration/safety baseline, not the native
 specification. `v1/` destinations below are under
-`kuberic-runtime/src/replicator/`; only OperationQueue is now implemented,
-and none is activated. P1 itself implemented no component.
+`kuberic-runtime/src/replicator/`; OperationQueue and the bounded components
+described below are implemented, and none is activated. P1 itself implemented
+no component.
 
 ## Evidence and status
 
 These are the **historical P1 baseline** statuses for the family, contract and
-scenario rows below. Only the explicit queue-slice update following this table
-changes component status; it does not close multi-family contracts.
+scenario rows below. Only the explicit slice updates following this table
+change component status; they do not close multi-family contracts.
 
 | Dimension | P1 status |
 |---|---|
@@ -70,15 +71,66 @@ the unchanged resolved aliases and interfaces. The
 measured inventory; the [provenance register](sf-v1-port-provenance.md#operationqueue-implementation-slice-p2-not-all-of-p2)
 records the selected production/test translation and representation changes.
 
-**Not established:** native execution or differential parity; sender/session/
-network ACK/tonic/buffer-adapter work; manager/receiver/provider/role integration;
+**Not established by the queue slice:** native execution or differential parity;
+sender/session/network ACK/tonic/buffer-adapter work; manager/receiver/provider/role integration;
 production selection; full P2, multi-family FR closure or P5 acceptance.
-All other families/scenarios retain pending port status. Scenario rows remain
+Other families retain pending status except the bounded F06 update below. Scenario rows remain
 source provenance/expectations, not another test-vector implementation.
+
+### Sender Session ACK Slice (P2, Bounded F06)
+
+Private, compiled and **production-unselected** components now implement:
+
+- [`ReliableOperationSender`](../../../kuberic-runtime/src/replicator/v1/sender.rs#L103):
+  separate monotone receive/apply cursors, ordered single/replay admission using
+  the existing shared queue entries, receive-based retirement, native
+  operation-count window/retry rules, timer-only RequestAck, completed-LSN
+  side channel and receive/apply latency/decay collection.
+- [`AckSender`](../../../kuberic-runtime/src/replicator/v1/ack.rs#L33):
+  first-deadline batching, immediate force, pending-only close flush, latest
+  owner callback rather than captured payload, construction-time force gate,
+  trace/issuance time and advisory timer cancellation.
+- A **partial** [`ReplicationSession`](../../../kuberic-runtime/src/replicator/v1/session.rs#L98)
+  translates selected RemoteSession/ReplicationSession duties: fixed supplied
+  identity, current sending versus original operation epoch, replication and
+  RequestAck intent/expiry, progress views and one rooted coalescing ACK
+  processor. Ordered handoffs are replication sender/dispatch, copy replication
+  gate, conditional initiating primary callback, then copy ACK. Copy terminal
+  -1 is absorbing; cached replication pairs may replace one field downward
+  while sender high-water marks stay monotone. Close does not drain the
+  processor or reject native post-close ACK input.
+
+There are **61 new actual component tests**: 28 sender (including its production
+statistics helper), 13 ACK scheduler and 20 session. Combined with the queue,
+the focused v1 selection runs **103 tests**. They drive actual components with
+manual time and explicit handoff delivery, not formulas defined in tests or an
+executable scenario catalog. Reviews corrected ACK trace-stopwatch retention
+on close/reopen; a real regression preserves it.
+
+**Adaptation:** short synchronous transitions stage owned batches/callbacks;
+all external effects run outside serialization. Selected entries and session
+roots can outlive close. Deadlines and timer callback entry are injected seams,
+not an integrated timer runtime. Callback false means send-queue-full only;
+carrier error/fault mapping is still absent. Safe bounded latency iteration
+preserves native positional traversal in its dense valid-input domain; sparse
+send ordering is tested, arbitrary sparse latency-cursor parity is not claimed.
+
+**Still unimplemented:** actual carrier/demux and buffer adapter; primary,
+secondary/receiver, CopySender/CopyAsyncOperation/context/establishment and
+role integration; provider enumeration, quorum/build completion; native session
+slow-fault flags/notification timer, MustCatchup and promotion-owner integration.
+These are named native responsibilities, not implicitly successful callbacks.
+Copy gate/ACK actions are unresolved owner obligations, not executed copy
+algorithms. No task abort substitutes for future advisory cancellation/drain.
+This is not a full RemoteSession/ReplicationSession port, full P2, native
+execution/differential parity, hosted evidence or multi-family contract closure.
+
+See [actual test selectors](testing.md#sf-v1-sender-session-ack-slice) and the
+[selected source/test register](sf-v1-port-provenance.md#sender-session-ack-implementation-slice-p2-bounded-f06).
 
 ## Source families, transitions and substitutions
 
-| ID / native family and source | Transitions/responsibility | Rust destination (queue only implemented) | Allowed representation substitution | Scenarios |
+| ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
 | F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | `v1/replicator.rs`, `state.rs`, existing facade | COM/refcounts → owned Rust, not altered role outcomes | A1, C1, L1 |
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | `v1/primary.rs`, `replica_manager.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic | A1, M1–M5, E1 |
@@ -142,7 +194,7 @@ named native cases are preserved in this ledger and the provenance table.
 | S3 S | retire normal NotCalled callback cancels it; late ACK cannot advance retired receiver; repeated completed ACK InvalidOperation; EOS callback differs. | [callback:167–224][callback] |
 | R1 D | add1,2,3; ACK(receive,apply) (1,0),(2,0); add4; (2,1),(3,2),(4,4) → pending[2,3],[3],[3,4],[4],[] and timer off. | [sender test:102–143][sender-test] |
 | R2 S | active sender window8/max8/noAckSinceLastCallback=true; retry→4; advancing receive ACK doubles4→8; duplicate leaves8; receive4/apply2/no pending send→RequestAck, not quorum. | [sender:548–579,636–679,732–755][sender] |
-| R3 S | combined ACK effects ordered sender progress → build gate → progress callback → copy ACK; batch15ms<retry5s; Close flushes final ACK. | [remote:585–611][remote], [ACK:64–112,174–208][ack] |
+| R3 S | combined ACK effects ordered sender progress/dispatch → build gate → progress callback → copy ACK; batch15ms<retry5s; Close flushes only a pending ACK batch. | [remote:585–611][remote], [ACK:64–127,174–208][ack] |
 | C1 S | actual QI/settings/fault/exclusion outcomes in next table, not SDK assumptions. | [QI:12–35][qi], [Com:1002–1050][com], [stream:66–85][stream] |
 | C2 S | provider [empty bytes,x,EOF] →3 polls,2 items,1 terminal EOF, no poll4; persisted target context to source, volatile omits callback. | [enum:108–121,182–195][enumerator], [copy:171–211][copy], [secondary:982–1003][secondary] |
 | C3 D/S | native15/15/4 cancel-at12 case reduced to full queue + one parked item; no additional poll until room/termination; cancel is OperationCanceled, not EOF. Copy count64/1024; no maximum-memory limit. | [copy test:418–449][copy-test], [copy:42–49,242–254][copy], [copy receiver:388–395][copy-receiver] |
