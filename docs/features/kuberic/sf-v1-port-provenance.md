@@ -320,7 +320,7 @@ partition validation passed. Discovery does not execute cluster/provider tiers.
 See the [bounded ledger](sf-v1-port-ledger.md#copy-enumeration-slice-p3-bounded-f05f07f11)
 and [test selector](testing.md#sf-v1-copy-enumeration-slice).
 
-CopySender `.cpp:56–85,267–406,524–579` and
+At this slice boundary, CopySender `.cpp:56–85,267–406,524–579` and
 `PrimaryReplicator.BuildIdleAsyncOperation.cpp:111–166` remain reviewed context,
 not ported build/replication gates or retargeting. Provider/context acquisition,
 StartCopy establishment, fault/drain/role orchestration and facade/service/
@@ -329,6 +329,51 @@ slow-provider monitoring/health reporting is not incorporated by this slice.
 No dependency, utility library,
 native harness, protected API, selected production wiring, native/differential/
 hosted/provider-fsync parity or complete P2/P3 claim is introduced.
+
+### CopySender Build Gates Slice (P3, Bounded F06/F07/F11)
+
+Rust destinations retain Microsoft copyright/MIT attribution:
+[`copy_sender.rs`](../../../kuberic-runtime/src/replicator/v1/copy_sender.rs)
+and adjacent
+[`tests.rs`](../../../kuberic-runtime/src/replicator/v1/copy_sender/tests.rs).
+The existing enumeration owner gains only an explicit outside-guard-waking
+external-error completion entry and private typed errors; its queue, sender,
+provider stream and serial enumeration algorithms are unchanged.
+`R/` denotes `src/prod/src/Reliability/Replication/` at the same immutable pin.
+
+| Selected native source | Incorporated responsibility and explicit Rust substitution |
+|---|---|
+| `R/CopySender.h:29–157`; `.cpp:26–265` | One-shot Begin, stale/pre-Begin failure, explicit FinishOperation, EOF callback, separate End and completion-disable race fault. Rust uses a caller-owned driver, short transitions, weak handles and an EOF-callback-rooted sender state instead of COM/Begin-End. A prefailed Begin never polls the provider. First completion wins, including synthetic prefailed completion. |
+| `R/CopySender.cpp:267–406` | Replication gate requires terminal-copy evidence before it latches; copy/application completion remains separate. Normalize copy `-1` to the known terminal, preserving zero/no-update and receive-versus-applied progress. Complete/update enumeration outside the sender guard. Disabling completion suppresses success, not ACK queue release. Malformed/impossible ACKs become explicit private errors, including parked-terminal input that would otherwise freeze retargeting. |
+| `R/CopySender.cpp:409–439,476–581` | Native five-state copy lifecycle, context/no-replication mode, final-copy identity, delegated sender progress/latency, monotonically increasing target only while LSNSet, and no reopening ReplCompleted. Metadata already supplied by the enumeration owner replaces pointer-based IsOperationLast inspection; no second reliable sender or ordering queue is added. |
+| `R/PrimaryReplicator.BuildIdleAsyncOperation.cpp:111–166`; `R/RemoteSession.cpp:367–385` | Invoke a fallible latest-issued getter from actual enumeration EOF, before sender Add and even when the terminal is parked. Propagate lookup failure as an operation error, not an invented provider fault. The native EOF recheck with copy LSN zero cannot satisfy its terminal predicate; no early replication gate is invented. This is the bounded callback, not GetCopyState/context acquisition or complete BuildIdle cleanup/StartCopy ownership. |
+| `R/RemoteSession.cpp:585–615` | Actual session ACK-processor witnesses deliver replication sends, CopyReplicationGate, primary progress and CopyAck in native order. Existing handoffs remain caller-owned, not automatic production wiring. |
+| `R/ReplicaManager.cpp:745–774,1983–2022`; `R/CopySender.cpp:87–103,555–581` | Port the upward pending-target update. Actual primary queue/session tests exercise EOF-issued versus committed progress and idle retention release after retarget. Barrier-synchronized real threads cover gate-versus-retarget serialization. Full timer/freshness/pressure eligibility, fault exclusion, notifications and promotion are future owners. |
+| `R/SecondaryCopyReceiver.cpp:24–184,302–455`; `R/CopyContextReceiver.cpp:105–234` | Real receiver witnesses feed actual terminal ACKs into CopySender, without test-only sentinel normalization or a fake build-success flag. Required/optimistic service ACKs both wait for the real replication gate; context numeric terminal ACK needs no replication gate. |
+
+There is no standalone native CopySender test file at this pin. The **47 new
+tests** are production-source-derived Rust component vectors, not native harness
+execution or a claim of differential parity. They exercise the actual wrapped
+enumerator, queues, reliable senders, session handoffs and copy/context receivers.
+Reentrant provider/getter/payload lifetimes, selected-work rooting, cancellation/
+FinishOperation, capture/provider errors and the selected-success/disable race
+are executable boundaries. End maps the native internal-error race to an
+explicit private failure plus the existing runtime fault representation and
+exact native description; no new protected/public error surface is introduced.
+
+**Measured scope:** V1 **453**, runtime library **510/510** (57 unchanged non-V1),
+workspace **868 = 822 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**.
+Workspace check/Clippy, no-default runtime, API/privacy, doctests and exact
+tier/partition gates passed. Discovery does not execute provider/cluster tiers.
+See the [ledger](sf-v1-port-ledger.md#copysender-build-gates-slice-p3-bounded-f06f07f11)
+and [test selector](testing.md#sf-v1-copysender-build-gates-slice).
+
+Provider/context acquisition, reliable StartCopy identity/epoch establishment,
+full BuildIdle/session/role/drain orchestration, periodic/slow-peer policy,
+promotion and provider monitoring remain separate owners. All components stay
+private/unselected. No dependencies, native Common/Transport/KTL utilities or
+test harness, protected APIs, factory/service/wire/host/controller wiring,
+native/differential/hosted/provider-fsync parity or full P2/P3 completion.
 
 ### P1 documented expectations (historical foundation)
 

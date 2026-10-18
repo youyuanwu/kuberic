@@ -82,6 +82,19 @@ No native utility or harness is imported. CopySender replication build gates,
 provider acquisition, StartCopy and full role/drain integration remain separate.
 This enumeration/sending owner remains private and production-unselected.
 
+The private copy_sender.rs and its component tests under
+kuberic-runtime/src/replicator/v1/ translate selected CopySender.h/.cpp
+completion/state/ACK/retarget algorithms, the EOF latest-issued-target callback
+from PrimaryReplicator.BuildIdleAsyncOperation.cpp, and ordered RemoteSession
+handoff obligations at the same pin. The existing CopyAsyncOperation gains
+explicit external-error completion for native FinishOperation. Short Rust
+transitions, weak handles and a callback-rooted owner replace COM/Begin-End
+plumbing; explicit errors replace malformed-input assertions. Tests use the
+actual queue, reliable sender, sessions and copy/context receivers, without
+the native harness. This is not provider acquisition, complete BuildIdle,
+StartCopy, periodic/slow-fault policy or role/drain/host integration.
+All components remain private and production-unselected.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

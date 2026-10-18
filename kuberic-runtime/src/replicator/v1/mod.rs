@@ -4,6 +4,7 @@ mod async_runtime;
 mod buffers;
 mod copy_async_operation;
 mod copy_context_receiver;
+mod copy_sender;
 mod operation_queue;
 mod operation_stream;
 mod received_operation;

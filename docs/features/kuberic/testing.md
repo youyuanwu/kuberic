@@ -12,7 +12,7 @@ not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
-and copy-receiver slices have
+copy-receiver, enumeration and CopySender build-gate slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -41,18 +41,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 775 |
+| ordinary | 822 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **821** |
+| **total** | **868** |
 
-Ordinary partition counts are `194, 194, 194, 193`. PostgreSQL partition counts
+Ordinary partition counts are `206, 206, 205, 205`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the copy-enumeration slice: 821 =
-775 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the CopySender build-gates slice: 868 =
+822 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -345,6 +345,46 @@ production activation. No protected API, selected factory/
 wire, dependency or tier/exemption policy changes.
 See the [bounded ledger](sf-v1-port-ledger.md#copy-enumeration-slice-p3-bounded-f05f07f11)
 and [source provenance](sf-v1-port-provenance.md#copy-enumeration-slice-p3-bounded-f05f07f11).
+
+### SF V1 CopySender Build Gates Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::copy_sender::)' -j 2
+```
+
+This slice adds **47 actual tests**, for **453 combined V1** and **510/510**
+passing runtime library cases, with the same 57 non-V1 library tests. Exact
+CopySender selection passes 47/47. Workspace all-target/all-feature check,
+warnings-denied Clippy, no-default runtime, external API/privacy, workspace
+doctests and exact **868-test** tier/partition discovery passed. Ordinary slices
+are **206/206/205/205**, PostgreSQL hashes remain **11/13/8/9**. Discovery does
+not execute PostgreSQL/KinD bodies. Full ordinary execution, native/differential,
+hosted parity and provider-fsync were not run or claimed.
+
+Tests execute CopySender wrapping the real CopyAsyncOperation, not redefined
+completion formulas. Both ACK arrival orders, actual session handoff ordering,
+empty versus terminal data, sentinel/numeric terminal ACKs, applied-only
+progress, parked EOF capture, malformed ACKs and real retry/queue-full behavior
+are covered. An actual primary queue proves EOF captures the latest issued,
+not committed/start-time LSN; a real session/queue witness proves upward pending
+retarget releases retention without declaring success. Barrier-synchronized
+threads test retarget/gate serialization; a reentrant final-payload destructor
+deterministically races selected success against disabling completion and
+requires the native End failure/fault. Native context mode, pre-Begin failures,
+distinct cancellation/FinishOperation timing, first completion, capture/provider
+errors, idempotent End, delegated progress/latency, rooted selected work and a
+real executor wakeup are exercised. Actual secondary copy receivers cover both
+service-ACK modes; actual primary context receipt supplies its numeric terminal
+ACK. No test-only sentinel normalization or build-success flag substitutes for
+the new owner.
+
+Provider/context acquisition, reliable StartCopy establishment, full BuildIdle/
+session/role/drain orchestration, periodic/slow-peer policy and monitoring remain
+pending. Protected APIs and selected factory/service/wire/host/controller paths
+are unchanged; the component is private and unselected.
+See the [ledger](sf-v1-port-ledger.md#copysender-build-gates-slice-p3-bounded-f06f07f11)
+and [provenance](sf-v1-port-provenance.md#copysender-build-gates-slice-p3-bounded-f06f07f11).
 
 ### Built-In Service Operation Delivery
 

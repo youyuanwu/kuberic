@@ -435,7 +435,7 @@ receiver boundaries. Combined V1 coverage is **406**; the runtime library passed
 3 KinD + 2 build-only**. See [selectors and validation](testing.md#sf-v1-copy-enumeration-slice)
 and [source provenance](sf-v1-port-provenance.md#copy-enumeration-slice-p3-bounded-f05f07f11).
 
-**Remaining owners:** CopySender final-copy/replication build gates, EOF-issued
+**Remaining at this slice boundary:** CopySender final-copy/replication build gates, EOF-issued
 target capture and retargeting; provider invocation/context acquisition;
 StartCopy identity/session/epoch establishment; cross-receiver faults/drains
 and full role orchestration; slow-provider API monitoring/health reporting.
@@ -443,6 +443,59 @@ Protected facade/service/host/controller adapters
 and atomic activation remain P4/P5. No selected production path, protected API,
 dependency, native execution, differential/hosted/provider-fsync or full P2/P3
 completion claim is introduced.
+
+### CopySender Build Gates Slice (P3, Bounded F06/F07/F11)
+
+Private
+[`CopySender`](../../../kuberic-runtime/src/replicator/v1/copy_sender.rs)
+now wraps the actual CopyAsyncOperation with the native
+NotStarted/Started/LSNSet/ReplCompleted/Completed state machine. At the real
+enumeration EOF callback, a supplied fallible getter captures the latest
+**issued** primary replication LSN, not a creation-time or committed snapshot.
+The callback runs outside guards, before terminal sender Add, even when EOF is
+parked. Lookup failures complete with an explicit error without inventing an
+EndGetNext provider fault.
+
+The replication gate does not latch from preterminal replication ACKs.
+Final-copy application and replication application through the captured target
+are separate conditions; neither alone succeeds. The existing session's ordered
+replication-gate, primary-progress and copy-ACK handoffs are consumed by real
+component tests without bypassing their continuation. CopySender normalizes
+native copy `-1` sentinels to the known terminal; zero still means no update.
+Receive progress suppresses retries, applied progress releases the copy queue,
+and impossible ACKs for a parked terminal cannot freeze the replication gate.
+Numeric terminal ACKs also work. Copy-context mode skips the replication gate
+and retains no replication finish target.
+
+Pending replication targets only increase while LSNSet; they cannot regress or
+reopen a satisfied gate. A real session/primary-queue witness shows retargeting
+increases idle retention progress and releases more queue entries without
+declaring build success. This ports the target update, not the full periodic
+freshness/queue-pressure/slow-fault policy or idle promotion owner.
+
+Disable-completion blocks new success decisions, not copy queue advancement.
+A selected success racing disable is explicitly failed and faulted at End with
+the native description. Pre-Begin failure skips enumeration; Begin is one-shot,
+external FinishOperation and enumeration cancellation retain their distinct
+timing, and first completion wins. End is separate and idempotent. Progress and
+averages delegate to the actual sender. Weak handles avoid cycles, and selected
+enumeration work roots this callback owner through End/owner release; external
+polls/getters, sends, wakes and retiring payloads stay outside transition guards.
+
+There are **47 new actual tests**, **453 combined V1**, and **510/510** passing
+runtime library cases, including concurrent retarget/gate and deterministic
+disable/success races, real executor wakeups and both secondary service-ACK
+modes plus primary context receipt. Exact workspace discovery is
+**868 = 822 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**.
+See [selectors and validation](testing.md#sf-v1-copysender-build-gates-slice)
+and [source provenance](sf-v1-port-provenance.md#copysender-build-gates-slice-p3-bounded-f06f07f11).
+
+**Remaining owners:** provider invocation/context acquisition, reliable StartCopy
+identity/session/epoch establishment, full BuildIdle/session/primary/secondary
+orchestration, periodic/slow-peer policy and promotion, cross-receiver faults/
+drains and roles, provider monitoring/health reports, and P4/P5 adapters/atomic
+activation. No protected interface, selected production path, dependency,
+native/differential/hosted/provider-fsync or full P2/P3 completion claim.
 
 ## Source families, transitions and substitutions
 
@@ -454,7 +507,7 @@ completion claim is introduced.
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`; full secondary/role owner pending | async queues/executor; required/optimistic ACK, copy receipt and explicit epoch handoffs delivered, provider/cross-receiver drains pending | S1–S3, E2 |
 | F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams and `copy_async_operation.rs` | protected Bytes/boxed stream/i64 unchanged; shared receipt, terminal adapters and serial stream polling delivered; provider invocation/public facade integration pending | D1, S2–S3, C1–C2 |
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs` | tasks/injected clocks, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
-| F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`; CopySender/provider acquisition/build/establishment owners pending | context receipt and serial copy/context enumeration/reliable sending delivered; terminal-ready is separate from outer build success; no fixed snapshot-only build substitute | C2–C5 |
+| F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`, `copy_sender.rs`; provider acquisition/full build/establishment owners pending | context receipt, serial enumeration/reliable sending, EOF-issued target and copy/replication gates/pending retarget delivered; no fixed snapshot-only build substitute | C2–C5 |
 | F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; host/role demux integration pending | T1–T2, D1 |
 | F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | `v1` + existing host/controller adapters | no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
@@ -597,9 +650,10 @@ hosted, native differential or provider-fsync parity.
 P2 ports the queue/session/sender/ACK/async/tonic substrate **without production
 activation**; remaining session fault/promotion owners stay explicit. P3 has a
 bounded primary queue/quorum, replication/copy receiver, context-receipt and
-copy/context enumeration/reliable-send cores. Next is CopySender's final-copy
-and replication build gates, EOF-issued target and retargeting; full primary/
-secondary, provider acquisition/establishment and roles remain.
+copy/context enumeration/reliable-send and CopySender build-gate/EOF-issued
+target/pending-retarget cores. Next is provider/context acquisition and reliable
+StartCopy/session/epoch/identity establishment; full primary/secondary/build
+orchestration, periodic/slow-peer policy, cross-receiver drains and roles remain.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
