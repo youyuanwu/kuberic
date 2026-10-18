@@ -70,6 +70,18 @@ completion. Receiver-local cleanup is not full cross-receiver fault/drain or
 role orchestration. The components remain private and production-unselected;
 the provenance register records exact sources and representation adaptations.
 
+The private copy_async_operation.rs and its component tests under
+kuberic-runtime/src/replicator/v1/ translate selected CopyAsyncOperation.h/.cpp
+and ComProxyAsyncEnumOperation.cpp enumeration contracts, plus selected
+CopyAsyncOperation.Test.cpp expectations at the same pin. The actual Rust queue
+and reliable sender retain their algorithms; a caller-driven Tokio future,
+weak handles and rooted stream lease replace native Threadpool/Begin-End/COM
+execution. The sender's read-only pending-operation view stages lifetime
+release outside copy-owner guards, without adding another ordering queue.
+No native utility or harness is imported. CopySender replication build gates,
+provider acquisition, StartCopy and full role/drain integration remain separate.
+This enumeration/sending owner remains private and production-unselected.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
-**P1 foundation, unselected P2 substrate slices and bounded P3 primary and
-secondary ownership slices; no selected production behavior change.** Native pin:
+**P1 foundation, unselected P2 substrate slices and bounded P3 primary,
+secondary and copy ownership slices; no selected production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -384,6 +384,66 @@ facade/service/host/controller adapters and atomic activation remain P4/P5.
 No protected API, selected production path, dependency, native execution,
 differential comparison, provider-fsync or hosted-parity claim is introduced.
 
+### Copy Enumeration Slice (P3, Bounded F05/F07/F11)
+
+Private
+[`CopyAsyncOperation`](../../../kuberic-runtime/src/replicator/v1/copy_async_operation.rs)
+now owns serial provider-stream enumeration and reliable copy/context sending,
+reusing the actual OperationQueue, ReliableOperationSender, buffer adapter and
+clock. It does not acquire a provider stream, implement CopySender or build an
+idle replica. Existing protected provider types remain unchanged.
+
+Copy sequence numbers start at one. Queue capacity uses the native copy count
+settings, clean-on-complete and ignore-commit policy, with no copy memory bound.
+A full queue parks exactly one already-numbered operation and stops further
+provider polls. Receive ACKs suppress retries; only applied ACKs release queue
+space and retry the parked item. ACK entry wakes the executor-driven provider
+loop instead of polling it inline. Per-item representation limits are separate
+from queue capacity, and framed payload accounting uses logical data length.
+
+Empty data remains data; EOF produces a numbered protocol terminal even for an
+empty stream. The last-enumerator callback runs once, outside serialization,
+before sender Add and even when the terminal is parked. No poll follows EOF.
+Cancellation at a full-queue stall or after EOF completes immediately; otherwise
+the driver stops before the next poll or allows an in-flight poll to finish.
+A provider error takes precedence over the post-cancellation check.
+Non-cancellation provider failures retain their error and `EndGetNext` fault
+description. Cancellation and malformed input never become successful EOF.
+
+The actual sender supplies retry windows, one-shot deadlines, RequestAck and
+receive/apply progress/averages. Send queue full remains a retryable false
+callback, not an ACK. Final copy progress marks `ready_to_complete`, but only an
+explicit outer-owner success request completes enumeration; no replication
+build gate is invented. Native `End` separately closes the sender idempotently.
+ACK input is already normalized: wire `-1` conversion belongs to future
+CopySender, not this owner.
+
+Rust replaces Threadpool/Begin-End with a caller-driven Tokio future and weak
+handles. A unique stream lease preserves pending polls across timer/wake
+branches and dropped drive futures, returning the provider to the callback
+root on drive-future drop/exit. Selected sends retain that provider/queue root through
+owner release and End. Dropping a driver future or owner is not native
+cancellation, successful drain or completion. Polls, callbacks, wakes and final
+payload destruction execute outside transition guards; the sender's new
+read-only pending view supports lifetime staging, not another ordering queue.
+
+There are **45 new actual tests**, including source-native twelve-item drained
+success and fifteen-item/eight-slot/full-retry cancellation vectors, real
+executor wake/cancel cases, lifetime/reentry regressions and real copy/context
+receiver boundaries. Combined V1 coverage is **406**; the runtime library passed
+**463/463**. Exact workspace inventory is **821 = 775 ordinary + 41 PostgreSQL +
+3 KinD + 2 build-only**. See [selectors and validation](testing.md#sf-v1-copy-enumeration-slice)
+and [source provenance](sf-v1-port-provenance.md#copy-enumeration-slice-p3-bounded-f05f07f11).
+
+**Remaining owners:** CopySender final-copy/replication build gates, EOF-issued
+target capture and retargeting; provider invocation/context acquisition;
+StartCopy identity/session/epoch establishment; cross-receiver faults/drains
+and full role orchestration; slow-provider API monitoring/health reporting.
+Protected facade/service/host/controller adapters
+and atomic activation remain P4/P5. No selected production path, protected API,
+dependency, native execution, differential/hosted/provider-fsync or full P2/P3
+completion claim is introduced.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
@@ -392,9 +452,9 @@ differential comparison, provider-fsync or hosted-parity claim is introduced.
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`; full `primary.rs` remains pending | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`; full secondary/role owner pending | async queues/executor; required/optimistic ACK, copy receipt and explicit epoch handoffs delivered, provider/cross-receiver drains pending | S1–S3, E2 |
-| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams | protected Bytes/boxed stream/i64 unchanged; shared receipt/terminal adapters delivered, provider polling/public facade integration pending | D1, S2–S3, C1–C2 |
+| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams and `copy_async_operation.rs` | protected Bytes/boxed stream/i64 unchanged; shared receipt, terminal adapters and serial stream polling delivered; provider invocation/public facade integration pending | D1, S2–S3, C1–C2 |
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs` | tasks/injected clocks, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
-| F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`; copy sender/provider/build/establishment owners pending | target-to-source context receipt and data-only stream delivered; no provider polling or fixed snapshot-only build substitute | C2–C5 |
+| F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`; CopySender/provider acquisition/build/establishment owners pending | context receipt and serial copy/context enumeration/reliable sending delivered; terminal-ready is separate from outer build success; no fixed snapshot-only build substitute | C2–C5 |
 | F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; host/role demux integration pending | T1–T2, D1 |
 | F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | `v1` + existing host/controller adapters | no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
@@ -536,8 +596,10 @@ hosted, native differential or provider-fsync parity.
 
 P2 ports the queue/session/sender/ACK/async/tonic substrate **without production
 activation**; remaining session fault/promotion owners stay explicit. P3 has a
-bounded primary queue/quorum, replication/copy receiver and context-receipt
-cores; full primary/secondary, copy sending/build/provider and roles remain.
+bounded primary queue/quorum, replication/copy receiver, context-receipt and
+copy/context enumeration/reliable-send cores. Next is CopySender's final-copy
+and replication build gates, EOF-issued target and retargeting; full primary/
+secondary, provider acquisition/establishment and roles remain.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the

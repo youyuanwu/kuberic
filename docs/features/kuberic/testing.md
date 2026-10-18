@@ -41,18 +41,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 730 |
+| ordinary | 775 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **776** |
+| **total** | **821** |
 
-Ordinary partition counts are `183, 183, 182, 182`. PostgreSQL partition counts
+Ordinary partition counts are `194, 194, 194, 193`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the copy-receiver slice: 776 =
-730 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the copy-enumeration slice: 821 =
+775 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -303,6 +303,48 @@ integration remain future owners. No protected type, selected production path,
 dependency, ignore/exemption or native/differential/hosted parity claim changes.
 See the [bounded ledger](sf-v1-port-ledger.md#copy-receivers-slice-p3-bounded-f04f05f07)
 and [source provenance](sf-v1-port-provenance.md#copy-receivers-slice-p3-bounded-f04f05f07).
+
+### SF V1 Copy Enumeration Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::copy_async_operation::)' -j 2
+```
+
+The slice adds **45 actual tests**, for **406 combined V1** and **463/463**
+passing runtime library tests (57 unchanged non-V1 cases). The exact selector
+passes 45/45. Workspace all-target/all-feature check, warnings-denied Clippy,
+runtime no-default-feature check, external API/privacy, workspace doctests and
+exact 821-test tier/partition discovery passed. Full ordinary, PostgreSQL and
+KinD test bodies, native execution/differential, hosted parity and provider-fsync
+were not run or claimed.
+
+Actual CopyAsyncOperation tests use the real OperationQueue, reliable sender,
+buffer adapter and injected clock. They exercise serial ready/pending provider
+polls, empty data versus numbered EOF, count growth, one parked item, received
+versus applied ACKs, duplicate/regressive ACKs, parked EOF notification, retry
+and RequestAck, native cancellation timing and late provider-error precedence.
+Native twelve-item drained-success and fifteen-item/eight-slot/full-retry
+cancellation cases are adapted without the native harness. Real-executor
+cases prove ACK wake/resume and in-flight cancellation; dropping a drive future
+preserves its pending provider poll, not a successful native cancellation.
+
+Rooted selected work retains the provider through End/owner release. Provider
+polls, EOF/send callbacks, driver wakers and rejected/retired payload destructors
+are exercised for outside-guard reentry. Framed-empty data, malformed settings/
+ACK/frame and sequence exhaustion have actual regressions. Actual secondary
+copy receivers exercise both service-ACK modes; actual primary-side context
+receipt hides the protocol terminal and ACKs its LSN.
+
+Final-copy readiness stays separate from an explicit outer-owner success request.
+Receiver-boundary tests do not implement CopySender's sentinel conversion,
+replication build gate, EOF-issued target or retargeting. Provider invocation/
+context acquisition, StartCopy establishment, full fault/drain/role integration
+and slow-provider API monitoring/health reporting remain pending, as does
+production activation. No protected API, selected factory/
+wire, dependency or tier/exemption policy changes.
+See the [bounded ledger](sf-v1-port-ledger.md#copy-enumeration-slice-p3-bounded-f05f07f11)
+and [source provenance](sf-v1-port-provenance.md#copy-enumeration-slice-p3-bounded-f05f07f11).
 
 ### Built-In Service Operation Delivery
 
