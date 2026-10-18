@@ -107,7 +107,11 @@ impl Route {
         }
     }
 
-    fn check(&self, envelope: &wire::Envelope, inbound: bool) -> Result<(), ProtocolError> {
+    pub(super) fn check(
+        &self,
+        envelope: &wire::Envelope,
+        inbound: bool,
+    ) -> Result<(), ProtocolError> {
         let source = envelope
             .source
             .as_ref()
@@ -922,6 +926,17 @@ impl SendIntentAdapter {
             return Err(SendError::WrongSession);
         }
         let body = match intent.kind {
+            SendKind::StartCopy {
+                replication_start,
+                epoch,
+            } => wire::envelope::Body::StartCopy(wire::StartCopy {
+                epoch: Some(wire::Epoch {
+                    data_loss: epoch.data_loss_number,
+                    configuration: epoch.configuration_number,
+                }),
+                replica: self.route.destination.replica,
+                replication_start,
+            }),
             SendKind::RequestAck => wire::envelope::Body::RequestAck(wire::RequestAck {}),
             SendKind::Replication {
                 operation,

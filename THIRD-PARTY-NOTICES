@@ -95,6 +95,21 @@ the native harness. This is not provider acquisition, complete BuildIdle,
 StartCopy, periodic/slow-fault policy or role/drain/host integration.
 All components remain private and production-unselected.
 
+The private copy_establishment.rs and its component tests translate selected
+RemoteSession.EstablishCopyAsyncOperation.cpp, RemoteSession.cpp,
+ReplicationSession.cpp, PrimaryReplicator.cpp,
+PrimaryReplicator.BuildIdleAsyncOperation.cpp, SecondaryReplicator.cpp and
+ComProxyStateProvider.cpp establishment/acquisition responsibilities at the
+same pin. Existing session/reliable sender and logical tonic adapter implement
+StartCopy delivery. Protected StateProvider callbacks and retained Rust futures
+replace COM stream acquisition/Begin-End; bound full logical routes replace
+native demux lookup only after caller-owned idle-role admission. Explicit private
+errors replace malformed-input assertions, and -1 is a private error token, not
+native HRESULT interoperability. Tests use actual receivers/senders, provider
+trait implementations and a real tonic connection, not a native harness.
+Full BuildIdle/session/role/drain and provider-monitoring owners remain pending;
+all components remain private and production-unselected.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

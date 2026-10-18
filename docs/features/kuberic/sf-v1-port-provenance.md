@@ -375,6 +375,51 @@ private/unselected. No dependencies, native Common/Transport/KTL utilities or
 test harness, protected APIs, factory/service/wire/host/controller wiring,
 native/differential/hosted/provider-fsync parity or full P2/P3 completion.
 
+### Copy Establishment Slice (P3, Bounded F04/F05/F07/F08/F11)
+
+Rust destinations retaining Microsoft copyright/MIT attribution:
+[`copy_establishment.rs`](../../../kuberic-runtime/src/replicator/v1/copy_establishment.rs)
+and its
+[`tests.rs`](../../../kuberic-runtime/src/replicator/v1/copy_establishment/tests.rs),
+with narrow changes to the existing session, logical carrier adapter and
+enumeration configuration/error seams. `R/` below denotes
+`src/prod/src/Reliability/Replication/` at the same immutable pin.
+
+| Selected native production material | Incorporated responsibility and explicit Rust substitution |
+|---|---|
+| `R/RemoteSession.EstablishCopyAsyncOperation.cpp:30–61`; `R/RemoteSession.cpp:252–365`; `R/ReplicationSession.cpp:328–384` | Persisted incoming context created before StartCopy; reliable sender published before first send, replication-start LSN as operation identity, current sending epoch/infinite expiry, explicit timer and close. Existing rooted sender batches and logical SendIntent/tonic carrier replace native messages/Threadpool/ComponentRoot, not retry algorithms. Selected sends remain deliverable after close. |
+| `R/PrimaryReplicator.cpp:550–705`; `R/RemoteSession.cpp:585–615,683–756` | First valid persisted target context vs nonpersisted successful ACK establishment; remote copy failure; actual context receiver processing and ordered session ACK handoffs. A caller-bound full Route validates endpoint/partition/replica/incarnation/address; it is not the native manager's idle-role lookup or dynamic session registration. Invalid shape/progress becomes explicit private error. Remote errors close retries even with no numeric ACK progress; first completion is preserved. |
+| `R/SecondaryReplicator.cpp:915–1123` | Wrong replica/inactive/older epoch rejection, unexpected newer established epoch fault, once-only actual replication receiver initialization, duplicate ACK reissue, persisted target GetCopyContext and existing no-replication-gate CopySender. Caller-supplied force-ACK callback is a required scheduling handoff, not a transport/service ACK or host fault report. Full secondary lifecycle and cross-receiver drainage are not ported. |
+| `R/PrimaryReplicator.BuildIdleAsyncOperation.cpp:84–166,185–214`; `R/ComProxyStateProvider.cpp:151–203` | Target context into protected source GetCopyState(start - 1); explicit acquisition fault descriptions and cleanup/cancellation unblocking of incoming context. Retained uniquely owned async provider futures replace synchronous COM acquisition while preserving one invocation across interrupted polls. Cancellation does not pretend an arbitrarily pending callback has drained; returned provider failure retains precedence. Successful acquisition begins the existing CopySender, not a synthetic build completion. |
+| `R/ReplicaManager.cpp:1187–1193`; `R/ReplicationQueueManager.cpp:165–194` | The caller supplies the frozen classic committed boundary + 1. Its provider boundary remains distinct from the latest-issued completion target captured by existing CopySender at actual enumeration EOF. This slice does not implement manager admission, PC/CC boundary selection, pending-operation retention/replay or the V2 copy-until-latest capability. |
+| `R/RemoteSession.cpp:312–324,733–756`; `R/SecondaryReplicator.cpp:862–913,1063–1123` | Explicit cancel/close/error cleanup, GetCopyState/GetCopyContext error identity, no fabricated EndGetNext fault. Weak handles avoid cycles; enumeration callbacks root establishment state; foreign polls/callbacks/wakes and payload retirement stay outside short guards. Private -1 error token preserves failure without claiming native HRESULT interoperability. Provider monitoring, health reporting and full cancellation/drain ownership remain pending. |
+
+The **45 new registered tests** are production-source-derived actual Rust
+component vectors, not imported/executed native fixtures. They cover real
+session/reliable sender retries and selection, context receiver and copy sender
+exchange into protected provider implementations, distinct provider/EOF targets,
+ordered build-gate handoffs, identity/epoch/duplicate/invalid inputs, acquisition
+failures, cancellation and interrupted driver lifetime. One real tonic
+connection verifies StartCopy's serialized logical fields, not SF wire
+interoperability. Root-reference tests supplement actual reentrant callbacks;
+they do not substitute for native role/drain qualification.
+
+**Measured scope:** V1 **498**, runtime library **555/555** (57 unchanged non-V1),
+workspace **913 = 867 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**.
+Workspace check/Clippy, no-default runtime, API/privacy, doctests and exact
+tier/partition gates passed. See the
+[ledger](sf-v1-port-ledger.md#copy-establishment-slice-p3-bounded-f04f05f07f08f11)
+and [selector](testing.md#sf-v1-copy-establishment-slice).
+Earlier slice counts and exclusions above remain historical boundary evidence.
+
+The caller still owns idle-role eligibility, frozen-boundary selection, route
+binding, acquisition/enumeration drivers, ordered ACK processing and remaining
+timer delivery. Full BuildIdle/idle-session/primary/secondary/role/fault/drain
+orchestration, slow-peer/promotion policy, provider monitoring and P4/P5
+adapters/atomic activation remain pending. No protected interfaces, selected
+production wiring, dependencies, native utilities/harness, complete P2/P3,
+native/differential/hosted/provider-fsync parity or full ordinary execution claim.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

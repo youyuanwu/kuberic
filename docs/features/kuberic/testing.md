@@ -12,7 +12,7 @@ not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
-copy-receiver, enumeration and CopySender build-gate slices have
+copy-receiver, enumeration, CopySender build-gate and copy-establishment slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -41,18 +41,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 822 |
+| ordinary | 867 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **868** |
+| **total** | **913** |
 
-Ordinary partition counts are `206, 206, 205, 205`. PostgreSQL partition counts
+Ordinary partition counts are `217, 217, 217, 216`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the CopySender build-gates slice: 868 =
-822 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the copy-establishment slice: 913 =
+867 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -385,6 +385,50 @@ pending. Protected APIs and selected factory/service/wire/host/controller paths
 are unchanged; the component is private and unselected.
 See the [ledger](sf-v1-port-ledger.md#copysender-build-gates-slice-p3-bounded-f06f07f11)
 and [provenance](sf-v1-port-provenance.md#copysender-build-gates-slice-p3-bounded-f06f07f11).
+
+### SF V1 Copy Establishment Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::copy_establishment::)' -j 2
+```
+
+This slice adds **45 actual tests**, for **498 combined V1** and **555/555**
+passing runtime library cases (57 unchanged non-V1). Exact establishment
+selection passes 45/45. Workspace check/Clippy, no-default runtime, external
+API/privacy, workspace doctests and exact tier/partition discovery passed.
+Current inventory is **913 = 867 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**,
+with ordinary slices **217/217/217/216** and unchanged PostgreSQL hashes
+**11/13/8/9**. Earlier slice measurements above are historical.
+
+Tests exercise the actual reliable StartCopy sender, current-epoch/infinite
+expiration mapping through a real tonic connection, sender-before-first-send
+publication, reentrant immediate context response, retry/queue-full behavior and
+selected sends surviving close. Target context travels through the real context
+CopySender and primary CopyContextReceiver into the protected source provider;
+the source provider's own GetCopyContext is never substituted. First context
+establishes before EOF; nonpersisted ACK establishes with empty context.
+The provider receives the frozen start-minus-one boundary while actual copy EOF
+captures the distinct latest-issued replication target. Actual ordered session
+ACK handoffs then satisfy the existing CopySender's build gates.
+
+Wrong full endpoint/incarnation/partition/address, wrong replica, malformed
+progress, stale/unexpected-new epoch, duplicate StartCopy, empty versus terminal
+and framed context are covered. Provider acquisition failures retain
+GetCopyContext/GetCopyState descriptions rather than fabricated EndGetNext
+faults. Interrupted driver futures retain one in-flight acquisition;
+cancellation closes incoming context to unblock GetCopyState but does not
+declare a still-pending provider callback drained. Reentrant provider/ACK calls,
+weak handles, callback roots and late-error/first-completion cases are exercised.
+
+All components stay private/unselected; the caller still owns idle-role
+eligibility, routes, the frozen committed boundary, ACK handoffs, acquisition/
+enumeration drivers and remaining timer delivery. This is not full BuildIdle,
+primary/secondary/role/drain orchestration, provider monitoring or activation.
+Full workspace ordinary execution, PostgreSQL/KinD bodies, native execution,
+differential/hosted parity and provider-fsync were not run or claimed.
+See the [ledger](sf-v1-port-ledger.md#copy-establishment-slice-p3-bounded-f04f05f07f08f11)
+and [provenance](sf-v1-port-provenance.md#copy-establishment-slice-p3-bounded-f04f05f07f08f11).
 
 ### Built-In Service Operation Delivery
 

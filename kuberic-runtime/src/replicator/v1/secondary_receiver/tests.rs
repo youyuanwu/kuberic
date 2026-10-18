@@ -1098,7 +1098,9 @@ fn real_receiver_ack_reaches_session_sender_but_cannot_bypass_ordered_primary_ha
                 assert!(ingress.ack.is_some());
                 received
             }
-            SendKind::RequestAck => panic!("expected actual primary data send"),
+            SendKind::RequestAck | SendKind::StartCopy { .. } => {
+                panic!("expected actual primary data send")
+            }
         };
         if required {
             let mut stream = receiver.stream();
