@@ -44,6 +44,23 @@ pub(super) struct CopyConfig {
     pub(super) buffer_limits: BufferLimits,
 }
 
+impl CopyConfig {
+    pub(super) fn validate(self) -> Result<(), CopyError> {
+        let settings = self.sender;
+        if settings.initial_window <= 1
+            || !settings.initial_window.is_power_of_two()
+            || !settings.max_window.is_power_of_two()
+            || settings.initial_window > settings.max_window
+            || settings.retry.is_zero()
+            || !(0.0..=1.0).contains(&settings.decay_factor)
+            || settings.decay_interval.is_zero()
+        {
+            return Err(CopyError::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, thiserror::Error)]
 pub(super) enum CopyError {
     #[error(
@@ -84,6 +101,8 @@ pub(super) enum CopyError {
     BuildCompletionDisabled,
     #[error("capturing the replication target failed: {0}")]
     ReplicationTarget(#[source] Arc<RuntimeError>),
+    #[error("remote copy/context failed with error {0}")]
+    Remote(i32),
 }
 
 #[derive(Clone, Debug)]
@@ -544,16 +563,7 @@ impl CopyAsyncOperation {
         clock: Clock,
     ) -> Result<Self, CopyError> {
         let settings = config.sender;
-        if settings.initial_window <= 1
-            || !settings.initial_window.is_power_of_two()
-            || !settings.max_window.is_power_of_two()
-            || settings.initial_window > settings.max_window
-            || settings.retry.is_zero()
-            || !(0.0..=1.0).contains(&settings.decay_factor)
-            || settings.decay_interval.is_zero()
-        {
-            return Err(CopyError::InvalidConfig);
-        }
+        config.validate()?;
         let queue = OperationQueue::new(
             QueueConfig {
                 initial_capacity: settings.initial_window,

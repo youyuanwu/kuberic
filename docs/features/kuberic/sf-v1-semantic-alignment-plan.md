@@ -42,8 +42,11 @@ adds serial copy/context stream polling and reliable sending (45 actual tests,
 406 combined V1). The [CopySender build-gates slice](sf-v1-port-ledger.md#copysender-build-gates-slice-p3-bounded-f06f07f11)
 adds final-copy/replication completion, actual EOF-issued target capture,
 pending-target retarget and disabled-completion behavior (47 actual tests,
-453 combined V1). These supersede the preceding slice-boundary omissions,
-not the pending provider acquisition/StartCopy/full build/role/policy owners.
+453 combined V1). The [copy-establishment slice](sf-v1-port-ledger.md#copy-establishment-slice-p3-bounded-f04f05f07f08f11)
+adds reliable StartCopy, bound identity/epoch admission and protected target
+GetCopyContext/source GetCopyState acquisition using the existing components
+(45 actual tests, 498 combined V1). These supersede the preceding slice-boundary
+omissions, not the pending full BuildIdle/session/role/drain/policy owners.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -405,8 +408,9 @@ P2 has unselected OperationQueue, bounded sender/session/ACK and async/tonic
 substrate slices; P3 has bounded primary queue/quorum, secondary receiver/ACK,
 secondary-copy, primary-side copy-context receipt and copy/context stream
 enumeration/reliable-send and CopySender build-gate/EOF-issued-target/retarget
-ownership cores. Provider invocation/establishment, full build orchestration,
-remaining session policies and primary/
+ownership cores, with bounded provider/context acquisition and reliable StartCopy
+identity/epoch establishment. Full build/idle-session admission and boundary
+selection, remaining session policies and primary/
 secondary/role integration are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.

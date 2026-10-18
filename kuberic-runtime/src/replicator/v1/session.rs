@@ -36,6 +36,10 @@ pub(super) struct SessionIdentity {
 
 #[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 send intent"))]
 pub(super) enum SendKind {
+    StartCopy {
+        replication_start: Lsn,
+        epoch: Epoch,
+    },
     Replication {
         operation: Arc<QueueOperation>,
         original_epoch: Epoch,
@@ -84,8 +88,7 @@ struct State {
     retry: Duration,
     active: bool,
     sender: ReliableOperationSender,
-    // Optional sender supplied by the future establishment owner, not a
-    // fabricated StartCopy protocol or successful establishment operation.
+    // Establishment owns admission; the session's ACK processor closes retries.
     start_copy: Option<ReliableOperationSender>,
     send: SendCallback,
     cached: AckSnapshot,
@@ -168,6 +171,67 @@ impl ReplicationSession {
         state.start_copy = Some(sender);
     }
 
+    pub(super) fn start_copy(
+        &self,
+        config: SenderConfig,
+        replication_start: Lsn,
+        now: Duration,
+    ) -> SessionSendBatch {
+        let mut state = self.state.lock().unwrap();
+        assert!(state.active && state.start_copy.is_none());
+        let mut sender = ReliableOperationSender::new(config, 0, now);
+        sender.open();
+        let batch = sender.add(
+            SenderOperation {
+                operation: QueueOperation::new(
+                    replication_start,
+                    crate::application::OperationData::new(),
+                    false,
+                ),
+                original_epoch: state.sending_epoch,
+            },
+            0,
+            now,
+        );
+        state.start_copy = Some(sender);
+        SessionSendBatch {
+            session: self.clone(),
+            batch,
+            start_copy: true,
+        }
+    }
+
+    pub(super) fn start_copy_deadline(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap()
+            .start_copy
+            .as_ref()
+            .and_then(ReliableOperationSender::deadline)
+    }
+
+    pub(super) fn on_start_copy_timer(&self, now: Duration) -> Option<SessionSendBatch> {
+        let batch = self
+            .state
+            .lock()
+            .unwrap()
+            .start_copy
+            .as_mut()?
+            .on_timer(now);
+        Some(SessionSendBatch {
+            session: self.clone(),
+            batch,
+            start_copy: true,
+        })
+    }
+
+    pub(super) fn close_start_copy(&self) {
+        let sender = self.state.lock().unwrap().start_copy.take();
+        if let Some(mut sender) = sender {
+            sender.close();
+        }
+    }
+
     pub(super) fn add(
         &self,
         operation: SenderOperation,
@@ -206,6 +270,7 @@ impl ReplicationSession {
         SessionSendBatch {
             session: self.clone(),
             batch,
+            start_copy: false,
         }
     }
 
@@ -301,6 +366,7 @@ impl ReplicationSession {
 pub(super) struct SessionSendBatch {
     session: ReplicationSession,
     batch: SendBatch,
+    start_copy: bool,
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "unselected rooted V1 sends"))]
@@ -311,6 +377,13 @@ impl SessionSendBatch {
             let (intent, send) = {
                 let state = session.state.lock().unwrap();
                 let (kind, expires_after) = match action {
+                    SendAction::Operation(entry) if self.start_copy => (
+                        SendKind::StartCopy {
+                            replication_start: entry.operation.lsn(),
+                            epoch: state.sending_epoch,
+                        },
+                        None,
+                    ),
                     SendAction::Operation(entry) => (
                         SendKind::Replication {
                             operation: entry.operation,
@@ -320,7 +393,10 @@ impl SessionSendBatch {
                         },
                         Some(state.retry),
                     ),
-                    SendAction::RequestAck => (SendKind::RequestAck, None),
+                    SendAction::RequestAck => {
+                        assert!(!self.start_copy, "StartCopy never requests an ACK");
+                        (SendKind::RequestAck, None)
+                    }
                 };
                 (
                     SendIntent {

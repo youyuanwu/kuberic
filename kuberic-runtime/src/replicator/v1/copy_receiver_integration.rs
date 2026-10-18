@@ -226,7 +226,9 @@ fn actual_terminal_copy_ack_reaches_session_but_cannot_execute_missing_build_own
             original_epoch,
             true,
         ),
-        SendKind::RequestAck => panic!("expected actual replication send"),
+        SendKind::RequestAck | SendKind::StartCopy { .. } => {
+            panic!("expected actual replication send")
+        }
     };
     let mut owner = receivers(true);
     let _ = owner
