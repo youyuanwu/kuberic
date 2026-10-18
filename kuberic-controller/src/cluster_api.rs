@@ -2909,6 +2909,34 @@ where
             _ => Err("exact public-v1 operation report is unavailable".into()),
         }
     }
+
+    async fn observe_public_v1_operation_source(
+        &self,
+        scope: &PublicV1Scope,
+        expected: &PublicV1AcceptedTransitionStatus,
+    ) -> std::result::Result<RawAgentObservation, String> {
+        let identity = &expected.intent.source.storage_incarnation.replica;
+        let observation = self.observe_public_v1_target_scope(scope, identity).await?;
+        if normalized_transition(&observation)?.as_ref() != Some(expected) {
+            return Err("stale public-v1 operation source authority".into());
+        }
+        let key = ReplicaObservationKey::new(identity.replica_id, identity.instance_id.clone());
+        let source = observation
+            .agents
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| "exact public-v1 operation source was not observed".to_string())?;
+        if let RawAgentObservation::PublicV1Report(report) = &source
+            && (report.replica != *identity
+                || report.resource_uid != scope.resource_uid
+                || report.identity != expected.evidence.identity
+                || report.history != expected.intent.history
+                || report.storage_incarnation != expected.intent.source.storage_incarnation)
+        {
+            return Err("public-v1 operation source report changed exact authority".into());
+        }
+        Ok(source)
+    }
 }
 
 #[async_trait]

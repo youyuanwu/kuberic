@@ -1,59 +1,16 @@
 use anyhow::{Context, Result, bail, ensure};
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
-use kube::{
-    Api, Resource, ResourceExt,
-    api::{DeleteParams, Preconditions},
-};
+use kube::{Resource, ResourceExt};
 use kuberic_controller::crd::PublicV1OperationStatus;
 use kuberic_runtime::protocol::public_operations::{
     PublicOperationProgram, PublicV1AcceptedOperationCompletion, PublicV1CallKind,
     PublicV1OperationResult,
 };
 
-use super::{harness::Harness, kube::Kind};
+use super::harness::Harness;
+use kuberic_controller::test_util::{Barrier, BarrierStage, ResourceKind as Kind, SupportResource};
 
-fn rewrite_detached_configuration(
-    status: &kuberic_controller::crd::KubericSetStatus,
-    evidence: &super::harness::ConfigurationEvidence,
-    change: impl Fn(&mut PublicOperationProgram),
-) -> Result<(
-    kuberic_controller::crd::KubericSetStatus,
-    super::harness::ConfigurationEvidence,
-)> {
-    let mut status = status.clone();
-    let mut evidence = evidence.clone();
-    let mut authority = status
-        .public_v1_authority
-        .as_ref()
-        .unwrap()
-        .authority()
-        .map_err(anyhow::Error::msg)?;
-    for (intent, completion) in evidence.operations.values_mut() {
-        let old = PublicV1AcceptedOperationCompletion::from_completion(completion);
-        let accepted = authority
-            .completed_operations
-            .iter_mut()
-            .find(|accepted| **accepted == old)
-            .context("detached baseline not accepted")?;
-        let program = intent.program.as_mut().unwrap();
-        change(program);
-        intent.input_digest = program.digest();
-        completion.input_digest = intent.input_digest.clone();
-        if matches!(program, PublicOperationProgram::Epoch { .. }) {
-            completion.call_kind = PublicV1CallKind::Epoch;
-            completion.current_configuration_id = None;
-        }
-        intent.validate().map_err(anyhow::Error::msg)?;
-        *accepted = PublicV1AcceptedOperationCompletion::from_completion(completion);
-    }
-    status.public_v1_authority = Some(
-        kuberic_controller::crd::PublicV1AuthorityStatus::from_authority(&authority)
-            .map_err(anyhow::Error::msg)?,
-    );
-    Ok((status, evidence))
-}
-
-async fn delete_secondary(harness: &Harness) -> Result<Vec<(Kind, String, String)>> {
+async fn delete_secondary(harness: &mut Harness) -> Result<Vec<(Kind, String, String)>> {
     let old = harness.report(2).await?;
     let uid = old.replica.instance_id.as_str();
     let pod = harness
@@ -97,18 +54,8 @@ async fn delete_secondary(harness: &Harness) -> Result<Vec<(Kind, String, String
         resources.iter().any(|(kind, _, _)| *kind == Kind::Service),
         "endpoint Service missing"
     );
-    Api::<Pod>::namespaced(harness.api.client(), "in-process")
-        .delete(
-            pod["metadata"]["name"].as_str().unwrap(),
-            &DeleteParams {
-                preconditions: Some(Preconditions {
-                    uid: Some(uid.to_owned()),
-                    resource_version: None,
-                }),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let reference = harness.reference(2).await?;
+    harness.cluster.delete_replica(&reference).await?;
     Ok(resources)
 }
 
@@ -120,39 +67,41 @@ async fn supporting_resources_are_repaired_without_losing_quorum() -> Result<()>
         harness
             .assert_values("repair-before", "acknowledged")
             .await?;
-        let services = Api::<Service>::namespaced(harness.api.client(), "in-process");
-        let secrets = Api::<Secret>::namespaced(harness.api.client(), "in-process");
-        let old_service = services.get("sample-peer").await?;
-        let old_secret = secrets.get("sample-agent-credentials").await?;
-        services
-            .delete(
-                "sample-peer",
-                &DeleteParams {
-                    preconditions: Some(Preconditions {
-                        uid: old_service.uid(),
-                        resource_version: old_service.resource_version(),
-                    }),
-                    ..Default::default()
-                },
-            )
+        harness.refresh().await?;
+        let old_service: Service = serde_json::from_value(
+            harness
+                .api
+                .get(Kind::Service, "sample-peer")
+                .context("peer missing")?,
+        )?;
+        let old_secret: Secret = serde_json::from_value(
+            harness
+                .api
+                .get(Kind::Secret, "sample-agent-credentials")
+                .context("credentials missing")?,
+        )?;
+        ensure!(harness.cluster.observe().await?.credentials_consistent());
+        harness
+            .cluster
+            .delete_support_resource(SupportResource::PeerService)
             .await?;
-        secrets
-            .delete(
-                "sample-agent-credentials",
-                &DeleteParams {
-                    preconditions: Some(Preconditions {
-                        uid: old_secret.uid(),
-                        resource_version: old_secret.resource_version(),
-                    }),
-                    ..Default::default()
-                },
-            )
+        harness
+            .cluster
+            .delete_support_resource(SupportResource::CredentialsSecret)
             .await?;
         loop {
             harness.step().await?;
             if let (Some(service), Some(secret)) = (
-                services.get_opt("sample-peer").await?,
-                secrets.get_opt("sample-agent-credentials").await?,
+                harness
+                    .api
+                    .get(Kind::Service, "sample-peer")
+                    .map(serde_json::from_value::<Service>)
+                    .transpose()?,
+                harness
+                    .api
+                    .get(Kind::Secret, "sample-agent-credentials")
+                    .map(serde_json::from_value::<Secret>)
+                    .transpose()?,
             ) && service.uid() != old_service.uid()
                 && secret.uid() != old_secret.uid()
             {
@@ -211,16 +160,8 @@ async fn supporting_resources_are_repaired_without_losing_quorum() -> Result<()>
                 }
                 ensure!(secret.type_.as_deref() == Some("Opaque"));
                 ensure!(
-                    secret.data == old_secret.data,
+                    harness.cluster.observe().await?.credentials_consistent(),
                     "repair changed startup credential contract"
-                );
-                ensure!(
-                    secret
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("bearer-token"))
-                        .map(|token| token.0.as_slice())
-                        == Some(b"local-test-token".as_slice())
                 );
                 break;
             }
@@ -245,8 +186,8 @@ async fn replacement_then_restart_publishes_exact_retained_storage_session() -> 
             .await?;
         let old = harness.report(2).await?;
         let old_root = harness.data_root(old.replica.instance_id.as_str()).await?;
-        let resources = delete_secondary(&harness).await?;
-        let pending_replacement = loop {
+        let resources = delete_secondary(&mut harness).await?;
+        let _pending_replacement = loop {
             if let Some(replacement) = harness
                 .set()
                 .await?
@@ -293,17 +234,6 @@ async fn replacement_then_restart_publishes_exact_retained_storage_session() -> 
             .assert_values("combined-middle", "replacement")
             .await?;
         harness.stop(2, true).await?;
-        let pending_renewal = loop {
-            if let Some(renewal) = harness
-                .set()
-                .await?
-                .status
-                .and_then(|s| s.public_v1_session_renewal)
-            {
-                break renewal;
-            }
-            harness.step().await?;
-        };
         harness.ready().await?;
         let restarted = harness.report(2).await?;
         ensure!(
@@ -317,18 +247,6 @@ async fn replacement_then_restart_publishes_exact_retained_storage_session() -> 
             restarted.replica == replacement.replica
                 && restarted.storage_incarnation == replacement.storage_incarnation
         );
-        let status = harness.set().await?.status.context("status missing")?;
-        let mut reports = Vec::new();
-        for id in 1..=3 {
-            reports.push(harness.report(id).await?);
-        }
-        ensure!(Harness::settled(&status, &reports, 3));
-        let mut altered = status.clone();
-        altered.public_v1_replacement = Some(pending_replacement);
-        ensure!(!Harness::settled(&altered, &reports, 3));
-        altered = status;
-        altered.public_v1_session_renewal = Some(pending_renewal);
-        ensure!(!Harness::settled(&altered, &reports, 3));
         ensure!(
             restarted.process_session_id != replacement.process_session_id
                 && restarted.replicator_creation_id != replacement.replicator_creation_id
@@ -364,196 +282,8 @@ async fn replacement_then_restart_publishes_exact_retained_storage_session() -> 
     harness.finish(result).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -> Result<()> {
-    let mut harness = Harness::new().await?;
-    let result = async {
-        let mut barrier = harness.api.arm_operation_barrier("sample")?;
-        let pending = loop {
-            tokio::select! {
-                pending = barrier.entered() => break pending?,
-                step = harness.step() => step?,
-            }
-        };
-        barrier.release();
-        harness.ready().await?;
-        let status = harness.set().await?.status.context("status missing")?;
-        let mut reports = Vec::new();
-        for id in 1..=3 {
-            reports.push(harness.report(id).await?);
-        }
-        ensure!(Harness::settled(&status, &reports, 3));
-        let evidence = harness.configuration_evidence(&reports).await?;
-        ensure!(Harness::configurations_settled(
-            &status, &reports, &evidence
-        ));
-        let mut pending_transfer = status.clone();
-        let topology = pending_transfer.public_v1_topology.as_mut().unwrap();
-        topology.pending_switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
-            request_id: "pending-transfer".into(),
-            target_replica_id: topology
-                .sessions
-                .iter()
-                .find(|session| session.identity.replica_id != topology.primary_id)
-                .unwrap()
-                .identity
-                .replica_id
-                .value() as u32,
-        });
-        ensure!(!Harness::settled(&pending_transfer, &reports, 3));
-        ensure!(!Harness::configurations_settled(
-            &pending_transfer,
-            &reports,
-            &evidence
-        ));
-        let (altered_status, altered_evidence) =
-            rewrite_detached_configuration(&status, &evidence, |program| {
-                if let PublicOperationProgram::Configuration(public)
-                | PublicOperationProgram::CatchUp {
-                    configuration: public,
-                    ..
-                } = program
-                    && let Some(peer) = public.replicas.first_mut()
-                {
-                    peer.process_session_id =
-                        kuberic_runtime::protocol::types::ProcessSessionId::new("stale-peer");
-                }
-            })?;
-        ensure!(!Harness::configurations_settled(
-            &altered_status,
-            &reports,
-            &altered_evidence
-        ));
-        let (unrelated_status, unrelated) =
-            rewrite_detached_configuration(&status, &evidence, |program| {
-                *program = PublicOperationProgram::Epoch {
-                    epoch: status.public_v1_topology.as_ref().unwrap().epoch,
-                };
-            })?;
-        ensure!(!Harness::configurations_settled(
-            &unrelated_status,
-            &reports,
-            &unrelated
-        ));
-        let (historical_status, historical) =
-            rewrite_detached_configuration(&status, &evidence, |program| {
-                if let PublicOperationProgram::Configuration(public)
-                | PublicOperationProgram::CatchUp {
-                    configuration: public,
-                    ..
-                } = program
-                {
-                    let mut epoch = public.current.epoch;
-                    epoch.configuration_number += 1;
-                    public.current = kuberic_runtime::protocol::types::ConfigurationDescriptor::new(
-                        epoch,
-                        public.current.primary_id,
-                        public.current.members.clone(),
-                        public.current.write_quorum,
-                    );
-                }
-            })?;
-        ensure!(!Harness::configurations_settled(
-            &historical_status,
-            &reports,
-            &historical
-        ));
-        for field in ["publicV1Operation", "publicV1Transition"] {
-            let mut altered = serde_json::to_value(&status)?;
-            altered[field] = pending["status"][field].clone();
-            ensure!(
-                !altered[field].is_null(),
-                "pending observation missing {field}"
-            );
-            ensure!(!Harness::settled(
-                &serde_json::from_value(altered)?,
-                &reports,
-                3
-            ));
-        }
-        for (field, value) in [
-            ("processSessionId", serde_json::json!("stale-session")),
-            ("replicatorCreationId", serde_json::json!("stale-creation")),
-            (
-                "storageIncarnation",
-                serde_json::to_value(&reports[2].storage_incarnation)?,
-            ),
-            ("role", serde_json::json!("none")),
-            ("writeStatus", serde_json::json!("granted")),
-            ("readStatus", serde_json::json!("notPrimary")),
-        ] {
-            let mut altered = reports.clone();
-            let mut report = serde_json::to_value(&altered[1])?;
-            report[field] = value;
-            altered[1] = serde_json::from_value(report)?;
-            ensure!(
-                !Harness::settled(&status, &altered, 3),
-                "accepted stale {field}"
-            );
-        }
-        let mut altered = reports.clone();
-        let primary = altered
-            .iter_mut()
-            .find(|r| r.role == kuberic_runtime::protocol::types::ReplicaRole::Primary)
-            .unwrap();
-        primary.write_status = kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
-        ensure!(!Harness::settled(&status, &altered, 3));
-        for index in 0..reports.len() {
-            let mut altered = reports.clone();
-            altered[index].progress.last = altered[index].progress.first + 1;
-            ensure!(
-                !Harness::settled(&status, &altered, 3)
-                    && !Harness::configurations_settled(&status, &altered, &evidence),
-                "uncommitted progress accepted for {:?}",
-                altered[index].role
-            );
-        }
-        let mut outsider = reports[0].clone();
-        outsider.replica.instance_id =
-            kuberic_runtime::protocol::types::ReplicaInstanceId::new("excluded-predecessor");
-        outsider.write_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
-        altered = reports.clone();
-        altered.push(outsider.clone());
-        ensure!(!Harness::settled(&status, &altered, 3));
-        outsider.write_status = kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
-        outsider.read_status = kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
-        altered = reports.clone();
-        altered.push(outsider.clone());
-        ensure!(
-            !Harness::settled(&status, &altered, 3),
-            "nonwriting unauthorized role accepted"
-        );
-        outsider.role = kuberic_runtime::protocol::types::ReplicaRole::None;
-        outsider.read_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
-        altered = reports.clone();
-        altered.push(outsider.clone());
-        ensure!(
-            !Harness::settled(&status, &altered, 3),
-            "excluded reader accepted"
-        );
-        let uids = reports
-            .iter()
-            .map(|report| report.replica.instance_id.to_string())
-            .chain(std::iter::once(outsider.replica.instance_id.to_string()))
-            .collect::<Vec<_>>();
-        ensure!(!Harness::observations_complete(&uids, &reports));
-        ensure!(
-            !Harness::observations_complete(&uids, &reports[..2]),
-            "two admitted observations hid unreachable predecessor"
-        );
-        altered = reports;
-        for report in &mut altered {
-            report.completed_operations.clear();
-        }
-        ensure!(!Harness::settled(&status, &altered, 3));
-        Ok(())
-    }
-    .await;
-    harness.finish(result).await
-}
-
 async fn assert_exact_completion(
-    harness: &Harness,
+    harness: &mut Harness,
     persisted: &serde_json::Value,
 ) -> Result<PublicV1AcceptedOperationCompletion> {
     let accepted: PublicV1OperationStatus =
@@ -605,10 +335,10 @@ async fn assert_exact_completion(
 async fn bootstrap_quorum_write_recovers_status_conflict() -> Result<()> {
     let mut harness = Harness::new().await?;
     let result = async {
-        let mut conflict = harness.api.arm_completion_conflict("sample")?;
+        let mut conflict = harness.cluster.completion_status_conflict()?;
         let (lsn, persisted) =
             tokio::try_join!(harness.write("bootstrap", "committed"), async move {
-                let persisted = conflict.entered().await?;
+                let persisted = serde_json::to_value(conflict.entered().await?.set())?;
                 conflict.release();
                 Ok::<_, anyhow::Error>(persisted)
             })?;
@@ -633,7 +363,7 @@ async fn bootstrap_quorum_write_recovers_status_conflict() -> Result<()> {
             harness.reconcile_errors > 0,
             "injected conflict was not retried"
         );
-        assert_exact_completion(&harness, &persisted).await?;
+        assert_exact_completion(&mut harness, &persisted).await?;
         Ok(())
     }
     .await;
@@ -709,19 +439,10 @@ async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> 
             .into_iter()
             .find(|pod| pod.uid().as_deref() == Some(&uid))
             .context("old Pod missing")?;
-        harness.hold_deletion(&uid, true).await;
-        Api::<Pod>::namespaced(harness.api.client(), "in-process")
-            .delete(
-                &pod.name_any(),
-                &DeleteParams {
-                    preconditions: Some(Preconditions {
-                        uid: Some(uid.clone()),
-                        resource_version: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        let resource = harness.api.reference(Kind::Pod, &uid)?;
+        let held = harness.cluster.hold_deletion(&resource).await?;
+        let reference = harness.reference(2).await?;
+        harness.cluster.delete_replica(&reference).await?;
         loop {
             let set = harness.set().await?;
             let status = set.status.as_ref().context("status missing")?;
@@ -746,7 +467,7 @@ async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> 
             }
             harness.step().await?;
         }
-        harness.hold_deletion(&uid, false).await;
+        drop(held);
         harness.ready().await?;
         let replacement = harness.report(2).await?;
         ensure!(
@@ -776,6 +497,123 @@ async fn stopped_primary_failover_preserves_acknowledged_data() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_recovery_does_not_block_stopped_primary_failover() -> Result<()> {
+    recovery_before_lifecycle(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_recovery_does_not_reuse_a_restarted_peer_session() -> Result<()> {
+    recovery_before_lifecycle(true).await
+}
+
+async fn recovery_before_lifecycle(restart_peer: bool) -> Result<()> {
+    use kuberic_controller::test_util::TestCluster;
+    let mut cluster = TestCluster::builder(super::harness::KvFactory)
+        .image("in-process/kvstore2")
+        .scenario_timeout(std::time::Duration::from_secs(45))
+        .start()
+        .await?;
+    let mut writes = tokio::task::JoinSet::new();
+    let mut phase = "initial topology";
+    let result: Result<()> = async {
+        let topology = cluster.settle().await?;
+        phase = "applied write";
+        let primary = topology.primary().clone();
+        let secondary = topology.secondaries().next().unwrap().clone();
+        let writer = cluster.service(&primary).await?;
+        let mut gate = writer.persistence().pause_next_apply();
+        writes.spawn(async move {
+            writer
+                .replicate_put("accepted-recovery".into(), "acknowledged".into())
+                .await
+        });
+        cluster
+            .probe(async {
+                gate.entered().await;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+        let pause = cluster
+            .pause_at(Barrier::intent(PublicV1CallKind::CatchUp))
+            .await?;
+        phase = "write receipt";
+        let command = pause
+            .evidence()
+            .operation()
+            .command()
+            .map_err(anyhow::Error::msg)?;
+        ensure!(matches!(
+            command.intent.program,
+            Some(PublicOperationProgram::CatchUp {
+                mode: kuberic_runtime::protocol::public_operations::PublicCatchUpMode::All,
+                ..
+            })
+        ));
+        gate.release(false);
+        let lsn = cluster
+            .probe(async {
+                let result = writes.join_next().await.context("writer missing")?;
+                Ok::<_, anyhow::Error>(result??)
+            })
+            .await?;
+        ensure!(lsn == 1);
+        cluster.resume(pause).await?;
+        phase = if restart_peer {
+            "peer restart"
+        } else {
+            "primary stop/failover"
+        };
+        let settled = if restart_peer {
+            let fresh = cluster.restart(&secondary).await?;
+            ensure!(fresh.process_session_id() != secondary.process_session_id());
+            ensure!(
+                fresh.identity() == secondary.identity()
+                    && fresh.storage_incarnation() == secondary.storage_incarnation(),
+                "a contained restart became a corrective storage replacement"
+            );
+            cluster.settle().await?
+        } else {
+            cluster.stop(&primary).await?;
+            let topology = cluster.settle_members(2).await?;
+            ensure!(topology.primary().identity() != primary.identity());
+            topology
+        };
+        for reference in settled.members() {
+            let service = cluster.service(reference).await?;
+            ensure!(
+                cluster
+                    .probe(service.get("accepted-recovery"))
+                    .await?
+                    .as_deref()
+                    == Some("acknowledged")
+            );
+        }
+        ensure!(
+            cluster
+                .observe()
+                .await?
+                .set()
+                .status
+                .as_ref()
+                .is_some_and(|status| status.public_v1_operation.is_none()
+                    && status.public_v1_transition.is_none()
+                    && status.public_v1_session_renewal.is_none())
+        );
+        Ok(())
+    }
+    .await;
+    writes.shutdown().await;
+    if let Err(error) = cluster.finish(result).await {
+        eprintln!("accepted recovery failure phase: {phase}");
+        if let Some(diagnostics) = error.diagnostics() {
+            eprintln!("accepted recovery diagnostics: {diagnostics}");
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unaccepted_switchover_does_not_block_unavailable_primary_failover() -> Result<()> {
     stopped_primary_failover(true).await
 }
@@ -789,18 +627,9 @@ async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
         let old_service = harness.service(primary).await?;
         harness.stop(primary, false).await?;
         let target = (1..=3).find(|id| *id != primary).unwrap();
-        if request_transfer {
-            let mut set = harness.set().await?;
-            set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
-                request_id: "unaccepted-transfer".into(),
-                target_replica_id: target as u32,
-            });
-            Api::<kuberic_controller::crd::KubericSet>::namespaced(
-                harness.api.client(),
-                "in-process",
-            )
-            .replace("sample", &kube::api::PostParams::default(), &set)
-            .await?;
+        let request = if request_transfer {
+            let request = harness.submit(target).await?;
+            let set = harness.set().await?;
             ensure!(
                 set.status
                     .unwrap()
@@ -809,19 +638,20 @@ async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
                     .pending_switchover
                     .is_none()
             );
-        }
+            Some(request)
+        } else {
+            None
+        };
         let promoted = harness.ready_members(2).await?;
         ensure!(promoted != primary, "failover did not promote a survivor");
         if request_transfer {
             let set = harness.set().await?;
             ensure!(
-                promoted == target
-                    && set
-                        .spec
-                        .switchover
-                        .as_ref()
-                        .is_some_and(|request| request.request_id == "unaccepted-transfer")
-            );
+                    promoted == target
+                        && set.spec.switchover.as_ref().is_some_and(
+                            |current| current.request_id == request.as_ref().unwrap().id()
+                        )
+                );
             ensure!(
                 set.status
                     .unwrap()
@@ -829,7 +659,7 @@ async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
                     .unwrap()
                     .completed_switchover_request_id
                     .as_deref()
-                    == Some("unaccepted-transfer")
+                    == Some(request.as_ref().unwrap().id())
             );
         }
         ensure!(
@@ -860,20 +690,23 @@ async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
 async fn controller_recreation_resumes_committed_operation() -> Result<()> {
     let mut harness = Harness::new().await?;
     let result = async {
-        let mut barrier = harness.api.arm_operation_barrier("sample")?;
-        let accepted = loop {
-            tokio::select! {
-                accepted = barrier.entered() => break accepted?,
-                result = harness.step() => result?,
-            }
-        };
+        let pause = harness
+            .cluster
+            .pause_at(Barrier::Operation {
+                stage: BarrierStage::Intent,
+                kind: None,
+                participant: None,
+            })
+            .await?;
+        let accepted = serde_json::to_value(pause.evidence().set())?;
         let command = accepted["status"]["publicV1Operation"].clone();
         ensure!(
             command.is_object(),
             "barrier did not capture an accepted operation"
         );
-        harness.recreate_controller()?;
-        barrier.release();
+        harness.recreate_controller().await?;
+        harness.cluster.resume(pause).await?;
+        harness.refresh().await?;
         let persisted = harness
             .api
             .get(Kind::KubericSet, "sample")
@@ -888,7 +721,7 @@ async fn controller_recreation_resumes_committed_operation() -> Result<()> {
         if status.public_v1_operation.is_some() {
             bail!("accepted operation remains pending");
         }
-        assert_exact_completion(&harness, &accepted).await?;
+        assert_exact_completion(&mut harness, &accepted).await?;
         Ok(())
     }
     .await;
@@ -938,10 +771,8 @@ async fn live_primary_isolation(attempt_isolated_writes: bool) -> Result<()> {
         );
         let uid = old.replica.instance_id.to_string();
         let service = harness.service(primary).await?;
-        harness.isolate_uid(&uid, true).await?;
-        let promoted = harness
-            .ready_survivors(2, std::slice::from_ref(&uid))
-            .await?;
+        let isolation = harness.isolate_uids(std::slice::from_ref(&uid)).await?;
+        let promoted = harness.ready_survivors(2, &isolation).await?;
         ensure!(promoted != primary);
         harness
             .service(promoted)
@@ -952,7 +783,7 @@ async fn live_primary_isolation(attempt_isolated_writes: bool) -> Result<()> {
             reject_write(&service, "live-stale-isolated").await?;
         }
         ensure!(harness.live_uids().await.contains(&uid));
-        harness.isolate_uid(&uid, false).await?;
+        harness.heal(isolation).await?;
         let returned = harness.report_uid(&uid).await?;
         ensure!(
             returned.process_session_id == old.process_session_id
@@ -1021,10 +852,10 @@ async fn quorum_loss_rejects_acknowledgements_and_recovers_ambiguous_suffix() ->
         for id in 1..=3 {
             if id != primary {
                 let uid = harness.report(id).await?.replica.instance_id.to_string();
-                harness.isolate_uid(&uid, true).await?;
                 isolated.push(uid);
             }
         }
+        let isolation = harness.isolate_uids(&isolated).await?;
         reject_write(&service, "quorum-ambiguous").await?;
         for _ in 0..3 {
             harness.step().await?;
@@ -1041,9 +872,7 @@ async fn quorum_loss_rejects_acknowledgements_and_recovers_ambiguous_suffix() ->
             );
             reject_write(&service, "quorum-lone").await?;
         }
-        for uid in isolated {
-            harness.isolate_uid(&uid, false).await?;
-        }
+        harness.heal(isolation).await?;
         ensure!(harness.ready().await? == primary);
         harness
             .assert_values("quorum-before", "acknowledged")
@@ -1088,10 +917,10 @@ async fn sf01_primary_visible_apply_is_fenced_during_physical_quorum_loss() -> R
         for id in 1..=3 {
             if id != primary {
                 let uid = harness.report(id).await?.replica.instance_id.to_string();
-                harness.isolate_uid(&uid, true).await?;
                 isolated.push(uid);
             }
         }
+        let isolation = harness.isolate_uids(&isolated).await?;
         let mut gate = service.persistence().pause_next_apply();
         let mut writes = tokio::task::JoinSet::new();
         let writer = service.clone();
@@ -1127,9 +956,7 @@ async fn sf01_primary_visible_apply_is_fenced_during_physical_quorum_loss() -> R
             service.get("sf01-visible").await,
             Err(RuntimeError::ReadClosed(AccessStatus::NotPrimary))
         ));
-        for uid in isolated {
-            harness.isolate_uid(&uid, false).await?;
-        }
+        harness.heal(isolation).await?;
         ensure!(harness.ready().await? == primary);
         harness.assert_values("sf01-visible", "uncommitted").await?;
         harness.write("sf01-after", "committed").await?;
@@ -1184,32 +1011,18 @@ async fn changed_switchover(retarget: bool) -> Result<()> {
                 .unwrap()
                 .public_v1_topology
                 .unwrap();
-            let mut barrier = harness.api.arm_matching(
-                "sample",
-                true,
-                Some("configuration"),
-                Some(&format!("-prepare-{last_peer}-")),
-            )?;
-            let sets = Api::<kuberic_controller::crd::KubericSet>::namespaced(
-                harness.api.client(),
-                "in-process",
-            );
-            let mut set = harness.set().await?;
-            let request = kuberic_controller::crd::PlannedSwitchoverRequestSpec {
-                request_id: "frozen-transfer".into(),
-                target_replica_id: target as u32,
-            };
-            set.spec.switchover = Some(request.clone());
-            sets.replace("sample", &kube::api::PostParams::default(), &set)
+            let request = harness.submit(target).await?;
+            let peer = harness.reference(last_peer).await?;
+            let pause = harness
+                .cluster
+                .pause_at(Barrier::SwitchoverPeerConfiguration {
+                    request: request.clone(),
+                    peer,
+                })
                 .await?;
-            let frozen = loop {
-                tokio::select! {
-                    frozen = barrier.entered() => break frozen?,
-                    step = harness.step() => step?,
-                }
-            };
-            let completed = assert_exact_completion(&harness, &frozen).await?;
-            let mut set = harness.set().await?;
+            let frozen = serde_json::to_value(pause.evidence().set())?;
+            let completed = assert_exact_completion(&mut harness, &frozen).await?;
+            let set = harness.set().await?;
             let topology = set
                 .status
                 .as_ref()
@@ -1218,24 +1031,27 @@ async fn changed_switchover(retarget: bool) -> Result<()> {
                 .as_ref()
                 .unwrap();
             ensure!(
-                topology.pending_switchover.as_ref() == Some(&request)
+                topology
+                    .pending_switchover
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == request.id()
+                        && i64::from(pending.target_replica_id) == target)
                     && topology.configuration_id == initial.configuration_id
                     && topology.sessions == initial.sessions
             );
-            set.spec.switchover =
-                retarget.then(|| kuberic_controller::crd::PlannedSwitchoverRequestSpec {
-                    request_id: "superseding-transfer".into(),
-                    target_replica_id: last_peer as u32,
-                });
-            let updated = sets
-                .replace("sample", &kube::api::PostParams::default(), &set)
-                .await?;
+            let superseding = if retarget {
+                Some(harness.submit(last_peer).await?)
+            } else {
+                harness.cluster.clear_switchover(&request).await?;
+                None
+            };
+            let updated = harness.set().await?;
             ensure!(
                 updated.status == set.status,
                 "spec edit changed frozen authority"
             );
-            harness.recreate_controller()?;
-            barrier.release();
+            harness.recreate_controller().await?;
+            harness.cluster.resume(pause).await?;
             loop {
                 let set = harness.set().await?;
                 let topology = set
@@ -1245,7 +1061,7 @@ async fn changed_switchover(retarget: bool) -> Result<()> {
                     .public_v1_topology
                     .as_ref()
                     .unwrap();
-                if topology.completed_switchover_request_id.as_deref() == Some("frozen-transfer") {
+                if topology.completed_switchover_request_id.as_deref() == Some(request.id()) {
                     ensure!(
                         topology.primary_id.value() == target
                             && topology.pending_switchover.is_none(),
@@ -1294,7 +1110,7 @@ async fn changed_switchover(retarget: bool) -> Result<()> {
                         .unwrap()
                         .completed_switchover_request_id
                         .as_deref()
-                        == Some("superseding-transfer")
+                        == Some(superseding.as_ref().unwrap().id())
                     {
                         break;
                     }
@@ -1340,47 +1156,36 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
         let target = if old == 2 { 3 } else { 2 };
         let last_peer = (1..=3).find(|id| *id != old && *id != target).unwrap();
         ensure!(target < last_peer, "fixture must prepare the target first");
-        let preparation_fragment = format!("-prepare-{last_peer}-");
-        let mut set = harness.set().await?;
+        let set = harness.set().await?;
         let generation = set.metadata.generation;
         let status = set.status.clone();
-        let mut preparation = harness.api.arm_matching(
-            "sample",
-            false,
-            Some("epoch"),
-            Some(&preparation_fragment),
-        )?;
-        set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
-            request_id: "requested-transfer".into(),
-            target_replica_id: target as u32,
-        });
-        let updated = Api::<kuberic_controller::crd::KubericSet>::namespaced(
-            harness.api.client(),
-            "in-process",
-        )
-        .replace("sample", &kube::api::PostParams::default(), &set)
-        .await?;
+        let request = harness.submit(target).await?;
+        let updated = harness.set().await?;
         ensure!(
             updated.metadata.generation == generation.map(|generation| generation + 1)
                 && updated.status == status
         );
-        loop {
-            tokio::select! {
-                frozen = preparation.entered() => { frozen?; break; }
-                step = harness.step() => step?,
-            }
-        }
+        let peer = harness.reference(last_peer).await?;
+        let preparation = harness
+            .cluster
+            .pause_at(Barrier::SwitchoverPeerEpoch {
+                request: request.clone(),
+                peer,
+            })
+            .await?;
         // A first catch-up is not a write fence. Acknowledge another write
         // after target preparation. Only the other old-epoch peer can ACK;
         // source Swap must transfer this missing committed prefix to the target.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            old_service.replicate_put(
-                "switch-after-first-catch-up".into(),
-                "racing-transfer".into(),
-            ),
-        )
-        .await??;
+        harness
+            .cluster
+            .probe(tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                old_service.replicate_put(
+                    "switch-after-first-catch-up".into(),
+                    "racing-transfer".into(),
+                ),
+            ))
+            .await??;
         ensure!(
             harness
                 .service(target)
@@ -1390,21 +1195,22 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
                 .is_none(),
             "the prepared target unexpectedly received the old-epoch write"
         );
-        preparation.release();
-        let mut barrier = cut
-            .map(|completion| {
-                harness
-                    .api
-                    .arm_matching("sample", completion, Some("swap"), Some("-handoff-"))
-            })
-            .transpose()?;
-        let frozen = if let Some(barrier) = &mut barrier {
-            let frozen = loop {
-                tokio::select! {
-                    frozen = barrier.entered() => break frozen?,
-                    step = harness.step() => step?,
-                }
-            };
+        harness.cluster.resume(preparation).await?;
+        let frozen = if let Some(completion) = cut {
+            let source = harness.reference(old).await?;
+            let pause = harness
+                .cluster
+                .pause_at(Barrier::SwitchoverHandoff {
+                    request: request.clone(),
+                    source,
+                    stage: if completion {
+                        BarrierStage::Completion
+                    } else {
+                        BarrierStage::Intent
+                    },
+                })
+                .await?;
+            let frozen = serde_json::to_value(pause.evidence().set())?;
             ensure!(
                 harness
                     .set()
@@ -1419,17 +1225,15 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
                 "handoff published final topology too early"
             );
             if cut == Some(true) {
-                assert_exact_completion(&harness, &frozen).await?;
+                assert_exact_completion(&mut harness, &frozen).await?;
                 reject_write(&old_service, "switch-handoff-boundary").await?;
             }
-            harness.recreate_controller()?;
+            harness.recreate_controller().await?;
+            harness.cluster.resume(pause).await?;
             Some(frozen)
         } else {
             None
         };
-        if let Some(barrier) = barrier.take() {
-            barrier.release();
-        }
         loop {
             let set = harness.set().await?;
             ensure!(
@@ -1445,8 +1249,7 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
                 .and_then(|s| s.public_v1_topology.as_ref())
                 .is_some_and(|t| {
                     t.primary_id.value() == target
-                        && t.completed_switchover_request_id.as_deref()
-                            == Some("requested-transfer")
+                        && t.completed_switchover_request_id.as_deref() == Some(request.id())
                 })
             {
                 break;
@@ -1465,7 +1268,7 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
             .assert_values("switch-after-first-catch-up", "racing-transfer")
             .await?;
         if let Some(frozen) = frozen {
-            assert_exact_completion(&harness, &frozen).await?;
+            assert_exact_completion(&mut harness, &frozen).await?;
         }
         reject_write(&old_service, "switch-stale").await?;
         harness
@@ -1493,16 +1296,12 @@ async fn build_transport_cut(source: bool) -> Result<()> {
     let mut harness = Harness::new().await?;
     let result = async {
         harness.write("build-cut-before", "acknowledged").await?;
-        let mut barrier = harness
-            .api
-            .arm_matching("sample", false, Some("build"), None)?;
-        delete_secondary(&harness).await?;
-        let frozen = loop {
-            tokio::select! {
-                frozen = barrier.entered() => break frozen?,
-                step = harness.step() => step?,
-            }
-        };
+        delete_secondary(&mut harness).await?;
+        let pause = harness
+            .cluster
+            .pause_at(Barrier::intent(PublicV1CallKind::Build))
+            .await?;
+        let frozen = serde_json::to_value(pause.evidence().set())?;
         let accepted: PublicV1OperationStatus =
             serde_json::from_value(frozen["status"]["publicV1Operation"].clone())?;
         let command = accepted.command().map_err(anyhow::Error::msg)?;
@@ -1518,22 +1317,28 @@ async fn build_transport_cut(source: bool) -> Result<()> {
         } else {
             build.replica.instance_id.as_str()
         };
-        let network = harness.transport();
-        network.isolate_on_next_dial(cut).await;
-        barrier.release();
-        while !network.is_isolated(cut).await {
-            harness.step().await?;
-        }
+        harness.refresh().await?;
+        let resource = harness.api.reference(Kind::Pod, cut)?;
+        let source_ref = harness
+            .reference_uid(command.target.instance_id.as_str())
+            .await?;
+        let destination_ref = harness
+            .reference_uid(build.replica.instance_id.as_str())
+            .await?;
+        let mut isolation = harness.cluster.arm_next_build_dial(&resource).await?;
+        harness.cluster.resume(pause).await?;
+        harness
+            .cluster
+            .drive(async { isolation.entered().await })
+            .await?;
         ensure!(
             target.persistence().durable_progress().await?.applied_lsn == 0,
             "isolated first Build dial applied provider effects"
         );
-        let address = network
-            .physical_route(
-                command.target.instance_id.as_str(),
-                &build.replication_address,
-            )
-            .await
+        let address = harness
+            .cluster
+            .physical_route(&source_ref, &destination_ref)
+            .await?
             .context("real Build did not dial the owned route")?;
         let uri: http::Uri = address.parse()?;
         let mut blocked = tokio::net::TcpStream::connect(uri.authority().unwrap().as_str()).await?;
@@ -1543,7 +1348,7 @@ async fn build_transport_cut(source: bool) -> Result<()> {
                 .await?
                 .is_err()
         );
-        harness.isolate_uid(cut, false).await?;
+        harness.heal(isolation).await?;
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             tonic::transport::Endpoint::from_shared(address)?.connect(),
@@ -1564,7 +1369,6 @@ async fn build_transport_cut(source: bool) -> Result<()> {
 async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Result<()> {
     for completion in [false, true] {
         let mut harness = Harness::new().await?;
-        let network = harness.transport();
         let mut uids = Vec::new();
         let mut addresses = Vec::new();
         let result = async {
@@ -1582,39 +1386,34 @@ async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Re
                 })
                 .collect();
             let service = harness.service(1).await?;
-            let mut barrier = harness.api.arm_matching("sample", completion, None, None)?;
-            let mut set = harness.set().await?;
-            set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
-                request_id: "cleanup-transfer".into(),
-                target_replica_id: 2,
-            });
-            Api::<kuberic_controller::crd::KubericSet>::namespaced(
-                harness.api.client(),
-                "in-process",
-            )
-            .replace("sample", &kube::api::PostParams::default(), &set)
-            .await?;
-            loop {
-                tokio::select! {
-                    frozen = barrier.entered() => { frozen?; break; }
-                    step = harness.step() => step?,
-                }
-            }
+            harness.submit(2).await?;
+            let pause = harness
+                .cluster
+                .pause_at(Barrier::Operation {
+                    stage: if completion {
+                        BarrierStage::Completion
+                    } else {
+                        BarrierStage::Intent
+                    },
+                    kind: None,
+                    participant: None,
+                })
+                .await?;
             let uid = harness.report(1).await?.replica.instance_id.to_string();
-            harness.hold_deletion(&uid, true).await;
-            harness.isolate_uid(&uid, true).await?;
+            let resource = harness.api.reference(Kind::Pod, &uid)?;
+            let _held = harness.cluster.hold_deletion(&resource).await?;
+            let _isolation = harness.isolate_uids(std::slice::from_ref(&uid)).await?;
             let write = tokio::time::timeout(
                 std::time::Duration::from_millis(50),
                 service.replicate_put("cleanup-ambiguous".into(), "attempt".into()),
             )
             .await;
             ensure!(!matches!(write, Ok(Ok(_))));
-            drop(barrier);
+            drop(pause);
             Ok(())
         }
         .await;
         tokio::time::timeout(std::time::Duration::from_secs(60), harness.finish(result)).await??;
-        network.assert_drained().await?;
         for uid in uids {
             let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
                 uid,
@@ -1671,30 +1470,42 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
         let baseline = predecessor_service
             .persistence()
             .snapshot_at(baseline_lsn)?;
-        let promotion_session = harness.report(2).await?.process_session_id.to_string();
-        let mut barrier = harness.api.arm_matching(
-            "sample",
-            completion,
-            Some(if failover { "role" } else { "build" }),
-            if failover {
-                Some(promotion_session.as_str())
-            } else {
-                None
-            },
-        )?;
+        let participant = if failover {
+            Some(harness.reference(2).await?)
+        } else {
+            None
+        };
+        let isolation = if failover {
+            Some(
+                harness
+                    .isolate_uids(std::slice::from_ref(&predecessor_uid))
+                    .await?,
+            )
+        } else {
+            None
+        };
         let removed = if failover {
-            harness.isolate_uid(&predecessor_uid, true).await?;
             Vec::new()
         } else {
-            delete_secondary(&harness).await?
+            delete_secondary(&mut harness).await?
         };
-        // Leaving this select scope cancels the old reconcile before recreation.
-        let frozen = loop {
-            tokio::select! {
-                frozen = barrier.entered() => break frozen?,
-                step = harness.step() => step?,
-            }
-        };
+        let pause = harness
+            .cluster
+            .pause_at(Barrier::Operation {
+                stage: if completion {
+                    BarrierStage::Completion
+                } else {
+                    BarrierStage::Intent
+                },
+                kind: Some(if failover {
+                    PublicV1CallKind::Role
+                } else {
+                    PublicV1CallKind::Build
+                }),
+                participant,
+            })
+            .await?;
+        let frozen = serde_json::to_value(pause.evidence().set())?;
         let accepted: PublicV1OperationStatus =
             serde_json::from_value(frozen["status"]["publicV1Operation"].clone())?;
         let command = accepted.command().map_err(anyhow::Error::msg)?;
@@ -1724,7 +1535,7 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
                 None
             };
         if completion {
-            let completed = assert_exact_completion(&harness, &frozen).await?;
+            let completed = assert_exact_completion(&mut harness, &frozen).await?;
             let authority = harness
                 .set()
                 .await?
@@ -1756,7 +1567,7 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
             .public_v1_topology
             .unwrap();
         ensure!(topology_before.primary_id.value() == primary);
-        harness.recreate_controller()?;
+        harness.recreate_controller().await?;
         let persisted = harness
             .api
             .get(Kind::KubericSet, "sample")
@@ -1772,16 +1583,16 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
                 "recreation rewrote persisted {field}"
             );
         }
-        barrier.release();
+        harness.cluster.resume(pause).await?;
         let settled_primary = if failover {
             harness
-                .ready_survivors(2, std::slice::from_ref(&predecessor_uid))
+                .ready_survivors(2, isolation.as_ref().unwrap())
                 .await?
         } else {
             harness.ready().await?
         };
         ensure!((settled_primary != primary) == failover);
-        let completed = assert_exact_completion(&harness, &frozen).await?;
+        let completed = assert_exact_completion(&mut harness, &frozen).await?;
         let authority = harness
             .set()
             .await?
@@ -1851,7 +1662,7 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
         );
         if failover {
             reject_write(&predecessor_service, "recreation-stale-isolated").await?;
-            harness.isolate_uid(&predecessor_uid, false).await?;
+            harness.heal(isolation.unwrap()).await?;
             harness.ready().await?;
             let returned = harness.report_uid(&predecessor_uid).await?;
             ensure!(

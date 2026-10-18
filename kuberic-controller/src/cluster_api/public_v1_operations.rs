@@ -138,6 +138,16 @@ pub trait PublicV1OperationApi: Send + Sync {
         scope: &PublicV1Scope,
         expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String>;
+
+    async fn observe_public_v1_operation_source(
+        &self,
+        scope: &PublicV1Scope,
+        expected: &PublicV1AcceptedTransitionStatus,
+    ) -> Result<crate::observation::RawAgentObservation, String> {
+        self.observe_public_v1_operation_report(scope, expected)
+            .await
+            .map(|report| crate::observation::RawAgentObservation::PublicV1Report(Box::new(report)))
+    }
 }
 
 #[derive(Clone)]

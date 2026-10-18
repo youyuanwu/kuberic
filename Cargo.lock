@@ -1338,9 +1338,12 @@ dependencies = [
 name = "kuberic-controller"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "clap",
+ "form_urlencoded",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "kuberic-runtime",
@@ -1352,8 +1355,10 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1362,19 +1367,20 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "form_urlencoded",
+ "bytes",
+ "futures",
  "http",
  "k8s-openapi",
  "kube",
  "kuberic-controller",
  "kuberic-runtime",
  "kvstore2",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tonic",
- "tower",
- "uuid",
 ]
 
 [[package]]

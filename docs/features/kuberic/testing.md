@@ -42,19 +42,20 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 1025 |
+| ordinary | 1057 |
+| source | 22 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
-| build-only | 2 |
-| **total** | **1071** |
+| **total** | **1123** |
 
-Ordinary partition counts are `257, 256, 256, 256`. PostgreSQL partition counts
+Ordinary partition counts are `265, 264, 264, 264`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the primary configuration slice: 1071 =
-1025 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
-PostgreSQL or KinD bodies.
+Inventory after the primary configuration slice and harness/source-job split:
+1123 = 1057 + 22 + 41 + 3. Discovery builds the tier binaries but does not execute
+PostgreSQL or KinD bodies. Doctests are additional source-job checks, not
+nextest archive entries.
 
 ## Ordinary Tier
 
@@ -99,8 +100,8 @@ algorithms. Five further current-source counterexamples in the ledger remain
 source-only. Memory-backed current-engine witnesses prove ordering, not fsync.
 The strengthened existing external API fixture pins Bytes, boxed `Stream<Item = Result<Bytes>>
 + Send`, i64 and all protected methods; it remains one of the **existing two**
-build-only guards run by `scripts/check_runtime_public_api.sh`, not a new
-ordinary or archive-only Cargo invocation.
+original build-environment guards, now selected by `just nextest-source`,
+not a new ordinary or archive-only Cargo invocation.
 
 ### SF V1 OperationQueue Slice
 
@@ -701,7 +702,7 @@ hosted KVStore2 replicas, TCP replication, and durable files. Only Kubernetes
 resource storage, Pod/PVC realization, and explicit socket faults are simulated. It requires no cluster,
 containers, kubeconfig, or application binaries.
 
-Twenty-five ordinary-tier journey/assertion tests cover bootstrap/status conflict,
+Ordinary-tier journey/assertion tests cover bootstrap/status conflict,
 support Service/Secret repair, contained restart, replacement with delayed exact
 cleanup, replacement followed by same-storage restart, stopped-primary failover,
 live-primary isolation/reconnection, quorum loss/restoration, and spec-driven
@@ -710,6 +711,21 @@ completion before status advancement for replacement and failover, plus prepared
 and completed switchover handoff. Provider LSNs/snapshots detect duplicate logical
 effects; exact accepted completions must be consumed once. Scenarios call
 `KvService` directly rather than its HTTP router.
+
+The [downstream harness design](../../proposal/downstream-in-process-testing.md)
+is implemented as `kuberic_controller::test_util`, behind the optional
+`test-util` feature. The [downstream guide](in-process-testing.md) describes the
+application factory, typed controls and cleanup contract. KVStore2 adapters and
+application assertions remain in `kuberic-level-tests`; the reusable store,
+transport and orchestration live in the controller testing module.
+
+The independent persisted counter application has eight normal workspace
+tests in `kuberic-level-tests::downstream_test_util`, covering its provider and
+bootstrap, restart, replacement, failover, live isolation, quorum restoration,
+transfer and error/cleanup journeys. They are included in the nextest archive
+and ordinary partitions. An ignored Rust source gate compiles those same
+self-contained test bodies against independently packaged crates and checks
+feature-off/private/conformance boundaries in the separate source-check job.
 
 Readiness requires no pending accepted operation, transition, replacement,
 session renewal, or planned transfer; exact admitted/live session, creation and storage agreement;
@@ -751,20 +767,24 @@ networking, watch delivery, and process pause/resume remain KinD concerns.
 Live network isolation is not scheduler suspension: the retained KinD failover
 journey still pauses and resumes the original containerd task.
 
-## Build-Only Tier
+## Source-Check Tier
 
 ```bash
-just nextest-build-only
+just nextest-source
 ```
 
-This runs:
+This checkout/build-tools job runs:
 
-- the runtime API/privacy guard;
-- the ignored executable Public V1 conformance gate.
+- implementation/source-policy and API inventory/privacy checks;
+- the ignored executable Public V1 conformance gate;
+- the ignored Rust packaged-consumer compilation/feature-boundary gate;
+- workspace doctests and rustdoc/API checks.
 
 The conformance gate executes the registered replacement scenarios under one
 bounded parent deadline and checks that every KSF mapping selects an existing
-test.
+test. Behavior and provider cases otherwise execute from ordinary archive
+partitions; they are not hidden behind a Python or nested Cargo test runner.
+`nextest-build-only` remains a compatibility name for the source-check recipe.
 
 ## PostgreSQL
 
@@ -785,9 +805,14 @@ just nextest-archive
 just nextest-validate-archive
 ```
 
-The archive is built from the current all-feature workspace after the
-build-only gate. Archive validation repeats exact tier and partition
-accounting against the packaged binaries.
+The archive includes every nextest-discoverable test binary from the current
+all-feature workspace, including ignored source gates. Archive validation
+repeats exact source/ordinary/PostgreSQL/KinD tier and partition accounting
+against those packaged binaries.
+
+Source checks execute in their own checkout-backed job with Cargo and build
+tools; archive inclusion does not make a source-sensitive test archive-only.
+Doctests run explicitly there because nextest archives do not contain them.
 
 ## Focused Public V1 Coverage
 

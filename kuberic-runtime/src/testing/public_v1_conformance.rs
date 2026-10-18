@@ -797,7 +797,13 @@ fn run_scenarios(
         }
         list.arg("--all-features");
     }
-    list.args(["--profile", "ordinary", "-E", &filter]);
+    list.args([
+        "--profile",
+        "ordinary",
+        "--ignore-default-filter",
+        "-E",
+        &filter,
+    ]);
     let list = bounded_output(&mut list, deadline, "list Public V1 conformance scenarios")
         .unwrap_or_else(|error| panic!("{error}"));
     assert!(
@@ -840,7 +846,13 @@ fn run_scenarios(
         }
         run.arg("--all-features");
     }
-    run.args(["--profile", "ordinary", "-E", &filter]);
+    run.args([
+        "--profile",
+        "ordinary",
+        "--ignore-default-filter",
+        "-E",
+        &filter,
+    ]);
     let result = bounded_output(
         &mut run,
         deadline,

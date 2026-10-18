@@ -27,6 +27,7 @@ pub(crate) struct PodRuntime {
     host: Arc<RuntimeHost>,
 }
 
+#[cfg(kuberic_workspace_tests)]
 pub(crate) const PUBLIC_V1_HOST_ATTACHMENTS: &[&str] = &[
     "PrimaryReplicator",
     "Replicator",

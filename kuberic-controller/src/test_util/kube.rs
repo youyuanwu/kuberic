@@ -79,6 +79,7 @@ struct ArmedBarrier {
     release: oneshot::Receiver<()>,
     call_kind: Option<&'static str>,
     operation_fragment: Option<String>,
+    matcher: Option<super::faults::Barrier>,
 }
 
 /// Both barriers publish the persisted object before waiting, without a store lock.
@@ -168,6 +169,7 @@ impl ApiServer {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(super) fn pending_deletions(&self, kind: Kind) -> Vec<Value> {
         self.snapshot(kind)
             .into_iter()
@@ -252,6 +254,7 @@ impl ApiServer {
         Ok(next)
     }
 
+    #[cfg(test)]
     pub(super) fn arm_operation_barrier(&self, name: &str) -> anyhow::Result<StatusBarrier> {
         self.arm_matching(name, false, None, None)
     }
@@ -292,11 +295,35 @@ impl ApiServer {
             release: release_rx,
             call_kind,
             operation_fragment: operation_fragment.map(str::to_owned),
+            matcher: None,
         });
         Ok(StatusBarrier {
             entered,
             release: Some(release),
         })
+    }
+
+    pub(super) fn arm_typed(
+        &self,
+        name: &str,
+        matcher: super::faults::Barrier,
+    ) -> anyhow::Result<StatusBarrier> {
+        let completion = matcher.stage() == super::faults::BarrierStage::Completion;
+        let barrier = self.arm_matching(name, completion, None, None)?;
+        let mut store = self.store.lock().unwrap();
+        let slot = if completion {
+            &mut store.completion_conflict
+        } else {
+            &mut store.operation_barrier
+        };
+        slot.as_mut().unwrap().matcher = Some(matcher);
+        Ok(barrier)
+    }
+
+    pub(super) fn release_barriers(&self) {
+        let mut store = self.store.lock().unwrap();
+        store.operation_barrier.take();
+        store.completion_conflict.take();
     }
 
     fn key(&self, kind: Kind, name: &str) -> Key {
@@ -811,6 +838,10 @@ fn barrier_matches(barrier: &Option<ArmedBarrier>, key: &Key, object: &Value) ->
                         .as_str()
                         .is_some_and(|id| id.contains(fragment))
                 })
+            && barrier
+                .matcher
+                .as_ref()
+                .is_none_or(|matcher| matcher.matches(object))
     })
 }
 
@@ -871,10 +902,10 @@ fn apply_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::KubericSet;
     use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
     use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
     use kube::{Api, ResourceExt};
-    use kuberic_controller::crd::KubericSet;
     use tokio::time::{Duration, timeout};
 
     fn pod(name: &str) -> Pod {

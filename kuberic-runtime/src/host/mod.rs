@@ -24,6 +24,7 @@ pub(crate) mod transport;
 
 pub use error::{HostError, Result};
 
+#[cfg(kuberic_workspace_tests)]
 pub(crate) use process::PUBLIC_V1_PROCESS_STARTUP_OWNERS;
 pub use process::{
     ApplicationStorageState, ReplicaBuildDiagnostics, ReplicaDiagnostics, ReplicaHandle,

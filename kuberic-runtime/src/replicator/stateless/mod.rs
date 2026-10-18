@@ -128,6 +128,23 @@ fn notify_inbound_build_boundary_waiting() {
 
 #[async_trait]
 impl crate::replicator::StatelessRuntimeControl for StatelessReplicator {
+    #[cfg(feature = "testing")]
+    fn testing_tcp_binding(
+        &self,
+    ) -> Option<(
+        ReplicaIdentity,
+        ProcessSessionId,
+        crate::replicator::ReplicatorCreationReservation,
+    )> {
+        self.context.reservation.map(|reservation| {
+            (
+                self.identity.clone(),
+                self.process_session.clone(),
+                reservation,
+            )
+        })
+    }
+
     async fn reported_progress(&self) -> Result<(i64, i64)> {
         let state = self.state.lock().await;
         if state.closed || self.closed.load(Ordering::Acquire) {
@@ -276,6 +293,7 @@ pub(crate) enum PublicV1DataServiceRegistration {
 }
 
 impl PublicV1DataServiceRegistration {
+    #[cfg(kuberic_workspace_tests)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::ReplicationData => "ReplicationDataServer",
@@ -1459,6 +1477,7 @@ impl StatelessReplicator {
         tokio::time::timeout(PEER_RPC_TIMEOUT, async {
             #[cfg(feature = "testing")]
             let endpoint = testing_transport::route(
+                TestingTcpRouteKind::Replication,
                 self.identity.instance_id.as_str(),
                 peer.identity.instance_id.as_str(),
                 endpoint,
@@ -2130,6 +2149,7 @@ impl StatelessReplicator {
         let final_ack = tokio::time::timeout(PEER_RPC_TIMEOUT, async {
             #[cfg(feature = "testing")]
             let endpoint = testing_transport::route(
+                TestingTcpRouteKind::Build,
                 self.identity.instance_id.as_str(),
                 replica.identity.instance_id.as_str(),
                 endpoint,
@@ -3681,6 +3701,6 @@ mod task_registry_tests {
     }
 }
 #[cfg(feature = "testing")]
-mod testing_transport;
+pub(super) mod testing_transport;
 #[cfg(feature = "testing")]
-pub use testing_transport::TestingTcpRoute;
+pub use testing_transport::{TestingTcpRoute, TestingTcpRouteKind};

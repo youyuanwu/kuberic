@@ -21,6 +21,7 @@ use crate::host::sqlite_store::SqliteStore;
 use crate::host::store::AgentStore;
 use crate::host::transport::ReplicaEndpointResolver;
 
+#[cfg(kuberic_workspace_tests)]
 pub(crate) const PUBLIC_V1_PROCESS_STARTUP_OWNERS: &[&str] = &["serve_control"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

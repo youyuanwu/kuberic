@@ -7,7 +7,6 @@ use kube::ResourceExt;
 use kuberic_runtime::host::ReplicaProcessConfig;
 use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
 
-pub(super) const IMAGE: &str = "in-process/kvstore2";
 pub(super) const RPC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(super) fn resolve(
@@ -15,15 +14,28 @@ pub(super) fn resolve(
     pvcs: &[PersistentVolumeClaim],
     secrets: &[Secret],
     root: &Path,
-) -> Result<ReplicaProcessConfig> {
+    image: &str,
+) -> Result<(ReplicaProcessConfig, BTreeMap<String, String>)> {
     let spec = pod.spec.as_ref().context("Pod spec missing")?;
     ensure!(
+        spec.init_containers
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+            && spec
+                .ephemeral_containers
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty(),
+        "additional container lifecycles are unsupported"
+    );
+    ensure!(
         spec.containers.len() == 1,
-        "only one KVStore2 container is supported"
+        "only one application container is supported"
     );
     let container = &spec.containers[0];
     ensure!(
-        container.image.as_deref() == Some(IMAGE),
+        container.image.as_deref() == Some(image),
         "unsupported application image"
     );
     ensure!(
@@ -78,6 +90,11 @@ pub(super) fn resolve(
             .with_context(|| format!("missing {name}"))
     };
     let data_path = value("KUBERIC_DATA_ROOT")?;
+    ensure!(
+        container.volume_mounts.as_deref().unwrap_or_default().len() == 1
+            && spec.volumes.as_deref().unwrap_or_default().len() == 1,
+        "only the declared application PVC mount is supported"
+    );
     let mount = container
         .volume_mounts
         .as_deref()
@@ -129,7 +146,7 @@ pub(super) fn resolve(
         .parse()
         .context("invalid replica ID")?;
     ensure!(replica_id > 0, "replica ID must be positive");
-    Ok(ReplicaProcessConfig {
+    let config = ReplicaProcessConfig {
         resource_uid: ResourceUid::new(value("KUBERIC_RESOURCE_UID")?),
         replica_id: ReplicaId::new(replica_id),
         pod_uid: PodUid::new(value("KUBERIC_POD_UID")?),
@@ -139,5 +156,13 @@ pub(super) fn resolve(
         bearer_token: value("KUBERIC_AGENT_BEARER_TOKEN")?.clone(),
         rpc_deadline: RPC_DEADLINE,
         transport_window_capacity: 256,
-    })
+    };
+    environment.retain(|name, _| {
+        !name.contains("TOKEN") && !name.contains("SECRET") && !name.contains("CREDENTIAL")
+    });
+    environment.insert(
+        "KUBERIC_DATA_ROOT".into(),
+        config.data_root.to_string_lossy().into_owned(),
+    );
+    Ok((config, environment))
 }

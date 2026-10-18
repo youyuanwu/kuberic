@@ -5,6 +5,23 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KUBERIC_WORKSPACE_TESTS");
     println!("cargo:rustc-check-cfg=cfg(kuberic_workspace_tests)");
     if std::env::var_os("KUBERIC_WORKSPACE_TESTS").is_some() {
+        let manifest = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo supplies the manifest directory"),
+        );
+        let workspace = manifest.parent().expect("runtime has a parent directory");
+        for relative in [
+            "Cargo.toml",
+            ".cargo/config.toml",
+            "kuberic-controller/src/lib.rs",
+            "kuberic-controller/src/public_v1_registration.rs",
+        ] {
+            assert!(
+                workspace.join(relative).is_file(),
+                "KUBERIC_WORKSPACE_TESTS requests repository conformance, but {relative} is \
+                 missing from {}. Unset KUBERIC_WORKSPACE_TESTS for packaged consumers.",
+                workspace.display()
+            );
+        }
         println!("cargo:rustc-cfg=kuberic_workspace_tests");
     }
 

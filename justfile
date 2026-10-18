@@ -13,15 +13,18 @@ default: level-triggered-build
 install-nextest:
     scripts/install_nextest.sh
 
-# Verify guards that need the build environment rather than an archive-only runner.
-nextest-build-only: install-nextest
-    scripts/check_runtime_public_api.sh
-    cargo nextest run -j 1 -p kuberic-runtime --all-features \
-        --profile build-only --run-ignored only \
-        -E 'test(=public_v1_conformance_executes_built_in_replacement_scenarios)'
+# Run all checkout/toolchain-backed source checks, including ignored tooling gates.
+nextest-source: install-nextest
+    cargo test --doc --workspace --all-features
+    scripts/check_runtime_public_api.sh --rustdoc-only
+    env -u NEXTEST_ARCHIVE cargo nextest run --workspace --all-features \
+        --profile source --run-ignored all
 
-# Verify build-only guards and build one reusable all-features test archive.
-nextest-archive: nextest-build-only
+# Compatibility alias for the checkout-backed source checks.
+nextest-build-only: nextest-source
+
+# Build every workspace test binary without executing source or behavior tests.
+nextest-archive: install-nextest
     cargo build -p postgres-replicated --bin postgres-replicated --all-features
     mkdir -p "$(dirname "{{ nextest_archive }}")"
     cargo nextest archive --workspace --all-features --profile ci \
@@ -36,7 +39,7 @@ nextest-validate-archive: install-nextest
     python3 scripts/validate_nextest_partitions.py \
         --archive-file "{{ nextest_archive }}"
 
-# List one semantic repository tier: all, ordinary, build-only, postgres, or kind.
+# List one semantic repository tier: all, ordinary, source, postgres, or kind.
 nextest-list tier="all": install-nextest
     #!/usr/bin/env bash
     set -euo pipefail
@@ -44,7 +47,7 @@ nextest-list tier="all": install-nextest
     case "{{ tier }}" in
       all) profile=ci ;;
       ordinary) profile=ordinary ;;
-      build-only) profile=build-only; ignored_args=(--run-ignored only) ;;
+      source|build-only) profile=source; ignored_args=(--run-ignored all) ;;
       postgres) profile=postgres ;;
       kind) profile=kind; ignored_args=(--run-ignored only) ;;
       *) echo "unknown nextest tier: {{ tier }}" >&2; exit 2 ;;
