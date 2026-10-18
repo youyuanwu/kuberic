@@ -30,6 +30,13 @@ adds private ordered dispatch, required/optimistic service ACK ownership,
 shared replication streams and explicit epoch barriers, with 92 actual tests
 (293 combined v1). Provider invocation, native fault/report/drain aftermath,
 copy/context/build and full secondary/role integration remain pending.
+The [bounded copy-receiver slice](sf-v1-port-ledger.md#copy-receivers-slice-p3-bounded-f04f05f07)
+adds secondary copy receipt and primary-side receipt of target context, reusing
+the queue/callback/shared-stream/ACK foundations, with 68 additional actual
+tests (361 combined v1). Copy/context enumeration and
+sending, StartCopy establishment, build gates and cross-receiver provider/
+fault/drain/role orchestration remain pending; these receivers do not execute
+those owners or activate the replacement.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -388,8 +395,8 @@ or license text is copied by this planning-only change. [N15]
 
 The phases below remain incomplete except the separately delivered P1 foundation;
 P2 has unselected OperationQueue, bounded sender/session/ACK and async/tonic
-substrate slices; P3 has bounded primary queue/quorum and secondary receiver/ACK
-ownership cores.
+substrate slices; P3 has bounded primary queue/quorum, secondary receiver/ACK,
+secondary-copy and primary-side copy-context receipt ownership cores.
 Remaining session policies and primary/secondary/copy/role integration are
 pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before

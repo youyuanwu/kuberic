@@ -2,12 +2,17 @@
 mod ack;
 mod async_runtime;
 mod buffers;
+mod copy_context_receiver;
 mod operation_queue;
 mod operation_stream;
 mod received_operation;
 mod replica_manager;
 mod replication_queue_manager;
+mod secondary_copy_receiver;
 mod secondary_receiver;
 mod sender;
 mod session;
 mod transport;
+
+#[cfg(test)]
+mod copy_receiver_integration;

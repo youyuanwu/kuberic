@@ -4,6 +4,8 @@
 // Source-guided Rust translation of ComFromBytesOperation.cpp:127-257 and
 // ComFromBytesOperation.h/ComOperation.h, microsoft/service-fabric
 // @3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d, Reliability/Replication.
+// Numbered network EOS: ReplicationTransport.cpp:722-752,776-802 and
+// ComFromBytesOperation.cpp:11-24; local zero-LSN EOS remains distinct.
 // See sf-v1-port-provenance.md for the private V1 port boundary.
 
 //! Received-operation identity, ACK callback state and retirement ownership.
@@ -15,7 +17,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crate::application::OperationData;
+use crate::application::{Lsn, OperationData};
 use crate::protocol::types::Epoch;
 
 use super::operation_queue::QueueOperation;
@@ -41,6 +43,8 @@ pub(super) enum AckState {
 pub(super) enum AckError {
     #[error("the operation ACK callback is not in a valid state for this transition")]
     InvalidOperation,
+    #[error("copy EOS sequence number must be positive and leave room for a queue cursor")]
+    InvalidCopySequenceNumber,
 }
 
 struct CallbackState {
@@ -108,9 +112,20 @@ impl ReceivedOperation {
 
     pub(super) fn end_of_stream(callback_required: bool) -> Self {
         // Native Constants::InvalidLSN and InvalidEpoch are zero, not the
-        // public API's noninitialized -1. EOS is never admitted to the queue.
+        // public API's noninitialized -1. Locally generated EOS is not queued.
+        Self::end_of_stream_at(0, callback_required)
+    }
+
+    pub(super) fn copy_end_of_stream(lsn: Lsn, callback_required: bool) -> Result<Self, AckError> {
+        if lsn <= 0 || lsn == Lsn::MAX {
+            return Err(AckError::InvalidCopySequenceNumber);
+        }
+        Ok(Self::end_of_stream_at(lsn, callback_required))
+    }
+
+    fn end_of_stream_at(lsn: Lsn, callback_required: bool) -> Self {
         let mut operation = Self::new(
-            QueueOperation::new(0, OperationData::new(), true),
+            QueueOperation::new(lsn, OperationData::new(), true),
             Epoch::new(0, 0),
             callback_required,
         );

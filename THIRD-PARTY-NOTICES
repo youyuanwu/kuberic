@@ -56,6 +56,20 @@ integration remain separate owners; failure containment is not their successful
 execution. No Common ReaderQueue implementation or native test harness is
 imported. The components remain private and production-unselected.
 
+The private secondary_copy_receiver.rs, copy_context_receiver.rs and their
+component tests under kuberic-runtime/src/replicator/v1/ translate selected
+SecondaryCopyReceiver and CopyContextReceiver algorithms at the same pin.
+The shared received-operation constructor and copy_receiver_integration.rs
+also adapt selected ReplicationTransport terminal metadata and
+SecondaryReplicator/RemoteSession ACK-boundary responsibilities.
+Existing Rust queue, received-operation, shared-stream and ACK-scheduler
+components replace native COM/ReaderQueue/Begin-End ownership plumbing.
+Copy-context receipt is target-to-source; it does not implement provider
+invocation, copy enumeration/sending, StartCopy establishment or build
+completion. Receiver-local cleanup is not full cross-receiver fault/drain or
+role orchestration. The components remain private and production-unselected;
+the provenance register records exact sources and representation adaptations.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

@@ -312,6 +312,78 @@ adapters and atomic cutover. No protected type, selected factory/data path,
 dependency or public wire changes. No full P2/P3, native execution/differential,
 provider-fsync, hosted parity or activation claim.
 
+### Copy Receivers Slice (P3, Bounded F04/F05/F07)
+
+Private
+[`SecondaryCopyReceiver`](../../../kuberic-runtime/src/replicator/v1/secondary_copy_receiver.rs)
+and
+[`CopyContextReceiver`](../../../kuberic-runtime/src/replicator/v1/copy_context_receiver.rs)
+reuse the actual queue, received-operation, shared-stream and ACK-scheduler
+components. These are receiving owners, not a working copy/build protocol.
+
+Secondary copy orders gaps and duplicates in a count-bounded queue with no
+invented memory bound. Required mode separates received from contiguous
+service-completed progress; optimistic mode completes at ordered dispatch
+admission, before dequeue. `copyDone` constructs a permanently empty closed
+stream without inventing a terminal operation. Getters share one consuming
+dispatch queue, and terminal reacquisition never replays.
+
+Numbered network copy/context terminal operations preserve their positive
+protocol LSN and native invalid operation epoch `(0,0)`, distinct from a locally
+generated zero-LSN EOS. Native transport marks the last operation EOS regardless
+of the configured EOS-ACK policy. With that policy enabled, secondary copy
+orders/exposes the numbered EOS and required mode waits for its real callback.
+Legacy empty last markers consume a protocol LSN but are not service data.
+Ordinary empty data is still an item, not EOF. Terminal arrival before a gap,
+full-queue retry, duplicates and nonempty legacy test-support last items retain
+their separate branches.
+
+Copy receive completion reports `-1` before outstanding service ACKs necessarily
+complete; both copy ACK fields become `-1` after the queue is released. These
+sentinels do not become replication progress or provider durability. The native
+legacy terminal bookkeeping can still require an explicit ignore-EOS-wait
+cleanup even when no EOS callback was exposed; the port does not silently
+change that drain predicate. Close, update-epoch-failure and stream-report-fault
+methods preserve their receiver-local differences. Selected callbacks survive
+queue reset, ordinary unstarted callbacks cancel, and EOS callbacks retain
+their real roots. A foreign callback cannot release a live queue predicate.
+
+Copy context is received **on the primary from the persisted target**, not
+generated from the primary's provider. Its optimistic queue completes without a
+service ACK, and its data-only stream hides protocol terminal metadata.
+Terminal-before-gap waits for all preceding context; terminal ACK progress
+includes the marker's LSN. Real AckSender batching uses the native strict
+`completed - lastIssued > maxPending` context threshold, not the replication
+threshold. Selected sends sample current progress/error at issuance; a failed
+send is not requeued. Successful explicit enumerator close permits an already
+pending dequeue to finish but rejects later polls; error close fails readers
+and issues the final error ACK. Shared Rust close state, sticky error/EOF and
+immediate inaccessible-data retirement are documented ownership adaptations,
+not native COM result parity.
+
+All wakeups, transport callbacks, ACK finishes and rejected/retired input-root
+release are staged outside receiver serialization. Malformed inputs produce
+explicit errors, not EOF or success. A real two-receiver/scheduler witness
+exercises the combined pending threshold and samples both progress pairs at
+issuance. A real terminal-copy/session trace stops at the unresolved copy-build
+handoff; observing terminal ACKs cannot execute a missing sender or build owner.
+See [selectors and validation](testing.md#sf-v1-copy-receivers-slice) and
+[source/representation provenance](sf-v1-port-provenance.md#copy-receivers-slice-p3-bounded-f04f05f07).
+
+There are **68 new actual tests**: 31 secondary-copy, 33 copy-context, two
+numbered-EOS constructor and two pair/session integration cases, for **361
+combined v1 tests**. The integrated runtime library passed **418/418**; exact
+inventory is 776 = 730 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only.
+Inventory discovery is not execution of those tier bodies.
+
+**Remaining owners:** provider invocation and target-context acquisition,
+CopyAsyncOperation/CopySender enumeration, reliable sending and build completion/
+retargeting, StartCopy/session/epoch/identity admission, cross-receiver fault
+reports/EOS/drains and full primary/secondary role transitions. Protected
+facade/service/host/controller adapters and atomic activation remain P4/P5.
+No protected API, selected production path, dependency, native execution,
+differential comparison, provider-fsync or hosted-parity claim is introduced.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
@@ -319,10 +391,10 @@ provider-fsync, hosted parity or activation claim.
 | F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | `v1/replicator.rs`, `state.rs`, existing facade | COM/refcounts → owned Rust, not altered role outcomes | A1, C1, L1 |
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`; full `primary.rs` remains pending | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
-| F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`; full secondary/role owner pending | async queues/executor; required/optimistic ACK and explicit epoch handoffs delivered, copy/provider/drains pending | S1–S3, E2 |
-| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs` | protected Bytes/boxed stream/i64 unchanged; codec and bounded replication callback/stream owners delivered, copy/provider/public facade integration pending | D1, S2–S3, C1–C2 |
+| F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`; full secondary/role owner pending | async queues/executor; required/optimistic ACK, copy receipt and explicit epoch handoffs delivered, provider/cross-receiver drains pending | S1–S3, E2 |
+| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams | protected Bytes/boxed stream/i64 unchanged; shared receipt/terminal adapters delivered, provider polling/public facade integration pending | D1, S2–S3, C1–C2 |
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs` | tasks/injected clocks, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
-| F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | `v1/copy.rs`, provider/stream adapters | bounded async queues/futures, not source-local context or a fixed snapshot-only gate | C2–C5 |
+| F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`; copy sender/provider/build/establishment owners pending | target-to-source context receipt and data-only stream delivered; no provider polling or fixed snapshot-only build substitute | C2–C5 |
 | F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; host/role demux integration pending | T1–T2, D1 |
 | F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | `v1` + existing host/controller adapters | no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
@@ -464,7 +536,8 @@ hosted, native differential or provider-fsync parity.
 
 P2 ports the queue/session/sender/ACK/async/tonic substrate **without production
 activation**; remaining session fault/promotion owners stay explicit. P3 has a
-bounded primary queue/quorum core; full primary, receivers/copy/roles remain.
+bounded primary queue/quorum, replication/copy receiver and context-receipt
+cores; full primary/secondary, copy sending/build/provider and roles remain.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
