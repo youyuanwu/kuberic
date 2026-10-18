@@ -10,7 +10,7 @@ use kuberic_runtime::host::{
 use kuberic_runtime::replicator::{
     PartitionAccessView, Replicator, ReplicatorAttachment, ReplicatorCreationReservation,
     ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
-    StatefulServicePartition,
+    StatefulServicePartition, v1,
 };
 fn forge_partition(context: ReplicatorFactoryContext) {
     let _ = StatefulServicePartition::new(Default::default(), Default::default(), context);

@@ -24,6 +24,15 @@ This is a bounded session responsibility port, not copy/build/primary/receiver
 integration or a carrier. Rust ownership, staged effects and injected time
 replace native pointer/timer execution; components remain production-unselected.
 
+The private transport.rs, buffers.rs, async_runtime.rs, sf_v1.proto and their
+component tests adapt selected ReplicationTransport message contracts,
+ReplicationEndpointId routing, RemoteSession send outcomes, and
+ReliableOperationSender/AckSender timer-lifetime obligations at the same pin.
+Tokio/tonic, bounded Rust queues and explicit versioned buffer framing replace
+native execution/transport representations. No native wire serialization,
+Common/Transport timer library, test harness or activated listener is imported.
+See the provenance register for exact selected ranges and remaining owners.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

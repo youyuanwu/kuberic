@@ -100,6 +100,7 @@ path = "private.rs"
         "module `state` is private",
         "module `store` is private",
         "module `transport` is private",
+        "module `v1` is private",
     ] {
         assert!(
             diagnostics.contains(expected),

@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=proto/kuberic.proto");
     println!("cargo:rerun-if-changed=proto/replication.proto");
+    println!("cargo:rerun-if-changed=proto/sf_v1.proto");
     println!("cargo:rerun-if-env-changed=KUBERIC_WORKSPACE_TESTS");
     println!("cargo:rustc-check-cfg=cfg(kuberic_workspace_tests)");
     if std::env::var_os("KUBERIC_WORKSPACE_TESTS").is_some() {
@@ -21,4 +22,11 @@ fn main() {
             &["proto"],
         )
         .expect("failed to compile level-triggered Kuberic protobuf schema");
+
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .bytes(".kuberic.sf.v1")
+        .compile_protos(&["proto/sf_v1.proto"], &["proto"])
+        .expect("failed to compile private SF V1 carrier protobuf schema");
 }

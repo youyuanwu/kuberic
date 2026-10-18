@@ -10,14 +10,16 @@ Scenarios remain documented acceptance criteria until tests can exercise the
 actual ported components; checking a locally redefined formula is not behavior
 coverage.
 The [OperationQueue slice](sf-v1-port-ledger.md#operationqueue-slice-p2) now
-provides an internal, unselected source-guided queue and 42 actual component
+provides an internal, unselected source-guided queue with 42 original component
 tests. The [bounded sender/session/ACK slice](sf-v1-port-ledger.md#sender-session-ack-slice-p2-bounded-f06)
 adds private reliable scheduling, ACK batching and selected session coordination
-with 61 new actual component tests (103 combined v1 tests). It is not a full
+with 61 actual component tests. It is not a full
 RemoteSession/ReplicationSession port: copy/build/role owners and session
-slow-fault/MustCatchup/promotion integration remain explicit. The tonic carrier,
-buffer adapter, remaining P2 integration and all activation/hosted-parity gates
-remain pending.
+slow-fault/MustCatchup/promotion integration remain explicit. The private
+[async/tonic substrate](sf-v1-port-ledger.md#async-tonic-substrate-slice-p2-bounded-f05f08f11)
+adds the logical carrier, explicit lossless buffer adapter and timer ownership,
+with 54 additional actual tests (157 combined v1 tests).
+Remaining owner integration and all activation/hosted-parity gates remain pending.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -375,8 +377,8 @@ or license text is copied by this planning-only change. [N15]
 ## Dependency-Ordered Implementation Program
 
 The phases below remain incomplete except the separately delivered P1 foundation;
-P2 has unselected OperationQueue and bounded sender/session/ACK slices completed;
-carrier/buffer and future-owner integration remain pending. This roadmap is not
+P2 has unselected OperationQueue, bounded sender/session/ACK and async/tonic
+substrate slices; future-owner integration remains pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required

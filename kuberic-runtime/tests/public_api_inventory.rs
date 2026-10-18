@@ -133,6 +133,7 @@ fn host_capabilities_are_not_source_public_even_when_doc_hidden() {
             "crate::replicator::copy",
             "crate::replicator::quorum",
             "crate::replicator::sender",
+            "crate::replicator::v1",
             "RuntimeHostToken",
             "ReplicatorCreationIdentity",
             "ReplicatorCreationReservation",

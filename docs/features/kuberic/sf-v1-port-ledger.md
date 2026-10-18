@@ -1,6 +1,6 @@
 # SF V1 Port Foundation Ledger
 
-**P1 foundation plus unselected queue and sender/session/ACK slices of P2; no selected
+**P1 foundation plus unselected queue, sender/session/ACK and async/tonic slices of P2; no selected
 production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
@@ -51,9 +51,10 @@ register.
 ### OperationQueue slice (P2)
 
 F03 now has an internal, synchronous, source-guided
-[`OperationQueue`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs#L179)
-with **42 actual component tests**
-([tests](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs#L59)).
+[`OperationQueue`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs#L212)
+with **42 original component tests**, plus three representation-accounting
+regressions in the async/tonic slice below
+([tests](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs#L73)).
 Queue-owned parts of Q1–Q4 and L2 are exercised: four cursors, ordered sparse
 admission, duplicates, partial retrieval, positional capacity/resize and byte
 limits, retention, callback call-point timing/self-disable/replay, trimming,
@@ -74,7 +75,7 @@ records the selected production/test translation and representation changes.
 **Not established by the queue slice:** native execution or differential parity;
 sender/session/network ACK/tonic/buffer-adapter work; manager/receiver/provider/role integration;
 production selection; full P2, multi-family FR closure or P5 acceptance.
-Other families retain pending status except the bounded F06 update below. Scenario rows remain
+Other families retain pending status except the bounded slices below. Scenario rows remain
 source provenance/expectations, not another test-vector implementation.
 
 ### Sender Session ACK Slice (P2, Bounded F06)
@@ -102,7 +103,7 @@ Private, compiled and **production-unselected** components now implement:
 
 There are **61 new actual component tests**: 28 sender (including its production
 statistics helper), 13 ACK scheduler and 20 session. Combined with the queue,
-the focused v1 selection runs **103 tests**. They drive actual components with
+those four original component families contain **103 tests**. They drive actual components with
 manual time and explicit handoff delivery, not formulas defined in tests or an
 executable scenario catalog. Reviews corrected ACK trace-stopwatch retention
 on close/reopen; a real regression preserves it.
@@ -115,7 +116,8 @@ carrier error/fault mapping is still absent. Safe bounded latency iteration
 preserves native positional traversal in its dense valid-input domain; sparse
 send ordering is tested, arbitrary sparse latency-cursor parity is not claimed.
 
-**Still unimplemented:** actual carrier/demux and buffer adapter; primary,
+**Outside this sender/session slice:** carrier, timer and buffer integration
+are recorded separately below. Still unimplemented are primary,
 secondary/receiver, CopySender/CopyAsyncOperation/context/establishment and
 role integration; provider enumeration, quorum/build completion; native session
 slow-fault flags/notification timer, MustCatchup and promotion-owner integration.
@@ -128,6 +130,67 @@ execution/differential parity, hosted evidence or multi-family contract closure.
 See [actual test selectors](testing.md#sf-v1-sender-session-ack-slice) and the
 [selected source/test register](sf-v1-port-provenance.md#sender-session-ack-implementation-slice-p2-bounded-f06).
 
+### Async Tonic Substrate Slice (P2, Bounded F05/F08/F11)
+
+The private [`transport`](../../../kuberic-runtime/src/replicator/v1/transport.rs),
+[`buffer adapter`](../../../kuberic-runtime/src/replicator/v1/buffers.rs) and
+[`async runtime`](../../../kuberic-runtime/src/replicator/v1/async_runtime.rs)
+prepare the language/execution/transport boundary. The private protobuf service
+is a logical-message carrier, **not native wire compatibility**; the selected
+`ReplicationData` RPCs and host listener remain unchanged.
+
+The carrier retains independent replication/copy/context ACK events, full
+endpoint/incarnation routing, separate current-sending and original-operation
+epochs, operation metadata/segments, terminal/error fields and reclamation
+hints. Bounded send admission, per-message expiry, stream replacement and
+observable transport outcomes do not constitute receive/application/quorum
+completion. A reconnect is not a new replica incarnation or role transition.
+Bound-route validation is not host authentication or native role/epoch admission.
+
+An explicitly chosen raw-single or versioned framed-segments adapter preserves
+the protected `Bytes` and boxed byte-stream types. Raw bytes are never sniffed
+for framing; empty stream items remain data. Framing preserves zero buffers
+versus one empty buffer, empty segments and their order. Malformed frames fail
+explicitly, and logical payload accounting remains separate from framing/wire
+overhead. Version 1 frames contain `SFVB`, a one-byte version, a little-endian
+u32 buffer count, one little-endian u32 length per buffer, then ordered payloads.
+The selected policy, never the prefix, determines interpretation.
+`QueueOperation::from_data` validates the selected representation and
+retains its logical size; queue admission, history, completion, rewinds and
+reclamation use that size rather than charging frame headers as service data.
+The original raw constructor retains its existing opaque-byte accounting.
+
+Carrier expiry is checked while queued at the transport handoff; it does not
+promise to retract an already handed-off HTTP/2 frame. Ingress retains bounded
+count/encoded bytes plus at most one bounded staged message. The carrier spawns
+no tasks: callers own/poll/join the client driver and server future.
+
+Tokio timers drive the actual session retry and ACK scheduler components, not
+reimplemented timing formulas. Short transitions select owned effects, then
+callbacks run outside guards. Native cancellation/close does not retract
+already-selected work; a pending final ACK is not service drain. Copy/primary
+processor actions remain explicit owner handoffs, not fabricated copy/build/
+quorum success. Runtime effect staging is bounded at 64 entries, with an ACK
+final-close slot reserved; `StagingFull` rejects admission before core mutation.
+This adapter bound is separate from native queue/window limits. Explicit
+shutdown rejects fresh runtime ingress and joins admitted effects; native close
+alone still permits rooted work/ACK processing. Dropping an unjoined runtime is
+reported as abnormal abort containment, never successful native drain.
+
+Actual-component and real loopback-tonic selectors are documented in
+[testing](testing.md#sf-v1-async-tonic-substrate-slice). The
+[provenance register](sf-v1-port-provenance.md#async-tonic-substrate-slice-p2-bounded-f05f08f11)
+separates native semantic sources from the Rust-specific framing and carrier.
+This slice adds **54 actual tests**: 27 async runtime, 20 carrier, four buffer
+adapter and three queue-accounting regressions, for **157 combined v1 tests**.
+
+**Remaining owners:** primary/secondary role admission and epoch policy,
+receiver reorder/dispatch/ACK modes, copy/context/provider enumeration and
+establishment, quorum/build completion, session slow-fault policy,
+MustCatchup/promotion, host credentials/listener/controller integration and
+atomic P5 cutover. No full P2, selected engine, native execution/differential,
+hosted parity or multi-family contract closure is claimed.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
@@ -136,10 +199,10 @@ See [actual test selectors](testing.md#sf-v1-sender-session-ack-slice) and the
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | `v1/primary.rs`, `replica_manager.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | `v1/secondary.rs`, `receiver.rs` | async queues/executor; preserve implicit dispatch vs service completion and receiver lifetime | S1–S3, E2 |
-| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1` adapters | owned callbacks; protected Bytes/boxed stream/i64 unchanged; explicit segmented adapter later | D1, S2–S3, C1–C2 |
+| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + private buffer adapter | protected Bytes/boxed stream/i64 unchanged; explicit segmented codec delivered, provider/receiver integration pending | D1, S2–S3, C1–C2 |
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs` | tasks/injected clocks, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
 | F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | `v1/copy.rs`, provider/stream adapters | bounded async queues/futures, not source-local context or a fixed snapshot-only gate | C2–C5 |
-| F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, future replication proto | tonic carrier, no native wire compatibility; accepted send is not service ACK | T1–T2, D1 |
+| F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; host/role demux integration pending | T1–T2, D1 |
 | F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | `v1` + existing host/controller adapters | no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
 | F11 async lifetime/diagnostics ([drain:56–102][drain], [health:62–125][health]) | retain owners through cancel/drain, outside-lock dispatch, batched/cleared warnings | Rust async ownership/clock + host reporting | no Common/Transport/KTL/Boost copy; preserve algorithm-affecting policy, not platform plumbing | R3, C3, H3 |
@@ -164,7 +227,7 @@ its named families, not an assertion that the contract is implemented.
 | FR-008 direct vs outer Close/error/Abort/cancel/retirement | F05/F09/F11 (owned drainage) | S3, C3, L3; current outer Close witness |
 | FR-009 persisted declaration/settings/specific quorum/fault/EOS/scoped reports | F10 (effective defaults/validation preserved) | C1, C6, H3; cases below |
 | FR-010 identity/history/provider guarantees; no substitute semantic gates | F08/F09 (tonic fencing + separate evidence) | T1, L2; helper-free hosted service remains P5 |
-| FR-011 protected resolved interfaces and lossless buffer representation | F05/F08 (Bytes/boxed Result<Bytes>/i64 fixed) | D1; existing external compiler fixture strengthened; codec pending P2 |
+| FR-011 protected resolved interfaces and lossless buffer representation | F05/F08 (Bytes/boxed Result<Bytes>/i64 fixed) | D1; external compiler fixture and private codec/accounting exercised; service activation pending |
 | FR-012 retain historical audit evidence; no closure from planning/ledger | F02/F04/F09 (current vs target separate) | A1, S1, L3 counterexamples; audit remains 7 fixed/14 open + SF-D01; historical SF-D02 fixed |
 | FR-013 faithful source-guided complete responsibility port | F01–F11 (all substitutions bounded) | all 33 inventoried vectors; components pending |
 | FR-014 Rust async/tonic retain lifetime/order/retry/epochs/ACK/errors | F06/F08/F11 (execution/carrier only) | R1–R3, T1–T2, D1 |
@@ -203,7 +266,7 @@ named native cases are preserved in this ledger and the provenance table.
 | C6 S | public defaults/update cases below; retry5s→6s specified public update InvalidArgument; legacy initial128 sets both roles, memory600 without legacy max sets counts0/0 vs max1024 flag gives1024/1024; later EX3 overrides per role before comparison. Credentials validated/updated. Config-store dynamic updates differ. | [Com:490–582,639–808][com], [defaults:136–207][defaults], [public config:12–17][reconfig] |
 | T1 D/S | wrong endpoint drops; same replica wrong incarnation cannot update valid session; matching identity still needs role/epoch checks. Sockets/sleep removed. | [transport test:594–617][transport-test], [primary:632–683][primary] |
 | T2 S | repl/copy expiry5s; StartCopy/RequestAck unbounded; queue-full stops batch; too-large faults; accepted send≠ACK; slow idle notification retries. | [session:217–243,364–384,423–463][session], [remote:757–790][remote] |
-| D1 S | [],[empty],[empty,empty],[ab,c],[a,bc] distinct; empty item≠EOF; sending vs original epochs and receive/apply/copy/context sequences distinct. No codec yet. | [IDL:636–683][idl], [header:25–42][header], [ACK body:17–24][ack-body] |
+| D1 S | [],[empty],[empty,empty],[ab,c],[a,bc] distinct; empty item≠EOF; sending vs original epochs and receive/apply/copy/context sequences distinct. Private codec/carrier tests now exercise these; service integration pending. | [IDL:636–683][idl], [header:25–42][header], [ACK body:17–24][ack-body] |
 | L1 S | Opened→Primary initial; Primary→Active demotes; Idle→Active retains secondary; Active→Idle rejected; None≠initial Opened. | [state:39–126][state] |
 | L2 S | promotion transfers completed retained state only; demotion requires tail==commit/trims; changed provider progress7 resets next8/history, unchanged does not reset. | [queue-manager:58–160][qm], [loss:82–126][loss] |
 | L3 S | direct child Close failure gives error/fault; outer host aborts/releases child and can complete Success, retaining diagnostic failure (not successful graceful child drain). | [direct Close:134–192][close], [outer Close:209–276][outer-close] |

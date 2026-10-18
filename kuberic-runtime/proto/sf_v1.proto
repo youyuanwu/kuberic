@@ -1,0 +1,91 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License. See LICENSES/service-fabric-MIT.txt.
+//
+// Logical-field translation of classic ReplicationTransport.cpp:168-355,684-945
+// and ReplicationEndpointId.h:23-80, microsoft/service-fabric at
+// 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
+// Protobuf/tonic is a private Rust substitution, NOT SF wire interoperability.
+syntax = "proto3";
+package kuberic.sf.v1;
+
+service Carrier {
+  rpc Exchange(stream Envelope) returns (stream Envelope);
+}
+
+message Endpoint {
+  bytes partition = 1; // Exactly 16 owner-supplied GUID bytes.
+  sint64 replica = 2;
+  bytes incarnation = 3; // Exactly 16 owner-supplied GUID bytes.
+}
+message Epoch {
+  sint64 data_loss = 1;
+  sint64 configuration = 2;
+}
+message Metadata {
+  sint64 sequence = 1;
+  uint32 operation_type = 2; // Preserve the native operation-type bit field.
+  sint64 atomic_group = 3;
+}
+message Buffers { repeated bytes segments = 1; }
+message StartCopy {
+  Epoch epoch = 1;
+  sint64 replica = 2;
+  sint64 replication_start = 3;
+}
+message ReplicationOperation {
+  Metadata metadata = 1;
+  Epoch original_epoch = 2;
+  Epoch sending_epoch = 3;
+  Buffers buffers = 4;
+  sint64 first_sequence = 5;
+  sint64 last_sequence = 6;
+  sint64 last_in_batch = 7;
+  repeated uint32 buffer_counts = 8;
+  sint64 completed_hint = 9;
+}
+message CopyOperation {
+  Metadata metadata = 1;
+  Epoch epoch = 2;
+  Buffers buffers = 3;
+  sint64 replica = 4;
+  bool is_last = 5;
+}
+message CopyContextOperation {
+  Metadata metadata = 1;
+  Buffers buffers = 2;
+  bool is_last = 3;
+}
+message ReplicationAck {
+  sint64 replication_received = 1;
+  sint64 replication_applied = 2;
+  sint64 copy_received = 3;
+  sint64 copy_applied = 4;
+  sint32 error = 5;
+}
+message CopyContextAck {
+  sint64 sequence = 1;
+  sint32 error = 2;
+}
+message RequestAck {}
+message InduceFault {
+  sint64 target_replica = 1;
+  bytes target_incarnation = 2;
+  string reason = 3;
+}
+message Envelope {
+  uint32 version = 1;
+  Endpoint source = 2;
+  Endpoint destination = 3;
+  string sender_address = 4;
+  string message_id = 5;
+  oneof body {
+    StartCopy start_copy = 10;
+    ReplicationOperation replication_operation = 11;
+    CopyOperation copy_operation = 12;
+    CopyContextOperation copy_context_operation = 13;
+    ReplicationAck replication_ack = 14;
+    CopyContextAck copy_context_ack = 15;
+    RequestAck request_ack = 16;
+    InduceFault induce_fault = 17;
+  }
+}

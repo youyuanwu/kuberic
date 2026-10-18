@@ -11,7 +11,7 @@ backpressure scenarios. Existing KSF inventory and current-contract regressions 
 not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue
-and bounded sender/session/ACK slices now have actual component tests below. Preserve
+and bounded sender/session/ACK and async/tonic slices have actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
 
@@ -39,18 +39,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 472 |
+| ordinary | 526 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **518** |
+| **total** | **572** |
 
-Ordinary partition counts are `118, 118, 118, 118`. PostgreSQL partition counts
+Ordinary partition counts are `132, 132, 131, 131`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the sender/session/ACK slice: 518 =
-472 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the async/tonic substrate slice: 572 =
+526 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -106,14 +106,17 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::operation_queue::tests::)'
 ```
 
-This selects **42** descriptive tests of the actual internal
-[`OperationQueue`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs#L179)
+This selects **45** descriptive tests of the actual internal
+[`OperationQueue`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs#L212)
 and its
-[`component tests`](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs#L59).
+[`component tests`](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs#L73).
 They cover separate tail/commit/completion/history boundaries, holes/duplicates,
 count-span and byte pressure (including history removal on failed admission),
 retention, callback timing/replay, rewinds, trim, reset and transfer. Q1–Q4/L2
 remain provenance identifiers, not a duplicate executable catalog.
+The original 42 queue tests are joined by three async/tonic-substrate adapter
+regressions proving framed-operation logical-byte accounting without changing
+the original raw-byte behavior.
 
 The tests belong to ordinary and the existing all-feature archive automatically;
 no new partition exemption or ignored tests are introduced. Source and archive
@@ -134,8 +137,9 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
 ```
 
 The first selects **61 new actual component tests**: **28 sender**, **13 ACK
-scheduler**, **20 bounded session**; the second selects **103**, including the
-42 existing queue tests. They invoke real private compiled components with
+scheduler**, **20 bounded session**. Those families plus the 42 existing queue
+tests account for **103**; the all-v1 selector also includes the later
+async/tonic substrate below. They invoke real private compiled components with
 injected/manual time, no guessed-deadline sleeps and no formula/catalog oracle.
 Sender tests also invoke its production latency/decay helpers. They exercise
 receive/apply separation, ordered replay/dedup, count windows, exact retries,
@@ -153,6 +157,36 @@ These tests are ordinary, automatically discoverable by the existing archive/
 partition rules; no ignored test, catalog ID, tier exemption or dependency added.
 See [scope/remaining owners](sf-v1-port-ledger.md#sender-session-ack-slice-p2-bounded-f06)
 and [source/test provenance](sf-v1-port-provenance.md#sender-session-ack-implementation-slice-p2-bounded-f06).
+
+### SF V1 Async Tonic Substrate Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::buffers::) or test(replicator::v1::transport::) or test(replicator::v1::async_runtime::)' -j 2
+```
+
+This selects **51 actual private component tests**: 27 async runtime, 20
+carrier and four buffer adapter. Together with three additional queue-accounting
+regressions selected above, the slice adds **54**, taking all-v1 coverage from
+103 to **157**. A cross-component test connects the actual session runtime,
+send-intent adapter, tonic exchange, reverse ACK runtime and ordered session
+ACK processor; required copy-owner handoffs are recorded, not fabricated.
+Explicit raw-single/framed-segments cases preserve arbitrary bytes,
+zero/empty/multiple buffers, per-item stream errors
+and ordinary EOF. Malformed frames fail rather than becoming empty success.
+Carrier cases keep routing/incarnation/stream ownership, independent receive/
+apply ACKs, per-message expiry, count/byte pressure and failure outcomes
+separate from service/quorum completion. Paused Tokio time drives actual
+session retry and ACK batching/force/close callbacks, not test-only formulas
+or guessed wall-clock sleeps.
+
+The private proto/service is built but not registered with the selected host.
+Public types, factory selection and current RPCs remain unchanged. The
+external negative compiler fixture explicitly rejects access to `replicator::v1`.
+No native test/binary, production activation, copy/build/quorum owner, full P2
+or hosted/native/differential parity is claimed. See the
+[bounded ledger](sf-v1-port-ledger.md#async-tonic-substrate-slice-p2-bounded-f05f08f11)
+and [provenance](sf-v1-port-provenance.md#async-tonic-substrate-slice-p2-bounded-f05f08f11).
 
 ### Built-In Service Operation Delivery
 
