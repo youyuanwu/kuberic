@@ -12,7 +12,7 @@ not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
-copy-receiver, enumeration, CopySender build-gate and copy-establishment slices have
+copy-receiver, enumeration, CopySender build-gate, copy-establishment and BuildIdle lifecycle slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -41,18 +41,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 867 |
+| ordinary | 908 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **913** |
+| **total** | **954** |
 
-Ordinary partition counts are `217, 217, 217, 216`. PostgreSQL partition counts
+Ordinary partition counts are `227, 227, 227, 227`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the copy-establishment slice: 913 =
-867 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the BuildIdle lifecycle slice: 954 =
+908 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -429,6 +429,50 @@ Full workspace ordinary execution, PostgreSQL/KinD bodies, native execution,
 differential/hosted parity and provider-fsync were not run or claimed.
 See the [ledger](sf-v1-port-ledger.md#copy-establishment-slice-p3-bounded-f04f05f07f08f11)
 and [provenance](sf-v1-port-provenance.md#copy-establishment-slice-p3-bounded-f04f05f07f08f11).
+
+### SF V1 BuildIdle Lifecycle Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::build_idle::) or test(replicator::v1::replication_queue_manager::tests::build_snapshot_)' -j 2
+```
+
+This slice adds **41 actual tests**: 38 BuildIdle and three primary-queue
+snapshot cases. Exact selection passes **41/41**; combined V1 is **539** and
+the runtime library passes **596/596** (57 unchanged non-V1).
+Workspace check/Clippy, no-default runtime, API/privacy, workspace doctests and
+exact tier/partition discovery pass. Current inventory is **954 = 908 ordinary +
+41 PostgreSQL + 3 KinD + 2 build-only**, with ordinary slices **227/227/227/227**
+and unchanged PostgreSQL hashes **11/13/8/9**.
+
+Actual manager admission freezes the classic committed/previous-quorum-floor
+boundary, retains/replays the actual pending entries and creates/opens a fresh
+session. The provider's frozen boundary and actual EOF-issued replication
+completion target remain distinct. Tests cover target context, ordered ACK
+handoffs and both build gates, success retaining idle replication, dynamic
+retention release, duplicate/invalid/closed/exhausted admission, pre-coalescing
+ACK validation, source acquisition versus enumeration faults, and subsequent
+build rejection after a private recorded primary fault.
+
+Reentrant replay/StartCopy/provider/context-ACK/removal/close callbacks run
+outside guards. Selected StartCopy may outlive removal but cannot restart
+retries or make the removed build succeed. BuildIdle context-only cancellation
+differs from RemoveReplica/Close session cancellation, and interrupted/pending
+provider acquisition stays owned until real completion. Old handles cannot
+cancel same-ID replacement builds; abandoned owners are explicit errors and
+do not prevent other close effects. Real pinned driver futures and paused Tokio
+time exercise retry continuity after establishment and newly installed
+context/replication deadlines, not just repeated drop-and-repoll tests.
+
+All components stay private/unselected. Full primary/secondary/session/role
+composition, cross-receiver/provider drains, slow-peer/promotion policy,
+provider monitoring and host health reporting remain separate owners.
+The build driver does not replace ongoing primary session ownership after
+completion. Full workspace ordinary execution, PostgreSQL/KinD bodies,
+native execution, differential/hosted parity and provider-fsync are not run
+or claimed. Earlier slice counts/exclusions are historical boundaries.
+See the [ledger](sf-v1-port-ledger.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11)
+and [provenance](sf-v1-port-provenance.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11).
 
 ### Built-In Service Operation Delivery
 

@@ -83,6 +83,41 @@ pub(super) struct CopySenderSnapshot {
     pub(super) result: Option<Result<(), CopyError>>,
 }
 
+fn normalize_copy_ack(
+    received: Lsn,
+    applied: Lsn,
+    last_copy: Option<Lsn>,
+    last_admitted: Lsn,
+) -> Result<(Lsn, Lsn), CopyError> {
+    let normalize = |lsn| match lsn {
+        -1 => last_copy.ok_or(CopyError::InvalidAck),
+        0.. => Ok(lsn),
+        _ => Err(CopyError::InvalidAck),
+    };
+    let received = normalize(received)?;
+    let applied = normalize(applied)?;
+    if received > last_admitted || applied > last_admitted || (received != 0 && received < applied)
+    {
+        return Err(CopyError::InvalidAck);
+    }
+    Ok((received, applied))
+}
+
+impl CopySenderSnapshot {
+    /// Ingress must reject impossible progress BEFORE session ACK coalescing.
+    pub(super) fn validate_ack(&self, received: Lsn, applied: Lsn) -> Result<(), CopyError> {
+        normalize_copy_ack(
+            received,
+            applied,
+            self.last_copy,
+            self.enumeration
+                .as_ref()
+                .map_or(0, |copy| copy.last_admitted),
+        )
+        .map(|_| ())
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CopySenderHandle {
     root: Weak<Root>,
@@ -235,21 +270,12 @@ impl CopySenderHandle {
             if !state.active || state.copy.phase == CopyPhase::Completed {
                 return Ok(false);
             }
-            let normalize = |lsn| {
-                if lsn == -1 {
-                    state.copy.last_copy.ok_or(CopyError::InvalidAck)
-                } else {
-                    Ok(lsn)
-                }
-            };
-            let received = normalize(received)?;
-            let applied = normalize(applied)?;
-            if received > snapshot.last_admitted
-                || applied > snapshot.last_admitted
-                || (received != 0 && received < applied)
-            {
-                return Err(CopyError::InvalidAck);
-            }
+            let (received, applied) = normalize_copy_ack(
+                received,
+                applied,
+                state.copy.last_copy,
+                snapshot.last_admitted,
+            )?;
             if received == 0 && applied == 0 {
                 return Ok(false);
             }
