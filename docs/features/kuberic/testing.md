@@ -10,7 +10,8 @@ progress/quorum/status, terminal outcomes and real tonic retry/reconnect/
 backpressure scenarios. Existing KSF inventory and current-contract regressions do
 not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
-counts for those only with actual implementations. Preserve
+counts for those only with actual implementations. The unselected OperationQueue
+slice now has actual component tests as described below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
 
@@ -38,13 +39,13 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 369 |
+| ordinary | 411 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **415** |
+| **total** | **457** |
 
-Ordinary partition counts are `93, 92, 92, 92`. PostgreSQL partition counts
+Ordinary partition counts are `103, 103, 103, 102`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
@@ -93,6 +94,30 @@ The strengthened existing external API fixture pins Bytes, boxed `Stream<Item = 
 + Send`, i64 and all protected methods; it remains one of the **existing two**
 build-only guards run by `scripts/check_runtime_public_api.sh`, not a new
 ordinary or archive-only Cargo invocation.
+
+### SF V1 OperationQueue Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::operation_queue::tests::)'
+```
+
+This selects **42** descriptive tests of the actual internal
+[`OperationQueue`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs#L179)
+and its
+[`component tests`](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs#L59).
+They cover separate tail/commit/completion/history boundaries, holes/duplicates,
+count-span and byte pressure (including history removal on failed admission),
+retention, callback timing/replay, rewinds, trim, reset and transfer. Q1–Q4/L2
+remain provenance identifiers, not a duplicate executable catalog.
+
+The tests belong to ordinary and the existing all-feature archive automatically;
+no new partition exemption or ignored tests are introduced. Source and archive
+inventories must agree. This is source-guided Rust component evidence, **not**
+native execution, differential parity, role/owner integration, full P2 or P5.
+The queue remains unselected and the protected compiler fixtures are unchanged.
+See the [ledger](sf-v1-port-ledger.md#operationqueue-slice-p2) and
+[selected translation provenance](sf-v1-port-provenance.md#operationqueue-implementation-slice-p2-not-all-of-p2).
 
 ### Built-In Service Operation Delivery
 

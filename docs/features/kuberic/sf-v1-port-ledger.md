@@ -1,16 +1,20 @@
 # SF V1 Port Foundation Ledger
 
-**P1 foundation only; no production behavior change.** Native pin:
+**P1 foundation plus the unselected OperationQueue slice of P2; no selected
+production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
 The current bespoke engine is the migration/safety baseline, not the native
-specification. All `v1/` destinations below are **proposed future paths** under
-`kuberic-runtime/src/replicator/`; none is activated or implemented by P1.
+specification. `v1/` destinations below are under
+`kuberic-runtime/src/replicator/`; only OperationQueue is now implemented,
+and none is activated. P1 itself implemented no component.
 
 ## Evidence and status
 
-These statuses apply to **every family, contract and scenario row** below:
+These are the **historical P1 baseline** statuses for the family, contract and
+scenario rows below. Only the explicit queue-slice update following this table
+changes component status; it does not close multi-family contracts.
 
 | Dimension | P1 status |
 |---|---|
@@ -43,9 +47,38 @@ means `src/prod/src/Reliability/Replication/` in that repository. Sources and
 selected native test cases are recorded in the tables below and the provenance
 register.
 
+### OperationQueue slice (P2)
+
+F03 now has an internal, synchronous, source-guided
+[`OperationQueue`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs#L179)
+with **42 actual component tests**
+([tests](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs#L59)).
+Queue-owned parts of Q1–Q4 and L2 are exercised: four cursors, ordered sparse
+admission, duplicates, partial retrieval, positional capacity/resize and byte
+limits, retention, callback call-point timing/self-disable/replay, trimming,
+rewinds, both suffix discards, classification/full reset and transfer.
+In particular, rejected count admission can already remove history; earlier-hole
+byte admission can discard a higher uncommitted suffix. Primary LSN assignment
+and role-transfer normalization belong to later managers/receivers, not this queue.
+
+Implementation review resolved a conditional-invariant/no-op regression after
+non-normalizing transfer; three real regression tests preserve that boundary.
+The scoped queue tests run under ordinary and are included by existing archive/
+partition rules. The protected positive/negative compiler fixtures still guard
+the unchanged resolved aliases and interfaces. The
+[testing guide](testing.md#sf-v1-operationqueue-slice) provides the selector and
+measured inventory; the [provenance register](sf-v1-port-provenance.md#operationqueue-implementation-slice-p2-not-all-of-p2)
+records the selected production/test translation and representation changes.
+
+**Not established:** native execution or differential parity; sender/session/
+network ACK/tonic/buffer-adapter work; manager/receiver/provider/role integration;
+production selection; full P2, multi-family FR closure or P5 acceptance.
+All other families/scenarios retain pending port status. Scenario rows remain
+source provenance/expectations, not another test-vector implementation.
+
 ## Source families, transitions and substitutions
 
-| ID / native family and source | Transitions/responsibility | Future Rust destination | Allowed representation substitution | Scenarios |
+| ID / native family and source | Transitions/responsibility | Rust destination (queue only implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
 | F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | `v1/replicator.rs`, `state.rs`, existing facade | COM/refcounts → owned Rust, not altered role outcomes | A1, C1, L1 |
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | `v1/primary.rs`, `replica_manager.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic | A1, M1–M5, E1 |
