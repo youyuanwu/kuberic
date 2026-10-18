@@ -252,6 +252,15 @@ impl PrimaryEstablishmentHandle {
         envelope: &wire::Envelope,
         progress: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Result<Option<AckProcessor>, EstablishError> {
+        self.receive_ack_for_role(envelope, true, progress)
+    }
+
+    pub(super) fn receive_ack_for_role(
+        &self,
+        envelope: &wire::Envelope,
+        process_copy: bool,
+        progress: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<Option<AckProcessor>, EstablishError> {
         let root = self.root()?;
         inbound(&root.route, envelope)?;
         let Some(wire::envelope::Body::ReplicationAck(body)) = &envelope.body else {
@@ -260,8 +269,7 @@ impl PrimaryEstablishmentHandle {
         if body.replication_received < 0
             || body.replication_applied < 0
             || body.replication_applied > body.replication_received
-            || body.copy_received < -1
-            || body.copy_applied < -1
+            || (process_copy && (body.copy_received < -1 || body.copy_applied < -1))
         {
             return Err(ProtocolError::Shape("invalid ACK progress").into());
         }
@@ -277,9 +285,11 @@ impl PrimaryEstablishmentHandle {
         };
         if body.error != 0 {
             root.complete(Err(EstablishError::Remote(body.error)));
-            root.copy.finish(CopyError::Remote(body.error))?;
-            root.cleanup_context(body.error)?;
-            root.session.close_start_copy();
+            if process_copy {
+                root.copy.finish(CopyError::Remote(body.error))?;
+                root.cleanup_context(body.error)?;
+                root.session.close_start_copy();
+            }
         } else if !persisted {
             root.complete(Ok(()));
         }
@@ -287,9 +297,9 @@ impl PrimaryEstablishmentHandle {
             AckUpdate {
                 replication_received: body.replication_received,
                 replication_applied: body.replication_applied,
-                copy_received: body.copy_received,
-                copy_applied: body.copy_applied,
-                process_copy: true,
+                copy_received: if process_copy { body.copy_received } else { -1 },
+                copy_applied: if process_copy { body.copy_applied } else { -1 },
+                process_copy,
                 message_id: envelope.message_id.clone(),
             },
             progress,

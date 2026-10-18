@@ -9,6 +9,7 @@ mod copy_establishment;
 mod copy_sender;
 mod operation_queue;
 mod operation_stream;
+mod primary;
 mod received_operation;
 mod replica_manager;
 mod replication_queue_manager;

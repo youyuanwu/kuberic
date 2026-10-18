@@ -508,6 +508,45 @@ production behavior, dependencies, native utilities/harness,
 native/differential/hosted/provider-fsync parity, full ordinary execution or
 full P2/P3 completion claim.
 
+### Primary Lifecycle Slice (P3, Bounded F02/F06/F07/F08/F09/F11)
+
+Rust destinations retain Microsoft copyright/MIT attribution:
+[`primary.rs`](../../../kuberic-runtime/src/replicator/v1/primary.rs) and
+[`tests.rs`](../../../kuberic-runtime/src/replicator/v1/primary/tests.rs).
+Narrow existing BuildIdle/establishment/manager seams are extended; ordered ACK
+handoff delivery is shared, not reimplemented. `R/` denotes the same pinned
+`src/prod/src/Reliability/Replication/` prefix.
+
+| Selected native production source | Incorporated responsibility and explicit Rust substitution |
+|---|---|
+| `R/PrimaryReplicator.cpp:261–315`; `R/PrimaryReplicator.CloseAsyncOperation.cpp:36–132` | Ordinary optional pending-quorum prewait, timeout continuing Close, manager/catchup cancellation and selected callback drainage. Independent Abort skips prewait. Explicit caller-driven futures, rooted activity accounting and oneshot delivery replace native async jobs/callback queue; client waiter bodies are not callback dispatch. Creating-secondary branch is excluded. |
+| `R/ReplicaManager.cpp:792–870,926–1007` | Actual existing manager cancels writes before session removal can invent quorum success, closes senders and cancels idle builds. Primary serializes admission/selection, delivers effects outside guards and distinguishes pending-quorum wait from selected-effect drainage. No arbitrary provider-build-call drain is asserted. |
+| `R/PrimaryReplicator.cpp:550–728`; `R/ReplicaManager.cpp:2187–2222` | Bound endpoint/partition/incarnation/address lookup, idle-only context and copy ACK admission versus active replication-only ACKs. Current/previous membership lookup precedes retained idle membership. Existing caller-established CC/PC configuration remains a seam, not full native configuration/session creation or promotion. |
+| `R/RemoteSession.cpp:448–656` | Actual rooted/coalesced session ACK processor continues ordered replication sends, actual copy replication gate, primary quorum progress and idle copy ACKs. Shared Rust handoff delivery drains all stages even on errors/reentrancy; selected work can finish after sender Close. |
+| `R/RemoteSession.cpp:98–112,252–365`; `R/ReliableOperationSender.cpp:548–755` | Existing reliable sender remains authoritative. BuildIdle owns building timers; lasting primary lifetime owns ordinary replication retry/RequestAck after build completion and for caller-established sessions. Tokio Notify registration precedes deadline sampling; interrupted driver polls retain actual build/provider futures. No extra sender or alternate timer algorithm is added. |
+
+The **42 new registered tests** execute actual components/provider
+implementations using production-derived input vectors, not native binaries,
+native test harness imports or locally redefined formula/state ledgers.
+Post-build replication/retry/quorum, idle nonvoting behavior, receive/apply
+RequestAck, CC/PC shared-root timers, reentrant/coalesced ACKs, paused deadlines,
+removal/replacement identity, actual provider faults/retention and finite/
+infinite prewait/Close/Abort/selected-effect drainage are exercised.
+
+**Measured scope:** V1 **622**, runtime **679/679**, unchanged non-V1 **57**.
+Exact discovery **1037 = 991 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**;
+ordinary **248/248/248/247**, PostgreSQL **11/13/8/9**. Workspace check/Clippy,
+no-default/API/privacy, doctests and exact inventory gates pass. See the
+[ledger](sf-v1-port-ledger.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11)
+and [selector](testing.md#sf-v1-primary-lifecycle-slice).
+
+All owners remain private/unselected. Full native configuration/session
+creation, role/external epochs, promotion/queue transfer, slow-peer/MustCatchup
+policy, monitoring/host health and P4/P5 activation remain pending. No protected
+API/selected wiring/dependency/tier change, native utility/harness import,
+native/differential/hosted/provider-fsync parity, full ordinary execution or
+full P2/P3 completion claim. Earlier slice omissions/counts remain historical.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The
