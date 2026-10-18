@@ -33,6 +33,16 @@ native execution/transport representations. No native wire serialization,
 Common/Transport timer library, test harness or activated listener is imported.
 See the provenance register for exact selected ranges and remaining owners.
 
+The private replication_queue_manager.rs, replica_manager.rs and their component
+tests under kuberic-runtime/src/replicator/v1/ translate selected
+ReplicationQueueManager/ReplicaManager primary queue, configured quorum,
+assignment/completion and catch-up algorithms, plus selected
+ReplicaManager.Test.cpp expectations at the same pin. Rust-owned queue entries,
+caller-established sessions, staged effects and separate completion receivers
+replace COM operations/job queues; they do not import native utilities or
+implement the complete primary, copy/build, slow-fault or role state machines.
+The components remain production-unselected.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

@@ -10,8 +10,9 @@ progress/quorum/status, terminal outcomes and real tonic retry/reconnect/
 backpressure scenarios. Existing KSF inventory and current-contract regressions do
 not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
-counts for those only with actual implementations. The unselected OperationQueue
-and bounded sender/session/ACK and async/tonic slices have actual component tests below. Preserve
+counts for those only with actual implementations. The unselected OperationQueue,
+bounded sender/session/ACK, async/tonic and primary queue/quorum slices have
+actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
 
@@ -39,18 +40,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 526 |
+| ordinary | 570 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **572** |
+| **total** | **616** |
 
-Ordinary partition counts are `132, 132, 131, 131`. PostgreSQL partition counts
+Ordinary partition counts are `143, 143, 142, 142`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the async/tonic substrate slice: 572 =
-526 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the primary queue/quorum slice: 616 =
+570 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -187,6 +188,46 @@ No native test/binary, production activation, copy/build/quorum owner, full P2
 or hosted/native/differential parity is claimed. See the
 [bounded ledger](sf-v1-port-ledger.md#async-tonic-substrate-slice-p2-bounded-f05f08f11)
 and [provenance](sf-v1-port-provenance.md#async-tonic-substrate-slice-p2-bounded-f05f08f11).
+
+### SF V1 Primary Queue and Quorum Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::replication_queue_manager::) or test(replicator::v1::replica_manager::)' -j 2
+```
+
+These tests invoke actual private managers, queue entries, sender sessions and
+ordered ACK processors. Successful assignment is observable before quorum
+completion; full/malformed admission does not consume an LSN. Held ACKs,
+configuration changes and outside-owner dispatch exercise current/previous
+quorum, quorum-one asymmetry, receive-based reclamation versus apply-based
+catch-up, idle retention, configuration capture/caps and moving MustCatchup
+requirements. Dropped waiters do not roll back admitted operations; terminal
+completion and close outcomes remain distinct.
+
+The slice adds **44 actual tests**: **13 primary queue owner** and **31 replica
+manager**, taking all-v1 coverage from 157 to **201**. The integrated runtime
+library selection passed **258/258**, including the 57 other library tests.
+Workspace checks, warnings-denied Clippy, no-default-feature runtime, doctests,
+external API/privacy and exact tier/partition inventory passed. This is not a
+claim that all 570 ordinary tests were rerun.
+
+Review regressions preserve cached CC quorum/all observations until the ordered
+primary-progress handoff, concrete session-root identity, error-atomic
+configuration/idle removal, and shutdown errors after terminal cleanup.
+Out-of-range session ACKs cannot become valid by admitting more operations
+while configured quorum membership is insufficient.
+
+Queue-only transfer tests preserve retained original epochs and the issued-tail
+assignment gap. They do not execute full promotion, demotion trimming, provider
+epoch callbacks or receiver drain. Concrete established-session inputs are not
+the full native descriptor-driven configuration/build lifecycle. No selected
+factory, protected interface, service persistence hook, dependency, ignored
+test, archive exemption or duplicate executable scenario catalog is added.
+Slow-fault policy/notification, full role/copy/secondary owners, native or
+differential execution, hosted parity and activation remain unestablished.
+See the [bounded ledger and owner map](sf-v1-port-ledger.md#primary-queue-and-quorum-slice-p3-bounded-f02f06f09)
+and [selected provenance](sf-v1-port-provenance.md#primary-queue-and-quorum-slice-p3-bounded-f02f06f09).
 
 ### Built-In Service Operation Delivery
 

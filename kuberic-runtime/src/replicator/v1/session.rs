@@ -152,6 +152,10 @@ impl ReplicationSession {
         self.state.lock().unwrap().identity.clone()
     }
 
+    pub(super) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub(super) fn update_sending_epoch(&self, epoch: Epoch) {
         let mut state = self.state.lock().unwrap();
         assert!(epoch >= state.sending_epoch);
@@ -220,11 +224,7 @@ impl ReplicationSession {
     /// The copy owner supplies its known finish target; no target is selected
     /// or build completed by this view.
     pub(super) fn idle_progress(&self, finish_copy_target: Option<Lsn>) -> Lsn {
-        let progress = self.progress(0);
-        finish_copy_target
-            .map(|target| progress.applied.max(progress.received.min(target)))
-            .unwrap_or(progress.received)
-            .max(0)
+        self.progress(0).idle_progress(finish_copy_target)
     }
 
     pub(super) fn averages(&self) -> (Duration, Duration) {

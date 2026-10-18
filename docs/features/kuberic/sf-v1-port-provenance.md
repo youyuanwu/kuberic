@@ -8,7 +8,7 @@ Fabric at immutable commit
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`](https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d).
 The authorized reference checkout was reviewed read-only and clean at that pin.
 No native binary or native test was run. P1 incorporated no implementation;
-the queue, bounded sender/session/ACK and async/tonic slices below translate selected native production
+the queue, bounded sender/session/ACK, async/tonic and primary ownership slices below translate selected native production
 algorithms, message contracts and test assertions into Rust. No native transport library or test
 harness is incorporated.
 
@@ -158,6 +158,44 @@ This remains preparatory P2 work. No primary/secondary/copy/role machine,
 service durability, native slow-peer policy, MustCatchup/promotion, host
 credentials/controller integration, production activation, complete P2,
 native/differential execution or hosted parity is established.
+
+### Primary Queue and Quorum Slice (P3, Bounded F02/F06/F09)
+
+Rust destinations are private
+[`replication_queue_manager.rs`](../../../kuberic-runtime/src/replicator/v1/replication_queue_manager.rs),
+[`replica_manager.rs`](../../../kuberic-runtime/src/replicator/v1/replica_manager.rs)
+and their component tests. Selected production/test files retain the Microsoft
+copyright/MIT attribution and the existing complete notice above.
+
+| Selected native material at the same pin (`R/` as above) | Translation / representation changes |
+|---|---|
+| `R/ReplicationQueueManager.cpp:29–91,99–160,209–236,261–408`; declarations in its header | Primary queue construction/normalization, issued/committed/capability views, configuration capture, commit/completion projection and admission-only LSN advancement. Existing `Arc<QueueOperation>`/`SenderOperation` retain operation data and original epochs; explicit buffer policy preserves logical-byte accounting. None represents native NonInitializedLSN, not missing-input success. |
+| `R/ReplicaManager.cpp:349–447,1061–1103,1244–1374,2328–2525` | Configured current/previous quorum, receive-based reclamation, all-current apply view, quorum-one asymmetry, catch-up-config cap and MustCatchup. Concrete established Rust sessions replace native descriptor-driven session creation; full native configuration lifecycle, slow-fault exclusion and promotion remain explicit owners. |
+| `R/ReplicaManager.cpp:107–147,792–869,2076–2197,2266–2275,2351–2411` | Admission and separately owned completion, multicast/replay effects and terminal outcome staging replace COM AsyncOperation/job queues. Caller serialization and outside-owner delivery replace native locks/job queues; service-local commit is not a new primary prerequisite. |
+| `R/PrimaryReplicator.CatchupAsyncOperation.cpp:43–104`; `R/PrimaryReplicator.cpp:383–419,761–832` | One pending catch-up owner, moving All versus saved WriteQuorum boundary, current-quorum-relative marked minimum, insufficient-quorum pending and terminal completion. Owned Rust receivers replace Begin/End; dropping a waiter is not rollback of assigned operations. |
+| `R/ReplicaManager.Test.cpp:154–220` **TestUpdateConfigurationWithQuorumIgnorePreviousConfig**, **TestUpdateConfigurationNoQuorumIgnorePreviousConfig**; production ranges above | Selected quorum progress inputs/expectations become tests of actual Rust managers and sessions. No native transport/partition wrapper, sleeps, random fixture, Boost harness or duplicated executable scenario catalog is translated. Other cases derive from production, not native test execution. |
+
+The slice contains **44 actual tests**: 13 queue owner and 31 replica manager,
+taking combined v1 coverage to **201**. Native binaries/tests were not executed.
+Single-model review corrections preserve cached current-configuration progress
+until its ordered primary handoff, concrete session-root reuse, atomic
+configuration/removal failures and observable shutdown-update failure after
+cleanup. A further admission regression rejects ahead-of-tail ACKs even when
+quorum membership is insufficient. These validation guards are Rust boundary
+adaptations, not native transport/role admission. Idle progress is shared by
+session and manager through one checked sender-progress calculation.
+
+The [ledger's remaining-owner table](sf-v1-port-ledger.md#primary-queue-and-quorum-slice-p3-bounded-f02f06f09)
+maps slow-fault eligibility, pressure-driven idle retarget, session fault flags/
+sender shutdown/InduceFault retry and full promotion/role/copy/provider duties.
+Reading these source paths does not claim their algorithms are implemented.
+Queue-transfer normalization, where exercised independently, is not a
+secondary-to-primary or demotion lifecycle.
+
+No new dependency, protected trait/type, public API, selected engine/factory/
+listener/wire or host/controller change is introduced. No native implementation
+binary, Common/Transport/KTL utility or test harness is imported. Component
+execution is not full P2/P3, native/differential, hosted or provider-fsync parity.
 
 ### P1 documented expectations (historical foundation)
 
