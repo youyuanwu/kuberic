@@ -281,6 +281,55 @@ protected type, selected production factory/listener/wire or service/host/
 controller change is introduced. This is not full F04/F05/F07 or P2/P3,
 native/differential/hosted/provider-fsync parity or production activation.
 
+### Copy Enumeration Slice (P3, Bounded F05/F07/F11)
+
+Rust destinations retain Microsoft copyright/MIT attribution:
+[`copy_async_operation.rs`](../../../kuberic-runtime/src/replicator/v1/copy_async_operation.rs)
+and adjacent
+[`tests.rs`](../../../kuberic-runtime/src/replicator/v1/copy_async_operation/tests.rs).
+Existing sender code gains only a read-only pending-operation iterator for
+outside-guard lifetime staging; its retry/window/ACK algorithms are unchanged.
+`R/` below is `src/prod/src/Reliability/Replication/` at the immutable pin.
+
+| Selected native source | Incorporated responsibility and explicit Rust substitution |
+|---|---|
+| `R/CopyAsyncOperation.h:12–103`; `.cpp:42–60,70–212` | Count-only clean-on-complete/ignore-commit queue starting at one, serial enumeration, cancellation at full/EOF versus in-flight polling, provider-error precedence and EndGetNext fault retention. A caller-driven Tokio future replaces native posting/Begin-End, without changing the protected stream type or acquiring/invoking the provider. |
+| `R/CopyAsyncOperation.cpp:214–271` | Next sequence assignment, one parked full-queue item, numbered EOF, last callback once even when parked and before sender Add. EOF is metadata, not an empty-byte heuristic. The existing explicit buffer adapter validates representation and accounts logical data; no new copy memory limit or ordering queue. |
+| `R/CopyAsyncOperation.cpp:273–365` | Sender receive-ACK processing/dispatch precedes applied queue completion and parked retry. Applied progress wakes the driver, never polls provider inline. Final progress sets ready only; it does not invent CopySender replication/build success. ACKs are already-normalized positive/zero sequences; wire sentinel conversion is not imported. |
+| `R/CopyAsyncOperation.cpp:367–417` | Separate idempotent End closes reliable sending, exposes provider fault/error description and keeps sender progress/latency views distinct. Explicit success request respects the first completion and the native ready bit. |
+| `R/ComProxyAsyncEnumOperation.cpp:90–121,137–195` | Nonnull empty data is an item, null output is EOF, absent native enumerator is an empty stream. Rust callers supply the unchanged boxed stream (including an explicit empty stream). Weak handles avoid callback cycles; a unique lease returns the stream to the rooted owner on drive-future cancellation or exit. Selected work retains the actual provider root through End/owner release. Stream Drop replaces applicable disposal ownership, not COM optional-interface result parity. |
+| `R/CopyAsyncOperation.Test.cpp:276–303,320–449` | Native cancellation timing assertions, twelve-item drained success, fifteen-item/eight-slot/ACK-below-four full retry cancellation, plus smaller parked/EOF vectors. Real Rust component tests replace native service wrappers, callback fixtures, sleeps and Boost harness. Production-derived tests cover malformed/overflow/ACK input, in-flight error precedence, timer/RequestAck behavior, framed data, real-executor wakeups and reentrant payload/provider/waker lifetimes. No native test is executed. |
+| `R/SecondaryCopyReceiver.cpp:24–184,302–455`; `R/CopyContextReceiver.cpp:105–234` | Real receiver boundary witnesses preserve required/optimistic service ACK, ordinary empty data, numbered copy terminal and data-only context EOF/terminal ACK LSN. Test-only normalization does not implement a production CopySender or build owner. |
+
+Review strengthened selected-work rooting: the provider lives in the actual
+callback root, not only beside it in the driver. A safe unique lease avoids
+holding any guard across foreign polling and returns the stream on dropped
+drive futures. Retired queue/sender payloads and callback wakeups are staged
+outside transition guards, including applied-only progress with received zero.
+The unique mutable driver is the serialization contract for stream polling;
+dropping it does not claim native cancellation/drain or successful completion.
+The constructor combines native sender-open and owner initialization; execution
+still requires driving the future. Invalid settings, ACKs, representation and
+sequence exhaustion surface explicit Rust errors instead of native assertions.
+
+**Measured scope:** **45 new actual tests**, **406 combined V1**, runtime library
+**463/463**, with 57 unchanged non-V1 library cases. Exact workspace discovery:
+**821 = 775 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**. Workspace check/
+Clippy, no-default runtime, external API/privacy, doctests and exact tier/
+partition validation passed. Discovery does not execute cluster/provider tiers.
+See the [bounded ledger](sf-v1-port-ledger.md#copy-enumeration-slice-p3-bounded-f05f07f11)
+and [test selector](testing.md#sf-v1-copy-enumeration-slice).
+
+CopySender `.cpp:56–85,267–406,524–579` and
+`PrimaryReplicator.BuildIdleAsyncOperation.cpp:111–166` remain reviewed context,
+not ported build/replication gates or retargeting. Provider/context acquisition,
+StartCopy establishment, fault/drain/role orchestration and facade/service/
+host/controller cutover remain future owners. Native ApiMonitoringWrapper
+slow-provider monitoring/health reporting is not incorporated by this slice.
+No dependency, utility library,
+native harness, protected API, selected production wiring, native/differential/
+hosted/provider-fsync parity or complete P2/P3 claim is introduced.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

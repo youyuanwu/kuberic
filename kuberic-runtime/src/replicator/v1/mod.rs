@@ -2,6 +2,7 @@
 mod ack;
 mod async_runtime;
 mod buffers;
+mod copy_async_operation;
 mod copy_context_receiver;
 mod operation_queue;
 mod operation_stream;

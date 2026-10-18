@@ -201,6 +201,10 @@ impl ReliableOperationSender {
         (self.receive_average.value(), self.apply_average.value())
     }
 
+    pub(super) fn pending_operations(&self) -> impl Iterator<Item = &SenderOperation> {
+        self.pending.values().map(|pending| &pending.operation)
+    }
+
     pub(super) fn set_decay_settings(&mut self, factor: f64, interval: Duration) {
         assert!((0.0..=1.0).contains(&factor) && !interval.is_zero());
         self.config.decay_factor = factor;
