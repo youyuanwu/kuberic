@@ -37,6 +37,13 @@ tests (361 combined v1). Copy/context enumeration and
 sending, StartCopy establishment, build gates and cross-receiver provider/
 fault/drain/role orchestration remain pending; these receivers do not execute
 those owners or activate the replacement.
+The [copy-enumeration slice](sf-v1-port-ledger.md#copy-enumeration-slice-p3-bounded-f05f07f11)
+adds serial copy/context stream polling and reliable sending (45 actual tests,
+406 combined V1). The [CopySender build-gates slice](sf-v1-port-ledger.md#copysender-build-gates-slice-p3-bounded-f06f07f11)
+adds final-copy/replication completion, actual EOF-issued target capture,
+pending-target retarget and disabled-completion behavior (47 actual tests,
+453 combined V1). These supersede the preceding slice-boundary omissions,
+not the pending provider acquisition/StartCopy/full build/role/policy owners.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -142,7 +149,7 @@ algorithm and its transport are removed at that cutover.
 | `OperationQueue` | `v1/operation_queue.rs` | Ordered/gapped retention with distinct tail/commit/complete/history heads, count/byte limits, trimming, reset and transfer rules. A plain channel is not a substitute. |
 | `SecondaryReplicator`, copy/replication receivers | `v1/secondary.rs`, `v1/receiver.rs` | Separate ordering/dispatch queues, persisted/volatile ACK modes, fixed copy versus minimum replication epochs, provider barriers and close/promotion drain. |
 | `ReplicationSession`, `RemoteSession`, `ReliableOperationSender`, `AckSender` | `v1/session.rs`, `v1/sender.rs`, `v1/ack.rs` | Per-incarnation receive/apply cursors, ordered ACK processing, retry/window/request-ACK, batching/final ACK, slow-peer and backpressure policy. |
-| `CopySender`, `CopyAsyncOperation`, `CopyContextReceiver`, establishment | `v1/copy_async_operation.rs`, `v1/copy_context_receiver.rs`, remaining build/provider/stream adapters | Serial provider enumeration, one parked full-queue item, target context ordering/EOF, reliable StartCopy and final-copy/replication build gates. |
+| `CopySender`, `CopyAsyncOperation`, `CopyContextReceiver`, establishment | `v1/copy_sender.rs`, `v1/copy_async_operation.rs`, `v1/copy_context_receiver.rs`, remaining full build/provider/stream adapters | Serial provider enumeration, one parked full-queue item, target context ordering/EOF, EOF-issued target, pending retarget and final-copy/replication gates; reliable StartCopy remains pending. |
 | Native transport/demux/message headers | `v1/transport.rs`, replication proto | Tonic carrier with native logical message/session/epoch/LSN semantics; no data-operation RPC result used as service ACK. |
 | COM/provider/operation/stream/settings facade | Existing public facade plus `v1` adapters | Preserve Rust protected types, early LSN/completion, lossless buffers, shared stream receivers, error classes, capabilities and effective defaults. |
 | RA/partition boundary | Host/controller adapters, not engine internals | Native callback/access/Close-layer behavior expressed through Kuberic lifecycle authority; no provider commitment mislabelled as native queue progress. |
@@ -397,8 +404,9 @@ The phases below remain incomplete except the separately delivered P1 foundation
 P2 has unselected OperationQueue, bounded sender/session/ACK and async/tonic
 substrate slices; P3 has bounded primary queue/quorum, secondary receiver/ACK,
 secondary-copy, primary-side copy-context receipt and copy/context stream
-enumeration/reliable-send ownership cores. CopySender build/retarget gates,
-provider invocation/establishment, remaining session policies and primary/
+enumeration/reliable-send and CopySender build-gate/EOF-issued-target/retarget
+ownership cores. Provider invocation/establishment, full build orchestration,
+remaining session policies and primary/
 secondary/role integration are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.

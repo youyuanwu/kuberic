@@ -70,6 +70,20 @@ pub(super) enum CopyError {
     OwnerDropped,
     #[error("copy operation transition mutex is poisoned")]
     Poisoned,
+    #[error("copy has not begun")]
+    NotStarted,
+    #[error("copy may only begin once")]
+    AlreadyStarted,
+    #[error("replication progress must be nonnegative")]
+    InvalidReplicationProgress,
+    #[error("copy context does not wait for replication ACKs")]
+    ReplicationNotRequired,
+    #[error("build completion is already disabled")]
+    AlreadyDisabled,
+    #[error("build completed successfully after completion was disabled")]
+    BuildCompletionDisabled,
+    #[error("capturing the replication target failed: {0}")]
+    ReplicationTarget(#[source] Arc<RuntimeError>),
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +95,7 @@ pub(super) struct CopyFault {
 #[derive(Clone, Debug)]
 pub(super) struct CopyEnd {
     pub(super) result: Result<(), CopyError>,
-    /// EndGetNext failures only; no host fault report is performed here.
+    /// Provider or outer CopySender fault; no host report is performed here.
     pub(super) fault: Option<CopyFault>,
 }
 
@@ -345,7 +359,19 @@ impl CopyHandle {
         Ok(())
     }
 
-    /// Inputs are already normalized by the future CopySender, not wire -1
+    /// Native CopySender::FinishOperation, not enumeration cancellation timing.
+    pub(super) fn complete_error(&self, error: CopyError) -> Result<bool, CopyError> {
+        let root = self.root()?;
+        let completed = root
+            .state
+            .lock()
+            .map_err(|_| CopyError::Poisoned)?
+            .complete(Err(error));
+        root.wake.notify_one();
+        Ok(completed)
+    }
+
+    /// Inputs are already normalized by CopySender, not wire -1
     /// sentinels. Sender dispatch precedes queue completion and parked replay.
     pub(super) fn update_progress(
         &self,
