@@ -11,7 +11,7 @@ backpressure scenarios. Existing KSF inventory and current-contract regressions 
 not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue
-slice now has actual component tests as described below. Preserve
+and bounded sender/session/ACK slices now have actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
 
@@ -39,15 +39,19 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 411 |
+| ordinary | 472 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **457** |
+| **total** | **518** |
 
-Ordinary partition counts are `103, 103, 103, 102`. PostgreSQL partition counts
+Ordinary partition counts are `118, 118, 118, 118`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
+
+Source inventory measured after the sender/session/ACK slice: 518 =
+472 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
 
@@ -118,6 +122,37 @@ native execution, differential parity, role/owner integration, full P2 or P5.
 The queue remains unselected and the protected compiler fixtures are unchanged.
 See the [ledger](sf-v1-port-ledger.md#operationqueue-slice-p2) and
 [selected translation provenance](sf-v1-port-provenance.md#operationqueue-implementation-slice-p2-not-all-of-p2).
+
+### SF V1 Sender Session ACK Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::sender::tests::) or test(replicator::v1::ack::tests::) or test(replicator::v1::session::tests::)' -j 2
+# All preparatory v1 components, including the existing queue:
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::)' -j 2
+```
+
+The first selects **61 new actual component tests**: **28 sender**, **13 ACK
+scheduler**, **20 bounded session**; the second selects **103**, including the
+42 existing queue tests. They invoke real private compiled components with
+injected/manual time, no guessed-deadline sleeps and no formula/catalog oracle.
+Sender tests also invoke its production latency/decay helpers. They exercise
+receive/apply separation, ordered replay/dedup, count windows, exact retries,
+RequestAck, hints/backpressure, batching/force/final pending flush, trace,
+coalescing/copy terminal state, reentrant dispatch and close/root lifetimes.
+The initiating callback and processor ownership survive coalesced ACK arrivals.
+
+Deadlines and timer-callback entry are component seams, not a live timer adapter.
+Session copy/primary effects are explicitly delivered handoffs, **not execution
+of missing copy/build/quorum owners**. Tests demonstrate component order,
+ownership and progress; they do not prove demux, carrier/error mapping, provider
+durability or native/hosted parity. Native tests/sources were read, not executed.
+The production factory, public aliases and protected interfaces are unchanged.
+These tests are ordinary, automatically discoverable by the existing archive/
+partition rules; no ignored test, catalog ID, tier exemption or dependency added.
+See [scope/remaining owners](sf-v1-port-ledger.md#sender-session-ack-slice-p2-bounded-f06)
+and [source/test provenance](sf-v1-port-provenance.md#sender-session-ack-implementation-slice-p2-bounded-f06).
 
 ### Built-In Service Operation Delivery
 
