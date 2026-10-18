@@ -129,6 +129,10 @@ pub(super) struct ReceiverEffects {
 
 #[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 effect delivery"))]
 impl ReceiverEffects {
+    pub(super) fn epoch_request(&self) -> Option<EpochBarrier> {
+        self.update_epoch
+    }
+
     pub(super) fn dispatch(self) -> Result<ReceiverSignals, ReceiverError> {
         for wake in self.wakes {
             wake.dispatch();
@@ -204,6 +208,14 @@ impl SecondaryReceiver {
 
     pub(super) fn requires_service_ack(&self) -> bool {
         self.require_ack
+    }
+
+    pub(super) fn has_persisted_state(&self) -> bool {
+        self.config.has_persisted_state
+    }
+
+    pub(super) fn dispatch_queue(&self) -> SharedDispatchQueue {
+        self.dispatch.clone()
     }
 
     fn ensure_active(&self) -> Result<(), ReceiverError> {
@@ -328,6 +340,23 @@ impl SecondaryReceiver {
 
     pub(super) fn provider_epoch(&self) -> Option<Epoch> {
         self.callback.lock().unwrap().provider_epoch
+    }
+
+    pub(super) fn has_pending_epoch(&self, barrier: EpochBarrier) -> bool {
+        self.callback.lock().unwrap().provider_pending == Some(barrier)
+    }
+
+    pub(super) fn fail_pending_epoch(
+        &mut self,
+        barrier: EpochBarrier,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<(), ReceiverError> {
+        if !self.has_pending_epoch(barrier) {
+            return Err(ReceiverError::InvalidEpochCompletion);
+        }
+        self.clean_queue(owner, true, true);
+        self.callback.lock().unwrap().provider_pending = None;
+        Ok(())
     }
 
     pub(super) fn minimum_sending_epoch(&self) -> Option<Epoch> {

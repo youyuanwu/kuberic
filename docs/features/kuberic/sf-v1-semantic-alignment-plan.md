@@ -48,8 +48,12 @@ GetCopyContext/source GetCopyState acquisition using the existing components
 (45 actual tests, 498 combined V1). The [BuildIdle lifecycle slice](sf-v1-port-ledger.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11)
 adds idle-session admission, classic frozen-boundary/pending replication capture,
 ordered build orchestration and removal/cancellation/completion cleanup
-(41 actual tests, 539 combined V1). These supersede the preceding slice-boundary
-omissions, not the pending full primary/secondary/session/role/drain/policy owners.
+(41 actual tests, 539 combined V1). The [secondary lifecycle slice](sf-v1-port-ledger.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11)
+adds one shared receiver/establishment/context/ACK lifetime, actual provider
+epoch callbacks, cross-receiver faults and ordinary legacy/EOS Close/drain/Abort
+(41 actual tests, 580 combined V1). These supersede preceding slice-boundary
+omissions, not pending full primary/session/role, external epoch reconfiguration,
+promotion, monitoring/health or policy owners.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -414,8 +418,11 @@ enumeration/reliable-send and CopySender build-gate/EOF-issued-target/retarget
 ownership cores, with bounded provider/context acquisition and reliable StartCopy
 identity/epoch establishment and bounded BuildIdle/idle-session admission,
 classic boundary/pending-replication capture, ordered orchestration and
-removal/cancellation/completion cleanup. Remaining session policies and primary/
-secondary/role integration are pending. This roadmap is not
+removal/cancellation/completion cleanup. Bounded secondary lifetime now adds
+shared receiver/context/ACK ownership, provider epoch callbacks and ordinary
+legacy/EOS Close/drain/Abort. Primary coordinator/session ownership and subsequent
+role/external-epoch orchestration, drained queue transfer and remaining session
+policies are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required

@@ -463,6 +463,51 @@ API, selected production path, dependencies, native utilities/harness,
 native/differential/hosted/provider-fsync parity, full ordinary execution or
 full P2/P3 completion claim.
 
+### Secondary Lifecycle Slice (P3, Bounded F04/F05/F06/F09/F11)
+
+Rust destinations retain Microsoft copyright/MIT attribution:
+[`secondary.rs`](../../../kuberic-runtime/src/replicator/v1/secondary.rs)
+and adjacent
+[`tests.rs`](../../../kuberic-runtime/src/replicator/v1/secondary/tests.rs).
+Narrow changes extend actual shared dispatch, receiver and establishment
+seams, not substitute queues/provider algorithms. `R/` denotes
+`src/prod/src/Reliability/Replication/` at the same immutable pin.
+
+| Selected native production source | Incorporated responsibility and explicit Rust substitution |
+|---|---|
+| `R/SecondaryReplicator.cpp:393–550` | Retire admission, own ordinary Close/End and independent Abort, cancel actual context sender and preserve provider wait ordering. Explicit caller-driven futures/weak ingress replace COM/job ownership; dropping the owner is abandonment, not Close. |
+| `R/SecondaryReplicator.CloseAsyncOperation.cpp:120–188,327–367` | Legacy ordinary Close aborts dispatch and clears pending queues, waits reserved UpdateEpoch but not held ACKs or GetCopyContext. No universal graceful-drain guarantee is inferred from native TODO comments. Promotion branch is excluded. |
+| `R/SecondaryReplicator.CloseAsyncOperation2.cpp:116–421` | EOS ordinary Close clears unpumped replication before EOS on incomplete copy, cleans data without ignoring EOS ACK, aborts uninitialized streams, drains copy then replication, waits GetCopyContext then provider UpdateEpoch. Drain failure returns early; subsequent Abort still owns pending calls. Promotion branch is excluded. |
+| `R/SecondaryReplicator.DrainQueueAsyncOperation.cpp:56–342`; `R/OperationStream.GetOperationAsyncOperation.cpp:139–184` | Observe real dispatch drain before required service ACK drain. Shared queue initialization/drain snapshots and outside-guard Notify wakes replace AsyncQueue waiters. Empty-open drain observation is not stream EOF. Stream faults preserve EOS wait and distinct failed drain, not fabricated success. |
+| `R/SecondaryReplicator.cpp:1624–1965` | Reserve ACK-triggered epoch obligation before rooted callback completion; retain and invoke actual protected UpdateEpoch outside guards. Distinguish full ACK-barrier failure cleanup from stream-marker provider fault/report and resumed dequeue. Retained Rust provider futures replace native Begin-End/manual-reset events; no callback is fabricated on cancellation. |
+| `R/SecondaryReplicator.cpp:862–914,1063–1123` | Actual GetCopyContext and EndGetNext provider failures record private typed faults. Acquisition additionally forces negative ACK only while copy remains in progress; enumeration provider fault is not a remote context failure. Non-provider remote errors use sticky negative context ACKs. This observation is not host health reporting. |
+| `R/SecondaryReplicator.cpp:1967–2083,2235–2280`; `R/AckSender.cpp:64–208` | Actual copy completion checks context sender, ACK scheduling snapshots actual two-receiver progress, cross-receiver stream-fault cleanup preserves EOS ACK waits. Caller-driven Tokio deadlines replace timers; initialization/dequeue/ACK wakes resample pinned drivers. Cleanup tokens retain actual provider without receiver/root cycles. |
+
+The **41 new registered tests** execute the actual Rust owners: 39 secondary
+lifetime cases and two actual shared-dispatch lifecycle vectors. Test inputs
+derive from the named production branches, not imported native test fixtures,
+native binary execution or locally redefined state/formula ledgers. Pinned
+paused-time tests cover ACK-deadline installation/live snapshots and continued
+context retries; reentrant callbacks run outside guards. Pending context/epoch
+calls retain actual errors after Close/Abort and interrupted polls.
+
+**Measured scope:** V1 **580**, runtime **637/637**, unchanged non-V1 **57**.
+Exact discovery: **995 = 949 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**;
+ordinary slices **238/237/237/237**, PostgreSQL **11/13/8/9**. Workspace
+check/Clippy, no-default/API/privacy, doctests and exact inventory gates pass.
+See the [ledger](sf-v1-port-ledger.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11)
+and [selector](testing.md#sf-v1-secondary-lifecycle-slice).
+
+Typed data ingress assumes caller-owned route/epoch admission. The owner does
+not implement role switching, promotion, external epoch reconfiguration, full
+primary/session ownership, provider monitoring/health or P4/P5 adapters/cutover.
+Neither Close nor Abort asserts arbitrary provider GetNext drainage. Legacy
+containment, EOS initialized-stream drain, faults and Abort remain distinct;
+uninitialized streams take native abort bypass. No protected API, selected
+production behavior, dependencies, native utilities/harness,
+native/differential/hosted/provider-fsync parity, full ordinary execution or
+full P2/P3 completion claim.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

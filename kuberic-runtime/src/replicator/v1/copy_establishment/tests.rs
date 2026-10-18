@@ -733,11 +733,9 @@ async fn secondary_initializes_actual_replication_receiver_once() {
     assert!(!handle.process_start(&start(Epoch::new(1, 7), 99)).unwrap());
     let root = handle.root().unwrap();
     let state = root.state.lock().unwrap();
-    assert_eq!(state.receiver.queue().unwrap().progress().complete_head, 8);
-    assert_eq!(
-        state.receiver.minimum_sending_epoch(),
-        Some(Epoch::new(1, 7))
-    );
+    let receiver = state.receiver.lock().unwrap();
+    assert_eq!(receiver.queue().unwrap().progress().complete_head, 8);
+    assert_eq!(receiver.minimum_sending_epoch(), Some(Epoch::new(1, 7)));
     assert_eq!(provider.context_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -817,6 +815,8 @@ async fn invalid_start_replica_epoch_and_boundary_do_not_initialize() {
             .lock()
             .unwrap()
             .receiver
+            .lock()
+            .unwrap()
             .queue()
             .is_none()
     );

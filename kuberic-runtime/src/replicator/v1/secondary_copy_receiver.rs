@@ -245,6 +245,10 @@ impl SecondaryCopyReceiver {
         self.dispatch.stream()
     }
 
+    pub(super) fn dispatch_queue(&self) -> SharedDispatchQueue {
+        self.dispatch.clone()
+    }
+
     pub(super) fn queue(&self) -> Option<&OperationQueue> {
         self.queue.as_ref()
     }
