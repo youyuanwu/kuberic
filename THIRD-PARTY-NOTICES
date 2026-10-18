@@ -43,6 +43,19 @@ replace COM operations/job queues; they do not import native utilities or
 implement the complete primary, copy/build, slow-fault or role state machines.
 The components remain production-unselected.
 
+The private received_operation.rs, operation_stream.rs, secondary_receiver.rs
+and their component tests under kuberic-runtime/src/replicator/v1/ translate
+selected ComFromBytesOperation/ComOperation callback-lifetime,
+OperationStream/GetOperationAsyncOperation and SecondaryReplicationReceiver
+algorithms, selected SecondaryReplicator ACK/admission orchestration, and
+ReplicationSecondary.Test.cpp expectations at the same pin. Rust-owned ACK
+work, shared consuming streams, staged wakeups and explicit provider epoch
+handoffs replace COM callbacks and ReaderQueue/Begin-End plumbing. Native
+copy/build, provider invocation, fault reporting, graceful drains and full role
+integration remain separate owners; failure containment is not their successful
+execution. No Common ReaderQueue implementation or native test harness is
+imported. The components remain private and production-unselected.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.
