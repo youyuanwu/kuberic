@@ -211,13 +211,14 @@ impl ReplicationSession {
     }
 
     pub(super) fn on_start_copy_timer(&self, now: Duration) -> Option<SessionSendBatch> {
-        let batch = self
-            .state
-            .lock()
-            .unwrap()
-            .start_copy
-            .as_mut()?
-            .on_timer(now);
+        let batch = {
+            let mut state = self.state.lock().unwrap();
+            let sender = state.start_copy.as_mut()?;
+            if sender.deadline().is_none_or(|deadline| deadline > now) {
+                return None;
+            }
+            sender.on_timer(now)
+        };
         Some(SessionSendBatch {
             session: self.clone(),
             batch,

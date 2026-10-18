@@ -420,6 +420,49 @@ adapters/atomic activation remain pending. No protected interfaces, selected
 production wiring, dependencies, native utilities/harness, complete P2/P3,
 native/differential/hosted/provider-fsync parity or full ordinary execution claim.
 
+### BuildIdle Lifecycle Slice (P3, Bounded F02/F05/F06/F07/F11)
+
+Rust destinations retain Microsoft copyright/MIT attribution:
+[`build_idle.rs`](../../../kuberic-runtime/src/replicator/v1/build_idle.rs)
+and adjacent
+[`tests.rs`](../../../kuberic-runtime/src/replicator/v1/build_idle/tests.rs).
+Narrow integration changes extend the existing ReplicaManager, queue,
+establishment, session timer and CopySender validation seams. `R/` denotes
+`src/prod/src/Reliability/Replication/` at the same immutable pin.
+
+| Selected native production source | Incorporated responsibility and explicit Rust substitution |
+|---|---|
+| `R/ReplicaManager.cpp:1142–1220`; `R/ReplicationQueueManager.cpp:165–194` | Fresh idle session creation/open with no caller progress, duplicate/identity checks, atomic frozen start and actual pending replication selection. Classic V1 uses max(current committed, previous-config quorum floor) + 1; V2 copy-until-latest is excluded. Manager serialization captures original operation roots/epochs and retention hint; pending replay dispatches outside the guard. |
+| `R/PrimaryReplicator.BuildIdleAsyncOperation.cpp:42–166`; `R/RemoteSession.cpp:252–365` | Compose actual establishment, protected GetCopyState(start - 1), CopySender driver and End. Publish StartCopy during admission before pending replay can reenter/remove; dispatch replay before selected StartCopy. Rust short transitions/owned futures replace native Begin-End/Threadpool, preserving late-selected work while stopping retries and unsuccessful builds after removal. |
+| `R/RemoteSession.cpp:585–615`; `R/ReplicationSession.cpp:285–326` | Consume every ordered ACK continuation, update the manager only at primary progress, and sample actual live EOF copy target for idle retention. Reuse CopySender normalization to reject impossible progress before sticky session coalescing. Explicit malformed-input errors replace native assertions; they do not imply successful ACK processing. |
+| `R/PrimaryReplicator.BuildIdleAsyncOperation.cpp:84–166,178–214`; `R/RemoteSession.cpp:312–324,733–756` | Preserve BuildIdle context-only cancellation versus immediate session CancelCopy on removal/close. Cancellation is observed before provider acquisition; post-acquisition context cleanup does not invent unconditional copy cancellation. Retained async acquisition stays pending until actual completion, including after manager removal/close; provider failure keeps precedence. Actual GetCopyState/EndGetNext faults and first private primary-fault observation are distinct from host reporting. |
+| `R/ReplicaManager.cpp:792–870,1783–1832` | Remove idle membership/retention constraint, close replication and cancel actual copy outside guards. Manager close stages terminal replicate waiters before build cancellation, including cleanup of other builds after an abandoned owner error. Per-session rooted handles prevent old-ID cleanup from affecting replacement builds. No synthetic success from removing quorum membership. |
+| `R/RemoteSession.cpp:252–365`; `R/ReliableOperationSender.cpp:113–137,548–755`; `R/AckSender.cpp:64–208` | Caller-driven Tokio deadlines replace independent native timers. Establishment drives StartCopy while waiting; BuildIdle continues it during acquisition/enumeration, and drives pending-build replication/context ACK deadlines. Notify-based ingress/enqueue wakeups resample newly installed deadlines; stale StartCopy timer callbacks cannot alter the current retry window. No autonomous production task or alternate sender is introduced. |
+
+The **41 new registered tests** execute actual Rust owners: 38 lifecycle cases
+and three queue snapshot vectors. The previous-quorum-floor case supplies a
+production-derived queue-state vector; it does not execute missing role
+transfer. `R/ReplicaManager.Test.cpp:772–824` provides admission/helper ancestry;
+the lifecycle/cancellation/fault/timer vectors derive from production sources,
+not imported native test fixtures or executable formula ledgers.
+
+**Measured scope:** V1 **539**, runtime **596/596**, unchanged non-V1 **57**.
+Exact workspace discovery: **954 = 908 ordinary + 41 PostgreSQL + 3 KinD +
+2 build-only**; ordinary slices **227/227/227/227**, PostgreSQL **11/13/8/9**.
+Workspace check/Clippy, no-default/API/privacy, doctests and exact inventory gates
+pass. See the [ledger](sf-v1-port-ledger.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11)
+and [selector](testing.md#sf-v1-buildidle-lifecycle-slice).
+
+Registry metadata retains weak manager/provider-driver handles; dropping the
+operation is abandonment, not successful drain. Successful builds remain idle;
+the future primary coordinator owns ongoing ordinary session timers/ingress
+after this build driver finishes. Full role/primary/secondary integration,
+cross-receiver/provider drains, slow-peer/promotion policy, provider monitoring,
+host health and P4/P5 adapters/activation remain pending. No protected/public
+API, selected production path, dependencies, native utilities/harness,
+native/differential/hosted/provider-fsync parity, full ordinary execution or
+full P2/P3 completion claim.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

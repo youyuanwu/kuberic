@@ -107,8 +107,26 @@ native demux lookup only after caller-owned idle-role admission. Explicit privat
 errors replace malformed-input assertions, and -1 is a private error token, not
 native HRESULT interoperability. Tests use actual receivers/senders, provider
 trait implementations and a real tonic connection, not a native harness.
-Full BuildIdle/session/role/drain and provider-monitoring owners remain pending;
+At that slice boundary, full BuildIdle/session/role/drain and provider-monitoring
+owners remained pending;
 all components remain private and production-unselected.
+
+The private build_idle.rs and its component tests translate selected
+PrimaryReplicator.BuildIdleAsyncOperation.cpp lifecycle responsibilities,
+ReplicaManager.cpp admission/removal/close and ReplicationQueueManager.cpp
+classic pending-build selection at the same pin. The existing manager, queue,
+establishment, session and CopySender remain the actual owners; no second
+algorithm or sender is introduced. Rust futures, weak driver/manager references,
+rooted lifecycle metadata and outside-guard effects replace COM/Threadpool/
+Begin-End lifetime plumbing. StartCopy is published during admission before
+callbacks can remove the replica. Already-selected sends may survive removal,
+but retries and pending build success do not. Explicit malformed-ACK checks
+reuse CopySender normalization before session coalescing; timer wakeups resample
+deadlines after ingress or enqueue. Tests execute these actual Rust components
+and protected provider implementations, not native binaries or the native
+harness. Full role/cross-receiver drain composition, slow-peer/promotion policy,
+host health reporting and provider monitoring remain pending. All components
+remain private and production-unselected.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 

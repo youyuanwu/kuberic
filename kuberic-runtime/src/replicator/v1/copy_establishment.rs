@@ -36,7 +36,7 @@ use super::copy_sender::{CopySender, CopySenderHandle};
 use super::operation_queue::QueueOperation;
 use super::received_operation::ReceivedOperation;
 use super::secondary_receiver::{ReceiverConfig, ReceiverError, SecondaryReceiver};
-use super::session::{AckProcessor, AckUpdate, ReplicationSession};
+use super::session::{AckProcessor, AckUpdate, ReplicationSession, SessionSendBatch};
 use super::transport::{ProtocolError, Route, wire};
 
 type CopySend = Arc<dyn Fn(CopySendAction) -> bool + Send + Sync>;
@@ -99,6 +99,7 @@ struct PrimaryState {
     start: Option<Lsn>,
     established: Option<Result<(), EstablishError>>,
     closed: bool,
+    build_cancelled: bool,
     context: Option<CopyContextReceiver>,
 }
 
@@ -151,12 +152,34 @@ impl PrimaryEstablishmentHandle {
         self.0.upgrade().ok_or(EstablishError::OwnerDropped)
     }
 
+    pub(super) fn is_established(&self) -> Result<bool, EstablishError> {
+        let root = self.root()?;
+        let established = root
+            .state
+            .lock()
+            .unwrap()
+            .established
+            .as_ref()
+            .is_some_and(Result::is_ok);
+        Ok(established)
+    }
+
     pub(super) fn cancel(&self) -> Result<(), EstablishError> {
         let root = self.root()?;
         root.state.lock().unwrap().closed = true;
         root.cleanup_context(-1)?;
         root.copy.finish(CopyError::Cancelled)?;
         root.session.close_start_copy();
+        root.wake.notify_one();
+        Ok(())
+    }
+
+    /// BuildIdle OnCancel only breaks context consumption. Session removal uses
+    /// `cancel` instead; neither operation fabricates provider callback drain.
+    pub(super) fn request_build_cancel(&self) -> Result<(), EstablishError> {
+        let root = self.root()?;
+        root.state.lock().unwrap().build_cancelled = true;
+        root.cleanup_context(-1)?;
         root.wake.notify_one();
         Ok(())
     }
@@ -221,6 +244,14 @@ impl PrimaryEstablishmentHandle {
         &self,
         envelope: &wire::Envelope,
     ) -> Result<Option<AckProcessor>, EstablishError> {
+        self.receive_ack_with_progress(envelope, None)
+    }
+
+    pub(super) fn receive_ack_with_progress(
+        &self,
+        envelope: &wire::Envelope,
+        progress: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<Option<AckProcessor>, EstablishError> {
         let root = self.root()?;
         inbound(&root.route, envelope)?;
         let Some(wire::envelope::Body::ReplicationAck(body)) = &envelope.body else {
@@ -261,7 +292,7 @@ impl PrimaryEstablishmentHandle {
                 process_copy: true,
                 message_id: envelope.message_id.clone(),
             },
-            None,
+            progress,
         ))
     }
 
@@ -332,6 +363,7 @@ impl PrimaryEstablishment {
                     start: None,
                     established: None,
                     closed: false,
+                    build_cancelled: false,
                     context: context_receiver,
                 }),
                 wake: Notify::new(),
@@ -356,6 +388,15 @@ impl PrimaryEstablishment {
     /// Caller supplies the frozen classic committed boundary + 1, not latest
     /// issued progress or the EOF replication completion target.
     pub(super) fn begin(&mut self, replication_start: Lsn) -> Result<(), EstablishError> {
+        self.prepare_begin(replication_start)?.dispatch();
+        Ok(())
+    }
+
+    /// Publish under the admission guard; dispatch only after releasing it.
+    pub(super) fn prepare_begin(
+        &mut self,
+        replication_start: Lsn,
+    ) -> Result<SessionSendBatch, EstablishError> {
         if replication_start <= 0 || replication_start == Lsn::MAX {
             return Err(EstablishError::InvalidStart);
         }
@@ -374,8 +415,7 @@ impl PrimaryEstablishment {
                 self.root.clock.now(),
             )
         };
-        batch.dispatch();
-        Ok(())
+        Ok(batch)
     }
 
     /// Only acquires the provider stream and begins the actual CopySender.
@@ -397,6 +437,9 @@ impl PrimaryEstablishment {
                 }
                 let start = state.start.ok_or(EstablishError::NotStarted)?;
                 if let Some(result) = &state.established {
+                    if state.build_cancelled && self.acquisition.is_none() {
+                        return Err(EstablishError::Cancelled);
+                    }
                     result.clone()?;
                     break start;
                 }
@@ -466,10 +509,13 @@ impl PrimaryEstablishment {
 
     pub(super) fn end_copy(&self) -> Result<CopyEnd, EstablishError> {
         let end = self.copy.handle().end()?;
-        self.root.session.close_start_copy();
-        self.root
-            .cleanup_context(if end.result.is_ok() { 0 } else { -1 })?;
+        self.cleanup(if end.result.is_ok() { 0 } else { -1 })?;
         Ok(end)
+    }
+
+    pub(super) fn cleanup(&self, error: i32) -> Result<(), EstablishError> {
+        self.root.session.close_start_copy();
+        self.root.cleanup_context(error)
     }
 }
 

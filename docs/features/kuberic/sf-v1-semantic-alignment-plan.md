@@ -45,8 +45,11 @@ pending-target retarget and disabled-completion behavior (47 actual tests,
 453 combined V1). The [copy-establishment slice](sf-v1-port-ledger.md#copy-establishment-slice-p3-bounded-f04f05f07f08f11)
 adds reliable StartCopy, bound identity/epoch admission and protected target
 GetCopyContext/source GetCopyState acquisition using the existing components
-(45 actual tests, 498 combined V1). These supersede the preceding slice-boundary
-omissions, not the pending full BuildIdle/session/role/drain/policy owners.
+(45 actual tests, 498 combined V1). The [BuildIdle lifecycle slice](sf-v1-port-ledger.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11)
+adds idle-session admission, classic frozen-boundary/pending replication capture,
+ordered build orchestration and removal/cancellation/completion cleanup
+(41 actual tests, 539 combined V1). These supersede the preceding slice-boundary
+omissions, not the pending full primary/secondary/session/role/drain/policy owners.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -409,8 +412,9 @@ substrate slices; P3 has bounded primary queue/quorum, secondary receiver/ACK,
 secondary-copy, primary-side copy-context receipt and copy/context stream
 enumeration/reliable-send and CopySender build-gate/EOF-issued-target/retarget
 ownership cores, with bounded provider/context acquisition and reliable StartCopy
-identity/epoch establishment. Full build/idle-session admission and boundary
-selection, remaining session policies and primary/
+identity/epoch establishment and bounded BuildIdle/idle-session admission,
+classic boundary/pending-replication capture, ordered orchestration and
+removal/cancellation/completion cleanup. Remaining session policies and primary/
 secondary/role integration are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.

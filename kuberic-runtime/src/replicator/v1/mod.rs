@@ -2,6 +2,7 @@
 mod ack;
 mod async_runtime;
 mod buffers;
+mod build_idle;
 mod copy_async_operation;
 mod copy_context_receiver;
 mod copy_establishment;

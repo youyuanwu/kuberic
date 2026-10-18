@@ -11,9 +11,10 @@
 //! supplies their logical replica IDs and serializes these `&mut self` calls.
 //! Session identity is checked, but this is not transport authentication.
 //!
-//! Native session creation/build lookup, CopySender promotion, reported faults,
-//! slow-replica exclusion, notification scheduling and role/queue transfer remain
-//! missing owners. No flag here declares copy/build/fault processing successful.
+//! BuildIdle owns fresh-session creation and registers its actual copy target
+//! and cancellation here. CopySender promotion, slow-replica exclusion, host
+//! fault reporting, notification scheduling and role/queue transfer remain
+//! missing owners. No flag here declares those responsibilities successful.
 //! Deliver returned effects after releasing the owner's guard. ACK processors
 //! must retain their ordered copy handoffs; call `update_progress` when their
 //! primary-progress handoff is delivered, not on raw ACK ingress.
@@ -27,10 +28,14 @@ use crate::application::{Lsn, OperationData};
 use crate::protocol::types::Epoch;
 
 use super::buffers::{BufferLimits, BufferPolicy};
+use super::build_idle::BuildIdleHandle;
+use super::copy_async_operation::CopyFault;
+use super::copy_establishment::PrimaryEstablishment;
 use super::operation_queue::QueueConfig;
 use super::replication_queue_manager::{QueueAdmissionError, QueueUpdate, ReplicationQueueManager};
 use super::sender::{SenderOperation, SenderProgress};
-use super::session::ReplicationSession;
+use super::session::{ReplicationSession, SessionIdentity, SessionSendBatch};
+use super::transport::Route;
 
 #[derive(Clone)]
 #[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 membership seam"))]
@@ -115,6 +120,12 @@ pub(super) enum ManagerError {
         latest: Lsn,
     },
     CatchupAlreadyPending,
+    BuildLifecycle(String),
+    BuildProgress(String),
+    ReportedFault {
+        description: &'static str,
+        error: String,
+    },
 }
 
 impl From<ConfigurationError> for ManagerError {
@@ -175,6 +186,8 @@ pub(super) struct ManagerEffects {
     /// A malformed session cursor can prevent close's final cap-release update.
     /// Shutdown still drains every waiter with an explicit terminal result.
     pub(super) close_progress_error: Option<ManagerError>,
+    build_cancellations: Vec<BuildIdleHandle>,
+    build_wakes: Vec<BuildIdleHandle>,
 }
 
 #[cfg_attr(
@@ -201,11 +214,22 @@ impl ManagerEffects {
                 SessionEffect::Close(session) => session.close(),
             }
         }
+        for build in self.build_wakes {
+            build.wake_timers();
+        }
         for (completion, result) in self.completions {
             // A dropped waiter does not roll back its already admitted operation.
             let _ = completion.send(result);
         }
-        self.close_progress_error.map_or(Ok(()), Err)
+        let mut error = self.close_progress_error;
+        for build in self.build_cancellations {
+            if let Err(failure) = build.cancel_for_removal()
+                && error.is_none()
+            {
+                error = Some(ManagerError::BuildLifecycle(failure.to_string()));
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 }
 
@@ -243,6 +267,8 @@ pub(super) struct ReplicaManager {
     current: Option<ReplicaSet>,
     previous: Option<ReplicaSet>,
     idle: Vec<EstablishedIdle>,
+    builds: BTreeMap<i64, BuildIdleHandle>,
+    build_fault: Option<CopyFault>,
     catchup_configuration: bool,
     // Native majorityReplicasApplyAckedLSNinCC_/allReplicasApplyAckedLSNinCC_.
     // Sampling sender state alone must not bypass the ordered primary handoff.
@@ -294,6 +320,8 @@ impl ReplicaManager {
             current: None,
             previous: None,
             idle: Vec::new(),
+            builds: BTreeMap::new(),
+            build_fault: None,
             catchup_configuration: false,
             cached_current: None,
             pending: BTreeMap::new(),
@@ -315,6 +343,54 @@ impl ReplicaManager {
 
     pub(super) fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    pub(super) fn last_sequence_number(&self) -> Result<Lsn, ManagerError> {
+        self.ensure_active()?;
+        Ok(self.queue.last_sequence_number())
+    }
+
+    pub(super) fn build_fault(&self) -> Option<&CopyFault> {
+        self.build_fault.as_ref()
+    }
+
+    pub(super) fn report_build_fault(&mut self, fault: CopyFault) {
+        if self.build_fault.is_none() {
+            self.build_fault = Some(fault);
+        }
+    }
+
+    pub(super) fn build_handle(&self, replica_id: i64) -> Option<BuildIdleHandle> {
+        self.builds.get(&replica_id).cloned()
+    }
+
+    pub(super) fn build_identity(
+        &self,
+        route: &Route,
+        remote_incarnation: i64,
+    ) -> Result<(SessionIdentity, Epoch), ManagerError> {
+        self.ensure_active()?;
+        if let Some(fault) = &self.build_fault {
+            return Err(ManagerError::ReportedFault {
+                description: fault.description,
+                error: fault.error.to_string(),
+            });
+        }
+        if route.source.replica != self.local_replica_id
+            || route.sender_address != self.primary_endpoint
+        {
+            return Err(
+                ConfigurationError::InvalidSessionIdentity(route.destination.replica).into(),
+            );
+        }
+        Ok((
+            SessionIdentity {
+                primary_endpoint: route.sender_address.clone(),
+                remote_endpoint: route.remote_address.clone(),
+                remote_incarnation,
+            },
+            self.epoch,
+        ))
     }
 
     fn established_sessions(&self) -> BTreeMap<i64, ReplicationSession> {
@@ -511,6 +587,18 @@ impl ReplicaManager {
                 effects.sessions.push(SessionEffect::Close(session));
             }
         }
+        let leaving_idle: Vec<_> = self
+            .builds
+            .keys()
+            .filter(|id| !self.idle.iter().any(|idle| idle.replica_id == **id))
+            .copied()
+            .collect();
+        for id in leaving_idle {
+            let build = self.builds.remove(&id).unwrap();
+            if !new_sessions.contains_key(&id) {
+                effects.build_cancellations.push(build);
+            }
+        }
         self.current = Some(configuration.current);
         self.previous = configuration.previous;
         self.catchup_configuration = configuration.catchup_configuration;
@@ -520,12 +608,7 @@ impl ReplicaManager {
         Ok(effects)
     }
 
-    /// Bounded native TryAddIdleReplica replay mode: replication starts at the
-    /// committed LSN + 1. StartCopy/copy-until-latest selection is not implemented.
-    pub(super) fn add_established_idle(
-        &mut self,
-        idle: EstablishedIdle,
-    ) -> Result<ManagerEffects, ManagerError> {
+    fn prepare_idle(&self, idle: &EstablishedIdle) -> Result<(Lsn, ManagerEffects), ManagerError> {
         self.ensure_active()?;
         self.validate_session(idle.replica_id, &idle.session)?;
         let sessions = self.established_sessions();
@@ -539,11 +622,9 @@ impl ReplicaManager {
         {
             return Err(ConfigurationError::InvalidCopyTarget(idle.replica_id).into());
         }
-        let mut operations = Vec::new();
-        let first = self.queue.current_progress().checked_add(1);
-        if !first.is_some_and(|first| self.queue.get_operations(first, &mut operations)) {
+        let Some((first, operations)) = self.queue.pending_for_build() else {
             return Err(ConfigurationError::MissingCurrentReplay(idle.replica_id).into());
-        }
+        };
         let mut effects = ManagerEffects::default();
         if !operations.is_empty() {
             effects.sessions.push(SessionEffect::Replay {
@@ -552,8 +633,38 @@ impl ReplicaManager {
                 completed_hint: self.queue.first_lsn_in_replication_queue() - 1,
             });
         }
+        Ok((first, effects))
+    }
+
+    /// Caller-established seam retained for isolated quorum scenarios.
+    pub(super) fn add_established_idle(
+        &mut self,
+        idle: EstablishedIdle,
+    ) -> Result<ManagerEffects, ManagerError> {
+        let (_, effects) = self.prepare_idle(&idle)?;
         self.idle.push(idle);
         Ok(effects)
+    }
+
+    pub(super) fn admit_build(
+        &mut self,
+        idle: EstablishedIdle,
+        build: BuildIdleHandle,
+        establishment: &mut PrimaryEstablishment,
+    ) -> Result<(ManagerEffects, SessionSendBatch), ManagerError> {
+        if let Some(fault) = &self.build_fault {
+            return Err(ManagerError::ReportedFault {
+                description: fault.description,
+                error: fault.error.to_string(),
+            });
+        }
+        let (first, effects) = self.prepare_idle(&idle)?;
+        let start = establishment
+            .prepare_begin(first)
+            .map_err(|error| ManagerError::BuildLifecycle(error.to_string()))?;
+        self.builds.insert(idle.replica_id, build);
+        self.idle.push(idle);
+        Ok((effects, start))
     }
 
     pub(super) fn remove_idle(&mut self, replica_id: i64) -> Result<ManagerEffects, ManagerError> {
@@ -574,6 +685,9 @@ impl ReplicaManager {
         )?;
         self.idle = retained_idle;
         let mut effects = ManagerEffects::default();
+        if let Some(build) = self.builds.remove(&replica_id) {
+            effects.build_cancellations.push(build);
+        }
         if !self.established_sessions().contains_key(&replica_id) {
             effects.sessions.push(SessionEffect::Close(idle.session));
         }
@@ -626,6 +740,7 @@ impl ReplicaManager {
                 completed_hint: hint,
             });
         }
+        effects.build_wakes.extend(self.builds.values().cloned());
         Ok(Admission {
             operation,
             completion: receiver,
@@ -688,10 +803,13 @@ impl ReplicaManager {
         for idle in idle {
             // ReplicationSession.cpp:285-326, from one checked sender snapshot.
             let progress = self.sample_progress(idle.replica_id, &idle.session)?;
-            completed = min_progress(
-                completed,
-                Some(progress.idle_progress(idle.finish_copy_target)),
-            );
+            let target = match self.builds.get(&idle.replica_id) {
+                Some(build) => build
+                    .finish_copy_target()
+                    .map_err(|error| ManagerError::BuildProgress(error.to_string()))?,
+                None => idle.finish_copy_target,
+            };
+            completed = min_progress(completed, Some(progress.idle_progress(target)));
         }
         if let Some(previous) = previous {
             if !Self::has_enough_replicas(previous) {
@@ -871,6 +989,9 @@ impl ReplicaManager {
                 .into_values()
                 .map(SessionEffect::Close),
         );
+        effects
+            .build_cancellations
+            .extend(std::mem::take(&mut self.builds).into_values());
         effects
     }
 }

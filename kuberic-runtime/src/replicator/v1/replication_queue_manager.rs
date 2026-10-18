@@ -326,6 +326,20 @@ impl ReplicationQueueManager {
         found
     }
 
+    /// Classic V1 cpp:165-194, without the separate V2 copy-until-latest probe.
+    pub(super) fn pending_for_build(&self) -> Option<(Lsn, Vec<SenderOperation>)> {
+        let first = self
+            .current_progress()
+            .max(self.previous_config_quorum_lsn)
+            .checked_add(1)?;
+        if first == Lsn::MAX {
+            return None;
+        }
+        let mut operations = Vec::new();
+        self.get_operations(first, &mut operations)
+            .then_some((first, operations))
+    }
+
     /// Call only when capturing a configuration boundary, not on each write.
     pub(super) fn update_catchup_completion_lsn(&mut self) {
         self.previous_config_catchup_lsn = self

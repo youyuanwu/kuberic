@@ -42,6 +42,53 @@ fn enqueue(queue: &mut ReplicationQueueManager, data: &'static [u8]) -> SenderOp
 }
 
 #[test]
+fn build_snapshot_uses_committed_boundary_and_retains_original_pending_entries() {
+    let mut queue = ReplicationQueueManager::new(config(), 7);
+    let first = enqueue(&mut queue, b"pending");
+    let second = enqueue(&mut queue, b"later");
+    let (start, pending) = queue.pending_for_build().unwrap();
+    assert_eq!(start, 8);
+    assert_eq!(pending.len(), 2);
+    assert!(Arc::ptr_eq(&pending[0].operation, &first.operation));
+    assert!(Arc::ptr_eq(&pending[1].operation, &second.operation));
+    assert_eq!(pending[0].original_epoch, Epoch::new(1, 2));
+    queue.update_queue(Some(8), Some(8)).unwrap();
+    assert_eq!(start, 8);
+    assert_eq!(pending[0].operation.data().as_ref(), b"pending");
+    assert_eq!(queue.pending_for_build().unwrap().0, 9);
+}
+
+#[test]
+fn build_snapshot_honors_native_previous_quorum_floor() {
+    let mut queue = ReplicationQueueManager::new(config(), 0);
+    for _ in 0..4 {
+        enqueue(&mut queue, b"pending");
+    }
+    // Production-derived queue-state vector; role transfer is not executed.
+    queue.previous_config_quorum_lsn = 2;
+    let (start, pending) = queue.pending_for_build().unwrap();
+    assert_eq!(start, 3);
+    assert_eq!(
+        pending
+            .iter()
+            .map(|entry| entry.operation.lsn())
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
+    assert_eq!(queue.current_progress(), 0);
+}
+
+#[test]
+fn build_snapshot_accepts_empty_tail_and_rejects_exhausted_cursor() {
+    let queue = ReplicationQueueManager::new(config(), 4);
+    let (start, pending) = queue.pending_for_build().unwrap();
+    assert_eq!(start, 5);
+    assert!(pending.is_empty());
+    let queue = ReplicationQueueManager::new(config(), Lsn::MAX - 1);
+    assert!(queue.pending_for_build().is_none());
+}
+
+#[test]
 fn successful_assignment_is_immediate_but_not_committed_or_completed() {
     let mut queue = ReplicationQueueManager::new(config(), 40);
     assert_eq!(queue.current_progress(), 40);
