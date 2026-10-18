@@ -222,10 +222,12 @@ impl OwnedProcess {
                 PgError::Process(format!("retain PostgreSQL exit observer: {error}"))
             })
         };
-        let supervisor = AsyncFd::new(duplicate(0)?).map_err(|error| {
+        // SAFETY: AsyncFd owns the duplicated pidfd; it is never replaced or closed separately.
+        let supervisor = unsafe { AsyncFd::register(duplicate(0)?) }.map_err(|error| {
             PgError::Process(format!("register PostgreSQL supervisor observer: {error}"))
         })?;
-        let postmaster = AsyncFd::new(duplicate(postmaster)?).map_err(|error| {
+        // SAFETY: AsyncFd owns the duplicated pidfd; it is never replaced or closed separately.
+        let postmaster = unsafe { AsyncFd::register(duplicate(postmaster)?) }.map_err(|error| {
             PgError::Process(format!("register PostgreSQL postmaster observer: {error}"))
         })?;
         Ok(ProcessExitObserver {
