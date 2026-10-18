@@ -12,6 +12,7 @@ mod operation_stream;
 mod received_operation;
 mod replica_manager;
 mod replication_queue_manager;
+mod secondary;
 mod secondary_copy_receiver;
 mod secondary_receiver;
 mod sender;

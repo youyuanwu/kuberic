@@ -12,7 +12,8 @@ not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
-copy-receiver, enumeration, CopySender build-gate, copy-establishment and BuildIdle lifecycle slices have
+copy-receiver, enumeration, CopySender build-gate, copy-establishment, BuildIdle
+and secondary lifecycle slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -41,18 +42,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 908 |
+| ordinary | 949 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **954** |
+| **total** | **995** |
 
-Ordinary partition counts are `227, 227, 227, 227`. PostgreSQL partition counts
+Ordinary partition counts are `238, 237, 237, 237`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the BuildIdle lifecycle slice: 954 =
-908 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the secondary lifecycle slice: 995 =
+949 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -473,6 +474,47 @@ native execution, differential/hosted parity and provider-fsync are not run
 or claimed. Earlier slice counts/exclusions are historical boundaries.
 See the [ledger](sf-v1-port-ledger.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11)
 and [provenance](sf-v1-port-provenance.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11).
+
+### SF V1 Secondary Lifecycle Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::secondary::) or test(replicator::v1::operation_stream::tests::lifecycle_)' -j 2
+```
+
+This slice adds **41 actual tests**: 39 secondary lifetime cases and two
+shared-dispatch lifecycle observations. Combined V1 is **580**, runtime
+**637** including 57 unchanged non-V1 cases. Current discovery is **995 =
+949 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**, with ordinary slices
+**238/237/237/237** and unchanged PostgreSQL hashes **11/13/8/9**.
+
+Actual components exercise shared StartCopy initialization, required/optimistic
+service ACKs, context acquisition/sender completion and retries, provider epoch
+calls from full ACK barriers versus stream markers, matching completion and
+cross-receiver fault cleanup. Legacy Close aborts dispatch without waiting for
+held data ACKs or pending GetCopyContext; EOS Close drains initialized copy then
+replication streams, including required EOS ACKs, before context/epoch waits.
+Uninitialized streams use native abort bypass. Incomplete copy clears unpumped
+replication before EOS. A failed copy drain returns its error without waiting
+for replication/provider drainage; subsequent Abort still waits actual pending
+provider calls. Actual provider faults retain their distinct aftermath and
+remain observable separately from Close/Abort results.
+
+Pinned driver futures and paused Tokio time exercise new ACK deadline
+resampling, live progress snapshots and context retry continuity. Reentrant ACK
+and provider callbacks execute outside guards. Interrupted driver polls retain
+actual provider futures, and cleanup callback tokens retain the provider without
+root/receiver cycles. Dropping the explicit owner is abandonment, not drain.
+Neither Close nor Abort claims arbitrary in-flight provider GetNext drainage.
+
+The owner is private/unselected; typed data ingress assumes caller-owned
+route/epoch admission. Full primary/session/role orchestration, external epoch
+reconfiguration, promotion, slow-peer policy, provider monitoring/host health
+and P4/P5 adapters/activation remain pending. Full ordinary execution,
+PostgreSQL/KinD bodies, native execution, differential/hosted parity and
+provider-fsync are not run or claimed. Earlier counts/exclusions remain
+historical. See the [ledger](sf-v1-port-ledger.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11)
+and [provenance](sf-v1-port-provenance.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11).
 
 ### Built-In Service Operation Delivery
 

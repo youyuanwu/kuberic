@@ -124,9 +124,28 @@ but retries and pending build success do not. Explicit malformed-ACK checks
 reuse CopySender normalization before session coalescing; timer wakeups resample
 deadlines after ingress or enqueue. Tests execute these actual Rust components
 and protected provider implementations, not native binaries or the native
-harness. Full role/cross-receiver drain composition, slow-peer/promotion policy,
-host health reporting and provider monitoring remain pending. All components
+harness. At that slice boundary, full role/cross-receiver drain composition,
+slow-peer/promotion policy, host health reporting and provider monitoring
+remained pending. All components
 remain private and production-unselected.
+
+The private secondary.rs and its component tests translate selected ordinary
+Close/EndClose/Abort and provider/receiver lifetime responsibilities from
+SecondaryReplicator.cpp, SecondaryReplicator.CloseAsyncOperation.cpp,
+SecondaryReplicator.CloseAsyncOperation2.cpp,
+SecondaryReplicator.DrainQueueAsyncOperation.cpp and
+OperationStream.GetOperationAsyncOperation.cpp at the same pin. Actual existing
+receiver, establishment, context-sender and ACK components remain the owners.
+Retained Rust provider futures, shared dispatch initialization/drain snapshots,
+weak ingress and outside-guard Notify wakes replace COM/job/manual-reset-event
+plumbing. Cleanup callback tokens retain the actual provider without a
+receiver/root cycle. Legacy containment, EOS initialized-stream drain, distinct
+provider/stream fault aftermath and independent Abort are not conflated. Tests
+execute actual Rust components and protected provider implementations, not a
+native harness. Primary/session/role orchestration, external epoch
+reconfiguration, promotion, monitoring/health and production activation remain
+pending; arbitrary provider GetNext drainage is not asserted. Components remain
+private and production-unselected.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 

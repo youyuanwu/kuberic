@@ -108,6 +108,51 @@ fn empty_open_is_pending_and_close_is_permanent_eof() {
 }
 
 #[test]
+fn lifecycle_snapshot_observes_initialization_without_consuming_data() {
+    let queue = SharedDispatchQueue::new();
+    assert!(!queue.snapshot().initialized);
+    assert!(queue.snapshot().drained);
+    let operation = operation(1);
+    queue
+        .append(vec![DispatchEntry::Operation(operation.clone())])
+        .unwrap()
+        .dispatch();
+    assert!(!queue.snapshot().drained);
+    let mut stream = queue.stream();
+    assert!(queue.snapshot().initialized);
+    let wake = Arc::new(WakeCount::default());
+    assert!(take_operation(poll(&mut stream, &wake)).same_instance(&operation));
+    assert!(queue.snapshot().drained);
+    // An empty open queue is drained, but not at EOF.
+    pending(&mut stream, &wake);
+    drop(stream);
+    assert!(queue.snapshot().initialized);
+}
+
+#[test]
+fn lifecycle_clear_pending_preserves_an_inflight_epoch_handoff() {
+    let queue = SharedDispatchQueue::new();
+    queue
+        .append(vec![
+            DispatchEntry::UpdateEpoch(barrier()),
+            DispatchEntry::Operation(operation(1)),
+        ])
+        .unwrap()
+        .dispatch();
+    let mut stream = queue.stream();
+    let wake = Arc::new(WakeCount::default());
+    assert_eq!(take_barrier(poll(&mut stream, &wake)), barrier());
+    queue.clear_pending().dispatch();
+    assert!(!queue.snapshot().drained);
+    assert_eq!(queue.blocked_epoch(), Some(barrier()));
+    queue.close().dispatch();
+    pending(&mut stream, &wake);
+    queue.finish_epoch(barrier()).unwrap().dispatch();
+    assert!(queue.snapshot().drained);
+    eof(&mut stream, &wake);
+}
+
+#[test]
 fn clones_and_reacquired_handles_share_consumption_without_replay() {
     let queue = SharedDispatchQueue::new();
     let other_owner = queue.clone();

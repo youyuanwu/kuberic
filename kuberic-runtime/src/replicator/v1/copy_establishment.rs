@@ -4,7 +4,7 @@
 // Source-guided translation of RemoteSession.EstablishCopyAsyncOperation.cpp,
 // RemoteSession.cpp:252-365,683-756, PrimaryReplicator.cpp:550-705,
 // PrimaryReplicator.BuildIdleAsyncOperation.cpp:84-166,185-214 and
-// SecondaryReplicator.cpp:915-1123, microsoft/service-fabric
+// SecondaryReplicator.cpp:862-1123, microsoft/service-fabric
 // @3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d, Reliability/Replication/.
 
 //! Private establishment/acquisition owners, not full BuildIdle or role owners.
@@ -522,7 +522,7 @@ impl PrimaryEstablishment {
 struct SecondaryState {
     active: bool,
     epoch: Option<Epoch>,
-    receiver: SecondaryReceiver,
+    receiver: Arc<Mutex<SecondaryReceiver>>,
     error: i32,
 }
 
@@ -586,6 +586,8 @@ impl SecondaryEstablishmentHandle {
             } else {
                 state
                     .receiver
+                    .lock()
+                    .unwrap()
                     .initialize(body.replication_start, epoch)
                     .map_err(|error| EstablishError::Receiver(Arc::new(error)))?;
                 state.epoch = Some(epoch);
@@ -631,6 +633,7 @@ pub(super) struct SecondaryEstablishment {
     clock: Clock,
     acquisition: Option<Acquire>,
     acquisition_result: Option<Result<(), EstablishError>>,
+    report_fault: Option<Arc<dyn Fn(EstablishError) + Send + Sync>>,
     copy: CopySender,
 }
 
@@ -643,27 +646,49 @@ impl SecondaryEstablishment {
         force_ack: Arc<dyn Fn(i32) + Send + Sync>,
         clock: Clock,
     ) -> Result<Self, EstablishError> {
+        Self::with_receiver(
+            route,
+            Arc::new(Mutex::new(SecondaryReceiver::new(receiver))),
+            config,
+            provider,
+            force_ack,
+            None,
+            clock,
+        )
+    }
+
+    pub(super) fn with_receiver(
+        route: Route,
+        receiver: Arc<Mutex<SecondaryReceiver>>,
+        config: CopyConfig,
+        provider: Arc<dyn StateProvider>,
+        force_ack: Arc<dyn Fn(i32) + Send + Sync>,
+        report_fault: Option<Arc<dyn Fn(EstablishError) + Send + Sync>>,
+        clock: Clock,
+    ) -> Result<Self, EstablishError> {
         route.validate()?;
         config.validate()?;
+        let persisted = receiver.lock().unwrap().has_persisted_state();
         let copy = CopySender::new(false);
         Ok(Self {
             root: Arc::new(SecondaryRoot {
                 state: Mutex::new(SecondaryState {
                     active: true,
                     epoch: None,
-                    receiver: SecondaryReceiver::new(receiver),
+                    receiver,
                     error: 0,
                 }),
                 route,
                 copy: copy.handle(),
                 force_ack,
             }),
-            persisted: receiver.has_persisted_state,
+            persisted,
             provider,
             config,
             clock,
             acquisition: None,
             acquisition_result: None,
+            report_fault,
             copy,
         })
     }
@@ -697,18 +722,22 @@ impl SecondaryEstablishment {
         self.acquisition = None;
         let result = match result {
             Err(error) => {
+                let error = EstablishError::Provider {
+                    description: "GetCopyContext",
+                    error: Arc::new(error),
+                };
                 let active = {
                     let mut state = self.root.state.lock().unwrap();
                     state.error = -1; // Private error token, not an HRESULT mapping.
                     state.active
                 };
+                if let Some(report_fault) = &self.report_fault {
+                    report_fault(error.clone());
+                }
                 if active {
                     (self.root.force_ack)(-1);
                 }
-                Err(EstablishError::Provider {
-                    description: "GetCopyContext",
-                    error: Arc::new(error),
-                })
+                Err(error)
             }
             Ok(provider) => {
                 let active = self.root.state.lock().unwrap().active;
