@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::application::{Lsn, OperationData};
 
+use super::buffers::{self, BufferError, BufferLimits, BufferPolicy};
+
 /// Minimal operation dependency, not the received-operation ACK state machine.
 /// The owner supplies numbered data and its current completion-blocking state.
 /// Releasing that state is not a provider-persistence or quorum assertion.
@@ -29,6 +31,8 @@ use crate::application::{Lsn, OperationData};
 pub(super) struct QueueOperation {
     lsn: Lsn,
     data: OperationData,
+    logical_bytes: usize,
+    representation: BufferPolicy,
     needs_ack: AtomicBool,
 }
 
@@ -43,9 +47,30 @@ impl QueueOperation {
     pub(super) fn new(lsn: Lsn, data: OperationData, needs_ack: bool) -> Arc<Self> {
         Arc::new(Self {
             lsn,
+            logical_bytes: data.len(),
             data,
+            representation: BufferPolicy::RawSingle,
             needs_ack: AtomicBool::new(needs_ack),
         })
+    }
+
+    /// Framed adapter bytes are representation overhead, not native DataSize.
+    pub(super) fn from_data(
+        lsn: Lsn,
+        data: OperationData,
+        needs_ack: bool,
+        policy: BufferPolicy,
+        limits: BufferLimits,
+    ) -> Result<Arc<Self>, BufferError> {
+        let segments = buffers::decode(data.clone(), policy, limits)?;
+        let logical_bytes = buffers::payload_len(&segments, limits)?;
+        Ok(Arc::new(Self {
+            lsn,
+            data,
+            logical_bytes,
+            representation: policy,
+            needs_ack: AtomicBool::new(needs_ack),
+        }))
     }
 
     pub(super) fn lsn(&self) -> Lsn {
@@ -54,6 +79,14 @@ impl QueueOperation {
 
     pub(super) fn data(&self) -> &OperationData {
         &self.data
+    }
+
+    pub(super) fn logical_bytes(&self) -> usize {
+        self.logical_bytes
+    }
+
+    pub(super) fn representation(&self) -> BufferPolicy {
+        self.representation
     }
 
     pub(super) fn needs_ack(&self) -> bool {
@@ -320,8 +353,8 @@ impl OperationQueue {
         if op.lsn < self.progress.commit_head || self.entries.contains_key(&op.lsn) {
             return Err(EnqueueError::Duplicate);
         }
-        self.make_room(op.lsn, op.data.len())?;
-        self.total_bytes += op.data.len();
+        self.make_room(op.lsn, op.logical_bytes)?;
+        self.total_bytes += op.logical_bytes;
         self.progress.tail = self.progress.tail.max(op.lsn + 1);
         assert!(self.entries.insert(op.lsn, op).is_none());
         self.check_invariants();
@@ -361,7 +394,7 @@ impl OperationQueue {
                 if lsn < self.progress.tail {
                     let mut drop_start = self.progress.tail - 1;
                     while drop_start > lsn && pending_bytes > self.config.max_bytes {
-                        pending_bytes -= self.entries[&drop_start].data.len();
+                        pending_bytes -= self.entries[&drop_start].logical_bytes;
                         drop_start -= 1;
                         while drop_start >= self.progress.commit_head
                             && !self.entries.contains_key(&drop_start)
@@ -382,7 +415,7 @@ impl OperationQueue {
                 let mut clear_until = self.progress.retained_head;
                 while clear_until < self.progress.complete_head && new_bytes > self.config.max_bytes
                 {
-                    new_bytes -= self.entries[&clear_until].data.len();
+                    new_bytes -= self.entries[&clear_until].logical_bytes;
                     clear_until += 1;
                 }
                 assert!(new_bytes <= self.config.max_bytes);
@@ -603,10 +636,10 @@ impl OperationQueue {
         self.progress.complete_head += 1;
         if self.config.clean_on_complete {
             let op = self.entries.remove(&lsn).expect("completed operation");
-            self.total_bytes -= op.data.len();
+            self.total_bytes -= op.logical_bytes;
             self.progress.retained_head += 1;
         } else {
-            self.completed_bytes += self.entries[&lsn].data.len();
+            self.completed_bytes += self.entries[&lsn].logical_bytes;
             self.completed_count += 1;
             if self.should_trim() {
                 while self.should_trim() {
@@ -644,7 +677,7 @@ impl OperationQueue {
         let next = next.max(self.progress.retained_head);
         while self.progress.complete_head > next {
             self.progress.complete_head -= 1;
-            self.completed_bytes -= self.entries[&self.progress.complete_head].data.len();
+            self.completed_bytes -= self.entries[&self.progress.complete_head].logical_bytes;
             self.completed_count -= 1;
         }
         self.check_invariants();
@@ -697,9 +730,9 @@ impl OperationQueue {
 
     fn remove_item(&mut self, lsn: Lsn) {
         if let Some(op) = self.entries.remove(&lsn) {
-            self.total_bytes -= op.data.len();
+            self.total_bytes -= op.logical_bytes;
             if lsn < self.progress.complete_head {
-                self.completed_bytes -= op.data.len();
+                self.completed_bytes -= op.logical_bytes;
                 self.completed_count -= 1;
             }
         }

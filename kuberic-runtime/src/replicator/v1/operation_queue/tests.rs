@@ -25,6 +25,20 @@ fn operation(lsn: Lsn, bytes: usize) -> Arc<QueueOperation> {
     QueueOperation::new(lsn, Bytes::from(vec![lsn as u8; bytes]), false)
 }
 
+fn framed_operation(lsn: Lsn, bytes: usize) -> Arc<QueueOperation> {
+    let limits = BufferLimits {
+        max_segments: 3,
+        max_payload_bytes: 100,
+    };
+    let data = buffers::encode(
+        &[Bytes::new(), Bytes::from(vec![7; bytes]), Bytes::new()],
+        BufferPolicy::FramedSegments,
+        limits,
+    )
+    .unwrap();
+    QueueOperation::from_data(lsn, data, false, BufferPolicy::FramedSegments, limits).unwrap()
+}
+
 fn enqueue(queue: &mut OperationQueue, lsn: Lsn, bytes: usize) -> Arc<QueueOperation> {
     let op = operation(lsn, bytes);
     queue.try_enqueue(op.clone()).unwrap();
@@ -69,6 +83,87 @@ fn nonzero_progress_without_history_does_not_claim_retained_capability() {
     assert_eq!(queue.capacity(), 4);
     assert_eq!(queue.capacity_change_count(), 1);
     assert_eq!(queue.convergent_capacity(), 4);
+}
+
+#[test]
+fn framed_queue_admission_completion_rewind_and_trim_count_only_logical_payload() {
+    let mut queue = OperationQueue::new(
+        QueueConfig {
+            max_bytes: 10,
+            ..config()
+        },
+        1,
+        false,
+        false,
+    );
+    let first = framed_operation(1, 4);
+    assert!(first.data().len() > 10);
+    assert_eq!(first.logical_bytes(), 4);
+    queue.try_enqueue(first).unwrap();
+    queue.try_enqueue(framed_operation(2, 6)).unwrap();
+    assert_eq!(queue.total_bytes(), 10);
+    assert_eq!(
+        queue.try_enqueue(framed_operation(3, 1)),
+        Err(EnqueueError::Full)
+    );
+    assert!(queue.commit());
+    assert!(queue.complete());
+    assert_eq!(queue.completed_bytes(), 10);
+    assert!(queue.update_last_completed(1));
+    assert_eq!(queue.completed_bytes(), 4);
+    assert!(queue.complete());
+    assert!(queue.update_complete_head(2));
+    assert_eq!((queue.total_bytes(), queue.completed_bytes()), (6, 6));
+    queue.try_enqueue(framed_operation(3, 4)).unwrap();
+    assert_eq!(queue.total_bytes(), 10);
+    queue.discard_noncompleted();
+    assert_eq!((queue.total_bytes(), queue.completed_bytes()), (6, 6));
+    queue.reset(20);
+    assert_eq!((queue.total_bytes(), queue.completed_bytes()), (0, 0));
+    assert_eq!(queue.operation_count(), 0);
+}
+
+#[test]
+fn framed_clean_completion_and_suffix_displacement_do_not_subtract_frame_overhead() {
+    let mut queue = OperationQueue::new(
+        QueueConfig {
+            max_bytes: 10,
+            clean_on_complete: true,
+            ..config()
+        },
+        1,
+        false,
+        false,
+    );
+    queue.try_enqueue(framed_operation(1, 4)).unwrap();
+    queue.try_enqueue(framed_operation(3, 6)).unwrap();
+    queue.try_enqueue(framed_operation(2, 6)).unwrap();
+    assert!(queue.get_operation(3).is_none());
+    assert_eq!(queue.total_bytes(), 10);
+    assert!(queue.commit());
+    assert!(queue.complete());
+    assert_eq!((queue.operation_count(), queue.total_bytes()), (0, 0));
+    assert_eq!(queue.completed_bytes(), 0);
+}
+
+#[test]
+fn explicit_queue_data_representation_validates_frames_without_sniffing_raw_data() {
+    let limits = BufferLimits {
+        max_segments: 3,
+        max_payload_bytes: 100,
+    };
+    let frame = buffers::encode(&[], BufferPolicy::FramedSegments, limits).unwrap();
+    let raw =
+        QueueOperation::from_data(1, frame.clone(), true, BufferPolicy::RawSingle, limits).unwrap();
+    assert_eq!(raw.logical_bytes(), frame.len());
+    let segmented =
+        QueueOperation::from_data(1, frame, true, BufferPolicy::FramedSegments, limits).unwrap();
+    assert_eq!(segmented.logical_bytes(), 0);
+    assert!(segmented.needs_ack());
+    assert!(matches!(
+        QueueOperation::from_data(1, Bytes::new(), false, BufferPolicy::FramedSegments, limits,),
+        Err(BufferError::Malformed)
+    ));
 }
 
 #[test]

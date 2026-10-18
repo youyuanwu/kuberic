@@ -8,8 +8,8 @@ Fabric at immutable commit
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`](https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d).
 The authorized reference checkout was reviewed read-only and clean at that pin.
 No native binary or native test was run. P1 incorporated no implementation;
-the queue and bounded sender/session/ACK slices below now translate selected native production
-algorithms and test assertions into Rust. No native transport library or test
+the queue, bounded sender/session/ACK and async/tonic slices below translate selected native production
+algorithms, message contracts and test assertions into Rust. No native transport library or test
 harness is incorporated.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
@@ -101,14 +101,63 @@ read for boundaries, not ported/executed. `Common/Timer.h:33–56`,
 `AsyncOperation.cpp:150–195` were consulted for timer/time/cancellation semantics;
 no platform utility implementation is copied.
 
-**Not implemented:** carrier/transport error-to-fault mapping, demux, buffer
-adapter, manager/receiver/copy/provider/role owners; ReplicationSession
+**Not implemented by this sender/session slice:** carrier/runtime/buffer
+integration (recorded separately below), manager/receiver/copy/provider/role owners; ReplicationSession
 slow-fault flags/notification timer, MustCatchup and promotion-owner mechanics.
 An epoch/progress view or handoff is not build/quorum/copy completion. Existing
 protected aliases/interfaces and selected production factory remain unchanged.
 No new dependency, native harness, Common/Transport/KTL/Boost implementation or
 dependency graph is imported. Full P2 and activation/hosted/native/differential
 parity remain unestablished.
+
+### Async Tonic Substrate Slice (P2, Bounded F05/F08/F11)
+
+Rust destinations are private
+[`transport.rs`](../../../kuberic-runtime/src/replicator/v1/transport.rs),
+[`buffers.rs`](../../../kuberic-runtime/src/replicator/v1/buffers.rs),
+[`async_runtime.rs`](../../../kuberic-runtime/src/replicator/v1/async_runtime.rs)
+and their component tests. The new private
+[`sf_v1.proto`](../../../kuberic-runtime/proto/sf_v1.proto) is a Rust/tonic
+logical-message encoding, not the native wire format or an activated listener.
+
+| Selected native material at the same pin (`R/` as above) | Translation / representation changes |
+|---|---|
+| `R/ReplicationEndpointId.h:23–80`; `ReplicationTransport.cpp:919–945` | Full partition/replica/incarnation routing and sender-address fields. Bound route and superseded-stream fencing replace native actor transport plumbing; authorization and role admission remain future owners. |
+| `R/ReplicationTransport.cpp:168–266,268–355,684–878`; `ReplicationOperationHeader.h:25–110`; `StartCopyMessageBody.h:17–47` | Independent ACK/error fields, distinct sending/original epochs, metadata/segments/batch boundaries, copy/context terminal markers, StartCopy, payload-free RequestAck and targeted InduceFault. A typed bidirectional tonic exchange replaces native one-way transport; its acceptance never supplies application ACK. |
+| `R/ReplicationTransport.cpp:880–917`; `RemoteSession.cpp:757–790` | Per-message retry/infinite expiry, queue-full-only batch stop, explicit too-large/failure obligations. Count/byte-bounded Rust queues and typed outcomes are the carrier adaptation, not native transport implementation. |
+| `R/ReliableOperationSender.cpp:113–137,548–755`; `R/AckSender.cpp:64–208`; `R/RemoteSession.cpp:448–655` | Tokio clock/timer ownership drives existing translated components, preserving outside-lock selected work, batching/final ACK and ordered processor handoffs. No Common/Timer implementation or platform cancellation code is translated. |
+| Public `FabricRuntime.idl:626–683`; `src/prod/src/managed/Api/src/System/Fabric/OperationData.cs:16–38`; roadmap section 6 | Ordered buffer-array semantics inform explicit raw-single/framed-segments conversion through unchanged protected byte streams. The versioned frame and checked decoder are Kuberic-authored representation adaptations, not native serialization. |
+| `R/ComOperation.cpp:100–115`; existing `OperationQueue.cpp` byte admission/history/removal paths | Explicit queue-data construction validates the chosen representation and stores logical payload size, excluding Rust frame overhead. Raw construction is unchanged. Actual queue regressions cover exact byte capacity, suffix displacement, completion/rewind/trim/discard and cleanup with framed entries. |
+| `R/ReplicationTransport.Test.cpp:594–617` **TestDropMessageToNotMatch**, plus production ranges above | Actual Rust bound-route/stale-incarnation and carrier tests use local tonic and deterministic inputs, not the native sockets/sleep fixture. Other carrier/runtime/frame cases derive from production obligations and the approved Rust representation, not translated native test executions. |
+
+The source-guided transport/runtime files retain Microsoft copyright/MIT
+attribution; the complete permission/disclaimer remains in
+`LICENSES/service-fabric-MIT.txt`. Generated
+protobuf code and Tokio/tonic execution replace platform plumbing; no native
+Common/Transport/KTL/Boost utility, native wire serializer or test harness is
+imported. No new production dependency is needed; Tokio's existing test-util
+feature is enabled for deterministic timer tests.
+
+Runtime effect staging has a separate fixed 64-entry adapter limit and reserves
+ACK final-close capacity. It is not a native REConfig default. Capacity errors
+precede core mutation; shutdown closes runtime ingress while native close alone
+does not reject rooted ACK work. Explicit runtime shutdown joins selected work;
+unjoined Drop is typed abnormal abort containment, not native graceful drain.
+The carrier itself spawns no tasks: its client driver and server future must
+remain explicitly owned by their caller.
+
+There are **54 new actual tests**: 27 runtime, 20 carrier, four buffer and three
+queue-accounting regressions. Combined v1 coverage is **157**. Review regressions
+preserve per-generation readiness wakers (late old polls cannot strand a new
+stream), exact failed-Exchange RPC status, shutdown-time ingress rejection and
+bounded effect admission. Real tonic tests also connect the session runtime and
+reverse ACK runtime end to end; recording owner handoffs are not copy/build/
+quorum implementations.
+
+This remains preparatory P2 work. No primary/secondary/copy/role machine,
+service durability, native slow-peer policy, MustCatchup/promotion, host
+credentials/controller integration, production activation, complete P2,
+native/differential execution or hosted parity is established.
 
 ### P1 documented expectations (historical foundation)
 
