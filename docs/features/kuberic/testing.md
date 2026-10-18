@@ -11,7 +11,7 @@ backpressure scenarios. Existing KSF inventory and current-contract regressions 
 not establish complete native parity. P1's documented acceptance scenarios are
 separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
-bounded sender/session/ACK, async/tonic and primary queue/quorum slices have
+bounded sender/session/ACK, async/tonic, primary queue/quorum and secondary receiver/ACK slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -40,18 +40,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 570 |
+| ordinary | 662 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **616** |
+| **total** | **708** |
 
-Ordinary partition counts are `143, 143, 142, 142`. PostgreSQL partition counts
+Ordinary partition counts are `166, 166, 165, 165`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the primary queue/quorum slice: 616 =
-570 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the secondary receiver/ACK slice: 708 =
+662 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -228,6 +228,44 @@ Slow-fault policy/notification, full role/copy/secondary owners, native or
 differential execution, hosted parity and activation remain unestablished.
 See the [bounded ledger and owner map](sf-v1-port-ledger.md#primary-queue-and-quorum-slice-p3-bounded-f02f06f09)
 and [selected provenance](sf-v1-port-provenance.md#primary-queue-and-quorum-slice-p3-bounded-f02f06f09).
+
+### SF V1 Secondary Receiver and ACK Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::received_operation::) or test(replicator::v1::operation_stream::) or test(replicator::v1::secondary_receiver::)' -j 2
+```
+
+The slice adds **92 actual tests**: 31 received-operation, 22 operation-stream
+and 39 receiver/integration, taking all-v1 coverage to **293**. The integrated
+runtime library selection passed **350/350**, including 57 other library tests.
+Workspace all-target/all-feature check, warnings-denied Clippy, no-default
+runtime, doctests, external API/privacy and exact tier/partition inventory passed.
+This is not a claim that all 662 ordinary tests were rerun.
+
+Actual queues and callbacks exercise required versus optimistic completion,
+out-of-order data/service ACKs, duplicate/root identity, logical byte/span
+pressure, completed hints and capability. Actual shared streams exercise
+wait/wake/cancellation, reacquisition, EOF/EOS and explicit epoch handoffs.
+Provider invocation is not a successful stub: full barriers pause until the
+captured ACK boundary and explicit matching completion; stream markers block
+all getters. Tests preserve original versus sending/copy epochs and callback
+replay through successive barriers. Abandoned work does not auto-complete.
+
+Real AckSender tests use copy-plus-replication pending thresholds and current
+receiver snapshots. A real primary queue/manager/send/receiver/ACK/session
+trace proves an ACK cannot bypass the ordered primary notification; its
+unimplemented copy-owner handoff stays explicitly unresolved. It does not
+execute build/role/provider integration or a selected hosted engine.
+
+Receiver failure containment and sticky stream abort are explicit Rust adapter
+boundaries; native fault reports, two-receiver EOS/drains, provider callbacks,
+copy/context/build and full secondary role transitions remain future owners.
+No protected interface, selected factory/wire, dependency, archive exemption,
+ignored test or duplicate executable scenario catalog is added. Native binary/
+test/differential, provider-fsync and hosted parity are not established.
+See the [bounded ledger](sf-v1-port-ledger.md#secondary-receiver-and-ack-slice-p3-bounded-f04f05f06f09)
+and [source provenance](sf-v1-port-provenance.md#secondary-receiver-and-ack-slice-p3-bounded-f04f05f06f09).
 
 ### Built-In Service Operation Delivery
 

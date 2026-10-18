@@ -8,7 +8,7 @@ Fabric at immutable commit
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`](https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d).
 The authorized reference checkout was reviewed read-only and clean at that pin.
 No native binary or native test was run. P1 incorporated no implementation;
-the queue, bounded sender/session/ACK, async/tonic and primary ownership slices below translate selected native production
+the queue, bounded sender/session/ACK, async/tonic, primary and secondary ownership slices below translate selected native production
 algorithms, message contracts and test assertions into Rust. No native transport library or test
 harness is incorporated.
 
@@ -196,6 +196,48 @@ No new dependency, protected trait/type, public API, selected engine/factory/
 listener/wire or host/controller change is introduced. No native implementation
 binary, Common/Transport/KTL utility or test harness is imported. Component
 execution is not full P2/P3, native/differential, hosted or provider-fsync parity.
+
+### Secondary Receiver and ACK Slice (P3, Bounded F04/F05/F06/F09)
+
+Rust destinations, each retaining Microsoft copyright/MIT attribution:
+[`received_operation.rs`](../../../kuberic-runtime/src/replicator/v1/received_operation.rs),
+[`operation_stream.rs`](../../../kuberic-runtime/src/replicator/v1/operation_stream.rs),
+[`secondary_receiver.rs`](../../../kuberic-runtime/src/replicator/v1/secondary_receiver.rs)
+and their adjacent `tests.rs` component suites. `R/` remains
+`src/prod/src/Reliability/Replication/` at the immutable pin above.
+
+| Selected native material | Translation / representation changes |
+|---|---|
+| `R/ComFromBytesOperation.h`; `.cpp:127–257`; selected `ComOperation.h` metadata/NeedsAck seam | Actual five-state service callback lifecycle, ordinary cancellation, EOS/root retention and repeated/late ACK behavior. Rust `Arc`/mutex and move-only `AckWork` replace COM callback invocation/refcounts. ReadyToRun blocks the existing queue; Running releases its atomic predicate. Callback completion/owner release runs outside the receiver guard. The protected operation-data/stream aliases remain unchanged. |
+| `R/SecondaryReplicationReceiver.h`; `.cpp:157–224,250–343,345–444,632–749` | Existing actual OperationQueue owns received/complete/history cursors, gaps, duplicates, span/byte pressure and primary completed hints. Caller-supplied StartCopy initialization does not execute copy. Metadata maps retain original epochs without replacing a duplicate root. Received and service completion remain distinct; volatile default completes on dispatch admission. Typed validation errors are Rust input-boundary guards. |
+| `R/SecondaryReplicationReceiver.cpp:446–630`; `R/ComUpdateEpochOperation.h` | Initial original-epoch establishment, internal stream marker versus full required-ACK barrier, captured previous-epoch last LSN and callback disable/replay. Explicit matching success resumes work; abandoned handoffs do not. Provider invocation and full native fault/drain aftermath remain absent. Error completion performs explicit receiver failure containment, not successful native Close. |
+| `R/OperationStream.h/.cpp`; `R/OperationStream.GetOperationAsyncOperation.h/.cpp`; `R/ReplicationPointers.h:33` | Shared consuming dispatch state, pending/open versus EOF/EOS and internal epoch interception. Rust futures/waker registration replaces Begin/End/ReaderQueue plumbing; no Common utility source is copied. A shared barrier prevents another handle bypassing an outstanding provider request. Sticky abort error once per handle, staged aborted-entry release and broadcast/cancellation-safe wakeups are explicit Rust adapter policies, not native COM error-result parity. |
+| `R/SecondaryReplicator.cpp:165–193,324–350,675–679,1306–1396,1624–1701,2087–2108`; `R/Constants.cpp:15–19` | Persisted-or-required mode, no callback for optimistic ACK, moving sending-epoch admission, service-ACK progress, native pending-count threshold and outside-guard scheduling. Existing AckSender samples the current receiver through its actual callback; the real copy owner must supply its pending count. Native InvalidLSN=0 and NonInitializedLSN=-1 stay distinct. Full role/demux/authentication/provider orchestration is not imported. |
+| `R/ReplicationSecondary.Test.cpp:1951–2010` **OutOfOrderReplication**, **OutOfOrderReplicationNoReply**, **OutOfOrderReplicationExceedingQueueCapacity**, **DuplicateReplication**; `:2052–2105` **MultipleOperationEpochs**, **VerifyStateProviderEstablishedEpochTest** | Selected ordering, duplicate/capacity and original-epoch expectations adapted to actual Rust components. Deterministic inputs/manual ACK delivery replace native wrappers, random ACK shuffles, sleeps and Boost fixtures. No native test or binary execution. Remaining callback/concurrency/wake/terminal tests derive from production branches and Rust ownership obligations. |
+
+**Measured scope:** 31 received-operation + 22 operation-stream + 39 receiver/
+integration tests = **92 new tests**, **293 combined v1**. The integrated runtime
+library passed **350/350**, including 57 other library tests. Tests include actual
+queue scans, concurrent ACK/retirement, owner-drop/reentry, multiple/cancelled
+readers, explicit successful/failed/abandoned barriers, real ACK timing/snapshot
+and a primary-manager-to-receiver/session trace deliberately stopped before its
+unimplemented copy handoff. No test-local replication formula or executable
+ledger copy is introduced.
+
+Single-model integration review corrected callback identity after queue cleanup:
+already-selected original callbacks remain addressable after reset, including
+terminal retirement, while foreign same-LSN or other-receiver callbacks cannot
+release a live receiver's queue predicate. All effect/callback wakeups remain
+outside serialization. Failed provider completion contains this component;
+native `SecondaryReplicator.cpp:1740–1860,2247–2286` fault reporting, two-receiver
+EOS/cleanup and drain completion remain future owner integration, not a claim
+of exact native fault lifecycle.
+
+No native Common/Transport/KTL/Boost code, native test fixture, new dependency,
+protected interface, selected listener/factory/wire, service persistence or host/
+controller code is imported or changed. See the [remaining-owner ledger](sf-v1-port-ledger.md#secondary-receiver-and-ack-slice-p3-bounded-f04f05f06f09).
+This is bounded preparatory ownership, not full F04/F05, P2/P3 completion,
+native/differential/hosted parity or production activation.
 
 ### P1 documented expectations (historical foundation)
 
