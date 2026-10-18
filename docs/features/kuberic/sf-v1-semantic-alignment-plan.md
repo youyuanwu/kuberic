@@ -19,7 +19,12 @@ slow-fault/MustCatchup/promotion integration remain explicit. The private
 [async/tonic substrate](sf-v1-port-ledger.md#async-tonic-substrate-slice-p2-bounded-f05f08f11)
 adds the logical carrier, explicit lossless buffer adapter and timer ownership,
 with 54 additional actual tests (157 combined v1 tests).
-Remaining owner integration and all activation/hosted-parity gates remain pending.
+The [bounded primary queue/quorum slice](sf-v1-port-ledger.md#primary-queue-and-quorum-slice-p3-bounded-f02f06f09)
+adds private primary assignment/completion, configuration progress and catch-up
+ownership on top of those components, with 44 actual tests (201 combined v1).
+It is not the full primary/configuration
+lifecycle: slow-fault, promotion, receiver/copy/provider/role integration and
+all activation/hosted-parity gates remain pending.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -121,7 +126,7 @@ algorithm and its transport are removed at that cutover.
 | Native component family | Rust port responsibility / proposed grouping | Required native behavior |
 |---|---|---|
 | `Replicator`, `ReplicatorState`, role async operations | `v1/replicator.rs`, `v1/state.rs` | Full initial/transitional/primary/secondary/faulted/closed transitions; role-based message admission and queue transfer, not one mutable role flag. |
-| `PrimaryReplicator`, `ReplicaManager`, `ReplicationQueueManager` | `v1/primary.rs`, `v1/replica_manager.rs` | CC/PC/idle sessions, assignment, completion map, captured/moving catch-up boundaries, native quorum special cases, build/recovery and reclamation. |
+| `PrimaryReplicator`, `ReplicaManager`, `ReplicationQueueManager` | `v1/primary.rs`, `v1/replica_manager.rs`, `v1/replication_queue_manager.rs` | CC/PC/idle sessions, assignment, completion map, captured/moving catch-up boundaries, native quorum special cases, build/recovery and reclamation. |
 | `OperationQueue` | `v1/operation_queue.rs` | Ordered/gapped retention with distinct tail/commit/complete/history heads, count/byte limits, trimming, reset and transfer rules. A plain channel is not a substitute. |
 | `SecondaryReplicator`, copy/replication receivers | `v1/secondary.rs`, `v1/receiver.rs` | Separate ordering/dispatch queues, persisted/volatile ACK modes, fixed copy versus minimum replication epochs, provider barriers and close/promotion drain. |
 | `ReplicationSession`, `RemoteSession`, `ReliableOperationSender`, `AckSender` | `v1/session.rs`, `v1/sender.rs`, `v1/ack.rs` | Per-incarnation receive/apply cursors, ordered ACK processing, retry/window/request-ACK, batching/final ACK, slow-peer and backpressure policy. |
@@ -378,7 +383,9 @@ or license text is copied by this planning-only change. [N15]
 
 The phases below remain incomplete except the separately delivered P1 foundation;
 P2 has unselected OperationQueue, bounded sender/session/ACK and async/tonic
-substrate slices; future-owner integration remains pending. This roadmap is not
+substrate slices; P3 has a bounded primary queue/quorum ownership core.
+Remaining session policies and primary/secondary/copy/role integration are
+pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required

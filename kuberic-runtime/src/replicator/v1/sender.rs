@@ -91,6 +91,15 @@ pub(super) struct SenderProgress {
     pub(super) received_not_applied: Lsn,
 }
 
+impl SenderProgress {
+    pub(super) fn idle_progress(self, finish_copy_target: Option<Lsn>) -> Lsn {
+        finish_copy_target
+            .map_or(self.received, |target| self.received.min(target))
+            .max(self.applied)
+            .max(0)
+    }
+}
+
 struct Pending {
     operation: SenderOperation,
     selected_at: Option<Duration>,

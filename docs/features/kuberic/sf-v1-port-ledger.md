@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
-**P1 foundation plus unselected queue, sender/session/ACK and async/tonic slices of P2; no selected
-production behavior change.** Native pin:
+**P1 foundation, unselected P2 substrate slices and a bounded P3 primary
+ownership slice; no selected production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -191,12 +191,70 @@ MustCatchup/promotion, host credentials/listener/controller integration and
 atomic P5 cutover. No full P2, selected engine, native execution/differential,
 hosted parity or multi-family contract closure is claimed.
 
+### Primary Queue and Quorum Slice (P3, Bounded F02/F06/F09)
+
+Private
+[`ReplicationQueueManager`](../../../kuberic-runtime/src/replicator/v1/replication_queue_manager.rs)
+and
+[`ReplicaManager`](../../../kuberic-runtime/src/replicator/v1/replica_manager.rs)
+extend the existing queue and sessions with a bounded primary ownership core.
+They are not a selected primary replicator or the complete native
+`ReplicaManager`/`UpdateConfiguration` lifecycle.
+
+Successful enqueue assigns an LSN independently of quorum completion; failed
+admission does not consume that LSN. Primary commitment requires configured
+remote apply ACKs plus the primary's implicit vote, not a provider-local commit
+hook. The actual queue retains distinct issued, committed, completed and
+capability boundaries. Normal reclamation uses receive ACKs capped at
+commitment, further constrained by idle progress; all-current catch-up uses
+apply ACKs instead. An idle cannot supply a quorum vote.
+
+Normal queue progress obeys both current and enabled previous configurations.
+Current quorum-one uses the native no-remote sentinel; previous quorum-one
+with remote sessions instead constrains progress by their minimum apply ACK.
+Missing previous quorum blocks normal commitment, not the independently saved
+current-configuration catch-up observation. The configuration catch-up cap is
+conditional on `AllowMultipleQuorumSet` being disabled.
+
+Configuration updates capture/raise the issued-tail catch-up boundary B.
+Ordinary writes and wait creation do not recapture B. Pending **All** follows
+the latest-issued tail and all-current apply progress. **WriteQuorum** compares
+current quorum apply Q with B, then requires every marked current session to
+have apply progress at least Q, not merely B. A completed wait stays terminal.
+Assignment/completion and catch-up receivers are ownership adaptations, not
+application transactions or cancellation rollback.
+
+There are **44 new actual component tests**: 13 queue-manager and 31
+replica-manager cases, for **201 combined v1 tests**. The integrated runtime
+library selection passed 258/258. Tests use real sessions and ordered ACK
+handoffs, not a test-local quorum formula or executable copy of this ledger.
+Review regressions guard cached CC observations before primary notification,
+same-root session reuse, failure-atomic configuration/removal, explicit shutdown
+errors after cleanup, and rejection of ahead-of-tail ACKs before admission even
+when configured quorum is missing. See the [selector and validation scope](testing.md#sf-v1-primary-queue-and-quorum-slice).
+
+**Owner boundaries remain explicit:**
+
+| Native responsibility | Remaining owner / boundary |
+|---|---|
+| Session creation, build admission, full native configuration history and routing/role/epoch admission | Future primary/establishment/role owners; this slice consumes concrete established sessions, not host replica descriptors or fabricated build success. |
+| Slow active-secondary reserve quorum, operation age, statistical eligibility and queue-pressure recheck (`ReplicaManager.cpp:1871–1981`) | Future primary slow-peer policy. Ordinary session ACK progress does not authorize exclusion from reclamation. |
+| Idle target pressure retarget before fault (`ReplicaManager.cpp:1983–2074`) | Future CopySender/build owner plus slow-peer policy; no fixed-snapshot substitute. |
+| Fault flag, reliable-sender close, build-completion disable and retrying InduceFault (`ReplicationSession.cpp:127–276`) | Future session fault owner/timer integration. The carrier's InduceFault message alone is not this policy. |
+| Idle-to-active promotion flag/latency reset (`ReplicationSession.cpp:279–283`) and secondary-to-primary/demotion/provider drains | Future session/role/receiver owners. Queue-transfer normalization alone is not a functioning role transition. |
+| Provider epoch, receiver ACK modes, copy/context/EOF/build completion | Remaining P3 state machines; protected service/host adapters are P4 and atomic activation is P5. |
+
+The [source register](sf-v1-port-provenance.md#primary-queue-and-quorum-slice-p3-bounded-f02f06f09)
+separates translated algorithms from these deferred owners. No full P2/P3,
+native execution/differential comparison, provider durability, hosted parity
+or activation claim follows from this component slice.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
 | F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | `v1/replicator.rs`, `state.rs`, existing facade | COM/refcounts → owned Rust, not altered role outcomes | A1, C1, L1 |
-| F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | `v1/primary.rs`, `replica_manager.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic | A1, M1–M5, E1 |
+| F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`; full `primary.rs` remains pending | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | `v1/secondary.rs`, `receiver.rs` | async queues/executor; preserve implicit dispatch vs service completion and receiver lifetime | S1–S3, E2 |
 | F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + private buffer adapter | protected Bytes/boxed stream/i64 unchanged; explicit segmented codec delivered, provider/receiver integration pending | D1, S2–S3, C1–C2 |
@@ -342,7 +400,9 @@ hosted, native differential or provider-fsync parity.
 ## Next boundary
 
 P2 ports the queue/session/sender/ACK/async/tonic substrate **without production
-activation**. P3 ports managers/receivers/copy/roles; P4 prepares service/host
+activation**; remaining session fault/promotion owners stay explicit. P3 has a
+bounded primary queue/quorum core; full primary, receivers/copy/roles remain.
+P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
 [roadmap](sf-v1-semantic-alignment-plan.md); P1 creates no permanent alternate
