@@ -124,8 +124,9 @@ pub(super) struct SecondaryAck {
 
 #[derive(Clone)]
 pub(super) struct SecondaryCallbacks {
-    pub(super) ack: Arc<dyn Fn(SecondaryAck, bool) -> bool + Send + Sync>,
-    pub(super) context: Arc<dyn Fn(CopySendAction) -> bool + Send + Sync>,
+    pub(super) ack: Arc<dyn Fn(Route, SecondaryAck, bool) -> bool + Send + Sync>,
+    pub(super) context: Arc<dyn Fn(Route, CopySendAction) -> bool + Send + Sync>,
+    pub(super) fault: Arc<dyn Fn(SecondaryError) + Send + Sync>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,11 +190,13 @@ struct Root {
     copy_dispatch: SharedDispatchQueue,
     replication_dispatch: SharedDispatchQueue,
     establishment: OnceLock<SecondaryEstablishmentHandle>,
+    reply_route: OnceLock<Arc<Mutex<Route>>>,
     context: OnceLock<CopySenderHandle>,
     config: SecondaryConfig,
     clock: Clock,
     wake: Notify,
-    send_ack: Arc<dyn Fn(SecondaryAck, bool) -> bool + Send + Sync>,
+    send_ack: Arc<dyn Fn(Route, SecondaryAck, bool) -> bool + Send + Sync>,
+    report_fault: Arc<dyn Fn(SecondaryError) + Send + Sync>,
     lifetime: Arc<CallbackLifetime>,
 }
 
@@ -234,7 +237,8 @@ impl Root {
                 error: state.ack_error,
             }
         };
-        (self.send_ack)(ack, trace)
+        let route = self.reply_route.get().unwrap().lock().unwrap().clone();
+        (self.send_ack)(route, ack, trace)
     }
 
     fn schedule(&self, check_pending: bool) -> Result<(), SecondaryError> {
@@ -335,9 +339,18 @@ impl SecondaryHandle {
     }
 
     pub(super) fn process_start(&self, envelope: &wire::Envelope) -> Result<bool, SecondaryError> {
+        self.start(envelope, true)
+    }
+
+    fn start(&self, envelope: &wire::Envelope, bound: bool) -> Result<bool, SecondaryError> {
         let root = self.root()?;
         Root::admit(&root.state.lock().unwrap())?;
-        let initialized = root.establishment.get().unwrap().process_start(envelope)?;
+        let establishment = root.establishment.get().unwrap();
+        let initialized = if bound {
+            establishment.process_start(envelope)?
+        } else {
+            establishment.process_start_message(envelope)?
+        };
         let mut state = root.state.lock().unwrap();
         if initialized && state.phase == Phase::Open {
             state.context_requested = true;
@@ -366,14 +379,29 @@ impl SecondaryHandle {
         operations: Vec<ReceivedOperation>,
         completed_hint: Option<Lsn>,
     ) -> Result<(), SecondaryError> {
+        self.receive_replication_from(epoch, operations, completed_hint, None)
+    }
+
+    fn receive_replication_from(
+        &self,
+        epoch: Epoch,
+        operations: Vec<ReceivedOperation>,
+        completed_hint: Option<Lsn>,
+        primary: Option<Route>,
+    ) -> Result<(), SecondaryError> {
         let root = self.root()?;
         let effects = {
             let state = root.state.lock().unwrap();
             Root::admit(&state)?;
-            root.replication
-                .lock()
-                .unwrap()
-                .receive(epoch, operations, completed_hint)?
+            let effects =
+                root.replication
+                    .lock()
+                    .unwrap()
+                    .receive(epoch, operations, completed_hint)?;
+            if let Some(primary) = primary {
+                root.establishment.get().unwrap().update_primary(primary)?;
+            }
+            effects
         };
         let signals = effects.dispatch()?;
         if let Some(request) = signals.ack {
@@ -623,7 +651,7 @@ pub(super) struct Secondary {
     root: Arc<Root>,
     establishment: SecondaryEstablishment,
     provider: Arc<dyn StateProvider>,
-    send_context: Arc<dyn Fn(CopySendAction) -> bool + Send + Sync>,
+    send_context: Arc<dyn Fn(Route, CopySendAction) -> bool + Send + Sync>,
     context_done: bool,
     epoch: Option<(EpochBarrier, BoxFuture<'static, crate::Result<()>>)>,
 }
@@ -699,11 +727,13 @@ impl Secondary {
                     transferred: false,
                 }),
                 establishment: OnceLock::new(),
+                reply_route: OnceLock::new(),
                 context: OnceLock::new(),
                 config,
                 clock: clock.clone(),
                 wake: Notify::new(),
                 send_ack: callbacks.ack,
+                report_fault: callbacks.fault,
                 lifetime: Arc::new(CallbackLifetime {
                     _provider: provider.clone(),
                 }),
@@ -729,6 +759,11 @@ impl Secondary {
             })),
             clock,
         )?;
+        assert!(
+            root.reply_route
+                .set(establishment.handle().reply_route()?)
+                .is_ok()
+        );
         assert!(root.establishment.set(establishment.handle()).is_ok());
         assert!(root.context.set(establishment.copy().handle()).is_ok());
         Ok(Self {
@@ -805,8 +840,13 @@ impl Secondary {
     async fn drive_context(
         establishment: &mut SecondaryEstablishment,
         root: &Root,
-        send: Arc<dyn Fn(CopySendAction) -> bool + Send + Sync>,
+        send: Arc<dyn Fn(Route, CopySendAction) -> bool + Send + Sync>,
     ) -> Result<(), EstablishError> {
+        let primary = establishment.handle().reply_route()?;
+        let send = Arc::new(move |action| {
+            let route = primary.lock().unwrap().clone();
+            send(route, action)
+        });
         let acquisition = establishment.acquire_context(send).await;
         let acquired = {
             let mut state = root.state.lock().unwrap();
@@ -1010,3 +1050,5 @@ impl Secondary {
 
 #[cfg(test)]
 mod tests;
+
+mod ingress;

@@ -424,6 +424,10 @@ impl SecondaryReceiver {
         self.minimum_sending_epoch
     }
 
+    pub(super) fn copy_epoch(&self) -> Option<Epoch> {
+        self.copy_epoch
+    }
+
     pub(super) fn capture_ack(&mut self) -> ReceiverAck {
         let ack = self.queue.as_ref().map_or(
             ReceiverAck {

@@ -694,12 +694,20 @@ impl PrimaryHandle {
         if !binding.idle {
             return Err(PrimaryError::NotBuilding(binding.route.destination.replica));
         }
+
         match binding.owner {
             SessionOwner::Build(build) => Ok(build.receive_context(envelope)?),
             SessionOwner::Established(_) => {
                 Err(PrimaryError::NotBuilding(binding.route.destination.replica))
             }
         }
+    }
+
+    pub(super) fn ingress_faulted(&self) -> Result<bool, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Ok(matches!(state.failure, Some(PrimaryError::Provider(_)))
+            || root.manager.lock().unwrap().check_reported_fault().is_err())
     }
 
     pub(super) fn receive_ack(&self, envelope: &wire::Envelope) -> Result<(), PrimaryError> {

@@ -683,6 +683,43 @@ InduceFault demux/remote fault handling, monitoring/health, public settings and
 P4/P5 adapters/activation remain pending. No full ordinary/native execution,
 differential/hosted/provider-fsync parity or full P2/P3 claim.
 
+### Role-Aware Message Ingress Slice (P3, Bounded F01/F04/F05/F08/F09/F11)
+
+Affected private components are
+[`ingress`](../../../kuberic-runtime/src/replicator/v1/ingress.rs),
+[`secondary ingress`](../../../kuberic-runtime/src/replicator/v1/secondary/ingress.rs),
+[`role`](../../../kuberic-runtime/src/replicator/v1/role.rs), and narrow existing
+primary/secondary/establishment/receiver/carrier extensions. Actual-owner
+regressions live in
+[`role ingress tests`](../../../kuberic-runtime/src/replicator/v1/role/tests/ingress.rs).
+`R/` retains the immutable replication source prefix and pin above.
+
+| Selected native material | Incorporated responsibility / Rust substitution |
+|---|---|
+| `R/Replicator.cpp:618-759` | Typed role/message selection, primary Closing exception, reported-fault preflight and outside-guard handler delivery. A shared Rust selection handle replaces native job dispatch/role lock; carrier reception remains distinct from application ACK. |
+| `R/ReplicatorState.cpp:39-186`; `R/Replicator.ChangeRoleAsyncOperation.cpp:131-275,405-489` | Native admission windows: initial progress versus actual primary creation/provider epoch, idle-to-active versus promotion/demotion drainage and data-loss gating. Retained caller-driven futures preserve interrupted work; ingress is not inferred from a single Ready boolean. |
+| `R/Replicator.CloseAsyncOperation.cpp:31-180`; `R/Replicator.cpp:659-708` | Private direct Close composes existing primary quorum prewait/secondary Close with role-owned Closing/Closed admission. Role-None teardown stays separate. Outer host teardown, transport registration and production selection remain unmodified. |
+| `R/SecondaryReplicator.cpp:915-1035,1125-1263,1306-1396,1438-1621` | Established StartCopy, fixed copy epoch versus advancing replication sending epoch, actual primary reply update, current-primary-only RequestAck/context ACK and future-copy fault reporting. Complete typed batch decoding precedes receiver admission; explicit configured buffer framing replaces native vector buffers without charging framing as payload. |
+| `R/SecondaryReplicator.cpp:2282-2344` | Target replica/incarnation and initialized-copy checks, source-independent InduceFault and first reported fault. Sticky actual secondary state and a required outside-guard caller reporting callback replace partition COM reporting at this private boundary. Fault reporting does not itself clean queues/streams, ACK work or remove membership. |
+| Production ranges above; existing `R/ReplicationTransport.cpp:684-832` logical terminal/buffer contracts | Actual Rust components and a real loopback-tonic pressure-notification-to-target journey, plus transition, identity, epoch, segmented-data, duplicate and callback-reentrancy cases. No native test/fixture/harness or dependency implementation is incorporated; no native binary execution or differential parity is asserted. |
+
+Reply routes retain real endpoint/incarnation/address state independently of
+weak establishment ingress, allowing selected ACK/context effects to retain
+their routing lifetime. Existing strictly bound establishment seams remain;
+role ingress owns the broader native secondary admission rules.
+The protected byte-stream adapter accepts normal metadata and terminal
+overrides; atomic-group/non-normal data is rejected explicitly, not represented
+as supported metadata. Native constants come from public FabricTypes.idl:46,
+779-781. Complete metadata capability/service exposure remains pending.
+
+See the [ledger](sf-v1-port-ledger.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11)
+and [selector](testing.md#sf-v1-role-aware-message-ingress-slice).
+All components remain private/unselected. Protected interfaces, selected wiring,
+dependencies and tier policy are unchanged. Broader Open/restart/rebuild,
+production host authentication/listener/registry and partition-report adapters,
+monitoring/health, public settings/service adapters and atomic activation remain
+pending. This slice is not full P3 or hosted/native/provider-fsync qualification.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

@@ -232,6 +232,20 @@ Existing typed tonic InduceFault carries real bound target identity; no native
 wire compatibility or remote host fault handling is claimed. No native
 binary, fixture, test harness or utility/dependency implementation is imported.
 
+The private ingress.rs, secondary/ingress.rs and role/secondary/establishment/
+receiver/carrier extensions translate selected Replicator.cpp:618-759,
+ReplicatorState.cpp:39-186,
+Replicator.ChangeRoleAsyncOperation.cpp:131-275,405-489,
+Replicator.CloseAsyncOperation.cpp:31-180,
+SecondaryReplicator.cpp:915-1035,1125-1263,1306-1396,1438-1621,2282-2344
+and existing ReplicationTransport.cpp:684-832 contracts at the same immutable
+pin. Shared Rust selection, actual receiver/session ownership, retained reply
+routes and required outside-guard fault callbacks replace native job queues,
+locking and partition COM handoffs. Tests derive from these production paths
+and execute actual owners and a real tonic connection, not native tests,
+fixtures, binaries or a harness. Production host wiring remains unselected;
+no native wire compatibility or complete hosted/native parity is asserted.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

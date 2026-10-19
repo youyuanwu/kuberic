@@ -206,14 +206,15 @@ impl Rig {
             config,
             provider.clone(),
             SecondaryCallbacks {
-                ack: Arc::new(move |ack, _| {
+                ack: Arc::new(move |_, ack, _| {
                     sent.lock().unwrap().push(ack);
                     true
                 }),
-                context: Arc::new(move |_| {
+                context: Arc::new(move |_, _| {
                     contexts.fetch_add(1, Ordering::SeqCst);
                     true
                 }),
+                fault: Arc::new(|_| {}),
             },
             Clock::new(),
         )
@@ -447,8 +448,9 @@ async fn configuration_rejects_mismatched_ack_and_eos_modes() {
                 settings,
                 Arc::new(Provider::new()),
                 SecondaryCallbacks {
-                    ack: Arc::new(|_, _| true),
-                    context: Arc::new(|_| true)
+                    ack: Arc::new(|_, _, _| true),
+                    context: Arc::new(|_, _| true),
+                    fault: Arc::new(|_| {}),
                 },
                 Clock::new()
             ),
@@ -918,7 +920,7 @@ async fn ack_callback_can_reenter_close_without_owner_guard() {
         config,
         Arc::new(Provider::new()),
         SecondaryCallbacks {
-            ack: Arc::new(move |_, _| {
+            ack: Arc::new(move |_, _, _| {
                 let handle = callback_handle.lock().unwrap().as_ref().unwrap().clone();
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     handle.receive_copy(operation(1, 7, false), false).unwrap();
@@ -926,7 +928,8 @@ async fn ack_callback_can_reenter_close_without_owner_guard() {
                 handle.close().unwrap();
                 true
             }),
-            context: Arc::new(|_| true),
+            context: Arc::new(|_, _| true),
+            fault: Arc::new(|_| {}),
         },
         Clock::new(),
     )

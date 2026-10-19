@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
 **P1 foundation, unselected P2 substrate slices and bounded P3 primary,
-secondary, copy, role, data-loss and queue-policy ownership slices; no selected production behavior change.** Native pin:
+secondary, copy, role, data-loss, queue-policy and message-ingress ownership slices; no selected production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -896,6 +896,53 @@ Protected interfaces, selected wiring, dependencies and tier policy remain
 unchanged. No full P2/P3, native execution, differential/hosted/provider-fsync
 parity or full ordinary execution is claimed.
 
+### Role-Aware Message Ingress Slice (P3, Bounded F01/F04/F05/F08/F09/F11)
+
+The private [`message ingress`](../../../kuberic-runtime/src/replicator/v1/ingress.rs)
+now selects actual primary/secondary owners through the existing
+[`role owner`](../../../kuberic-runtime/src/replicator/v1/role.rs).
+Retained ingress handles observe changing admission; handlers and caller
+callbacks execute outside the selection guard. Initial progress acquisition,
+promotion/demotion drainage, data loss, role-None teardown and Abort reject fresh
+messages. Primary creation admits ACK/context after queue ownership exists,
+including while the provider epoch callback is pending; idle-to-active
+activation retains secondary admission. Direct primary Close preserves ACK/
+context admission during its existing quorum prewait, then closes ingress.
+
+The actual [`secondary ingress`](../../../kuberic-runtime/src/replicator/v1/secondary/ingress.rs)
+decodes complete replication batches into the existing received-operation/queue/
+stream owners before admission. Buffer policy remains explicit, original and
+sending epochs stay separate, and framed overhead is not logical payload.
+Copy uses its fixed established epoch and real legacy/EOS terminal handling.
+Stale messages are observable typed drops; malformed messages return errors.
+The current protected byte-stream adapter admits normal data and copy/context
+terminals; atomic-group/non-normal data metadata fails explicitly rather than
+being silently erased. Broader metadata capabilities remain an adapter blocker.
+Unexpected newer StartCopy/copy epochs report a sticky actual secondary fault.
+
+Accepted replication updates the actual reply route; ACK/context callbacks
+receive the selected endpoint/incarnation/address. RequestAck and context ACK
+require the established current primary, while same-epoch copy does not impose
+an extra sender constraint. Targeted InduceFault checks local replica/incarnation
+and established copy state, **not an invented current-primary or epoch gate**.
+It latches the first secondary fault and invokes the required caller reporting
+handoff outside guards. Duplicates do not report again. Reporting alone neither
+cleans streams, generates EOS/ACKs nor removes configuration membership.
+
+Actual-owner regressions and a real tonic journey connect primary pressure
+policy and session notification to target fault admission. See the
+[selector](testing.md#sf-v1-role-aware-message-ingress-slice) and
+[source/substitution register](sf-v1-port-provenance.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11).
+No static coverage total is maintained.
+
+**Remaining owners:** production host authentication/listener/registry and
+partition-report adapter wiring, broader Open/restart/host recovery and rebuild,
+monitoring/health, public settings/service adapters and atomic activation.
+The required private reporting callback is not production partition integration.
+Protected interfaces, selected wiring, dependencies and tier policy are unchanged.
+No native execution, differential/hosted/provider-fsync parity or full P3 closure
+is claimed. Historical omissions above are superseded only by this bounded slice.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
@@ -907,7 +954,7 @@ parity or full ordinary execution is claimed.
 | F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams, `copy_async_operation.rs`, `copy_establishment.rs` | protected Bytes/boxed stream/i64 unchanged; shared receipt, terminal adapters, serial polling and bounded copy provider acquisition delivered; public facade/full provider lifecycle pending | D1, S2–S3, C1–C2 |
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs`, bounded `primary.rs`, `replica_manager/policy.rs` | injected clocks, lasting session timers/ordered ACKs and slow-fault notification/reclamation policy; quorum/all/MustCatchup remain separate | R1–R3, T2 |
 | F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`, `copy_sender.rs`, `copy_establishment.rs`, `build_idle.rs`; full role composition pending | context acquisition/receipt, reliable StartCopy, serial enumeration/sending, EOF-issued target, copy/replication gates/pending retarget and idle lifecycle delivered; no fixed snapshot-only build substitute | C2–C5 |
-| F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, bounded primary session ACK/context lookup, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; full host/role demux integration pending | T1–T2, D1 |
+| F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, `ingress.rs`, bounded role/primary/secondary owners, private `sf_v1.proto` | typed role demux, native secondary per-message admission, current reply routing and targeted fault reporting; accepted send is not service ACK; production host integration and native wire compatibility are not claimed | T1–T2, D1 |
 | F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | bounded `v1/role.rs`, `primary.rs`, `replica_manager.rs`, `replication_queue_manager.rs`; host/controller adapters pending | actual changed/unchanged provider recovery and queue reset, no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
 | F11 async lifetime/diagnostics ([drain:56–102][drain], [health:62–125][health]) | retain owners through cancel/drain, outside-lock dispatch, batched/cleared warnings | Rust async ownership/clock + host reporting | no Common/Transport/KTL/Boost copy; preserve algorithm-affecting policy, not platform plumbing | R3, C3, H3 |
@@ -1066,12 +1113,13 @@ now adds role/external-epoch sequencing, ACK-mode-specific promotion drains and
 actual retained-queue/original-epoch handoff in both directions. Bounded
 data-loss orchestration now retains changed/unchanged provider recovery,
 actual queue reset and native admission/error/state restoration.
-Broader Open/restart/host recovery and rebuild policy and full host role/epoch
-demux remain pending.
+Broader Open/restart/host recovery and rebuild policy remain pending.
 Bounded periodic/pressure/slow-peer policy now drives actual retarget/disable,
 reclamation exclusion and retrying fault notifications while preserving
-quorum/all/MustCatchup. Remote fault handling and platform monitoring remain
-explicit host responsibilities.
+quorum/all/MustCatchup. Bounded role-aware ingress now routes real messages,
+updates secondary reply identity and reports targeted remote faults through the
+actual secondary owner. Production listener/authentication/registry and partition
+reporting integration, plus platform monitoring, remain explicit host boundaries.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
