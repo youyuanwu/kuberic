@@ -787,10 +787,9 @@ service ACKs without an extra provider callback. Stream-induced provider epochs
 keep their existing distinct ownership. Provider/build faults prevent successful
 role handoff; explicit Abort retains already-selected provider obligations.
 
-Original slice validation, before the downstream-harness/source-tier migration,
-recorded **39 new actual tests** (31 role, four secondary and four queue),
-**695 V1**, **752/752 runtime**, unchanged non-V1 **57**. Exact discovery is
-**1110 = 1064 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**. See
+Actual-component regressions exercise role transitions, secondary drainage/
+epochs and queue normalization. Use the live inventory validator for current
+test discovery and partitioning. See
 [validation](testing.md#sf-v1-role-transition-slice) and
 [provenance](sf-v1-port-provenance.md#role-transition-slice-p3-bounded-f01f02f04f09f11).
 

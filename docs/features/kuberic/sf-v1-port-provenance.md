@@ -603,18 +603,15 @@ with existing primary/secondary/receiver/queue-manager seams and their tests.
 | `R/ReplicaManager.cpp:792-920`; `R/PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31-90` | Demotion cancellation before forced progress; primary issued-tail epoch boundary, session notification and provider call including duplicates. Existing primary timer driver remains active while the provider future is pending. Stale invalid input is an explicit Rust error, not a copied native assertion. Provider/build faults block handoff; old build providers remain rooted for separate explicit drainage. |
 | `R/SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31-155`; `R/Replicator.UpdateEpochAsyncOperation.cpp:34-145` | Serialize direct external epoch requests, preserve secondary minimum/duplicate/stale admission, out-of-order discard, unfinished-copy fault and actual dispatch/service-ACK drainage. Direct secondary update does not invoke provider; existing stream/provider barriers remain distinct. Interrupted polling retains the operation; explicit Abort retains selected provider obligations and an abnormal outcome. |
 
-**39 new registered actual tests:** 31 role-owner, four secondary and four
-demotion-normalization. They exercise real shared queues/operation Arc identity,
+Actual role-owner, secondary and demotion-normalization tests exercise real
+shared queues/operation Arc identity,
 original versus sending epochs, actual ACK-mode drains/provider futures, native
 edge rejection, faults, pending build retention, retry timers and interrupted
 polling/Abort. No native test harness, utility source, formula-only ledger or
 additional dependency is incorporated.
 
-**Original pre-source-tier validation:** V1 **695**, runtime **752/752**,
-unchanged non-V1 **57**. These are historical slice measurements; use the
-current inventory validator in the testing guide for the rebased workspace.
-Exact discovery **1110 = 1064 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**;
-ordinary **266/266/266/266**, PostgreSQL **11/13/8/9**. Workspace check/Clippy,
+Use the live inventory validator in the testing guide for current discovery
+and partitioning. Workspace check/Clippy,
 no-default/API/privacy, doctests and inventory gates pass. See the
 [ledger](sf-v1-port-ledger.md#role-transition-slice-p3-bounded-f01f02f04f09f11)
 and [selector](testing.md#sf-v1-role-transition-slice).

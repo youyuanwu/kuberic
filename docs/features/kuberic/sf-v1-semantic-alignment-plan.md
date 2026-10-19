@@ -63,7 +63,7 @@ reuse is ID-based while bound ACK identity remains strict.
 The [role-transition slice](sf-v1-port-ledger.md#role-transition-slice-p3-bounded-f01f02f04f09f11)
 adds native role edges, ACK-mode-specific promotion drainage, real retained
 queue/original-epoch handoff, demotion limits and external primary/secondary
-epoch sequencing (39 actual tests, 695 combined V1). These supersede preceding
+epoch sequencing with actual-component regressions. These supersede preceding
 slice-boundary omissions, not pending data-loss/recovery/reset orchestration,
 full host role/epoch demux, monitoring/health or periodic/slow-peer policy.
 This roadmap replaces isolated audit-item prioritization with a **faithful
