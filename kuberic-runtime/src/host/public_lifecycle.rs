@@ -905,6 +905,23 @@ pub(crate) async fn public_v1_report(
     Ok(report)
 }
 
+pub(crate) fn completed_configuration(record: &PublicOperationRecord) -> bool {
+    record.stage == PublicOperationStage::Completed
+        && record.disposition == Some(PublicOperationDisposition::Succeeded)
+        && operation_instructions(&record.intent)
+            .iter()
+            .zip(&record.lifecycle.outcomes)
+            .any(|(instruction, outcome)| {
+                matches!(
+                    instruction,
+                    PublicInstruction::Configuration
+                        | PublicInstruction::CurrentConfiguration
+                        | PublicInstruction::CatchUpConfiguration
+                        | PublicInstruction::RefreshedConfiguration
+                ) && *outcome == PublicInstructionOutcome::Done
+            })
+}
+
 pub(crate) fn complete(record: &PublicOperationRecord) -> bool {
     (record.intent.lifecycle.is_none() && record.intent.program.is_none()) || {
         record.lifecycle.in_flight.is_none()

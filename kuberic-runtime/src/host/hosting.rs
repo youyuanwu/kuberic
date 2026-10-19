@@ -442,7 +442,28 @@ impl PodRuntime {
                 .cmp(&right.intent.revision)
                 .then_with(|| left.intent.operation_id.cmp(&right.intent.operation_id))
         });
+        let completed_configuration_revision = records
+            .iter()
+            .filter(|record| crate::host::public_lifecycle::completed_configuration(record))
+            .map(|record| record.intent.revision)
+            .max()
+            .unwrap_or(0);
         for record in records {
+            if record.stage == PublicOperationStage::Completed
+                && record.disposition != Some(PublicOperationDisposition::Succeeded)
+                && record.intent.replay_disposition
+                    == crate::protocol::public_operations::PublicOperationReplayDisposition::
+                        ReevaluateCatchUp
+                && record.intent.revision < completed_configuration_revision
+                && !record.lifecycle.outcomes.iter().any(|outcome| {
+                    matches!(
+                        outcome,
+                        crate::host::state::PublicInstructionOutcome::RebuildRequired(_)
+                    )
+                })
+            {
+                continue;
+            }
             if record.stage != PublicOperationStage::Completed
                 || record.disposition != Some(PublicOperationDisposition::Succeeded)
             {
@@ -561,7 +582,7 @@ impl PodRuntime {
             .host
             .replacement_ambiguity_fenced
             .load(Ordering::Acquire);
-        if allow_reopen && candidate_ready && !ambiguity_fenced {
+        if allow_reopen && candidate_ready {
             self.host
                 .replacement_authority_fenced
                 .store(false, Ordering::Release);
@@ -1304,6 +1325,255 @@ mod tests {
             previous: None,
             replicas: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn completed_authority_does_not_latch_an_independent_ambiguity_fence() {
+        use super::{HostAccessView, PodRuntime};
+        use crate::application::{OpenContext, RoleChange, StatefulServiceReplica};
+        use crate::host::state::*;
+        use crate::host::store::AgentStore;
+        use crate::protocol::public_operations::*;
+        use crate::protocol::types::*;
+        use crate::replicator::PartitionAccessView;
+        use std::sync::Arc;
+
+        struct ProjectionStore(AgentState);
+        #[async_trait::async_trait]
+        impl AgentStore for ProjectionStore {
+            async fn identity(&self) -> crate::host::Result<StorageIdentity> {
+                Ok(self.0.identity.clone())
+            }
+            async fn load_state(&self) -> crate::host::Result<AgentState> {
+                Ok(self.0.clone())
+            }
+            async fn complete_application_initialization(&self) -> crate::host::Result<()> {
+                unreachable!("projection does not initialize application storage")
+            }
+            async fn record_partition_reports(
+                &self,
+                _: Vec<LoadMetric>,
+                _: Option<FaultType>,
+            ) -> crate::host::Result<()> {
+                unreachable!("projection does not record partition reports")
+            }
+        }
+        struct Application;
+        #[async_trait::async_trait]
+        impl StatefulServiceReplica for Application {
+            async fn open(
+                self: Arc<Self>,
+                _: OpenContext,
+            ) -> crate::Result<Arc<dyn crate::replicator::Replicator>> {
+                unreachable!("projection does not invoke application callbacks")
+            }
+            async fn change_role(&self, _: ReplicaRole) -> crate::Result<RoleChange> {
+                unreachable!("projection does not invoke application callbacks")
+            }
+            async fn close(&self) -> crate::Result<()> {
+                unreachable!("projection does not invoke application callbacks")
+            }
+            fn abort(&self) {}
+        }
+        let configuration = configuration(Epoch::new(0, 1));
+        let local = configuration.current.members[0].identity.clone();
+        let resource = ResourceUid::new("projection-resource");
+        let identity = PublicV1Identity::new(1);
+        let binding = PublicV1LifecycleBinding {
+            identity: identity.clone(),
+            resource_uid: resource.clone(),
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let storage = ReplicaStorageIncarnationContext {
+            replica: local.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new("pod-1"),
+                pvc_uid: PvcUid::new("pvc-1"),
+            },
+            storage_generation: StorageGeneration::new("storage"),
+        };
+        let initialization =
+            derive_history_initialization_id(&resource, PublicProtocolGeneration::new(1));
+        let history =
+            derive_bootstrap_history(&resource, PublicProtocolGeneration::new(1), &initialization);
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: resource,
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+            initialization_id: InitializationId::new("initialization"),
+            local_identity: local.clone(),
+            effective_policy: EffectivePolicy::fixed(1, 1).unwrap(),
+        });
+        let session = ProcessSessionId::new("session");
+        let input = PublicLifecycleInput {
+            recipe: PublicLifecycleRecipe::InitialPrimary,
+            replica: local.clone(),
+            epoch: configuration.current.epoch,
+            possible_data_loss: PossibleDataLossIntent::NotPossible,
+            current: configuration.current,
+            previous: None,
+            replicas: Vec::new(),
+            data_loss_recovery: None,
+        };
+        input.validate().unwrap();
+        let intent = PublicOperationIntent {
+            identity,
+            operation_id: OperationId::new("completed-authority"),
+            revision: 1,
+            process_session_id: session.clone(),
+            class: PublicOperationClass::Authority,
+            input_digest: input.digest(),
+            replay_disposition: PublicOperationReplayDisposition::Convergent,
+            lifecycle: Some(input),
+            program: None,
+        };
+        intent.validate().unwrap();
+        let mut preview = PublicV1OperationState::new_bound(binding.clone());
+        preview.history_initialization_id = Some(initialization);
+        preview.history = Some(history.clone());
+        preview.storage_incarnation = Some(storage.clone());
+        preview.operations.insert(
+            intent.operation_id.clone(),
+            PublicOperationRecord {
+                intent,
+                accepted_history: Some(history),
+                accepted_storage: Some(storage),
+                stage: PublicOperationStage::Completed,
+                disposition: Some(PublicOperationDisposition::Succeeded),
+                containment: PublicOperationContainment::Complete,
+                superseded_by: None,
+                blockers: Default::default(),
+                lifecycle: PublicLifecycleRecord {
+                    in_flight: None,
+                    outcomes: vec![
+                        PublicInstructionOutcome::Done,
+                        PublicInstructionOutcome::ApplicationRole(None),
+                        PublicInstructionOutcome::Done,
+                        PublicInstructionOutcome::Done,
+                    ],
+                },
+            },
+        );
+        state.public_v1_operation_state = Some(preview);
+        let store = Arc::new(ProjectionStore(state));
+        let runtime = PodRuntime::new_replacement(
+            local,
+            Arc::new(Application),
+            store.clone(),
+            binding,
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let access = HostAccessView {
+            host: Arc::downgrade(&runtime.host),
+            partition_information: runtime
+                .host
+                .state
+                .read()
+                .await
+                .partition_information
+                .clone(),
+        };
+        runtime.fence_replacement_access().await;
+        access
+            .publish_replacement_progress(0, 0, true)
+            .await
+            .unwrap();
+        runtime
+            .refresh_replacement_projection(store.as_ref(), &session, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            access.write_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            access.read_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+
+        access
+            .publish_replacement_progress(0, 0, false)
+            .await
+            .unwrap();
+        runtime
+            .refresh_replacement_projection(store.as_ref(), &session, false)
+            .await
+            .unwrap();
+        assert_eq!(access.write_status().await.unwrap(), AccessStatus::Granted);
+        assert_eq!(access.read_status().await.unwrap(), AccessStatus::Granted);
+
+        runtime.fence_replacement_access().await;
+        access
+            .publish_replacement_progress(0, 0, false)
+            .await
+            .unwrap();
+        runtime
+            .refresh_replacement_projection(store.as_ref(), &session, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            access.write_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        let mut recovery_store = ProjectionStore(store.0.clone());
+        let preview = recovery_store.0.public_v1_operation_state.as_mut().unwrap();
+        let original = preview.operations.values().next().unwrap().clone();
+        let configuration = original.intent.lifecycle.as_ref().unwrap().configuration();
+        let program = PublicOperationProgram::CatchUp {
+            configuration: configuration.clone(),
+            mode: PublicCatchUpMode::All,
+        };
+        let mut failed = original.clone();
+        failed.intent.operation_id = OperationId::new("obsolete-recovery");
+        failed.intent.revision = 2;
+        failed.intent.input_digest = program.digest();
+        failed.intent.replay_disposition = program.replay_disposition();
+        failed.intent.lifecycle = None;
+        failed.intent.program = Some(program);
+        failed.disposition = Some(PublicOperationDisposition::Failed("lost peer".into()));
+        failed.lifecycle = PublicLifecycleRecord {
+            in_flight: Some(PublicInstruction::FirstCatchUp),
+            outcomes: vec![PublicInstructionOutcome::Done],
+        };
+        preview
+            .operations
+            .insert(failed.intent.operation_id.clone(), failed);
+        runtime
+            .refresh_replacement_projection(&recovery_store, &session, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            access.write_status().await.unwrap(),
+            AccessStatus::NotPrimary,
+            "an unresolved failed recovery must remain fenced"
+        );
+        let program = PublicOperationProgram::Configuration(configuration);
+        let mut successor = original;
+        successor.intent.operation_id = OperationId::new("successor-configuration");
+        successor.intent.revision = 3;
+        successor.intent.input_digest = program.digest();
+        successor.intent.replay_disposition = program.replay_disposition();
+        successor.intent.lifecycle = None;
+        successor.intent.program = Some(program);
+        successor.lifecycle.outcomes = vec![PublicInstructionOutcome::Done];
+        recovery_store
+            .0
+            .public_v1_operation_state
+            .as_mut()
+            .unwrap()
+            .operations
+            .insert(successor.intent.operation_id.clone(), successor);
+        runtime
+            .refresh_replacement_projection(&recovery_store, &session, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            access.write_status().await.unwrap(),
+            AccessStatus::Granted,
+            "historical recovery failure cannot override completed successor configuration"
+        );
     }
 
     #[test]

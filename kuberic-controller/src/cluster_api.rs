@@ -2532,6 +2532,81 @@ where
         if current.epoch != expected.required.previous_epoch {
             return Err("session renewal changed its predecessor topology".into());
         }
+        let replicas = renewal_topology_replicas(&observation, expected)?;
+        if replicas.iter().any(|replica| {
+            expected
+                .required
+                .fresh_configuration
+                .members
+                .iter()
+                .any(|member| {
+                    member.identity == replica.report.replica
+                        && (replica.report.role != member.role
+                            || replica.report.progress.first != replica.report.progress.last)
+                })
+        }) {
+            let primary = replicas
+                .iter()
+                .find(|replica| {
+                    replica.report.replica.replica_id
+                        == expected.required.fresh_configuration.primary_id
+                })
+                .ok_or_else(|| "session renewal lacks its exact primary report".to_string())?;
+            let authority = accepted_public_v1_status(Some(&status))?
+                .ok_or_else(|| "session renewal lacks accepted public-v1 authority".to_string())?;
+            let revision = primary
+                .report
+                .completed_operations
+                .iter()
+                .map(|completion| completion.revision)
+                .chain(
+                    authority
+                        .completed_operations
+                        .iter()
+                        .filter(|completion| {
+                            completion.storage_incarnation.replica == primary.report.replica
+                        })
+                        .map(|completion| completion.revision),
+                )
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| "session-renewal settlement revision overflow".to_string())?;
+            let program = PublicOperationProgram::CatchUp {
+                configuration: renewal_public_configuration(
+                    &primary.report.replica,
+                    &replicas,
+                    &expected.required.fresh_configuration,
+                )?,
+                mode: kuberic_runtime::protocol::public_operations::PublicCatchUpMode::All,
+            };
+            let intent = PublicOperationIntent {
+                identity: authority.identity,
+                operation_id: crate::public_v1_reconciliation::renewal_settlement_id(
+                    &expected.required.operation_id,
+                    primary.report.replica.replica_id,
+                    revision,
+                    &program,
+                ),
+                revision,
+                process_session_id: primary.report.process_session_id.clone(),
+                class: PublicOperationClass::Authority,
+                input_digest: program.digest(),
+                replay_disposition: program.replay_disposition(),
+                lifecycle: None,
+                program: Some(program),
+            };
+            self.execute_command(
+                &observation,
+                &ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+                    target: primary.report.replica.clone(),
+                    intent,
+                })),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
         let sessions = renewed_topology_sessions(&observation, expected)?;
         status.public_v1_topology = Some(topology_state_with_switchover_completion(
             &observation.set,
@@ -3056,6 +3131,20 @@ where
             .map(PublicV1OperationStatus::command)
             .transpose()?
         {
+            if let Some(configuration) =
+                crate::public_v1_reconciliation::ordinary_recovery_configuration(
+                    &observation,
+                    expected,
+                    &command,
+                )?
+                && crate::public_v1_reconciliation::recovery_peer_changed(
+                    &observation,
+                    configuration,
+                    expected,
+                )?
+            {
+                return Err("ordinary recovery peer changed before source retirement".into());
+            }
             revoke_inbound_build_authority(
                 self,
                 &observation,

@@ -87,6 +87,38 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_secondary_replacement_preserves_acknowledged_data() -> Result<()> {
+    let mut cluster = cluster().await?;
+    let result = async {
+        let topology = cluster.settle().await?;
+        let writer = cluster.service(topology.primary()).await?;
+        cluster
+            .drive(async { Ok::<_, anyhow::Error>(writer.set(71).await?) })
+            .await?;
+        let topology = cluster.settle().await?;
+        let replica_id = topology.secondaries().next().unwrap().identity().replica_id;
+        for _ in 0..2 {
+            let topology = cluster.settle().await?;
+            let replaced = topology
+                .secondaries()
+                .find(|replica| replica.identity().replica_id == replica_id)
+                .unwrap()
+                .clone();
+            cluster.delete_replica(&replaced).await?;
+            cluster.settle().await?;
+            ensure!(
+                cluster.service(&replaced).await.is_err(),
+                "retired reference resolved"
+            );
+            assert_values(&mut cluster, 3, 71).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    finish(cluster, result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_primary_failover_preserves_receipts_and_fences_the_old_service() -> Result<()> {
     let mut cluster = cluster().await?;
     let result = async {

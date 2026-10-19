@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use crate::protocol::public_operations::PublicV1Identity;
 use crate::protocol::public_operations::PublicV1LifecycleBinding;
 use crate::protocol::public_operations::{
-    DataLossRenewalDecision, PossibleDataLossIntent, PublicOperationIntent,
+    DataLossRenewalDecision, PossibleDataLossIntent, PublicBuildInput, PublicOperationIntent,
 };
 use crate::protocol::types::{FaultType, LoadMetric, OperationId, ReplicaRole};
 use async_trait::async_trait;
@@ -448,6 +448,57 @@ fn classify_public_v1_inbound_build_authority(
     }
 }
 
+fn build_was_promoted(preview: &PublicV1OperationState, build: &PublicBuildInput) -> bool {
+    use crate::protocol::public_operations::{PublicOperationProgram, PublicV1OperationResult};
+
+    let Some(record) = preview.build_records.get(&build.attempt) else {
+        return false;
+    };
+    if record.result != Some(PublicV1OperationResult::Succeeded)
+        || record.retirement != PublicV1BuildRetirement::Retain
+    {
+        return false;
+    }
+    preview.operations.values().any(|operation| {
+        if !crate::host::public_lifecycle::completed_configuration(operation)
+            || operation.intent.revision <= record.admission_revision
+            || operation.intent.process_session_id != record.source_session
+            || operation.accepted_history.as_ref() != Some(&record.history)
+            || operation.accepted_storage.as_ref() != Some(&record.source_storage)
+        {
+            return false;
+        }
+        let (current, replicas) = match operation.intent.program.as_ref() {
+            Some(PublicOperationProgram::Configuration(configuration))
+            | Some(PublicOperationProgram::CatchUp { configuration, .. }) => {
+                (&configuration.current, &configuration.replicas)
+            }
+            Some(PublicOperationProgram::Swap { refreshed, .. }) => {
+                (&refreshed.current, &refreshed.replicas)
+            }
+            None => match operation.intent.lifecycle.as_ref() {
+                Some(input) => (&input.current, &input.replicas),
+                None => return false,
+            },
+            _ => return false,
+        };
+        current.epoch >= build.epoch
+            && current.members.iter().any(|member| {
+                member.identity == build.replica
+                    && matches!(
+                        member.role,
+                        ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                    )
+            })
+            && replicas.iter().any(|replica| {
+                replica.identity == build.replica
+                    && replica.storage_incarnation.as_ref() == Some(&build.target_storage)
+                    && replica.process_session_id == build.process_session_id
+                    && replica.replication_address == build.replication_address
+            })
+    })
+}
+
 #[async_trait]
 impl AgentStore for SqliteStore {
     async fn identity(&self) -> Result<StorageIdentity> {
@@ -822,6 +873,32 @@ impl AgentStore for SqliteStore {
                     } else {
                         None
                     };
+                    let predecessor = preview
+                        .active_builds
+                        .get(&build.replica.replica_id)
+                        .filter(|active| {
+                            active.replica != build.replica && build_was_promoted(preview, active)
+                        })
+                        .cloned();
+                    if let Some(predecessor) = predecessor {
+                        // Promotion transfers ownership to the configuration. A fresh
+                        // incarnation may retire that idle slot, not an unfinished Build.
+                        preview.active_builds.remove(&build.replica.replica_id);
+                        preview.absent_builds.insert(predecessor.attempt.clone());
+                        if !preview
+                            .retired_storage_incarnations
+                            .contains(&predecessor.target_storage)
+                        {
+                            preview
+                                .retired_storage_incarnations
+                                .push(predecessor.target_storage);
+                        }
+                        preview
+                            .build_records
+                            .get_mut(&predecessor.attempt)
+                            .expect("promoted build record checked")
+                            .retirement = PublicV1BuildRetirement::Retired;
+                    }
                     if preview
                         .retired_storage_incarnations
                         .contains(&build.target_storage)

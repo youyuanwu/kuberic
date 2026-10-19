@@ -166,6 +166,7 @@ impl PrimaryReplicator for Replication {
         Ok(())
     }
     async fn build_replica(&self, _: ReplicaInformation) -> crate::Result<()> {
+        self.0.event("build");
         Ok(())
     }
     async fn remove_replica(&self, _: ReplicaId) -> crate::Result<()> {
@@ -317,6 +318,292 @@ async fn completed(operation: &PartitionOperation) -> PublicOperationRecord {
         .await
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test]
+async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing_replay() {
+    use crate::protocol::public_operations::{PublicOperationClass, PublicReplicaDescriptor};
+
+    let fixture = Fixture::new().await;
+    let authority = fixture
+        .launch(
+            PublicOperationProgram::Role {
+                epoch: Epoch::new(0, 1),
+                role: ReplicaRole::Primary,
+            },
+            1,
+        )
+        .await;
+    assert_eq!(
+        completed(&authority).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    let state = fixture.store.load_state().await.unwrap();
+    let source = state.identity.local_identity;
+    let history = state.public_v1_operation_state.unwrap().history.unwrap();
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("built-pod"),
+        agent_generation: AgentGeneration::new("built-agent"),
+    };
+    let target_storage = ReplicaStorageIncarnationContext {
+        replica: target.clone(),
+        storage: ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("built-pod"),
+            pvc_uid: PvcUid::new("built-pvc"),
+        },
+        storage_generation: StorageGeneration::new("built-storage"),
+    };
+    let build = PublicBuildInput {
+        attempt: OperationId::new("first-build"),
+        epoch: Epoch::new(0, 1),
+        current_configuration_id: Some(
+            ConfigurationDescriptor::new(
+                Epoch::new(0, 1),
+                source.replica_id,
+                vec![ConfigurationMember {
+                    identity: source.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )
+            .configuration_id,
+        ),
+        replica: target.clone(),
+        target_storage: target_storage.clone(),
+        process_session_id: ProcessSessionId::new("built-session"),
+        replication_address: "http://127.0.0.1:2".into(),
+        history: Some(history),
+    };
+    let build_intent = |build: PublicBuildInput, revision| {
+        let mut intent = fixture.intent(PublicOperationProgram::Build(build.clone()), revision);
+        intent.operation_id = build.attempt;
+        intent.class = PublicOperationClass::Build {
+            target: build.replica.replica_id,
+        };
+        intent
+    };
+    let first_intent = build_intent(build.clone(), 1);
+    let first = launch(
+        &fixture.registry,
+        fixture.store.clone(),
+        first_intent.clone(),
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    let first_result = completed(&first).await;
+    assert_eq!(
+        first_result.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    let replacement = ReplicaIdentity {
+        replica_id: target.replica_id,
+        instance_id: ReplicaInstanceId::new("replacement-pod"),
+        agent_generation: AgentGeneration::new("replacement-agent"),
+    };
+    let mut successor = build.clone();
+    successor.attempt = OperationId::new("replacement-build");
+    successor.replica = replacement.clone();
+    successor.target_storage = ReplicaStorageIncarnationContext {
+        replica: replacement,
+        storage: ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("replacement-pod"),
+            pvc_uid: PvcUid::new("replacement-pvc"),
+        },
+        storage_generation: StorageGeneration::new("replacement-storage"),
+    };
+    successor.process_session_id = ProcessSessionId::new("replacement-session");
+    successor.replication_address = "http://127.0.0.1:3".into();
+    assert!(
+        fixture
+            .registry
+            .admit(build_intent(successor.clone(), 1))
+            .await
+            .is_err(),
+        "an unpromoted idle Build still owns its logical replica slot"
+    );
+    let descriptor = |storage| PublicReplicaDescriptor {
+        build_id: OperationId::default(),
+        identity: target.clone(),
+        replication_address: build.replication_address.clone(),
+        process_session_id: build.process_session_id.clone(),
+        storage_incarnation: Some(storage),
+        role: ReplicaRole::ActiveSecondary,
+        current_progress: 0,
+        catch_up_capability: 0,
+        must_catchup: false,
+    };
+    let epoch_primary = ReplicaIdentity {
+        replica_id: ReplicaId::new(3),
+        instance_id: ReplicaInstanceId::new("epoch-primary"),
+        agent_generation: AgentGeneration::new("epoch-primary-agent"),
+    };
+    let epoch_only = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::SecondaryEpochAdvance,
+        replica: source.clone(),
+        epoch: Epoch::new(0, 2),
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            epoch_primary.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: epoch_primary,
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            1,
+        ),
+        previous: None,
+        replicas: vec![descriptor(target_storage.clone())],
+        data_loss_recovery: None,
+    };
+    let mut epoch_intent = fixture.intent(
+        PublicOperationProgram::Epoch {
+            epoch: epoch_only.epoch,
+        },
+        2,
+    );
+    epoch_intent.program = None;
+    epoch_intent.input_digest = epoch_only.digest();
+    epoch_intent.lifecycle = Some(epoch_only);
+    let epoch = launch(
+        &fixture.registry,
+        fixture.store.clone(),
+        epoch_intent,
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        completed(&epoch).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    let before = fixture.store.load_state().await.unwrap();
+    assert!(
+        fixture
+            .registry
+            .admit(build_intent(successor.clone(), 2))
+            .await
+            .is_err(),
+        "an epoch-only lifecycle does not prove configuration installation"
+    );
+    assert_eq!(fixture.store.load_state().await.unwrap(), before);
+    for (revision, exact_storage) in [(3, false), (4, true)] {
+        let epoch = Epoch::new(0, i64::try_from(revision).unwrap());
+        let mut storage = target_storage.clone();
+        if !exact_storage {
+            storage.storage_generation = StorageGeneration::new("not-the-built-storage");
+        }
+        let configuration = PublicConfiguration {
+            current: ConfigurationDescriptor::new(
+                epoch,
+                source.replica_id,
+                vec![
+                    ConfigurationMember {
+                        identity: source.clone(),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: target.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                    },
+                ],
+                1,
+            ),
+            previous: None,
+            replicas: vec![descriptor(storage)],
+        };
+        let operation = fixture
+            .launch(
+                PublicOperationProgram::Configuration(configuration.clone()),
+                revision,
+            )
+            .await;
+        assert_eq!(
+            completed(&operation).await.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
+        successor.epoch = epoch;
+        successor.current_configuration_id = Some(configuration.current.configuration_id);
+        if !exact_storage {
+            let before = fixture.store.load_state().await.unwrap();
+            assert!(
+                fixture
+                    .registry
+                    .admit(build_intent(successor.clone(), revision))
+                    .await
+                    .is_err(),
+                "configuration of different storage cannot release the Build slot"
+            );
+            assert_eq!(fixture.store.load_state().await.unwrap(), before);
+        }
+    }
+    let next = launch(
+        &fixture.registry,
+        fixture.store.clone(),
+        build_intent(successor, 4),
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        completed(&next).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    let preview = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .public_v1_operation_state
+        .unwrap();
+    assert_eq!(preview.active_builds.len(), 1);
+    assert_eq!(
+        preview.active_builds[&target.replica_id].attempt,
+        OperationId::new("replacement-build")
+    );
+    assert!(
+        preview
+            .retired_storage_incarnations
+            .contains(&target_storage)
+    );
+    assert!(preview.absent_builds.contains(&build.attempt));
+    assert_eq!(
+        preview.build_records[&build.attempt].retirement,
+        crate::host::public_build_store::PublicV1BuildRetirement::Retired
+    );
+    let replay = launch(
+        &fixture.registry,
+        fixture.store.clone(),
+        first_intent,
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(completed(&replay).await, first_result);
+    assert_eq!(
+        fixture
+            .probe
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "build")
+            .count(),
+        2,
+        "replaying the old success must not rebuild its retired incarnation"
+    );
+    fixture.registry.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -104,7 +104,7 @@ cargo nextest run -p kuberic-level-tests --all-features \
 just nextest-source
 ```
 
-The eight counter application/provider tests are normal workspace integration
+The counter application/provider tests are normal workspace integration
 tests. They are discovered by nextest, included in the reusable archive and
 executed in its ordinary partitions. They share the self-contained counter
 source with the standalone consumer fixture rather than running through a
