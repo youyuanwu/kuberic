@@ -754,6 +754,50 @@ full workspace ordinary or PostgreSQL/KinD qualification is claimed.
 See the [ledger](sf-v1-port-ledger.md#open-and-restart-recovery-slice-p3-bounded-f01f04f07f08f09f11)
 and [provenance](sf-v1-port-provenance.md#open-and-restart-recovery-slice-p3-bounded-f01f04f07f08f09f11).
 
+### SF V1 Private Service Adapter Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::service_adapter::)' -j 2
+```
+
+Cases execute the private async control/service adapter over actual role,
+provider, primary queue/session/quorum, secondary receiver/stream and copy/build
+owners. Interrupted control calls resume once without restarting callbacks;
+Opened progress caches only success. Access errors precede primary admission,
+invalid/full-queue admission consumes no LSN, and assigned writes have separate
+resumable quorum completion. Dropping a waiter never retracts accepted work.
+
+The helper-free journey obtains real target context, consumes provider copy,
+ACKs the actual target, finishes build and configures/promotes it before
+replication. Concurrent assignments remain incomplete until contiguous target
+service ACKs satisfy actual quorum/catch-up. A separate in-memory service owns
+ordered commit, visibility and client completion: a held/failed/out-of-order
+commit cannot expose an uncommitted value despite quorum success. Provider
+progress is not implicitly advanced by replication. The journey also retains
+real ACK ingress through primary Close quorum prewait.
+
+Stream cases cover shared consuming handles, no rewind, temporary emptiness,
+copy EOF, legacy close error then EOF, explicit EOS ACK drain, duplicate/late ACK
+identity, volatile implicit completion and private stream-fault capability
+errors. Internal epoch markers wait for the actual retained provider callback,
+not service-fabricated success. Queries use real native queue/receiver values;
+copy-time secondary queries return NotReady and report a sticky fault.
+Role handoffs refresh the same service handle. Build waiter drop, actual
+cancellation waiting for establishment, removal, explicit retired-build drainage
+and abnormal owner abandonment remain distinct. Abandonment wakes outstanding
+build waiters with an explicit error, never an invented End or indefinite wait.
+
+Use the live nextest inventory for behavioral coverage and tier discovery.
+No public trait/factory/service/wire/report/controller behavior is switched.
+The adapter remains caller-driven and unselected, with an exclusive control lane
+rather than a claim of full native concurrent facade interleavings. Real
+KV/SQLite migration, host listener/authentication/registry/status/reporting,
+settings, monitoring and P5 cutover remain pending. No native execution,
+hosted/differential parity or provider-fsync qualification is claimed.
+See the [ledger](sf-v1-port-ledger.md#private-service-adapter-slice-p4-bounded-f01f02f04f05f09f11)
+and [provenance](sf-v1-port-provenance.md#private-service-adapter-slice-p4-bounded-f01f02f04f05f09f11).
+
 ### Built-In Service Operation Delivery
 
 ```bash

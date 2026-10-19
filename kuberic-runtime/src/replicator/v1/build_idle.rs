@@ -15,6 +15,7 @@
 
 #![cfg_attr(not(test), expect(dead_code, reason = "unselected V1 BuildIdle"))]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -53,6 +54,8 @@ pub(super) enum BuildError {
     Manager(Arc<ManagerError>),
     #[error("BuildIdle manager owner was dropped")]
     ManagerDropped,
+    #[error("BuildIdle driver was abandoned before End")]
+    OwnerDropped,
     #[error(transparent)]
     Establishment(#[from] EstablishError),
     #[error(transparent)]
@@ -88,6 +91,8 @@ struct Root {
     session: ReplicationSession,
     clock: Clock,
     wake: Notify,
+    completed: Notify,
+    alive: AtomicBool,
     terminal: Mutex<Option<Terminal>>,
 }
 
@@ -175,6 +180,21 @@ impl BuildIdleHandle {
             .unwrap()
             .as_ref()
             .map(|terminal| terminal.end.clone())
+    }
+
+    pub(super) async fn wait(&self) -> Result<BuildEnd, BuildError> {
+        loop {
+            let completed = self.0.completed.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            if let Some(end) = self.result() {
+                return Ok(end);
+            }
+            if !self.0.alive.load(Ordering::Acquire) {
+                return Err(BuildError::OwnerDropped);
+            }
+            completed.await;
+        }
     }
 
     pub(super) fn finish_copy_target(&self) -> Result<Option<Lsn>, CopyError> {
@@ -371,6 +391,8 @@ impl BuildIdle {
             session: session.clone(),
             clock: clock.clone(),
             wake: Notify::new(),
+            completed: Notify::new(),
+            alive: AtomicBool::new(true),
             terminal: Mutex::new(None),
         }));
         let (pending, start) = manager.lock().unwrap().admit_build(
@@ -459,11 +481,16 @@ impl BuildIdle {
             }
         }
         let mut terminal = self.handle.0.terminal.lock().unwrap();
-        let terminal = terminal.get_or_insert(Terminal {
-            end,
-            finish_copy_target: target,
-        });
-        Ok(terminal.end.clone())
+        let end = terminal
+            .get_or_insert(Terminal {
+                end,
+                finish_copy_target: target,
+            })
+            .end
+            .clone();
+        drop(terminal);
+        self.handle.0.completed.notify_waiters();
+        Ok(end)
     }
 
     /// Interruptible driver; acquisition/enumeration state lives in the owner.
@@ -481,6 +508,13 @@ impl BuildIdle {
                 timer = root.timer() => timer?,
             }
         }
+    }
+}
+
+impl Drop for BuildIdle {
+    fn drop(&mut self) {
+        self.handle.0.alive.store(false, Ordering::Release);
+        self.handle.0.completed.notify_waiters();
     }
 }
 

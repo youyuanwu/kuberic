@@ -6,6 +6,7 @@
 // CloseAsyncOperation2.cpp:116-421 and DrainQueueAsyncOperation.cpp:56-342,
 // promotion branches in both Close operations and
 // SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31-155,
+// SecondaryReplicator.cpp:553-619 (copy-gated progress/capability queries),
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d,
 // src/prod/src/Reliability/Replication/. See sf-v1-port-provenance.md.
 
@@ -58,6 +59,8 @@ pub(super) enum SecondaryError {
     Aborted,
     #[error("secondary has a reported fault: {0}")]
     Fault(String),
+    #[error("secondary progress is unavailable before copy completes")]
+    NotReady,
     #[error("StateProvider EndUpdateEpoch: {0}")]
     Provider(Arc<RuntimeError>),
     #[error("provider epoch callback is already outstanding")]
@@ -328,6 +331,38 @@ pub(super) struct SecondaryHandle(Weak<Root>);
 impl SecondaryHandle {
     fn root(&self) -> Result<Arc<Root>, SecondaryError> {
         self.0.upgrade().ok_or(SecondaryError::OwnerDropped)
+    }
+
+    pub(super) fn current_progress(&self) -> Result<Lsn, SecondaryError> {
+        self.query_progress(false)
+    }
+
+    pub(super) fn catchup_capability(&self) -> Result<Lsn, SecondaryError> {
+        self.query_progress(true)
+    }
+
+    fn query_progress(&self, capability: bool) -> Result<Lsn, SecondaryError> {
+        let root = self.root()?;
+        let result = {
+            let mut state = root.state.lock().unwrap();
+            Root::admit(&state)?;
+            let replication = root.replication.lock().unwrap();
+            if state.copy.is_copy_in_progress() || replication.queue().is_none() {
+                state.fault = Some(SecondaryError::NotReady);
+                Err(SecondaryError::NotReady)
+            } else if capability {
+                replication
+                    .catchup_capability()
+                    .map_err(SecondaryError::from)
+            } else {
+                replication.current_progress().map_err(SecondaryError::from)
+            }
+        };
+        if matches!(result, Err(SecondaryError::NotReady)) {
+            (root.report_fault)(SecondaryError::NotReady);
+            root.wake.notify_one();
+        }
+        result
     }
 
     pub(super) fn copy_stream(&self) -> Result<OperationStream, SecondaryError> {

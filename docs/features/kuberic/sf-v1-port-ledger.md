@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
 **P1 foundation, unselected P2 substrate slices and bounded P3 primary,
-secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices; no selected production behavior change.** Native pin:
+secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus a bounded private P4 service adapter; no selected production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -995,15 +995,72 @@ No full P3, native execution, differential/hosted parity or provider-fsync
 qualification is claimed. Earlier slice-boundary omissions are superseded only
 for this bounded private lifecycle and caller-directed recovery handoff.
 
+### Private Service Adapter Slice (P4, Bounded F01/F02/F04/F05/F09/F11)
+
+The private [`service adapter`](../../../kuberic-runtime/src/replicator/v1/service_adapter.rs)
+composes the existing role, primary, secondary, queue, build and provider owners.
+Its caller-driven async control owner exposes Open, role/epoch changes, progress,
+data loss, configuration/build/catch-up/removal and Close/Abort. Dropping a
+selected control future retains the actual work; explicit `resume` finishes it
+without restarting provider callbacks. The exclusive control lane and separate
+steady `drive` are Rust execution substitutions, not full native concurrent
+facade interleavings. No autonomous engine/task or public factory is installed.
+
+A cloneable weak service handle selects the current role under a short guard,
+then invokes the actual owner unlocked. Payload validation and an injected
+write-access callback precede primary admission. That callback preserves native
+ReconfigurationPending/NoWriteQuorum/NotPrimary precedence but is not a host
+status calculation or serving grant. Successful admission returns the actual
+LSN and a separate resumable quorum-completion waiter. Dropping the waiter does
+not retract the queue entry; neither assignment nor quorum completion commits
+service state, changes provider progress or produces client success.
+
+Copy/replication adapters consume the existing shared receiver queues. Internal
+epoch markers hand off to the real secondary/provider driver; the service sees
+operations only after that barrier. Operations expose immutable data/LSN/epoch,
+optional EOS and parameterless service ACK through the original callback owner.
+Reacquisition does not rewind; empty open streams wait; legacy error-then-EOF,
+copy EOF, explicit EOS/ACK drainage, duplicate and retired ACK behavior remain
+distinct. Build waiters observe actual End via outside-guard notification;
+waiter drop is not native Build cancellation or RemoveReplica. Abandoning the
+actual driver wakes outstanding build waiters with an explicit owner-dropped
+error, not a fabricated End or an indefinite wait. Ordinary Close
+and explicit retired-build drainage remain separate. Drop is abnormal abort
+containment, not successful callback/provider drainage.
+
+Opened capability is zero and progress uses existing lazy provider recovery.
+Stable primary queries read native queue commitment/capability. Secondary
+queries read actual receiver progress; querying during copy/uninitialized state
+returns NotReady and reports a sticky fault instead of synthesizing progress.
+No new query value is fed into existing published host reports.
+
+The [actual-owner regressions](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests.rs)
+include helper-free target-context/copy/build, configuration, concurrent
+assignment, held service ACK/quorum completion and separate ordered local
+commit/client completion. Failed or delayed local commit leaves the service
+value invisible even after quorum success. Additional vectors cover interrupted
+control/provider/stream work, access/admission failures, volatile implicit ACK,
+role handoffs, build cancellation/removal and Close/Abort/abandonment.
+See the [selector](testing.md#sf-v1-private-service-adapter-slice) and
+[source register](sf-v1-port-provenance.md#private-service-adapter-slice-p4-bounded-f01f02f04f05f09f11).
+
+This is a bounded private P4 preparation, not implementation of the published
+facade or full P4/P3 closure. Protected interfaces, production factory, service
+writes, selected wire, host/schema/controller reports, dependencies and tier
+policy are unchanged. Production host/authentication/listener/registry and
+partition reporting, real KV/SQLite migration, settings/capabilities,
+monitoring/health and P5 atomic cutover remain pending. No native execution,
+hosted/differential parity or provider-fsync qualification is claimed.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
-| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`; public facade/factory and outer host lifecycle pending | COM/refcounts → owned Rust; explicit Created/Open with logical registration, actual role edges/retained handoff and data-loss admission/restoration, not public activation | A1, C1, L1 |
+| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`, private `service_adapter.rs`; public facade/factory and outer host lifecycle pending | COM/refcounts → owned Rust; Created/Open registration, actual role/recovery and resumable private async control, not public activation | A1, C1, L1 |
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`, `primary.rs`, `role.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle lifecycle, lasting primary/session ownership, descriptor configuration and role/epoch queue handoff delivered | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`, `copy_establishment.rs`, `secondary.rs`, `role.rs` | async queues/executor; required/optimistic ACK, shared StartCopy receiver, provider callbacks, ordinary Close/Abort, promotion drainage, direct epochs and actual queue handoff delivered; host demux pending | S1–S3, E2 |
-| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams, `copy_async_operation.rs`, `copy_establishment.rs` | protected Bytes/boxed stream/i64 unchanged; shared receipt, terminal adapters, serial polling and bounded copy provider acquisition delivered; public facade/full provider lifecycle pending | D1, S2–S3, C1–C2 |
+| F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams, `copy_async_operation.rs`, `copy_establishment.rs`, private `service_adapter.rs` | protected Bytes/boxed stream/i64 unchanged; private service streams/ACK and provider-barrier handoff compose actual owners; published facade/full provider lifecycle pending | D1, S2–S3, C1–C2 |
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs`, bounded `primary.rs`, `replica_manager/policy.rs` | injected clocks, lasting session timers/ordered ACKs and slow-fault notification/reclamation policy; quorum/all/MustCatchup remain separate | R1–R3, T2 |
 | F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`, `copy_sender.rs`, `copy_establishment.rs`, `build_idle.rs`; full role composition pending | context acquisition/receipt, reliable StartCopy, serial enumeration/sending, EOF-issued target, copy/replication gates/pending retarget and idle lifecycle delivered; no fixed snapshot-only build substitute | C2–C5 |
 | F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, `ingress.rs`, bounded role/primary/secondary owners, private `sf_v1.proto` | typed role demux, native secondary per-message admission, current reply routing and targeted fault reporting; accepted send is not service ACK; production host integration and native wire compatibility are not claimed | T1–T2, D1 |
@@ -1174,7 +1231,10 @@ quorum/all/MustCatchup. Bounded role-aware ingress now routes real messages,
 updates secondary reply identity and reports targeted remote faults through the
 actual secondary owner. Production listener/authentication/registry and partition
 reporting integration, plus platform monitoring, remain explicit host boundaries.
-P4 prepares service/host
+P4 now has a bounded private caller-driven service/control adapter, separate
+assignment/quorum completion, shared stream/ACK/provider-barrier adapters and
+actual-owner helper-free service isolation evidence. Public facade, real
+service migration and host integration remain pending. P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
 [roadmap](sf-v1-semantic-alignment-plan.md); P1 creates no permanent alternate

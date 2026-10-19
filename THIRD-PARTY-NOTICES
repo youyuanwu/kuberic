@@ -263,6 +263,25 @@ recovering invented bytes or importing placement policy. No native transport,
 monitoring, utility, fixture or test-harness implementation is incorporated.
 All components remain private and production-unselected.
 
+The private service_adapter.rs, its actual-owner tests, primary.rs/secondary.rs
+query seams and build_idle.rs End notification compose selected
+ComReplicator.cpp:219-313, ComReplicator.ReplicateOperation.cpp:23-74,
+Replicator.ReplicateAsyncOperation.cpp:31-98,
+PrimaryReplicator.ReplicateAsyncOperation.cpp:31-66,
+Replicator.cpp:296-562,889-907, PrimaryReplicator.cpp:319-336,
+SecondaryReplicator.cpp:553-619,
+ComOperationStream.GetOperationOperation.cpp:23-72,
+ComFromBytesOperation.cpp:139-257 and EnumOperators.cpp:85-129 at the same pin.
+Weak Rust service handles, explicitly driven resumable controls, retained
+completion receivers and outside-guard notifications replace COM Begin/End
+execution plumbing. Existing queues, ACK callbacks, provider barriers and build
+owners remain authoritative; no second engine, service-local commit hook,
+mandatory DurableState or success oracle is added. Tests use actual compiled
+owners and a helper-free in-memory service, not native binaries/fixtures.
+Public facade/factory, real services and host/report integration remain
+unselected. No native utility, harness or third-party dependency source is
+imported; full concurrent native facade interleavings are not asserted.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.
