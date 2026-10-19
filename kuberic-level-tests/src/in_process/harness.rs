@@ -224,7 +224,7 @@ impl Harness {
         let service = self.service(primary).await?;
         Ok(self
             .cluster
-            .drive(async move { service.replicate_put(key.into(), value.into()).await })
+            .probe(async move { service.replicate_put(key.into(), value.into()).await })
             .await?)
     }
     pub async fn assert_values(&mut self, key: &str, value: &str) -> Result<()> {

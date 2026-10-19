@@ -8,9 +8,7 @@ impl RetainedFailure {
         Self(Arc::new(source))
     }
     fn kind(&self) -> ErrorKind {
-        self.0
-            .downcast_ref::<TestError>()
-            .map_or(ErrorKind::Fatal, TestError::kind)
+        source_kind(&self.0)
     }
 }
 impl fmt::Display for RetainedFailure {
@@ -35,6 +33,18 @@ pub enum ErrorKind {
     Deadline,
     Fatal,
     Cleanup,
+}
+
+fn source_kind(source: &anyhow::Error) -> ErrorKind {
+    if let Some(error) = source.downcast_ref::<TestError>() {
+        error.kind()
+    } else if let Some(retained) = source.downcast_ref::<RetainedFailure>() {
+        retained.kind()
+    } else if source.is::<tokio::time::error::Elapsed>() {
+        ErrorKind::Deadline
+    } else {
+        ErrorKind::Fatal
+    }
 }
 
 /// Preserves application and cleanup sources without printing credentials.
@@ -119,13 +129,7 @@ impl From<anyhow::Error> for TestError {
         match source.downcast::<Self>() {
             Ok(error) => error,
             Err(source) => {
-                let kind = if let Some(retained) = source.downcast_ref::<RetainedFailure>() {
-                    retained.kind()
-                } else if source.is::<tokio::time::error::Elapsed>() {
-                    ErrorKind::Deadline
-                } else {
-                    ErrorKind::Fatal
-                };
+                let kind = source_kind(&source);
                 Self::with_source(kind, "harness operation failed", source)
             }
         }
@@ -138,5 +142,26 @@ impl From<std::io::Error> for TestError {
             "application storage operation failed",
             source,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retained_constructor_timeout_keeps_deadline_classification() {
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let source = anyhow::Error::new(elapsed).context("supervisor constructor timed out");
+        let retained = RetainedFailure::new(source);
+        let error = TestError::from(anyhow::Error::new(retained));
+        assert_eq!(error.kind(), ErrorKind::Deadline);
+        assert!(error.sources().any(|source| {
+            source
+                .to_string()
+                .contains("supervisor constructor timed out")
+        }));
     }
 }

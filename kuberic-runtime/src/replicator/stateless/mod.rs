@@ -784,6 +784,7 @@ pub struct StatelessReplicator {
     open_gate: Mutex<()>,
     write_gate: Mutex<()>,
     provider_effect_gate: Mutex<()>,
+    progress_publication_gate: Mutex<()>,
     inbound_build_admission_gate: Mutex<()>,
     listener: StdMutex<Option<Arc<ListenerOwner>>>,
     descendants: TaskRegistry,
@@ -841,6 +842,7 @@ impl StatelessReplicator {
             open_gate: Mutex::new(()),
             write_gate: Mutex::new(()),
             provider_effect_gate: Mutex::new(()),
+            progress_publication_gate: Mutex::new(()),
             inbound_build_admission_gate: Mutex::new(()),
             listener: StdMutex::new(None),
             descendants: TaskRegistry::new(),
@@ -954,24 +956,21 @@ impl StatelessReplicator {
         Ok(authority)
     }
 
-    async fn publish_progress(&self, ambiguous: bool) -> Result<()> {
+    async fn publish_progress(&self) -> Result<()> {
+        let _publication = self.progress_publication_gate.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        let (applied_lsn, committed_lsn, local_rebuild_required) = {
+        let (applied_lsn, committed_lsn, ambiguous) = {
             let state = self.state.lock().await;
             (
                 state.applied_lsn,
                 state.committed_lsn,
-                state.local_rebuild_required,
+                state.ambiguous_suffix || state.local_rebuild_required,
             )
         };
         self.context
-            .publish_replacement_progress(
-                applied_lsn,
-                committed_lsn,
-                ambiguous || local_rebuild_required,
-            )
+            .publish_replacement_progress(applied_lsn, committed_lsn, ambiguous)
             .await
     }
 
@@ -981,9 +980,10 @@ impl StatelessReplicator {
         {
             let mut state = self.state.lock().await;
             state.applied_lsn = state.applied_lsn.max(applied_floor);
-            state.ambiguous_suffix = true;
+            // A late cancellation must not re-fence a prefix verified by recovery.
+            state.ambiguous_suffix |= state.applied_lsn > state.committed_lsn;
         }
-        let _ = self.publish_progress(true).await;
+        let _ = self.publish_progress().await;
     }
 
     async fn verify_retained_payload(&self, lsn: i64, data: &[u8]) -> Result<()> {
@@ -1052,8 +1052,7 @@ impl StatelessReplicator {
             self.abandoned_applied_floor.store(0, Ordering::Release);
         }
         drop(state);
-        self.publish_progress(progress.applied_lsn > progress.committed_lsn)
-            .await
+        self.publish_progress().await
     }
 
     async fn fence_local_build_source(&self) {
@@ -1065,7 +1064,7 @@ impl StatelessReplicator {
             state.inbound_build = None;
             state.local_rebuild_required = true;
         }
-        let _ = self.publish_progress(true).await;
+        let _ = self.publish_progress().await;
     }
 
     async fn reconcile_provider_committed_tail(&self) -> Result<i64> {
@@ -1086,6 +1085,8 @@ impl StatelessReplicator {
         if !state.ambiguous_suffix {
             self.abandoned_applied_floor.store(0, Ordering::Release);
         }
+        drop(state);
+        self.publish_progress().await?;
         Ok(progress.committed_lsn)
     }
 
@@ -1323,7 +1324,7 @@ impl StatelessReplicator {
         // delivery, without crediting any applied/committed progress. A dropped
         // request leaves this fence in place until verified ACK or recovery.
         self.state.lock().await.ambiguous_suffix = true;
-        self.publish_progress(true).await.map_err(runtime_status)?;
+        self.publish_progress().await.map_err(runtime_status)?;
         let committed = self
             .streams
             .deliver(
@@ -1392,13 +1393,7 @@ impl StatelessReplicator {
             state.committed_lsn = state.committed_lsn.max(committed.committed_lsn);
             state.ambiguous_suffix = state.applied_lsn > state.committed_lsn;
         }
-        let ambiguous = {
-            let state = self.state.lock().await;
-            state.ambiguous_suffix
-        };
-        self.publish_progress(ambiguous)
-            .await
-            .map_err(runtime_status)?;
+        self.publish_progress().await.map_err(runtime_status)?;
         if !self
             .exact_authority_is_current(&authority, generation, ReplicaRole::ActiveSecondary)
             .await
@@ -1879,7 +1874,7 @@ impl StatelessReplicator {
                 state.ambiguous_suffix = false;
             }
             self.abandoned_applied_floor.store(0, Ordering::Release);
-            self.publish_progress(false).await?;
+            self.publish_progress().await?;
             for peer in authority.peers.values() {
                 if peer_progress.contains_key(&peer.identity) {
                     let retained = self
@@ -2715,9 +2710,7 @@ impl StatelessReplicator {
                 .map_err(runtime_status)?;
             self.state.lock().await.inbound_build = None;
         }
-        self.publish_progress(progress.applied_lsn > durable_lsn)
-            .await
-            .map_err(runtime_status)?;
+        self.publish_progress().await.map_err(runtime_status)?;
         Ok(proto::CopyAck {
             protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             build_id: build_id.to_string(),
@@ -2852,9 +2845,8 @@ impl Replicator for StatelessReplicator {
         state.applied_lsn = progress.applied_lsn;
         state.committed_lsn = progress.committed_lsn;
         state.ambiguous_suffix = progress.applied_lsn > progress.committed_lsn;
-        let ambiguous = state.ambiguous_suffix;
         drop(state);
-        if let Err(error) = self.publish_progress(ambiguous).await {
+        if let Err(error) = self.publish_progress().await {
             self.abort_listener();
             return Err(error);
         }
@@ -3338,7 +3330,7 @@ impl StateReplicator for StatelessReplicator {
         // Close normal read admission before the provider can expose a mutation.
         // Until provider entry, abandonment must not claim the allocated LSN.
         self.state.lock().await.ambiguous_suffix = true;
-        self.publish_progress(true).await?;
+        self.publish_progress().await?;
         if !self
             .exact_authority_is_current(&authority, generation, ReplicaRole::Primary)
             .await
@@ -3369,7 +3361,7 @@ impl StateReplicator for StatelessReplicator {
             state.applied_lsn = state.applied_lsn.max(applied.applied_lsn);
             state.ambiguous_suffix = state.applied_lsn > state.committed_lsn;
         }
-        self.publish_progress(true).await?;
+        self.publish_progress().await?;
         let mut acknowledgements = std::collections::BTreeSet::from([self.identity.clone()]);
         let quorum = |acknowledgements: &BTreeSet<ReplicaIdentity>,
                       configuration: &ConfigurationDescriptor| {
@@ -3445,7 +3437,7 @@ impl StateReplicator for StatelessReplicator {
         state.committed_lsn = state.committed_lsn.max(committed.committed_lsn);
         state.ambiguous_suffix = state.applied_lsn > state.committed_lsn;
         drop(state);
-        self.publish_progress(false).await?;
+        self.publish_progress().await?;
         if !self
             .exact_authority_is_current(&authority, generation, ReplicaRole::Primary)
             .await

@@ -42,18 +42,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 1057 |
+| ordinary | 1060 |
 | source | 22 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
-| **total** | **1123** |
+| **total** | **1126** |
 
-Ordinary partition counts are `265, 264, 264, 264`. PostgreSQL partition counts
+Ordinary partition counts are `265, 265, 265, 265`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
 Inventory after the primary configuration slice and harness/source-job split:
-1123 = 1057 + 22 + 41 + 3. Discovery builds the tier binaries but does not execute
+1126 = 1060 + 22 + 41 + 3. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies. Doctests are additional source-job checks, not
 nextest archive entries.
 

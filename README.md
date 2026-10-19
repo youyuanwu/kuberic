@@ -85,7 +85,7 @@ The archive contains all nextest-discoverable test binaries. Source/API/package
 checks and doctests run in a separate checkout-backed CI job; ordinary
 application/provider tests execute from archive partitions.
 
-The current inventory contains 1123 nextest tests: 1057 ordinary,
+The current inventory contains 1126 nextest tests: 1060 ordinary,
 22 source checks, 41 PostgreSQL and three KinD. Doctests run separately in the
 source-check job.
 
