@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
 **P1 foundation, unselected P2 substrate slices and bounded P3 primary,
-secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus a bounded private P4 service adapter; no selected production behavior change.** Native pin:
+secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus bounded private P4 service and protected-facade execution adapters; no selected production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -1052,11 +1052,60 @@ partition reporting, real KV/SQLite migration, settings/capabilities,
 monitoring/health and P5 atomic cutover remain pending. No native execution,
 hosted/differential parity or provider-fsync qualification is claimed.
 
+### Private Protected-Facade Execution Slice (P4, Bounded F01/F02/F09/F11)
+
+The private [`facade bridge`](../../../kuberic-runtime/src/replicator/v1/service_adapter/facade.rs)
+implements the unchanged `Replicator` and `PrimaryReplicator` traits over the
+existing service adapter and actual V1 owners. No public constructor or factory
+selects it. Open returns the existing logical registration address, not an
+authenticated production listener. Exact public identity/process/storage/address
+bindings are supplied as a private snapshot; opaque public string IDs are not
+hashed or truncated into native sender incarnations.
+
+A bounded request channel selects existing owner transitions. One retained
+Tokio task progresses control callbacks, steady timers/ingress/provider barriers
+and independent build/catch-up waits. Dropping a trait-call future does not
+retract a sent request or destroy selected work. Incompatible controls fail
+explicitly; stable primary queries remain available during an external epoch
+callback. The active owner future remains alive between wakes. Retired primary
+build drivers and outstanding secondary context callbacks transfer intact to
+the same task and progress independently after role handoff, not only at final
+shutdown. Descriptor conversion preserves former-primary roles in the previous
+configuration while requiring the local primary in the current configuration.
+
+Abort synchronously revokes facade/service admission, disables projected ingress
+and aborts the projected child outside the projection guard. The task then
+performs actual role Abort and observes retained callbacks. This scheduling and
+the existing exclusive control lane are explicit Rust substitutions, not full
+native concurrent facade/Abort interleaving parity. Reentrant provider Abort
+cannot publish late control success. Ordinary Close completes at the actual
+role Close boundary; explicit cancellation-safe join additionally observes
+provider/build drainage (including context acquisition after legacy secondary
+Close) and task errors. Drop is abnormal Abort containment,
+not proof of successful Close/join. Channel loss, callback failure and worker
+panic are errors, never successful operation results.
+
+[Actual-owner trait-object regressions](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs)
+cover interrupted callbacks, query/control admission, real context/copy/build,
+configuration/quorum, sender retries, stream epoch/EOS barriers, retired build
+progress and distinct Close/Abort/join lifetimes. The protected `Result<bool>`
+data-loss call returns an error on failed End; the richer changed/error result
+remains in the private actual owner.
+
+See the [selector](testing.md#sf-v1-private-protected-facade-execution-slice)
+and [source register](sf-v1-port-provenance.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11).
+Protected signatures, published assignment/ACK APIs, default factory, services,
+selected wire, report/schema/controller/election/rejoin semantics, dependencies
+and tier policy remain unchanged. Real-service and authenticated host/status/
+reporting adapters, full P4 closure and atomic P5 activation remain pending.
+No native execution, hosted/differential parity or provider-fsync qualification
+is claimed.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
-| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`, private `service_adapter.rs`; public facade/factory and outer host lifecycle pending | COM/refcounts → owned Rust; Created/Open registration, actual role/recovery and resumable private async control, not public activation | A1, C1, L1 |
+| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`, private `service_adapter.rs` and `service_adapter/facade.rs`; public selection/factory and outer host lifecycle pending | COM/refcounts → owned Rust; Created/Open registration, actual role/recovery, resumable control and retained protected-trait driver, not public activation | A1, C1, L1 |
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`, `primary.rs`, `role.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle lifecycle, lasting primary/session ownership, descriptor configuration and role/epoch queue handoff delivered | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`, `copy_establishment.rs`, `secondary.rs`, `role.rs` | async queues/executor; required/optimistic ACK, shared StartCopy receiver, provider callbacks, ordinary Close/Abort, promotion drainage, direct epochs and actual queue handoff delivered; host demux pending | S1–S3, E2 |
@@ -1233,8 +1282,10 @@ actual secondary owner. Production listener/authentication/registry and partitio
 reporting integration, plus platform monitoring, remain explicit host boundaries.
 P4 now has a bounded private caller-driven service/control adapter, separate
 assignment/quorum completion, shared stream/ACK/provider-barrier adapters and
-actual-owner helper-free service isolation evidence. Public facade, real
-service migration and host integration remain pending. P4 prepares service/host
+actual-owner helper-free service isolation evidence. A private protected-trait
+bridge now owns autonomous active/retired progress and distinct Close/Abort/join
+lifetimes. Public facade selection, real service migration and host integration
+remain pending. P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
 [roadmap](sf-v1-semantic-alignment-plan.md); P1 creates no permanent alternate

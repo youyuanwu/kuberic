@@ -1027,12 +1027,23 @@ impl Primary {
 
     /// Explicit provider/build drainage, separate from native primary Close.
     pub(super) async fn drain_builds(&mut self) -> Result<(), PrimaryError> {
+        std::future::poll_fn(|cx| self.poll_drain_builds(cx)).await
+    }
+
+    pub(super) fn poll_drain_builds(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), PrimaryError>> {
+        use futures::Stream;
+        use std::task::Poll;
+
         loop {
             self.collect_builds();
-            let Some((build, result)) = self.drivers.next().await else {
-                return Ok(());
-            };
-            self.finish_build(build, result)?;
+            match std::pin::Pin::new(&mut self.drivers).poll_next(cx) {
+                Poll::Ready(Some((build, result))) => self.finish_build(build, result)?,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 

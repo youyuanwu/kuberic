@@ -798,6 +798,42 @@ hosted/differential parity or provider-fsync qualification is claimed.
 See the [ledger](sf-v1-port-ledger.md#private-service-adapter-slice-p4-bounded-f01f02f04f05f09f11)
 and [provenance](sf-v1-port-provenance.md#private-service-adapter-slice-p4-bounded-f01f02f04f05f09f11).
 
+### SF V1 Private Protected-Facade Execution Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::service_adapter::tests::facade::)' -j 2
+```
+
+Cases call the unchanged protected traits through real trait objects backed by
+the private retained driver and actual V1 owners. Held/interrupted provider
+progress, role, epoch and data-loss calls keep their callbacks without caller
+polling. Concurrent incompatible controls fail explicitly; stable primary
+queries remain available during external epoch work. Reentrant provider Abort
+cannot deadlock a facade guard or publish late success.
+
+Actual source/target context, copy, service ACK, build/configuration and quorum
+exercise independent waiters and logical ingress. Sender retries and secondary
+stream epoch/EOS barriers progress without manual owner drive. Retired build
+providers continue after demotion. Close may finish while a build provider or
+legacy secondary context acquisition is held; cancellation-safe join remains
+pending until real callback drainage. Retired secondary context work continues
+without a Close caller, and its provider failures remain explicit. Configuration
+cases preserve former-primary roles in the previous voting set and reject a
+different current primary before mutation.
+Abort seals service admission synchronously while retaining outstanding callback
+work. Provider errors, exact identity/configuration mismatches and worker panic
+are explicit failures, not success-shaped fallbacks.
+
+Use the live nextest inventory, not a fixed test total. The private binding
+snapshot/logical endpoint are not a production host registry/listener. No
+factory, public assignment/ACK API, real service, wire, report/schema/controller
+or tier policy is switched. Exclusive control admission and Abort coordination
+remain explicit Rust substitutions; full native interleaving/hosted parity,
+real-service migration and P5 activation are not claimed.
+See the [ledger](sf-v1-port-ledger.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11)
+and [provenance](sf-v1-port-provenance.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11).
+
 ### Built-In Service Operation Delivery
 
 ```bash
