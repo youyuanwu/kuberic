@@ -241,7 +241,7 @@ impl HostedPublicV1Harness {
                     PublicOperationProgram::Open {
                         replica: member.identity.clone(),
                         existing: report.open_mode
-                            == kuberic_runtime::application::OpenMode::Existing,
+                            == kuberic_runtime::protocol::types::OpenMode::Existing,
                     },
                 )
                 .await?;
@@ -503,7 +503,7 @@ impl HostedPublicV1Harness {
                         PublicOperationProgram::Open {
                             replica: replacement.identity.clone(),
                             existing: report.open_mode
-                                == kuberic_runtime::application::OpenMode::Existing,
+                                == kuberic_runtime::protocol::types::OpenMode::Existing,
                         },
                     )
                     .await?;

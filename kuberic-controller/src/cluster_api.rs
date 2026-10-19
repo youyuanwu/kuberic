@@ -4087,7 +4087,7 @@ impl ClusterApi for InMemoryClusterApi {
                                     format!("in-memory-creation-{}", replica.replica_id.value()),
                                 ),
                             report_sequence: 1,
-                            open_mode: kuberic_runtime::application::OpenMode::Existing,
+                            open_mode: kuberic_runtime::protocol::types::OpenMode::Existing,
                             role: ReplicaRole::None,
                             read_status: kuberic_runtime::protocol::types::AccessStatus::NotPrimary,
                             write_status: kuberic_runtime::protocol::types::AccessStatus::NotPrimary,
@@ -4168,7 +4168,7 @@ impl ClusterApi for InMemoryClusterApi {
                     if let Some(program) = operation.intent.program.as_ref() {
                         match program {
                             kuberic_runtime::protocol::public_operations::PublicOperationProgram::Open { .. } => {
-                                report.open_mode = kuberic_runtime::application::OpenMode::Existing;
+                                report.open_mode = kuberic_runtime::protocol::types::OpenMode::Existing;
                                 report.extensions.catch_up_specific_quorum = Some(false);
                                 report.replication_address = Some(format!(
                                     "http://10.0.0.{}:50052",
@@ -5554,7 +5554,7 @@ mod corrective_replacement_tests {
             process_session_id: expected.intent.process_session_id.clone(),
             replicator_creation_id: ReplicatorCreationId::new("corrective-creation"),
             report_sequence: 1,
-            open_mode: kuberic_runtime::application::OpenMode::Existing,
+            open_mode: kuberic_runtime::protocol::types::OpenMode::Existing,
             role: ReplicaRole::Primary,
             read_status: kuberic_runtime::protocol::types::AccessStatus::Granted,
             write_status: kuberic_runtime::protocol::types::AccessStatus::Granted,
@@ -6272,7 +6272,7 @@ mod tests {
                 process_session_id: endpoint.process_session_id.clone(),
                 replicator_creation_id: endpoint.replicator_creation_id.clone(),
                 report_sequence: 1,
-                open_mode: kuberic_runtime::application::OpenMode::Existing,
+                open_mode: kuberic_runtime::protocol::types::OpenMode::Existing,
                 role: report_role,
                 read_status: AccessStatus::NotPrimary,
                 write_status: AccessStatus::NotPrimary,

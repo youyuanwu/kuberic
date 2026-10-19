@@ -105,7 +105,7 @@ fn report(
         process_session_id: ProcessSessionId::new("session-1"),
         replicator_creation_id: ReplicatorCreationId::new("creation-1"),
         report_sequence: 1,
-        open_mode: kuberic_runtime::application::OpenMode::Existing,
+        open_mode: kuberic_runtime::protocol::types::OpenMode::Existing,
         role: ReplicaRole::Primary,
         read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,

@@ -3,18 +3,13 @@ use std::pin::Pin;
 use crate::protocol::types::{OperationId, ReplicaIdentity};
 use bytes::Bytes;
 use futures::Stream;
-use serde::{Deserialize, Serialize};
 
 use crate::Result;
 use crate::replicator::StatefulServicePartition;
 
+#[doc(inline)]
+pub use crate::protocol::types::OpenMode;
 pub use crate::traits::{StateProvider, StatefulServiceReplica};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub enum OpenMode {
-    New,
-    Existing,
-}
 
 /// Logical sequence number identifying an operation's position in replicated history.
 pub type Lsn = i64;

@@ -2,9 +2,10 @@
 
 use crate::protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, Epoch, FaultType, HistoryContext,
-    OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
-    PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole, ReplicaStorageIdentity,
-    ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid, derive_data_loss_history,
+    OpenMode, OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId,
+    ProcessSessionRenewalReason, PvcUid, ReplicaId, ReplicaIdentity, ReplicaRole,
+    ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
+    derive_data_loss_history,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2365,7 +2366,7 @@ pub struct PublicV1AgentReport {
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub progress: PublicProgress,
     /// Host-authoritative mode for a new Open against the current application storage.
-    pub open_mode: crate::application::OpenMode,
+    pub open_mode: OpenMode,
     /// The current process's successful Replicator Open result, absent before Open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication_address: Option<String>,

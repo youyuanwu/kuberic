@@ -81,7 +81,7 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
             "creation-1",
         ),
         report_sequence: 1,
-        open_mode: kuberic_runtime::application::OpenMode::Existing,
+        open_mode: kuberic_runtime::protocol::types::OpenMode::Existing,
         role: ReplicaRole::None,
         read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,

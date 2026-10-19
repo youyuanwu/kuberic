@@ -5,8 +5,8 @@ use kuberic_runtime::protocol::public_operations::{
     PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch, OperationId, ReplicaId,
-    ReplicaRole,
+    ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch, OpenMode, OperationId,
+    ReplicaId, ReplicaRole,
 };
 
 use super::public_v1_evidence::{
@@ -184,7 +184,7 @@ pub fn plan_public_v1_topology(
     }) {
         let open = PublicOperationProgram::Open {
             replica: replica.report.replica.clone(),
-            existing: replica.report.open_mode == kuberic_runtime::application::OpenMode::Existing,
+            existing: replica.report.open_mode == OpenMode::Existing,
         };
         let open_configuration_id = if current.is_some_and(|configuration| {
             !configuration
@@ -1295,7 +1295,7 @@ mod tests {
                 process_session_id: ProcessSessionId::new(format!("session-{id}")),
                 replicator_creation_id: ReplicatorCreationId::new(format!("creation-{id}")),
                 report_sequence: 1,
-                open_mode: kuberic_runtime::application::OpenMode::Existing,
+                open_mode: OpenMode::Existing,
                 role,
                 read_status: if role == ReplicaRole::None {
                     AccessStatus::NotPrimary
@@ -1391,7 +1391,7 @@ mod tests {
             catch_up_specific_quorum,
         ) = match command.intent.program.as_ref().expect("program") {
             PublicOperationProgram::Open { .. } => {
-                report.report.open_mode = kuberic_runtime::application::OpenMode::Existing;
+                report.report.open_mode = OpenMode::Existing;
                 (PublicV1CallKind::Open, None, None, None, None)
             }
             PublicOperationProgram::Role { role, .. } => {
@@ -1529,8 +1529,8 @@ mod tests {
             replica.report.replication_address = None;
             replica.report.completed_operations.clear();
         }
-        replicas[0].report.open_mode = kuberic_runtime::application::OpenMode::New;
-        replicas[2].report.open_mode = kuberic_runtime::application::OpenMode::New;
+        replicas[0].report.open_mode = OpenMode::New;
+        replicas[2].report.open_mode = OpenMode::New;
         let mut accepted = accepted(&replicas[0]);
         for index in 0..replicas.len() {
             let PublicV1TopologyPlan::Begin { command, .. } = plan_public_v1_topology(
@@ -1550,8 +1550,7 @@ mod tests {
                 command.intent.program,
                 Some(PublicOperationProgram::Open {
                     replica: replicas[index].report.replica.clone(),
-                    existing: replicas[index].report.open_mode
-                        == kuberic_runtime::application::OpenMode::Existing,
+                    existing: replicas[index].report.open_mode == OpenMode::Existing,
                 })
             );
             accept_command(&mut accepted, &mut replicas, &command);
@@ -1645,8 +1644,6 @@ mod tests {
 
     #[test]
     fn replacement_open_uses_host_mode_and_is_not_repeated_after_endpoint_publication() {
-        use kuberic_runtime::application::OpenMode;
-
         for mode in [OpenMode::New, OpenMode::Existing] {
             let mut replicas = vec![
                 replica(1, ReplicaRole::Primary),
