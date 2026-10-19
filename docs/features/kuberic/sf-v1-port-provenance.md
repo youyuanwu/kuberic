@@ -580,12 +580,50 @@ no-default/API/privacy, doctests and exact inventory gates pass. See the
 [ledger](sf-v1-port-ledger.md#primary-configuration-slice-p3-bounded-f02f06f08f09)
 and [selector](testing.md#sf-v1-primary-configuration-slice).
 
-All owners remain private/unselected. Role/external-epoch orchestration,
+All owners remain private/unselected. At that slice boundary, role/external-epoch orchestration,
 secondary-to-primary promotion/drained queue transfer, periodic/slow-peer policy,
 monitoring/host health and P4/P5 activation remain pending. No protected API,
 selected wiring, dependency/tier change, native utility/harness import,
 native/differential/hosted/provider-fsync parity, full ordinary execution or
 full P2/P3 completion claim. Earlier slice omissions/counts are historical.
+
+### Role Transition Slice (P3, Bounded F01/F02/F04/F09/F11)
+
+Rust destinations retain Microsoft copyright/MIT:
+[`role.rs`](../../../kuberic-runtime/src/replicator/v1/role.rs) and its
+[`actual-component tests`](../../../kuberic-runtime/src/replicator/v1/role/tests.rs),
+with existing primary/secondary/receiver/queue-manager seams and their tests.
+`R/` is the same pinned `src/prod/src/Reliability/Replication/` prefix.
+
+| Selected native production source | Incorporated responsibility / Rust substitution |
+|---|---|
+| `R/ReplicatorState.cpp:39-126`; `R/Replicator.ChangeRoleAsyncOperation.cpp:37-514` | Private native edge matrix, initial provider/cached progress, close/create/handoff ordering, idle-to-active dispatch wait, primary epoch before successful completion and terminal role None. Typed status and retained caller-driven steps/futures replace COM async roots; no public facade/factory or outer Close port. |
+| `R/ReplicationQueueManager.cpp:59-160`; `R/SecondaryReplicationReceiver.cpp:61-155,689-706` | Consume actual queues/original epochs through existing promotion normalization; demotion requires committed tail, trims history to actual count/byte bounds, completes applied retained history and installs secondary callback/ACK mode. Rust removes oldest excess entries until the native asserted bound holds rather than copying the count expression literally. Arc identity and logical payload accounting survive; no scalar reconstruction or synthetic service ACK. Fresh Rust primary queues did not require service callbacks, so demoted queues explicitly adopt the service's ACK mode for new received entries. |
+| `R/SecondaryReplicator.CloseAsyncOperation.cpp:39-117,188-367`; `R/SecondaryReplicator.CloseAsyncOperation2.cpp:40-115`; `R/SecondaryReplicator.cpp:2110-2136` | Distinct promotion Close versus existing ordinary Close; legacy required-ACK incomplete-copy rejection, optimistic dispatch drainage, EOS fully-received-copy/data/EOS ACK drainage and pending context/provider retention. Existing actual streams, callbacks and futures remain authoritative. |
+| `R/ReplicaManager.cpp:792-920`; `R/PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31-90` | Demotion cancellation before forced progress; primary issued-tail epoch boundary, session notification and provider call including duplicates. Existing primary timer driver remains active while the provider future is pending. Stale invalid input is an explicit Rust error, not a copied native assertion. Provider/build faults block handoff; old build providers remain rooted for separate explicit drainage. |
+| `R/SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31-155`; `R/Replicator.UpdateEpochAsyncOperation.cpp:34-145` | Serialize direct external epoch requests, preserve secondary minimum/duplicate/stale admission, out-of-order discard, unfinished-copy fault and actual dispatch/service-ACK drainage. Direct secondary update does not invoke provider; existing stream/provider barriers remain distinct. Interrupted polling retains the operation; explicit Abort retains selected provider obligations and an abnormal outcome. |
+
+**39 new registered actual tests:** 31 role-owner, four secondary and four
+demotion-normalization. They exercise real shared queues/operation Arc identity,
+original versus sending epochs, actual ACK-mode drains/provider futures, native
+edge rejection, faults, pending build retention, retry timers and interrupted
+polling/Abort. No native test harness, utility source, formula-only ledger or
+additional dependency is incorporated.
+
+**Original pre-source-tier validation:** V1 **695**, runtime **752/752**,
+unchanged non-V1 **57**. These are historical slice measurements; use the
+current inventory validator in the testing guide for the rebased workspace.
+Exact discovery **1110 = 1064 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**;
+ordinary **266/266/266/266**, PostgreSQL **11/13/8/9**. Workspace check/Clippy,
+no-default/API/privacy, doctests and inventory gates pass. See the
+[ledger](sf-v1-port-ledger.md#role-transition-slice-p3-bounded-f01f02f04f09f11)
+and [selector](testing.md#sf-v1-role-transition-slice).
+
+All owners remain private/unselected. Data-loss/recovery/reset orchestration,
+periodic/slow-peer/MustCatchup policy, full host role/epoch demux, monitoring/
+health, P4 public/outer lifecycle adapters and P5 activation remain pending.
+No protected API, selected wiring, tier/dependency change, native/differential/
+hosted/provider-fsync parity, full ordinary execution or full P2/P3 claim.
 
 ### P1 documented expectations (historical foundation)
 

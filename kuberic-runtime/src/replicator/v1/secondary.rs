@@ -4,10 +4,13 @@
 // Source-guided translation of SecondaryReplicator.cpp:393-550,862-1123,1624-2083,
 // 2235-2280, SecondaryReplicator.CloseAsyncOperation.cpp:120-188,327-367,
 // CloseAsyncOperation2.cpp:116-421 and DrainQueueAsyncOperation.cpp:56-342,
+// promotion branches in both Close operations and
+// SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31-155,
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d,
 // src/prod/src/Reliability/Replication/. See sf-v1-port-provenance.md.
 
-//! Private secondary lifetime, not role switching or production activation.
+//! Private secondary lifetime, promotion drains and direct external epochs.
+//! The role owner supplies queue handoff; no production activation is implied.
 //! Typed data ingress assumes route/epoch admission by its caller. StartCopy/context
 //! ACKs use the existing bound establishment. The caller retains and drives
 //! this owner; no autonomous task is spawned. Interrupted polls retain provider
@@ -36,6 +39,7 @@ use super::copy_sender::CopySenderHandle;
 use super::operation_stream::{EpochBarrier, OperationStream, SharedDispatchQueue, StreamError};
 use super::received_operation::AckWork;
 use super::received_operation::ReceivedOperation;
+use super::replication_queue_manager::QueueTransfer;
 use super::secondary_copy_receiver::{
     SecondaryCopyAck, SecondaryCopyConfig, SecondaryCopyError, SecondaryCopyReceiver,
 };
@@ -58,6 +62,10 @@ pub(super) enum SecondaryError {
     Provider(Arc<RuntimeError>),
     #[error("provider epoch callback is already outstanding")]
     EpochPending,
+    #[error("copy is incomplete for this role/epoch transition")]
+    IncompleteCopy,
+    #[error("queue transfer requires a successfully drained promotion")]
+    InvalidTransfer,
     #[error(transparent)]
     Establish(#[from] EstablishError),
     #[error("replication receiver: {0}")]
@@ -93,6 +101,20 @@ pub(super) struct SecondaryConfig {
     pub(super) trace_interval: Duration,
 }
 
+impl SecondaryConfig {
+    pub(super) fn is_valid(self) -> bool {
+        let require_ack =
+            self.replication.has_persisted_state || self.replication.require_service_ack;
+        self.batch_ack < self.retry_ack
+            && self.replication.queue.is_valid()
+            && self.copy.is_valid()
+            && self.context.sender.is_valid()
+            && self.copy.require_service_ack == require_ack
+            && self.copy.enable_eos_ack == self.replication.enable_eos_ack
+            && self.max_pending_acks <= Lsn::MAX as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SecondaryAck {
     pub(super) replication: ReceiverAck,
@@ -100,6 +122,7 @@ pub(super) struct SecondaryAck {
     pub(super) error: i32,
 }
 
+#[derive(Clone)]
 pub(super) struct SecondaryCallbacks {
     pub(super) ack: Arc<dyn Fn(SecondaryAck, bool) -> bool + Send + Sync>,
     pub(super) context: Arc<dyn Fn(CopySendAction) -> bool + Send + Sync>,
@@ -112,6 +135,13 @@ enum Phase {
     Aborting,
     Closed,
     Aborted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriveUntil {
+    Terminal,
+    ExternalEpoch,
+    CopyDispatch,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +172,9 @@ struct State {
     drain_fault: bool,
     failed_epoch_drain: bool,
     end: Option<SecondaryEnd>,
+    promoting: bool,
+    external_epoch: bool,
+    transferred: bool,
 }
 
 // Cleanup callbacks retain the real provider, but not a root->receiver->root
@@ -237,7 +270,8 @@ impl Root {
         let aborted = state.phase == Phase::Aborting;
         let eos = self.config.copy.enable_eos_ack;
         let mut failed_drain = !aborted && state.failed_epoch_drain;
-        if !aborted && eos && !state.failed_epoch_drain {
+        let draining = eos || state.promoting;
+        if !aborted && draining && !state.failed_epoch_drain {
             if state.wait_copy {
                 if !self.copy_dispatch.snapshot().drained || !state.copy.all_operations_acked() {
                     return None;
@@ -254,7 +288,7 @@ impl Root {
                 failed_drain = state.drain_fault;
             }
         }
-        if (aborted || (eos && !failed_drain)) && state.context_acquiring {
+        if (aborted || (draining && !failed_drain)) && state.context_acquiring {
             return None;
         }
         state.suppress_epoch = true;
@@ -270,7 +304,7 @@ impl Root {
                 Ok(())
             },
             aborted,
-            streams_drained: !aborted && eos && !failed_drain,
+            streams_drained: !aborted && draining && !failed_drain,
             fault: state.fault.clone(),
             context_result: state.context_result.clone(),
         };
@@ -454,14 +488,43 @@ impl SecondaryHandle {
     }
 
     pub(super) fn close(&self) -> Result<(), SecondaryError> {
-        self.begin_stop(false)
+        self.begin_stop(false, false)
     }
 
     pub(super) fn abort(&self) -> Result<(), SecondaryError> {
-        self.begin_stop(true)
+        self.begin_stop(true, false)
     }
 
-    fn begin_stop(&self, abort: bool) -> Result<(), SecondaryError> {
+    pub(super) fn close_for_primary(&self) -> Result<(), SecondaryError> {
+        self.begin_stop(false, true)
+    }
+
+    pub(super) fn begin_external_epoch(&self, epoch: Epoch) -> Result<bool, SecondaryError> {
+        let root = self.root()?;
+        let mut state = root.state.lock().unwrap();
+        Root::admit(&state)?;
+        if state.external_epoch {
+            return Err(SecondaryError::EpochPending);
+        }
+        if !root
+            .replication
+            .lock()
+            .unwrap()
+            .advance_external_epoch(epoch)?
+        {
+            return Ok(false);
+        }
+        if state.copy.is_copy_in_progress() {
+            state.fault.get_or_insert(SecondaryError::IncompleteCopy);
+            return Err(SecondaryError::IncompleteCopy);
+        }
+        state.external_epoch = true;
+        drop(state);
+        root.wake.notify_one();
+        Ok(true)
+    }
+
+    fn begin_stop(&self, abort: bool, promotion: bool) -> Result<(), SecondaryError> {
         let root = self.root()?;
         let mut wakes = Vec::new();
         let mut copies = Vec::new();
@@ -473,6 +536,19 @@ impl SecondaryHandle {
             {
                 return Ok(());
             }
+            if promotion {
+                Root::admit(&state)?;
+                if root.replication.lock().unwrap().queue().is_none()
+                    || (state.copy.is_copy_in_progress()
+                        && (!state.copy.all_operations_received()
+                            || (!root.config.copy.enable_eos_ack
+                                && root.config.copy.require_service_ack)))
+                {
+                    state.fault.get_or_insert(SecondaryError::IncompleteCopy);
+                    return Err(SecondaryError::IncompleteCopy);
+                }
+            }
+            state.promoting = promotion && !abort;
             state.phase = if abort {
                 Phase::Aborting
             } else {
@@ -483,7 +559,7 @@ impl SecondaryHandle {
             let owner = root.lifetime.clone() as Arc<dyn Send + Sync>;
             let eos = root.config.copy.enable_eos_ack;
             let mut replication = root.replication.lock().unwrap();
-            if abort || !eos {
+            if abort || (!eos && !promotion) {
                 replication.clean_queue(owner.clone(), true, true);
                 copies.push(state.copy.clean_queue_on_close(&owner, true));
                 state.copy.close_copy_operation_queue();
@@ -492,14 +568,16 @@ impl SecondaryHandle {
                 state.ack.close(root.clock.now())
             } else {
                 state.wait_copy = state.copy.is_copy_in_progress();
-                if state.wait_copy && !state.copy.all_operations_received() {
+                if !promotion && state.wait_copy && !state.copy.all_operations_received() {
                     wakes.push(root.replication_dispatch.clear_pending());
                 }
-                replications.push(replication.enqueue_eos(owner.clone())?);
-                if state.copy.is_copy_in_progress() {
-                    copies.push(state.copy.enqueue_eos(&owner)?);
+                if eos {
+                    replications.push(replication.enqueue_eos(owner.clone())?);
+                    if state.copy.is_copy_in_progress() {
+                        copies.push(state.copy.enqueue_eos(&owner)?);
+                    }
                 }
-                if state.wait_copy && !state.copy.all_operations_received() {
+                if !promotion && state.wait_copy && !state.copy.all_operations_received() {
                     replication.clean_queue(owner.clone(), true, false);
                 }
                 if !root.copy_dispatch.snapshot().initialized {
@@ -558,16 +636,26 @@ impl Secondary {
         callbacks: SecondaryCallbacks,
         clock: Clock,
     ) -> Result<Self, SecondaryError> {
-        let require_ack =
-            config.replication.has_persisted_state || config.replication.require_service_ack;
-        if config.batch_ack >= config.retry_ack
-            || config.copy.require_service_ack != require_ack
-            || config.copy.enable_eos_ack != config.replication.enable_eos_ack
-            || config.max_pending_acks > Lsn::MAX as usize
-        {
+        Self::create(route, config, provider, callbacks, clock, None)
+    }
+
+    fn create(
+        route: Route,
+        config: SecondaryConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: SecondaryCallbacks,
+        clock: Clock,
+        transfer: Option<(Epoch, QueueTransfer)>,
+    ) -> Result<Self, SecondaryError> {
+        if !config.is_valid() {
             return Err(SecondaryError::InvalidConfig);
         }
-        let replication = Arc::new(Mutex::new(SecondaryReceiver::new(config.replication)));
+        let replication = Arc::new(Mutex::new(match transfer {
+            Some((epoch, transfer)) => {
+                SecondaryReceiver::from_primary(config.replication, epoch, transfer)?
+            }
+            None => SecondaryReceiver::new(config.replication),
+        }));
         let copy = SecondaryCopyReceiver::new(config.copy)?;
         let root = Arc::new_cyclic(|weak: &Weak<Root>| {
             let callback_root = weak.clone();
@@ -606,6 +694,9 @@ impl Secondary {
                     drain_fault: false,
                     failed_epoch_drain: false,
                     end: None,
+                    promoting: false,
+                    external_epoch: false,
+                    transferred: false,
                 }),
                 establishment: OnceLock::new(),
                 context: OnceLock::new(),
@@ -652,6 +743,63 @@ impl Secondary {
 
     pub(super) fn handle(&self) -> SecondaryHandle {
         SecondaryHandle(Arc::downgrade(&self.root))
+    }
+
+    pub(super) fn from_primary(
+        route: Route,
+        mut config: SecondaryConfig,
+        epoch: Epoch,
+        transfer: QueueTransfer,
+        provider: Arc<dyn StateProvider>,
+        callbacks: SecondaryCallbacks,
+        clock: Clock,
+    ) -> Result<Self, SecondaryError> {
+        config.copy.copy_done = true;
+        Self::create(
+            route,
+            config,
+            provider,
+            callbacks,
+            clock,
+            Some((epoch, transfer)),
+        )
+    }
+
+    pub(super) fn take_for_primary(&mut self) -> Result<QueueTransfer, SecondaryError> {
+        let mut state = self.root.state.lock().unwrap();
+        if let Some(fault) = &state.fault {
+            return Err(fault.clone());
+        }
+        if state.phase != Phase::Closed
+            || !state.promoting
+            || state.transferred
+            || !state
+                .end
+                .as_ref()
+                .is_some_and(|end| end.result.is_ok() && end.streams_drained)
+        {
+            return Err(SecondaryError::InvalidTransfer);
+        }
+        let transfer = self.root.replication.lock().unwrap().take_for_primary()?;
+        state.transferred = true;
+        Ok(transfer)
+    }
+
+    pub(super) async fn wait_external_epoch(&mut self) -> Result<(), SecondaryError> {
+        match self.drive(DriveUntil::ExternalEpoch).await? {
+            None => Ok(()),
+            Some(end) => end.result.and(Err(SecondaryError::Closed)),
+        }
+    }
+
+    pub(super) async fn wait_for_active(&mut self) -> Result<(), SecondaryError> {
+        if self.root.config.copy.require_service_ack {
+            return Ok(());
+        }
+        match self.drive(DriveUntil::CopyDispatch).await? {
+            None => Ok(()),
+            Some(end) => end.result.and(Err(SecondaryError::Closed)),
+        }
     }
 
     async fn drive_context(
@@ -744,6 +892,13 @@ impl Secondary {
     }
 
     pub(super) async fn run(&mut self) -> Result<SecondaryEnd, SecondaryError> {
+        Ok(self
+            .drive(DriveUntil::Terminal)
+            .await?
+            .expect("ordinary drive returns only a terminal end"))
+    }
+
+    async fn drive(&mut self, until: DriveUntil) -> Result<Option<SecondaryEnd>, SecondaryError> {
         let root = self.root.clone();
         let copy_changed = root.copy_dispatch.notifier();
         let replication_changed = root.replication_dispatch.notifier();
@@ -759,7 +914,26 @@ impl Secondary {
                 if let Some(ack) = ack {
                     ack.dispatch();
                 }
-                return Ok(end);
+                return Ok(Some(end));
+            }
+            if until != DriveUntil::Terminal {
+                let mut state = root.state.lock().unwrap();
+                if let Some(fault) = &state.fault {
+                    return Err(fault.clone());
+                }
+                if until == DriveUntil::CopyDispatch && root.copy_dispatch.snapshot().drained {
+                    return Ok(None);
+                }
+                if until == DriveUntil::ExternalEpoch
+                    && state.external_epoch
+                    && root.replication_dispatch.snapshot().drained
+                    && root.replication.lock().unwrap().all_operations_acked()
+                    && state.pending_epoch.is_none()
+                    && state.running_epoch.is_none()
+                {
+                    state.external_epoch = false;
+                    return Ok(None);
+                }
             }
             let (context, deadline) = {
                 let mut state = root.state.lock().unwrap();

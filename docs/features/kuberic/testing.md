@@ -552,12 +552,56 @@ the existing real reliable sender.
 Workspace check/Clippy, no-default/API/privacy, workspace doctests and exact
 inventory gates pass. The established-session seam remains for isolated callers,
 but the new configuration entry points construct their own sessions.
-All owners remain private/unselected. Secondary-to-primary role promotion,
+All owners remain private/unselected. At that slice boundary, secondary-to-primary role promotion,
 external epochs/drained queue transfer, periodic/slow-peer policy, host health and
 P4/P5 activation remain pending. No full ordinary execution, PostgreSQL/KinD
 bodies, native execution, differential/hosted parity or provider-fsync claim.
 See the [ledger](sf-v1-port-ledger.md#primary-configuration-slice-p3-bounded-f02f06f08f09)
 and [provenance](sf-v1-port-provenance.md#primary-configuration-slice-p3-bounded-f02f06f08f09).
+
+### SF V1 Role Transition Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::role::tests::) | test(replicator::v1::secondary::tests::) | test(replicator::v1::replication_queue_manager::tests::)' -j 2
+```
+
+The affected-owner selector exercises the actual role owner, secondary
+drain/epoch paths and demotion normalization alongside their existing component
+regressions. Use the exact inventory validator above for current test and
+partition counts rather than retaining a static slice total.
+
+Actual role edges cover initial progress acquisition/caching, primary epoch
+completion before role publication, idle-to-active dispatch drainage, promotion
+and demotion with real queues, and terminal role None. Required ACK promotion
+waits actual service callbacks; optimistic promotion waits dispatch consumption,
+not an invented application ACK. Legacy incomplete-copy rejection differs from
+EOS promotion's fully-received-copy/data/EOS ACK drainage. Provider barriers
+already running when promotion begins remain retained.
+
+Queue handoff preserves operation Arc identity and original epochs, does not
+replay already-applied demoted history and installs the correct service ACK mode
+for new secondary data. Demotion enforces actual count and logical-byte limits,
+rejects uncommitted suffixes and cancels pending writes without fabricating ACKs.
+New primaries still require actual configuration before accepting writes.
+
+External primary epochs use issued tail, update session send epochs and call
+the provider even for duplicates. Pending provider calls retain real retry
+timers across interrupted polls. Secondary direct epochs instead discard actual
+out-of-order work, raise the minimum and drain dispatch/ACKs without invoking
+the provider themselves. Stale epochs, copy-in-progress transitions, actual
+provider/build faults and Abort remain explicit outcomes. Role completion does
+not claim pending build/provider enumeration drainage; retained old-primary
+builds can be explicitly driven after handoff.
+
+Workspace check/Clippy, no-default/API/privacy, doctests and exact inventory
+gates pass. Protected APIs, selected wiring, dependencies and tier policy are
+unchanged. No full ordinary execution, PostgreSQL/KinD bodies, native execution,
+differential/hosted parity or provider-fsync is claimed. Data-loss/recovery
+orchestration, periodic/slow-peer policy, host demux/health and P4/P5 activation
+remain pending. See the
+[ledger](sf-v1-port-ledger.md#role-transition-slice-p3-bounded-f01f02f04f09f11)
+and [provenance](sf-v1-port-provenance.md#role-transition-slice-p3-bounded-f01f02f04f09f11).
 
 ### Built-In Service Operation Delivery
 

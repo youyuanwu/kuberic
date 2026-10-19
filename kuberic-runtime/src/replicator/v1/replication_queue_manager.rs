@@ -2,13 +2,14 @@
 // Licensed under the MIT License. See LICENSES/service-fabric-MIT.txt.
 //
 // Source-guided Rust translation of selected ReplicationQueueManager.h/.cpp:
+// Role transfer normalization includes .cpp:59-160.
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d
 // src/prod/src/Reliability/Replication/. See sf-v1-port-provenance.md.
 
 //! Synchronous, production-unselected primary retention and assignment owner.
 //! Its caller serializes access and completes replicate requests separately.
 //! Queue-only transfer normalization is not a functioning role transition.
-//! Secondary demotion trimming and native V2 build selection are not provided.
+//! Role owners supply drained queues; native V2 build selection is not provided.
 
 use std::collections::BTreeMap;
 
@@ -60,6 +61,10 @@ pub(super) struct CatchupProgress {
     expect(dead_code, reason = "unselected queue-only normalization errors")
 )]
 pub(super) enum QueueNormalizationError {
+    #[error("invalid destination queue configuration")]
+    InvalidQueueConfig,
+    #[error("primary demotion requires an entirely committed issued tail")]
+    UncommittedSuffix,
     #[error("initial progress must be nonnegative and leave room for a queue cursor")]
     InvalidInitialProgress,
     #[error("queue reset requires no pending operations")]
@@ -70,6 +75,11 @@ pub(super) enum QueueNormalizationError {
     CapacityExceeded,
     #[error("transferred operation {lsn} has no original epoch")]
     MissingOriginalEpoch { lsn: Lsn },
+}
+
+pub(super) struct QueueTransfer {
+    pub(super) queue: OperationQueue,
+    pub(super) original_epochs: BTreeMap<Lsn, Epoch>,
 }
 
 #[cfg_attr(
@@ -111,6 +121,9 @@ impl ReplicationQueueManager {
         queue: OperationQueue,
         original_epochs: BTreeMap<Lsn, Epoch>,
     ) -> Result<Self, QueueNormalizationError> {
+        if !config.is_valid() {
+            return Err(QueueNormalizationError::InvalidQueueConfig);
+        }
         let progress = queue.progress();
         if progress.commit_head != progress.complete_head {
             return Err(QueueNormalizationError::InvalidSourceProgress);
@@ -149,6 +162,43 @@ impl ReplicationQueueManager {
         };
         manager.prune_epochs();
         Ok(manager)
+    }
+
+    pub(super) fn take_for_secondary(
+        &mut self,
+        config: QueueConfig,
+    ) -> Result<QueueTransfer, QueueNormalizationError> {
+        if !config.is_valid() {
+            return Err(QueueNormalizationError::InvalidQueueConfig);
+        }
+        if self.queue.progress().tail != self.queue.progress().commit_head {
+            return Err(QueueNormalizationError::UncommittedSuffix);
+        }
+        while (config.max_capacity != 0 && self.queue.operation_count() > config.max_capacity)
+            || (config.max_bytes != 0 && self.queue.total_bytes() > config.max_bytes)
+        {
+            let progress = self.queue.progress();
+            if progress.retained_head < progress.complete_head {
+                self.queue.update_complete_head(progress.retained_head + 1);
+            } else {
+                self.queue.complete_through(progress.retained_head);
+            }
+        }
+        let start = self.queue.progress().tail;
+        let queue = std::mem::replace(
+            &mut self.queue,
+            OperationQueue::new(Self::primary_config(config), start, false, false),
+        );
+        self.prune_epochs_for(&queue);
+        Ok(QueueTransfer {
+            queue,
+            original_epochs: std::mem::take(&mut self.original_epochs),
+        })
+    }
+
+    fn prune_epochs_for(&mut self, queue: &OperationQueue) {
+        self.original_epochs
+            .retain(|lsn, _| queue.get_operation(*lsn).is_some());
     }
 
     /// Native cpp 148–160 requires the caller to finish pending work first.

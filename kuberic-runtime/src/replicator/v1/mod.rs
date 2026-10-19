@@ -13,6 +13,7 @@ mod primary;
 mod received_operation;
 mod replica_manager;
 mod replication_queue_manager;
+mod role;
 mod secondary;
 mod secondary_copy_receiver;
 mod secondary_receiver;

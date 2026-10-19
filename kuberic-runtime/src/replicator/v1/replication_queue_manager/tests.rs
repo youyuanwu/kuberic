@@ -23,6 +23,80 @@ fn config() -> QueueConfig {
     }
 }
 
+#[test]
+fn demotion_count_trim_preserves_newest_actual_entries_and_original_epochs() {
+    let mut source = ReplicationQueueManager::new(
+        QueueConfig {
+            max_capacity: 8,
+            ..config()
+        },
+        0,
+    );
+    let operations: Vec<_> = (0..7).map(|_| enqueue(&mut source, b"data")).collect();
+    source.update_queue(Some(7), Some(0)).unwrap();
+    let transfer = source.take_for_secondary(config()).unwrap();
+    assert_eq!(transfer.queue.operation_count(), 4);
+    assert_eq!(transfer.queue.progress().retained_head, 4);
+    assert!(Arc::ptr_eq(
+        transfer.queue.get_operation(4).unwrap(),
+        &operations[3].operation
+    ));
+    assert_eq!(
+        transfer.original_epochs.keys().copied().collect::<Vec<_>>(),
+        [4, 5, 6, 7]
+    );
+}
+
+#[test]
+fn demotion_byte_trim_is_a_payload_bound_not_an_operation_count_estimate() {
+    let mut source = ReplicationQueueManager::new(config(), 0);
+    enqueue(&mut source, b"aaaa");
+    let newest = enqueue(&mut source, b"bb");
+    source.update_queue(Some(2), Some(0)).unwrap();
+    let transfer = source
+        .take_for_secondary(QueueConfig {
+            max_bytes: 3,
+            ..config()
+        })
+        .unwrap();
+    assert_eq!(transfer.queue.total_bytes(), 2);
+    assert_eq!(transfer.queue.operation_count(), 1);
+    assert!(Arc::ptr_eq(
+        transfer.queue.get_operation(2).unwrap(),
+        &newest.operation
+    ));
+    assert_eq!(transfer.original_epochs.len(), 1);
+}
+
+#[test]
+fn demotion_rejects_uncommitted_suffix_before_trimming_or_moving_history() {
+    let mut source = ReplicationQueueManager::new(config(), 0);
+    let first = enqueue(&mut source, b"data");
+    assert!(matches!(
+        source.take_for_secondary(QueueConfig {
+            max_bytes: 1,
+            ..config()
+        }),
+        Err(QueueNormalizationError::UncommittedSuffix)
+    ));
+    assert_eq!(source.operation_count(), 1);
+    let mut retained = Vec::new();
+    assert!(source.get_operations(1, &mut retained));
+    assert!(Arc::ptr_eq(&retained[0].operation, &first.operation));
+}
+
+#[test]
+fn demotion_rejects_invalid_limits_without_constructor_assertion() {
+    let mut source = ReplicationQueueManager::new(config(), 0);
+    assert!(matches!(
+        source.take_for_secondary(QueueConfig {
+            initial_capacity: 3,
+            ..config()
+        }),
+        Err(QueueNormalizationError::InvalidQueueConfig)
+    ));
+}
+
 fn limits() -> BufferLimits {
     BufferLimits {
         max_segments: 3,

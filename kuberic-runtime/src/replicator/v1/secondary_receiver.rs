@@ -26,6 +26,7 @@ use super::operation_stream::{
     DispatchEntry, DispatchWake, EpochBarrier, OperationStream, SharedDispatchQueue, StreamError,
 };
 use super::received_operation::{AckError, AckState, AckWork, ReceivedOperation};
+use super::replication_queue_manager::QueueTransfer;
 
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(
@@ -169,6 +170,7 @@ pub(super) struct SecondaryReceiver {
     require_ack: bool,
     queue: Option<OperationQueue>,
     callback: Arc<Mutex<DispatchState>>,
+    original_epochs: BTreeMap<Lsn, Epoch>,
     dispatch: SharedDispatchQueue,
     minimum_sending_epoch: Option<Epoch>,
     copy_epoch: Option<Epoch>,
@@ -195,6 +197,7 @@ impl SecondaryReceiver {
                 staged: Vec::new(),
                 require_ack,
             })),
+            original_epochs: BTreeMap::new(),
             dispatch: SharedDispatchQueue::new(),
             minimum_sending_epoch: None,
             copy_epoch: None,
@@ -208,6 +211,62 @@ impl SecondaryReceiver {
 
     pub(super) fn requires_service_ack(&self) -> bool {
         self.require_ack
+    }
+
+    pub(super) fn from_primary(
+        config: ReceiverConfig,
+        epoch: Epoch,
+        transfer: QueueTransfer,
+    ) -> Result<Self, ReceiverError> {
+        Self::validate_epoch(epoch)?;
+        let mut receiver = Self::new(config);
+        let mut queue = transfer.queue.transfer(config.queue);
+        queue.set_commit_callback(None);
+        queue.complete();
+        // Fresh Rust primary entries never need a service callback. Received
+        // secondary entries must enforce the actual service's ACK mode.
+        queue.set_require_service_ack(receiver.require_ack);
+        queue.set_ignore_commit(!receiver.require_ack);
+        receiver.queue = Some(queue);
+        receiver.original_epochs = transfer.original_epochs;
+        receiver.copy_epoch = Some(epoch);
+        receiver.minimum_sending_epoch = Some(epoch);
+        receiver.callback.lock().unwrap().provider_epoch = Some(epoch);
+        receiver.enable_callback();
+        receiver.prune_operations();
+        Ok(receiver)
+    }
+
+    pub(super) fn take_for_primary(&mut self) -> Result<QueueTransfer, ReceiverError> {
+        let queue = self.queue.as_ref().ok_or(ReceiverError::NotInitialized)?;
+        if queue.progress().commit_head != queue.progress().complete_head {
+            return Err(ReceiverError::InvalidEpochCompletion);
+        }
+        self.retired = true;
+        let mut queue = self.queue.take().unwrap();
+        queue.set_commit_callback(None);
+        Ok(QueueTransfer {
+            queue,
+            original_epochs: std::mem::take(&mut self.original_epochs),
+        })
+    }
+
+    pub(super) fn advance_external_epoch(&mut self, epoch: Epoch) -> Result<bool, ReceiverError> {
+        self.ensure_active()?;
+        Self::validate_epoch(epoch)?;
+        let minimum = self.minimum_sending_epoch.unwrap_or(Epoch::new(0, 0));
+        if epoch < minimum {
+            return Err(ReceiverError::StaleSendingEpoch {
+                sending: epoch,
+                minimum,
+            });
+        }
+        if epoch == minimum {
+            return Ok(false);
+        }
+        self.discard_out_of_order();
+        self.minimum_sending_epoch = Some(epoch);
+        Ok(true)
     }
 
     pub(super) fn has_persisted_state(&self) -> bool {
@@ -308,6 +367,8 @@ impl SecondaryReceiver {
             .lock()
             .unwrap()
             .operations
+            .retain(|lsn, _| queue.get_operation(*lsn).is_some());
+        self.original_epochs
             .retain(|lsn, _| queue.get_operation(*lsn).is_some());
     }
 
@@ -465,6 +526,7 @@ impl SecondaryReceiver {
             };
             match queue.try_enqueue(operation.queue_operation().clone()) {
                 Ok(()) => {
+                    self.original_epochs.insert(lsn, operation.epoch());
                     effects.batch.admitted += 1;
                     check_pending_limit = false;
                     let progressed = if self.require_ack {

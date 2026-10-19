@@ -4,12 +4,14 @@
 // Source-guided primary/session lifetime composition from PrimaryReplicator.cpp:
 // 261-315,340-462,550-728, PrimaryReplicator.CloseAsyncOperation.cpp:36-132,
 // ReplicaManager.cpp:306-335,792-870,926-1007,1205-1779,2187-2222,
+// ReplicaManager.cpp:871-920 and PrimaryReplicator.UpdateEpochAsyncOperation.cpp,
 // ReplicationSession.cpp:279-283 and RemoteSession.cpp:448-656,
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d,
 // src/prod/src/Reliability/Replication/. See sf-v1-port-provenance.md.
 
 //! Private caller-driven primary lifetime and descriptor-based configuration.
-//! Not role promotion, role/epoch orchestration or activation. One shared clock
+//! The private role owner supplies promotion queues and provider epoch calls;
+//! this owner does not activate a public engine. One shared clock
 //! covers owned sessions; the established-session seam remains for isolated use.
 //! No task is spawned; dropping the owner is abandonment, not Close or drain.
 //! Terminal Close/Abort drains selected synchronous effect/oneshot deliveries,
@@ -47,6 +49,7 @@ use super::replica_manager::{
     CatchupMode, CompletionReceiver, EstablishedConfiguration, ManagerEffects, ManagerError,
     ReplicaManager, ReplicaSet, SessionMember,
 };
+use super::replication_queue_manager::QueueTransfer;
 use super::sender::SenderConfig;
 use super::session::{AckUpdate, ReplicationSession, SendIntent};
 use super::transport::{ProtocolError, Route, wire};
@@ -73,6 +76,8 @@ pub(super) enum PrimaryError {
     InvalidProgress(i64),
     #[error("current write quorum one requires an empty remote replica set")]
     InvalidCurrentQuorum,
+    #[error("StateProvider EndUpdateEpoch: {0}")]
+    Provider(Arc<crate::error::RuntimeError>),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
@@ -87,6 +92,7 @@ impl From<ManagerError> for PrimaryError {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct PrimaryConfig {
     pub(super) queue: QueueConfig,
     pub(super) initial_progress: Lsn,
@@ -165,6 +171,8 @@ struct State {
     aborted: bool,
     quorum_wait_expired: bool,
     failure: Option<PrimaryError>,
+    creating_secondary: bool,
+    transferred: bool,
 }
 
 struct Root {
@@ -198,6 +206,9 @@ impl Root {
         if state.phase != Phase::Open {
             return Err(PrimaryError::Closed);
         }
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
         Ok(())
     }
 
@@ -228,7 +239,11 @@ impl Root {
 
     fn close_effects(self: &Arc<Self>, state: &mut State) -> (ManagerEffects, Activity) {
         state.phase = Phase::Closing;
-        let effects = self.manager.lock().unwrap().close();
+        let effects = if state.creating_secondary {
+            self.manager.lock().unwrap().close_for_secondary()
+        } else {
+            self.manager.lock().unwrap().close()
+        };
         (effects, self.activity(state))
     }
 
@@ -652,6 +667,40 @@ impl PrimaryHandle {
         Ok(())
     }
 
+    pub(super) fn close_for_secondary(&self) -> Result<(), PrimaryError> {
+        let root = self.root()?;
+        let selected = {
+            let mut state = root.state.lock().unwrap();
+            Root::check_open(&state)?;
+            root.manager.lock().unwrap().check_reported_fault()?;
+            state.creating_secondary = true;
+            root.close_effects(&mut state)
+        };
+        let (effects, _activity) = selected;
+        root.deliver_close(effects)
+    }
+
+    pub(super) fn update_epoch(&self, epoch: Epoch) -> Result<Lsn, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        Ok(root.manager.lock().unwrap().update_epoch(epoch)?)
+    }
+
+    pub(super) fn report_provider_fault(&self, error: Arc<crate::error::RuntimeError>) {
+        if let Ok(root) = self.root() {
+            root.state
+                .lock()
+                .unwrap()
+                .failure
+                .get_or_insert(PrimaryError::Provider(error));
+            root.wake.notify_one();
+        }
+    }
+
     pub(super) fn abort(&self) -> Result<(), PrimaryError> {
         let root = self.root()?;
         let selected = {
@@ -681,20 +730,46 @@ pub(super) struct Primary {
 
 impl Primary {
     pub(super) fn new(config: PrimaryConfig, clock: Clock) -> Result<Self, PrimaryError> {
+        Self::create(config, clock, None)
+    }
+
+    pub(super) fn from_secondary(
+        config: PrimaryConfig,
+        clock: Clock,
+        transfer: QueueTransfer,
+    ) -> Result<Self, PrimaryError> {
+        Self::create(config, clock, Some(transfer))
+    }
+
+    fn create(
+        config: PrimaryConfig,
+        clock: Clock,
+        transfer: Option<QueueTransfer>,
+    ) -> Result<Self, PrimaryError> {
         if config.endpoint.partition.len() != 16 || config.endpoint.incarnation.len() != 16 {
             return Err(ProtocolError::Shape("endpoint GUID length").into());
         }
         if !config.sender.is_valid() {
             return Err(PrimaryError::InvalidSenderConfig);
         }
-        let manager = ReplicaManager::new(
-            config.queue,
-            config.initial_progress,
-            config.endpoint.replica,
-            config.address.clone(),
-            config.epoch,
-            config.allow_multiple_quorum_set,
-        )?;
+        let manager = match transfer {
+            Some(transfer) => ReplicaManager::from_transferred(
+                config.queue,
+                transfer,
+                config.endpoint.replica,
+                config.address.clone(),
+                config.epoch,
+                config.allow_multiple_quorum_set,
+            )?,
+            None => ReplicaManager::new(
+                config.queue,
+                config.initial_progress,
+                config.endpoint.replica,
+                config.address.clone(),
+                config.epoch,
+                config.allow_multiple_quorum_set,
+            )?,
+        };
         Ok(Self {
             root: Arc::new(Root {
                 state: Mutex::new(State {
@@ -705,6 +780,8 @@ impl Primary {
                     aborted: false,
                     quorum_wait_expired: false,
                     failure: None,
+                    creating_secondary: false,
+                    transferred: false,
                 }),
                 manager: Arc::new(Mutex::new(manager)),
                 endpoint: config.endpoint,
@@ -722,6 +799,31 @@ impl Primary {
 
     pub(super) fn handle(&self) -> PrimaryHandle {
         PrimaryHandle(Arc::downgrade(&self.root))
+    }
+
+    pub(super) fn take_for_secondary(
+        &mut self,
+        config: QueueConfig,
+    ) -> Result<QueueTransfer, PrimaryError> {
+        let mut state = self.root.state.lock().unwrap();
+        if state.phase != Phase::Closed
+            || !state.creating_secondary
+            || state.aborted
+            || state.transferred
+        {
+            return Err(PrimaryError::Closed);
+        }
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        let transfer = self
+            .root
+            .manager
+            .lock()
+            .unwrap()
+            .take_for_secondary(config)?;
+        state.transferred = true;
+        Ok(transfer)
     }
 
     fn collect_builds(&mut self) {
