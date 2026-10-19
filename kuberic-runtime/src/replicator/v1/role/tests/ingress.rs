@@ -742,6 +742,7 @@ async fn actual_primary_pressure_notification_crosses_tonic_into_target_fault_ow
     config.secondary_route = outbound.reversed();
     config.secondary_callbacks.fault = Arc::new(move |fault| captured.lock().unwrap().push(fault));
     let mut target = RoleReplicator::new(config, Arc::new(Provider::new()), Clock::new()).unwrap();
+    target.open(&MessageRegistry::default()).unwrap();
     target
         .begin_change_role(Role::IdleSecondary, epoch(1))
         .unwrap();

@@ -246,6 +246,23 @@ and execute actual owners and a real tonic connection, not native tests,
 fixtures, binaries or a harness. Production host wiring remains unselected;
 no native wire compatibility or complete hosted/native parity is asserted.
 
+The private Open/recovery extension of role.rs, logical endpoint registration
+in ingress.rs, shared endpoint validation in transport.rs and actual-owner
+regressions translate selected Replicator.OpenAsyncOperation.cpp:29-81,
+ReplicatorState.cpp:16-37,177-242, Replicator.cpp:178-253,296-367,
+ReplicationTransport.h:253-267,301-308,
+ReplicationTransport.cpp:872-878, ComProxyStateProvider.cpp:63-79,
+Replicator.ChangeRoleAsyncOperation.cpp:131-208 and
+Replicator.CloseAsyncOperation.cpp:31-100,131-180 at the same immutable pin.
+Rust RAII registration and typed endpoints replace native demux roots/string
+formatting; retained explicitly driven futures replace synchronous COM progress
+reads. Successful negative provider progress normalizes to zero; errors are not
+erased. Restart exercises the existing empty recovered queue, missing-replay
+error and caller-directed copy/build/receiver/session owners rather than
+recovering invented bytes or importing placement policy. No native transport,
+monitoring, utility, fixture or test-harness implementation is incorporated.
+All components remain private and production-unselected.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

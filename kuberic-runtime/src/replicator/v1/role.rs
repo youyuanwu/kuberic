@@ -7,6 +7,9 @@
 // @3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d, Reliability/Replication.
 // Data loss: Replicator.OnDatalossAsyncOperation.cpp:30-157,
 // ReplicatorState.cpp:129-139,177-186, ReplicationQueueManager.cpp:148-160.
+// Open/recovery: Replicator.OpenAsyncOperation.cpp:29-81,
+// Replicator.cpp:296-367, ComProxyStateProvider.cpp:63-79,
+// Replicator.CloseAsyncOperation.cpp:79-100, Replicator.cpp:178-253.
 
 //! Private, explicitly driven role/epoch/recovery owner with typed ingress, not
 //! a public facade or production host. A cancelled run retains selected work.
@@ -26,7 +29,10 @@ use crate::protocol::types::Epoch;
 use crate::traits::StateProvider;
 
 use super::async_runtime::Clock;
-use super::ingress::{MessageIngress, Target};
+use super::ingress::{
+    MessageIngress, MessageRegistration, MessageRegistry, PublishedEndpoint, RegistrationError,
+    Target,
+};
 use super::primary::{Primary, PrimaryConfig, PrimaryError, PrimaryHandle};
 use super::secondary::{
     Secondary, SecondaryCallbacks, SecondaryConfig, SecondaryError, SecondaryHandle,
@@ -43,6 +49,7 @@ pub(super) enum Role {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RoleStatus {
+    Created,
     Opened,
     Changing(Role),
     Ready(Role),
@@ -71,6 +78,8 @@ pub(super) enum RoleError {
     #[error("StateProvider role/recovery callback: {0}")]
     Provider(Arc<RuntimeError>),
     #[error(transparent)]
+    Registration(#[from] RegistrationError),
+    #[error(transparent)]
     Primary(#[from] PrimaryError),
     #[error(transparent)]
     Secondary(#[from] SecondaryError),
@@ -98,6 +107,7 @@ struct DataLossRecovery {
 
 #[derive(Clone, Copy)]
 enum Step {
+    OpenedProgress,
     InitialPrimary(Epoch),
     Promote(Epoch),
     Demote(Epoch),
@@ -117,6 +127,7 @@ pub(super) struct RoleReplicator {
     status: RoleStatus,
     pending: Option<Step>,
     provider_call: Option<BoxFuture<'static, crate::Result<Lsn>>>,
+    opened_progress: Option<Result<Lsn, RoleError>>,
     data_loss_call: Option<BoxFuture<'static, DataLossRecovery>>,
     data_loss_failure: Option<RoleError>,
     data_loss_end: Option<DataLossEnd>,
@@ -126,6 +137,12 @@ pub(super) struct RoleReplicator {
     retired_secondaries: Vec<Secondary>,
     fault: Option<RoleError>,
     ingress: MessageIngress,
+    registration: Option<MessageRegistration>,
+}
+
+async fn read_provider_progress(provider: &dyn StateProvider) -> crate::Result<Lsn> {
+    // Native ComProxyStateProvider treats every successful negative LSN as empty.
+    provider.last_committed_lsn().await.map(|lsn| lsn.max(0))
 }
 
 impl RoleReplicator {
@@ -158,9 +175,10 @@ impl RoleReplicator {
             config,
             provider,
             clock,
-            status: RoleStatus::Opened,
+            status: RoleStatus::Created,
             pending: None,
             provider_call: None,
+            opened_progress: None,
             data_loss_call: None,
             data_loss_failure: None,
             data_loss_end: None,
@@ -170,7 +188,40 @@ impl RoleReplicator {
             retired_secondaries: Vec::new(),
             fault: None,
             ingress,
+            registration: None,
         })
+    }
+
+    pub(super) fn open(
+        &mut self,
+        registry: &MessageRegistry,
+    ) -> Result<PublishedEndpoint, RoleError> {
+        if self.status != RoleStatus::Created {
+            return Err(RoleError::InvalidState);
+        }
+        self.registration = Some(registry.register(self.ingress.clone())?);
+        self.status = RoleStatus::Opened;
+        Ok(self.ingress.published_endpoint())
+    }
+
+    pub(super) fn begin_get_opened_progress(&mut self) -> Result<(), RoleError> {
+        self.check_idle()?;
+        if self.status != RoleStatus::Opened {
+            return Err(RoleError::InvalidState);
+        }
+        self.opened_progress = self.config.cached_progress.map(Ok);
+        if self.opened_progress.is_none() {
+            let provider = self.provider.clone();
+            self.provider_call = Some(Box::pin(async move {
+                read_provider_progress(provider.as_ref()).await
+            }));
+            self.pending = Some(Step::OpenedProgress);
+        }
+        Ok(())
+    }
+
+    pub(super) fn opened_progress_result(&self) -> Option<&Result<Lsn, RoleError>> {
+        self.opened_progress.as_ref()
     }
 
     pub(super) fn ingress(&self) -> MessageIngress {
@@ -264,7 +315,7 @@ impl RoleReplicator {
                 self.provider_call = Some(Box::pin(async move {
                     match cached {
                         Some(progress) => Ok(progress),
-                        None => provider.last_committed_lsn().await,
+                        None => read_provider_progress(provider.as_ref()).await,
                     }
                 }));
                 Some(Step::InitialPrimary(epoch))
@@ -399,7 +450,7 @@ impl RoleReplicator {
                 Ok(state_changed) => DataLossRecovery {
                     state_changed,
                     progress: if state_changed {
-                        provider.last_committed_lsn().await.map(Some)
+                        read_provider_progress(provider.as_ref()).await.map(Some)
                     } else {
                         Ok(None)
                     },
@@ -504,17 +555,26 @@ impl RoleReplicator {
         ) {
             return Err(RoleError::InvalidState);
         }
-        let role = if let Some(primary) = &self.primary {
-            primary.handle().close(quorum_wait)?;
-            Role::Primary
+        let (role, result) = if let Some(primary) = &self.primary {
+            (
+                Role::Primary,
+                primary.handle().close(quorum_wait).map_err(RoleError::from),
+            )
         } else if let Some(secondary) = &self.secondary {
-            secondary.handle().close()?;
-            Role::ActiveSecondary
+            (
+                Role::ActiveSecondary,
+                secondary.handle().close().map_err(RoleError::from),
+            )
         } else {
             self.status = RoleStatus::Closed;
             self.refresh_ingress();
+            self.registration = None;
             return Ok(());
         };
+        if let Err(error) = result {
+            self.registration = None;
+            return self.fail(error);
+        }
         self.pending = Some(Step::DirectClose(role));
         self.status = RoleStatus::Closing(role);
         self.refresh_ingress();
@@ -531,9 +591,13 @@ impl RoleReplicator {
         if let Some(secondary) = &self.secondary {
             secondary.handle().abort()?;
         }
+        if matches!(self.pending, Some(Step::OpenedProgress)) {
+            self.opened_progress = Some(Err(RoleError::Aborted));
+        }
         self.status = RoleStatus::Aborting;
         self.pending = Some(Step::Abort);
         self.refresh_ingress();
+        self.registration = None;
         Ok(())
     }
 
@@ -542,9 +606,16 @@ impl RoleReplicator {
             return Err(RoleError::NoOperation);
         }
         let data_loss = matches!(self.pending, Some(Step::DataLoss));
+        let opened_progress = matches!(self.pending, Some(Step::OpenedProgress));
+        let direct_close = matches!(self.pending, Some(Step::DirectClose(_)));
         let result = self.run_inner().await;
+        if direct_close {
+            self.registration = None;
+        }
         match result {
-            Err(error) if !data_loss && self.status != RoleStatus::Aborted => self.fail(error),
+            Err(error) if !data_loss && !opened_progress && self.status != RoleStatus::Aborted => {
+                self.fail(error)
+            }
             result => result,
         }
     }
@@ -553,10 +624,26 @@ impl RoleReplicator {
         loop {
             let step = self.pending.ok_or(RoleError::NoOperation)?;
             match step {
+                Step::OpenedProgress => {
+                    let result = self
+                        .provider_call
+                        .as_mut()
+                        .unwrap()
+                        .await
+                        .map_err(|error| RoleError::Provider(Arc::new(error)));
+                    self.provider_call = None;
+                    if let Ok(progress) = result {
+                        self.config.cached_progress = Some(progress);
+                    }
+                    self.opened_progress = Some(result.clone());
+                    self.pending = None;
+                    return result.map(|_| ());
+                }
                 Step::InitialPrimary(epoch) => {
                     let result = self.provider_call.as_mut().unwrap().await;
                     self.provider_call = None;
                     let progress = result.map_err(|error| RoleError::Provider(Arc::new(error)))?;
+                    self.config.cached_progress = Some(progress);
                     let mut config = self.config.primary.clone();
                     config.initial_progress = progress;
                     config.epoch = epoch;
