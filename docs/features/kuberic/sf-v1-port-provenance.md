@@ -616,11 +616,43 @@ no-default/API/privacy, doctests and inventory gates pass. See the
 [ledger](sf-v1-port-ledger.md#role-transition-slice-p3-bounded-f01f02f04f09f11)
 and [selector](testing.md#sf-v1-role-transition-slice).
 
-All owners remain private/unselected. Data-loss/recovery/reset orchestration,
+All owners remain private/unselected. At that slice boundary,
+data-loss/recovery/reset orchestration,
 periodic/slow-peer/MustCatchup policy, full host role/epoch demux, monitoring/
 health, P4 public/outer lifecycle adapters and P5 activation remain pending.
 No protected API, selected wiring, tier/dependency change, native/differential/
 hosted/provider-fsync parity, full ordinary execution or full P2/P3 claim.
+
+### Data Loss Recovery Slice (P3, Bounded F01/F02/F03/F09/F11)
+
+Rust destinations retain Microsoft copyright/MIT:
+[`role.rs`](../../../kuberic-runtime/src/replicator/v1/role.rs),
+[`recovery tests`](../../../kuberic-runtime/src/replicator/v1/role/tests/data_loss.rs),
+the existing role test provider, and narrow
+[`primary`](../../../kuberic-runtime/src/replicator/v1/primary.rs) /
+[`manager`](../../../kuberic-runtime/src/replicator/v1/replica_manager.rs)
+extensions and their actual-component tests.
+The existing queue reset helper remains authoritative.
+`R/` is the same pinned `src/prod/src/Reliability/Replication/` prefix.
+
+| Selected native production/test material | Incorporated responsibility / Rust substitution |
+|---|---|
+| `R/Replicator.OnDatalossAsyncOperation.cpp:30-157`; `R/ReplicatorState.cpp:129-139,177-186` | Reported-fault preflight, primary-only CheckingDataLoss, actual provider callback, changed-only progress query, cached-progress update before reset and End restoration even on errors. Retained caller-driven composite future replaces COM Begin/End roots. Explicit End retains changed flag even when the later query/reset fails; original error wins over restoration error. No generic permanent role fault is invented for ordinary provider/reset failure. |
+| `R/Replicator.cpp:659-708,799-838` | Temporary primary-call and new ACK/context admission gating, including previously issued Rust handles. Selected activities stay rooted. The actual primary driver continues build/session timers while provider work is pending; callbacks execute without owner/manager locks. This is bounded admission, not full host demux or partition-access integration. |
+| `R/PrimaryReplicator.cpp:501-505`; `R/ReplicaManager.cpp:1015-1023`; `R/ReplicationQueueManager.cpp:148-160` | Forward reset through actual active primary/manager into the existing queue. Clear old entries/original epochs and reset next assignment and previous-config catch-up/quorum cursors. Native caller preconditions become explicit errors for pending writes/queue work or selected primary activities, not successful cancellation or synthetic ACK/drain. Invalid negative/overflow progress is rejected before queue mutation. Cached recovery progress is updated before attempting reset, including a rejected reset, as in native. Session/configuration roots remain unchanged. |
+| `R/Replicator.OnDatalossAsyncOperation.cpp:82-157` and existing Rust retained-provider Abort ownership | Keep the recovery chain rooted through interrupted polling/Abort. A changed callback still obtains actual provider progress; Abort skips reset of the closed primary and cannot publish successful recovery. Rust's explicit abnormal End outcome replaces native teardown/assertion assumptions; callback failure is retained separately from the role Abort result. |
+| `R/PublicApi.Test.cpp:1349-1383`, `TestDataLoss(true/false)`; production ranges above | Changed/unchanged callback and actual progress expectations adapted to real Rust owners. Additional production-derived regressions cover lower/zero/invalid progress, assignment and catch-up boundaries, unchanged operation Arc/original-epoch identity, retry driving, preconditions, callback reentrancy/interruption, fault admission and error/restoration/Abort ordering. No native fixture, harness or utility source is incorporated. |
+
+See the
+[ledger](sf-v1-port-ledger.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11)
+and [selector](testing.md#sf-v1-data-loss-recovery-slice).
+Use the live inventory validator for current discovery and partitioning.
+No dependency or protected-interface change is introduced. All owners remain
+private/unselected; broader Open/restart/host recovery and replica rebuild
+policy, periodic/slow-peer/MustCatchup policy, full host demux/health,
+P4 public/outer lifecycle adapters and P5 activation remain pending.
+No native execution, differential/hosted/provider-fsync parity, full ordinary
+execution or complete P2/P3 claim.
 
 ### P1 documented expectations (historical foundation)
 

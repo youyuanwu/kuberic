@@ -64,8 +64,13 @@ The [role-transition slice](sf-v1-port-ledger.md#role-transition-slice-p3-bounde
 adds native role edges, ACK-mode-specific promotion drainage, real retained
 queue/original-epoch handoff, demotion limits and external primary/secondary
 epoch sequencing with actual-component regressions. These supersede preceding
-slice-boundary omissions, not pending data-loss/recovery/reset orchestration,
-full host role/epoch demux, monitoring/health or periodic/slow-peer policy.
+slice-boundary omissions.
+The [data-loss recovery slice](sf-v1-port-ledger.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11)
+adds primary-only checking, changed/unchanged provider recovery, actual queue
+reset, retained callbacks and native error/state-restoration ordering.
+Broader Open/restart/host recovery and replica rebuild policy,
+full host role/epoch demux, monitoring/health and periodic/slow-peer policy
+remain pending.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -437,8 +442,10 @@ timers/ordered ACKs and quorum prewait/Close/Abort effects. Descriptor-based
 configuration creates/reuses sessions, marks idle-to-active session promotion and
 composes replay/retirement with the actual manager. Bounded role orchestration
 now adds promotion-specific drains, retained queue handoff/demotion and direct
-external epoch sequencing. Data-loss/recovery/reset, full host demux and remaining
-session policies are pending. This roadmap is not
+external epoch sequencing. Bounded data-loss orchestration now composes actual
+provider recovery, changed-only progress/reset and native admission/restoration.
+Broader Open/restart/host recovery and rebuild policy, full host demux and
+remaining session policies are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required

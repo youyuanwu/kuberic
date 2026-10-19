@@ -597,11 +597,48 @@ builds can be explicitly driven after handoff.
 Workspace check/Clippy, no-default/API/privacy, doctests and exact inventory
 gates pass. Protected APIs, selected wiring, dependencies and tier policy are
 unchanged. No full ordinary execution, PostgreSQL/KinD bodies, native execution,
-differential/hosted parity or provider-fsync is claimed. Data-loss/recovery
-orchestration, periodic/slow-peer policy, host demux/health and P4/P5 activation
+differential/hosted parity or provider-fsync is claimed. At that slice boundary
+data-loss/recovery orchestration, periodic/slow-peer policy, host demux/health and P4/P5 activation
 remain pending. See the
 [ledger](sf-v1-port-ledger.md#role-transition-slice-p3-bounded-f01f02f04f09f11)
 and [provenance](sf-v1-port-provenance.md#role-transition-slice-p3-bounded-f01f02f04f09f11).
+
+### SF V1 Data Loss Recovery Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::role::tests::) | test(replicator::v1::primary::tests::) | test(replicator::v1::replica_manager::tests::) | test(replicator::v1::replication_queue_manager::tests::)' -j 2
+```
+
+This selector exercises the actual role, primary, manager and queue owners,
+including their existing regressions. Use the live nextest inventory and exact
+partition validator rather than a static slice total.
+
+Data-loss checks are primary-only and serialize with role/epoch operations.
+Previously issued primary handles and new ACK/context ingress are gated while
+checking. Actual provider callbacks can reenter without owner/manager locks.
+Unchanged recovery preserves pending writes, operation identity, original
+epochs, queue/cached progress and real retry timers without a provider progress
+query. Changed recovery queries actual progress, updates the cache before reset
+and forwards reset into the existing queue. Higher, lower, equal and empty
+progress drive actual subsequent LSN assignment and catch-up/quorum boundaries.
+
+Pending writes, committed-but-uncompleted history, selected activities and
+invalid progress reject reset without cancellation or invented ACKs. Callback/
+query/reset failures retain the changed flag and restore primary admission;
+original provider errors win over simultaneous restoration errors.
+Interrupted polling retains each callback/query. Abort retains the recovery
+chain, but not successful reset or recovery, and preserves provider failure.
+Reported source build faults reject admission. Reentrant primary Abort and
+concurrent primary Close cannot produce successful recovery.
+
+Protected APIs, selected wiring, dependencies and tier policy are unchanged.
+Broader host/Open recovery and rebuild policy, periodic/slow-peer/MustCatchup
+policy, full host demux/health and P4/P5 activation remain pending.
+No full ordinary execution, PostgreSQL/KinD bodies, native binary/differential/
+hosted parity or provider-fsync is claimed. See the
+[ledger](sf-v1-port-ledger.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11)
+and [provenance](sf-v1-port-provenance.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11).
 
 ### Built-In Service Operation Delivery
 

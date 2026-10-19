@@ -19,10 +19,107 @@ use crate::error::RuntimeError;
 use crate::replicator::v1::copy_async_operation::{CopyConfig, CopySendAction};
 use crate::replicator::v1::copy_context_receiver::CopyContextConfig;
 use crate::replicator::v1::replica_manager::{CompletionError, ReplicaSet, SessionMember};
+use crate::replicator::v1::replication_queue_manager::QueueNormalizationError;
 use crate::replicator::v1::sender::SenderConfig;
 use crate::replicator::v1::session::{SendIntent, SendKind, SessionIdentity};
 
 mod configuration;
+
+#[tokio::test]
+async fn recovery_reset_requires_selected_send_and_queue_drain_without_reopening_closed_primary() {
+    let mut rig = Rig::new();
+    assert!(matches!(
+        rig.primary.reset_replication_queue(24),
+        Err(PrimaryError::NoDataLoss)
+    ));
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let enter = entered.clone();
+    let unblock = release.clone();
+    let session = rig.session(
+        20,
+        Arc::new(move |_| {
+            enter.wait();
+            unblock.wait();
+            true
+        }),
+    );
+    rig.configure(
+        vec![SessionMember {
+            replica_id: 20,
+            session,
+            must_catchup: false,
+        }],
+        2,
+    );
+    let handle = rig.handle.clone();
+    let worker = std::thread::spawn(move || {
+        handle
+            .enqueue(Bytes::new(), BufferPolicy::RawSingle, limits())
+            .unwrap()
+    });
+    entered.wait();
+    rig.primary.begin_data_loss().unwrap();
+    assert!(matches!(
+        rig.primary.reset_replication_queue(24),
+        Err(PrimaryError::PendingActivity)
+    ));
+    assert_eq!(
+        rig.primary
+            .root
+            .manager
+            .lock()
+            .unwrap()
+            .queue()
+            .current_progress(),
+        0
+    );
+    release.wait();
+    let mut admission = worker.join().unwrap();
+    assert!(matches!(
+        rig.primary.reset_replication_queue(24),
+        Err(PrimaryError::Manager(error))
+            if matches!(error.as_ref(), ManagerError::QueueNormalization(
+                QueueNormalizationError::PendingOperations))
+    ));
+    assert_eq!(admission.completion.try_recv(), Err(TryRecvError::Empty));
+    rig.primary.end_data_loss().unwrap();
+    rig.handle.receive_ack(&ack(20, 1, 1, -1)).unwrap();
+    assert_eq!(admission.completion.await.unwrap(), Ok(()));
+    rig.primary.begin_data_loss().unwrap();
+    rig.primary.reset_replication_queue(24).unwrap();
+    assert_eq!(
+        rig.primary
+            .root
+            .manager
+            .lock()
+            .unwrap()
+            .queue()
+            .current_progress(),
+        24
+    );
+    rig.primary.end_data_loss().unwrap();
+    rig.primary.begin_data_loss().unwrap();
+    rig.handle.abort().unwrap();
+    assert!(matches!(
+        rig.primary.reset_replication_queue(0),
+        Err(PrimaryError::Closed)
+    ));
+    assert!(matches!(
+        rig.primary.end_data_loss(),
+        Err(PrimaryError::Closed)
+    ));
+    assert_eq!(
+        rig.primary
+            .root
+            .manager
+            .lock()
+            .unwrap()
+            .queue()
+            .current_progress(),
+        24
+    );
+}
 
 fn route(id: i64) -> Route {
     Route {
