@@ -13,7 +13,8 @@ separate from future executable port-component/hosted cases; add selectors
 for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
 copy-receiver, enumeration, CopySender build-gate, copy-establishment, BuildIdle,
-secondary and primary lifecycle and primary configuration slices have
+secondary and primary lifecycle, configuration, role/recovery, queue-policy and
+message-ingress slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -679,6 +680,38 @@ native execution, differential/hosted/provider-fsync parity or full P2/P3 claim.
 See the
 [ledger](sf-v1-port-ledger.md#queue-pressure-and-slow-peer-policy-slice-p3-bounded-f02f03f06f07f08f11)
 and [provenance](sf-v1-port-provenance.md#queue-pressure-and-slow-peer-policy-slice-p3-bounded-f02f03f06f07f08f11).
+
+### SF V1 Role-Aware Message Ingress Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::role::tests::) | test(replicator::v1::secondary::tests::) | test(replicator::v1::primary::tests::) | test(replicator::v1::copy_establishment::tests::) | test(replicator::v1::transport::tests::)' -j 2
+```
+
+Cases invoke actual role/primary/secondary/queue/stream/session owners, with a
+real tonic connection from primary pressure policy to targeted secondary fault.
+Retained ingress observes native initial-progress, provider-epoch, activation,
+promotion/demotion, data-loss, direct-Close quorum-prewait and Abort boundaries.
+Typed batch validation cannot partially admit malformed input; required service
+ACKs remain explicit and framed buffers retain logical accounting.
+Atomic-group/non-normal data metadata is an explicit adapter error, not
+silently accepted as ordinary byte-stream data.
+
+Accepted replication changes the actual ACK reply identity. RequestAck/context
+ACK cannot retarget it; same-epoch copy and targeted InduceFault do not inherit
+an extra current-primary gate. Target identity and initialized copy are required.
+Future-copy/StartCopy faults and repeated notifications latch one actual
+secondary fault and deliver the caller report outside guards. Reporting alone
+does not fabricate stream cleanup/EOS, application ACK or membership changes.
+
+Use live nextest inventory for discovery and partition coverage. This is a
+private, production-unselected slice, not a new factory or host endpoint.
+Production host listener/authentication/registry and partition-report wiring,
+broader Open/restart/rebuild, monitoring/health, public adapters and activation
+remain pending. No native execution, differential/hosted/provider-fsync parity,
+full workspace ordinary execution or PostgreSQL/KinD execution is claimed.
+See the [ledger](sf-v1-port-ledger.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11)
+and [provenance](sf-v1-port-provenance.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11).
 
 ### Built-In Service Operation Delivery
 

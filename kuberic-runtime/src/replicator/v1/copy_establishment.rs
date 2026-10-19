@@ -540,6 +540,7 @@ struct SecondaryState {
 struct SecondaryRoot {
     state: Mutex<SecondaryState>,
     route: Route,
+    primary: Arc<Mutex<Route>>,
     copy: CopySenderHandle,
     force_ack: Arc<dyn Fn(i32) + Send + Sync>,
 }
@@ -548,6 +549,19 @@ struct SecondaryRoot {
 pub(super) struct SecondaryEstablishmentHandle(Weak<SecondaryRoot>);
 
 impl SecondaryEstablishmentHandle {
+    pub(super) fn primary_route(&self) -> Result<Route, EstablishError> {
+        Ok(self.reply_route()?.lock().unwrap().clone())
+    }
+
+    pub(super) fn reply_route(&self) -> Result<Arc<Mutex<Route>>, EstablishError> {
+        Ok(self.root()?.primary.clone())
+    }
+
+    pub(super) fn update_primary(&self, route: Route) -> Result<(), EstablishError> {
+        *self.reply_route()?.lock().unwrap() = route;
+        Ok(())
+    }
+
     fn root(&self) -> Result<Arc<SecondaryRoot>, EstablishError> {
         self.0.upgrade().ok_or(EstablishError::OwnerDropped)
     }
@@ -563,6 +577,16 @@ impl SecondaryEstablishmentHandle {
     pub(super) fn process_start(&self, envelope: &wire::Envelope) -> Result<bool, EstablishError> {
         let root = self.root()?;
         inbound(&root.route, envelope)?;
+        self.process_start_message(envelope)
+    }
+
+    pub(super) fn process_start_message(
+        &self,
+        envelope: &wire::Envelope,
+    ) -> Result<bool, EstablishError> {
+        let root = self.root()?;
+        let primary = root.route.incoming(envelope)?;
+        inbound(&primary, envelope)?;
         let Some(wire::envelope::Body::StartCopy(body)) = &envelope.body else {
             return Err(ProtocolError::Shape("expected StartCopy").into());
         };
@@ -602,6 +626,7 @@ impl SecondaryEstablishmentHandle {
                     .initialize(body.replication_start, epoch)
                     .map_err(|error| EstablishError::Receiver(Arc::new(error)))?;
                 state.epoch = Some(epoch);
+                *root.primary.lock().unwrap() = primary;
                 (true, state.error)
             }
         };
@@ -614,7 +639,6 @@ impl SecondaryEstablishmentHandle {
         envelope: &wire::Envelope,
     ) -> Result<(), EstablishError> {
         let root = self.root()?;
-        inbound(&root.route, envelope)?;
         let Some(wire::envelope::Body::CopyContextAck(body)) = &envelope.body else {
             return Err(ProtocolError::Shape("expected context ACK").into());
         };
@@ -626,6 +650,7 @@ impl SecondaryEstablishmentHandle {
             if state.epoch.is_none() {
                 return Err(EstablishError::NotStarted);
             }
+            inbound(&root.primary.lock().unwrap(), envelope)?;
         }
         if body.error != 0 {
             root.copy.finish(CopyError::Remote(body.error))?;
@@ -680,15 +705,17 @@ impl SecondaryEstablishment {
         route.validate()?;
         config.validate()?;
         let persisted = receiver.lock().unwrap().has_persisted_state();
+        let epoch = receiver.lock().unwrap().copy_epoch();
         let copy = CopySender::new(false);
         Ok(Self {
             root: Arc::new(SecondaryRoot {
                 state: Mutex::new(SecondaryState {
                     active: true,
-                    epoch: None,
+                    epoch,
                     receiver,
                     error: 0,
                 }),
+                primary: Arc::new(Mutex::new(route.clone())),
                 route,
                 copy: copy.handle(),
                 force_ack,

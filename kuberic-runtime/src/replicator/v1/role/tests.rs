@@ -28,6 +28,7 @@ use crate::replicator::v1::session::{SendIntent, SendKind};
 use crate::replicator::v1::transport::wire;
 
 mod data_loss;
+mod ingress;
 
 struct Provider {
     epochs: Mutex<Vec<EpochBarrier>>,
@@ -237,8 +238,9 @@ impl Rig {
                 },
                 secondary_route: route(10),
                 secondary_callbacks: SecondaryCallbacks {
-                    ack: Arc::new(|_, _| true),
-                    context: Arc::new(|_| true),
+                    ack: Arc::new(|_, _, _| true),
+                    context: Arc::new(|_, _| true),
+                    fault: Arc::new(|_| {}),
                 },
                 cached_progress: cached,
             },

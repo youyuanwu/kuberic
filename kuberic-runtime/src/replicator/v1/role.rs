@@ -8,8 +8,8 @@
 // Data loss: Replicator.OnDatalossAsyncOperation.cpp:30-157,
 // ReplicatorState.cpp:129-139,177-186, ReplicationQueueManager.cpp:148-160.
 
-//! Private, explicitly driven role/epoch/recovery owner, not a public facade or host
-//! demultiplexer. A cancelled run retains the selected operation/provider call.
+//! Private, explicitly driven role/epoch/recovery owner with typed ingress, not
+//! a public facade or production host. A cancelled run retains selected work.
 //! Old primary build providers stay rooted separately; role completion is not
 //! arbitrary GetCopyState/GetNext drainage. No task or engine is activated.
 
@@ -26,6 +26,7 @@ use crate::protocol::types::Epoch;
 use crate::traits::StateProvider;
 
 use super::async_runtime::Clock;
+use super::ingress::{MessageIngress, Target};
 use super::primary::{Primary, PrimaryConfig, PrimaryError, PrimaryHandle};
 use super::secondary::{
     Secondary, SecondaryCallbacks, SecondaryConfig, SecondaryError, SecondaryHandle,
@@ -46,6 +47,8 @@ pub(super) enum RoleStatus {
     Changing(Role),
     Ready(Role),
     CheckingDataLoss,
+    Closing(Role),
+    Closed,
     Faulted,
     Aborting,
     Aborted,
@@ -100,6 +103,7 @@ enum Step {
     Demote(Epoch),
     ActivateSecondary,
     Close(Role),
+    DirectClose(Role),
     PrimaryEpoch(Option<Role>),
     SecondaryEpoch,
     DataLoss,
@@ -121,6 +125,7 @@ pub(super) struct RoleReplicator {
     retired_primaries: Vec<Primary>,
     retired_secondaries: Vec<Secondary>,
     fault: Option<RoleError>,
+    ingress: MessageIngress,
 }
 
 impl RoleReplicator {
@@ -145,6 +150,10 @@ impl RoleReplicator {
         {
             return Err(RoleError::InvalidConfig);
         }
+        let ingress = MessageIngress::new(
+            config.secondary_route.clone(),
+            config.secondary.context.buffer_limits,
+        );
         Ok(Self {
             config,
             provider,
@@ -160,7 +169,38 @@ impl RoleReplicator {
             retired_primaries: Vec::new(),
             retired_secondaries: Vec::new(),
             fault: None,
+            ingress,
         })
+    }
+
+    pub(super) fn ingress(&self) -> MessageIngress {
+        self.ingress.clone()
+    }
+
+    fn refresh_ingress(&self) {
+        let target = match (self.status, self.pending) {
+            (RoleStatus::Ready(Role::Primary) | RoleStatus::Closing(Role::Primary), _)
+            | (
+                RoleStatus::Changing(Role::Primary),
+                Some(Step::PrimaryEpoch(Some(Role::Primary))),
+            ) => Target::Primary(
+                self.primary
+                    .as_ref()
+                    .expect("admitted primary owner")
+                    .handle(),
+            ),
+            (RoleStatus::Ready(Role::IdleSecondary | Role::ActiveSecondary), _)
+            | (RoleStatus::Changing(Role::ActiveSecondary), Some(Step::ActivateSecondary)) => {
+                Target::Secondary(
+                    self.secondary
+                        .as_ref()
+                        .expect("admitted secondary owner")
+                        .handle(),
+                )
+            }
+            _ => Target::None,
+        };
+        self.ingress.set_target(target);
     }
 
     pub(super) fn status(&self) -> RoleStatus {
@@ -301,6 +341,7 @@ impl RoleReplicator {
         } else {
             RoleStatus::Ready(role)
         };
+        self.refresh_ingress();
         Ok(())
     }
 
@@ -317,6 +358,7 @@ impl RoleReplicator {
             Ok(boundary)
         }));
         self.pending = Some(Step::PrimaryEpoch(role));
+        self.refresh_ingress();
         Ok(())
     }
 
@@ -372,6 +414,7 @@ impl RoleReplicator {
         self.data_loss_failure = None;
         self.pending = Some(Step::DataLoss);
         self.status = RoleStatus::CheckingDataLoss;
+        self.refresh_ingress();
         Ok(())
     }
 
@@ -417,6 +460,7 @@ impl RoleReplicator {
             // error wins over a simultaneous failure to restore primary admission.
             result = result.and(restore.map_err(RoleError::from));
             self.pending = None;
+            self.refresh_ingress();
         }
         self.data_loss_end = Some(DataLossEnd {
             state_changed: recovery.state_changed,
@@ -448,7 +492,33 @@ impl RoleReplicator {
         self.status = RoleStatus::Faulted;
         self.pending = None;
         self.fault.get_or_insert(error.clone());
+        self.refresh_ingress();
         Err(error)
+    }
+
+    pub(super) fn begin_close(&mut self, quorum_wait: Duration) -> Result<(), RoleError> {
+        self.check_idle()?;
+        if !matches!(
+            self.status,
+            RoleStatus::Opened | RoleStatus::Ready(_) | RoleStatus::Faulted
+        ) {
+            return Err(RoleError::InvalidState);
+        }
+        let role = if let Some(primary) = &self.primary {
+            primary.handle().close(quorum_wait)?;
+            Role::Primary
+        } else if let Some(secondary) = &self.secondary {
+            secondary.handle().close()?;
+            Role::ActiveSecondary
+        } else {
+            self.status = RoleStatus::Closed;
+            self.refresh_ingress();
+            return Ok(());
+        };
+        self.pending = Some(Step::DirectClose(role));
+        self.status = RoleStatus::Closing(role);
+        self.refresh_ingress();
+        Ok(())
     }
 
     pub(super) fn abort(&mut self) -> Result<(), RoleError> {
@@ -463,6 +533,7 @@ impl RoleReplicator {
         }
         self.status = RoleStatus::Aborting;
         self.pending = Some(Step::Abort);
+        self.refresh_ingress();
         Ok(())
     }
 
@@ -524,15 +595,18 @@ impl RoleReplicator {
                     self.retired_primaries.push(self.primary.take().unwrap());
                     self.status = RoleStatus::Ready(Role::ActiveSecondary);
                     self.pending = None;
+                    self.refresh_ingress();
                     return Ok(());
                 }
                 Step::ActivateSecondary => {
                     self.secondary.as_mut().unwrap().wait_for_active().await?;
                     self.status = RoleStatus::Ready(Role::ActiveSecondary);
                     self.pending = None;
+                    self.refresh_ingress();
                     return Ok(());
                 }
-                Step::Close(old) => {
+                Step::Close(old) | Step::DirectClose(old) => {
+                    let direct = matches!(step, Step::DirectClose(_));
                     if old == Role::Primary {
                         self.primary.as_mut().unwrap().run().await?.result?;
                         self.retired_primaries.push(self.primary.take().unwrap());
@@ -541,8 +615,13 @@ impl RoleReplicator {
                         self.retired_secondaries
                             .push(self.secondary.take().unwrap());
                     }
-                    self.status = RoleStatus::Ready(Role::None);
+                    self.status = if direct {
+                        RoleStatus::Closed
+                    } else {
+                        RoleStatus::Ready(Role::None)
+                    };
                     self.pending = None;
+                    self.refresh_ingress();
                     return Ok(());
                 }
                 Step::PrimaryEpoch(role) => {
@@ -567,6 +646,7 @@ impl RoleReplicator {
                         self.status = RoleStatus::Ready(role);
                     }
                     self.pending = None;
+                    self.refresh_ingress();
                     return Ok(());
                 }
                 Step::SecondaryEpoch => {
@@ -576,6 +656,7 @@ impl RoleReplicator {
                         .wait_external_epoch()
                         .await?;
                     self.pending = None;
+                    self.refresh_ingress();
                     return Ok(());
                 }
                 Step::DataLoss => return self.run_data_loss().await,
@@ -605,6 +686,7 @@ impl RoleReplicator {
                     }
                     self.status = RoleStatus::Aborted;
                     self.pending = None;
+                    self.refresh_ingress();
                     return Err(RoleError::Aborted);
                 }
             }

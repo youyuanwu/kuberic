@@ -78,6 +78,34 @@ fn validate_endpoint(endpoint: &wire::Endpoint) -> Result<(), ProtocolError> {
 }
 
 impl Route {
+    pub(super) fn incoming(&self, envelope: &wire::Envelope) -> Result<Self, ProtocolError> {
+        let source = envelope
+            .source
+            .as_ref()
+            .ok_or(ProtocolError::Missing("source"))?;
+        let destination = envelope
+            .destination
+            .as_ref()
+            .ok_or(ProtocolError::Missing("destination"))?;
+        validate_endpoint(source)?;
+        validate_endpoint(destination)?;
+        if destination != &self.source {
+            return Err(ProtocolError::WrongDestination);
+        }
+        if source.partition != self.source.partition {
+            return Err(ProtocolError::WrongSource);
+        }
+        if envelope.sender_address.is_empty() {
+            return Err(ProtocolError::Missing("sender address"));
+        }
+        Ok(Self {
+            source: self.source.clone(),
+            destination: source.clone(),
+            sender_address: self.sender_address.clone(),
+            remote_address: envelope.sender_address.clone(),
+        })
+    }
+
     pub(super) fn validate(&self) -> Result<(), ProtocolError> {
         validate_endpoint(&self.source)?;
         validate_endpoint(&self.destination)?;
@@ -154,10 +182,17 @@ pub(super) struct CarrierLimits {
 }
 
 fn validate_body(envelope: &wire::Envelope, limits: CarrierLimits) -> Result<(), ProtocolError> {
-    use wire::envelope::Body;
     if envelope.encoded_len() > limits.max_wire_bytes {
         return Err(ProtocolError::TooLarge);
     }
+    validate_shape(envelope, limits.buffers)
+}
+
+pub(super) fn validate_shape(
+    envelope: &wire::Envelope,
+    limits: BufferLimits,
+) -> Result<(), ProtocolError> {
+    use wire::envelope::Body;
     if envelope.version != VERSION {
         return Err(ProtocolError::UnsupportedVersion(envelope.version));
     }
@@ -166,7 +201,7 @@ fn validate_body(envelope: &wire::Envelope, limits: CarrierLimits) -> Result<(),
     }
     let check_buffers = |buffers: &Option<wire::Buffers>| {
         let buffers = buffers.as_ref().ok_or(ProtocolError::Missing("buffers"))?;
-        super::buffers::payload_len(&buffers.segments, limits.buffers)
+        super::buffers::payload_len(&buffers.segments, limits)
             .map_err(|_| ProtocolError::TooLarge)?;
         Ok::<_, ProtocolError>(buffers.segments.len())
     };

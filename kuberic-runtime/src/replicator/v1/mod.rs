@@ -7,6 +7,7 @@ mod copy_async_operation;
 mod copy_context_receiver;
 mod copy_establishment;
 mod copy_sender;
+mod ingress;
 mod operation_queue;
 mod operation_stream;
 mod primary;

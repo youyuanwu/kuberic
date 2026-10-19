@@ -72,9 +72,12 @@ The [queue-policy slice](sf-v1-port-ledger.md#queue-pressure-and-slow-peer-polic
 adds periodic freshness and pressure retargeting, slow-peer completion-disable/
 sender closure and reclamation exclusion, and retrying typed fault notifications.
 Quorum/all-applied and live MustCatchup retain faulted active replicas.
-Broader Open/restart/host recovery and replica rebuild policy,
-full host role/epoch/InduceFault demux, remote fault handling and monitoring/health
-remain pending.
+The [message-ingress slice](sf-v1-port-ledger.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11)
+adds private role-aware typed dispatch, native secondary message/epoch admission,
+current-primary reply routing and once-only targeted remote fault reporting.
+Broader Open/restart/host recovery and replica rebuild policy, production host
+listener/authentication/registry and partition-report integration, and
+monitoring/health remain pending.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -450,8 +453,11 @@ external epoch sequencing. Bounded data-loss orchestration now composes actual
 provider recovery, changed-only progress/reset and native admission/restoration.
 Bounded queue policy now composes periodic/pressure retarget, slow-peer
 exclusion and retrying notifications with native quorum/all/MustCatchup behavior.
-Broader Open/restart/host recovery and rebuild policy, full host demux/remote
-fault handling and platform monitoring are pending. This roadmap is not
+Bounded private role-aware message dispatch and targeted remote fault reporting
+now compose existing primary/secondary owners and real reply identity.
+Broader Open/restart/host recovery and rebuild policy, production host
+listener/authentication/registry and partition-report integration, and platform
+monitoring are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required
