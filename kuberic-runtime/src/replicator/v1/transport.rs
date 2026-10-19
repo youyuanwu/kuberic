@@ -70,7 +70,7 @@ pub(super) enum ProtocolError {
     StaleStream,
 }
 
-fn validate_endpoint(endpoint: &wire::Endpoint) -> Result<(), ProtocolError> {
+pub(super) fn validate_endpoint(endpoint: &wire::Endpoint) -> Result<(), ProtocolError> {
     if endpoint.partition.len() != 16 || endpoint.incarnation.len() != 16 {
         return Err(ProtocolError::Shape("endpoint GUID length"));
     }

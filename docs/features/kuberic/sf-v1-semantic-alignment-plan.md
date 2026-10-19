@@ -75,8 +75,12 @@ Quorum/all-applied and live MustCatchup retain faulted active replicas.
 The [message-ingress slice](sf-v1-port-ledger.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11)
 adds private role-aware typed dispatch, native secondary message/epoch admission,
 current-primary reply routing and once-only targeted remote fault reporting.
-Broader Open/restart/host recovery and replica rebuild policy, production host
-listener/authentication/registry and partition-report integration, and
+The [Open/restart recovery slice](sf-v1-port-ledger.md#open-and-restart-recovery-slice-p3-bounded-f01f04f07f08f09f11)
+adds explicit Created/Open and private logical ingress registration,
+lazy normalized/cached provider progress and a caller-directed actual-owner
+restart-to-copy/replication handoff without DurableState or invented history.
+Broader production host recovery, automatic replica rebuild/placement policy,
+host listener/authentication/registry and partition-report integration, and
 monitoring/health remain pending.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
@@ -455,7 +459,10 @@ Bounded queue policy now composes periodic/pressure retarget, slow-peer
 exclusion and retrying notifications with native quorum/all/MustCatchup behavior.
 Bounded private role-aware message dispatch and targeted remote fault reporting
 now compose existing primary/secondary owners and real reply identity.
-Broader Open/restart/host recovery and rebuild policy, production host
+Private Created/Open, logical ingress registration and lazy normalized/cached
+initial progress now compose an actual-owner caller-directed restart/copy/
+replication journey. Broader production host recovery and automatic rebuild/
+placement policy, production host
 listener/authentication/registry and partition-report integration, and platform
 monitoring are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
@@ -471,7 +478,7 @@ fallback is introduced. Component tests are not counted as hosted native parity.
 |---|---|---|---|
 | P1 Port ledger, notices and scenario oracle | None | Map native components/transitions/defaults/capabilities, resolved protected types, licensing and native test vectors. Extend fixtures without claiming native execution or pending parity. | Each source family and contract row has a destination, native evidence, allowed substitution and deterministic vector. Expanded protected signatures are pinned; supported/unsupported native capabilities remain explicit. |
 | P2 Queue/session/async/tonic substrate | P1 | Port OperationQueue, ReliableOperationSender/AckSender and session delivery mechanics; implement bounded typed tonic carrier, deterministic clock and buffer adapter. Not production-selected. | Native-derived gap/limit/trim/transfer, receive/apply, retry/window/request-ACK, batching/expiry/backpressure, reconnect and buffer vectors pass with fake and real tonic carriers. Current production journeys stay unchanged. |
-| P3 Native primary/secondary/copy state machines | P2 | Port ReplicaManager/ReplicationQueueManager, role coordinator, primary/secondary receivers, provider barriers and copy/context/build state machines. Not production-selected. | Source-mapped quorum/assignment/role-transfer, persisted/volatile ACK, EOF/context/drain and copy-target/retarget traces pass. No old production stream/owner is removed; hosted parity waits for P5. |
+| P3 Native primary/secondary/copy state machines | P2 | Port ReplicaManager/ReplicationQueueManager, private Open/role coordinator, primary/secondary receivers, provider recovery/barriers and copy/context/build state machines. Not production-selected. | Source-mapped Open/restart recovery, quorum/assignment/role-transfer, persisted/volatile ACK, EOF/context/drain and copy-target/retarget traces pass. No old production stream/owner is removed; hosted parity waits for P5. |
 | P4 Rust service and Kuberic host adapters | P2, P3 | Prepare protected facade, assignment/ACK APIs, helper-free and real KV/SQLite service ownership, native status/lifecycle adapter, named reports/schema/controller/election/rejoin cutover. | Adapters compile against resolved protected types; service-local commit/isolation and report/error cases pass. Old published evidence/wiring stays unchanged; no producer feeds new queue counters into old first/last. |
 | P5 Atomic port cutover and old-engine removal | P2, P3, P4 | Switch sole Default factory, public services, tonic wire, host/schema/controller and lifecycle together; remove old stateless algorithm/RPCs and mandatory engine persistence/oracles. | Real public factory/host traces pass across Open/restart/build/catch-up/epoch/promotion/status/Close. Helper-free service needs no DurableState or extra commit signal; real KV/SQLite client durability/isolation stays safe. No dual engine/fallback remains. |
 | P6 Custom-replicator and application closure | P4, P5 | PostgreSQL protected control semantics, partition/SQL admission, successor/catch-up policy, local idle removal, slots/WAL cleanup, stopped-progress snapshot and Abort grants. Reassess KV teardown and dynamic Open/settings guards. | All applicable protected control cases run against built-in and custom paths. Production PostgreSQL tests demonstrate denied SQL cannot commit, idle removal preserves others, slot cleanup, nonregressing relevant progress and disarmed retained gateway objects. |

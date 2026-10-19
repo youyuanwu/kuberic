@@ -720,6 +720,38 @@ production host authentication/listener/registry and partition-report adapters,
 monitoring/health, public settings/service adapters and atomic activation remain
 pending. This slice is not full P3 or hosted/native/provider-fsync qualification.
 
+### Open and Restart Recovery Slice (P3, Bounded F01/F04/F07/F08/F09/F11)
+
+Rust destinations:
+[`role.rs`](../../../kuberic-runtime/src/replicator/v1/role.rs),
+the private logical registry in
+[`ingress.rs`](../../../kuberic-runtime/src/replicator/v1/ingress.rs),
+shared endpoint-shape validation in
+[`transport.rs`](../../../kuberic-runtime/src/replicator/v1/transport.rs)
+and [actual-owner regressions](../../../kuberic-runtime/src/replicator/v1/role/tests/open.rs).
+Existing role/ingress/recovery fixtures now Open explicitly; negative provider
+progress expectations are corrected to the native normalization below.
+
+| Selected native material at the immutable pin (`R/` prefix) | Translation / representation changes |
+|---|---|
+| [`Replicator.OpenAsyncOperation.cpp:29-81`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.OpenAsyncOperation.cpp#L29-L81); `ReplicatorState.cpp:16-37` | Created admits synchronous private Open once. Open registers actual ingress and returns typed address/full endpoint, without querying the provider or creating a role. Performance counters/API monitor and native endpoint string/transport-ID formatting are not imported. |
+| [`ReplicationTransport.h:253-267,301-308`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicationTransport.h#L253-L308); `ReplicationTransport.cpp:872-878` | Private in-process endpoint registry and RAII registration replace native demux roots. Duplicate identities return an explicit error; dispatch releases the registry guard before calling the actual role-selected owner. This is not a production authenticated listener or native wire/address interoperability. |
+| [`Replicator.cpp:296-367`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.cpp#L296-L367); `Replicator.ChangeRoleAsyncOperation.cpp:131-208` | Lazy successful Opened-progress caching and initial-primary recovery reuse the protected provider callback. Retained Rust futures replace synchronous COM calls in the explicit driver. Query failure returns an error without fault/cache; initial-primary failure faults. The private query lane serializes with other role/Close operations; full native query concurrency is not asserted. |
+| [`ComProxyStateProvider.cpp:63-79`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ComProxyStateProvider.cpp#L63-L79) | Shared protected-callback adapter maps every successful negative LSN to zero for lazy query, initial-primary and changed-data-loss recovery. Error variants are preserved; unsupported overflowing queue seeds remain errors. No HRESULT conversion or protected-interface change. |
+| `Replicator.CloseAsyncOperation.cpp:31-100,131-180`; `Replicator.cpp:178-253`; `ReplicatorState.cpp:177-242` | Registration remains through actual primary Close quorum prewait, then releases even on child failure; Abort unregisters/seals while the explicit driver retains selected provider obligations. Role None is not outer Close. RAII drop also seals retained ingress; no successful callback drain is fabricated. |
+| `ReplicationQueueManager.cpp:29-71`; existing `ReplicaManager.cpp:1205-1779` and `PrimaryReplicator.BuildIdleAsyncOperation.cpp` responsibilities recorded in earlier slices | Restart seeds the existing empty process-local queue from provider progress. Actual missing-replay rejection, caller-directed BuildIdle, target context/copy/service ACK, configuration and replication owners provide the recovery witness; no recovered byte suffix, DurableState requirement, automatic placement/rebuild controller or second state machine. |
+
+Source headers retain Microsoft MIT attribution; complete permission/disclaimer
+remains in the linked license and selected material in THIRD-PARTY-NOTICES.
+No native utility, harness, fixture or dependency implementation is imported.
+See the [ledger](sf-v1-port-ledger.md#open-and-restart-recovery-slice-p3-bounded-f01f04f07f08f09f11)
+and [selector](testing.md#sf-v1-open-and-restart-recovery-slice).
+Components remain private/unselected. Production host lifecycle/authentication/
+listener/registry and partition reporting, automatic rebuild/placement,
+monitoring/health, public adapters and activation remain pending.
+Actual-component execution is not native execution, full P3, hosted/differential
+parity or provider-fsync qualification.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

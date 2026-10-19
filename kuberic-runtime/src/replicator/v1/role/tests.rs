@@ -29,6 +29,7 @@ use crate::replicator::v1::transport::wire;
 
 mod data_loss;
 mod ingress;
+mod open;
 
 struct Provider {
     epochs: Mutex<Vec<EpochBarrier>>,
@@ -40,6 +41,7 @@ struct Provider {
     fail_progress: AtomicBool,
     fail_copy: AtomicBool,
     copy_calls: AtomicUsize,
+    copy_boundaries: Mutex<Vec<Lsn>>,
     copy_gate: Semaphore,
     data_loss_calls: AtomicUsize,
     data_loss_gate: Semaphore,
@@ -60,6 +62,7 @@ impl Provider {
             fail_progress: AtomicBool::new(false),
             fail_copy: AtomicBool::new(false),
             copy_calls: AtomicUsize::new(0),
+            copy_boundaries: Mutex::new(Vec::new()),
             copy_gate: Semaphore::new(100),
             data_loss_calls: AtomicUsize::new(0),
             data_loss_gate: Semaphore::new(100),
@@ -99,10 +102,11 @@ impl StateProvider for Provider {
     }
     async fn get_copy_state(
         &self,
-        _: Lsn,
+        up_to_lsn: Lsn,
         _: OperationDataStream,
     ) -> crate::Result<OperationDataStream> {
         self.copy_calls.fetch_add(1, Ordering::SeqCst);
+        self.copy_boundaries.lock().unwrap().push(up_to_lsn);
         self.copy_gate.acquire().await.unwrap().forget();
         if self.fail_copy.load(Ordering::SeqCst) {
             return Err(RuntimeError::InvalidReplication(
@@ -191,6 +195,11 @@ impl Rig {
         provider: Arc<Provider>,
         cached: Option<Lsn>,
     ) -> Self {
+        let mut rig = Self::unopened(required, eos, provider, cached);
+        rig.owner.open(&MessageRegistry::default()).unwrap();
+        rig
+    }
+    fn unopened(required: bool, eos: bool, provider: Arc<Provider>, cached: Option<Lsn>) -> Self {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let recorded = sent.clone();
         let owner = RoleReplicator::new(
@@ -1019,20 +1028,18 @@ async fn pending_primary_epoch_keeps_driving_real_retry_timers_with_distinct_ori
 }
 
 #[tokio::test]
-async fn invalid_provider_initial_progress_faults_without_invoking_epoch_or_panicking() {
-    for progress in [-1, Lsn::MAX] {
-        let provider = Arc::new(Provider {
-            progress,
-            ..Provider::new()
-        });
-        let mut rig = Rig::with_provider(true, false, provider, None);
-        rig.owner
-            .begin_change_role(Role::Primary, epoch(1))
-            .unwrap();
-        assert!(rig.owner.run().await.is_err());
-        assert_eq!(rig.owner.status(), RoleStatus::Faulted);
-        assert!(rig.provider.epochs.lock().unwrap().is_empty());
-    }
+async fn overflowing_provider_initial_progress_faults_without_invoking_epoch_or_panicking() {
+    let provider = Arc::new(Provider {
+        progress: Lsn::MAX,
+        ..Provider::new()
+    });
+    let mut rig = Rig::with_provider(true, false, provider, None);
+    rig.owner
+        .begin_change_role(Role::Primary, epoch(1))
+        .unwrap();
+    assert!(rig.owner.run().await.is_err());
+    assert_eq!(rig.owner.status(), RoleStatus::Faulted);
+    assert!(rig.provider.epochs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

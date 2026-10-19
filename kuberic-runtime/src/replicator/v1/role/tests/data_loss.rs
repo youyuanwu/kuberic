@@ -327,24 +327,22 @@ async fn progress_failure_keeps_changed_flag_and_old_queue_without_faulting_role
 }
 
 #[tokio::test]
-async fn invalid_recovered_progress_cannot_reset_queue_or_overflow_assignment() {
-    for progress in [-1, Lsn::MAX] {
-        let mut rig = recovery(progress, true, 1);
-        let primary = rig.primary().await;
-        rig.owner.begin_data_loss().unwrap();
-        let error = rig.owner.run().await.unwrap_err();
-        assert!(matches!(
-            error,
-            RoleError::Primary(PrimaryError::Manager(error))
-                if matches!(error.as_ref(), ManagerError::QueueNormalization(
-                    QueueNormalizationError::InvalidInitialProgress))
-        ));
-        assert!(rig.owner.data_loss_result().unwrap().state_changed);
-        assert_eq!(rig.owner.status(), RoleStatus::Ready(Role::Primary));
-        assert_eq!(rig.owner.config.cached_progress, Some(progress));
-        configuration(&primary, 1, &[]);
-        assert_eq!(enqueue(&primary).lsn, 8);
-    }
+async fn overflowing_recovered_progress_cannot_reset_queue_or_overflow_assignment() {
+    let mut rig = recovery(Lsn::MAX, true, 1);
+    let primary = rig.primary().await;
+    rig.owner.begin_data_loss().unwrap();
+    let error = rig.owner.run().await.unwrap_err();
+    assert!(matches!(
+        error,
+        RoleError::Primary(PrimaryError::Manager(error))
+            if matches!(error.as_ref(), ManagerError::QueueNormalization(
+                QueueNormalizationError::InvalidInitialProgress))
+    ));
+    assert!(rig.owner.data_loss_result().unwrap().state_changed);
+    assert_eq!(rig.owner.status(), RoleStatus::Ready(Role::Primary));
+    assert_eq!(rig.owner.config.cached_progress, Some(Lsn::MAX));
+    configuration(&primary, 1, &[]);
+    assert_eq!(enqueue(&primary).lsn, 8);
 }
 
 #[tokio::test]

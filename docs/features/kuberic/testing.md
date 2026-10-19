@@ -713,6 +713,47 @@ full workspace ordinary execution or PostgreSQL/KinD execution is claimed.
 See the [ledger](sf-v1-port-ledger.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11)
 and [provenance](sf-v1-port-provenance.md#role-aware-message-ingress-slice-p3-bounded-f01f04f05f08f09f11).
 
+### SF V1 Open and Restart Recovery Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::role::tests::)' -j 2
+```
+
+Cases invoke actual role/registry/ingress, primary queue/session, secondary
+receiver/stream and copy/context/BuildIdle owners. Created admits Open once;
+Open publishes/registers the full logical identity without reading provider
+progress. Duplicate registration cannot replace a live owner. Retained ingress
+is sealed by registration drop/Abort; direct Close keeps real ACK admission
+through quorum prewait and unregisters even after a child-close error.
+Provider and fault callbacks can reenter the registry without a held guard.
+
+Lazy Opened progress retains one callback across interrupted runs and caches
+success for initial-primary creation. Query errors remain retryable without
+fault/cache; initial-primary errors fault without publishing a primary.
+Successful negative provider progress is empty/zero in initial, query and
+changed-data-loss paths; overflowing assignment remains an explicit error.
+Abort retains selected callback obligations without publishing late recovery.
+The private query driver serializes with other requests, not full native
+concurrent-query/Close interleavings.
+
+The restart journey discards old process-local history, reads provider-owned
+progress with only the protected StateProvider contract, rejects an old
+incarnation and reports missing retained replay for a lagging current replica.
+Explicit caller-directed BuildIdle uses actual target context, provider copy,
+target consuming/service-ACK streams and source build gates before configuration
+promotion and subsequent replication/quorum completion. It requires no
+DurableState or extra durable-progress oracle and invents no historical bytes.
+
+Use the live nextest inventory for coverage and partition discovery.
+This private logical registry is not production listener/authentication/host
+registration. Production host recovery, automatic placement/rebuild,
+partition reporting, monitoring/health, public adapters and activation remain
+pending. No native execution, differential/hosted parity, provider-fsync,
+full workspace ordinary or PostgreSQL/KinD qualification is claimed.
+See the [ledger](sf-v1-port-ledger.md#open-and-restart-recovery-slice-p3-bounded-f01f04f07f08f09f11)
+and [provenance](sf-v1-port-provenance.md#open-and-restart-recovery-slice-p3-bounded-f01f04f07f08f09f11).
+
 ### Built-In Service Operation Delivery
 
 ```bash

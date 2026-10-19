@@ -3,21 +3,24 @@
 //
 // Source-guided translation of Replicator.cpp:618-759,
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
+// Logical registration: ReplicationTransport.h:253-267,301-308.
 // Byte-stream metadata constants: public FabricTypes.idl:46,779-781.
 //! Private role-aware demux. Callers admit peer routes; the carrier owns bounded
 //! delivery and stream generations, not host authentication. Effects run unlocked.
 
 #![cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ingress"))]
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::buffers::{BufferError, BufferLimits};
 use super::primary::{PrimaryError, PrimaryHandle};
 use super::secondary::{SecondaryError, SecondaryHandle};
-use super::transport::{ProtocolError, Route, validate_shape, wire};
+use super::transport::{ProtocolError, Route, validate_endpoint, validate_shape, wire};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DropReason {
+    Unregistered,
     Role,
     Faulted,
     NotInitialized,
@@ -59,6 +62,89 @@ pub(super) struct MessageIngress {
     limits: BufferLimits,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PublishedEndpoint {
+    pub(super) address: String,
+    pub(super) endpoint: wire::Endpoint,
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub(super) enum RegistrationError {
+    #[error("message processor endpoint is already registered")]
+    DuplicateEndpoint,
+}
+
+type EndpointKey = (bytes::Bytes, i64, bytes::Bytes);
+
+fn endpoint_key(endpoint: &wire::Endpoint) -> EndpointKey {
+    (
+        endpoint.partition.clone(),
+        endpoint.replica,
+        endpoint.incarnation.clone(),
+    )
+}
+
+/// Private logical counterpart of ReplicationTransport.h:253-267,301-308.
+/// A production authenticated listener/registry is deliberately not selected.
+#[derive(Clone, Default)]
+pub(super) struct MessageRegistry {
+    processors: Arc<Mutex<BTreeMap<EndpointKey, MessageIngress>>>,
+}
+
+#[must_use = "retain the registration until Close/Abort"]
+pub(super) struct MessageRegistration {
+    registry: MessageRegistry,
+    ingress: MessageIngress,
+}
+
+impl MessageRegistry {
+    pub(super) fn register(
+        &self,
+        ingress: MessageIngress,
+    ) -> Result<MessageRegistration, RegistrationError> {
+        let mut processors = self.processors.lock().unwrap();
+        let std::collections::btree_map::Entry::Vacant(entry) =
+            processors.entry(endpoint_key(&ingress.local.source))
+        else {
+            return Err(RegistrationError::DuplicateEndpoint);
+        };
+        entry.insert(ingress.clone());
+        Ok(MessageRegistration {
+            registry: self.clone(),
+            ingress,
+        })
+    }
+
+    pub(super) fn dispatch(&self, envelope: &wire::Envelope) -> Result<Disposition, IngressError> {
+        let endpoint = envelope
+            .destination
+            .as_ref()
+            .ok_or(ProtocolError::Missing("destination"))?;
+        validate_endpoint(endpoint)?;
+        let ingress = self
+            .processors
+            .lock()
+            .unwrap()
+            .get(&endpoint_key(endpoint))
+            .cloned();
+        match ingress {
+            Some(ingress) => ingress.dispatch(envelope),
+            None => Ok(Disposition::Dropped(DropReason::Unregistered)),
+        }
+    }
+}
+
+impl Drop for MessageRegistration {
+    fn drop(&mut self) {
+        self.ingress.set_target(Target::None);
+        self.registry
+            .processors
+            .lock()
+            .unwrap()
+            .remove(&endpoint_key(&self.ingress.local.source));
+    }
+}
+
 impl MessageIngress {
     pub(super) fn new(local: Route, limits: BufferLimits) -> Self {
         Self {
@@ -70,6 +156,13 @@ impl MessageIngress {
 
     pub(super) fn set_target(&self, target: Target) {
         *self.target.lock().unwrap() = target;
+    }
+
+    pub(super) fn published_endpoint(&self) -> PublishedEndpoint {
+        PublishedEndpoint {
+            address: self.local.sender_address.clone(),
+            endpoint: self.local.source.clone(),
+        }
     }
 
     pub(super) fn dispatch(&self, envelope: &wire::Envelope) -> Result<Disposition, IngressError> {
