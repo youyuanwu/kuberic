@@ -678,8 +678,8 @@ Idle sessions receive copy/context handoffs; active sessions receive
 replication-only ACK processing. Shared delivery preserves the actual rooted
 sender -> copy replication gate -> primary quorum progress -> idle copy ACK
 order, including reentrant/coalesced ACKs and selected work after Close.
-Configuration remains the existing caller-established seam, not native
-UpdateConfiguration/session creation or a claim of promotion.
+At that slice boundary configuration remained the caller-established seam, not
+native UpdateConfiguration/session creation or a claim of promotion.
 
 Ordinary Close optionally prewaits actual pending replicate quorum completion.
 Timeout continues Close without fabricated ACKs or a timeout-shaped Close
@@ -702,19 +702,64 @@ Discovery is **1037 = 991 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**.
 See [validation](testing.md#sf-v1-primary-lifecycle-slice) and
 [source provenance](sf-v1-port-provenance.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11).
 
-**Remaining owners:** full native configuration/session creation, role and
-external epoch orchestration, promotion/drained queue transfer,
+**Remaining owners at that slice boundary:** native configuration/session
+creation, role and external epoch orchestration, promotion/drained queue transfer,
 periodic/slow-peer/MustCatchup policy, monitoring/host health and P4/P5
 adapters/atomic activation. Protected interfaces, selected wiring,
 dependencies/tier policy remain unchanged. No native binary/differential/
 hosted/provider-fsync parity, full ordinary execution or full P2/P3 claim.
+
+### Primary Configuration Slice (P3, Bounded F02/F06/F08/F09)
+
+Private [`PrimaryHandle`](../../../kuberic-runtime/src/replicator/v1/primary.rs)
+now accepts typed replica descriptors through distinct catch-up and current-only
+configuration entry points. It creates/opens actual sessions using supplied
+progress and the owner's sender settings/callback, and reuses actual
+current/previous/idle roots. The existing manager remains authoritative for
+quorum, captured catchup boundary, marks, replay, queue reclamation and waiter
+completion. No parallel configuration arithmetic or synthetic session is added.
+
+Native configuration matching is **replica-ID based**, unlike bound ACK ingress.
+Reused descriptors do not overwrite an existing session's endpoint/incarnation,
+callback or ACK progress. Full route/identity checks remain on incoming ACKs.
+Unknown current progress requires existing current or idle membership;
+previous-only membership does not suffice. New current members must have retained replay;
+missing replay for new previous-only members explicitly pauses their senders.
+Existing PC contracts rather than expands; CC/PC overlap shares one root.
+Bindings are published before outside-guard replay can reenter.
+
+Actual idle membership is distinguished from active-priority ACK classification.
+Idle-to-active **session promotion**, including a retained PC/idle overlap,
+preserves sender/build roots, sets the native promotion marker and resets actual
+sender averages once. Live latency watches remain. Promotion neither declares
+copy success nor invents cancellation/drain of a pending provider/build; the
+actual copy owner and explicit cleanup remain authoritative. This is not
+secondary-to-primary role promotion.
+
+There are **34 new actual-component tests** for creation/seed/replay, identity/
+progress reuse, unknown admission, CC/PC overlap/contraction/retirement,
+invalid-input atomicity, real idle promotion and averages, pending provider
+retention, quorum/catchup reevaluation, reentrant ACK/reconfiguration/Abort,
+selected-send Close drainage, queue-full retry and pinned deadlines.
+V1 **656**, runtime **713/713**, non-V1 unchanged **57**. Exact discovery:
+**1071 = 1025 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**.
+See [validation](testing.md#sf-v1-primary-configuration-slice) and
+[source provenance](sf-v1-port-provenance.md#primary-configuration-slice-p3-bounded-f02f06f08f09).
+
+**Remaining owners:** role/external-epoch orchestration, secondary-to-primary
+promotion/drained queue transfer, periodic/slow-peer policy, monitoring/host health
+and P4/P5 adapters/atomic activation. The established-session seam remains for
+isolated use, not a requirement of the new descriptor API. Protected interfaces,
+selected wiring, dependencies and tier policy are unchanged. No native execution,
+differential/hosted/provider-fsync parity, full ordinary execution or full P2/P3
+completion claim. Earlier omissions/counts are historical.
 
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
 | F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | `v1/replicator.rs`, `state.rs`, existing facade | COM/refcounts → owned Rust, not altered role outcomes | A1, C1, L1 |
-| F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`, `primary.rs`; full configuration/role owner pending | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle lifecycle and bounded primary/session timer/ACK/ordinary Close/Abort composition delivered | A1, M1–M5, E1 |
+| F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`, `primary.rs`; role owner pending | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle lifecycle, lasting primary/session ownership and descriptor-based configuration/session creation/reuse/promotion delivered | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`, `copy_establishment.rs`, `secondary.rs`; full role owner pending | async queues/executor; required/optimistic ACK, shared StartCopy receiver, copy receipt, provider callbacks and bounded ordinary Close/drain/Abort delivered; role/promotion/external epoch owner pending | S1–S3, E2 |
 | F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams, `copy_async_operation.rs`, `copy_establishment.rs` | protected Bytes/boxed stream/i64 unchanged; shared receipt, terminal adapters, serial polling and bounded copy provider acquisition delivered; public facade/full provider lifecycle pending | D1, S2–S3, C1–C2 |
@@ -871,10 +916,12 @@ The bounded secondary lifetime now composes the actual receivers,
 establishment/context/ACK and provider epoch owners, including cross-receiver
 faults and ordinary legacy/EOS Close/drain/Abort. The bounded primary lifetime
 now retains BuildIdle drivers, session timers/ordered ACK ingress beyond build
-completion, quorum prewait and ordinary Close/Abort effect drainage. Native
-configuration/session creation remains a caller-established seam. Next is
-role/external-epoch orchestration and drained queue transfer, including the
-missing native configuration/session-creation and promotion responsibilities.
+completion, quorum prewait and ordinary Close/Abort effect drainage.
+Descriptor-based catch-up/current configuration now creates/reuses real sessions,
+preserves identity/progress, owns idle-to-active session promotion and composes
+native replay/retirement with existing quorum/catchup. Next is
+role/external-epoch orchestration and drained queue transfer, including
+secondary-to-primary role promotion and demotion responsibilities.
 Periodic/slow-peer/MustCatchup policy remains an explicit separate owner.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/

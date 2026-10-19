@@ -22,6 +22,8 @@ use crate::replicator::v1::replica_manager::{CompletionError, ReplicaSet, Sessio
 use crate::replicator::v1::sender::SenderConfig;
 use crate::replicator::v1::session::{SendIntent, SendKind, SessionIdentity};
 
+mod configuration;
+
 fn route(id: i64) -> Route {
     Route {
         source: wire::Endpoint {
@@ -91,6 +93,8 @@ fn primary_config() -> PrimaryConfig {
         address: "primary".into(),
         epoch: Epoch::new(1, 7),
         allow_multiple_quorum_set: true,
+        sender: sender(),
+        send: Arc::new(|_| panic!("isolated fixture must supply a session callback")),
     }
 }
 

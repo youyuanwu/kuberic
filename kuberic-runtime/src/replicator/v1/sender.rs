@@ -38,6 +38,18 @@ pub(super) struct SenderConfig {
     pub(super) decay_interval: Duration,
 }
 
+impl SenderConfig {
+    pub(super) fn is_valid(self) -> bool {
+        self.initial_window.is_power_of_two()
+            && (self.max_window == 0
+                || (self.max_window.is_power_of_two() && self.max_window >= self.initial_window))
+            && (self.max_window != 0 || self.initial_window.checked_mul(4).is_some())
+            && !self.retry.is_zero()
+            && (0.0..=1.0).contains(&self.decay_factor)
+            && !self.decay_interval.is_zero()
+    }
+}
+
 #[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 selected work"))]
 pub(super) enum SendAction {
     Operation(SenderOperation),

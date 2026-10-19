@@ -540,12 +540,52 @@ no-default/API/privacy, doctests and exact inventory gates pass. See the
 [ledger](sf-v1-port-ledger.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11)
 and [selector](testing.md#sf-v1-primary-lifecycle-slice).
 
-All owners remain private/unselected. Full native configuration/session
+At that slice boundary, native configuration/session
 creation, role/external epochs, promotion/queue transfer, slow-peer/MustCatchup
-policy, monitoring/host health and P4/P5 activation remain pending. No protected
+policy, monitoring/host health and P4/P5 activation remained pending.
+All owners remain private/unselected. No protected
 API/selected wiring/dependency/tier change, native utility/harness import,
 native/differential/hosted/provider-fsync parity, full ordinary execution or
 full P2/P3 completion claim. Earlier slice omissions/counts remain historical.
+
+### Primary Configuration Slice (P3, Bounded F02/F06/F08/F09)
+
+Rust destinations retain Microsoft copyright/MIT attribution:
+[`primary.rs`](../../../kuberic-runtime/src/replicator/v1/primary.rs),
+[`configuration.rs` tests](../../../kuberic-runtime/src/replicator/v1/primary/tests/configuration.rs)
+and narrow existing manager/session/sender seams. `R/` denotes the same pinned
+`src/prod/src/Reliability/Replication/` prefix.
+
+| Selected native production source | Incorporated responsibility and explicit Rust substitution |
+|---|---|
+| `R/PrimaryReplicator.cpp:340–462` | Distinct catch-up/current-only updates, primary fault rejection and actual outstanding catchup reevaluation. Typed private Rust configurations contain remote active members; no COM/host descriptor ABI or public method change. |
+| `R/ReplicaManager.cpp:306–335,1205–1242` | ID-based reuse, real session creation/Open seeded by descriptor progress, actual retained replay starting at last apply + 1. Optional typed progress substitutes for FABRIC_INVALID_SEQUENCE_NUMBER. Reused identity/progress is not overwritten; bound ACK ingress remains full-identity checked. |
+| `R/ReplicaManager.cpp:1244–1779` | Existing manager supplies CC/PC/idle reuse, independent quorums, catchup boundary/marks, unknown-current admission, PC contraction, current replay requirement, explicit previous-only replay pause and unreferenced-sender retirement. Candidate validation/installation is failure-atomic; binding publication precedes outside-guard replay and reentrant callbacks. |
+| `R/ReplicaManager.cpp:1738–1779`; `R/ReplicationSession.cpp:279–283` | Actual idle-to-active session marking and reliable sender average reset, including PC/idle overlap. Real sender/build roots and live latency watches remain. No copy-success assertion, synthetic cancellation/drain, secondary-to-primary role transition or slow-peer policy is introduced. |
+
+The **34 registered tests** execute actual primary/manager/session/build/provider
+components, not native binaries, native harness imports or locally redefined
+formula ledgers. They exercise creation/seed/replay/original epochs, reuse versus
+bound identity, overlap/contraction/retirement, unknown progress, failure atomicity,
+actual idle session promotion/averages and pending provider retention. Actual
+quorum/catchup reevaluation, reentrant ACK/reconfiguration/Abort, selected-send
+Close drainage, queue-full retry and pinned-driver deadlines are also exercised.
+Power-of-two sender windows and retry/decay settings are validated before owned
+session construction; malformed typed input returns explicit private errors.
+
+**Measured scope:** V1 **656**, runtime **713/713**, unchanged non-V1 **57**.
+Exact discovery **1071 = 1025 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**;
+ordinary **257/256/256/256**, PostgreSQL **11/13/8/9**. Workspace check/Clippy,
+no-default/API/privacy, doctests and exact inventory gates pass. See the
+[ledger](sf-v1-port-ledger.md#primary-configuration-slice-p3-bounded-f02f06f08f09)
+and [selector](testing.md#sf-v1-primary-configuration-slice).
+
+All owners remain private/unselected. Role/external-epoch orchestration,
+secondary-to-primary promotion/drained queue transfer, periodic/slow-peer policy,
+monitoring/host health and P4/P5 activation remain pending. No protected API,
+selected wiring, dependency/tier change, native utility/harness import,
+native/differential/hosted/provider-fsync parity, full ordinary execution or
+full P2/P3 completion claim. Earlier slice omissions/counts are historical.
 
 ### P1 documented expectations (historical foundation)
 

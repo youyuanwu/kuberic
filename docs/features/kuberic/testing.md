@@ -13,7 +13,7 @@ separate from future executable port-component/hosted cases; add selectors and
 counts for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
 copy-receiver, enumeration, CopySender build-gate, copy-establishment, BuildIdle,
-secondary and primary lifecycle slices have
+secondary and primary lifecycle and primary configuration slices have
 actual component tests below. Preserve
 safety outcomes while revising assertions that encode intentionally different
 current contracts.
@@ -42,18 +42,18 @@ The current test inventory is:
 
 | Tier | Tests |
 |---|---:|
-| ordinary | 991 |
+| ordinary | 1025 |
 | PostgreSQL | 41 |
 | KinD live | 3 |
 | build-only | 2 |
-| **total** | **1037** |
+| **total** | **1071** |
 
-Ordinary partition counts are `248, 248, 248, 247`. PostgreSQL partition counts
+Ordinary partition counts are `257, 256, 256, 256`. PostgreSQL partition counts
 are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
 every configured partition union is complete.
 
-Source inventory measured after the primary lifecycle slice: 1037 =
-991 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
+Source inventory measured after the primary configuration slice: 1071 =
+1025 + 41 + 3 + 2. Discovery builds the tier binaries but does not execute
 PostgreSQL or KinD bodies.
 
 ## Ordinary Tier
@@ -551,15 +551,57 @@ Weak ingress rejects owner abandonment; removed builds/providers are released
 after actual completion without aliasing a replacement with the same replica ID.
 
 Workspace check/Clippy, no-default/API/privacy, workspace doctests and exact
-inventory gates pass. All components remain private/unselected. Configuration
-is still a caller-established seam, not native UpdateConfiguration/session
-creation or promotion. Role/external-epoch orchestration, queue transfer,
-slow-peer/MustCatchup policy, host health and P4/P5 activation remain pending.
+inventory gates pass. All components remain private/unselected. At that slice
+boundary configuration was a caller-established seam, not native
+UpdateConfiguration/session creation or promotion. Role/external-epoch
+orchestration, queue transfer, slow-peer/MustCatchup policy, host health and P4/P5
+activation remain pending.
 No full ordinary execution, PostgreSQL/KinD bodies, native binary execution,
 differential/hosted parity or provider-fsync is run/claimed. Earlier counts and
 exclusions are historical. See the
 [ledger](sf-v1-port-ledger.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11)
 and [provenance](sf-v1-port-provenance.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11).
+
+### SF V1 Primary Configuration Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::primary::tests::configuration::)' -j 2
+```
+
+This slice adds **34 actual primary/manager/session tests**. V1 is **656**,
+runtime **713/713**, with 57 unchanged non-V1 cases. Exact discovery is
+**1071 = 1025 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**;
+ordinary partitions **257/256/256/256**, PostgreSQL hashes **11/13/8/9**.
+
+Descriptor-driven catch-up and current-only updates create/open actual sessions
+from known progress, reuse current/previous/idle roots, replay retained operations,
+pause new previous-only sessions with missing history and retire unreferenced
+senders. Unknown-progress current members need existing current or idle membership,
+not merely a previous-only session. Native configuration matching is by replica
+ID: changed descriptor addresses/incarnations/progress do not rebind an existing
+session. Full bound ACK identity checks still reject stale/replacement ingress.
+
+Actual tests cover seeded replay and original epochs, shared CC/PC roots,
+duplicate updates and contraction, missing history and atomic invalid-input
+rejection, independent current/previous quorum constraints and pending catchup
+reevaluation. Idle-to-active session promotion preserves the actual build/sender,
+marks promotion and resets actual latency averages once while retaining live
+latency watches. A pending provider/build is not fabricated successful or silently
+drained by promotion; explicit cleanup continues the actual owner.
+Reentrant replay can ACK, reconfigure/remove or Abort; ordinary Close waits a
+selected configuration send. Queue-full and pinned-driver retry cases exercise
+the existing real reliable sender.
+
+Workspace check/Clippy, no-default/API/privacy, workspace doctests and exact
+inventory gates pass. The established-session seam remains for isolated callers,
+but the new configuration entry points construct their own sessions.
+All owners remain private/unselected. Secondary-to-primary role promotion,
+external epochs/drained queue transfer, periodic/slow-peer policy, host health and
+P4/P5 activation remain pending. No full ordinary execution, PostgreSQL/KinD
+bodies, native execution, differential/hosted parity or provider-fsync claim.
+See the [ledger](sf-v1-port-ledger.md#primary-configuration-slice-p3-bounded-f02f06f08f09)
+and [provenance](sf-v1-port-provenance.md#primary-configuration-slice-p3-bounded-f02f06f08f09).
 
 ### Built-In Service Operation Delivery
 

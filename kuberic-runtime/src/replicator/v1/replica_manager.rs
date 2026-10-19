@@ -11,8 +11,9 @@
 //! supplies their logical replica IDs and serializes these `&mut self` calls.
 //! Session identity is checked, but this is not transport authentication.
 //!
-//! BuildIdle owns fresh-session creation and registers its actual copy target
-//! and cancellation here. CopySender promotion, slow-replica exclusion, host
+//! BuildIdle owns fresh idle-session creation and registers its actual copy target
+//! and cancellation here. Primary resolves descriptor-created/reused sessions and
+//! idle-to-active session promotion. Slow-replica exclusion, host
 //! fault reporting, notification scheduling and role/queue transfer remain
 //! missing owners. No flag here declares those responsibilities successful.
 //! Deliver returned effects after releasing the owner's guard. ACK processors
@@ -367,6 +368,19 @@ impl ReplicaManager {
     pub(super) fn contains_session(&self, replica_id: i64) -> bool {
         self.is_idle(replica_id)
             || self.current.iter().chain(self.previous.iter()).any(|set| {
+                set.members
+                    .iter()
+                    .any(|member| member.replica_id == replica_id)
+            })
+    }
+
+    pub(super) fn has_idle_membership(&self, replica_id: i64) -> bool {
+        self.idle.iter().any(|idle| idle.replica_id == replica_id)
+    }
+
+    pub(super) fn accepts_unknown_current(&self, replica_id: i64) -> bool {
+        self.has_idle_membership(replica_id)
+            || self.current.as_ref().is_some_and(|set| {
                 set.members
                     .iter()
                     .any(|member| member.replica_id == replica_id)

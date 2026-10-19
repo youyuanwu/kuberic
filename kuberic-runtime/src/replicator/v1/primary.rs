@@ -2,14 +2,15 @@
 // Licensed under the MIT License. See LICENSES/service-fabric-MIT.txt.
 //
 // Source-guided primary/session lifetime composition from PrimaryReplicator.cpp:
-// 261-315,550-728, PrimaryReplicator.CloseAsyncOperation.cpp:36-132,
-// ReplicaManager.cpp:792-870,926-1007,2187-2222 and RemoteSession.cpp:448-656,
+// 261-315,340-462,550-728, PrimaryReplicator.CloseAsyncOperation.cpp:36-132,
+// ReplicaManager.cpp:306-335,792-870,926-1007,1205-1779,2187-2222,
+// ReplicationSession.cpp:279-283 and RemoteSession.cpp:448-656,
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d,
 // src/prod/src/Reliability/Replication/. See sf-v1-port-provenance.md.
 
-//! Private caller-driven primary lifetime, not native UpdateConfiguration,
-//! promotion, role/epoch orchestration or activation. Configuration is an
-//! explicit caller-established seam. One shared clock covers supplied sessions.
+//! Private caller-driven primary lifetime and descriptor-based configuration.
+//! Not role promotion, role/epoch orchestration or activation. One shared clock
+//! covers owned sessions; the established-session seam remains for isolated use.
 //! No task is spawned; dropping the owner is abandonment, not Close or drain.
 //! Terminal Close/Abort drains selected synchronous effect/oneshot deliveries,
 //! not client waiter bodies or arbitrary provider build calls. Retained builds
@@ -44,9 +45,10 @@ use super::copy_sender::CopySender;
 use super::operation_queue::QueueConfig;
 use super::replica_manager::{
     CatchupMode, CompletionReceiver, EstablishedConfiguration, ManagerEffects, ManagerError,
-    ReplicaManager,
+    ReplicaManager, ReplicaSet, SessionMember,
 };
-use super::session::{AckUpdate, ReplicationSession};
+use super::sender::SenderConfig;
+use super::session::{AckUpdate, ReplicationSession, SendIntent};
 use super::transport::{ProtocolError, Route, wire};
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -63,6 +65,14 @@ pub(super) enum PrimaryError {
     NotBuilding(i64),
     #[error("replica {0} has no unique matching route/session binding")]
     InvalidBinding(i64),
+    #[error("invalid primary session sender settings")]
+    InvalidSenderConfig,
+    #[error("current replica {0} has unknown progress and no current or idle session")]
+    UnknownCurrentProgress(i64),
+    #[error("replica {0} has invalid initial progress")]
+    InvalidProgress(i64),
+    #[error("current write quorum one requires an empty remote replica set")]
+    InvalidCurrentQuorum,
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
@@ -84,6 +94,23 @@ pub(super) struct PrimaryConfig {
     pub(super) address: String,
     pub(super) epoch: Epoch,
     pub(super) allow_multiple_quorum_set: bool,
+    pub(super) sender: SenderConfig,
+    pub(super) send: Arc<dyn Fn(SendIntent) -> bool + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub(super) struct ReplicaDescriptor {
+    pub(super) route: Route,
+    pub(super) remote_incarnation: i64,
+    /// None is native FABRIC_INVALID_SEQUENCE_NUMBER, not progress zero.
+    pub(super) progress: Option<Lsn>,
+    pub(super) must_catchup: bool,
+}
+
+pub(super) struct ReplicaConfiguration {
+    /// Includes the primary's immediate vote; descriptors exclude the primary.
+    pub(super) write_quorum: usize,
+    pub(super) replicas: Vec<ReplicaDescriptor>,
 }
 
 pub(super) struct PrimaryAdmission {
@@ -146,6 +173,8 @@ struct Root {
     endpoint: wire::Endpoint,
     address: String,
     clock: Clock,
+    sender: SenderConfig,
+    send: Arc<dyn Fn(SendIntent) -> bool + Send + Sync>,
     wake: Notify,
     alive: AtomicBool,
 }
@@ -241,57 +270,183 @@ impl PrimaryHandle {
         let (effects, _activity) = {
             let mut state = root.state.lock().unwrap();
             Root::check_open(&state)?;
-            let mut supplied = BTreeMap::new();
-            for route in routes {
-                root.check_route(&route)?;
-                let id = route.destination.replica;
-                if supplied.insert(id, route).is_some() {
+            let effects = Self::install_configuration(&root, &mut state, configuration, routes)?;
+            (effects, root.activity(&mut state))
+        };
+        let paused = effects.paused_previous_replay.clone();
+        effects.dispatch(root.clock.now())?;
+        Ok(paused)
+    }
+
+    fn install_configuration(
+        root: &Root,
+        state: &mut State,
+        configuration: EstablishedConfiguration,
+        routes: Vec<Route>,
+    ) -> Result<ManagerEffects, PrimaryError> {
+        let mut supplied = BTreeMap::new();
+        for route in routes {
+            root.check_route(&route)?;
+            let id = route.destination.replica;
+            if supplied.insert(id, route).is_some() {
+                return Err(PrimaryError::InvalidBinding(id));
+            }
+        }
+        let mut bindings = state.bindings.clone();
+        for set in std::iter::once(&configuration.current).chain(configuration.previous.iter()) {
+            for member in &set.members {
+                let id = member.replica_id;
+                let route = supplied.get(&id).ok_or(PrimaryError::InvalidBinding(id))?;
+                let identity = member.session.identity();
+                if identity.primary_endpoint != route.sender_address
+                    || identity.remote_endpoint != route.remote_address
+                    || bindings.get(&id).is_some_and(|binding| {
+                        !binding.session.same_instance(&member.session)
+                            || binding.route.source != route.source
+                            || binding.route.destination != route.destination
+                            || binding.route.remote_address != route.remote_address
+                    })
+                {
                     return Err(PrimaryError::InvalidBinding(id));
                 }
-            }
-            let mut bindings = state.bindings.clone();
-            for set in std::iter::once(&configuration.current).chain(configuration.previous.iter())
-            {
-                for member in &set.members {
-                    let id = member.replica_id;
-                    let route = supplied.get(&id).ok_or(PrimaryError::InvalidBinding(id))?;
-                    let identity = member.session.identity();
-                    if identity.primary_endpoint != route.sender_address
-                        || identity.remote_endpoint != route.remote_address
-                        || bindings.get(&id).is_some_and(|binding| {
-                            !binding.session.same_instance(&member.session)
-                                || binding.route.source != route.source
-                                || binding.route.destination != route.destination
-                                || binding.route.remote_address != route.remote_address
-                        })
-                    {
-                        return Err(PrimaryError::InvalidBinding(id));
-                    }
-                    bindings.entry(id).or_insert_with(|| Binding {
-                        route: route.clone(),
-                        session: member.session.clone(),
-                        owner: SessionOwner::Established(Arc::new(CopySender::new(false))),
-                        idle: false,
-                    });
-                }
-            }
-            if let Some(id) = supplied.keys().find(|id| {
-                !std::iter::once(&configuration.current)
-                    .chain(configuration.previous.iter())
-                    .any(|set| set.members.iter().any(|member| member.replica_id == **id))
-            }) {
-                return Err(PrimaryError::InvalidBinding(*id));
-            }
-            let effects = {
-                let mut manager = root.manager.lock().unwrap();
-                let effects = manager.configure_established(configuration)?;
-                bindings.retain(|id, binding| {
-                    binding.idle = manager.is_idle(*id);
-                    manager.contains_session(*id)
+                bindings.entry(id).or_insert_with(|| Binding {
+                    route: route.clone(),
+                    session: member.session.clone(),
+                    owner: SessionOwner::Established(Arc::new(CopySender::new(false))),
+                    idle: false,
                 });
-                effects
-            };
-            state.bindings = bindings;
+            }
+        }
+        if let Some(id) = supplied.keys().find(|id| {
+            !std::iter::once(&configuration.current)
+                .chain(configuration.previous.iter())
+                .any(|set| set.members.iter().any(|member| member.replica_id == **id))
+        }) {
+            return Err(PrimaryError::InvalidBinding(*id));
+        }
+        let effects = {
+            let mut manager = root.manager.lock().unwrap();
+            let effects = manager.configure_established(configuration)?;
+            bindings.retain(|id, binding| {
+                binding.idle = manager.is_idle(*id);
+                manager.contains_session(*id)
+            });
+            effects
+        };
+        state.bindings = bindings;
+        Ok(effects)
+    }
+
+    pub(super) fn update_catchup_configuration(
+        &self,
+        previous: Option<ReplicaConfiguration>,
+        current: ReplicaConfiguration,
+    ) -> Result<Vec<i64>, PrimaryError> {
+        self.update_configuration(previous, current, true)
+    }
+
+    pub(super) fn update_current_configuration(
+        &self,
+        current: ReplicaConfiguration,
+    ) -> Result<Vec<i64>, PrimaryError> {
+        self.update_configuration(None, current, false)
+    }
+
+    fn update_configuration(
+        &self,
+        previous: Option<ReplicaConfiguration>,
+        current: ReplicaConfiguration,
+        catchup_configuration: bool,
+    ) -> Result<Vec<i64>, PrimaryError> {
+        let root = self.root()?;
+        let (effects, _activity) = {
+            let mut state = root.state.lock().unwrap();
+            Root::check_open(&state)?;
+            if current.write_quorum == 1 && !current.replicas.is_empty() {
+                return Err(PrimaryError::InvalidCurrentQuorum);
+            }
+            let mut created = BTreeMap::<i64, (Route, ReplicationSession)>::new();
+            let mut routes = BTreeMap::new();
+            let mut promotions = Vec::new();
+            let manager = root.manager.lock().unwrap();
+            if let Some(fault) = manager.build_fault() {
+                return Err(ManagerError::ReportedFault {
+                    description: fault.description,
+                    error: fault.error.to_string(),
+                }
+                .into());
+            }
+            let mut resolve =
+                |set: ReplicaConfiguration, is_current: bool| -> Result<ReplicaSet, PrimaryError> {
+                    let mut members = Vec::new();
+                    for replica in set.replicas {
+                        root.check_route(&replica.route)?;
+                        let id = replica.route.destination.replica;
+                        if replica
+                            .progress
+                            .is_some_and(|progress| progress < 0 || progress == Lsn::MAX)
+                        {
+                            return Err(PrimaryError::InvalidProgress(id));
+                        }
+                        if is_current
+                            && replica.progress.is_none()
+                            && !manager.accepts_unknown_current(id)
+                        {
+                            return Err(PrimaryError::UnknownCurrentProgress(id));
+                        }
+                        // Native configuration lookup is ID-based. An existing root
+                        // retains its bound endpoint, incarnation, callback and ACKs.
+                        let (route, session) = if let Some(binding) = state.bindings.get(&id) {
+                            (binding.route.clone(), binding.session.clone())
+                        } else if let Some(binding) = created.get(&id) {
+                            binding.clone()
+                        } else {
+                            let (identity, epoch) = manager
+                                .build_identity(&replica.route, replica.remote_incarnation)?;
+                            let session = ReplicationSession::new(
+                                identity,
+                                epoch,
+                                replica.progress.unwrap_or(-1),
+                                root.sender,
+                                root.send.clone(),
+                                root.clock.now(),
+                            );
+                            session.open();
+                            let binding = (replica.route, session);
+                            created.insert(id, binding.clone());
+                            binding
+                        };
+                        if is_current && manager.has_idle_membership(id) {
+                            promotions.push(session.clone());
+                        }
+                        routes.insert(id, route);
+                        members.push(SessionMember {
+                            replica_id: id,
+                            session,
+                            must_catchup: replica.must_catchup,
+                        });
+                    }
+                    Ok(ReplicaSet {
+                        write_quorum: set.write_quorum,
+                        members,
+                    })
+                };
+            let current = resolve(current, true)?;
+            let previous = previous.map(|set| resolve(set, false)).transpose()?;
+            drop(manager);
+            let effects = Self::install_configuration(
+                &root,
+                &mut state,
+                EstablishedConfiguration {
+                    current,
+                    previous,
+                    catchup_configuration,
+                },
+                routes.into_values().collect(),
+            )?;
+            for session in promotions {
+                session.promote_to_active_secondary(root.clock.now());
+            }
             (effects, root.activity(&mut state))
         };
         let paused = effects.paused_previous_replay.clone();
@@ -529,6 +684,9 @@ impl Primary {
         if config.endpoint.partition.len() != 16 || config.endpoint.incarnation.len() != 16 {
             return Err(ProtocolError::Shape("endpoint GUID length").into());
         }
+        if !config.sender.is_valid() {
+            return Err(PrimaryError::InvalidSenderConfig);
+        }
         let manager = ReplicaManager::new(
             config.queue,
             config.initial_progress,
@@ -552,6 +710,8 @@ impl Primary {
                 endpoint: config.endpoint,
                 address: config.address,
                 clock,
+                sender: config.sender,
+                send: config.send,
                 wake: Notify::new(),
                 alive: AtomicBool::new(true),
             }),
