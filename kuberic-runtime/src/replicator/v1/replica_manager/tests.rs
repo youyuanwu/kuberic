@@ -214,6 +214,55 @@ fn succeeded(receiver: &mut CompletionReceiver) {
 }
 
 #[test]
+fn recovery_reset_forwards_actual_queue_boundaries_and_assigns_from_recovered_tail() {
+    let mut manager = manager(8, true);
+    configure(&mut manager, set(1, &[]), None, false)
+        .dispatch(now())
+        .unwrap();
+    let (_, mut completed) = enqueue(&mut manager);
+    succeeded(&mut completed);
+    for progress in [24, 2, 0] {
+        manager.reset_replication_queue(progress).unwrap();
+        assert_eq!(manager.queue().current_progress(), progress);
+        assert_eq!(manager.queue().last_sequence_number(), progress);
+        assert_eq!(manager.queue().previous_config_catchup_lsn(), progress);
+        assert_eq!(manager.queue().previous_config_quorum_lsn(), progress);
+        assert_eq!(manager.queue().catchup_capability(), 0);
+        assert_eq!(manager.queue().operation_count(), 0);
+        assert_eq!(manager.queue().total_bytes(), 0);
+        let (lsn, mut completed) = enqueue(&mut manager);
+        assert_eq!(lsn, progress + 1);
+        succeeded(&mut completed);
+    }
+    manager.close().dispatch(now()).unwrap();
+    assert!(matches!(
+        manager.reset_replication_queue(7),
+        Err(ManagerError::ObjectClosed)
+    ));
+}
+
+#[test]
+fn recovery_reset_cannot_drop_pending_completions_or_rewrite_original_operations() {
+    let (mut manager, mut receivers) = held(1);
+    let mut replay = Vec::new();
+    assert!(manager.queue().get_operations(1, &mut replay));
+    let original = replay[0].clone();
+    assert!(matches!(
+        manager.reset_replication_queue(24),
+        Err(ManagerError::QueueNormalization(
+            QueueNormalizationError::PendingOperations
+        ))
+    ));
+    pending(&mut receivers[0]);
+    assert_eq!(manager.pending_count(), 1);
+    assert_eq!(manager.queue().last_sequence_number(), 1);
+    replay.clear();
+    assert!(manager.queue().get_operations(1, &mut replay));
+    assert!(Arc::ptr_eq(&original.operation, &replay[0].operation));
+    assert_eq!(original.original_epoch, replay[0].original_epoch);
+}
+
+#[test]
 fn assigned_before_quorum_ack_completes_once_without_provider_commit() {
     let mut manager = manager(8, true);
     let remote = member(2);

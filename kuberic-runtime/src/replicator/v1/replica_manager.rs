@@ -15,7 +15,7 @@
 //! and cancellation here. Primary resolves descriptor-created/reused sessions and
 //! idle-to-active session promotion. Slow-replica exclusion, host
 //! fault reporting and notification scheduling remain missing owners.
-//! The private role owner supplies queue transfer and epoch orchestration.
+//! The private role owner supplies queue transfer, epoch and data-loss orchestration.
 //! Deliver returned effects after releasing the owner's guard. ACK processors
 //! must retain their ordered copy handoffs; call `update_progress` when their
 //! primary-progress handoff is delivered, not on raw ACK ingress.
@@ -337,6 +337,19 @@ impl ReplicaManager {
             .map_err(ManagerError::QueueNormalization)
     }
 
+    pub(super) fn reset_replication_queue(&mut self, progress: Lsn) -> Result<(), ManagerError> {
+        self.ensure_active()?;
+        self.check_reported_fault()?;
+        if !self.pending.is_empty() {
+            return Err(ManagerError::QueueNormalization(
+                QueueNormalizationError::PendingOperations,
+            ));
+        }
+        self.queue
+            .reset_queue(progress)
+            .map_err(ManagerError::QueueNormalization)
+    }
+
     pub(super) fn new(
         queue_config: QueueConfig,
         initial_progress: Lsn,
@@ -364,8 +377,7 @@ impl ReplicaManager {
             return Err(ConfigurationError::InvalidQueueConfig.into());
         }
         Ok(Self {
-            // Queue transfer belongs to the missing role owner. In particular,
-            // this constructor does not silently normalize issued-LSN gaps.
+            // Only the consuming transfer constructor normalizes issued-LSN gaps.
             queue: ReplicationQueueManager::new(queue_config, initial_progress),
             local_replica_id,
             primary_endpoint,

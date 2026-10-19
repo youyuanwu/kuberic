@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
 **P1 foundation, unselected P2 substrate slices and bounded P3 primary,
-secondary and copy ownership slices; no selected production behavior change.** Native pin:
+secondary, copy, role and data-loss ownership slices; no selected production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -793,18 +793,60 @@ test discovery and partitioning. See
 [validation](testing.md#sf-v1-role-transition-slice) and
 [provenance](sf-v1-port-provenance.md#role-transition-slice-p3-bounded-f01f02f04f09f11).
 
-**Remaining owners:** data-loss/recovery/reset orchestration,
+**Remaining owners at that slice boundary:** data-loss/recovery/reset orchestration,
 periodic/slow-peer/MustCatchup policy, full host role/epoch demux,
 monitoring/health, P4 public adapters/outer lifecycle and P5 atomic activation.
 All components remain private/unselected. No protected API, selected wiring,
 dependency/tier change, full ordinary execution, native/differential/hosted/
 provider-fsync parity or full P2/P3 completion claim.
 
+### Data Loss Recovery Slice (P3, Bounded F01/F02/F03/F09/F11)
+
+Private [`RoleReplicator`](../../../kuberic-runtime/src/replicator/v1/role.rs)
+now selects primary-only data-loss checking and retains the actual
+`StateProvider::on_data_loss` callback across interrupted polling.
+Unchanged state preserves the queue, pending writes, original epochs and
+cached progress without querying provider progress. Changed state queries
+`last_committed_lsn`, updates cached recovery progress before reset and forwards
+through the actual Primary and ReplicaManager into the existing queue reset.
+Successful reset clears old entries/original epochs and resets assignment and
+previous-configuration catch-up/quorum cursors to recovered progress.
+Higher, lower and zero progress are valid; malformed progress is an error.
+
+CheckingDataLoss gates role/epoch requests, previously issued primary handles
+and new ACK/context ingress. Existing selected activities remain rooted,
+and actual session/build timers continue while the provider is pending.
+Reset requires no pending queue/write work and no selected primary activity.
+An invalid reset does not cancel writes, synthesize ACKs or silently discard
+uncompleted history. Session/configuration roots are not rebuilt or rewritten;
+the caller still owns subsequent configuration and replica rebuild policy.
+
+An explicit End result retains both the provider's changed flag and completion
+error. Ordinary callback/query/reset failures restore primary admission rather
+than applying the generic role-operation fault transition. If restoration also
+fails, the original callback/reset error wins. Abort retains the selected
+recovery chain, including a changed-only progress query, but cannot reset the
+closed primary or publish successful recovery; provider failure remains explicit.
+
+Actual-owner regressions cover admission, retained callbacks, reentrancy,
+unchanged operation identity/retries, recovered progress/assignment, reset
+preconditions, original errors/state restoration and abnormal shutdown. See
+[validation](testing.md#sf-v1-data-loss-recovery-slice) and
+[source provenance](sf-v1-port-provenance.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11).
+Use the live nextest inventory for discovery and partitioning.
+
+**Remaining owners:** broader Open/restart/host recovery and rebuild policy,
+periodic/slow-peer/MustCatchup policy, full host role/epoch demux, monitoring/
+health, P4 public/outer lifecycle adapters and P5 atomic activation.
+All components remain private/unselected. No protected API, selected wiring,
+dependency/tier change, native/differential/hosted/provider-fsync parity,
+full ordinary execution or complete P2/P3 claim.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
-| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`; public facade/factory and outer lifecycle pending | COM/refcounts → owned Rust; actual role edges/retained handoff, not public activation | A1, C1, L1 |
+| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`; public facade/factory and outer lifecycle pending | COM/refcounts → owned Rust; actual role edges/retained handoff and data-loss admission/restoration, not public activation | A1, C1, L1 |
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`, `primary.rs`, `role.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle lifecycle, lasting primary/session ownership, descriptor configuration and role/epoch queue handoff delivered | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`, `copy_establishment.rs`, `secondary.rs`, `role.rs` | async queues/executor; required/optimistic ACK, shared StartCopy receiver, provider callbacks, ordinary Close/Abort, promotion drainage, direct epochs and actual queue handoff delivered; host demux pending | S1–S3, E2 |
@@ -812,7 +854,7 @@ provider-fsync parity or full P2/P3 completion claim.
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs`, bounded `primary.rs` | tasks/injected clocks and lasting post-build session timer/ordered ACK ownership, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
 | F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`, `copy_sender.rs`, `copy_establishment.rs`, `build_idle.rs`; full role composition pending | context acquisition/receipt, reliable StartCopy, serial enumeration/sending, EOF-issued target, copy/replication gates/pending retarget and idle lifecycle delivered; no fixed snapshot-only build substitute | C2–C5 |
 | F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, bounded primary session ACK/context lookup, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; full host/role demux integration pending | T1–T2, D1 |
-| F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | `v1` + existing host/controller adapters | no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
+| F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | bounded `v1/role.rs`, `primary.rs`, `replica_manager.rs`, `replication_queue_manager.rs`; host/controller adapters pending | actual changed/unchanged provider recovery and queue reset, no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
 | F11 async lifetime/diagnostics ([drain:56–102][drain], [health:62–125][health]) | retain owners through cancel/drain, outside-lock dispatch, batched/cleared warnings | Rust async ownership/clock + host reporting | no Common/Transport/KTL/Boost copy; preserve algorithm-affecting policy, not platform plumbing | R3, C3, H3 |
 
@@ -967,8 +1009,11 @@ Descriptor-based catch-up/current configuration now creates/reuses real sessions
 preserves identity/progress, owns idle-to-active session promotion and composes
 native replay/retirement with existing quorum/catchup. The bounded role owner
 now adds role/external-epoch sequencing, ACK-mode-specific promotion drains and
-actual retained-queue/original-epoch handoff in both directions. Data-loss/
-recovery/reset orchestration and full host role/epoch demux remain pending.
+actual retained-queue/original-epoch handoff in both directions. Bounded
+data-loss orchestration now retains changed/unchanged provider recovery,
+actual queue reset and native admission/error/state restoration.
+Broader Open/restart/host recovery and rebuild policy and full host role/epoch
+demux remain pending.
 Periodic/slow-peer/MustCatchup policy remains an explicit separate owner.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/

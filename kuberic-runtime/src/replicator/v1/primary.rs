@@ -5,6 +5,8 @@
 // 261-315,340-462,550-728, PrimaryReplicator.CloseAsyncOperation.cpp:36-132,
 // ReplicaManager.cpp:306-335,792-870,926-1007,1205-1779,2187-2222,
 // ReplicaManager.cpp:871-920 and PrimaryReplicator.UpdateEpochAsyncOperation.cpp,
+// PrimaryReplicator.cpp:501-505, ReplicaManager.cpp:1015-1023 and
+// Replicator.cpp:659-708,799-838 (CheckingDataLoss admission),
 // ReplicationSession.cpp:279-283 and RemoteSession.cpp:448-656,
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d,
 // src/prod/src/Reliability/Replication/. See sf-v1-port-provenance.md.
@@ -62,6 +64,12 @@ pub(super) enum PrimaryError {
     OwnerDropped,
     #[error("primary was aborted, not ordinarily closed")]
     Aborted,
+    #[error("primary is checking data loss")]
+    CheckingDataLoss,
+    #[error("primary has no admitted data-loss operation")]
+    NoDataLoss,
+    #[error("queue reset requires selected primary activities to finish")]
+    PendingActivity,
     #[error("no admitted primary session for replica {0}")]
     UnknownSession(i64),
     #[error("replica {0} is not an idle build")]
@@ -173,6 +181,7 @@ struct State {
     failure: Option<PrimaryError>,
     creating_secondary: bool,
     transferred: bool,
+    checking_data_loss: bool,
 }
 
 struct Root {
@@ -203,6 +212,14 @@ impl Root {
     }
 
     fn check_open(state: &State) -> Result<(), PrimaryError> {
+        Self::check_active(state)?;
+        if state.checking_data_loss {
+            return Err(PrimaryError::CheckingDataLoss);
+        }
+        Ok(())
+    }
+
+    fn check_active(state: &State) -> Result<(), PrimaryError> {
         if state.phase != Phase::Open {
             return Err(PrimaryError::Closed);
         }
@@ -573,6 +590,9 @@ impl PrimaryHandle {
             if matches!(state.phase, Phase::Closing | Phase::Closed) {
                 return Err(PrimaryError::Closed);
             }
+            if state.checking_data_loss {
+                return Err(PrimaryError::CheckingDataLoss);
+            }
             let id = envelope
                 .source
                 .as_ref()
@@ -782,6 +802,7 @@ impl Primary {
                     failure: None,
                     creating_secondary: false,
                     transferred: false,
+                    checking_data_loss: false,
                 }),
                 manager: Arc::new(Mutex::new(manager)),
                 endpoint: config.endpoint,
@@ -799,6 +820,40 @@ impl Primary {
 
     pub(super) fn handle(&self) -> PrimaryHandle {
         PrimaryHandle(Arc::downgrade(&self.root))
+    }
+
+    pub(super) fn begin_data_loss(&self) -> Result<(), PrimaryError> {
+        let mut state = self.root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        self.root.manager.lock().unwrap().check_reported_fault()?;
+        state.checking_data_loss = true;
+        Ok(())
+    }
+
+    pub(super) fn reset_replication_queue(&self, progress: Lsn) -> Result<(), PrimaryError> {
+        let state = self.root.state.lock().unwrap();
+        Root::check_active(&state)?;
+        if !state.checking_data_loss {
+            return Err(PrimaryError::NoDataLoss);
+        }
+        if state.activities != 0 {
+            return Err(PrimaryError::PendingActivity);
+        }
+        Ok(self
+            .root
+            .manager
+            .lock()
+            .unwrap()
+            .reset_replication_queue(progress)?)
+    }
+
+    pub(super) fn end_data_loss(&self) -> Result<(), PrimaryError> {
+        let mut state = self.root.state.lock().unwrap();
+        if !state.checking_data_loss {
+            return Err(PrimaryError::NoDataLoss);
+        }
+        state.checking_data_loss = false;
+        Root::check_active(&state)
     }
 
     pub(super) fn take_for_secondary(

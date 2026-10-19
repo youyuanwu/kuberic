@@ -5,8 +5,10 @@
 // Replicator.ChangeRoleAsyncOperation.cpp:37-514 and
 // Replicator.UpdateEpochAsyncOperation.cpp:34-145, microsoft/service-fabric
 // @3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d, Reliability/Replication.
+// Data loss: Replicator.OnDatalossAsyncOperation.cpp:30-157,
+// ReplicatorState.cpp:129-139,177-186, ReplicationQueueManager.cpp:148-160.
 
-//! Private, explicitly driven role/epoch owner, not a public facade or host
+//! Private, explicitly driven role/epoch/recovery owner, not a public facade or host
 //! demultiplexer. A cancelled run retains the selected operation/provider call.
 //! Old primary build providers stay rooted separately; role completion is not
 //! arbitrary GetCopyState/GetNext drainage. No task or engine is activated.
@@ -43,6 +45,7 @@ pub(super) enum RoleStatus {
     Opened,
     Changing(Role),
     Ready(Role),
+    CheckingDataLoss,
     Faulted,
     Aborting,
     Aborted,
@@ -50,11 +53,11 @@ pub(super) enum RoleStatus {
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub(super) enum RoleError {
-    #[error("role/epoch operation already outstanding")]
+    #[error("role/epoch/recovery operation already outstanding")]
     Busy,
     #[error("role transition is not admitted from {0:?} to {1:?}")]
     InvalidTransition(RoleStatus, Role),
-    #[error("role owner has no admitted role/epoch operation")]
+    #[error("role owner has no admitted role/epoch/recovery operation")]
     NoOperation,
     #[error("role owner is not in the requested stable role")]
     InvalidState,
@@ -62,7 +65,7 @@ pub(super) enum RoleError {
     InvalidConfig,
     #[error("role owner was aborted")]
     Aborted,
-    #[error("StateProvider role callback: {0}")]
+    #[error("StateProvider role/recovery callback: {0}")]
     Provider(Arc<RuntimeError>),
     #[error(transparent)]
     Primary(#[from] PrimaryError),
@@ -79,6 +82,17 @@ pub(super) struct RoleConfig {
     pub(super) cached_progress: Option<Lsn>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct DataLossEnd {
+    pub(super) state_changed: bool,
+    pub(super) result: Result<(), RoleError>,
+}
+
+struct DataLossRecovery {
+    state_changed: bool,
+    progress: crate::Result<Option<Lsn>>,
+}
+
 #[derive(Clone, Copy)]
 enum Step {
     InitialPrimary(Epoch),
@@ -88,6 +102,7 @@ enum Step {
     Close(Role),
     PrimaryEpoch(Option<Role>),
     SecondaryEpoch,
+    DataLoss,
     Abort,
 }
 
@@ -98,6 +113,9 @@ pub(super) struct RoleReplicator {
     status: RoleStatus,
     pending: Option<Step>,
     provider_call: Option<BoxFuture<'static, crate::Result<Lsn>>>,
+    data_loss_call: Option<BoxFuture<'static, DataLossRecovery>>,
+    data_loss_failure: Option<RoleError>,
+    data_loss_end: Option<DataLossEnd>,
     primary: Option<Primary>,
     secondary: Option<Secondary>,
     retired_primaries: Vec<Primary>,
@@ -134,6 +152,9 @@ impl RoleReplicator {
             status: RoleStatus::Opened,
             pending: None,
             provider_call: None,
+            data_loss_call: None,
+            data_loss_failure: None,
+            data_loss_end: None,
             primary: None,
             secondary: None,
             retired_primaries: Vec::new(),
@@ -152,6 +173,10 @@ impl RoleReplicator {
 
     pub(super) fn operation_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    pub(super) fn data_loss_result(&self) -> Option<&DataLossEnd> {
+        self.data_loss_end.as_ref()
     }
 
     pub(super) fn primary(&self) -> Result<PrimaryHandle, RoleError> {
@@ -320,6 +345,105 @@ impl RoleReplicator {
         }
     }
 
+    pub(super) fn begin_data_loss(&mut self) -> Result<(), RoleError> {
+        self.check_idle()?;
+        if self.status != RoleStatus::Ready(Role::Primary) {
+            return Err(RoleError::InvalidState);
+        }
+        self.primary.as_ref().unwrap().begin_data_loss()?;
+        let provider = self.provider.clone();
+        self.data_loss_call = Some(Box::pin(async move {
+            match provider.on_data_loss().await {
+                Ok(state_changed) => DataLossRecovery {
+                    state_changed,
+                    progress: if state_changed {
+                        provider.last_committed_lsn().await.map(Some)
+                    } else {
+                        Ok(None)
+                    },
+                },
+                Err(error) => DataLossRecovery {
+                    state_changed: false,
+                    progress: Err(error),
+                },
+            }
+        }));
+        self.data_loss_end = None;
+        self.data_loss_failure = None;
+        self.pending = Some(Step::DataLoss);
+        self.status = RoleStatus::CheckingDataLoss;
+        Ok(())
+    }
+
+    fn complete_data_loss(
+        &mut self,
+        recovery: DataLossRecovery,
+        aborting: bool,
+    ) -> Result<(), RoleError> {
+        let failure = self.data_loss_failure.take();
+        let mut result = recovery
+            .progress
+            .map_err(|error| RoleError::Provider(Arc::new(error)))
+            .and_then(|progress| {
+                // Native updates its cached recovery progress before attempting reset.
+                if let Some(progress) = progress {
+                    self.config.cached_progress = Some(progress);
+                }
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                if aborting {
+                    return Err(RoleError::Aborted);
+                }
+                match progress {
+                    Some(progress) => self
+                        .primary
+                        .as_ref()
+                        .unwrap()
+                        .reset_replication_queue(progress)
+                        .map_err(RoleError::from),
+                    None => Ok(()),
+                }
+            });
+        if !aborting {
+            let restore = self.primary.as_ref().unwrap().end_data_loss();
+            self.status = if let Err(error) = &restore {
+                self.fault.get_or_insert(error.clone().into());
+                RoleStatus::Faulted
+            } else {
+                RoleStatus::Ready(Role::Primary)
+            };
+            // End restores the role even on callback/reset failure; the original
+            // error wins over a simultaneous failure to restore primary admission.
+            result = result.and(restore.map_err(RoleError::from));
+            self.pending = None;
+        }
+        self.data_loss_end = Some(DataLossEnd {
+            state_changed: recovery.state_changed,
+            result: result.clone(),
+        });
+        result
+    }
+
+    async fn run_data_loss(&mut self) -> Result<(), RoleError> {
+        let call = self.data_loss_call.as_mut().unwrap();
+        let recovery = if self.data_loss_failure.is_some() {
+            call.await
+        } else {
+            tokio::select! {
+                recovery = &mut *call => recovery,
+                end = self.primary.as_mut().unwrap().run() => {
+                    let result = end.map_err(RoleError::from)
+                        .and_then(|end| end.result.map_err(RoleError::from));
+                    self.data_loss_failure = Some(result.err().unwrap_or(RoleError::InvalidState));
+                    call.await
+                }
+            }
+        };
+        self.data_loss_call = None;
+        self.complete_data_loss(recovery, false)
+    }
+
     fn fail<T>(&mut self, error: RoleError) -> Result<T, RoleError> {
         self.status = RoleStatus::Faulted;
         self.pending = None;
@@ -346,9 +470,10 @@ impl RoleReplicator {
         if self.pending.is_none() {
             return Err(RoleError::NoOperation);
         }
+        let data_loss = matches!(self.pending, Some(Step::DataLoss));
         let result = self.run_inner().await;
         match result {
-            Err(error) if self.status != RoleStatus::Aborted => self.fail(error),
+            Err(error) if !data_loss && self.status != RoleStatus::Aborted => self.fail(error),
             result => result,
         }
     }
@@ -453,6 +578,7 @@ impl RoleReplicator {
                     self.pending = None;
                     return Ok(());
                 }
+                Step::DataLoss => return self.run_data_loss().await,
                 Step::Abort => {
                     if let Some(call) = self.provider_call.as_mut() {
                         let result = call.await;
@@ -460,6 +586,15 @@ impl RoleReplicator {
                         if let Err(error) = result {
                             self.fault
                                 .get_or_insert(RoleError::Provider(Arc::new(error)));
+                        }
+                    }
+                    if let Some(call) = self.data_loss_call.as_mut() {
+                        let recovery = call.await;
+                        self.data_loss_call = None;
+                        if let Err(error) = self.complete_data_loss(recovery, true)
+                            && !matches!(error, RoleError::Aborted)
+                        {
+                            self.fault.get_or_insert(error);
                         }
                     }
                     if let Some(primary) = &mut self.primary {

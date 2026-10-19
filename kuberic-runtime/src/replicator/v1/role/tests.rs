@@ -27,6 +27,8 @@ use crate::replicator::v1::sender::SenderConfig;
 use crate::replicator::v1::session::{SendIntent, SendKind};
 use crate::replicator::v1::transport::wire;
 
+mod data_loss;
+
 struct Provider {
     epochs: Mutex<Vec<EpochBarrier>>,
     progress_calls: AtomicUsize,
@@ -38,6 +40,11 @@ struct Provider {
     fail_copy: AtomicBool,
     copy_calls: AtomicUsize,
     copy_gate: Semaphore,
+    data_loss_calls: AtomicUsize,
+    data_loss_gate: Semaphore,
+    state_changed: AtomicBool,
+    fail_data_loss: AtomicBool,
+    recovery_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Provider {
@@ -53,6 +60,11 @@ impl Provider {
             fail_copy: AtomicBool::new(false),
             copy_calls: AtomicUsize::new(0),
             copy_gate: Semaphore::new(100),
+            data_loss_calls: AtomicUsize::new(0),
+            data_loss_gate: Semaphore::new(100),
+            state_changed: AtomicBool::new(false),
+            fail_data_loss: AtomicBool::new(false),
+            recovery_hook: None,
         }
     }
 }
@@ -72,6 +84,9 @@ impl StateProvider for Provider {
     }
     async fn last_committed_lsn(&self) -> crate::Result<Lsn> {
         self.progress_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(hook) = &self.recovery_hook {
+            hook();
+        }
         self.progress_gate.acquire().await.unwrap().forget();
         if self.fail_progress.load(Ordering::SeqCst) {
             return Err(RuntimeError::InvalidReplication("progress failure".into()));
@@ -96,7 +111,15 @@ impl StateProvider for Provider {
         Ok(Box::pin(stream::iter([Ok(Bytes::from_static(b"copy"))])))
     }
     async fn on_data_loss(&self) -> crate::Result<bool> {
-        panic!("role handoff must not invent a data-loss recovery call")
+        self.data_loss_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(hook) = &self.recovery_hook {
+            hook();
+        }
+        self.data_loss_gate.acquire().await.unwrap().forget();
+        if self.fail_data_loss.load(Ordering::SeqCst) {
+            return Err(RuntimeError::InvalidReplication("data-loss failure".into()));
+        }
+        Ok(self.state_changed.load(Ordering::SeqCst))
     }
 }
 
@@ -346,6 +369,7 @@ async fn initial_primary_queries_provider_before_epoch_and_requires_configuratio
     let mut rig = Rig::new(true, false);
     let handle = rig.primary().await;
     assert_eq!(rig.provider.progress_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.provider.data_loss_calls.load(Ordering::SeqCst), 0);
     assert_eq!(
         *rig.provider.epochs.lock().unwrap(),
         [EpochBarrier {
@@ -1046,6 +1070,9 @@ async fn primary_reported_build_fault_prevents_demotion_instead_of_creating_heal
         .unwrap();
     assert!(rig.owner.drive().now_or_never().is_none());
     assert_eq!(rig.provider.copy_calls.load(Ordering::SeqCst), 1);
+    assert!(rig.owner.begin_data_loss().is_err());
+    assert_eq!(rig.owner.status(), RoleStatus::Ready(Role::Primary));
+    assert_eq!(rig.provider.data_loss_calls.load(Ordering::SeqCst), 0);
     assert!(
         rig.owner
             .begin_change_role(Role::ActiveSecondary, epoch(2))
