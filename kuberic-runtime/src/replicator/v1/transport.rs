@@ -938,6 +938,13 @@ impl SendIntentAdapter {
                 replication_start,
             }),
             SendKind::RequestAck => wire::envelope::Body::RequestAck(wire::RequestAck {}),
+            SendKind::InduceFault { reason } => {
+                wire::envelope::Body::InduceFault(wire::InduceFault {
+                    target_replica: self.route.destination.replica,
+                    target_incarnation: self.route.destination.incarnation.clone(),
+                    reason,
+                })
+            }
             SendKind::Replication {
                 operation,
                 original_epoch,

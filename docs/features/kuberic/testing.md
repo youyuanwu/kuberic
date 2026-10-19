@@ -633,12 +633,52 @@ Reported source build faults reject admission. Reentrant primary Abort and
 concurrent primary Close cannot produce successful recovery.
 
 Protected APIs, selected wiring, dependencies and tier policy are unchanged.
-Broader host/Open recovery and rebuild policy, periodic/slow-peer/MustCatchup
+At that slice boundary broader host/Open recovery and rebuild policy, periodic/slow-peer/MustCatchup
 policy, full host demux/health and P4/P5 activation remain pending.
 No full ordinary execution, PostgreSQL/KinD bodies, native binary/differential/
 hosted parity or provider-fsync is claimed. See the
 [ledger](sf-v1-port-ledger.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11)
 and [provenance](sf-v1-port-provenance.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11).
+
+### SF V1 Queue Pressure and Slow-Peer Policy Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::primary::tests::) | test(replicator::v1::replica_manager::tests::) | test(replicator::v1::session::tests::) | test(replicator::v1::build_idle::tests::) | test(replicator::v1::copy_establishment::tests::) | test(replicator::v1::operation_queue::tests::) | test(replicator::v1::transport::tests::) | test(replicator::v1::role::tests::)' -j 2
+```
+
+The selector runs actual private owners and their existing regressions. New
+policy cases drive paused Tokio time and actual queue admission/ACKs: freshness
+strictly beyond the lag interval retargets to commitment, pressure retargets to
+issued tail before disable/fault and rechecks freed capacity. Rejected full
+admission still drives pressure without consuming an LSN. Utilization covers
+pending span, holes, logical bytes and completed-history exclusion; transfer
+refreshes actual operation age.
+
+Actual sender latencies exercise fastest-quorum population deviation and its
+strict boundary, matching least receive progress, age and spare-member guards.
+Slow fault closes the sender before receive-based reclamation without changing
+quorum/all-applied or the live MustCatchup minimum. A marked faulted replica can
+keep catch-up pending; late ACKs cannot invent progress. Idle completion-disable
+uses the actual CopySender; an already completed build cannot be faulted.
+Faulted idle promotion is rejected.
+
+Idle fault notification requires both terminal copy ACK sentinels. Retry checks
+cover backpressure, accepted delivery, callbacks outside guards, removal and
+Close/Abort. An actual tonic carrier delivers repeated typed InduceFault sends
+with the route's real target identity and no synthetic sender ACK. Invalid
+private timer settings and missing real copy ownership fail explicitly; policy
+failure does not hide an already assigned write.
+
+Use live nextest inventory/partition validation rather than static test totals.
+Protected interfaces, selected wiring, dependencies and tier policy are
+unchanged. Broader Open/restart/host recovery and rebuild, full host role/epoch/
+InduceFault demux, remote fault handling, monitoring/health, public settings
+and P4/P5 activation remain pending. No full ordinary execution, PostgreSQL/KinD,
+native execution, differential/hosted/provider-fsync parity or full P2/P3 claim.
+See the
+[ledger](sf-v1-port-ledger.md#queue-pressure-and-slow-peer-policy-slice-p3-bounded-f02f03f06f07f08f11)
+and [provenance](sf-v1-port-provenance.md#queue-pressure-and-slow-peer-policy-slice-p3-bounded-f02f03f06f07f08f11).
 
 ### Built-In Service Operation Delivery
 

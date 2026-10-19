@@ -49,7 +49,7 @@ use super::copy_sender::CopySender;
 use super::operation_queue::QueueConfig;
 use super::replica_manager::{
     CatchupMode, CompletionReceiver, EstablishedConfiguration, ManagerEffects, ManagerError,
-    ReplicaManager, ReplicaSet, SessionMember,
+    QueuePolicyConfig, ReplicaManager, ReplicaSet, SessionMember,
 };
 use super::replication_queue_manager::QueueTransfer;
 use super::sender::SenderConfig;
@@ -78,6 +78,8 @@ pub(super) enum PrimaryError {
     InvalidBinding(i64),
     #[error("invalid primary session sender settings")]
     InvalidSenderConfig,
+    #[error("invalid primary queue-policy timer settings")]
+    InvalidQueuePolicy,
     #[error("current replica {0} has unknown progress and no current or idle session")]
     UnknownCurrentProgress(i64),
     #[error("replica {0} has invalid initial progress")]
@@ -109,6 +111,7 @@ pub(super) struct PrimaryConfig {
     pub(super) epoch: Epoch,
     pub(super) allow_multiple_quorum_set: bool,
     pub(super) sender: SenderConfig,
+    pub(super) queue_policy: QueuePolicyConfig,
     pub(super) send: Arc<dyn Fn(SendIntent) -> bool + Send + Sync>,
 }
 
@@ -182,6 +185,9 @@ struct State {
     creating_secondary: bool,
     transferred: bool,
     checking_data_loss: bool,
+    queue_policy: QueuePolicyConfig,
+    policy_deadline: Duration,
+    idle_refreshed_at: Duration,
 }
 
 struct Root {
@@ -276,6 +282,45 @@ impl Root {
         }
         result
     }
+
+    fn queue_pressure(self: &Arc<Self>) -> Result<(), PrimaryError> {
+        let (effects, result, _activity) = {
+            let mut state = self.state.lock().unwrap();
+            if !matches!(state.phase, Phase::Open | Phase::PreClose(_)) {
+                return Ok(());
+            }
+            let (effects, result) = self
+                .manager
+                .lock()
+                .unwrap()
+                .apply_queue_pressure(state.queue_policy, self.clock.now());
+            let result = result.map_err(PrimaryError::from);
+            if let Err(error) = &result {
+                state.failure.get_or_insert(error.clone());
+            }
+            (effects, result, self.activity(&mut state))
+        };
+        self.wake.notify_one();
+        let delivery = effects.dispatch(self.clock.now());
+        result?;
+        delivery?;
+        Ok(())
+    }
+
+    fn policy_tick(&self) -> Result<(), PrimaryError> {
+        let mut state = self.state.lock().unwrap();
+        let now = self.clock.now();
+        if !matches!(state.phase, Phase::Open | Phase::PreClose(_)) || state.policy_deadline > now {
+            return Ok(());
+        }
+        let config = state.queue_policy;
+        if now.saturating_sub(state.idle_refreshed_at) > config.idle_max_lag {
+            self.manager.lock().unwrap().refresh_idle_targets()?;
+            state.idle_refreshed_at = now;
+        }
+        state.policy_deadline = now.saturating_add(config.interval());
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -288,6 +333,21 @@ impl PrimaryHandle {
             return Err(PrimaryError::OwnerDropped);
         }
         Ok(root)
+    }
+
+    pub(super) fn update_queue_policy(
+        &self,
+        config: QueuePolicyConfig,
+    ) -> Result<(), PrimaryError> {
+        let root = self.root()?;
+        let mut state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        if !config.is_valid() {
+            return Err(PrimaryError::InvalidQueuePolicy);
+        }
+        state.queue_policy = config;
+        root.wake.notify_one();
+        Ok(())
     }
 
     /// Explicit established-membership seam, not native promotion/role creation.
@@ -534,14 +594,25 @@ impl PrimaryHandle {
         let (admission, _activity) = {
             let mut state = root.state.lock().unwrap();
             Root::check_open(&state)?;
-            let admission = root.manager.lock().unwrap().enqueue(data, policy, limits)?;
+            let admission = root.manager.lock().unwrap().enqueue(data, policy, limits);
             (admission, root.activity(&mut state))
         };
-        admission.effects.dispatch(root.clock.now())?;
-        Ok(PrimaryAdmission {
-            lsn: admission.operation.operation.lsn(),
-            completion: admission.completion,
-        })
+        let admission = match admission {
+            Ok(admission) => {
+                admission.effects.dispatch(root.clock.now())?;
+                Ok(PrimaryAdmission {
+                    lsn: admission.operation.operation.lsn(),
+                    completion: admission.completion,
+                })
+            }
+            Err(error) => Err(PrimaryError::from(error)),
+        };
+        if let Err(error) = root.queue_pressure() {
+            // Never hide an already admitted LSN behind a policy error.
+            root.state.lock().unwrap().failure.get_or_insert(error);
+            root.wake.notify_one();
+        }
+        admission
     }
 
     pub(super) fn begin_catchup(
@@ -649,7 +720,7 @@ impl PrimaryHandle {
                 {
                     return Err(ProtocolError::Shape("invalid replication ACK progress").into());
                 }
-                let processor = binding.session.update_ack(
+                let processor = binding.session.update_ack_at(
                     AckUpdate {
                         replication_received: body.replication_received,
                         replication_applied: body.replication_applied,
@@ -659,10 +730,12 @@ impl PrimaryHandle {
                         message_id: envelope.message_id.clone(),
                     },
                     Some(Arc::new(|| {})),
+                    root.clock.now(),
                 );
                 deliver_ack(processor, &copy.handle(), &root.clock, || root.progress())?;
             }
         }
+        root.wake.notify_one();
         Ok(())
     }
 
@@ -772,6 +845,9 @@ impl Primary {
         if !config.sender.is_valid() {
             return Err(PrimaryError::InvalidSenderConfig);
         }
+        if !config.queue_policy.is_valid() {
+            return Err(PrimaryError::InvalidQueuePolicy);
+        }
         let manager = match transfer {
             Some(transfer) => ReplicaManager::from_transferred(
                 config.queue,
@@ -803,6 +879,9 @@ impl Primary {
                     creating_secondary: false,
                     transferred: false,
                     checking_data_loss: false,
+                    queue_policy: config.queue_policy,
+                    policy_deadline: clock.now().saturating_add(config.queue_policy.interval()),
+                    idle_refreshed_at: clock.now(),
                 }),
                 manager: Arc::new(Mutex::new(manager)),
                 endpoint: config.endpoint,
@@ -939,6 +1018,11 @@ impl Primary {
             self.collect_builds();
             let (deadline, selected_close, end) = {
                 let mut state = root.state.lock().unwrap();
+                if matches!(state.phase, Phase::Open | Phase::PreClose(_))
+                    && let Some(error) = &state.failure
+                {
+                    return Err(error.clone());
+                }
                 let mut deadline = None;
                 let mut selected = None;
                 if let Phase::PreClose(until) = state.phase {
@@ -965,6 +1049,10 @@ impl Primary {
                     })
                 } else {
                     if matches!(state.phase, Phase::Open | Phase::PreClose(_)) {
+                        deadline =
+                            Some(deadline.map_or(state.policy_deadline, |old| {
+                                old.min(state.policy_deadline)
+                            }));
                         for binding in state
                             .bindings
                             .values()
@@ -973,6 +1061,9 @@ impl Primary {
                             if let Some(next) = binding.session.retry_deadline() {
                                 deadline =
                                     Some(deadline.map_or(next, |old: Duration| old.min(next)));
+                            }
+                            if let Some(next) = binding.session.fault_deadline() {
+                                deadline = Some(deadline.map_or(next, |old| old.min(next)));
                             }
                         }
                     }
@@ -1009,13 +1100,22 @@ impl Primary {
                                 .filter(|binding| binding.drives_replication_timer())
                                 .filter(|binding| binding.session.retry_deadline().is_some_and(|due| due <= root.clock.now()))
                                 .map(|binding| binding.session.on_timer(root.clock.now())).collect();
-                            Some((batches, root.activity(&mut state)))
+                            let faults: Vec<_> = state.bindings.values()
+                                .filter(|binding| binding.drives_replication_timer())
+                                .filter_map(|binding| binding.session.on_fault_timer(root.clock.now()))
+                                .collect();
+                            Some((batches, faults, root.activity(&mut state)))
                         } else {
                             None
                         }
                     };
-                    if let Some((batches, _activity)) = selected {
+                    if let Some((batches, faults, _activity)) = selected {
                         for batch in batches { batch.dispatch(); }
+                        for fault in faults { fault.dispatch(); }
+                    }
+                    if let Err(error) = root.policy_tick() {
+                        root.state.lock().unwrap().failure.get_or_insert(error.clone());
+                        return Err(error);
                     }
                 }
             }

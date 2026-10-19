@@ -293,7 +293,7 @@ impl PrimaryEstablishmentHandle {
         } else if !persisted {
             root.complete(Ok(()));
         }
-        Ok(root.session.update_ack(
+        Ok(root.session.update_ack_at(
             AckUpdate {
                 replication_received: body.replication_received,
                 replication_applied: body.replication_applied,
@@ -303,6 +303,7 @@ impl PrimaryEstablishmentHandle {
                 message_id: envelope.message_id.clone(),
             },
             progress,
+            root.clock.now(),
         ))
     }
 

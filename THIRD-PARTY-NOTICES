@@ -214,6 +214,24 @@ provider obligations but cannot publish successful reset/recovery. Broader
 host recovery/rebuild policy, public adapters and activation remain pending.
 No native binary, fixture, harness or utility dependency is incorporated.
 
+The private queue-policy extension in replica_manager/policy.rs and narrow
+primary/session/build/establishment/queue/carrier extensions translate selected
+ReplicaManager.cpp:173-284,350-432,530-545,716-778,1748-1750,1832-2076,2443-2450;
+ReplicationSession.cpp:87-283; RemoteSession.cpp:448-490;
+standarddeviation.h:17-22 and standarddeviation.cpp:32-76;
+Replicator.cpp:946-980; OperationQueue.cpp:135-138,205-212;
+ComOperation.cpp:18-28; REInternalSettings.cpp:451-607; and
+src/prod/src/ServiceModel/reliability/replication/REConfigMacros.h:166-177,
+at the same immutable pin. Actual component tests derive from these production
+paths; DecayAverage.Test.cpp:65-108 and ReplicatorSettings.Test.cpp:738-788
+are reviewed context, not whole-test translations. Injected Tokio time and
+outside-guard Rust effects replace native timers/locks, preserving sender
+closure before reclamation, separate quorum/all/MustCatchup observations,
+actual copy completion-disable races and deferred/retrying fault notification.
+Existing typed tonic InduceFault carries real bound target identity; no native
+wire compatibility or remote host fault handling is claimed. No native
+binary, fixture, test harness or utility/dependency implementation is imported.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

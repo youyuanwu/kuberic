@@ -128,7 +128,9 @@ fn observe(intent: SendIntent, clock: &Clock) -> SendObservation {
             Some(completed_hint),
         ),
         SendKind::RequestAck => (None, None, None, None),
-        SendKind::StartCopy { .. } => panic!("expected replication or RequestAck"),
+        SendKind::StartCopy { .. } | SendKind::InduceFault { .. } => {
+            panic!("expected replication or RequestAck")
+        }
     };
     SendObservation {
         at: clock.now(),

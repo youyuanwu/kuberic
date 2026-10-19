@@ -51,6 +51,42 @@ fn enqueue_range(queue: &mut OperationQueue, range: std::ops::RangeInclusive<Lsn
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn queue_pressure_uses_pending_span_and_logical_bytes_and_refreshes_transferred_age() {
+    let mut settings = config();
+    settings.max_bytes = 100;
+    let mut queue = OperationQueue::new(settings, 1, false, false);
+    let first = enqueue(&mut queue, 1, 30);
+    enqueue(&mut queue, 2, 30);
+    assert_eq!(queue.utilization_percent(), 60, "bytes dominate count");
+    queue.commit();
+    queue.update_last_completed(1);
+    assert_eq!(
+        queue.utilization_percent(),
+        30,
+        "completed history is excluded"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    assert_eq!(first.age(), std::time::Duration::from_secs(4));
+    let queue = queue.transfer(settings);
+    assert!(Arc::ptr_eq(queue.get_operation(1).unwrap(), &first));
+    assert_eq!(first.age(), std::time::Duration::ZERO);
+    assert_eq!(queue.utilization_percent(), 30);
+    let mut settings = config();
+    settings.max_capacity = 0;
+    settings.max_bytes = 100;
+    let mut bytes_only = OperationQueue::new(settings, 1, false, false);
+    enqueue(&mut bytes_only, 1, 33);
+    assert_eq!(bytes_only.utilization_percent(), 33);
+    let mut span = OperationQueue::new(config(), 1, false, false);
+    enqueue(&mut span, 3, 0);
+    assert_eq!(
+        span.utilization_percent(),
+        37,
+        "LSN holes count and percentage truncates"
+    );
+}
+
 fn progress(retained_head: Lsn, complete_head: Lsn, commit_head: Lsn, tail: Lsn) -> QueueProgress {
     QueueProgress {
         retained_head,

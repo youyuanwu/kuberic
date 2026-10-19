@@ -1232,6 +1232,54 @@ async fn actual_session_intent_reaches_tonic_but_progress_only_changes_on_indepe
     loopback.close().await;
 }
 
+#[tokio::test]
+async fn slow_fault_retry_reaches_actual_tonic_with_the_bound_target_identity() {
+    let mut loopback = Loopback::start().await;
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let adapter = adapter(
+        loopback.client.clone(),
+        BufferPolicy::RawSingle,
+        errors.clone(),
+    );
+    let session = ReplicationSession::new(
+        identity(),
+        Epoch::new(2, 3),
+        0,
+        SenderConfig {
+            initial_window: 1,
+            max_window: 1,
+            retry: Duration::from_secs(5),
+            decay_factor: 0.0,
+            decay_interval: Duration::from_secs(1),
+        },
+        Arc::new(move |intent| adapter.send(intent)),
+        Duration::ZERO,
+    );
+    session.open();
+    assert!(session.try_fault_active("actual slow sender".into(), Duration::ZERO));
+    for seconds in [5, 10] {
+        session
+            .on_fault_timer(Duration::from_secs(seconds))
+            .unwrap()
+            .dispatch();
+        let Delivery::Message { envelope, .. } = receive(&mut loopback.server_ingress).await else {
+            panic!("expected fault notification")
+        };
+        assert_eq!(envelope.destination.as_ref(), Some(&route().destination));
+        let Some(wire::envelope::Body::InduceFault(body)) = envelope.body else {
+            panic!("expected typed InduceFault")
+        };
+        assert_eq!(body.target_replica, route().destination.replica);
+        assert_eq!(body.target_incarnation, route().destination.incarnation);
+        assert_eq!(body.reason, "actual slow sender");
+        assert_eq!(session.progress(0).applied, 0);
+    }
+    session.close();
+    assert!(session.on_fault_timer(Duration::from_secs(15)).is_none());
+    assert!(errors.lock().unwrap().is_empty());
+    loopback.close().await;
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum RecordedCopyHandoff {
     ReplicationGate {

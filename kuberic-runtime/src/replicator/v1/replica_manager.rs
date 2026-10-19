@@ -13,8 +13,8 @@
 //!
 //! BuildIdle owns fresh idle-session creation and registers its actual copy target
 //! and cancellation here. Primary resolves descriptor-created/reused sessions and
-//! idle-to-active session promotion. Slow-replica exclusion, host
-//! fault reporting and notification scheduling remain missing owners.
+//! idle-to-active session promotion. Private queue policy excludes faulted
+//! senders from reclamation, not quorum/catch-up. Host fault handling is separate.
 //! The private role owner supplies queue transfer, epoch and data-loss orchestration.
 //! Deliver returned effects after releasing the owner's guard. ACK processors
 //! must retain their ordered copy handoffs; call `update_progress` when their
@@ -40,6 +40,9 @@ use super::replication_queue_manager::{
 use super::sender::{SenderOperation, SenderProgress};
 use super::session::{ReplicationSession, SessionIdentity, SessionSendBatch};
 use super::transport::Route;
+
+mod policy;
+pub(super) use policy::QueuePolicyConfig;
 
 #[derive(Clone)]
 #[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 membership seam"))]
@@ -108,6 +111,7 @@ pub(super) enum ConfigurationError {
     IdleAlreadyExists(i64),
     IdleNotFound(i64),
     InvalidCopyTarget(i64),
+    FaultedIdlePromotion(i64),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -600,6 +604,11 @@ impl ReplicaManager {
         configuration: EstablishedConfiguration,
     ) -> Result<ManagerEffects, ManagerError> {
         self.ensure_active()?;
+        for member in &configuration.current.members {
+            if self.has_idle_membership(member.replica_id) && member.session.idle_faulted() {
+                return Err(ConfigurationError::FaultedIdlePromotion(member.replica_id).into());
+            }
+        }
         let old_sessions = self.established_sessions();
         let mut checked = old_sessions.clone();
         self.validate_set(
@@ -862,7 +871,9 @@ impl ReplicaManager {
             let progress = self.sample_progress(member.replica_id, &member.session)?;
             let apply = progress.applied.max(0);
             applied.push(apply);
-            minimum_received = min_progress(minimum_received, Some(progress.received.max(0)));
+            if !member.session.active_faulted() {
+                minimum_received = min_progress(minimum_received, Some(progress.received.max(0)));
+            }
         }
         if set.write_quorum <= 1 {
             // Native Helpers::GetReplicasProgress cpp:358-363 deliberately
@@ -904,6 +915,9 @@ impl ReplicaManager {
         let mut committed = current_progress.quorum;
         let mut completed = current_progress.completed;
         for idle in idle {
+            if idle.session.idle_faulted() {
+                continue;
+            }
             // ReplicationSession.cpp:285-326, from one checked sender snapshot.
             let progress = self.sample_progress(idle.replica_id, &idle.session)?;
             let target = match self.builds.get(&idle.replica_id) {

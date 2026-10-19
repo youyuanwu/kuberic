@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), expect(dead_code, reason = "unselected V1 BuildIdle"))]
 
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -110,10 +111,15 @@ impl Root {
             .is_established()?
             .then(|| self.session.start_copy_deadline())
             .flatten();
-        let deadline = [self.session.retry_deadline(), context, start]
-            .into_iter()
-            .flatten()
-            .min();
+        let deadline = [
+            self.session.retry_deadline(),
+            self.session.fault_deadline(),
+            context,
+            start,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         tokio::select! {
             () = &mut wake => return Ok(()),
             () = async {
@@ -137,6 +143,9 @@ impl Root {
         }
         if context.is_some_and(|deadline| deadline <= self.clock.now()) {
             self.establishment.context_ack_timer()?;
+        }
+        if let Some(send) = self.session.on_fault_timer(self.clock.now()) {
+            send.dispatch();
         }
         Ok(())
     }
@@ -173,6 +182,18 @@ impl BuildIdleHandle {
             return Ok(terminal.finish_copy_target);
         }
         Ok(self.0.copy.snapshot()?.replication_target)
+    }
+
+    pub(super) fn retarget_replication(&self, lsn: Lsn) -> Result<bool, CopyError> {
+        self.0
+            .copy
+            .update_last_replication_operation_during_copy(lsn)
+    }
+
+    pub(super) fn try_fault_slow(&self, reason: String, now: Duration) -> Result<bool, CopyError> {
+        let faulted = self.0.session.try_fault_idle(&self.0.copy, reason, now)?;
+        self.wake_timers();
+        Ok(faulted)
     }
 
     /// Native BuildIdle OnCancel, not RemoveReplica/RemoteSession::CancelCopy.

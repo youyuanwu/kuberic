@@ -359,6 +359,16 @@ impl ReplicationQueueManager {
         self.queue.operation_count()
     }
 
+    pub(super) fn utilization_percent(&self) -> u32 {
+        self.queue.utilization_percent()
+    }
+
+    pub(super) fn oldest_operation_age(&self) -> Option<std::time::Duration> {
+        self.queue
+            .get_operation(self.first_lsn_in_replication_queue())
+            .map(|operation| operation.age())
+    }
+
     pub(super) fn total_bytes(&self) -> usize {
         self.queue.total_bytes()
     }
