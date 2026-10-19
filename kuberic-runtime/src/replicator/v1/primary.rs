@@ -6,6 +6,7 @@
 // ReplicaManager.cpp:306-335,792-870,926-1007,1205-1779,2187-2222,
 // ReplicaManager.cpp:871-920 and PrimaryReplicator.UpdateEpochAsyncOperation.cpp,
 // PrimaryReplicator.cpp:501-505, ReplicaManager.cpp:1015-1023 and
+// PrimaryReplicator.cpp:319-336 (queue progress/capability queries),
 // Replicator.cpp:659-708,799-838 (CheckingDataLoss admission),
 // ReplicationSession.cpp:279-283 and RemoteSession.cpp:448-656,
 // microsoft/service-fabric@3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d,
@@ -333,6 +334,24 @@ impl PrimaryHandle {
             return Err(PrimaryError::OwnerDropped);
         }
         Ok(root)
+    }
+
+    pub(super) fn current_progress(&self) -> Result<Lsn, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        let manager = root.manager.lock().unwrap();
+        manager.check_reported_fault()?;
+        Ok(manager.queue().current_progress())
+    }
+
+    pub(super) fn catchup_capability(&self) -> Result<Lsn, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        let manager = root.manager.lock().unwrap();
+        manager.check_reported_fault()?;
+        Ok(manager.queue().catchup_capability())
     }
 
     pub(super) fn update_queue_policy(

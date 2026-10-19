@@ -82,6 +82,13 @@ restart-to-copy/replication handoff without DurableState or invented history.
 Broader production host recovery, automatic replica rebuild/placement policy,
 host listener/authentication/registry and partition-report integration, and
 monitoring/health remain pending.
+The [private service-adapter slice](sf-v1-port-ledger.md#private-service-adapter-slice-p4-bounded-f01f02f04f05f09f11)
+adds caller-driven resumable async control, separate assignment/quorum completion,
+shared service streams/ACK/provider-barrier handoff and native progress queries
+over actual owners. A helper-free in-memory service demonstrates separate
+ordered commit, visibility and client completion. This bounded P4 preparation
+does not implement or activate the published facade, real KV/SQLite migration,
+host listener/authentication/registry/status/reporting or atomic cutover.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -464,7 +471,11 @@ initial progress now compose an actual-owner caller-directed restart/copy/
 replication journey. Broader production host recovery and automatic rebuild/
 placement policy, production host
 listener/authentication/registry and partition-report integration, and platform
-monitoring are pending. This roadmap is not
+monitoring are pending. P4 now has a bounded private service/control adapter:
+resumable caller-driven lifecycle, early assignment/separate quorum completion,
+shared receiver/ACK/provider-barrier adaptation and helper-free service ownership
+evidence. Public facade, real services and host/status/reporting integration
+remain pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required

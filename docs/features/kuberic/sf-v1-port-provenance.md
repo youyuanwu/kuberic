@@ -752,6 +752,41 @@ monitoring/health, public adapters and activation remain pending.
 Actual-component execution is not native execution, full P3, hosted/differential
 parity or provider-fsync qualification.
 
+### Private Service Adapter Slice (P4, Bounded F01/F02/F04/F05/F09/F11)
+
+Rust destinations:
+[`service_adapter.rs`](../../../kuberic-runtime/src/replicator/v1/service_adapter.rs)
+and its [actual-owner regressions](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests.rs),
+query seams in [`primary.rs`](../../../kuberic-runtime/src/replicator/v1/primary.rs)
+and [`secondary.rs`](../../../kuberic-runtime/src/replicator/v1/secondary.rs),
+and End notification in [`build_idle.rs`](../../../kuberic-runtime/src/replicator/v1/build_idle.rs).
+Existing role/queue/receiver/provider/build owners remain authoritative.
+
+| Selected native production material at the immutable pin (`R/` prefix) | Translation / representation changes |
+|---|---|
+| [`ComReplicator.cpp:219-313`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ComReplicator.cpp#L219-L313); `ComReplicator.ReplicateOperation.cpp:23-74`; `PrimaryReplicator.ReplicateAsyncOperation.cpp:31-66` | Private weak service handle returns actual manager assignment separately from a retained quorum-completion receiver. Rust futures/cache replace COM Begin/End; dropping a waiter does not retract admission. No service-local commit, DurableState dependency or client-success oracle is introduced. |
+| [`Replicator.ReplicateAsyncOperation.cpp:31-98`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.ReplicateAsyncOperation.cpp#L31-L98); `Replicator.cpp:889-907`; `EnumOperators.cpp:85-129` | Existing lossless buffer validation precedes injected typed write-access errors, then actual primary admission. Valid empty payload/segment representations remain valid; the misleading native "Do not allow empty" comment is not a new semantic restriction. Access callback is an unselected host seam, not host policy or a production grant. |
+| [`Replicator.cpp:296-399`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.cpp#L296-L399); `PrimaryReplicator.cpp:319-336`; `SecondaryReplicator.cpp:553-619` | Opened uses the existing lazy normalized provider cache and capability zero. Primary queries return queue commitment/capability; copy/uninitialized secondary queries return NotReady and report a sticky fault outside guards. No public report reinterpretation. |
+| `Replicator.cpp:407-562`; existing Open/role/epoch/data-loss/Close/Abort sources recorded above | Private caller-driven async facade routes configuration/build/catch-up/removal and lifecycle to real owners. Selected controls resume after cancelled waiters. Exclusive control lane, weak projected handles and explicit steady driver replace execution plumbing; full concurrent native facade interleavings and published trait implementation are not claimed. |
+| [`ComOperationStream.GetOperationOperation.cpp:23-72`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ComOperationStream.GetOperationOperation.cpp#L23-L72); `ComFromBytesOperation.cpp:139-257`; existing operation-stream/secondary epoch sources recorded above | Service streams wrap shared consuming queues; internal epoch markers select actual provider work. Parameterless ACK delivers the existing callback to its original receiver. No duplicate ACK state machine, queue rewind, fake EOF, item-level negative ACK or automatic service apply. |
+| Existing `PrimaryReplicator.BuildIdleAsyncOperation.cpp`/BuildIdle and primary Close sources recorded above | Actual build End gains a separate outside-guard Notify for cancellable/multiple waiters. A Rust driver-liveness bit and Drop notification report abandonment separately from actual End, without an indefinite wait or fabricated result. Waiter drop, native build cancellation and session removal remain distinct. Ordinary Close is not arbitrary provider drainage; explicit retired-build drainage and abnormal Drop containment remain separate. No native timer/job/COM utility implementation is imported. |
+
+Tests derive from these production contracts and execute actual compiled Rust
+owners, protected provider implementations and a helper-free in-memory service.
+They do not translate a native fixture or run a native binary. The service
+explicitly owns ordered commit, visibility and client return; delayed/failed
+commit remains observable after real quorum completion. No native utility,
+third-party dependency or harness is imported. Microsoft MIT source attribution
+and complete permission/disclaimer are retained.
+
+See the [ledger](sf-v1-port-ledger.md#private-service-adapter-slice-p4-bounded-f01f02f04f05f09f11)
+and [selector](testing.md#sf-v1-private-service-adapter-slice).
+This bounded private P4 preparation does not activate a facade, factory,
+service, listener, host registry or report schema. Public/real-service adapters,
+host/authentication/status/report/controller integration, settings/capabilities,
+monitoring/health and atomic P5 cutover remain pending. No full P4/P3 closure,
+native/hosted/differential parity or provider-fsync qualification is claimed.
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

@@ -19,6 +19,7 @@ mod secondary;
 mod secondary_copy_receiver;
 mod secondary_receiver;
 mod sender;
+mod service_adapter;
 mod session;
 mod transport;
 
