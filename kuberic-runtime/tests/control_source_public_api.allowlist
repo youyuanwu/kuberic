@@ -31,6 +31,7 @@ public-path documented enum crate::protocol::types::BuildAuthorityKind
 public-path documented enum crate::protocol::types::CleanupResourceIdentity
 public-path documented enum crate::protocol::types::ConditionStatus
 public-path documented enum crate::protocol::types::FaultType
+public-path documented enum crate::protocol::types::OpenMode
 public-path documented enum crate::protocol::types::PlannedSwitchoverOutcome
 public-path documented enum crate::protocol::types::PlannedSwitchoverResolution
 public-path documented enum crate::protocol::types::ProcessSessionRenewalReason
@@ -732,6 +733,8 @@ public-path documented variant crate::protocol::types::ConditionStatus::True
 public-path documented variant crate::protocol::types::ConditionStatus::Unknown
 public-path documented variant crate::protocol::types::FaultType::Permanent
 public-path documented variant crate::protocol::types::FaultType::Transient
+public-path documented variant crate::protocol::types::OpenMode::Existing
+public-path documented variant crate::protocol::types::OpenMode::New
 public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::OldPrimaryCompensated
 public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::OldPrimaryRestored
 public-path documented variant crate::protocol::types::PlannedSwitchoverOutcome::Rejected
@@ -1051,6 +1054,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::extensions: PublicV1Extensions
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::history: HistoryContext
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::identity: PublicV1Identity
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::open_mode: OpenMode
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::progress: PublicProgress
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::read_status: AccessStatus
@@ -1140,6 +1144,7 @@ public-path hidden impl crate::protocol::public_operations::PublicReplicaDescrip
 public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::fn from_completion (completion : & PublicV1OperationCompletion) -> Self
 public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedStatus::fn is_evidence_successor_of (& self , previous : & Self) -> bool
 public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedStatus::fn validate_evidence (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::PublicV1AgentReport::fn has_current_open_endpoint (& self) -> bool
 public-path hidden impl crate::protocol::public_operations::PublicV1AgentReport::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicV1Identity::const fn is_public_v1 (& self) -> bool
 public-path hidden impl crate::protocol::public_operations::PublicV1Identity::const fn is_valid (& self) -> bool

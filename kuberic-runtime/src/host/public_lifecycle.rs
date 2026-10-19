@@ -733,6 +733,7 @@ pub(crate) async fn public_v1_report(
         ));
     }
     let state = store.load_state().await?;
+    let open_mode = state.application_open_mode();
     let preview = state.public_v1_operation_state.ok_or_else(|| {
         HostError::CommandRejected("Public V1 report requires replacement state".into())
     })?;
@@ -890,6 +891,7 @@ pub(crate) async fn public_v1_report(
         history,
         storage_incarnation,
         progress: projection.progress,
+        open_mode,
         replication_address,
         service_location,
         data_loss_recovery,

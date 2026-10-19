@@ -156,6 +156,13 @@ impl Epoch {
     }
 }
 
+/// Whether application Open initializes fresh storage or reopens established storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum OpenMode {
+    New,
+    Existing,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Runtime role of one exact replica incarnation.

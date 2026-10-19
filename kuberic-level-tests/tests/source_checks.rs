@@ -185,6 +185,26 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
         .parent()
         .context("level tests must be inside the workspace")?;
     let toolchain = pinned_toolchain(root)?;
+    // Separate invocations keep test/dev dependencies from enabling runtime hosting.
+    for (package, target) in [
+        ("kuberic-runtime", "--lib"),
+        ("kuberic-controller", "--bins"),
+    ] {
+        checked_output(
+            Command::new("cargo")
+                .args([
+                    "check",
+                    "--locked",
+                    "--offline",
+                    "--no-default-features",
+                    "--package",
+                    package,
+                    target,
+                ])
+                .current_dir(root)
+                .env("RUSTUP_TOOLCHAIN", &toolchain),
+        )?;
+    }
     let output = checked_output(
         Command::new("cargo")
             .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])

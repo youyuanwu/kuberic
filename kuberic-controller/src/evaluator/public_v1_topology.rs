@@ -5,8 +5,8 @@ use kuberic_runtime::protocol::public_operations::{
     PublicV1AcceptedStatus, PublicV1AgentReport, PublicV1CallKind, PublicV1OperationResult,
 };
 use kuberic_runtime::protocol::types::{
-    ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch, OperationId, ReplicaId,
-    ReplicaRole,
+    ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch, OpenMode, OperationId,
+    ReplicaId, ReplicaRole,
 };
 
 use super::public_v1_evidence::{
@@ -179,13 +179,12 @@ pub fn plan_public_v1_topology(
         })
         .map(|target| target.report.replica.clone())
         .collect::<Vec<_>>();
-    if let Some(replica) = operational_replicas
-        .iter()
-        .find(|replica| replica.replication_address.is_empty())
-    {
+    if let Some(replica) = operational_replicas.iter().find(|replica| {
+        replica.replication_address.is_empty() || !replica.report.has_current_open_endpoint()
+    }) {
         let open = PublicOperationProgram::Open {
             replica: replica.report.replica.clone(),
-            existing: true,
+            existing: replica.report.open_mode == OpenMode::Existing,
         };
         let open_configuration_id = if current.is_some_and(|configuration| {
             !configuration
@@ -197,21 +196,34 @@ pub fn plan_public_v1_topology(
         } else {
             &operational_next.configuration_id
         };
-        let open_id = content_addressed_operation_id(
-            format!(
-                "topology-{}-{}-{}-open",
-                open_configuration_id,
-                replica.report.replica.replica_id,
-                replica.report.process_session_id,
-            ),
-            &open,
+        let open_base = format!(
+            "topology-{}-{}-{}-open",
+            open_configuration_id,
+            replica.report.replica.replica_id,
+            replica.report.process_session_id,
         );
-        if accepted.completed_operations.iter().any(|completion| {
-            completion.operation_id == open_id
-                && completion.result == PublicV1AcceptedResult::Succeeded
+        // Initialization changes the reported mode, not exact successful Open credit.
+        if [false, true].into_iter().any(|existing| {
+            let program = PublicOperationProgram::Open {
+                replica: replica.report.replica.clone(),
+                existing,
+            };
+            let operation_id = content_addressed_operation_id(open_base.clone(), &program);
+            let digest = program.digest();
+            accepted.completed_operations.iter().any(|completion| {
+                completion.operation_id == operation_id
+                    && completion.call_kind == PublicV1CallKind::Open
+                    && completion.process_session_id == replica.report.process_session_id
+                    && completion.storage_incarnation == replica.report.storage_incarnation
+                    && completion.history == replica.report.history
+                    && completion.input_digest_version == digest.version()
+                    && completion.input_digest_sha256 == digest.sha256()
+                    && completion.result == PublicV1AcceptedResult::Succeeded
+            })
         }) {
             return Ok(PublicV1TopologyPlan::Wait);
         }
+        let open_id = content_addressed_operation_id(open_base, &open);
         return begin_operation(accepted, replica, open, open_id, resource_version).map(
             |(transition, command)| PublicV1TopologyPlan::Begin {
                 transition: Box::new(transition),
@@ -370,30 +382,6 @@ pub fn plan_public_v1_topology(
                 && !retained_rejoins.contains(&replica.report.replica)
         })
     {
-        let open = PublicOperationProgram::Open {
-            replica: target.report.replica.clone(),
-            existing: true,
-        };
-        let open_id = content_addressed_operation_id(
-            format!(
-                "topology-{}-{}-{}-open",
-                next.configuration_id,
-                target.report.replica.replica_id,
-                target.report.process_session_id,
-            ),
-            &open,
-        );
-        if !accepted.completed_operations.iter().any(|completion| {
-            completion.operation_id == open_id
-                && completion.result == PublicV1AcceptedResult::Succeeded
-        }) {
-            return begin_operation(accepted, target, open, open_id, resource_version).map(
-                |(transition, command)| PublicV1TopologyPlan::Begin {
-                    transition: Box::new(transition),
-                    command: Box::new(command),
-                },
-            );
-        }
         let role = (
             "build-role",
             PublicOperationProgram::Role {
@@ -1001,7 +989,7 @@ fn operation_sequence(
     replicas: &[PublicV1TopologyReplica],
     configuration: &ConfigurationDescriptor,
     prebuilt: bool,
-    reopen_retained: bool,
+    prepare_retained: bool,
     catch_up_primary: bool,
 ) -> Result<Vec<(&'static str, PublicOperationProgram)>, String> {
     let role = configuration
@@ -1012,13 +1000,6 @@ fn operation_sequence(
         .ok_or_else(|| "local replica is not in desired configuration".to_string())?;
     let public_configuration =
         public_configuration(&local.report.replica, replicas, configuration)?;
-    let open = (
-        "open",
-        PublicOperationProgram::Open {
-            replica: local.report.replica.clone(),
-            existing: true,
-        },
-    );
     let role = (
         "role",
         PublicOperationProgram::Role {
@@ -1046,10 +1027,8 @@ fn operation_sequence(
             PublicOperationProgram::Configuration(public_configuration),
         )
     };
-    if should_reopen(local.report.role, prebuilt, reopen_retained) {
-        Ok(vec![open, role, epoch, configuration])
-    } else if reopen_retained {
-        Ok(vec![open, epoch, role, configuration])
+    if role_before_epoch(local.report.role, prebuilt, prepare_retained) {
+        Ok(vec![role, epoch, configuration])
     } else {
         Ok(vec![epoch, role, configuration])
     }
@@ -1096,8 +1075,8 @@ fn public_configuration(
     Ok(configuration)
 }
 
-fn should_reopen(role: ReplicaRole, prebuilt: bool, reopen_retained: bool) -> bool {
-    reopen_retained && role == ReplicaRole::None && !prebuilt
+fn role_before_epoch(role: ReplicaRole, prebuilt: bool, prepare_retained: bool) -> bool {
+    prepare_retained && role == ReplicaRole::None && !prebuilt
 }
 
 fn begin_operation(
@@ -1308,7 +1287,7 @@ mod tests {
             instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
             agent_generation: AgentGeneration::new(format!("generation-{id}")),
         };
-        PublicV1TopologyReplica {
+        let mut replica = PublicV1TopologyReplica {
             report: PublicV1AgentReport {
                 identity: PublicV1Identity::new(1),
                 resource_uid: resource_uid.clone(),
@@ -1316,6 +1295,7 @@ mod tests {
                 process_session_id: ProcessSessionId::new(format!("session-{id}")),
                 replicator_creation_id: ReplicatorCreationId::new(format!("creation-{id}")),
                 report_sequence: 1,
+                open_mode: OpenMode::Existing,
                 role,
                 read_status: if role == ReplicaRole::None {
                     AccessStatus::NotPrimary
@@ -1354,7 +1334,30 @@ mod tests {
                 extensions: PublicV1Extensions::default(),
             },
             replication_address: format!("http://10.0.0.{id}:50052"),
-        }
+        };
+        let program = PublicOperationProgram::Open {
+            replica: replica.report.replica.clone(),
+            existing: true,
+        };
+        replica
+            .report
+            .completed_operations
+            .push(PublicV1OperationCompletion {
+                operation_id: OperationId::new(format!("observed-open-{id}")),
+                revision: 1,
+                call_kind: PublicV1CallKind::Open,
+                process_session_id: replica.report.process_session_id.clone(),
+                input_digest: program.digest(),
+                replay_disposition: program.replay_disposition(),
+                history: replica.report.history.clone(),
+                storage_incarnation: replica.report.storage_incarnation.clone(),
+                previous_configuration_id: None,
+                current_configuration_id: None,
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+                result: PublicV1OperationResult::Succeeded,
+            });
+        replica
     }
 
     fn accepted(replica: &PublicV1TopologyReplica) -> PublicV1AcceptedStatus {
@@ -1387,7 +1390,10 @@ mod tests {
             catch_up_mode,
             catch_up_specific_quorum,
         ) = match command.intent.program.as_ref().expect("program") {
-            PublicOperationProgram::Open { .. } => (PublicV1CallKind::Open, None, None, None, None),
+            PublicOperationProgram::Open { .. } => {
+                report.report.open_mode = OpenMode::Existing;
+                (PublicV1CallKind::Open, None, None, None, None)
+            }
             PublicOperationProgram::Role { role, .. } => {
                 report.report.role = if *role == ReplicaRole::IdleSecondary {
                     ReplicaRole::None
@@ -1458,6 +1464,9 @@ mod tests {
             catch_up_specific_quorum,
             result: PublicV1OperationResult::Succeeded,
         };
+        if call_kind == PublicV1CallKind::Open {
+            report.report.completed_operations.push(completion.clone());
+        }
         accepted
             .completed_operations
             .push(PublicV1AcceptedOperationCompletion::from_completion(
@@ -1466,8 +1475,46 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_failover_does_not_reopen_transiently_fenced_replica() {
-        assert!(!should_reopen(ReplicaRole::None, false, false));
+    fn open_endpoint_requires_exact_current_successful_open_evidence() {
+        let original = replica(1, ReplicaRole::Primary).report;
+        assert!(original.has_current_open_endpoint());
+        let mut initialized = original.clone();
+        initialized.completed_operations[0].input_digest = PublicOperationProgram::Open {
+            replica: original.replica.clone(),
+            existing: false,
+        }
+        .digest();
+        assert!(initialized.has_current_open_endpoint());
+        for mutation in 0..7 {
+            let mut report = original.clone();
+            match mutation {
+                0 => report.process_session_id = ProcessSessionId::new("restarted-session"),
+                1 => {
+                    report.storage_incarnation.storage_generation =
+                        StorageGeneration::new("replaced-storage")
+                }
+                2 => report.completed_operations[0].history.data_loss_number += 1,
+                3 => report.completed_operations[0].call_kind = PublicV1CallKind::Epoch,
+                4 => {
+                    report.completed_operations[0].input_digest = PublicOperationProgram::Epoch {
+                        epoch: Epoch::new(0, 1),
+                    }
+                    .digest()
+                }
+                5 => {
+                    report.completed_operations[0].result =
+                        PublicV1OperationResult::Failed("failed Open".into())
+                }
+                6 => report.replication_address = None,
+                _ => unreachable!(),
+            }
+            assert!(!report.has_current_open_endpoint(), "mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn ordinary_failover_advances_epoch_before_assigning_a_fenced_role() {
+        assert!(!role_before_epoch(ReplicaRole::None, false, false));
     }
 
     #[test]
@@ -1480,7 +1527,10 @@ mod tests {
         for replica in &mut replicas {
             replica.replication_address.clear();
             replica.report.replication_address = None;
+            replica.report.completed_operations.clear();
         }
+        replicas[0].report.open_mode = OpenMode::New;
+        replicas[2].report.open_mode = OpenMode::New;
         let mut accepted = accepted(&replicas[0]);
         for index in 0..replicas.len() {
             let PublicV1TopologyPlan::Begin { command, .. } = plan_public_v1_topology(
@@ -1496,10 +1546,13 @@ mod tests {
                 panic!("bootstrap must authorize Open before discovering its endpoint");
             };
             assert_eq!(command.target, replicas[index].report.replica);
-            assert!(matches!(
+            assert_eq!(
                 command.intent.program,
-                Some(PublicOperationProgram::Open { .. })
-            ));
+                Some(PublicOperationProgram::Open {
+                    replica: replicas[index].report.replica.clone(),
+                    existing: replicas[index].report.open_mode == OpenMode::Existing,
+                })
+            );
             accept_command(&mut accepted, &mut replicas, &command);
             assert_eq!(
                 plan_public_v1_topology(
@@ -1514,6 +1567,34 @@ mod tests {
                 .unwrap(),
                 PublicV1TopologyPlan::Wait,
             );
+            if index == 0 {
+                for mutation in 0..3 {
+                    let mut stale = accepted.clone();
+                    let completion = stale.completed_operations.last_mut().unwrap();
+                    match mutation {
+                        0 => completion.process_session_id = ProcessSessionId::new("old-session"),
+                        1 => {
+                            completion.storage_incarnation.storage_generation =
+                                StorageGeneration::new("old-storage")
+                        }
+                        2 => completion.input_digest_sha256 = "0".repeat(64),
+                        _ => unreachable!(),
+                    }
+                    assert!(matches!(
+                        plan_public_v1_topology(
+                            &stale,
+                            None,
+                            &replicas,
+                            3,
+                            None,
+                            None,
+                            "resource-version",
+                        )
+                        .unwrap(),
+                        PublicV1TopologyPlan::Begin { .. }
+                    ));
+                }
+            }
             let address = format!("http://127.0.0.1:{}", 41001 + index);
             replicas[index].replication_address = address.clone();
             replicas[index].report.replication_address = Some(address);
@@ -1536,7 +1617,7 @@ mod tests {
                             command.intent.program,
                             Some(PublicOperationProgram::Open { .. })
                         ),
-                        "Open discovery and topology preparation must share the same operation ID"
+                        "topology preparation must not reopen a process with a successful Open endpoint"
                     );
                     if let Some(PublicOperationProgram::Configuration(configuration)) =
                         command.intent.program.as_ref()
@@ -1559,6 +1640,70 @@ mod tests {
             }
         }
         panic!("bootstrap did not admit the opened replicas");
+    }
+
+    #[test]
+    fn replacement_open_uses_host_mode_and_is_not_repeated_after_endpoint_publication() {
+        for mode in [OpenMode::New, OpenMode::Existing] {
+            let mut replicas = vec![
+                replica(1, ReplicaRole::Primary),
+                replica(2, ReplicaRole::ActiveSecondary),
+                replica(3, ReplicaRole::ActiveSecondary),
+            ];
+            let current = desired_configuration(None, &replicas, ReplicaId::new(1)).unwrap();
+            let mut accepted = accepted(&replicas[0]);
+            replicas[2].report.replica.instance_id = ReplicaInstanceId::new("replacement-pod");
+            replicas[2].report.storage_incarnation.replica = replicas[2].report.replica.clone();
+            replicas[2].report.open_mode = mode;
+            replicas[2].report.role = ReplicaRole::None;
+            replicas[2].report.progress.role = PublicProgressRole::Recovery;
+            replicas[2].report.replication_address = None;
+            replicas[2].report.completed_operations.clear();
+            replicas[2].replication_address.clear();
+            let PublicV1TopologyPlan::Begin { command, .. } = plan_public_v1_topology(
+                &accepted,
+                Some(&current),
+                &replicas,
+                3,
+                None,
+                None,
+                "resource-version",
+            )
+            .unwrap() else {
+                panic!("replacement must authorize its host-selected Open");
+            };
+            assert_eq!(
+                command.intent.program,
+                Some(PublicOperationProgram::Open {
+                    replica: replicas[2].report.replica.clone(),
+                    existing: mode == OpenMode::Existing,
+                })
+            );
+            assert_eq!(
+                command.intent.input_digest,
+                command.intent.program.as_ref().unwrap().digest()
+            );
+            accept_command(&mut accepted, &mut replicas, &command);
+            let address = "http://127.0.0.1:41003".to_string();
+            replicas[2].report.replication_address = Some(address.clone());
+            replicas[2].replication_address = address;
+            let PublicV1TopologyPlan::Begin { command, .. } = plan_public_v1_topology(
+                &accepted,
+                Some(&current),
+                &replicas,
+                3,
+                None,
+                None,
+                "resource-version",
+            )
+            .unwrap() else {
+                panic!("opened replacement must proceed to Build preparation");
+            };
+            assert!(!matches!(
+                command.intent.program,
+                Some(PublicOperationProgram::Open { .. })
+            ));
+        }
     }
 
     #[test]

@@ -146,7 +146,6 @@ private-path documented variant crate::host::error::HostError::Uninitialized
 private-path documented variant crate::host::process::ApplicationStorageState::Established
 private-path documented variant crate::host::process::ApplicationStorageState::FreshEmpty
 public-path documented const crate::application::INVALID_LSN: Lsn
-public-path documented enum crate::application::OpenMode
 public-path documented enum crate::replicator::ReplicaSetQuorumMode
 public-path documented enum crate::replicator::stream::OperationMetadata
 public-path documented field crate::application::ClientWrite::data: Bytes
@@ -256,6 +255,7 @@ public-path documented type crate::application::OperationData = Bytes
 public-path documented type crate::application::OperationDataStream = Pin < Box < dyn Stream < Item = Result < OperationData > > + Send > >
 public-path documented type crate::engine::RetainedOperationStream = Pin < Box < dyn Stream < Item = Result < Operation > > + Send > >
 public-path documented use crate::application :: { StateProvider , StatefulServiceReplica }
+public-path documented use crate::application::crate :: protocol :: types :: OpenMode
 public-path documented use crate::application::crate :: traits :: { StateProvider , StatefulServiceReplica }
 public-path documented use crate::error :: { Result , RuntimeError }
 public-path documented use crate::host::error :: { HostError , Result }
@@ -263,8 +263,6 @@ public-path documented use crate::host::process :: { ApplicationStorageState , R
 public-path documented use crate::host::transport :: { KubernetesDnsResolver , ReplicaEndpointResolver }
 public-path documented use crate::replicator :: { DefaultReplicatorFactory , PrimaryReplicator , Replicator , ReplicatorFactory , ReplicatorInterfaces , StateReplicator , StatefulServicePartition , }
 public-path documented use crate::replicator::traits :: { PrimaryReplicator , Replicator , ReplicatorFactory , StateReplicator }
-public-path documented variant crate::application::OpenMode::Existing
-public-path documented variant crate::application::OpenMode::New
 public-path documented variant crate::replicator::ReplicaSetQuorumMode::All
 public-path documented variant crate::replicator::ReplicaSetQuorumMode::WriteQuorum
 public-path documented variant crate::replicator::stream::OperationMetadata::Copy { { build_id : OperationId , sequence : u64 , } }

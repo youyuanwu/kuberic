@@ -11,7 +11,6 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 use crate::RuntimeError;
-use crate::application::OpenMode;
 use crate::control::{normalize_execute_request, proto, public_v1_agent_status_to_proto};
 use crate::host::Result;
 use crate::host::hosting::PodRuntime;
@@ -715,15 +714,7 @@ where
         let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
         if open_program {
             let state = self.store.load_state().await?;
-            let mode = if state
-                .application_storage
-                .as_ref()
-                .is_some_and(|binding| binding.initializing)
-            {
-                OpenMode::New
-            } else {
-                OpenMode::Existing
-            };
+            let mode = state.application_open_mode();
             callbacks.open_context = Some(self.runtime.public_open_context(mode).await);
         }
         let registry = self.registry.get().cloned().ok_or_else(|| {

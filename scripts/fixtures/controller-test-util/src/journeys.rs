@@ -1,5 +1,8 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use kuberic_controller::test_util::TestCluster;
+use kuberic_runtime::application::OpenMode;
+use kuberic_runtime::protocol::public_operations::{PublicV1AcceptedResult, PublicV1CallKind};
+use kuberic_runtime::protocol::types::AccessStatus;
 
 use super::CounterFactory;
 
@@ -53,6 +56,10 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
     let mut cluster = cluster().await?;
     let result = async {
         let topology = cluster.settle().await?;
+        for replica in topology.members() {
+            let service = cluster.service(replica).await?;
+            ensure!(service.open_modes() == [OpenMode::New]);
+        }
         let writer = cluster.service(topology.primary()).await?;
         cluster
             .drive(async { Ok::<_, anyhow::Error>(writer.set(17).await?) })
@@ -60,6 +67,7 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
         let secondary = topology.secondaries().next().unwrap().clone();
         let reopened = cluster.restart(&secondary).await?;
         let service = cluster.service(&reopened).await?;
+        ensure!(service.open_modes() == [OpenMode::Existing]);
         ensure!(service.read().await? == 17);
         ensure!(
             cluster.service(&secondary).await.is_err(),
@@ -70,6 +78,11 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
         let replaced = topology.secondaries().last().unwrap().clone();
         cluster.delete_replica(&replaced).await?;
         let topology = cluster.settle().await?;
+        let replacement = topology
+            .members()
+            .find(|replica| replica.identity().replica_id == replaced.identity().replica_id)
+            .unwrap();
+        ensure!(cluster.service(replacement).await?.open_modes() == [OpenMode::New]);
         ensure!(
             cluster.service(&replaced).await.is_err(),
             "retired reference resolved"
@@ -80,6 +93,103 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
             .drive(async { Ok::<_, anyhow::Error>(writer.set(23).await?) })
             .await?;
         assert_values(&mut cluster, 3, 23).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    finish(cluster, result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secondary_restart_gap_preserves_admitted_topology_and_primary_writes() -> Result<()> {
+    let mut cluster = cluster().await?;
+    let result = async {
+        let topology = cluster.settle().await?;
+        let writer = cluster.service(topology.primary()).await?;
+        cluster
+            .probe(async { Ok::<_, anyhow::Error>(writer.set(83).await?) })
+            .await?;
+        cluster.settle().await?;
+        let before = cluster.observe().await?;
+        let authority = before
+            .set()
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_authority.clone())
+            .context("settled authority missing")?
+            .authority()
+            .map_err(anyhow::Error::msg)?;
+        let configuration = before
+            .set()
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.clone())
+            .context("settled topology missing")?;
+        let secondary = topology.secondaries().next().unwrap().clone();
+        let isolation = cluster.isolate(std::slice::from_ref(&secondary)).await?;
+        for _ in 0..6 {
+            cluster.step().await?;
+        }
+        let during = cluster.observe().await?;
+        ensure!(
+            during
+                .set()
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_topology.as_ref())
+                == Some(&configuration),
+            "an RPC-only secondary outage changed admitted membership"
+        );
+        let current = during
+            .set()
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_authority.as_ref())
+            .context("current authority missing")?
+            .authority()
+            .map_err(anyhow::Error::msg)?;
+        for completion in current.completed_operations.iter().filter(|completion| {
+            !authority
+                .completed_operations
+                .iter()
+                .any(|before| before.operation_id == completion.operation_id)
+        }) {
+            ensure!(
+                completion.result == PublicV1AcceptedResult::Succeeded
+                    && (completion.call_kind == PublicV1CallKind::Progress
+                        || (completion.call_kind == PublicV1CallKind::CatchUp
+                            && completion.current_configuration_id.as_ref()
+                                == Some(&configuration.configuration_id))),
+                "secondary outage authorized {:?}: {}",
+                completion.call_kind,
+                completion.operation_id,
+            );
+        }
+        ensure!(
+            during
+                .report(topology.primary())
+                .context("healthy primary report missing")?
+                .write_status
+                == AccessStatus::Granted,
+            "an RPC-only secondary outage fenced the healthy primary"
+        );
+        cluster
+            .probe(async { Ok::<_, anyhow::Error>(writer.set(89).await?) })
+            .await?;
+        cluster.heal(isolation).await?;
+        let reopened = cluster
+            .restart(&secondary)
+            .await
+            .context("restart after the RPC gap")?;
+        ensure!(reopened != secondary);
+        ensure!(cluster.service(&reopened).await?.open_modes() == [OpenMode::Existing]);
+        let restored = cluster
+            .settle()
+            .await
+            .context("settle the renewed secondary")?;
+        ensure!(restored.primary() == topology.primary());
+        assert_values(&mut cluster, 3, 89)
+            .await
+            .context("acknowledged data after secondary renewal")?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -106,6 +216,12 @@ async fn repeated_secondary_replacement_preserves_acknowledged_data() -> Result<
                 .clone();
             cluster.delete_replica(&replaced).await?;
             cluster.settle().await?;
+            let observation = cluster.observe().await?;
+            let replacement = observation
+                .replicas()
+                .find(|replica| replica.identity().replica_id == replica_id)
+                .unwrap();
+            ensure!(cluster.service(replacement).await?.open_modes() == [OpenMode::New]);
             ensure!(
                 cluster.service(&replaced).await.is_err(),
                 "retired reference resolved"

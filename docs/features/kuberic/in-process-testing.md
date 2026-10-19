@@ -40,6 +40,14 @@ change role/access in the adapter: the production controller and host own
 those actions. Unexpected, incompatible or partial provider state must reject
 unchanged rather than be erased or classified as empty.
 
+Supply the application's actual owned data/runtime paths with
+`CreatedApplication::with_storage_paths`. The host reports the authoritative
+Open mode for those bindings: fresh initialization uses `OpenMode::New`, while
+reopening initialized storage uses `OpenMode::Existing`. The controller uses
+that report rather than inferring a mode from topology or a missing endpoint.
+Do not omit storage bindings to force Existing mode. Reports require explicit
+Open-mode evidence; older controller/runtime revisions must not be mixed.
+
 The independent [counter application](../../../scripts/fixtures/controller-test-util/src/lib.rs),
 [factory](../../../scripts/fixtures/controller-test-util/src/harness.rs) and
 [journeys](../../../scripts/fixtures/controller-test-util/src/journeys.rs) form
@@ -65,6 +73,11 @@ creation session. Contained restart reuses the volume but returns a fresh
 reference; replacement follows the controller's real PVC/Pod authority.
 Retained old service handles still address the old instance, making real
 stale-writer assertions possible.
+
+An RPC outage alone does not remove a still-desired secondary while its exact
+Pod remains live and the admitted primary is reachable. Membership is retained
+through restart gaps; positive Pod retirement/replacement and explicit
+scale-down still permit topology changes.
 
 Finish every normal result path with the consuming async `finish(result)`
 operation. It drains the supervisor, startup/host tasks, application workers

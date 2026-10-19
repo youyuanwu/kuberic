@@ -1200,6 +1200,27 @@ impl Reconciler {
                 })
             })
         });
+        // A live secondary's missing RPC is not evidence of membership retirement.
+        if current_primary_available
+            && current.as_ref().is_some_and(|configuration| {
+                configuration.members.iter().any(|member| {
+                    member.role == ReplicaRole::ActiveSecondary
+                        && member.identity.replica_id.value() <= i64::from(desired_replicas)
+                        && !topology_replicas.iter().any(|replica| {
+                            replica.report.replica.replica_id == member.identity.replica_id
+                        })
+                        && raw.pods.iter().any(|pod| {
+                            pod.uid().as_deref() == Some(member.identity.instance_id.as_str())
+                                && pod.metadata.deletion_timestamp.is_none()
+                        })
+                })
+            })
+        {
+            return Ok(ReconcileAction {
+                requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
+                kind: ReconcileKind::Waiting,
+            });
+        }
         if frozen_topology.is_none()
             && current_primary_available
             && active_switchover.is_some_and(|request| {

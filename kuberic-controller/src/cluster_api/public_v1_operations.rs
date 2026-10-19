@@ -229,19 +229,23 @@ impl HostedPublicV1Harness {
         configuration: &kuberic_runtime::protocol::types::ConfigurationDescriptor,
     ) -> Result<(), String> {
         for member in &configuration.members {
-            self.execute_authority_program(
-                &member.identity,
-                preview_generation,
-                OperationId::new(format!(
-                    "{operation_id}-open-{}",
-                    member.identity.replica_id
-                )),
-                PublicOperationProgram::Open {
-                    replica: member.identity.clone(),
-                    existing: true,
-                },
-            )
-            .await?;
+            let report = self.report(&member.identity).await?;
+            if !report.has_current_open_endpoint() {
+                self.execute_authority_program(
+                    &member.identity,
+                    preview_generation,
+                    OperationId::new(format!(
+                        "{operation_id}-open-{}",
+                        member.identity.replica_id
+                    )),
+                    PublicOperationProgram::Open {
+                        replica: member.identity.clone(),
+                        existing: report.open_mode
+                            == kuberic_runtime::protocol::types::OpenMode::Existing,
+                    },
+                )
+                .await?;
+            }
         }
         self.install_configuration_on_all(operation_id, preview_generation, configuration)
             .await
@@ -487,12 +491,8 @@ impl HostedPublicV1Harness {
                     .replacement
                     .as_ref()
                     .ok_or_else(|| "session renewal lacks a replacement".to_string())?;
-                if self
-                    .replica(&replacement.identity)?
-                    .handle
-                    .public_v1_provider_writer_count()
-                    == 0
-                {
+                let report = self.report(&replacement.identity).await?;
+                if !report.has_current_open_endpoint() {
                     self.execute_authority_program(
                         &replacement.identity,
                         accepted.required.history.protocol_generation.value(),
@@ -502,7 +502,8 @@ impl HostedPublicV1Harness {
                         )),
                         PublicOperationProgram::Open {
                             replica: replacement.identity.clone(),
-                            existing: true,
+                            existing: report.open_mode
+                                == kuberic_runtime::protocol::types::OpenMode::Existing,
                         },
                     )
                     .await?;

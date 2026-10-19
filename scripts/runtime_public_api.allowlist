@@ -54,6 +54,7 @@ page:control/proto/enum.FaultType.html
 page:control/proto/enum.PublicV1CallKind.html
 page:control/proto/enum.PublicV1CatchUpMode.html
 page:control/proto/enum.PublicV1DataLossRecoveryStage.html
+page:control/proto/enum.PublicV1OpenMode.html
 page:control/proto/enum.PublicV1OperationResultKind.html
 page:control/proto/enum.PublicV1ProgressRole.html
 page:control/proto/enum.PublicV1ProviderProgressResetKind.html
@@ -207,6 +208,7 @@ page:protocol/types/enum.BuildAuthorityKind.html
 page:protocol/types/enum.CleanupResourceIdentity.html
 page:protocol/types/enum.ConditionStatus.html
 page:protocol/types/enum.FaultType.html
+page:protocol/types/enum.OpenMode.html
 page:protocol/types/enum.PlannedSwitchoverOutcome.html
 page:protocol/types/enum.PlannedSwitchoverResolution.html
 page:protocol/types/enum.ProcessSessionRenewalReason.html

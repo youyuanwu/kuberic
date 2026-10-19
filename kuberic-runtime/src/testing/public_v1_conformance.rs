@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -769,6 +769,18 @@ fn scenario_filter(scenarios: fn(&Gate) -> &'static [&'static str]) -> String {
         .join(" or ")
 }
 
+fn conformance_command(action: &str, root: &Path, archive: Option<&Path>) -> Command {
+    let mut command = Command::new("cargo");
+    command.current_dir(root).args(["nextest", action]);
+    if let Some(archive) = archive {
+        command.arg("--archive-file").arg(archive);
+    } else {
+        // Match the source job's feature graph instead of rebuilding a package subset.
+        command.args(["--workspace", "--all-features"]);
+    }
+    command
+}
+
 fn run_scenarios(
     subject: &str,
     packages: &[&str],
@@ -776,7 +788,12 @@ fn run_scenarios(
     deadline: Instant,
 ) {
     let root = workspace_root();
-    let filter = scenario_filter(scenarios);
+    let packages = packages
+        .iter()
+        .map(|package| format!("package(={package})"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let filter = format!("({packages}) and ({})", scenario_filter(scenarios));
     let archive = std::env::var_os("NEXTEST_ARCHIVE")
         .map(PathBuf::from)
         .map(|path| {
@@ -787,16 +804,7 @@ fn run_scenarios(
             }
         })
         .filter(|path| path.is_file());
-    let mut list = Command::new("cargo");
-    list.current_dir(&root).args(["nextest", "list"]);
-    if let Some(archive) = &archive {
-        list.arg("--archive-file").arg(archive);
-    } else {
-        for package in packages {
-            list.args(["-p", package]);
-        }
-        list.arg("--all-features");
-    }
+    let mut list = conformance_command("list", &root, archive.as_deref());
     list.args([
         "--profile",
         "ordinary",
@@ -823,29 +831,21 @@ fn run_scenarios(
         }
     }
 
-    let mut run = Command::new("cargo");
-    run.current_dir(&root).args(["nextest", "run", "-j", "1"]);
-    let extract = archive.as_ref().map(|archive| {
+    let mut run = conformance_command("run", &root, archive.as_deref());
+    run.args(["-j", "1"]);
+    let extract = archive.as_ref().map(|_| {
         let path = root.join("target").join(format!(
             "public-v1-conformance-extract-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create Public V1 conformance extraction directory");
-        run.arg("--archive-file")
-            .arg(archive)
-            .arg("--extract-to")
+        run.arg("--extract-to")
             .arg(&path)
             .arg("--workspace-remap")
             .arg(&root);
         path
     });
-    if archive.is_none() {
-        for package in packages {
-            run.args(["-p", package]);
-        }
-        run.arg("--all-features");
-    }
     run.args([
         "--profile",
         "ordinary",
@@ -873,6 +873,27 @@ fn run_scenarios(
 #[cfg(all(test, unix))]
 mod bounded_process_tests {
     use super::*;
+
+    #[test]
+    fn nested_commands_reuse_workspace_features_or_the_exact_archive() {
+        for action in ["list", "run"] {
+            for archive in [None, Some(Path::new("conformance.tar.zst"))] {
+                let command = conformance_command(action, Path::new("."), archive);
+                let expected = if archive.is_some() {
+                    vec!["nextest", action, "--archive-file", "conformance.tar.zst"]
+                } else {
+                    vec!["nextest", action, "--workspace", "--all-features"]
+                };
+                assert_eq!(
+                    command
+                        .get_args()
+                        .map(|argument| argument.to_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
 
     fn process_exists(pid: i32) -> bool {
         unsafe extern "C" {
