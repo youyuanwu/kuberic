@@ -1098,7 +1098,7 @@ fn real_receiver_ack_reaches_session_sender_but_cannot_bypass_ordered_primary_ha
                 assert!(ingress.ack.is_some());
                 received
             }
-            SendKind::RequestAck | SendKind::StartCopy { .. } => {
+            SendKind::RequestAck | SendKind::StartCopy { .. } | SendKind::InduceFault { .. } => {
                 panic!("expected actual primary data send")
             }
         };

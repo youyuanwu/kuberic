@@ -68,8 +68,12 @@ slice-boundary omissions.
 The [data-loss recovery slice](sf-v1-port-ledger.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11)
 adds primary-only checking, changed/unchanged provider recovery, actual queue
 reset, retained callbacks and native error/state-restoration ordering.
+The [queue-policy slice](sf-v1-port-ledger.md#queue-pressure-and-slow-peer-policy-slice-p3-bounded-f02f03f06f07f08f11)
+adds periodic freshness and pressure retargeting, slow-peer completion-disable/
+sender closure and reclamation exclusion, and retrying typed fault notifications.
+Quorum/all-applied and live MustCatchup retain faulted active replicas.
 Broader Open/restart/host recovery and replica rebuild policy,
-full host role/epoch demux, monitoring/health and periodic/slow-peer policy
+full host role/epoch/InduceFault demux, remote fault handling and monitoring/health
 remain pending.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
@@ -444,8 +448,10 @@ composes replay/retirement with the actual manager. Bounded role orchestration
 now adds promotion-specific drains, retained queue handoff/demotion and direct
 external epoch sequencing. Bounded data-loss orchestration now composes actual
 provider recovery, changed-only progress/reset and native admission/restoration.
-Broader Open/restart/host recovery and rebuild policy, full host demux and
-remaining session policies are pending. This roadmap is not
+Bounded queue policy now composes periodic/pressure retarget, slow-peer
+exclusion and retrying notifications with native quorum/all/MustCatchup behavior.
+Broader Open/restart/host recovery and rebuild policy, full host demux/remote
+fault handling and platform monitoring are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required

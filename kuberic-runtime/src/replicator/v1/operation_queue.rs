@@ -9,13 +9,13 @@
 //!
 //! Owners serialize synchronous calls. Callbacks must be fast, staging only;
 //! owners perform provider/transport/dispatch effects outside their guards.
-//! There is no lock, task or await here. Ordered owned storage replaces the
+//! There is no task or await here. Ordered owned storage replaces the
 //! native ring, but capacity still bounds LSN span (holes included), not length.
-//! Trace/timing/performance-counter plumbing is not translated.
+//! Only enqueue age is retained from native timing/performance plumbing.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::application::{Lsn, OperationData};
 
@@ -34,6 +34,7 @@ pub(super) struct QueueOperation {
     logical_bytes: usize,
     representation: BufferPolicy,
     needs_ack: AtomicBool,
+    enqueued_at: Mutex<tokio::time::Instant>,
 }
 
 #[cfg_attr(
@@ -51,6 +52,7 @@ impl QueueOperation {
             data,
             representation: BufferPolicy::RawSingle,
             needs_ack: AtomicBool::new(needs_ack),
+            enqueued_at: Mutex::new(tokio::time::Instant::now()),
         })
     }
 
@@ -70,11 +72,20 @@ impl QueueOperation {
             logical_bytes,
             representation: policy,
             needs_ack: AtomicBool::new(needs_ack),
+            enqueued_at: Mutex::new(tokio::time::Instant::now()),
         }))
     }
 
     pub(super) fn lsn(&self) -> Lsn {
         self.lsn
+    }
+
+    pub(super) fn age(&self) -> std::time::Duration {
+        self.enqueued_at.lock().unwrap().elapsed()
+    }
+
+    fn refresh_enqueue_time(&self) {
+        *self.enqueued_at.lock().unwrap() = tokio::time::Instant::now();
     }
 
     pub(super) fn data(&self) -> &OperationData {
@@ -271,6 +282,9 @@ impl OperationQueue {
     /// Owners normalize role state/byte/history limits, not this constructor.
     pub(super) fn transfer(mut self, config: QueueConfig) -> Self {
         config.validate();
+        for operation in self.entries.values() {
+            operation.refresh_enqueue_time();
+        }
         self.config = config;
         if config.max_capacity != 0 {
             assert!(self.entries.len() <= config.max_capacity);
@@ -291,6 +305,25 @@ impl OperationQueue {
 
     pub(super) fn operation_count(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(super) fn utilization_percent(&self) -> u32 {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        let count = if self.config.max_capacity == 0 {
+            0
+        } else {
+            ((self.progress.tail - self.progress.complete_head) as u128 * 100
+                / self.config.max_capacity as u128) as u32
+        };
+        let bytes = if self.config.max_bytes == 0 {
+            0
+        } else {
+            ((self.total_bytes - self.completed_bytes) as u128 * 100
+                / self.config.max_bytes as u128) as u32
+        };
+        count.max(bytes)
     }
 
     pub(super) fn total_bytes(&self) -> usize {

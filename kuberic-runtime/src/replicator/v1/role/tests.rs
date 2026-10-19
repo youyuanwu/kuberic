@@ -202,6 +202,10 @@ impl Rig {
                     epoch: epoch(1),
                     allow_multiple_quorum_set: true,
                     sender: sender(),
+                    queue_policy:
+                        crate::replicator::v1::replica_manager::QueuePolicyConfig::for_persisted(
+                            required,
+                        ),
                     send: Arc::new(move |intent| {
                         recorded.lock().unwrap().push(intent);
                         true

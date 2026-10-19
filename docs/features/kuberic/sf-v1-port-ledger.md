@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
 **P1 foundation, unselected P2 substrate slices and bounded P3 primary,
-secondary, copy, role and data-loss ownership slices; no selected production behavior change.** Native pin:
+secondary, copy, role, data-loss and queue-policy ownership slices; no selected production behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -835,12 +835,66 @@ preconditions, original errors/state restoration and abnormal shutdown. See
 [source provenance](sf-v1-port-provenance.md#data-loss-recovery-slice-p3-bounded-f01f02f03f09f11).
 Use the live nextest inventory for discovery and partitioning.
 
-**Remaining owners:** broader Open/restart/host recovery and rebuild policy,
+**Remaining owners at that slice boundary:** broader Open/restart/host recovery and rebuild policy,
 periodic/slow-peer/MustCatchup policy, full host role/epoch demux, monitoring/
 health, P4 public/outer lifecycle adapters and P5 atomic activation.
 All components remain private/unselected. No protected API, selected wiring,
 dependency/tier change, native/differential/hosted/provider-fsync parity,
 full ordinary execution or complete P2/P3 claim.
+
+### Queue Pressure and Slow-Peer Policy Slice (P3, Bounded F02/F03/F06/F07/F08/F11)
+
+The private [`primary`](../../../kuberic-runtime/src/replicator/v1/primary.rs)
+now drives the actual
+[`manager policy`](../../../kuberic-runtime/src/replicator/v1/replica_manager/policy.rs)
+after queue admission, including rejected full admission, and owns periodic
+freshness ticks. Freshness raises pending idle copy targets to commitment;
+pressure first raises them to latest-issued, updates actual progress and
+rechecks utilization before faulting. Neither path resets a completed copy gate.
+Dynamic private settings are sampled on each decision; persisted/volatile
+restart defaults remain distinct. No public settings adapter is activated.
+
+Utilization is the truncated maximum of pending LSN-span and logical-byte
+percentages, excluding completed history. Oldest-operation age uses Tokio's
+monotonic clock; queue transfer refreshes actual operation timestamps as native
+does. Active faulting requires spare current members, write quorum above one,
+the age guard, current quorum strictly beyond the queue head and a receive
+latency above the fastest remote quorum's mean plus twice population deviation.
+The duration outlier must also be the least-receive-progress replica.
+
+Idle faulting uses the actual BuildIdle/CopySender completion-disable operation.
+A completed build wins that race and is not faulted. Successful slow faulting
+closes the reliable replication sender **before reclamation**, then removes its
+receive constraint without fabricating receive/apply ACKs or deleting membership.
+Active quorum/all-applied and the live MustCatchup minimum still include a
+slow-faulted active replica; late ACKs cannot reopen its closed sender. Such a
+MustCatchup wait can remain pending until the host changes configuration.
+Faulted idle-to-current promotion is rejected; previous-config overlap is not
+promotion.
+
+Session-owned InduceFault notifications retry independently of replication,
+even after send-queue backpressure or accepted delivery. Active notification
+starts after the retry interval; idle notification waits for **both** terminal
+copy ACK sentinels. Build or terminal-session drivers own the deadlines, and
+Close/Abort/removal cancels them. Selected effects dispatch outside owner guards.
+The typed tonic adapter uses the bound route's actual target replica/incarnation,
+not the session's legacy logical incarnation. Receipt is not a remote fault ACK.
+
+Actual-owner regressions cover strict freshness/outlier/age/usage boundaries,
+retarget-before-fault reclamation, full-admission policy, completion races,
+MustCatchup/quorum/all preservation, retry/identity, reentrancy and shutdown.
+Missing actual copy ownership fails explicitly rather than supplying success;
+a policy failure never hides an already assigned write. See
+[validation](testing.md#sf-v1-queue-pressure-and-slow-peer-policy-slice) and
+[provenance](sf-v1-port-provenance.md#queue-pressure-and-slow-peer-policy-slice-p3-bounded-f02f03f06f07f08f11).
+Use the live nextest inventory, not a static coverage total.
+
+**Remaining owners:** broader Open/restart/host recovery and rebuild policy,
+full host role/epoch/InduceFault demux and remote fault handling, monitoring/
+health, public settings/service/outer-lifecycle adapters and atomic activation.
+Protected interfaces, selected wiring, dependencies and tier policy remain
+unchanged. No full P2/P3, native execution, differential/hosted/provider-fsync
+parity or full ordinary execution is claimed.
 
 ## Source families, transitions and substitutions
 
@@ -851,7 +905,7 @@ full ordinary execution or complete P2/P3 claim.
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`, `copy_establishment.rs`, `secondary.rs`, `role.rs` | async queues/executor; required/optimistic ACK, shared StartCopy receiver, provider callbacks, ordinary Close/Abort, promotion drainage, direct epochs and actual queue handoff delivered; host demux pending | S1–S3, E2 |
 | F05 operation/data/stream/provider ([stream:24–80][copy-receiver], [callback:167–224][callback], [IDL:636–683][idl]) | shared getters, data/EOF/EOS, late callback states, provider enumeration | existing protected facade + `v1/buffers.rs`, `received_operation.rs`, `operation_stream.rs`, bounded copy/context streams, `copy_async_operation.rs`, `copy_establishment.rs` | protected Bytes/boxed stream/i64 unchanged; shared receipt, terminal adapters, serial polling and bounded copy provider acquisition delivered; public facade/full provider lifecycle pending | D1, S2–S3, C1–C2 |
-| F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs`, bounded `primary.rs` | tasks/injected clocks and lasting post-build session timer/ordered ACK ownership, not deleting native retry/flow control because HTTP/2 is reliable | R1–R3, T2 |
+| F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs`, bounded `primary.rs`, `replica_manager/policy.rs` | injected clocks, lasting session timers/ordered ACKs and slow-fault notification/reclamation policy; quorum/all/MustCatchup remain separate | R1–R3, T2 |
 | F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`, `copy_sender.rs`, `copy_establishment.rs`, `build_idle.rs`; full role composition pending | context acquisition/receipt, reliable StartCopy, serial enumeration/sending, EOF-issued target, copy/replication gates/pending retarget and idle lifecycle delivered; no fixed snapshot-only build substitute | C2–C5 |
 | F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, bounded primary session ACK/context lookup, private `sf_v1.proto` | tonic carrier, no native wire compatibility; accepted send is not service ACK; full host/role demux integration pending | T1–T2, D1 |
 | F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | bounded `v1/role.rs`, `primary.rs`, `replica_manager.rs`, `replication_queue_manager.rs`; host/controller adapters pending | actual changed/unchanged provider recovery and queue reset, no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
@@ -1014,7 +1068,10 @@ data-loss orchestration now retains changed/unchanged provider recovery,
 actual queue reset and native admission/error/state restoration.
 Broader Open/restart/host recovery and rebuild policy and full host role/epoch
 demux remain pending.
-Periodic/slow-peer/MustCatchup policy remains an explicit separate owner.
+Bounded periodic/pressure/slow-peer policy now drives actual retarget/disable,
+reclamation exclusion and retrying fault notifications while preserving
+quorum/all/MustCatchup. Remote fault handling and platform monitoring remain
+explicit host responsibilities.
 P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the

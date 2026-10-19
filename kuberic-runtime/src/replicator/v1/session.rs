@@ -6,7 +6,7 @@
 // src/prod/src/Reliability/Replication/. See sf-v1-port-provenance.md.
 
 //! Bounded, unselected session coordination, NOT a complete ReplicationSession.
-//! No carrier, demultiplexer, copy/build/quorum/role owner or slow-fault timer.
+//! No host demultiplexer or production activation. Owners drive timer effects.
 //! Primary owns idle-to-active session marking and actual sender-average reset.
 //! Copy/primary handoffs are explicit obligations, never successful stubs.
 //! Short transitions own a mutex; every external effect executes after release.
@@ -17,6 +17,8 @@ use std::time::Duration;
 use crate::application::Lsn;
 use crate::protocol::types::Epoch;
 
+use super::copy_async_operation::CopyError;
+use super::copy_sender::CopySenderHandle;
 use super::operation_queue::QueueOperation;
 use super::sender::{
     ReliableOperationSender, SendAction, SendBatch, SenderConfig, SenderOperation, SenderProgress,
@@ -49,6 +51,9 @@ pub(super) enum SendKind {
     },
     // Native RequestAck has no operation epoch or completed-hint body.
     RequestAck,
+    InduceFault {
+        reason: String,
+    },
 }
 
 #[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 send intent"))]
@@ -96,6 +101,10 @@ struct State {
     cached: AckSnapshot,
     processing: bool,
     latest_message_id: String,
+    idle_faulted: bool,
+    active_faulted: bool,
+    fault_reason: String,
+    fault_deadline: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -133,6 +142,10 @@ impl ReplicationSession {
                 },
                 processing: false,
                 latest_message_id: String::new(),
+                idle_faulted: false,
+                active_faulted: false,
+                fault_reason: String::new(),
+                fault_deadline: None,
             })),
         }
     }
@@ -148,6 +161,7 @@ impl ReplicationSession {
         let mut state = self.state.lock().unwrap();
         state.active = false;
         state.sender.close();
+        state.fault_deadline = None;
         if let Some(start_copy) = state.start_copy.as_mut() {
             start_copy.close();
         }
@@ -318,6 +332,80 @@ impl ReplicationSession {
         self.state.lock().unwrap().promoted
     }
 
+    pub(super) fn idle_faulted(&self) -> bool {
+        self.state.lock().unwrap().idle_faulted
+    }
+
+    pub(super) fn active_faulted(&self) -> bool {
+        self.state.lock().unwrap().active_faulted
+    }
+
+    pub(super) fn try_fault_idle(
+        &self,
+        copy: &CopySenderHandle,
+        reason: String,
+        now: Duration,
+    ) -> Result<bool, CopyError> {
+        let mut state = self.state.lock().unwrap();
+        if state.idle_faulted || !state.active {
+            return Ok(false);
+        }
+        if !copy.try_disable_build_completion()? {
+            return Ok(false);
+        }
+        assert!(!state.promoted);
+        state.sender.close();
+        state.idle_faulted = true;
+        state.fault_reason = reason;
+        Self::arm_fault(&mut state, now);
+        Ok(true)
+    }
+
+    pub(super) fn try_fault_active(&self, reason: String, now: Duration) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.active_faulted || !state.active {
+            return false;
+        }
+        state.sender.close();
+        state.active_faulted = true;
+        state.fault_reason = reason;
+        state.fault_deadline = Some(now.saturating_add(state.retry));
+        true
+    }
+
+    fn arm_fault(state: &mut State, now: Duration) {
+        if state.active
+            && state.idle_faulted
+            && state.cached.copy_received == -1
+            && state.cached.copy_applied == -1
+            && state.fault_deadline.is_none()
+        {
+            state.fault_deadline = Some(now.saturating_add(state.retry));
+        }
+    }
+
+    pub(super) fn fault_deadline(&self) -> Option<Duration> {
+        self.state.lock().unwrap().fault_deadline
+    }
+
+    pub(super) fn on_fault_timer(&self, now: Duration) -> Option<FaultSend> {
+        let mut state = self.state.lock().unwrap();
+        if !state.active || state.fault_deadline.is_none_or(|deadline| deadline > now) {
+            return None;
+        }
+        state.fault_deadline = Some(now.saturating_add(state.retry));
+        Some(FaultSend {
+            send: state.send.clone(),
+            intent: SendIntent {
+                identity: state.identity.clone(),
+                kind: SendKind::InduceFault {
+                    reason: state.fault_reason.clone(),
+                },
+                expires_after: None,
+            },
+        })
+    }
+
     pub(super) fn is_processing(&self) -> bool {
         self.state.lock().unwrap().processing
     }
@@ -328,6 +416,15 @@ impl ReplicationSession {
         &self,
         update: AckUpdate,
         progress_callback: Option<ProgressCallback>,
+    ) -> Option<AckProcessor> {
+        self.update_ack_at(update, progress_callback, Duration::ZERO)
+    }
+
+    pub(super) fn update_ack_at(
+        &self,
+        update: AckUpdate,
+        progress_callback: Option<ProgressCallback>,
+        now: Duration,
     ) -> Option<AckProcessor> {
         let mut state = self.state.lock().unwrap();
         let cached = &mut state.cached;
@@ -358,10 +455,12 @@ impl ReplicationSession {
         if !changed {
             return None;
         }
+        Self::arm_fault(&mut state, now);
         state.latest_message_id = update.message_id;
         if state.processing {
             return None;
         }
+
         state.processing = true;
         let mut snapshot = state.cached;
         snapshot.process_copy = update.process_copy;
@@ -372,6 +471,19 @@ impl ReplicationSession {
             stage: Stage::Replication,
             replication_advanced: false,
         })
+    }
+}
+
+#[must_use = "deliver the selected notification outside owner guards"]
+pub(super) struct FaultSend {
+    send: SendCallback,
+    intent: SendIntent,
+}
+
+impl FaultSend {
+    pub(super) fn dispatch(self) {
+        // Queue-full and accepted delivery both leave the periodic retry armed.
+        (self.send)(self.intent);
     }
 }
 

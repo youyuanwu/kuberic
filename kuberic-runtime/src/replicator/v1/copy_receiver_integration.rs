@@ -226,7 +226,7 @@ fn actual_terminal_copy_ack_reaches_session_but_cannot_execute_missing_build_own
             original_epoch,
             true,
         ),
-        SendKind::RequestAck | SendKind::StartCopy { .. } => {
+        SendKind::RequestAck | SendKind::StartCopy { .. } | SendKind::InduceFault { .. } => {
             panic!("expected actual replication send")
         }
     };

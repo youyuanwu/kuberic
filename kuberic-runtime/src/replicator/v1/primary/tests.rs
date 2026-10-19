@@ -24,6 +24,7 @@ use crate::replicator::v1::sender::SenderConfig;
 use crate::replicator::v1::session::{SendIntent, SendKind, SessionIdentity};
 
 mod configuration;
+mod policy;
 
 #[tokio::test]
 async fn recovery_reset_requires_selected_send_and_queue_drain_without_reopening_closed_primary() {
@@ -191,6 +192,7 @@ fn primary_config() -> PrimaryConfig {
         epoch: Epoch::new(1, 7),
         allow_multiple_quorum_set: true,
         sender: sender(),
+        queue_policy: QueuePolicyConfig::for_persisted(true),
         send: Arc::new(|_| panic!("isolated fixture must supply a session callback")),
     }
 }

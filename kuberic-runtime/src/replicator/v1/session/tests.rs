@@ -98,6 +98,52 @@ fn drive(mut processor: AckProcessor, now: Duration) -> Vec<Event> {
 }
 
 #[test]
+fn active_slow_fault_retries_after_backpressure_and_acceptance_without_advancing_ack() {
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let target = attempts.clone();
+    let session = session(Arc::new(move |intent| {
+        assert_eq!(intent.identity, identity());
+        assert_eq!(intent.expires_after, None);
+        let SendKind::InduceFault { reason } = intent.kind else {
+            panic!("expected fault")
+        };
+        target.lock().unwrap().push(reason);
+        target.lock().unwrap().len() != 1
+    }));
+    assert!(session.try_fault_active("queue pressure".into(), ms(5)));
+    assert!(!session.try_fault_active("duplicate".into(), ms(6)));
+    assert_eq!(session.retry_deadline(), None);
+    assert!(session.on_fault_timer(ms(14)).is_none());
+    session.on_fault_timer(ms(15)).unwrap().dispatch();
+    session.on_fault_timer(ms(25)).unwrap().dispatch();
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        ["queue pressure", "queue pressure"]
+    );
+    assert_eq!(session.fault_deadline(), Some(ms(35)));
+    assert_eq!(session.progress(0).applied, 0);
+    session.close();
+    assert!(session.on_fault_timer(ms(35)).is_none());
+    assert_eq!(session.fault_deadline(), None);
+    assert!(!session.try_fault_active("closed".into(), ms(36)));
+}
+
+#[test]
+fn selected_fault_send_can_reenter_close_without_holding_a_session_guard() {
+    let target = Arc::new(Mutex::new(None::<ReplicationSession>));
+    let callback = target.clone();
+    let session = session(Arc::new(move |_| {
+        callback.lock().unwrap().as_ref().unwrap().close();
+        true
+    }));
+    *target.lock().unwrap() = Some(session.clone());
+    assert!(session.try_fault_active("slow".into(), ms(0)));
+    session.on_fault_timer(ms(10)).unwrap().dispatch();
+    assert_eq!(session.fault_deadline(), None);
+    *target.lock().unwrap() = None;
+}
+
+#[test]
 fn pass_closes_start_copy_then_dispatches_replication_before_copy_gate_primary_copy() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let sent = log.clone();

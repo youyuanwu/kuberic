@@ -648,11 +648,40 @@ See the
 and [selector](testing.md#sf-v1-data-loss-recovery-slice).
 Use the live inventory validator for current discovery and partitioning.
 No dependency or protected-interface change is introduced. All owners remain
-private/unselected; broader Open/restart/host recovery and replica rebuild
+private/unselected; at that slice boundary broader Open/restart/host recovery and replica rebuild
 policy, periodic/slow-peer/MustCatchup policy, full host demux/health,
 P4 public/outer lifecycle adapters and P5 activation remain pending.
 No native execution, differential/hosted/provider-fsync parity, full ordinary
 execution or complete P2/P3 claim.
+
+### Queue Pressure and Slow-Peer Policy Slice (P3, Bounded F02/F03/F06/F07/F08/F11)
+
+Rust destinations retain Microsoft copyright/MIT:
+[`manager policy`](../../../kuberic-runtime/src/replicator/v1/replica_manager/policy.rs),
+[`primary`](../../../kuberic-runtime/src/replicator/v1/primary.rs),
+[`policy regressions`](../../../kuberic-runtime/src/replicator/v1/primary/tests/policy.rs)
+and narrow actual manager/session/build/establishment/queue/carrier extensions
+with their component tests. `R/` is the pinned replication source prefix above.
+
+| Selected native material | Incorporated responsibility / Rust substitution |
+|---|---|
+| `R/ReplicaManager.cpp:530-545,716-778` | Minimum trace/freshness tick, strict elapsed freshness comparison, nonfaulted-idle retarget to current commitment and callback-time settings sampling. Primary caller-driven Tokio timer replaces Common Timer; tracing itself is not a new monitoring implementation. |
+| `R/ReplicaManager.cpp:1832-2076`; `R/CopySender.cpp:524-579`; `R/ReplicationSession.cpp:127-173` | Policy after successful or full admission; idle retarget to issued tail before disable/fault, actual progress update and pressure recheck. Reuse actual CopySender target/completion-disable gates through BuildIdle. Completed build wins the disable race. Serialized Rust transitions replace native read/write lock reselection; external effects remain outside guards. Partial selected completions are retained even if later policy work fails. |
+| `R/ReplicaManager.cpp:173-284,350-432,1871-1980`; `R/standarddeviation.h:17-22`, `.cpp:32-76` | Spare-quorum, age and current-quorum guards; fastest remote quorum population mean/deviation, strict outlier and least-receive-progress identity; rechecked utilization. Preserve native 100ns threshold truncation using bounded sender-duration samples, without importing numeric utility code. Active slow faults exclude only receive-based reclamation, not quorum/all-applied or live MustCatchup. No marked-replica exemption is invented. |
+| `R/ReplicationSession.cpp:175-283`; `R/RemoteSession.cpp:448-490`; `R/ReplicaManager.cpp:1748-1750,2443-2450` | Close reliable sender before reclamation; keep separate idle/active fault flags; idle notifications wait for both copy sentinels, active notifications start after retry interval. Session deadlines and rooted send effects replace retry timers. Accepted send does not clear retries or advance ACKs; actual Close cancels deadlines. Faulted idle promotion fails explicitly while PC overlap stays distinct. |
+| `R/Replicator.cpp:946-980`; `R/OperationQueue.cpp:135-138,205-212`; `R/ComOperation.cpp:18-28` | Pending LSN-span/logical-byte utilization with integer truncation; actual operation creation timestamp and refresh on queue transfer. Tokio monotonic instants support deterministic paused-time checks; retained operation identity is unchanged. No native performance-counter plumbing is imported. |
+| `src/prod/src/ServiceModel/reliability/replication/REConfigMacros.h:166-177`; `R/REInternalSettings.cpp:451-607` | Private typed settings retain inspected defaults and persisted/volatile enablement. Explicit private updates are sampled by real owners; no config-store implementation or arbitrary public-settings upgrade is claimed. |
+| `R/ReplicationSession.cpp:251-280`; existing private `sf_v1.proto` and logical carrier | Map real session fault sends into existing typed InduceFault envelope using the bound route's real target identity. Actual tonic roundtrip exercises repeated notification and unchanged sender progress. No native wire compatibility or remote host fault handling is claimed. |
+| Production ranges above; `R/DecayAverage.Test.cpp:65-108` and `R/ReplicatorSettings.Test.cpp:738-788` are reviewed context only | Rust tests exercise actual owners, sends, queue observations and paused time. Deviation thresholds are observed through real sender ACK latency, not a duplicated formula oracle. No whole native test, fixture, harness, Common/Transport/KTL/Boost or other dependency implementation is incorporated. |
+
+See the
+[ledger](sf-v1-port-ledger.md#queue-pressure-and-slow-peer-policy-slice-p3-bounded-f02f03f06f07f08f11)
+and [selector](testing.md#sf-v1-queue-pressure-and-slow-peer-policy-slice).
+All components remain private/unselected. Protected APIs, dependencies and tier
+policy are unchanged. Broader host/Open/restart/rebuild, full role/epoch and
+InduceFault demux/remote fault handling, monitoring/health, public settings and
+P4/P5 adapters/activation remain pending. No full ordinary/native execution,
+differential/hosted/provider-fsync parity or full P2/P3 claim.
 
 ### P1 documented expectations (historical foundation)
 
