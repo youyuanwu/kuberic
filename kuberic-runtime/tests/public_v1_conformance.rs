@@ -1,3 +1,5 @@
+#![cfg(kuberic_workspace_tests)]
+
 #[test]
 fn public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16() {
     kuberic_runtime::testing::assert_public_v1_conformance_subject("built-in-replacement");

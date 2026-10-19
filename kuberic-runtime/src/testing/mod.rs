@@ -5,7 +5,9 @@
 //! none of these records can be passed to production admission APIs. Private
 //! attachment, registration, lifecycle, and authority capabilities stay private.
 
+#[cfg(kuberic_workspace_tests)]
 mod public_v1_alternate_registration_fixture;
+#[cfg(kuberic_workspace_tests)]
 mod public_v1_conformance;
 pub mod session;
 pub mod sqlite_store;
@@ -18,6 +20,7 @@ fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> U {
         .expect("fixture record matches the durable host format")
 }
 
+#[cfg(kuberic_workspace_tests)]
 pub use public_v1_conformance::{
     ReplacementOwnershipInventory, assert_public_v1_conformance_gate,
     assert_public_v1_conformance_not_applicable, assert_public_v1_conformance_subject,

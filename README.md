@@ -20,7 +20,7 @@ history and lifecycle authority.
 ```text
 kuberic-runtime/           Application/replicator API, host, protocol, control
 kuberic-controller/        CRDs, reconciliation policy and Kubernetes controller
-kuberic-level-tests/       Unpublished isolated KinD scenario harness
+kuberic-level-tests/       Unpublished in-process application and owned KinD journeys
 
 examples/kvstore2/         Level-triggered conformance application
 examples/sqlite/           SQLite Public V1 application
@@ -32,8 +32,11 @@ There are exactly two public production crates: `kuberic-runtime` and
 unpublished workspace packages (`publish = false`).
 Applications depend only on `kuberic-runtime`; its default `host` feature supplies
 `host::ReplicaHost`. Shared contracts are under `protocol` and `control`.
-The `testing` feature provides isolated conformance fixtures without exporting
-production capabilities. The SQLite example owns its application-specific WAL
+The runtime's `testing` feature provides isolated fixtures without exporting
+production capabilities. The controller's opt-in `test-util` feature exposes
+the [downstream in-process harness](docs/features/kuberic/in-process-testing.md)
+for application dev-dependencies. Checkout-only conformance helpers remain
+separately gated. The SQLite example owns its application-specific WAL
 commit-barrier implementation as a private module; it is not a runtime API.
 The controller disables runtime default features and owns pure evaluation/plan APIs.
 
@@ -72,13 +75,15 @@ Build once and verify the exact ordinary/PostgreSQL partitions with:
 ```bash
 just nextest-archive
 just nextest-validate-archive
+just nextest-source
 ```
 
 The complete tier inventory and shard commands are documented in the
 [test strategy](docs/features/kuberic/testing.md).
 
-The current test inventory contains 1071 tests: 1025 ordinary, 41 PostgreSQL,
-three KinD, and two build-only.
+The archive contains all nextest-discoverable test binaries. Source/API/package
+checks and doctests run in a separate checkout-backed CI job; ordinary
+application/provider tests execute from archive partitions.
 
 ## Experimental Kubernetes Validation
 
@@ -149,6 +154,8 @@ the isolated development/CI assets above.
 - [V2 transactional Replicator design](docs/features/kuberic/v2-transactional-replicator-design.md)
 - [Replicator boundary and native proof](docs/features/kuberic/replicator-boundary.md)
 - [Testing strategy](docs/features/kuberic/testing.md)
+- [Downstream in-process application testing](docs/features/kuberic/in-process-testing.md)
+- [Downstream in-process testing harness design](docs/proposal/downstream-in-process-testing.md)
 - [SQLite design](docs/features/sqlite/design.md)
 - [PostgreSQL design](docs/features/postgres/design.md)
 - [V1 removal record](docs/proposal/v1-retirement-plan.md)

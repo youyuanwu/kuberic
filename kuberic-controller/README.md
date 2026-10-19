@@ -7,6 +7,19 @@ The controller watches `operator.kuberic.io/v1alpha1` `KubericSet` resources
 and their owned Pods, PVCs, Services, and Secrets. It consumes shared Public V1
 contracts from `kuberic-runtime` with runtime host features disabled.
 
+## In-Process Application Tests
+
+The optional `test-util` feature exposes `test_util::TestCluster` and
+`ApplicationFactory` for downstream application integration tests. It hosts
+real application replicas and drives the production reconciler against an
+owned Kubernetes resource test service. It is disabled by default and never
+redirects production controller entry points.
+
+Use the controller as a dev-dependency with `features = ["test-util"]` and a
+matching runtime dependency. See the
+[downstream testing guide](../docs/features/kuberic/in-process-testing.md) for
+factory/lifecycle ownership, typed faults, package checks and evidence limits.
+
 ## Reconciliation
 
 Each reconcile:

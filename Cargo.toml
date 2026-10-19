@@ -19,7 +19,7 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 kuberic-controller = { version = "0.0.1", path = "kuberic-controller" }
-kuberic-runtime = { version = "0.0.1", path = "kuberic-runtime", default-features = false }
+kuberic-runtime = { version = "=0.0.1", path = "kuberic-runtime", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tokio-stream = "0.1"

@@ -41,6 +41,7 @@ pub(crate) enum PublicV1ControlServiceRegistration {
 }
 
 impl PublicV1ControlServiceRegistration {
+    #[cfg(kuberic_workspace_tests)]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::AgentControl => "AgentControlServer",
@@ -123,7 +124,9 @@ pub(crate) fn validate_public_v1_control_services(
     }
     Ok(())
 }
+#[cfg(kuberic_workspace_tests)]
 pub(crate) const PUBLIC_V1_AGENT_REPORT_BRANCHES: &[&str] = &["public_v1"];
+#[cfg(kuberic_workspace_tests)]
 pub(crate) const PUBLIC_V1_SERVICE_STARTUP_OWNERS: &[&str] = &["PartitionOperationRuntime"];
 
 pub(crate) struct InitializationService {
@@ -674,6 +677,27 @@ where
     }
 
     async fn execute_public_intent(&self, intent: PublicOperationIntent) -> Result<()> {
+        let registry = self.registry.get().cloned().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "Public V1 operation runtime is unavailable".into(),
+            )
+        })?;
+        let service = self.clone();
+        let (completed, result) = tokio::sync::oneshot::channel();
+        // Access-fence release and projection publication belong to the accepted
+        // execution, not to the lifetime of the RPC waiting for its reply.
+        registry.own_control_task(async move {
+            let outcome = service.execute_public_intent_owned(intent).await;
+            let _ = completed.send(outcome);
+        });
+        result.await.map_err(|error| {
+            crate::host::HostError::CommandRejected(format!(
+                "owned public execution stopped before replying: {error}"
+            ))
+        })?
+    }
+
+    async fn execute_public_intent_owned(&self, intent: PublicOperationIntent) -> Result<()> {
         let terminal_program = matches!(
             intent.program.as_ref(),
             Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
@@ -1052,6 +1076,10 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "service_cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {

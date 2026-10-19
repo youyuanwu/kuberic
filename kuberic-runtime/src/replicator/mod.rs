@@ -17,6 +17,7 @@ pub(crate) struct PublicV1FactoryRegistration {
 }
 
 impl PublicV1FactoryRegistration {
+    #[cfg(kuberic_workspace_tests)]
     pub(crate) const fn stateless(
         name: &'static str,
         constructor: fn(Arc<dyn DurableState>) -> stateless::StatelessReplicatorFactory,
@@ -129,6 +130,15 @@ use stream::OperationStream;
 
 #[async_trait]
 pub(crate) trait StatelessRuntimeControl: Send + Sync {
+    #[cfg(feature = "testing")]
+    fn testing_tcp_binding(
+        &self,
+    ) -> Option<(
+        ReplicaIdentity,
+        ProcessSessionId,
+        ReplicatorCreationReservation,
+    )>;
+
     async fn reported_progress(&self) -> Result<(i64, i64)>;
     async fn shutdown_and_drain(&self) -> Result<()>;
     async fn install_inbound_build_authority(
@@ -1012,6 +1022,11 @@ impl StatefulServicePartition {
         })?;
         let reservation = self.registration.reserve_replicator_creation()?;
         let context = self.context.for_creation(reservation);
+        #[cfg(feature = "testing")]
+        let testing_route = stateless::testing_transport::before_attachment(
+            self.context.identity.instance_id.as_str(),
+            &self.context.process_session_id,
+        );
         let settings = settings.unwrap_or_default();
         let interfaces = match factory
             .create_replicator(context, state_provider.clone(), settings.clone())
@@ -1046,6 +1061,19 @@ impl StatefulServicePartition {
             return Err(error);
         }
         attachment.disarm();
+        #[cfg(feature = "testing")]
+        if let Some(control) = attachment.stateless_runtime_control(RuntimeHostToken::new())
+            && let Some(route) = testing_route.filter(|_| {
+                control.testing_tcp_binding()
+                    == Some((
+                        self.context.identity.clone(),
+                        self.context.process_session_id.clone(),
+                        reservation,
+                    ))
+            })
+        {
+            stateless::testing_transport::acknowledge(route, &interfaces.creation);
+        }
         Ok(interfaces)
     }
 }

@@ -16,6 +16,7 @@ struct Publication {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     calls: AtomicU64,
+    ambiguous: AtomicBool,
     fail: bool,
 }
 
@@ -38,6 +39,7 @@ impl PartitionAccessView for Publication {
         committed: i64,
         ambiguous: bool,
     ) -> Result<()> {
+        self.ambiguous.store(ambiguous, Ordering::Release);
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
             assert_eq!((applied, committed, ambiguous), (0, 0, true));
             self.entered.notify_one();
@@ -170,11 +172,12 @@ impl DurableState for Provider {
     }
 }
 
-async fn publication_boundary(fail: bool, revoke: bool, cancel: bool) {
+fn fixture(fail: bool) -> (Arc<StatelessReplicator>, Arc<Publication>, Arc<Provider>) {
     let access = Arc::new(Publication {
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
         calls: AtomicU64::new(0),
+        ambiguous: AtomicBool::new(false),
         fail,
     });
     let provider = Arc::new(Provider::default());
@@ -208,6 +211,12 @@ async fn publication_boundary(fail: bool, revoke: bool, cancel: bool) {
         address,
     ));
     engine.self_ref.set(Arc::downgrade(&engine)).unwrap();
+    (engine, access, provider)
+}
+
+async fn publication_boundary(fail: bool, revoke: bool, cancel: bool) {
+    let (engine, access, provider) = fixture(fail);
+    let identity = engine.identity.clone();
     let epoch = Epoch::new(0, 1);
     {
         let mut state = engine.state.lock().await;
@@ -285,4 +294,51 @@ async fn sf01_revocation_during_preapply_publication_never_enters_provider() {
 #[tokio::test]
 async fn sf01_drop_during_preapply_publication_never_enters_provider() {
     publication_boundary(false, false, true).await;
+}
+
+#[tokio::test]
+async fn drained_provider_progress_clears_the_published_ambiguity_fence() {
+    let (engine, access, _) = fixture(false);
+    access.calls.store(1, Ordering::Release);
+    engine.state.lock().await.ambiguous_suffix = true;
+    engine.publish_progress().await.unwrap();
+    assert!(access.ambiguous.load(Ordering::Acquire));
+
+    assert_eq!(engine.reconcile_provider_committed_tail().await.unwrap(), 0);
+    assert!(!engine.state.lock().await.ambiguous_suffix);
+    assert!(
+        !access.ambiguous.load(Ordering::Acquire),
+        "verified provider progress left a cancelled ingress publication fenced"
+    );
+    engine.contain_ambiguous_suffix(0).await;
+    assert!(
+        !access.ambiguous.load(Ordering::Acquire),
+        "late cancellation re-fenced a prefix already verified by recovery"
+    );
+    engine.contain_ambiguous_suffix(1).await;
+    assert!(
+        access.ambiguous.load(Ordering::Acquire),
+        "an unresolved applied suffix was not fenced"
+    );
+}
+
+#[tokio::test]
+async fn progress_publications_preserve_order_and_resample_the_current_fence() {
+    let (engine, access, _) = fixture(false);
+    engine.state.lock().await.ambiguous_suffix = true;
+    let first = engine.publish_progress();
+    tokio::pin!(first);
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let next = engine.publish_progress();
+    tokio::pin!(next);
+    assert!(futures::poll!(next.as_mut()).is_pending());
+    assert_eq!(access.calls.load(Ordering::Acquire), 1);
+    engine.state.lock().await.ambiguous_suffix = false;
+    access.release.notify_one();
+    first.await.unwrap();
+    next.await.unwrap();
+    assert!(
+        !access.ambiguous.load(Ordering::Acquire),
+        "a waiting publication reused the fence from before provider reconciliation"
+    );
 }

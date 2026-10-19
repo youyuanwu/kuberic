@@ -37,6 +37,25 @@ pub struct Reconciler {
     locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
+fn recovery_source_is_unavailable(
+    observed: RawAgentObservation,
+    expected: &ReplicaIdentity,
+) -> Result<bool> {
+    match observed {
+        RawAgentObservation::Unavailable { .. } => Ok(true),
+        RawAgentObservation::PublicV1Report(report) if report.replica == *expected => {
+            report
+                .validate()
+                .map_err(|message| ControllerError::InvalidAgentEvidence(message.into()))?;
+            Ok(false)
+        }
+        RawAgentObservation::Invalid { message } => {
+            Err(ControllerError::InvalidAgentEvidence(message))
+        }
+        _ => Err(ControllerError::ObservationStale),
+    }
+}
+
 async fn cleanup_stale_scaffolding(
     raw: &crate::observation::RawObservation,
     current: Option<&ConfigurationDescriptor>,
@@ -375,6 +394,139 @@ impl Reconciler {
         }
     }
 
+    async fn reconcile_unavailable_recovery(
+        &self,
+        raw: &crate::observation::RawObservation,
+        scope: &PublicV1Scope,
+        command: &kuberic_runtime::protocol::command::PublicV1OperationCommand,
+    ) -> Result<Option<ReconcileAction>> {
+        use kuberic_runtime::protocol::public_operations::{
+            PublicCatchUpMode, PublicOperationProgram,
+        };
+        let Some(status) = raw.set.status.as_ref() else {
+            return Ok(None);
+        };
+        let Some(topology) = status.public_v1_topology.as_ref() else {
+            return Ok(None);
+        };
+        let Some(transition) = status.public_v1_transition.as_ref() else {
+            return Ok(None);
+        };
+        let transition = transition
+            .transition()
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+        let Some(PublicOperationProgram::CatchUp {
+            configuration,
+            mode: PublicCatchUpMode::All,
+        }) = command.intent.program.as_ref()
+        else {
+            return Ok(None);
+        };
+        let current = topology
+            .configuration()
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+        if topology.pending_switchover.is_some()
+            || transition.intent.consumer
+                != crate::evaluator::public_v1_evidence::PublicV1EvidenceConsumer::Topology
+            || configuration.previous.is_some()
+            || configuration.current != current
+            || !topology.sessions.iter().any(|session| {
+                session.role == ReplicaRole::Primary
+                    && session.identity == command.target
+                    && session.storage_incarnation == transition.intent.source.storage_incarnation
+                    && session.process_session_id == command.intent.process_session_id
+            })
+            || !raw.pods.iter().any(|pod| {
+                pod.uid().as_deref() == Some(command.target.instance_id.as_str())
+                    && pod.metadata.deletion_timestamp.is_none()
+            })
+        {
+            return Ok(None);
+        }
+        let key = kuberic_runtime::protocol::observation::ReplicaObservationKey::new(
+            command.target.replica_id,
+            command.target.instance_id.clone(),
+        );
+        let unavailable = matches!(
+            raw.agents.get(&key),
+            Some(RawAgentObservation::Unavailable { .. } | RawAgentObservation::Absent)
+        ) || (!raw.agents.contains_key(&key)
+            && topology.unavailable_primary_id == Some(current.primary_id));
+        if !unavailable {
+            return Ok(None);
+        }
+        let since = match (
+            topology.unavailable_primary_id,
+            topology.unavailable_since_unix_seconds,
+        ) {
+            (Some(primary), Some(since)) if primary == current.primary_id => since,
+            _ => {
+                self.api
+                    .persist_public_v1_primary_unavailable(
+                        scope,
+                        &current.configuration_id,
+                        Some((current.primary_id, raw.now_unix_seconds)),
+                    )
+                    .await
+                    .map_err(ControllerError::InvalidAgentEvidence)?;
+                return Ok(Some(ReconcileAction {
+                    requeue_after: Duration::ZERO,
+                    kind: ReconcileKind::Applied,
+                }));
+            }
+        };
+        if raw.now_unix_seconds.saturating_sub(since)
+            < i64::try_from(raw.set.spec.failover_delay_seconds).unwrap_or(i64::MAX)
+        {
+            return Ok(Some(ReconcileAction {
+                requeue_after: Duration::from_secs(self.evaluation.wait_requeue_seconds),
+                kind: ReconcileKind::Waiting,
+            }));
+        }
+        let expected = self
+            .api
+            .observe_public_v1_operation(scope)
+            .await
+            .map_err(ControllerError::InvalidAgentEvidence)?
+            .ok_or_else(|| {
+                ControllerError::InvalidAgentEvidence(
+                    "recovery transition disappeared during source reobservation".into(),
+                )
+            })?;
+        if expected.intent != transition.intent || expected.evidence != transition.evidence {
+            return Err(ControllerError::ObservationStale);
+        }
+        let source = self
+            .api
+            .observe_public_v1_operation_source(scope, &expected)
+            .await
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+        if !recovery_source_is_unavailable(source, &command.target)? {
+            self.api
+                .persist_public_v1_primary_unavailable(scope, &current.configuration_id, None)
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(Some(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Applied,
+            }));
+        }
+        // A reevaluable recovery probe must not indefinitely pin a stopped
+        // primary merely because Kubernetes still contains its exact Pod.
+        self.api
+            .supersede_public_v1_operation(
+                scope,
+                &expected,
+                &ProtocolCommand::PublicV1Operation(Box::new(command.clone())),
+            )
+            .await
+            .map_err(ControllerError::InvalidAgentEvidence)?;
+        Ok(Some(ReconcileAction {
+            requeue_after: Duration::ZERO,
+            kind: ReconcileKind::Executed,
+        }))
+    }
+
     pub async fn reconcile(&self, namespace: &str, name: &str) -> Result<ReconcileAction> {
         let key = format!("{namespace}/{name}");
         let lock = {
@@ -442,6 +594,12 @@ impl Reconciler {
                 })?
                 .command()
                 .map_err(ControllerError::InvalidAgentEvidence)?;
+            if let Some(action) = self
+                .reconcile_unavailable_recovery(&raw, &scope, &command)
+                .await?
+            {
+                return Ok(action);
+            }
             crate::public_v1_reconciliation::reconcile_public_v1_operation(
                 self.api.as_ref(),
                 &scope,
@@ -1448,4 +1606,40 @@ pub enum ReconcileKind {
 pub struct ReconcileAction {
     pub requeue_after: Duration,
     pub kind: ReconcileKind,
+}
+
+#[cfg(test)]
+mod recovery_source_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_requires_positive_unavailable_evidence() {
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: kuberic_runtime::protocol::types::AgentGeneration::new("generation"),
+        };
+        assert!(
+            recovery_source_is_unavailable(
+                RawAgentObservation::Unavailable {
+                    message: "connection closed".into()
+                },
+                &identity
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            recovery_source_is_unavailable(
+                RawAgentObservation::Invalid {
+                    message: "malformed report".into()
+                },
+                &identity
+            ),
+            Err(ControllerError::InvalidAgentEvidence(_))
+        ));
+        assert!(matches!(
+            recovery_source_is_unavailable(RawAgentObservation::Absent, &identity),
+            Err(ControllerError::ObservationStale)
+        ));
+    }
 }

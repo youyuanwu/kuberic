@@ -2,10 +2,16 @@
 
 ## Status and Scope
 
-Implemented in `kuberic-level-tests/src/in_process`. This document describes
-the architecture and invariants of the cluster-free integration harness for one
-production controller and multiple real KVStore2 replicas inside one test
-process.
+Implemented in `kuberic-controller/src/test_util`, enabled by the optional
+`test-util` feature. `kuberic-level-tests/src/in_process` retains the KVStore2
+adapter and connected journeys. This document describes the architecture and
+invariants of the cluster-free harness for one production controller and
+multiple real application replicas inside one test process.
+
+The [downstream exposure design](downstream-in-process-testing.md) records the
+extraction into `kuberic_controller::test_util` and its application factory.
+See the [downstream guide](../features/kuberic/in-process-testing.md) for the
+public API; the architecture and evidence limits below still apply.
 
 The harness uses Tokio tasks, loopback TCP, temporary directories, and real
 application and agent storage. It does not launch application binaries,
@@ -352,8 +358,9 @@ reuse its addresses or remove its storage as though cleanup succeeded.
 
 ## Connected Journeys
 
-Keep the first implementation to a fixed KVStore2 application and three-replica
-configuration, without a generic application-plugin framework.
+Repository conformance journeys retain a fixed KVStore2 application and
+three-replica configuration. The downstream factory supplies application
+construction, not an image-execution or application-plugin framework.
 
 | Journey | What it establishes |
 |---|---|
@@ -493,14 +500,15 @@ behavior that this harness deliberately cannot reproduce.
 
 ## Repository Integration
 
-Place the harness and scenarios in `kuberic-level-tests`, alongside but separate
-from the owned-cluster module. Use the public controller and host entry points
-and a test-only dependency on the KVStore2 library. Prefer existing Tokio,
-Tower, Kubernetes types, and temporary-directory utilities; no additional mock
-framework is required.
+The reusable harness lives under the controller's opt-in `test_util` module.
+Application scenarios and their KVStore2 adapter remain in
+`kuberic-level-tests`, alongside but separate from the owned-cluster module.
+Use the public controller and host entry points; the controller must not
+depend on the example application. Existing Tokio, Tower, Kubernetes types
+and temporary-directory utilities supply the test infrastructure.
 
-Keep the API test service, resource store, supervisor, and scenario helpers
-private to the test crate. Open-result publication, Open-before-discovery
+Keep the API test service, resource store and supervisor private behind the
+typed public testing surface. Open-result publication, Open-before-discovery
 planning, and owned control-listener startup require narrow production changes,
 together with private host/built-in-replicator shutdown-and-drain ownership and
 application consumer joining. Keep replication binding inside the replicator
@@ -508,8 +516,8 @@ rather than adding listener transfer to the factory context or another public
 lifecycle framework. Do not expose a production fake-cluster API or add test-only
 lifecycle capabilities to protected interfaces.
 
-The twenty-three journey/assertion tests run without cluster environment variables in the ordinary
-nextest tier:
+The connected application journeys run without cluster environment variables
+in the ordinary nextest tier:
 
 ```bash
 cargo nextest run -p kuberic-level-tests --all-features --profile ordinary \
@@ -524,6 +532,8 @@ cargo test -p kuberic-level-tests --lib --all-features \
 ```
 
 The harness adds no test tier. The API test service and listener/task ownership
-helpers also have focused ordinary-tier tests. See the
+helpers also have focused ordinary-tier tests under
+`kuberic-controller::test_util`; the private adversarial readiness fixture
+moved there with the shared oracle. See the
 [test strategy](../features/kuberic/testing.md) for discovered inventory and
 partition accounting.

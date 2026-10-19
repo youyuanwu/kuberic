@@ -11,6 +11,7 @@ readme = "README.md"
 [features]
 default = []
 runtime-test-bridge = ["kuberic-runtime/testing"]
+test-util = ["kuberic-runtime/testing", "dep:tempfile", "dep:tower", "dep:http", "dep:form_urlencoded", "dep:uuid", "dep:anyhow"]
 
 [[bin]]
 name = "kuberic-controller"
@@ -31,6 +32,12 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tempfile = { version = "3", optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+http = { version = "1", optional = true }
+form_urlencoded = { version = "1", optional = true }
+uuid = { workspace = true, features = ["v4"], optional = true }
+anyhow = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_yaml_ng = "0.10"

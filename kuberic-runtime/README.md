@@ -14,7 +14,12 @@ kuberic-runtime = "0.0.1"
 
 The default `host` feature supplies `host::ReplicaHost`. Shared identities,
 commands, reports, and wire conversion live in `protocol` and `control`.
-Enable `testing` only for isolated repository fixtures.
+Enable `testing` only for isolated test fixtures. The controller's opt-in
+`test-util` feature composes those helpers into the
+[downstream in-process harness](../docs/features/kuberic/in-process-testing.md).
+Checkout-bound conformance/source-inventory helpers additionally require the
+repository-owned `kuberic_workspace_tests` configuration and are not part of
+the packaged downstream fixture surface.
 
 The public Service Fabric-shaped interfaces are:
 
@@ -92,7 +97,7 @@ cargo check -p kuberic-runtime --all-targets --all-features
 cargo clippy -p kuberic-runtime --all-targets --all-features -- -D warnings
 scripts/check_runtime_public_api.sh
 just nextest-test
-just nextest-build-only
+just nextest-source
 ```
 
 See [Stateless Default Replicator](../docs/features/kuberic/stateless-default-replicator.md),

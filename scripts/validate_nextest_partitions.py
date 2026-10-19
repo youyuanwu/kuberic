@@ -37,7 +37,96 @@ class ListedTest:
     matches: bool
 
 
-BUILD_ONLY_TESTS = {
+SOURCE_TESTS = {
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::public_api_inventory",
+        name,
+    )
+    for name in [
+        "application_replication_api_has_no_parallel_driver_or_admission_surface",
+        "source_public_api_matches_reviewed_inventory",
+        "host_capabilities_are_not_source_public_even_when_doc_hidden",
+        "control_inventory_tracks_ownership_not_referenced_types",
+    ]
+} | {
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::lifecycle_capability_boundaries",
+        name,
+    )
+    for name in [
+        "protected_public_trait_method_sets_are_unchanged",
+        "replacement_runtime_has_no_managed_default_or_agent_replication_owner",
+        "public_operation_owners_are_ordinary_modules",
+    ]
+} | {
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::public_v1_conformance",
+        name,
+    )
+    for name in [
+        "public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16",
+        "public_v1_conformance_executes_built_in_replacement_scenarios",
+        "built_in_replacement_ksf_mappings_require_each_authorized_observation",
+    ]
+} | {
+    TestId(
+        "kuberic-controller",
+        "kuberic-controller::public_api",
+        name,
+    )
+    for name in [
+        "crdgen_preserves_public_v1_only_typed_status",
+        "deployment_sources_installation_namespace_from_metadata_namespace_only",
+        "deployment_prevents_concurrent_controller_reconciliation",
+        "production_inventory_contains_only_public_v1_controller_surfaces",
+    ]
+} | {
+    TestId(
+        "kvstore2",
+        "kvstore2::bin/kvstore2",
+        name,
+    )
+    for name in [
+        "tests::application_main_uses_the_agent_host_instead_of_protocol_internals",
+        "tests::default_manifest_neither_enables_nor_routes_live_test_gate",
+    ]
+} | {
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::public_api_privacy",
+        "external_applications_can_use_contracts_but_cannot_forge_host_capabilities",
+    ),
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::public_v1_evidence",
+        "public_v1_source_uses_no_native_evidence",
+    ),
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime::public_v1_recovery",
+        "production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth",
+    ),
+    TestId(
+        "kuberic-controller",
+        "kuberic-controller",
+        "cluster_api::tests::production_kubernetes_api_requires_one_exact_namespace",
+    ),
+    TestId(
+        "sqlite-replicated",
+        "sqlite-replicated::bin/sqlite-replicated",
+        "tests::startup_uses_replica_host_and_has_no_demo_surface",
+    ),
+    TestId(
+        "kuberic-level-tests",
+        "kuberic-level-tests::source_checks",
+        "packaged_controller_test_util_boundary",
+    ),
+}
+
+IGNORED_SOURCE_TESTS = {
     TestId(
         "kuberic-runtime",
         "kuberic-runtime::public_api_privacy",
@@ -48,7 +137,13 @@ BUILD_ONLY_TESTS = {
         "kuberic-runtime::public_v1_conformance",
         "public_v1_conformance_executes_built_in_replacement_scenarios",
     ),
+    TestId(
+        "kuberic-level-tests",
+        "kuberic-level-tests::source_checks",
+        "packaged_controller_test_util_boundary",
+    ),
 }
+
 
 def postgres_test(name: str, binary: str = POSTGRES_LIBRARY_BINARY) -> TestId:
     return TestId(POSTGRES_PACKAGE, binary, name)
@@ -172,8 +267,8 @@ def listed_tests(document: dict) -> list[ListedTest]:
 
 def classify(test: ListedTest) -> str | None:
     test_id = test.test_id
-    if test_id in BUILD_ONLY_TESTS:
-        return "build-only" if test.ignored else None
+    if test_id in SOURCE_TESTS:
+        return "source" if test.ignored == (test_id in IGNORED_SOURCE_TESTS) else None
     if test.ignored:
         if test_id.package == KIND_PACKAGE and test_id.name.startswith(KIND_PREFIX):
             return "kind-live"
@@ -251,8 +346,12 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
         raise ValueError(f"unassigned tests in complete inventory:\n{rendered}")
     if len(set().union(*assignments.values())) != len(inventory):
         raise ValueError("test inventory contains duplicate identifiers")
-    if assignments.get("build-only", set()) != BUILD_ONLY_TESTS:
-        raise ValueError("build-only inventory does not exactly match its guards")
+    if assignments.get("source", set()) != SOURCE_TESTS:
+        missing = SOURCE_TESTS - assignments.get("source", set())
+        extra = assignments.get("source", set()) - SOURCE_TESTS
+        raise ValueError(
+            f"source catalog mismatch: missing={sorted(missing)} extra={sorted(extra)}"
+        )
     if len(assignments.get("kind-live", set())) != EXPECTED_KIND_LIVE_COUNT:
         raise ValueError(
             f"KinD live selector expected {EXPECTED_KIND_LIVE_COUNT} tests, "
@@ -267,9 +366,9 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
         )
 
     configured = {
-        "build-only": matching_ids(
+        "source": matching_ids(
             nextest_json(
-                root, extracted, "--profile", "build-only", "--run-ignored", "only"
+                root, extracted, "--profile", "source", "--run-ignored", "all"
             ),
             include_ignored=True,
         ),
@@ -282,7 +381,28 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
     }
     for tier, selected in configured.items():
         if selected != assignments.get(tier, set()):
-            raise ValueError(f"configured {tier} profile does not exactly match inventory")
+            missing = assignments.get(tier, set()) - selected
+            extra = selected - assignments.get(tier, set())
+            raise ValueError(
+                f"configured {tier} profile mismatch: "
+                f"missing={sorted(missing)} extra={sorted(extra)}"
+            )
+    selected_once: set[TestId] = set()
+    for tier, selected in configured.items():
+        overlap = selected_once & selected
+        if overlap:
+            raise ValueError(f"configured {tier} profile overlaps: {sorted(overlap)}")
+        selected_once.update(selected)
+    if selected_once != {test.test_id for test in inventory}:
+        raise ValueError("configured tiers do not cover the complete archive inventory")
+    compatibility = matching_ids(
+        nextest_json(
+            root, extracted, "--profile", "build-only", "--run-ignored", "all"
+        ),
+        include_ignored=True,
+    )
+    if compatibility != SOURCE_TESTS:
+        raise ValueError("build-only compatibility alias does not select all source checks")
     selected_smoke = matching_ids(
         nextest_json(
             root,
@@ -364,16 +484,20 @@ def validate_kind_contract(root: Path) -> None:
 def validate_timeout_profiles(config: dict) -> None:
     profiles = config.get("profile", {})
 
-    def validate_timeout(label: str, timeout: dict) -> None:
+    def validate_timeout(label: str, timeout: dict, maximum: int = 270) -> None:
         period = timeout.get("period", "")
         match = re.fullmatch(r"(\d+)(s|m)", period)
         if match is None:
             raise ValueError(f"{label} has an unsupported timeout: {period}")
         seconds = int(match.group(1)) * (60 if match.group(2) == "m" else 1)
-        if seconds > 270 or timeout.get("terminate-after") != 1:
-            raise ValueError(f"{label} must terminate once within 270 seconds")
+        if seconds <= 0 or seconds > maximum or timeout.get("terminate-after") != 1:
+            raise ValueError(f"{label} must terminate once within {maximum} seconds")
 
-    for name in ["default", "ci", "ordinary", "build-only", "postgres", "kind"]:
+    tooling_filters = {
+        "binary_id(=kuberic-level-tests::source_checks) and test(=packaged_controller_test_util_boundary)",
+        "binary_id(=kuberic-runtime::public_api_privacy)",
+    }
+    for name in ["default", "ci", "ordinary", "source", "build-only", "postgres", "kind"]:
         current = profiles.get(name, {})
         seen: set[str] = set()
         while "slow-timeout" not in current:
@@ -388,6 +512,7 @@ def validate_timeout_profiles(config: dict) -> None:
                 validate_timeout(
                     f"profile {name} override {index} timeout",
                     override["slow-timeout"],
+                    1200 if name == "source" and override.get("filter") in tooling_filters else 270,
                 )
 
 

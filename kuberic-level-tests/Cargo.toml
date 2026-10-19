@@ -8,21 +8,26 @@ rust-version.workspace = true
 description = "In-process and isolated KinD integration tests for the level-triggered Kuberic stack"
 publish = false
 
+[features]
+default = ["harness"]
+harness = []
+
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
 async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
 http = "1"
-form_urlencoded = "1"
 k8s-openapi.workspace = true
 kube.workspace = true
-kuberic-controller.workspace = true
+kuberic-controller = { workspace = true, features = ["test-util"] }
 kuberic-runtime = { workspace = true, features = ["host", "testing"] }
 kvstore2 = { path = "../examples/kvstore2", features = ["testing"] }
+serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
+tempfile = "3"
 tonic.workspace = true
-tower = { version = "0.5", features = ["util"] }
-uuid = { workspace = true, features = ["v4"] }

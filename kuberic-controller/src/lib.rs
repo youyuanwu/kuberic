@@ -26,6 +26,8 @@ mod public_v1_normalize;
 mod public_v1_reconciliation;
 mod public_v1_registration;
 pub mod reconciler;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 
 pub use error::{ControllerError, Result};
 pub use evaluator::EvaluationConfig;

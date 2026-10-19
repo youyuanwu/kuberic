@@ -3,6 +3,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# The source nextest profile owns Rust inventory/privacy tests in this mode.
+rustdoc_only=false
+case "${1:-}" in
+    "") ;;
+    --rustdoc-only) rustdoc_only=true ;;
+    *) echo "usage: $0 [--rustdoc-only]" >&2; exit 2 ;;
+esac
+if [[ $# -gt 1 ]]; then
+    echo "usage: $0 [--rustdoc-only]" >&2
+    exit 2
+fi
+
 target_dir="${CARGO_TARGET_DIR:-target}"
 if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
     doc_root="$target_dir/$CARGO_BUILD_TARGET/doc/kuberic_runtime"
@@ -48,9 +60,13 @@ for expected in \
     fi
 done
 
-cargo test -p kuberic-runtime --all-features \
-    --test public_api_inventory --quiet
-cargo test -p kuberic-runtime --all-features \
-    --test public_api_privacy --quiet -- --ignored
+if [[ "$rustdoc_only" == true ]]; then
+    echo "kuberic-runtime rustdoc allowlist and external API-leak fixture guards passed."
+else
+    cargo test -p kuberic-runtime --all-features \
+        --test public_api_inventory --quiet
+    cargo test -p kuberic-runtime --all-features \
+        --test public_api_privacy --quiet -- --ignored
 
-echo "kuberic-runtime documented and source-public APIs match their allowlists; tested private-capability extraction, forging, attachment, guard, authority, and host-construction paths are unreachable from safe application code."
+    echo "kuberic-runtime documented and source-public APIs match their allowlists; tested private-capability extraction, forging, attachment, guard, authority, and host-construction paths are unreachable from safe application code."
+fi

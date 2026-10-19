@@ -1,0 +1,39 @@
+[package]
+name = "downstream-controller-test-util"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = ["harness"]
+harness = ["kuberic-controller/test-util"]
+all-controller = ["harness", "kuberic-controller/runtime-test-bridge"]
+
+[dependencies]
+kuberic-runtime = { version = "=0.0.1", features = ["testing"] }
+kuberic-controller = "=0.0.1"
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "feature-off"
+path = "src/feature_off.rs"
+
+[[bin]]
+name = "private"
+path = "src/private.rs"
+
+[[bin]]
+name = "conformance"
+path = "src/conformance.rs"
