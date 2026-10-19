@@ -9,8 +9,8 @@ persisted/volatile services, service-owned primary commit, receiver lifetimes,
 progress/quorum/status, terminal outcomes and real tonic retry/reconnect/
 backpressure scenarios. Existing KSF inventory and current-contract regressions do
 not establish complete native parity. P1's documented acceptance scenarios are
-separate from future executable port-component/hosted cases; add selectors and
-counts for those only with actual implementations. The unselected OperationQueue,
+separate from future executable port-component/hosted cases; add selectors
+for those only with actual implementations. The unselected OperationQueue,
 bounded sender/session/ACK, async/tonic, primary queue/quorum, secondary receiver/ACK
 copy-receiver, enumeration, CopySender build-gate, copy-establishment, BuildIdle,
 secondary and primary lifecycle and primary configuration slices have
@@ -38,24 +38,11 @@ exporting host capabilities.
 just nextest-validate
 ```
 
-The current test inventory is:
-
-| Tier | Tests |
-|---|---:|
-| ordinary | 1060 |
-| source | 22 |
-| PostgreSQL | 41 |
-| KinD live | 3 |
-| **total** | **1126** |
-
-Ordinary partition counts are `265, 265, 265, 265`. PostgreSQL partition counts
-are `11, 13, 8, 9`. The validator proves every test has exactly one tier and
-every configured partition union is complete.
-
-Inventory after the primary configuration slice and harness/source-job split:
-1126 = 1060 + 22 + 41 + 3. Discovery builds the tier binaries but does not execute
-PostgreSQL or KinD bodies. Doctests are additional source-job checks, not
-nextest archive entries.
+The validator reports the current test and partition counts, proves every test
+has exactly one ordinary, source, PostgreSQL, or KinD tier, and verifies that every
+configured partition union is complete. Discovery builds the tier binaries but
+does not execute PostgreSQL or KinD bodies. Doctests are additional source-job
+checks, not nextest archive entries.
 
 ## Ordinary Tier
 
@@ -78,12 +65,12 @@ scripts/check_runtime_public_api.sh
 ```
 
 P1 adds source-backed acceptance scenarios in the
-[port ledger](sf-v1-port-ledger.md): 11 source families, 15 contract mappings,
-33 deterministic scenarios and 29 capability/settings cases. They are
+[port ledger](sf-v1-port-ledger.md), covering source families, contract mappings,
+deterministic scenarios and capability/settings cases. They are
 documented expectations for future tests of actual ported components, not new
 ordinary tests or executable formula checks. The strengthened existing external
 API fixture above checks real protected-interface compatibility. The existing
-16 KSF entries remain structural/current-contract evidence; no new KSF ID or
+KSF entries remain structural/current-contract evidence; no new KSF ID or
 native-parity claim is introduced.
 
 The separate current-engine counterexample selection is:
@@ -94,13 +81,13 @@ cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
   -E 'test(=read_fencing::sf_d02_primary_scalar_waits_for_quorum_and_local_commit_across_cancel_and_epoch) or test(=read_fencing::sf_d02_secondary_scalar_is_contiguous_service_acknowledged_not_committed) or test(=hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children)'
 ```
 
-These three existing real-engine tests preserve current held-ACK/held-local-
+These existing real-engine tests preserve current held-ACK/held-local-
 commit and contained-Close assertions. They do not execute expected native
-algorithms. Five further current-source counterexamples in the ledger remain
+algorithms. Further current-source counterexamples in the ledger remain
 source-only. Memory-backed current-engine witnesses prove ordering, not fsync.
 The strengthened existing external API fixture pins Bytes, boxed `Stream<Item = Result<Bytes>>
-+ Send`, i64 and all protected methods; it remains one of the **existing two**
-original build-environment guards, now selected by `just nextest-source`,
++ Send`, i64 and all protected methods; it remains one of the existing
+build-environment guards, now selected by `just nextest-source`,
 not a new ordinary or archive-only Cargo invocation.
 
 ### SF V1 OperationQueue Slice
@@ -110,7 +97,7 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::operation_queue::tests::)'
 ```
 
-This selects **45** descriptive tests of the actual internal
+This selects descriptive tests of the actual internal
 [`OperationQueue`](../../../kuberic-runtime/src/replicator/v1/operation_queue.rs#L212)
 and its
 [`component tests`](../../../kuberic-runtime/src/replicator/v1/operation_queue/tests.rs#L73).
@@ -118,7 +105,7 @@ They cover separate tail/commit/completion/history boundaries, holes/duplicates,
 count-span and byte pressure (including history removal on failed admission),
 retention, callback timing/replay, rewinds, trim, reset and transfer. Q1–Q4/L2
 remain provenance identifiers, not a duplicate executable catalog.
-The original 42 queue tests are joined by three async/tonic-substrate adapter
+The original queue tests are joined by async/tonic-substrate adapter
 regressions proving framed-operation logical-byte accounting without changing
 the original raw-byte behavior.
 
@@ -140,11 +127,10 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::)' -j 2
 ```
 
-The first selects **61 new actual component tests**: **28 sender**, **13 ACK
-scheduler**, **20 bounded session**. Those families plus the 42 existing queue
-tests account for **103**; the all-v1 selector also includes the later
-async/tonic substrate below. They invoke real private compiled components with
-injected/manual time, no guessed-deadline sleeps and no formula/catalog oracle.
+The first selects actual sender, ACK scheduler and bounded-session component
+tests; the all-v1 selector also includes the queue and later async/tonic substrate
+below. They invoke real private compiled components with injected/manual time,
+no guessed-deadline sleeps and no formula/catalog oracle.
 Sender tests also invoke its production latency/decay helpers. They exercise
 receive/apply separation, ordered replay/dedup, count windows, exact retries,
 RequestAck, hints/backpressure, batching/force/final pending flush, trace,
@@ -169,11 +155,10 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::buffers::) or test(replicator::v1::transport::) or test(replicator::v1::async_runtime::)' -j 2
 ```
 
-This selects **51 actual private component tests**: 27 async runtime, 20
-carrier and four buffer adapter. Together with three additional queue-accounting
-regressions selected above, the slice adds **54**, taking all-v1 coverage from
-103 to **157**. A cross-component test connects the actual session runtime,
-send-intent adapter, tonic exchange, reverse ACK runtime and ordered session
+This selects actual private async runtime, carrier and buffer adapter tests.
+Queue-accounting regressions are selected above. A cross-component test connects
+the actual session runtime, send-intent adapter, tonic exchange, reverse ACK
+runtime and ordered session
 ACK processor; required copy-owner handoffs are recorded, not fabricated.
 Explicit raw-single/framed-segments cases preserve arbitrary bytes,
 zero/empty/multiple buffers, per-item stream errors
@@ -208,12 +193,11 @@ catch-up, idle retention, configuration capture/caps and moving MustCatchup
 requirements. Dropped waiters do not roll back admitted operations; terminal
 completion and close outcomes remain distinct.
 
-The slice adds **44 actual tests**: **13 primary queue owner** and **31 replica
-manager**, taking all-v1 coverage from 157 to **201**. The integrated runtime
-library selection passed **258/258**, including the 57 other library tests.
-Workspace checks, warnings-denied Clippy, no-default-feature runtime, doctests,
+The primary queue owner, replica manager and integrated runtime library
+selections passed. Workspace checks, warnings-denied Clippy,
+no-default-feature runtime, doctests,
 external API/privacy and exact tier/partition inventory passed. This is not a
-claim that all 570 ordinary tests were rerun.
+claim that all ordinary tests were rerun.
 
 Review regressions preserve cached CC quorum/all observations until the ordered
 primary-progress handoff, concrete session-root identity, error-atomic
@@ -239,12 +223,11 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::received_operation::) or test(replicator::v1::operation_stream::) or test(replicator::v1::secondary_receiver::)' -j 2
 ```
 
-The slice adds **92 actual tests**: 31 received-operation, 22 operation-stream
-and 39 receiver/integration, taking all-v1 coverage to **293**. The integrated
-runtime library selection passed **350/350**, including 57 other library tests.
-Workspace all-target/all-feature check, warnings-denied Clippy, no-default
+The received-operation, operation-stream, receiver/integration and integrated
+runtime library selections passed. Workspace all-target/all-feature check,
+warnings-denied Clippy, no-default
 runtime, doctests, external API/privacy and exact tier/partition inventory passed.
-This is not a claim that all 662 ordinary tests were rerun.
+This is not a claim that all ordinary tests were rerun.
 
 Actual queues and callbacks exercise required versus optimistic completion,
 out-of-order data/service ACKs, duplicate/root identity, logical byte/span
@@ -277,12 +260,11 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::secondary_copy_receiver::) or test(replicator::v1::copy_context_receiver::) or test(replicator::v1::copy_receiver_integration::) or test(numbered_copy_eos_)' -j 2
 ```
 
-The slice adds **68 actual tests**: 31 secondary-copy, 33 copy-context, two
-numbered-EOS constructor and two pair/session integration cases. Combined V1
-coverage is **361**; the integrated runtime library passed **418/418**, including
-57 other library tests. Workspace all-target/all-feature check, warnings-denied
-Clippy, no-default runtime, doctests, external API/privacy and the exact
-776-test tier/partition inventory passed. Full ordinary, PostgreSQL and KinD
+The secondary-copy, copy-context, numbered-EOS constructor, pair/session
+integration and integrated runtime library selections passed.
+Workspace all-target/all-feature check, warnings-denied Clippy, no-default
+runtime, doctests, external API/privacy and the exact
+tier/partition inventory passed. Full ordinary, PostgreSQL and KinD
 test bodies were not rerun.
 
 Actual secondary-copy/context receivers reuse OperationQueue, ReceivedOperation,
@@ -313,11 +295,10 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::copy_async_operation::)' -j 2
 ```
 
-The slice adds **45 actual tests**, for **406 combined V1** and **463/463**
-passing runtime library tests (57 unchanged non-V1 cases). The exact selector
-passes 45/45. Workspace all-target/all-feature check, warnings-denied Clippy,
+The copy-enumeration and integrated runtime library selections passed.
+Workspace all-target/all-feature check, warnings-denied Clippy,
 runtime no-default-feature check, external API/privacy, workspace doctests and
-exact 821-test tier/partition discovery passed. Full ordinary, PostgreSQL and
+exact tier/partition discovery passed. Full ordinary, PostgreSQL and
 KinD test bodies, native execution/differential, hosted parity and provider-fsync
 were not run or claimed.
 
@@ -355,12 +336,10 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::copy_sender::)' -j 2
 ```
 
-This slice adds **47 actual tests**, for **453 combined V1** and **510/510**
-passing runtime library cases, with the same 57 non-V1 library tests. Exact
-CopySender selection passes 47/47. Workspace all-target/all-feature check,
-warnings-denied Clippy, no-default runtime, external API/privacy, workspace
-doctests and exact **868-test** tier/partition discovery passed. Ordinary slices
-are **206/206/205/205**, PostgreSQL hashes remain **11/13/8/9**. Discovery does
+The CopySender and integrated runtime library selections passed.
+Workspace all-target/all-feature check, warnings-denied Clippy, no-default
+runtime, external API/privacy, workspace
+doctests and exact tier/partition discovery passed. Discovery does
 not execute PostgreSQL/KinD bodies. Full ordinary execution, native/differential,
 hosted parity and provider-fsync were not run or claimed.
 
@@ -395,13 +374,9 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::copy_establishment::)' -j 2
 ```
 
-This slice adds **45 actual tests**, for **498 combined V1** and **555/555**
-passing runtime library cases (57 unchanged non-V1). Exact establishment
-selection passes 45/45. Workspace check/Clippy, no-default runtime, external
-API/privacy, workspace doctests and exact tier/partition discovery passed.
-Current inventory is **913 = 867 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**,
-with ordinary slices **217/217/217/216** and unchanged PostgreSQL hashes
-**11/13/8/9**. Earlier slice measurements above are historical.
+The copy-establishment and integrated runtime library selections passed.
+Workspace check/Clippy, no-default runtime, external API/privacy, workspace
+doctests and exact tier/partition discovery passed.
 
 Tests exercise the actual reliable StartCopy sender, current-epoch/infinite
 expiration mapping through a real tonic connection, sender-before-first-send
@@ -439,13 +414,9 @@ cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::build_idle::) or test(replicator::v1::replication_queue_manager::tests::build_snapshot_)' -j 2
 ```
 
-This slice adds **41 actual tests**: 38 BuildIdle and three primary-queue
-snapshot cases. Exact selection passes **41/41**; combined V1 is **539** and
-the runtime library passes **596/596** (57 unchanged non-V1).
-Workspace check/Clippy, no-default runtime, API/privacy, workspace doctests and
-exact tier/partition discovery pass. Current inventory is **954 = 908 ordinary +
-41 PostgreSQL + 3 KinD + 2 build-only**, with ordinary slices **227/227/227/227**
-and unchanged PostgreSQL hashes **11/13/8/9**.
+The BuildIdle, primary-queue snapshot and integrated runtime library selections
+pass. Workspace check/Clippy, no-default runtime, API/privacy, workspace doctests
+and exact tier/partition discovery pass.
 
 Actual manager admission freezes the classic committed/previous-quorum-floor
 boundary, retains/replays the actual pending entries and creates/opens a fresh
@@ -472,7 +443,7 @@ provider monitoring and host health reporting remain separate owners.
 The build driver does not replace ongoing primary session ownership after
 completion. Full workspace ordinary execution, PostgreSQL/KinD bodies,
 native execution, differential/hosted parity and provider-fsync are not run
-or claimed. Earlier slice counts/exclusions are historical boundaries.
+or claimed. Earlier slice exclusions are historical boundaries.
 See the [ledger](sf-v1-port-ledger.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11)
 and [provenance](sf-v1-port-provenance.md#buildidle-lifecycle-slice-p3-bounded-f02f05f06f07f11).
 
@@ -482,12 +453,6 @@ and [provenance](sf-v1-port-provenance.md#buildidle-lifecycle-slice-p3-bounded-f
 cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::secondary::) or test(replicator::v1::operation_stream::tests::lifecycle_)' -j 2
 ```
-
-This slice adds **41 actual tests**: 39 secondary lifetime cases and two
-shared-dispatch lifecycle observations. Combined V1 is **580**, runtime
-**637** including 57 unchanged non-V1 cases. Discovery at that slice was **995 =
-949 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**, with ordinary slices
-**238/237/237/237** and unchanged PostgreSQL hashes **11/13/8/9**.
 
 Actual components exercise shared StartCopy initialization, required/optimistic
 service ACKs, context acquisition/sender completion and retries, provider epoch
@@ -513,7 +478,7 @@ route/epoch admission. Full primary/session/role orchestration, external epoch
 reconfiguration, promotion, slow-peer policy, provider monitoring/host health
 and P4/P5 adapters/activation remain pending. Full ordinary execution,
 PostgreSQL/KinD bodies, native execution, differential/hosted parity and
-provider-fsync are not run or claimed. Earlier counts/exclusions remain
+provider-fsync are not run or claimed. Earlier exclusions remain
 historical. See the [ledger](sf-v1-port-ledger.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11)
 and [provenance](sf-v1-port-provenance.md#secondary-lifecycle-slice-p3-bounded-f04f05f06f09f11).
 
@@ -523,11 +488,6 @@ and [provenance](sf-v1-port-provenance.md#secondary-lifecycle-slice-p3-bounded-f
 cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::primary::)' -j 2
 ```
-
-This slice adds **42 actual primary-component tests**. Combined V1 is **622**,
-runtime **679/679** including 57 unchanged non-V1 cases. Exact discovery is
-**1037 = 991 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**, ordinary
-partitions **248/248/248/247**, PostgreSQL hashes **11/13/8/9**.
 
 The decisive case finishes an actual BuildIdle, supplies that same session
 through the explicit caller-established configuration seam, then admits more
@@ -558,8 +518,8 @@ UpdateConfiguration/session creation or promotion. Role/external-epoch
 orchestration, queue transfer, slow-peer/MustCatchup policy, host health and P4/P5
 activation remain pending.
 No full ordinary execution, PostgreSQL/KinD bodies, native binary execution,
-differential/hosted parity or provider-fsync is run/claimed. Earlier counts and
-exclusions are historical. See the
+differential/hosted parity or provider-fsync is run/claimed. Earlier exclusions
+are historical. See the
 [ledger](sf-v1-port-ledger.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11)
 and [provenance](sf-v1-port-provenance.md#primary-lifecycle-slice-p3-bounded-f02f06f07f08f09f11).
 
@@ -569,11 +529,6 @@ and [provenance](sf-v1-port-provenance.md#primary-lifecycle-slice-p3-bounded-f02
 cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
   -E 'test(replicator::v1::primary::tests::configuration::)' -j 2
 ```
-
-This slice adds **34 actual primary/manager/session tests**. V1 is **656**,
-runtime **713/713**, with 57 unchanged non-V1 cases. Exact discovery is
-**1071 = 1025 ordinary + 41 PostgreSQL + 3 KinD + 2 build-only**;
-ordinary partitions **257/256/256/256**, PostgreSQL hashes **11/13/8/9**.
 
 Descriptor-driven catch-up and current-only updates create/open actual sessions
 from known progress, reuse current/previous/idle roots, replay retained operations,
@@ -719,7 +674,7 @@ application factory, typed controls and cleanup contract. KVStore2 adapters and
 application assertions remain in `kuberic-level-tests`; the reusable store,
 transport and orchestration live in the controller testing module.
 
-The independent persisted counter application has eight normal workspace
+The independent persisted counter application has normal workspace
 tests in `kuberic-level-tests::downstream_test_util`, covering its provider and
 bootstrap, restart, replacement, failover, live isolation, quorum restoration,
 transfer and error/cleanup journeys. They are included in the nextest archive
@@ -794,7 +749,7 @@ Routine validation:
 just nextest-postgres-smoke
 ```
 
-The smoke target builds the owned command binary and runs eight representative
+The smoke target builds the owned command binary and runs representative
 Public V1 custom-Replicator scenarios. Run `just nextest-postgres` only when
 the full PostgreSQL suite is explicitly required.
 
@@ -849,7 +804,7 @@ just delete-kind-cluster
 ```
 
 The harness requires an explicit ownership receipt and refuses default/shared
-cluster coordinates. The three scenarios inspect current Public V1 authority,
+cluster coordinates. The scenarios inspect current Public V1 authority,
 resources, agent diagnostics, and exactly one granted writer. Bootstrap proves
 quorum writes after a contained process restart; replacement proves preserved
 data and exact new-incarnation admission; failover uses a sustained containerd
