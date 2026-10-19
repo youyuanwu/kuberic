@@ -498,15 +498,26 @@ async fn stopped_primary_failover_preserves_acknowledged_data() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_recovery_does_not_block_stopped_primary_failover() -> Result<()> {
-    recovery_before_lifecycle(false).await
+    recovery_before_lifecycle(RecoveryLifecycle::PrimaryFailover).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accepted_recovery_does_not_reuse_a_restarted_peer_session() -> Result<()> {
-    recovery_before_lifecycle(true).await
+    recovery_before_lifecycle(RecoveryLifecycle::PeerRestart).await
 }
 
-async fn recovery_before_lifecycle(restart_peer: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_recovery_does_not_retire_the_primary_after_peer_deletion() -> Result<()> {
+    recovery_before_lifecycle(RecoveryLifecycle::PeerReplacement).await
+}
+
+enum RecoveryLifecycle {
+    PrimaryFailover,
+    PeerRestart,
+    PeerReplacement,
+}
+
+async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
     use kuberic_controller::test_util::TestCluster;
     let mut cluster = TestCluster::builder(super::harness::KvFactory)
         .image("in-process/kvstore2")
@@ -558,25 +569,47 @@ async fn recovery_before_lifecycle(restart_peer: bool) -> Result<()> {
             .await?;
         ensure!(lsn == 1);
         cluster.resume(pause).await?;
-        phase = if restart_peer {
-            "peer restart"
-        } else {
-            "primary stop/failover"
-        };
-        let settled = if restart_peer {
-            let fresh = cluster.restart(&secondary).await?;
-            ensure!(fresh.process_session_id() != secondary.process_session_id());
-            ensure!(
-                fresh.identity() == secondary.identity()
-                    && fresh.storage_incarnation() == secondary.storage_incarnation(),
-                "a contained restart became a corrective storage replacement"
-            );
-            cluster.settle().await?
-        } else {
-            cluster.stop(&primary).await?;
-            let topology = cluster.settle_members(2).await?;
-            ensure!(topology.primary().identity() != primary.identity());
-            topology
+        let settled = match lifecycle {
+            RecoveryLifecycle::PeerRestart => {
+                phase = "peer restart";
+                let fresh = cluster.restart(&secondary).await?;
+                ensure!(fresh.process_session_id() != secondary.process_session_id());
+                ensure!(
+                    fresh.identity() == secondary.identity()
+                        && fresh.storage_incarnation() == secondary.storage_incarnation(),
+                    "a contained restart became a corrective storage replacement"
+                );
+                cluster.settle().await?
+            }
+            RecoveryLifecycle::PrimaryFailover => {
+                phase = "primary stop/failover";
+                cluster.stop(&primary).await?;
+                let topology = cluster.settle_members(2).await?;
+                ensure!(topology.primary().identity() != primary.identity());
+                topology
+            }
+            RecoveryLifecycle::PeerReplacement => {
+                phase = "peer deletion during accepted recovery";
+                cluster.delete_replica(&secondary).await?;
+                loop {
+                    let observation = cluster.observe().await?;
+                    if !observation
+                        .resources()
+                        .iter()
+                        .any(|resource| resource.reference().uid() == secondary.instance_id())
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let topology = cluster.settle().await?;
+                ensure!(
+                    topology.primary() == &primary,
+                    "a lost peer caused retirement of the still-current primary"
+                );
+                ensure!(cluster.service(&secondary).await.is_err());
+                topology
+            }
         };
         for reference in settled.members() {
             let service = cluster.service(reference).await?;

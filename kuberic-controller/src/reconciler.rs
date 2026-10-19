@@ -394,14 +394,14 @@ impl Reconciler {
         }
     }
 
-    async fn reconcile_unavailable_recovery(
+    async fn reconcile_obsolete_recovery(
         &self,
         raw: &crate::observation::RawObservation,
         scope: &PublicV1Scope,
         command: &kuberic_runtime::protocol::command::PublicV1OperationCommand,
     ) -> Result<Option<ReconcileAction>> {
-        use kuberic_runtime::protocol::public_operations::{
-            PublicCatchUpMode, PublicOperationProgram,
+        use crate::public_v1_reconciliation::{
+            ordinary_recovery_configuration, recovery_peer_changed,
         };
         let Some(status) = raw.set.status.as_ref() else {
             return Ok(None);
@@ -415,38 +415,145 @@ impl Reconciler {
         let transition = transition
             .transition()
             .map_err(ControllerError::InvalidAgentEvidence)?;
-        let Some(PublicOperationProgram::CatchUp {
-            configuration,
-            mode: PublicCatchUpMode::All,
-        }) = command.intent.program.as_ref()
+        let Some(configuration) = ordinary_recovery_configuration(raw, &transition, command)
+            .map_err(ControllerError::InvalidAgentEvidence)?
         else {
             return Ok(None);
         };
-        let current = topology
-            .configuration()
-            .map_err(ControllerError::InvalidAgentEvidence)?;
-        if topology.pending_switchover.is_some()
-            || transition.intent.consumer
-                != crate::evaluator::public_v1_evidence::PublicV1EvidenceConsumer::Topology
-            || configuration.previous.is_some()
-            || configuration.current != current
-            || !topology.sessions.iter().any(|session| {
-                session.role == ReplicaRole::Primary
-                    && session.identity == command.target
-                    && session.storage_incarnation == transition.intent.source.storage_incarnation
-                    && session.process_session_id == command.intent.process_session_id
-            })
-            || !raw.pods.iter().any(|pod| {
-                pod.uid().as_deref() == Some(command.target.instance_id.as_str())
-                    && pod.metadata.deletion_timestamp.is_none()
-            })
-        {
+        let current = &configuration.current;
+        if !raw.pods.iter().any(|pod| {
+            pod.uid().as_deref() == Some(command.target.instance_id.as_str())
+                && pod.metadata.deletion_timestamp.is_none()
+        }) {
             return Ok(None);
         }
         let key = kuberic_runtime::protocol::observation::ReplicaObservationKey::new(
             command.target.replica_id,
             command.target.instance_id.clone(),
         );
+        if recovery_peer_changed(raw, configuration, &transition)
+            .map_err(ControllerError::InvalidAgentEvidence)?
+        {
+            let fresh = self.api.observe(&scope.namespace, &scope.name).await?;
+            if !fresh.failures.is_empty() {
+                return Err(ControllerError::TransientObservation(
+                    fresh
+                        .failures
+                        .iter()
+                        .map(|failure| format!("{}: {}", failure.source, failure.message))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
+            let fresh_status = fresh
+                .set
+                .status
+                .as_ref()
+                .ok_or(ControllerError::ObservationStale)?;
+            let fresh_topology = fresh_status
+                .public_v1_topology
+                .as_ref()
+                .ok_or(ControllerError::ObservationStale)?;
+            let expected = fresh_status
+                .public_v1_transition
+                .as_ref()
+                .ok_or(ControllerError::ObservationStale)?
+                .transition()
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            if fresh.set.uid().as_deref() != Some(scope.resource_uid.as_str())
+                || fresh_topology
+                    .configuration()
+                    .map_err(ControllerError::InvalidAgentEvidence)?
+                    != *current
+                || fresh_topology.pending_switchover.is_some()
+                || expected.intent != transition.intent
+                || expected.evidence != transition.evidence
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            if !recovery_peer_changed(&fresh, configuration, &expected)
+                .map_err(ControllerError::InvalidAgentEvidence)?
+            {
+                return Ok(None);
+            }
+            use kuberic_runtime::protocol::public_operations::{
+                PublicV1AcceptedResult, PublicV1OperationResult,
+            };
+            if expected
+                .evidence
+                .completed_operations
+                .iter()
+                .any(|completion| {
+                    completion.operation_id == expected.intent.operation_id
+                        && completion.revision == expected.intent.revision
+                        && matches!(
+                            completion.result,
+                            PublicV1AcceptedResult::Succeeded
+                                | PublicV1AcceptedResult::RebuildRequired
+                        )
+                })
+            {
+                return Ok(None);
+            }
+            match fresh.agents.get(&key) {
+                Some(RawAgentObservation::PublicV1Report(report)) => {
+                    report
+                        .validate()
+                        .map_err(|message| ControllerError::InvalidAgentEvidence(message.into()))?;
+                    if report.replica != command.target
+                        || report.identity != expected.evidence.identity
+                        || report.resource_uid != scope.resource_uid
+                        || report.history != expected.intent.history
+                        || report.storage_incarnation != expected.intent.source.storage_incarnation
+                    {
+                        return Err(ControllerError::ObservationStale);
+                    }
+                    if report.completed_operations.iter().any(|completion| {
+                        expected.intent.matches(completion)
+                            && matches!(
+                                completion.result,
+                                PublicV1OperationResult::Succeeded
+                                    | PublicV1OperationResult::RebuildRequired(_)
+                            )
+                    }) {
+                        return Ok(None);
+                    }
+                    if let Some(completion) = report
+                        .completed_operations
+                        .iter()
+                        .find(|completion| expected.intent.matches(completion))
+                    {
+                        tracing::warn!(
+                            operation_id = %expected.intent.operation_id,
+                            result = ?completion.result,
+                            "superseding obsolete recovery after exact peer change"
+                        );
+                    }
+                }
+                Some(RawAgentObservation::Invalid { message }) => {
+                    return Err(ControllerError::InvalidAgentEvidence(message.clone()));
+                }
+                Some(RawAgentObservation::Uninitialized(_)) => {
+                    return Err(ControllerError::ObservationStale);
+                }
+                Some(RawAgentObservation::Unavailable { .. } | RawAgentObservation::Absent)
+                | None => {}
+            }
+            // All-peer recovery is obsolete when an exact peer changes. Its
+            // failed wait is not evidence that the healthy source storage failed.
+            self.api
+                .supersede_public_v1_operation(
+                    scope,
+                    &expected,
+                    &ProtocolCommand::PublicV1Operation(Box::new(command.clone())),
+                )
+                .await
+                .map_err(ControllerError::InvalidAgentEvidence)?;
+            return Ok(Some(ReconcileAction {
+                requeue_after: Duration::ZERO,
+                kind: ReconcileKind::Executed,
+            }));
+        }
         let unavailable = matches!(
             raw.agents.get(&key),
             Some(RawAgentObservation::Unavailable { .. } | RawAgentObservation::Absent)
@@ -595,7 +702,7 @@ impl Reconciler {
                 .command()
                 .map_err(ControllerError::InvalidAgentEvidence)?;
             if let Some(action) = self
-                .reconcile_unavailable_recovery(&raw, &scope, &command)
+                .reconcile_obsolete_recovery(&raw, &scope, &command)
                 .await?
             {
                 return Ok(action);

@@ -680,11 +680,27 @@ impl<F: ApplicationFactory> Harness<F> {
             ) || evidence.renewals.iter().any(|required| {
                 required.history == accepted.history
                     && required.fresh_configuration == configuration
-                    && intent.operation_id.to_string()
+                    && (intent.operation_id.to_string()
                         == format!(
                             "{}-configuration-{}",
                             required.operation_id, session.identity.replica_id
                         )
+                        || (session.role == ReplicaRole::Primary
+                            && matches!(
+                                intent.program,
+                                Some(PublicOperationProgram::CatchUp {
+                                    mode: kuberic_runtime::protocol::public_operations::
+                                        PublicCatchUpMode::All,
+                                    ..
+                                })
+                            )
+                            && intent.operation_id
+                                == crate::public_v1_reconciliation::renewal_settlement_id(
+                                    &required.operation_id,
+                                    session.identity.replica_id,
+                                    intent.revision,
+                                    intent.program.as_ref().expect("CatchUp checked"),
+                                )))
                     && required
                         .replacement
                         .iter()
