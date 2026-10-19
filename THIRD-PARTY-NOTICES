@@ -158,11 +158,28 @@ reentrant sends; shared handoff delivery preserves ACK ordering and continues
 after failures. Retained Rust build futures, weak ingress, outside-guard effects,
 Tokio deadlines/Notify and rooted activity accounting replace COM/job/callback
 queue plumbing. Oneshot delivery drainage does not assert client waiter
-execution or arbitrary pending provider-call drain. Configuration is an explicit
-caller-established seam, not native session creation or promotion. Full role/
-external-epoch/queue-transfer, slow-peer/MustCatchup policy, monitoring/health and
+execution or arbitrary pending provider-call drain. At that slice boundary,
+configuration was a caller-established seam, not native session creation or
+promotion. Full role/external-epoch/queue-transfer, slow-peer/MustCatchup policy, monitoring/health and
 production activation remain pending. Tests execute actual Rust components,
 not native binaries or a native harness. Components remain private/unselected.
+
+The descriptor-based primary configuration extension in primary.rs, narrow
+replica_manager.rs/session.rs/sender.rs seams and
+primary/tests/configuration.rs translate selected PrimaryReplicator.cpp
+catch-up/current update entry points, ReplicaManager.cpp:306-335,1205-1779
+session creation/reuse, membership/replay/retirement and
+ReplicationSession.cpp:279-283 idle-to-active session marking/average reset at
+the same pin. Typed Rust descriptors use optional progress for the native
+unknown sentinel and contain active remote members only. Configuration matches
+existing sessions by replica ID; retained endpoint/incarnation and ACK state are
+not silently replaced by new descriptor metadata. Bound ACK ingress still
+checks full identity. Shared existing quorum/replay/catchup algorithms and
+outside-guard effects are reused. Actual pending copy/provider work is neither
+declared successful nor implicitly drained by session promotion. This is not
+secondary-to-primary role promotion, external epoch/queue transfer, slow-peer
+policy, host integration or production activation. Tests execute actual Rust
+components, not native binaries or the native harness.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 

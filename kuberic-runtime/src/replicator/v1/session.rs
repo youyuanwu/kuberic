@@ -7,6 +7,7 @@
 
 //! Bounded, unselected session coordination, NOT a complete ReplicationSession.
 //! No carrier, demultiplexer, copy/build/quorum/role owner or slow-fault timer.
+//! Primary owns idle-to-active session marking and actual sender-average reset.
 //! Copy/primary handoffs are explicit obligations, never successful stubs.
 //! Short transitions own a mutex; every external effect executes after release.
 
@@ -87,6 +88,7 @@ struct State {
     sending_epoch: Epoch,
     retry: Duration,
     active: bool,
+    promoted: bool,
     sender: ReliableOperationSender,
     // Establishment owns admission; the session's ACK processor closes retries.
     start_copy: Option<ReliableOperationSender>,
@@ -118,6 +120,7 @@ impl ReplicationSession {
                 sending_epoch,
                 retry: config.retry,
                 active: false,
+                promoted: false,
                 sender: ReliableOperationSender::new(config, last_ack, now),
                 start_copy: None,
                 send,
@@ -303,6 +306,16 @@ impl ReplicationSession {
             .unwrap()
             .sender
             .reset_average_statistics(now);
+    }
+
+    pub(super) fn promote_to_active_secondary(&self, now: Duration) {
+        let mut state = self.state.lock().unwrap();
+        state.promoted = true;
+        state.sender.reset_average_statistics(now);
+    }
+
+    pub(super) fn is_promoted(&self) -> bool {
+        self.state.lock().unwrap().promoted
     }
 
     pub(super) fn is_processing(&self) -> bool {

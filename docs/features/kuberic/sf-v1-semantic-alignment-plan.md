@@ -55,11 +55,14 @@ epoch callbacks, cross-receiver faults and ordinary legacy/EOS Close/drain/Abort
 adds retained build/session lifetime, post-build retry/RequestAck timers,
 bound role-aware ordered ACK/quorum delivery and ordinary quorum prewait/
 Close/Abort effect drainage (42 actual tests, 622 combined V1).
-Configuration/session creation remains an explicit caller-established seam,
-not native promotion or full UpdateConfiguration. These supersede preceding
-slice-boundary omissions, not pending full native configuration/session
-creation and role, external epoch reconfiguration, promotion, monitoring/health
-or policy owners.
+The [primary configuration slice](sf-v1-port-ledger.md#primary-configuration-slice-p3-bounded-f02f06f08f09)
+adds descriptor-based catch-up/current updates, actual session creation/reuse,
+idle-to-active session marking/average reset and existing replay/retirement/
+quorum/catchup composition (34 actual tests, 656 combined V1). Configuration
+reuse is ID-based while bound ACK identity remains strict. These supersede
+preceding slice-boundary omissions, not pending role/external-epoch orchestration,
+secondary-to-primary role promotion/drained queue transfer, monitoring/health or
+periodic/slow-peer policy owners.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -426,7 +429,10 @@ identity/epoch establishment and bounded BuildIdle/idle-session admission,
 classic boundary/pending-replication capture, ordered orchestration and
 removal/cancellation/completion cleanup. Bounded secondary lifetime now adds
 shared receiver/context/ACK ownership, provider epoch callbacks and ordinary
-legacy/EOS Close/drain/Abort. Primary coordinator/session ownership and subsequent
+legacy/EOS Close/drain/Abort. Bounded primary lifetime now retains builds/session
+timers/ordered ACKs and quorum prewait/Close/Abort effects. Descriptor-based
+configuration creates/reuses sessions, marks idle-to-active session promotion and
+composes replay/retirement with the actual manager. Subsequent
 role/external-epoch orchestration, drained queue transfer and remaining session
 policies are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before

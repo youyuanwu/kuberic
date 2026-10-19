@@ -77,7 +77,7 @@ just nextest-validate-archive
 The complete tier inventory and shard commands are documented in the
 [test strategy](docs/features/kuberic/testing.md).
 
-The current test inventory contains 1037 tests: 991 ordinary, 41 PostgreSQL,
+The current test inventory contains 1071 tests: 1025 ordinary, 41 PostgreSQL,
 three KinD, and two build-only.
 
 ## Experimental Kubernetes Validation
