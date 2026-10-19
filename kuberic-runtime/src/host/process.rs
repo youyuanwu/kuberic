@@ -273,15 +273,7 @@ impl ReplicaHandle {
             Some(crate::protocol::public_operations::PublicOperationProgram::Open { .. })
         ) {
             let state = self.store.load_state().await?;
-            let mode = if state
-                .application_storage
-                .as_ref()
-                .is_some_and(|binding| binding.initializing)
-            {
-                crate::application::OpenMode::New
-            } else {
-                crate::application::OpenMode::Existing
-            };
+            let mode = state.application_open_mode();
             callbacks.open_context = Some(self.runtime.public_open_context(mode).await);
         }
         let operation = crate::host::public_lifecycle::launch(

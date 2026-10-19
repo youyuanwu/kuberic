@@ -148,6 +148,13 @@ message PublicV1AgentStatus {
   string replicator_creation_id = 21;
   optional bool catch_up_specific_quorum = 23;
   optional string replication_address = 22;
+  PublicV1OpenMode open_mode = 24;
+}
+
+enum PublicV1OpenMode {
+  PUBLIC_V1_OPEN_MODE_UNKNOWN = 0;
+  PUBLIC_V1_OPEN_MODE_NEW = 1;
+  PUBLIC_V1_OPEN_MODE_EXISTING = 2;
 }
 
 message PublicV1ServiceLocation {

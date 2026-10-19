@@ -279,6 +279,16 @@ pub fn normalize_public_v1_agent_status_report(
             });
         }
     };
+    let open_mode = match proto::PublicV1OpenMode::try_from(public.open_mode) {
+        Ok(proto::PublicV1OpenMode::New) => crate::application::OpenMode::New,
+        Ok(proto::PublicV1OpenMode::Existing) => crate::application::OpenMode::Existing,
+        Ok(proto::PublicV1OpenMode::Unknown) | Err(_) => {
+            return Err(WireError::InvalidEnum {
+                field: "public_v1.open_mode",
+                value: public.open_mode,
+            });
+        }
+    };
     let completed_operations = public
         .completed_operations
         .into_iter()
@@ -356,6 +366,7 @@ pub fn normalize_public_v1_agent_status_report(
             last: public.last_progress,
         },
         replication_address: public.replication_address,
+        open_mode,
         service_location,
         data_loss_recovery,
         completed_operations,
@@ -384,6 +395,10 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
             process_session_id: report.process_session_id.as_str().to_string(),
             replicator_creation_id: report.replicator_creation_id.as_str().to_string(),
             report_sequence: report.report_sequence,
+            open_mode: match report.open_mode {
+                crate::application::OpenMode::New => proto::PublicV1OpenMode::New as i32,
+                crate::application::OpenMode::Existing => proto::PublicV1OpenMode::Existing as i32,
+            },
             replication_address: report.replication_address.clone(),
             role: role_to_proto(report.role) as i32,
             read_status: access_status_to_proto(report.read_status) as i32,

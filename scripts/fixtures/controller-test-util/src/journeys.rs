@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
 use kuberic_controller::test_util::TestCluster;
+use kuberic_runtime::application::OpenMode;
 
 use super::CounterFactory;
 
@@ -53,6 +54,10 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
     let mut cluster = cluster().await?;
     let result = async {
         let topology = cluster.settle().await?;
+        for replica in topology.members() {
+            let service = cluster.service(replica).await?;
+            ensure!(service.open_modes() == [OpenMode::New]);
+        }
         let writer = cluster.service(topology.primary()).await?;
         cluster
             .drive(async { Ok::<_, anyhow::Error>(writer.set(17).await?) })
@@ -60,6 +65,7 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
         let secondary = topology.secondaries().next().unwrap().clone();
         let reopened = cluster.restart(&secondary).await?;
         let service = cluster.service(&reopened).await?;
+        ensure!(service.open_modes() == [OpenMode::Existing]);
         ensure!(service.read().await? == 17);
         ensure!(
             cluster.service(&secondary).await.is_err(),
@@ -70,6 +76,11 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
         let replaced = topology.secondaries().last().unwrap().clone();
         cluster.delete_replica(&replaced).await?;
         let topology = cluster.settle().await?;
+        let replacement = topology
+            .members()
+            .find(|replica| replica.identity().replica_id == replaced.identity().replica_id)
+            .unwrap();
+        ensure!(cluster.service(replacement).await?.open_modes() == [OpenMode::New]);
         ensure!(
             cluster.service(&replaced).await.is_err(),
             "retired reference resolved"
@@ -106,6 +117,12 @@ async fn repeated_secondary_replacement_preserves_acknowledged_data() -> Result<
                 .clone();
             cluster.delete_replica(&replaced).await?;
             cluster.settle().await?;
+            let observation = cluster.observe().await?;
+            let replacement = observation
+                .replicas()
+                .find(|replica| replica.identity().replica_id == replica_id)
+                .unwrap();
+            ensure!(cluster.service(replacement).await?.open_modes() == [OpenMode::New]);
             ensure!(
                 cluster.service(&replaced).await.is_err(),
                 "retired reference resolved"

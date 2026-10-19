@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use kuberic_runtime::application::{
-    CopyChunk, DurableApplicationProgress, OpenContext, Operation, OperationDataStream, RoleChange,
+    CopyChunk, DurableApplicationProgress, OpenContext, OpenMode, Operation, OperationDataStream,
+    RoleChange,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, OperationId, ReplicaRole};
@@ -357,6 +358,7 @@ impl StateProvider for CounterStore {
 
 pub struct CounterService {
     store: Arc<CounterStore>,
+    open_modes: Mutex<Vec<OpenMode>>,
     address: String,
     partition: RwLock<Option<StatefulServicePartition>>,
     state: RwLock<Option<Arc<dyn StateReplicator>>>,
@@ -369,6 +371,7 @@ impl CounterService {
     pub fn new(store: CounterStore, address: String) -> Self {
         Self {
             store: Arc::new(store),
+            open_modes: Mutex::new(Vec::new()),
             address,
             partition: RwLock::new(None),
             state: RwLock::new(None),
@@ -376,6 +379,10 @@ impl CounterService {
             stop: watch::channel(false).0,
             consumers: AsyncMutex::new(JoinSet::new()),
         }
+    }
+
+    pub fn open_modes(&self) -> Vec<OpenMode> {
+        self.open_modes.lock().unwrap().clone()
     }
 
     pub async fn set(&self, value: i64) -> Result<i64> {
@@ -445,6 +452,7 @@ impl CounterService {
 #[async_trait]
 impl StatefulServiceReplica for CounterService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        self.open_modes.lock().unwrap().push(context.mode);
         let mut tasks = self.consumers.lock().await;
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);

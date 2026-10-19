@@ -10,7 +10,7 @@ use crate::replicator::StatefulServicePartition;
 
 pub use crate::traits::{StateProvider, StatefulServiceReplica};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub enum OpenMode {
     New,
     Existing,

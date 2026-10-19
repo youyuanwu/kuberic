@@ -217,6 +217,7 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
         process_session_id: replacement.process_session_id.clone(),
         replicator_creation_id: replacement.replicator_creation_id.clone(),
         report_sequence: 1,
+        open_mode: kuberic_runtime::application::OpenMode::Existing,
         role: ReplicaRole::None,
         read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,

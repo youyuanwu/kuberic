@@ -27,7 +27,8 @@ impl ApplicationFactory for CounterFactory {
             } else {
                 ApplicationStorageState::Established
             },
-        ))
+        )
+        .with_storage_paths([context.application_root().to_owned()]))
     }
 
     async fn shutdown_and_drain(&self, service: Arc<Self::Service>) -> Result<()> {

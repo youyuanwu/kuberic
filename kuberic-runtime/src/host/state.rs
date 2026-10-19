@@ -257,6 +257,18 @@ pub(crate) struct AgentState {
 }
 
 impl AgentState {
+    pub(crate) fn application_open_mode(&self) -> crate::application::OpenMode {
+        if self
+            .application_storage
+            .as_ref()
+            .is_some_and(|binding| binding.initializing)
+        {
+            crate::application::OpenMode::New
+        } else {
+            crate::application::OpenMode::Existing
+        }
+    }
+
     pub(crate) fn new(identity: StorageIdentity) -> Self {
         Self {
             identity,

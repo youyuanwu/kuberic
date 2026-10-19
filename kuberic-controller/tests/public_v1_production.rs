@@ -81,6 +81,7 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
             "creation-1",
         ),
         report_sequence: 1,
+        open_mode: kuberic_runtime::application::OpenMode::Existing,
         role: ReplicaRole::None,
         read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,
@@ -2844,6 +2845,7 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
         peer.progress.role = PublicProgressRole::Recovery;
         peer.service_location = None;
         peer.completed_operations.clear();
+        let restarted_peer = peer.replica.clone();
         api.set_observation(observed).await;
 
         assert_eq!(
@@ -2854,16 +2856,50 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
                 .kind,
             ReconcileKind::Applied
         );
-        let command = api
+        let open = api
             .observation()
             .await
             .set
             .status
             .as_ref()
             .and_then(|status| status.public_v1_operation.as_ref())
-            .expect("refreshed primary configuration")
+            .expect("current peer Open must precede refreshed primary configuration")
             .command()
             .unwrap();
+        assert_eq!(open.target, restarted_peer);
+        assert!(matches!(
+            open.intent.program,
+            Some(
+                kuberic_runtime::protocol::public_operations::PublicOperationProgram::Open {
+                    existing: true,
+                    ..
+                }
+            )
+        ));
+        let mut refreshed = None;
+        for _ in 0..8 {
+            reconciler.reconcile("default", "sample").await.unwrap();
+            let observation = api.observation().await;
+            if let Some(operation) = observation
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_operation.as_ref())
+            {
+                let command = operation.command().unwrap();
+                if command.target == primary {
+                    assert!(observation.agents.values().any(|agent| matches!(
+                        agent,
+                        RawAgentObservation::PublicV1Report(report)
+                            if report.replica == restarted_peer
+                                && report.has_current_open_endpoint()
+                    )));
+                    refreshed = Some(command);
+                    break;
+                }
+            }
+        }
+        let command = refreshed.expect("refreshed primary configuration after current peer Open");
         assert_eq!(command.target, primary);
         assert!(matches!(
             command.intent.program.as_ref(),

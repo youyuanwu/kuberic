@@ -2364,6 +2364,8 @@ pub struct PublicV1AgentReport {
     pub history: HistoryContext,
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub progress: PublicProgress,
+    /// Host-authoritative mode for a new Open against the current application storage.
+    pub open_mode: crate::application::OpenMode,
     /// The current process's successful Replicator Open result, absent before Open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication_address: Option<String>,
@@ -2378,6 +2380,28 @@ pub struct PublicV1AgentReport {
 }
 
 impl PublicV1AgentReport {
+    /// An endpoint backed by a successful Open for this exact storage and process.
+    pub fn has_current_open_endpoint(&self) -> bool {
+        self.replication_address
+            .as_ref()
+            .is_some_and(|address| !address.trim().is_empty())
+            && self.completed_operations.iter().any(|completion| {
+                completion.call_kind == PublicV1CallKind::Open
+                    && completion.process_session_id == self.process_session_id
+                    && completion.history == self.history
+                    && completion.storage_incarnation == self.storage_incarnation
+                    && completion.result == PublicV1OperationResult::Succeeded
+                    && [false, true].into_iter().any(|existing| {
+                        completion.input_digest
+                            == (PublicOperationProgram::Open {
+                                replica: self.replica.clone(),
+                                existing,
+                            })
+                            .digest()
+                    })
+            })
+    }
+
     fn is_access_closed_replacement_observation(&self) -> bool {
         self.role == ReplicaRole::None
             && self.read_status != AccessStatus::Granted

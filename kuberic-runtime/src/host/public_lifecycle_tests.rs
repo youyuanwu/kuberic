@@ -44,13 +44,14 @@ impl Probe {
     }
 }
 
-struct Application(Arc<Probe>);
+struct Application(Arc<Probe>, Arc<dyn Replicator>);
 struct Replication(Arc<Probe>);
 
 #[async_trait::async_trait]
 impl StatefulServiceReplica for Application {
-    async fn open(self: Arc<Self>, _: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
-        Ok(Arc::new(Replication(self.0.clone())))
+    async fn open(self: Arc<Self>, context: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
+        self.0.event(format!("application.open.{:?}", context.mode));
+        Ok(self.1.clone())
     }
 
     async fn change_role(&self, role: ReplicaRole) -> crate::Result<RoleChange> {
@@ -239,7 +240,7 @@ impl Fixture {
         let replication = Arc::new(Replication(probe.clone()));
         let drain_probe = probe.clone();
         let callbacks = PublicLifecycleCallbacks {
-            application: Arc::new(Application(probe.clone())),
+            application: Arc::new(Application(probe.clone(), replication.clone())),
             replicator: replication.clone(),
             primary: replication,
             application_control_match: None,
@@ -311,6 +312,23 @@ impl Fixture {
         .await
         .unwrap()
     }
+
+    async fn bind_open_context(&mut self, mode: crate::application::OpenMode) -> ReplicaIdentity {
+        let state = self.store.load_state().await.unwrap();
+        let replica = state.identity.local_identity;
+        let runtime = crate::host::hosting::PodRuntime::new_replacement(
+            replica.clone(),
+            Arc::new(Application(
+                self.probe.clone(),
+                self.callbacks.replicator.clone(),
+            )),
+            self.store.clone(),
+            state.public_v1_operation_state.unwrap().binding.unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        self.callbacks.open_context = Some(runtime.public_open_context(mode).await);
+        replica
+    }
 }
 
 async fn completed(operation: &PartitionOperation) -> PublicOperationRecord {
@@ -318,6 +336,75 @@ async fn completed(operation: &PartitionOperation) -> PublicOperationRecord {
         .await
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test]
+async fn open_mode_disagreement_rejects_before_the_application_callback() {
+    use crate::application::OpenMode;
+
+    for mode in [OpenMode::New, OpenMode::Existing] {
+        let mut fixture = Fixture::new().await;
+        let replica = fixture.bind_open_context(mode).await;
+        let operation = fixture
+            .launch(
+                PublicOperationProgram::Open {
+                    replica,
+                    existing: mode == OpenMode::New,
+                },
+                1,
+            )
+            .await;
+        assert!(matches!(
+            completed(&operation).await.disposition,
+            Some(PublicOperationDisposition::Failed(detail))
+                if detail.contains("open context changed")
+        ));
+        assert!(
+            fixture
+                .probe
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !event.starts_with("application.open."))
+        );
+        fixture.registry.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn completed_new_open_replays_after_the_bound_mode_changes_to_existing() {
+    use crate::application::OpenMode;
+
+    let mut fixture = Fixture::new().await;
+    let replica = fixture.bind_open_context(OpenMode::New).await;
+    let program = PublicOperationProgram::Open {
+        replica,
+        existing: false,
+    };
+    let operation = fixture.launch(program.clone(), 1).await;
+    assert_eq!(
+        completed(&operation).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    fixture.callbacks.open_context.as_mut().unwrap().mode = OpenMode::Existing;
+    let replay = fixture.launch(program, 1).await;
+    assert_eq!(
+        completed(&replay).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    assert_eq!(
+        fixture
+            .probe
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.starts_with("application.open."))
+            .collect::<Vec<_>>(),
+        vec!["application.open.New"]
+    );
+    fixture.registry.shutdown().await.unwrap();
 }
 
 #[tokio::test]
