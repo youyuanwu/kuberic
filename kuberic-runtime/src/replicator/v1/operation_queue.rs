@@ -117,20 +117,20 @@ pub(super) struct QueueConfig {
 }
 
 impl QueueConfig {
-    fn validate(self) {
-        assert!(self.initial_capacity > 1 && self.initial_capacity.is_power_of_two());
-        assert!(
-            self.max_capacity == 0
+    pub(super) fn is_valid(self) -> bool {
+        self.initial_capacity > 1
+            && self.initial_capacity.is_power_of_two()
+            && (self.max_capacity == 0
                 || (self.max_capacity.is_power_of_two()
-                    && self.initial_capacity <= self.max_capacity)
-        );
-        assert!(self.max_capacity != 0 || self.max_bytes != 0);
-        // Preserve the native conjunction, not a guessed stronger prohibition.
-        assert!(
-            !self.clean_on_complete
+                    && self.initial_capacity <= self.max_capacity))
+            && (self.max_capacity != 0 || self.max_bytes != 0)
+            && (!self.clean_on_complete
                 || self.max_completed_count == 0
-                || self.max_completed_bytes == 0
-        );
+                || self.max_completed_bytes == 0)
+    }
+
+    fn validate(self) {
+        assert!(self.is_valid());
     }
 }
 
@@ -320,6 +320,10 @@ impl OperationQueue {
     pub(super) fn set_ignore_commit(&mut self, value: bool) {
         assert_eq!(self.progress.commit_head, self.progress.complete_head);
         self.ignore_commit = value;
+    }
+
+    pub(super) fn set_require_service_ack(&mut self, value: bool) {
+        self.require_service_ack = value;
     }
 
     /// Flag assignment only: the owner must arrange valid history state.

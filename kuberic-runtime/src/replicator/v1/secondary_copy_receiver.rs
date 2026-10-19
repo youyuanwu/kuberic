@@ -36,6 +36,15 @@ pub(super) struct SecondaryCopyConfig {
     pub(super) copy_done: bool,
 }
 
+impl SecondaryCopyConfig {
+    pub(super) fn is_valid(self) -> bool {
+        self.initial_capacity > 1
+            && self.initial_capacity.is_power_of_two()
+            && self.max_capacity.is_power_of_two()
+            && self.initial_capacity <= self.max_capacity
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 #[cfg_attr(
     not(test),
@@ -184,11 +193,7 @@ pub(super) struct SecondaryCopyReceiver {
 )]
 impl SecondaryCopyReceiver {
     pub(super) fn new(config: SecondaryCopyConfig) -> Result<Self, SecondaryCopyError> {
-        if config.initial_capacity <= 1
-            || !config.initial_capacity.is_power_of_two()
-            || !config.max_capacity.is_power_of_two()
-            || config.initial_capacity > config.max_capacity
-        {
+        if !config.is_valid() {
             return Err(SecondaryCopyError::InvalidCapacity);
         }
         let callback = Arc::new(Mutex::new(CopyDispatchState {

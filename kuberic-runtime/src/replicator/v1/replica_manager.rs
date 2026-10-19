@@ -14,8 +14,8 @@
 //! BuildIdle owns fresh idle-session creation and registers its actual copy target
 //! and cancellation here. Primary resolves descriptor-created/reused sessions and
 //! idle-to-active session promotion. Slow-replica exclusion, host
-//! fault reporting, notification scheduling and role/queue transfer remain
-//! missing owners. No flag here declares those responsibilities successful.
+//! fault reporting and notification scheduling remain missing owners.
+//! The private role owner supplies queue transfer and epoch orchestration.
 //! Deliver returned effects after releasing the owner's guard. ACK processors
 //! must retain their ordered copy handoffs; call `update_progress` when their
 //! primary-progress handoff is delivered, not on raw ACK ingress.
@@ -33,7 +33,10 @@ use super::build_idle::BuildIdleHandle;
 use super::copy_async_operation::CopyFault;
 use super::copy_establishment::PrimaryEstablishment;
 use super::operation_queue::QueueConfig;
-use super::replication_queue_manager::{QueueAdmissionError, QueueUpdate, ReplicationQueueManager};
+use super::replication_queue_manager::{
+    QueueAdmissionError, QueueNormalizationError, QueueTransfer, QueueUpdate,
+    ReplicationQueueManager,
+};
 use super::sender::{SenderOperation, SenderProgress};
 use super::session::{ReplicationSession, SessionIdentity, SessionSendBatch};
 use super::transport::Route;
@@ -112,6 +115,7 @@ pub(super) enum ConfigurationError {
 pub(super) enum ManagerError {
     ObjectClosed,
     ReconfigurationPending,
+    QueueNormalization(QueueNormalizationError),
     Configuration(ConfigurationError),
     Admission(QueueAdmissionError),
     InvalidSessionProgress {
@@ -283,6 +287,56 @@ pub(super) struct ReplicaManager {
     expect(dead_code, reason = "unselected V1 primary owner API")
 )]
 impl ReplicaManager {
+    pub(super) fn from_transferred(
+        queue_config: QueueConfig,
+        transfer: QueueTransfer,
+        local_replica_id: i64,
+        primary_endpoint: String,
+        epoch: Epoch,
+        allow_multiple_quorum_set: bool,
+    ) -> Result<Self, ManagerError> {
+        let mut manager = Self::new(
+            queue_config,
+            0,
+            local_replica_id,
+            primary_endpoint,
+            epoch,
+            allow_multiple_quorum_set,
+        )?;
+        manager.queue = ReplicationQueueManager::from_transferred_queue(
+            queue_config,
+            transfer.queue,
+            transfer.original_epochs,
+        )
+        .map_err(ManagerError::QueueNormalization)?;
+        Ok(manager)
+    }
+
+    pub(super) fn update_epoch(&mut self, epoch: Epoch) -> Result<Lsn, ManagerError> {
+        self.ensure_active()?;
+        if epoch < self.epoch || epoch.data_loss_number < 0 || epoch.configuration_number < 0 {
+            return Err(ConfigurationError::InvalidEpoch.into());
+        }
+        self.check_reported_fault()?;
+        self.epoch = epoch;
+        for session in self.established_sessions().into_values() {
+            session.update_sending_epoch(epoch);
+        }
+        Ok(self.queue.last_sequence_number())
+    }
+
+    pub(super) fn take_for_secondary(
+        &mut self,
+        config: QueueConfig,
+    ) -> Result<QueueTransfer, ManagerError> {
+        if self.active {
+            return Err(ManagerError::ReconfigurationPending);
+        }
+        self.queue
+            .take_for_secondary(config)
+            .map_err(ManagerError::QueueNormalization)
+    }
+
     pub(super) fn new(
         queue_config: QueueConfig,
         initial_progress: Lsn,
@@ -355,6 +409,16 @@ impl ReplicaManager {
         self.build_fault.as_ref()
     }
 
+    pub(super) fn check_reported_fault(&self) -> Result<(), ManagerError> {
+        if let Some(fault) = &self.build_fault {
+            return Err(ManagerError::ReportedFault {
+                description: fault.description,
+                error: fault.error.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn report_build_fault(&mut self, fault: CopyFault) {
         if self.build_fault.is_none() {
             self.build_fault = Some(fault);
@@ -402,12 +466,7 @@ impl ReplicaManager {
         remote_incarnation: i64,
     ) -> Result<(SessionIdentity, Epoch), ManagerError> {
         self.ensure_active()?;
-        if let Some(fault) = &self.build_fault {
-            return Err(ManagerError::ReportedFault {
-                description: fault.description,
-                error: fault.error.to_string(),
-            });
-        }
+        self.check_reported_fault()?;
         if route.source.replica != self.local_replica_id
             || route.sender_address != self.primary_endpoint
         {
@@ -989,6 +1048,14 @@ impl ReplicaManager {
     }
 
     pub(super) fn close(&mut self) -> ManagerEffects {
+        self.close_inner(false)
+    }
+
+    pub(super) fn close_for_secondary(&mut self) -> ManagerEffects {
+        self.close_inner(true)
+    }
+
+    fn close_inner(&mut self, creating_secondary: bool) -> ManagerEffects {
         if !self.active {
             return ManagerEffects::default();
         }
@@ -1021,6 +1088,16 @@ impl ReplicaManager {
                 .into_values()
                 .map(SessionEffect::Close),
         );
+        if creating_secondary {
+            self.idle.clear();
+            match self.observe() {
+                Ok(observation) => {
+                    self.cached_current = observation.current;
+                    self.advance_queue(observation.normal, &mut effects);
+                }
+                Err(error) => effects.close_progress_error = Some(error),
+            }
+        }
         effects
             .build_cancellations
             .extend(std::mem::take(&mut self.builds).into_values());

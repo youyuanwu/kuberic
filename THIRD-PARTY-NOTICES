@@ -160,8 +160,9 @@ Tokio deadlines/Notify and rooted activity accounting replace COM/job/callback
 queue plumbing. Oneshot delivery drainage does not assert client waiter
 execution or arbitrary pending provider-call drain. At that slice boundary,
 configuration was a caller-established seam, not native session creation or
-promotion. Full role/external-epoch/queue-transfer, slow-peer/MustCatchup policy, monitoring/health and
-production activation remain pending. Tests execute actual Rust components,
+promotion. At that slice boundary, full role/external-epoch/queue-transfer, slow-peer/
+MustCatchup policy, monitoring/health and production activation remained pending.
+Tests execute actual Rust components,
 not native binaries or a native harness. Components remain private/unselected.
 
 The descriptor-based primary configuration extension in primary.rs, narrow
@@ -180,6 +181,23 @@ declared successful nor implicitly drained by session promotion. This is not
 secondary-to-primary role promotion, external epoch/queue transfer, slow-peer
 policy, host integration or production activation. Tests execute actual Rust
 components, not native binaries or the native harness.
+
+The private role.rs, its component tests and narrow primary/secondary/receiver/
+queue-manager extensions translate selected ReplicatorState.cpp role edges,
+Replicator.ChangeRoleAsyncOperation.cpp close/create/handoff ordering,
+ReplicationQueueManager.cpp and SecondaryReplicationReceiver.cpp queue transfer,
+promotion-specific branches of both SecondaryReplicator Close operations,
+idle-to-active dispatch drainage and primary/secondary UpdateEpoch operations
+at the same immutable pin. Retained caller-driven Rust steps/provider futures
+replace native COM async roots. Actual queue/operation identity and original
+epochs survive; demotion enforces count/logical-byte bounds and correct service
+ACK mode without reconstructing history or replaying already-applied state.
+Distinct ordinary/promotion Close, required/optimistic ACK and direct/stream
+epochs remain separate. Old primary builds retain their actual provider calls
+for explicit later drainage, not an invented role-completion promise.
+Data-loss/recovery/reset, periodic/slow-peer policy, host demux/health,
+public adapters and activation remain pending. No native binary, native test
+harness or utility dependency is incorporated.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 

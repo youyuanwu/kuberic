@@ -15,3 +15,7 @@ interfaces.
 ## PostgreSQL tests
 Use `just nextest-postgres-smoke` for routine checks. Run the full
 `just nextest-postgres` suite only when explicitly requested.
+
+## Test documentation
+Never add hard-coded test counts to documentation, PR descriptions, or progress
+summaries. Describe coverage and refer to the live nextest inventory instead.

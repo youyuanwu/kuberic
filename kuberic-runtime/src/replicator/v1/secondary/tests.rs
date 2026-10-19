@@ -268,6 +268,131 @@ fn ack_replication(handle: &SecondaryHandle, operation: &ReceivedOperation) {
 }
 
 #[tokio::test]
+async fn legacy_required_ack_promotion_rejects_received_but_unacked_copy() {
+    let rig = Rig::new(config(true, false, false));
+    rig.start();
+    let _copy = rig.handle.copy_stream().unwrap();
+    rig.handle
+        .receive_copy(operation(1, 7, true), false)
+        .unwrap();
+    rig.handle
+        .receive_copy(
+            ReceivedOperation::copy_end_of_stream(2, true).unwrap(),
+            true,
+        )
+        .unwrap();
+    assert!(matches!(
+        rig.handle.close_for_primary(),
+        Err(SecondaryError::IncompleteCopy)
+    ));
+    assert!(
+        rig.owner
+            .root
+            .state
+            .lock()
+            .unwrap()
+            .copy
+            .all_operations_received()
+    );
+}
+
+#[tokio::test]
+async fn eos_promotion_accepts_received_copy_but_waits_its_real_ack() {
+    let mut rig = Rig::new(config(true, false, true));
+    rig.start();
+    let mut copy = rig.handle.copy_stream().unwrap();
+    let mut replication = rig.handle.replication_stream().unwrap();
+    rig.handle
+        .receive_copy(
+            ReceivedOperation::copy_end_of_stream(1, true).unwrap(),
+            true,
+        )
+        .unwrap();
+    rig.handle.close_for_primary().unwrap();
+    let last = take(&mut copy).await;
+    let eos = take(&mut replication).await;
+    ack_replication(&rig.handle, &eos);
+    assert!(rig.owner.run().now_or_never().is_none());
+    ack_copy(&rig.handle, &last);
+    assert!(rig.owner.run().await.unwrap().streams_drained);
+    rig.owner.take_for_primary().unwrap();
+    assert!(matches!(
+        rig.owner.take_for_primary(),
+        Err(SecondaryError::InvalidTransfer)
+    ));
+}
+
+#[tokio::test]
+async fn promotion_waits_already_running_provider_epoch_without_restarting_it() {
+    for fail_epoch in [false, true] {
+        let provider = Arc::new(Provider {
+            epoch_gate: Semaphore::new(0),
+            fail_epoch,
+            ..Provider::new()
+        });
+        let mut rig = Rig::with_provider(config(true, false, false), provider);
+        rig.start();
+        rig.handle
+            .receive_copy(
+                ReceivedOperation::copy_end_of_stream(1, true).unwrap(),
+                true,
+            )
+            .unwrap();
+        let mut stream = rig.handle.replication_stream().unwrap();
+        rig.replicate(1, 8);
+        let barrier = marker(&mut stream).await;
+        rig.handle.update_stream_epoch(barrier).unwrap();
+        assert!(rig.owner.run().now_or_never().is_none());
+        rig.handle.close_for_primary().unwrap();
+        assert!(rig.owner.run().now_or_never().is_none());
+        assert_eq!(rig.provider.epochs.lock().unwrap().len(), 1);
+        rig.provider.epoch_gate.add_permits(1);
+        assert!(rig.owner.run().now_or_never().is_none());
+        let data = take(&mut stream).await;
+        ack_replication(&rig.handle, &data);
+        assert!(rig.owner.run().await.unwrap().streams_drained);
+        if fail_epoch {
+            assert!(matches!(
+                rig.owner.take_for_primary(),
+                Err(SecondaryError::Provider(_))
+            ));
+        } else {
+            rig.owner.take_for_primary().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn secondary_external_epoch_discards_actual_out_of_order_suffix() {
+    let mut rig = Rig::new(config(false, false, false));
+    rig.start();
+    rig.handle
+        .receive_copy(
+            ReceivedOperation::copy_end_of_stream(1, false).unwrap(),
+            true,
+        )
+        .unwrap();
+    rig.replicate(3, 7);
+    assert_eq!(
+        rig.owner
+            .root
+            .replication
+            .lock()
+            .unwrap()
+            .queue()
+            .unwrap()
+            .operation_count(),
+        1
+    );
+    assert!(rig.handle.begin_external_epoch(Epoch::new(1, 8)).unwrap());
+    rig.owner.wait_external_epoch().await.unwrap();
+    let receiver = rig.owner.root.replication.lock().unwrap();
+    assert_eq!(receiver.queue().unwrap().operation_count(), 0);
+    assert_eq!(receiver.minimum_sending_epoch(), Some(Epoch::new(1, 8)));
+    assert!(rig.provider.epochs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn start_initializes_the_shared_actual_receiver_once() {
     let mut rig = Rig::new(config(true, false, true));
     rig.start();

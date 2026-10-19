@@ -2,7 +2,7 @@
 
 ## Status and Compatibility Target
 
-**Roadmap, updated 2026-10-18. No selected runtime behavior changes.**
+**Roadmap, updated 2026-10-19. No selected runtime behavior changes.**
 The separately delivered [P1 foundation ledger](sf-v1-port-ledger.md) and
 [provenance/notices](sf-v1-port-provenance.md) record source-derived scenarios
 and protected-type guards, not ported engine behavior or complete alignment.
@@ -59,10 +59,13 @@ The [primary configuration slice](sf-v1-port-ledger.md#primary-configuration-sli
 adds descriptor-based catch-up/current updates, actual session creation/reuse,
 idle-to-active session marking/average reset and existing replay/retirement/
 quorum/catchup composition (34 actual tests, 656 combined V1). Configuration
-reuse is ID-based while bound ACK identity remains strict. These supersede
-preceding slice-boundary omissions, not pending role/external-epoch orchestration,
-secondary-to-primary role promotion/drained queue transfer, monitoring/health or
-periodic/slow-peer policy owners.
+reuse is ID-based while bound ACK identity remains strict.
+The [role-transition slice](sf-v1-port-ledger.md#role-transition-slice-p3-bounded-f01f02f04f09f11)
+adds native role edges, ACK-mode-specific promotion drainage, real retained
+queue/original-epoch handoff, demotion limits and external primary/secondary
+epoch sequencing with actual-component regressions. These supersede preceding
+slice-boundary omissions, not pending data-loss/recovery/reset orchestration,
+full host role/epoch demux, monitoring/health or periodic/slow-peer policy.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -432,9 +435,10 @@ shared receiver/context/ACK ownership, provider epoch callbacks and ordinary
 legacy/EOS Close/drain/Abort. Bounded primary lifetime now retains builds/session
 timers/ordered ACKs and quorum prewait/Close/Abort effects. Descriptor-based
 configuration creates/reuses sessions, marks idle-to-active session promotion and
-composes replay/retirement with the actual manager. Subsequent
-role/external-epoch orchestration, drained queue transfer and remaining session
-policies are pending. This roadmap is not
+composes replay/retirement with the actual manager. Bounded role orchestration
+now adds promotion-specific drains, retained queue handoff/demotion and direct
+external epoch sequencing. Data-loss/recovery/reset, full host demux and remaining
+session policies are pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required
