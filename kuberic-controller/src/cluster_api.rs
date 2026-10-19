@@ -2533,6 +2533,13 @@ where
             return Err("session renewal changed its predecessor topology".into());
         }
         let replicas = renewal_topology_replicas(&observation, expected)?;
+        let primary = replicas
+            .iter()
+            .find(|replica| {
+                replica.report.replica.replica_id
+                    == expected.required.fresh_configuration.primary_id
+            })
+            .ok_or_else(|| "session renewal lacks its exact primary report".to_string())?;
         if replicas.iter().any(|replica| {
             expected
                 .required
@@ -2542,16 +2549,10 @@ where
                 .any(|member| {
                     member.identity == replica.report.replica
                         && (replica.report.role != member.role
-                            || replica.report.progress.first != replica.report.progress.last)
+                            || replica.report.progress.first != replica.report.progress.last
+                            || replica.report.progress.last != primary.report.progress.last)
                 })
         }) {
-            let primary = replicas
-                .iter()
-                .find(|replica| {
-                    replica.report.replica.replica_id
-                        == expected.required.fresh_configuration.primary_id
-                })
-                .ok_or_else(|| "session renewal lacks its exact primary report".to_string())?;
             let authority = accepted_public_v1_status(Some(&status))?
                 .ok_or_else(|| "session renewal lacks accepted public-v1 authority".to_string())?;
             let revision = primary

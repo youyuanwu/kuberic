@@ -2032,6 +2032,111 @@ async fn production_reconciler_transfers_routing_before_removing_current_primary
 }
 
 #[tokio::test]
+async fn production_reconciler_requires_retirement_evidence_before_dropping_a_secondary() {
+    let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));
+    let reconciler = Reconciler::new(
+        api.clone(),
+        kuberic_controller::production_evaluation_config(0, 1, 1),
+    );
+    for _ in 0..160 {
+        if reconciler
+            .reconcile("default", "sample")
+            .await
+            .unwrap()
+            .kind
+            == ReconcileKind::Stable
+        {
+            break;
+        }
+    }
+    let settled = api.observation().await;
+    let topology = settled
+        .set
+        .status
+        .as_ref()
+        .and_then(|status| status.public_v1_topology.as_ref())
+        .expect("settled topology");
+    for (missing, pod_state, desired, wait) in [
+        (2, "live", 3, true),
+        (2, "deleting", 3, false),
+        (2, "absent", 3, false),
+        (3, "live", 2, false),
+    ] {
+        let missing = ReplicaId::new(missing);
+        let mut observation = settled.clone();
+        observation
+            .agents
+            .retain(|key, _| key.replica_id != missing);
+        let name = format!("sample-{missing}");
+        if pod_state == "absent" {
+            observation.pods.retain(|pod| pod.name_any() != name);
+        } else if pod_state == "deleting" {
+            observation
+                .pods
+                .iter_mut()
+                .find(|pod| pod.name_any() == name)
+                .unwrap()
+                .metadata
+                .deletion_timestamp =
+                Some(serde_json::from_value(serde_json::json!("2026-10-19T00:00:00Z")).unwrap());
+        }
+        observation.set.spec.replicas = desired;
+        let api = Arc::new(InMemoryClusterApi::new(observation));
+        let reconciler = Reconciler::new(
+            api.clone(),
+            kuberic_controller::production_evaluation_config(0, 1, 1),
+        );
+        let action = reconciler.reconcile("default", "sample").await.unwrap();
+        let observation = api.observation().await;
+        let operation = observation
+            .set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_operation.as_ref());
+        if wait {
+            assert_eq!(action.kind, ReconcileKind::Waiting);
+            assert!(operation.is_none());
+        } else if pod_state != "live" {
+            assert_eq!(action.kind, ReconcileKind::Applied);
+            assert!(operation.is_none());
+            let replacement = observation
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_replacement.as_ref())
+                .expect("positive Pod retirement must authorize replacement");
+            assert_eq!(
+                &replacement.predecessor,
+                &topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.identity.replica_id == missing)
+                    .unwrap()
+                    .storage_incarnation,
+            );
+        } else {
+            assert_eq!(action.kind, ReconcileKind::Applied);
+            let command = operation
+                .expect("authorized reconfiguration")
+                .command()
+                .unwrap();
+            assert_eq!(command.target.replica_id, topology.primary_id);
+            assert_eq!(
+                command.intent.program,
+                Some(
+                    kuberic_runtime::protocol::public_operations::PublicOperationProgram::Epoch {
+                        epoch: kuberic_runtime::protocol::types::Epoch::new(
+                            topology.epoch.data_loss_number,
+                            topology.epoch.configuration_number + 1,
+                        ),
+                    }
+                )
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn production_reconciler_replays_topology_after_process_restart() {
     tokio::time::timeout(Duration::from_secs(270), async {
         let api = Arc::new(InMemoryClusterApi::new(empty_observation(3)));

@@ -74,6 +74,11 @@ reference; replacement follows the controller's real PVC/Pod authority.
 Retained old service handles still address the old instance, making real
 stale-writer assertions possible.
 
+An RPC outage alone does not remove a still-desired secondary while its exact
+Pod remains live and the admitted primary is reachable. Membership is retained
+through restart gaps; positive Pod retirement/replacement and explicit
+scale-down still permit topology changes.
+
 Finish every normal result path with the consuming async `finish(result)`
 operation. It drains the supervisor, startup/host tasks, application workers
 and socket owners, preserving scenario and cleanup errors. Drop only requests
