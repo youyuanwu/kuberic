@@ -787,6 +787,36 @@ host/authentication/status/report/controller integration, settings/capabilities,
 monitoring/health and atomic P5 cutover remain pending. No full P4/P3 closure,
 native/hosted/differential parity or provider-fsync qualification is claimed.
 
+### Private Protected-Facade Execution Slice (P4, Bounded F01/F02/F09/F11)
+
+Rust destination:
+[`service_adapter/facade.rs`](../../../kuberic-runtime/src/replicator/v1/service_adapter/facade.rs),
+with [actual-owner trait-object regressions](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs).
+Existing primary/secondary/role owners expose intact retired-owner transfer,
+pollable build drainage and explicit outstanding context drainage after legacy
+Close; no replication state machine is replaced.
+
+| Selected native production material at the immutable pin (`R/` prefix) | Translation / representation changes |
+|---|---|
+| [`Replicator.cpp:296-562`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.cpp#L296-L562); [`ReplicatorState.cpp:39-126`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicatorState.cpp#L39-L126) | Private unchanged protected traits select actual owner operations via a bounded request channel. A retained Tokio task replaces COM caller/operation rooting. Incompatible controls fail; stable primary queries remain available during external epoch work. Exact public replica descriptions bind to explicit private transport/session snapshots, not fabricated identity conversion or production registration. |
+| [`Replicator.CatchupReplicaSetAsyncOperation.cpp:29-94`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.CatchupReplicaSetAsyncOperation.cpp#L29-L94); existing primary/BuildIdle lifetime sources above | Independent build/catch-up futures remain driver-rooted after caller cancellation. Retired primary owners transfer intact and progress concurrently with the active owner. Persistent futures retain notification registrations; no queue/session/ACK or provider completion is synthesized. |
+| [`Replicator.cpp:178-253`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.cpp#L178-L253); [`ReplicatorState.cpp:177-248`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ReplicatorState.cpp#L177-L248); [`Replicator.CloseAsyncOperation.cpp:31-154`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/Replicator.CloseAsyncOperation.cpp#L31-L154) | Abort synchronously gates requests/service handles, disables projected ingress and aborts the projected child unlocked; the task performs role Abort and retains provider drainage. Exclusive control admission and this synchronous-gate/asynchronous-coordination split are explicit Rust substitutions, not full native interleaving parity. Reentrant Abort suppresses late success. Ordinary Close does not wait for arbitrary build providers; a separate cancellation-safe join reports complete worker drainage/errors. Drop is abnormal containment, not clean shutdown. |
+
+Descriptor conversion retains exact remote roles in the previous configuration,
+including its former primary, while validating the current local primary.
+Legacy secondary Close does not imply GetCopyContext drainage: its retained
+provider future continues independently and join observes acquisition failure.
+Tests use the actual compiled Rust owners and protected provider callbacks, not
+native fixtures/binaries. The private bridge implements the protected traits but
+does not publish a factory or alter their signatures/Rustdoc, public assignment/
+ACK APIs, real service writes, selected wire or report/controller semantics.
+The current published durability semantics remain the migration baseline until
+atomic P5 cutover. The protected data-loss `Result<bool>` cannot carry a changed
+flag alongside failed End; the richer private owner result is not replaced.
+No native utility, monitoring, dependency or harness implementation is imported.
+See the [ledger](sf-v1-port-ledger.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11)
+and [selector](testing.md#sf-v1-private-protected-facade-execution-slice).
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

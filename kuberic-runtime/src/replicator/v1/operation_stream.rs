@@ -28,7 +28,6 @@ use crate::protocol::types::Epoch;
 use super::received_operation::ReceivedOperation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 epoch handoff"))]
 pub(super) struct EpochBarrier {
     pub(super) epoch: Epoch,
     pub(super) previous_epoch_last_lsn: Lsn,

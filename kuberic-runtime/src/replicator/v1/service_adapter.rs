@@ -17,6 +17,7 @@
 #![cfg_attr(not(test), expect(dead_code, reason = "unselected V1 service adapter"))]
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -37,6 +38,8 @@ use super::received_operation::{AckError, ReceivedOperation};
 use super::replica_manager::{CatchupMode, CompletionError, CompletionReceiver};
 use super::role::{DataLossEnd, Role, RoleConfig, RoleError, RoleReplicator, RoleStatus};
 use super::secondary::{SecondaryError, SecondaryHandle};
+
+mod facade;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WriteAccess {
@@ -118,6 +121,7 @@ impl ServiceReplicator {
         let target = Arc::new(Mutex::new(Target::Unavailable(RoleStatus::Created)));
         let service = ServiceHandle {
             target: Arc::downgrade(&target),
+            aborted: Arc::new(AtomicBool::new(false)),
             policy: config.secondary.context.buffer_policy,
             limits: config.secondary.context.buffer_limits,
             write_access,
@@ -141,7 +145,9 @@ impl ServiceReplicator {
     }
 
     fn refresh(&self) {
-        let target = if let Ok(primary) = self.owner.primary() {
+        let target = if self.service.aborted.load(Ordering::Acquire) {
+            Target::Unavailable(RoleStatus::Aborting)
+        } else if let Ok(primary) = self.owner.primary() {
             Target::Primary(primary)
         } else if let Ok(secondary) = self.owner.secondary() {
             Target::Secondary(secondary)
@@ -345,6 +351,7 @@ impl Drop for ServiceReplicator {
 #[derive(Clone)]
 pub(super) struct ServiceHandle {
     target: Weak<Mutex<Target>>,
+    aborted: Arc<AtomicBool>,
     policy: BufferPolicy,
     limits: BufferLimits,
     write_access: Arc<dyn Fn() -> WriteAccess + Send + Sync>,
@@ -352,6 +359,9 @@ pub(super) struct ServiceHandle {
 
 impl ServiceHandle {
     fn target(&self) -> Result<Target, AdapterError> {
+        if self.aborted.load(Ordering::Acquire) {
+            return Err(RoleError::Aborted.into());
+        }
         let target = self.target.upgrade().ok_or(AdapterError::OwnerDropped)?;
         Ok(target.lock().unwrap().clone())
     }

@@ -812,6 +812,21 @@ impl RoleReplicator {
         }
         Ok(())
     }
+
+    pub(super) fn take_retired_primaries(&mut self) -> Vec<Primary> {
+        std::mem::take(&mut self.retired_primaries)
+    }
+
+    pub(super) fn take_retired_secondaries(&mut self) -> Vec<Secondary> {
+        std::mem::take(&mut self.retired_secondaries)
+    }
+
+    pub(super) async fn drain_builds(&mut self) -> Result<(), RoleError> {
+        if let Some(primary) = &mut self.primary {
+            primary.drain_builds().await?;
+        }
+        self.drain_retired_builds().await
+    }
 }
 
 #[cfg(test)]

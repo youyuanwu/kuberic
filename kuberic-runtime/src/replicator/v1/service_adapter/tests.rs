@@ -29,6 +29,8 @@ use super::super::sender::SenderConfig;
 use super::super::session::{SendIntent, SendKind};
 use super::super::transport::{Route, wire};
 
+mod facade;
+
 struct Provider {
     progress: AtomicI64,
     progress_calls: AtomicUsize,
@@ -39,9 +41,16 @@ struct Provider {
     loss_calls: AtomicUsize,
     changed: AtomicBool,
     fail_progress: AtomicBool,
+    panic_progress: AtomicBool,
     fail_epoch: AtomicBool,
     copy_gate: Semaphore,
     copy_calls: AtomicUsize,
+    copy_resumed: AtomicUsize,
+    epoch_callback: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    context_gate: Semaphore,
+    context_calls: AtomicUsize,
+    context_resumed: AtomicUsize,
+    fail_context: AtomicBool,
 }
 
 impl Provider {
@@ -56,9 +65,16 @@ impl Provider {
             loss_calls: AtomicUsize::new(0),
             changed: AtomicBool::new(false),
             fail_progress: AtomicBool::new(false),
+            panic_progress: AtomicBool::new(false),
             fail_epoch: AtomicBool::new(false),
             copy_gate: Semaphore::new(100),
             copy_calls: AtomicUsize::new(0),
+            copy_resumed: AtomicUsize::new(0),
+            epoch_callback: Mutex::new(None),
+            context_gate: Semaphore::new(100),
+            context_calls: AtomicUsize::new(0),
+            context_resumed: AtomicUsize::new(0),
+            fail_context: AtomicBool::new(false),
         }
     }
 }
@@ -67,6 +83,10 @@ impl Provider {
 impl StateProvider for Provider {
     async fn update_epoch(&self, epoch: Epoch, boundary: Lsn) -> crate::Result<()> {
         self.epochs.lock().unwrap().push((epoch, boundary));
+        let callback = self.epoch_callback.lock().unwrap().clone();
+        if let Some(callback) = callback {
+            callback();
+        }
         self.epoch_gate.acquire().await.unwrap().forget();
         if self.fail_epoch.load(Ordering::SeqCst) {
             return Err(RuntimeError::InvalidReplication("provider epoch".into()));
@@ -76,6 +96,10 @@ impl StateProvider for Provider {
 
     async fn last_committed_lsn(&self) -> crate::Result<Lsn> {
         self.progress_calls.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !self.panic_progress.load(Ordering::SeqCst),
+            "provider panic"
+        );
         self.progress_gate.acquire().await.unwrap().forget();
         if self.fail_progress.load(Ordering::SeqCst) {
             return Err(RuntimeError::InvalidReplication("provider progress".into()));
@@ -84,6 +108,12 @@ impl StateProvider for Provider {
     }
 
     async fn get_copy_context(&self) -> crate::Result<OperationDataStream> {
+        self.context_calls.fetch_add(1, Ordering::SeqCst);
+        self.context_gate.acquire().await.unwrap().forget();
+        self.context_resumed.fetch_add(1, Ordering::SeqCst);
+        if self.fail_context.load(Ordering::SeqCst) {
+            return Err(RuntimeError::Application("provider context".into()));
+        }
         Ok(Box::pin(stream::iter([Ok(Bytes::from_static(b"context"))])))
     }
 
@@ -94,6 +124,7 @@ impl StateProvider for Provider {
     ) -> crate::Result<OperationDataStream> {
         self.copy_calls.fetch_add(1, Ordering::SeqCst);
         self.copy_gate.acquire().await.unwrap().forget();
+        self.copy_resumed.fetch_add(1, Ordering::SeqCst);
         while let Some(item) = context.next().await {
             assert_eq!(item?, Bytes::from_static(b"context"));
         }
@@ -446,41 +477,44 @@ impl Node {
     }
 
     fn build(&self, to: i64, persisted: bool) -> BuildOperation {
+        let (config, callbacks) = self.build_parts(to, persisted);
+        self.adapter.build_replica(config, callbacks).unwrap()
+    }
+
+    fn build_parts(&self, to: i64, persisted: bool) -> (BuildConfig, BuildCallbacks) {
         let send = self.bus.clone();
         let copies = self.bus.clone();
         let contexts = self.bus.clone();
         let from = self.id;
-        self.adapter
-            .build_replica(
-                BuildConfig {
-                    route: route(from, to),
-                    remote_incarnation: to,
-                    copy: copy_config(),
-                    context: persisted.then_some(CopyContextConfig {
-                        initial_queue_size: 2,
-                        max_queue_size: 8,
-                        batch_ack_interval: Duration::ZERO,
-                        retry_interval: Duration::from_secs(1),
-                        max_pending_acknowledgements: 4,
-                        trace_interval: Duration::ZERO,
-                    }),
-                },
-                BuildCallbacks {
-                    replication: Arc::new(move |intent| send.send(from, intent)),
-                    copy: Arc::new(move |action| copies.copy(&route(from, to), action, false)),
-                    context_ack: Arc::new(move |ack, _| {
-                        contexts.push(
-                            &route(from, to),
-                            wire::envelope::Body::CopyContextAck(wire::CopyContextAck {
-                                sequence: ack.completed,
-                                error: ack.error_code,
-                            }),
-                        );
-                        true
-                    }),
-                },
-            )
-            .unwrap()
+        (
+            BuildConfig {
+                route: route(from, to),
+                remote_incarnation: to,
+                copy: copy_config(),
+                context: persisted.then_some(CopyContextConfig {
+                    initial_queue_size: 2,
+                    max_queue_size: 8,
+                    batch_ack_interval: Duration::ZERO,
+                    retry_interval: Duration::from_secs(1),
+                    max_pending_acknowledgements: 4,
+                    trace_interval: Duration::ZERO,
+                }),
+            },
+            BuildCallbacks {
+                replication: Arc::new(move |intent| send.send(from, intent)),
+                copy: Arc::new(move |action| copies.copy(&route(from, to), action, false)),
+                context_ack: Arc::new(move |ack, _| {
+                    contexts.push(
+                        &route(from, to),
+                        wire::envelope::Body::CopyContextAck(wire::CopyContextAck {
+                            sequence: ack.completed,
+                            error: ack.error_code,
+                        }),
+                    );
+                    true
+                }),
+            },
+        )
     }
 }
 

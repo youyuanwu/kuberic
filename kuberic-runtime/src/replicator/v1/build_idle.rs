@@ -34,6 +34,7 @@ use super::replica_manager::{EstablishedIdle, ManagerEffects, ManagerError, Repl
 use super::session::{AckAction, AckProcessor, ReplicationSession, SendIntent, SessionSendBatch};
 use super::transport::{ProtocolError, Route, wire};
 
+#[derive(Clone)]
 pub(super) struct BuildConfig {
     pub(super) route: Route,
     /// Logical sender identity, not a conversion of the route's GUID.
@@ -42,6 +43,7 @@ pub(super) struct BuildConfig {
     pub(super) context: Option<CopyContextConfig>,
 }
 
+#[derive(Clone)]
 pub(super) struct BuildCallbacks {
     pub(super) replication: Arc<dyn Fn(SendIntent) -> bool + Send + Sync>,
     pub(super) copy: Arc<dyn Fn(CopySendAction) -> bool + Send + Sync>,

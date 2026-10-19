@@ -872,6 +872,25 @@ impl Secondary {
         }
     }
 
+    pub(super) async fn drain_context(&mut self) -> Result<(), SecondaryError> {
+        if self.context_done || !self.root.state.lock().unwrap().context_active {
+            return Ok(());
+        }
+        let result = Self::drive_context(
+            &mut self.establishment,
+            &self.root,
+            self.send_context.clone(),
+        )
+        .await;
+        self.context_done = true;
+        self.root.state.lock().unwrap().context_result = Some(result.clone());
+        match result {
+            Ok(())
+            | Err(EstablishError::Cancelled | EstablishError::Copy(CopyError::Cancelled)) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn drive_context(
         establishment: &mut SecondaryEstablishment,
         root: &Root,

@@ -89,6 +89,11 @@ over actual owners. A helper-free in-memory service demonstrates separate
 ordered commit, visibility and client completion. This bounded P4 preparation
 does not implement or activate the published facade, real KV/SQLite migration,
 host listener/authentication/registry/status/reporting or atomic cutover.
+The [private protected-facade execution slice](sf-v1-port-ledger.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11)
+now implements unchanged protected traits over those owners with a retained
+active/retired driver, independent build/catch-up waits, synchronous Abort
+gating and separate Close/join lifetimes. Published selection, assignment/ACK
+APIs and their current durability contract remain unchanged until P5.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -474,8 +479,10 @@ listener/authentication/registry and partition-report integration, and platform
 monitoring are pending. P4 now has a bounded private service/control adapter:
 resumable caller-driven lifecycle, early assignment/separate quorum completion,
 shared receiver/ACK/provider-barrier adaptation and helper-free service ownership
-evidence. Public facade, real services and host/status/reporting integration
-remain pending. This roadmap is not
+evidence. A private protected-trait execution bridge now retains active and
+retired work independently of callers, without changing public selection.
+Published facade/assignment/ACK integration, real services and host/status/
+reporting integration remain pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required
