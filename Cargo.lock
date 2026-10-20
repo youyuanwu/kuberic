@@ -1394,6 +1394,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kuberic-controller",
+ "kvstore2",
  "prost",
  "quote",
  "rusqlite",

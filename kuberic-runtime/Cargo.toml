@@ -40,6 +40,7 @@ tonic-prost-build.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 kuberic-controller = { path = "../kuberic-controller", features = ["runtime-test-bridge"] }
+kvstore2 = { path = "../examples/kvstore2", features = ["testing"] }
 quote = "1"
 rusqlite.workspace = true
 serde_json.workspace = true

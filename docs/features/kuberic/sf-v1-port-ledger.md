@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
 **P1 foundation, unselected P2 substrate slices and bounded P3 primary,
-secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus bounded private P4 service, protected-facade execution and host access/lifecycle adapters; no selected production behavior change.** Native pin:
+secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus bounded private P4 service, protected-facade execution, host access/lifecycle and real-KV commit adapters; no selected replication behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -1162,6 +1162,65 @@ migration, service-qualified native serving grants, full P4 closure and atomic
 P5 activation remain pending. No native execution, hosted/differential parity
 or provider-fsync qualification is claimed.
 
+### Private Real KV Commit Slice (P4, Bounded F02/F04/F05/F07/F09/F11)
+
+The unselected [`KV committer`](../../../examples/kvstore2/src/v1.rs) owns
+application preparation, FIFO local commit, committed read snapshots and client
+completion. It reuses [`KvPersistence`](../../../examples/kvstore2/src/persistence.rs)'s
+actual file/fsync/rename primitive and mutation reconstruction. The implementation
+belongs to the service, not the replication engine. The existing `testing`
+feature exposes a repository-only byte/LSN/future bridge; a dev-only dependency
+lets [private V1 integration tests](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/kv.rs)
+exercise those real service/storage owners without publishing engine types,
+changing protected traits or adding a factory/selector.
+
+Source guidance is the existing F02 assignment/completion, F04/F05 receiver
+ACK/stream and F07 copy/provider contracts, plus the application example
+[`Store/ReplicatedStore.TransactionReplicator.cpp:606-796,848-900`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp#L606-L900)
+at the immutable native pin. The latter supplies service-side ordered local
+commit and client-completion evidence, not a full KVS translation or a universal
+engine persistence requirement. This KV service chooses serial FIFO commits;
+native KVS batching/implicit completion optimizations are not ported.
+
+Assignment is supplied by the actual V1 handle and precedes separate quorum
+completion. Durable prepares do not become client-visible KV values.
+The retained KV worker waits for quorum, commits locally in assignment order,
+and only then publishes client success. Cancelling a wait or dropping a client
+handle does not retract engine admission or service work. Native host reads
+can remain Granted while KV reads expose only the locally committed prefix.
+Service faults independently deny access, notify the supplied fault sink outside
+guards and remain observable at cancellation-safe, repeatable drainage.
+Abort suppresses not-yet-selected local success, not already admitted replication.
+
+Persisted secondary mutation and complete snapshot installation finish storage
+before their no-argument native service ACKs. Source copy acquisition waits for
+the requested local committed prefix instead of copying unresolved prepares.
+Copy EOF, native build completion and local snapshot installation stay distinct.
+The example encodes one versioned whole-snapshot operation; malformed, regressing
+or conflicting snapshots fail explicitly. New-instance recovery validates
+contiguous local state and discards only locally uncommitted prepares; this is
+not same-lifetime rollback, queue recovery, proof of no remote acceptance, or
+qualification of old production-store migration.
+
+Actual-owner journeys cover delayed ACK versus received progress, quorum ahead
+of local commit, dropped/cancelled client waits, retained Close and explicit
+Abort, source-copy waiting, persisted-secondary failure without ACK, native
+EOS-enabled stream fault, real-file restart, copied-prefix promotion and later
+assignment. Ordinary service tests additionally cover out-of-order completions,
+admission/prepare/commit failures, corrupt recovery and worker panic. Use the
+[live-inventory selector](testing.md#sf-v1-private-real-kv-commit-slice) and
+[source register](sf-v1-port-provenance.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11).
+
+Published KV service/factory/HTTP routes, public assignment/ACK APIs, production
+host/listener/registry/status/wire/reports/schema/controller/election/rejoin and
+protected interfaces remain unchanged. Existing supported KV journeys continue
+to use the old selected engine; unreadable state is explicitly rejected rather
+than treated as a fresh empty store. SQLite adaptation, production service
+migration/serving qualification, full P4 closure and atomic P5 activation remain
+pending. File-backed tests are not power-loss qualification, native execution,
+hosted parity or differential evidence. No production dependency or tier-policy
+change is introduced.
+
 ## Source families, transitions and substitutions
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
@@ -1348,8 +1407,11 @@ bridge now owns autonomous active/retired progress and distinct Close/Abort/join
 lifetimes. A private caller-driven host adapter now composes native access
 selection, independent host-availability quorum, actual role/catch-up/application
 callbacks and outer Close diagnostics, without activating serving grants.
-Public facade selection, real service migration and production host/reporting
-integration remain pending. P4 prepares service/host
+A private real-KV committer now adds service-owned durable prepares, ordered
+local commit/client success, committed read isolation and copy/restart/promotion
+evidence over the actual V1 owners. Public facade selection, production service
+migration, SQLite adaptation and production host/reporting integration remain
+pending. P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
 [roadmap](sf-v1-semantic-alignment-plan.md); P1 creates no permanent alternate

@@ -847,8 +847,9 @@ Authority/fault/retirement fences remain distinct; no applied==committed or
 optional provider-evidence gate changes a normal native access decision.
 Synthetic journeys execute actual compiled Rust queue/role/copy/ACK/provider
 owners and StatefulServiceReplica callbacks, not native fixtures or binaries.
-Separate service-local commit/visibility is demonstrated only in memory; real
-KV/SQLite migration and service-qualified native serving grants remain pending.
+This host slice demonstrates service-local commit/visibility only in memory;
+the subsequent private KV slice adds real-storage evidence. Production KV/SQLite
+migration and service-qualified native serving grants remain pending.
 No public factory, selected host/status/wire, report/schema/controller/election/
 rejoin contract, protected signature, dependency or tier policy changes.
 No native utility, monitoring or harness implementation is imported. Full P4
@@ -856,6 +857,41 @@ closure, P5 activation, hosted/differential parity and provider-fsync qualificat
 are not claimed. See the
 [ledger](sf-v1-port-ledger.md#private-host-access-and-lifecycle-slice-p4-bounded-f01f09f11)
 and [selector](testing.md#sf-v1-private-host-access-and-lifecycle-slice).
+
+### Private Real KV Commit Slice (P4, Bounded F02/F04/F05/F07/F09/F11)
+
+Service destinations:
+[`examples/kvstore2/src/v1.rs`](../../../examples/kvstore2/src/v1.rs)
+and native service-only methods sharing the existing
+[`persistence.rs`](../../../examples/kvstore2/src/persistence.rs) file/fsync/rename
+primitive. Actual V1 integration remains beside the
+[private runtime fixtures](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/kv.rs);
+the fixture node accepts a real protected provider instead of substituting a
+replication machine. A repository-only dev dependency and the example's existing
+`testing` feature bridge use byte/LSN/IO/future contracts, not exported V1 types.
+Normal builds keep the companion private and unselected.
+
+| Selected immutable native evidence | Service translation / representation changes |
+|---|---|
+| [`Store/ReplicatedStore.TransactionReplicator.cpp:606-796`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp#L606-L796), [`848-900`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp#L848-L900) | A service-owned retained FIFO worker waits for actual replication completion, durably commits in assignment order and then completes the client. Failure fences later commits and reports outside guards. Rust channel/task/oneshot retention replaces KVS transaction/COM operation rooting. This is source-guided application ownership, not a full KVS port: implicit-completion, batching, tombstones and local-store optimizations are not translated or required of the engine. |
+| Existing F02 facade/primary assignment and completion sources recorded in the private service slice | Neutral injected assignment supplies an actual LSN and separate actual completion future; no new public StateReplicator or alternative engine is implemented. Durable preparation, local commit, committed read snapshots and client success belong to KV. Waiter cancellation does not retract admission; post-admission preparation failure is explicitly ambiguous. |
+| Existing F04/F05 receivers, shared streams, operation callback and EOS/stream-fault sources recorded above | Real KV secondary persistence finishes before parameterless ACK; application failure does not produce an item-level negative ACK. The EOS-enabled fault case selects the existing native stream-fault path and explicit Abort. Legacy-mode unsupported results are not changed. Copy's complete versioned snapshot is service-owned content, distinct from native copy sequence/EOF/build completion. |
+| Existing F07 provider acquisition/enumeration and F09 role/recovery sources recorded above | Source snapshot acquisition waits for local commitment through its requested boundary, without a new engine prerequisite. Complete copied state survives real-file reopen and actual receiver-to-primary queue transfer; later writes use the actual inherited LSN. New service instances validate local state and discard only uncommitted prepares. That local transaction recovery is not native retained-queue reconstruction, same-lifetime rollback or old-store migration qualification. |
+
+The same storage primitive serves unchanged production KV behavior; mutation
+candidate construction and snapshot reconstruction are shared, not copied
+storage or success stubs. Opening unreadable state now propagates the actual IO
+error instead of silently selecting empty state. Deterministic gates hold local
+commit while the real engine/host progress independently. Tests run actual
+compiled owners and file IO, not native fixtures/binaries, crash/power-loss
+qualification, fsync instrumentation or hosted/differential parity.
+No native utility, store dependency, fixture or harness source is imported.
+Microsoft MIT attribution and full notice are retained. Protected traits/types,
+production factories/services/status/host/wire/reports/controller and tier policy
+are unchanged. Public service API migration, SQLite, production serving
+qualification, full P4 and atomic P5 activation remain pending. See the
+[ledger](sf-v1-port-ledger.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11)
+and [selector](testing.md#sf-v1-private-real-kv-commit-slice).
 
 ### P1 documented expectations (historical foundation)
 

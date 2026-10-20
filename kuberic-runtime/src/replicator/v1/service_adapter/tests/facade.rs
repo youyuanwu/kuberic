@@ -67,7 +67,10 @@ pub(super) fn config(
     }
 }
 
-pub(super) fn facade_config(node: &Node, peers: &[(i64, bool)]) -> FacadeConfig {
+pub(super) fn facade_config<P: StateProvider + 'static>(
+    node: &Node<P>,
+    peers: &[(i64, bool)],
+) -> FacadeConfig {
     let bindings = peers
         .iter()
         .map(|&(id, persisted)| {

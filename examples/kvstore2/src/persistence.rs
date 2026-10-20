@@ -43,6 +43,14 @@ struct OperationRecord {
     data: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSnapshot {
+    version: u32,
+    lsn: i64,
+    values: BTreeMap<String, String>,
+}
+
 pub struct KvPersistence {
     root: PathBuf,
     state_path: PathBuf,
@@ -140,14 +148,11 @@ impl KvPersistence {
         std::fs::create_dir_all(&root)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
         let state_path = root.join("state.json");
-        let state = if state_path.is_file() {
-            serde_json::from_slice(
-                &std::fs::read(&state_path)
-                    .map_err(|error| RuntimeError::Application(error.to_string()))?,
-            )
-            .map_err(|error| RuntimeError::Application(error.to_string()))?
-        } else {
-            PersistedState::default()
+        let state = match std::fs::read(&state_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| RuntimeError::Application(error.to_string()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
+            Err(error) => return Err(RuntimeError::Application(error.to_string())),
         };
         Ok(Self {
             root,
@@ -168,6 +173,10 @@ impl KvPersistence {
 
     pub fn snapshot_at(&self, up_to_lsn: i64) -> Result<BTreeMap<String, String>> {
         let state = self.state.lock().unwrap();
+        Self::values_at(&state, up_to_lsn)
+    }
+
+    fn values_at(state: &PersistedState, up_to_lsn: i64) -> Result<BTreeMap<String, String>> {
         if up_to_lsn < state.base_lsn {
             return Err(RuntimeError::Application(format!(
                 "snapshot boundary {up_to_lsn} predates retained base {}",
@@ -191,6 +200,168 @@ impl KvPersistence {
         Ok(values)
     }
 
+    fn mutation_candidate(
+        state: &PersistedState,
+        operation: &Operation,
+        mutation: Mutation,
+    ) -> PersistedState {
+        let mut candidate = state.clone();
+        match mutation {
+            Mutation::Put { key, value } => {
+                candidate.values.insert(key, value);
+            }
+        }
+        candidate.operations.insert(
+            operation.lsn,
+            OperationRecord {
+                committed_lsn: operation.committed_lsn,
+                data: operation.data.to_vec(),
+            },
+        );
+        candidate.applied_lsn = candidate.applied_lsn.max(operation.lsn);
+        candidate.committed_lsn = candidate.committed_lsn.max(operation.committed_lsn);
+        candidate
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "private V1 companion is compiled in the library, not the binary"
+)]
+impl KvPersistence {
+    pub(crate) fn native_recover(&self) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.base_lsn < 0
+            || state.base_lsn > state.committed_lsn
+            || state.committed_lsn > state.applied_lsn
+            || state
+                .operations
+                .keys()
+                .try_fold(state.base_lsn, |previous, &actual| {
+                    (previous.checked_add(1) == Some(actual)).then_some(actual)
+                })
+                != Some(state.applied_lsn)
+            || Self::values_at(&state, state.applied_lsn)? != state.values
+        {
+            return Err(RuntimeError::Application(
+                "invalid native KV persisted prefix".into(),
+            ));
+        }
+        if state.applied_lsn != state.committed_lsn {
+            let mut candidate = state.clone();
+            candidate.values = Self::values_at(&state, state.committed_lsn)?;
+            candidate
+                .operations
+                .retain(|lsn, _| *lsn <= state.committed_lsn);
+            candidate.applied_lsn = candidate.committed_lsn;
+            self.persist(&candidate)?;
+            *state = candidate;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn native_progress(&self) -> i64 {
+        self.state.lock().unwrap().committed_lsn
+    }
+
+    pub(crate) fn native_prepare(&self, lsn: i64, data: Bytes, commit: bool) -> Result<()> {
+        let mutation: Mutation = serde_json::from_slice(&data)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let mut state = self.state.lock().unwrap();
+        if state.applied_lsn.checked_add(1) != Some(lsn) {
+            return Err(RuntimeError::Application(
+                "native KV preparation is not the next LSN".into(),
+            ));
+        }
+        let mut candidate = Self::mutation_candidate(
+            &state,
+            &Operation {
+                lsn,
+                committed_lsn: 0,
+                data,
+            },
+            mutation,
+        );
+        if commit {
+            if state.committed_lsn.checked_add(1) != Some(lsn) {
+                return Err(RuntimeError::Application(
+                    "native KV secondary commit would skip a prepare".into(),
+                ));
+            }
+            candidate.committed_lsn = lsn;
+        }
+        self.persist(&candidate)?;
+        *state = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn native_commit(&self, lsn: i64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.committed_lsn.checked_add(1) != Some(lsn) || lsn > state.applied_lsn {
+            return Err(RuntimeError::Application(
+                "native KV local commit is not ordered".into(),
+            ));
+        }
+        let mut candidate = state.clone();
+        candidate.committed_lsn = lsn;
+        self.persist(&candidate)?;
+        *state = candidate;
+        Ok(())
+    }
+
+    pub(crate) fn native_get(&self, key: &str) -> Result<Option<String>> {
+        let state = self.state.lock().unwrap();
+        Ok(Self::values_at(&state, state.committed_lsn)?
+            .get(key)
+            .cloned())
+    }
+
+    pub(crate) fn native_snapshot(&self, lsn: i64) -> Result<Bytes> {
+        let state = self.state.lock().unwrap();
+        if lsn > state.committed_lsn {
+            return Err(RuntimeError::Application(
+                "native KV snapshot is ahead of local commitment".into(),
+            ));
+        }
+        serde_json::to_vec(&NativeSnapshot {
+            version: 1,
+            lsn,
+            values: Self::values_at(&state, lsn)?,
+        })
+        .map(Bytes::from)
+        .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    pub(crate) fn native_install(&self, data: Bytes) -> Result<i64> {
+        let snapshot: NativeSnapshot = serde_json::from_slice(&data)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let mut state = self.state.lock().unwrap();
+        if snapshot.version != 1
+            || snapshot.lsn < 0
+            || snapshot.lsn < state.committed_lsn
+            || (snapshot.lsn == state.committed_lsn
+                && snapshot.values != Self::values_at(&state, state.committed_lsn)?)
+        {
+            return Err(RuntimeError::Application(
+                "invalid or regressing native KV snapshot".into(),
+            ));
+        }
+        let candidate = PersistedState {
+            values: snapshot.values.clone(),
+            base_values: snapshot.values,
+            base_lsn: snapshot.lsn,
+            operations: BTreeMap::new(),
+            applied_lsn: snapshot.lsn,
+            committed_lsn: snapshot.lsn,
+            epoch: state.epoch,
+        };
+        self.persist(&candidate)?;
+        *state = candidate;
+        Ok(snapshot.lsn)
+    }
+}
+
+impl KvPersistence {
     pub fn encode_put(key: String, value: String) -> Result<Bytes> {
         serde_json::to_vec(&Mutation::Put { key, value })
             .map(Bytes::from)
@@ -415,21 +586,7 @@ impl DurableState for KvPersistence {
                     "LSN was reused with different application data".into(),
                 ));
             }
-            let mut candidate = state.clone();
-            match mutation {
-                Mutation::Put { key, value } => {
-                    candidate.values.insert(key, value);
-                }
-            }
-            candidate.operations.insert(
-                operation.lsn,
-                OperationRecord {
-                    committed_lsn: operation.committed_lsn,
-                    data: operation.data.to_vec(),
-                },
-            );
-            candidate.applied_lsn = candidate.applied_lsn.max(operation.lsn);
-            candidate.committed_lsn = candidate.committed_lsn.max(operation.committed_lsn);
+            let candidate = Self::mutation_candidate(&state, &operation, mutation);
             self.persist(&candidate)?;
             *state = candidate;
             DurableApplicationProgress {

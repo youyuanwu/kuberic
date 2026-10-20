@@ -883,6 +883,49 @@ are not claimed. See the
 [ledger](sf-v1-port-ledger.md#private-host-access-and-lifecycle-slice-p4-bounded-f01f09f11)
 and [source register](sf-v1-port-provenance.md#private-host-access-and-lifecycle-slice-p4-bounded-f01f09f11).
 
+### SF V1 Private Real KV Commit Slice
+
+```bash
+cargo nextest run -p kuberic-runtime -p kvstore2 --lib --all-features \
+  --profile ordinary -j 2 \
+  -E 'test(replicator::v1::service_adapter::tests::kv::) or (package(=kvstore2) and test(v1::tests::))'
+```
+
+The implementation lives in the private KV service companion, not in the
+replicator. A dev-only dependency and the existing KV `testing` feature bridge
+let runtime-private fixtures exercise actual queue/role/receiver/copy/build/ACK/
+facade/host owners with the real example persistence and retained ordered commit
+worker. Native progress, application durability, read visibility and client
+success are observed separately.
+
+Journeys hold secondary ACK and service-local commit independently, leave native
+reads Granted while committed KV reads remain isolated, drop/cancel client waits,
+cancel and resume service Close, and select Abort without promising rollback.
+They exercise source copy waiting for local commitment, durable snapshot
+installation before ACK/EOF/build completion, real-file restart and
+receiver-to-primary promotion with later assignment. A persisted-secondary
+failure leaves quorum/client completion pending and uses the native EOS-enabled
+stream-fault path before explicit Abort. Legacy-mode unsupported stream faults
+are not redefined. Service tests additionally cover FIFO completion ordering,
+admission/prepare/commit failures, malformed/regressing/conflicting state,
+corrupt recovery and worker panic.
+
+Storage uses the existing file/fsync/rename primitive; deterministic failures
+cannot become client success or erase retained drainage errors. New-instance
+recovery preserves committed state and discards only locally uncommitted
+prepares. It does not retract remotely accepted work or qualify old-store
+migration. These tests belong to the existing ordinary inventory/archive without
+new tier exemptions; consult the live nextest inventory rather than a fixed
+coverage count.
+
+Production KV HTTP/service/factory wiring, public assignment/ACK APIs, selected
+host/status/listener/registry/wire/reports/controller and protected interfaces
+remain unchanged. This is not SQLite migration, production serving qualification,
+full P4/P5 closure, native execution, hosted/differential parity or power-loss
+qualification. See the
+[ledger](sf-v1-port-ledger.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11)
+and [source register](sf-v1-port-provenance.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11).
+
 ### Built-In Service Operation Delivery
 
 ```bash
