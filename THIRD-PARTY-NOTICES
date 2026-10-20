@@ -336,7 +336,25 @@ runtime fixtures without exporting engine types or creating a public factory.
 Actual file IO/restart tests are not native execution, power-loss qualification,
 hosted/differential parity or production service migration. Protected interfaces,
 selected services/factory/host/status/wire/reports/controller remain unchanged;
-SQLite adaptation and atomic cutover remain pending.
+Private SQLite preparation follows below; production migration and atomic
+cutover remain pending.
+
+The private examples/sqlite/src/v1.rs companion, native-only frame-log helpers
+and actual-V1-owner regressions use the same selected service-owned ordering
+from Store/ReplicatedStore.TransactionReplicator.cpp:606-796,848-900, together
+with the existing classic V1 assignment/completion, receiver/ACK, stream/copy
+and role/recovery sources. This is application adaptation over the existing
+real SQLite WAL staging VFS, connection and fsynced frame log, not an SF SQLite
+implementation. Retained FIFO SQL work replaces KVS transaction/COM rooting;
+local frame commitment, WAL publication and client success remain separate
+service responsibilities. No native engine algorithm is replaced. KVS
+batching/implicit completion, tombstones, local-store utilities and native
+harness/dependency source are not ported. An existing-feature testing bridge
+and repository-only dev dependency expose neutral callbacks, not engine types.
+Protected interfaces and production selection/services/host/status/wire/reports/
+controller remain unchanged. File IO/restart tests do not claim native
+execution, power-loss or old-store migration qualification, hosted/differential
+parity, production service migration, full P4 closure or atomic P5 activation.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 

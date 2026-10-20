@@ -926,6 +926,49 @@ qualification. See the
 [ledger](sf-v1-port-ledger.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11)
 and [source register](sf-v1-port-provenance.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11).
 
+### SF V1 Private Real SQLite Publication Slice
+
+```bash
+cargo nextest run -p kuberic-runtime -p sqlite-replicated --lib --all-features \
+  --profile ordinary -j 1 \
+  -E 'test(replicator::v1::service_adapter::tests::sqlite::) or (package(=sqlite-replicated) and test(v1::tests::))'
+```
+
+These ordinary tests run the actual private V1 owners with the real SQLite
+frame log, connection and WAL staging VFS. They distinguish assignment,
+persisted-secondary state, parameterless ACK/quorum, service-local commit,
+WAL publication/read visibility and client completion. The repository-only
+dev bridge exposes no private runtime types. The fixture supplies an explicit
+bounded payload limit suitable for real SQLite pages; other fixture limits and
+production policy are unchanged.
+
+Actual-owner journeys cover source-copy waiting for local commit, complete
+snapshot installation before ACK/EOF/build completion, real-file restart,
+native promotion and inherited later assignment. Native host access can remain
+Granted while pending SQL reads return busy and client success is withheld.
+Real manifest-publication failure fences the service without retracting engine
+quorum. Failed secondary persistence withholds ACK, selects the existing
+EOS-enabled stream-fault path and terminates through explicit Abort.
+
+Service tests retain dropped/cancelled clients and Close observers, exercise
+FIFO SQL work, separate commitment/publication/success cuts, reject definitive
+SQL/admission errors without inventing progress, and preserve explicit
+post-admission prepare/commit/publication ambiguity. Abort suppresses late
+success, abnormal Drop wakes native waits, and SQLite C-ABI callback/future
+panics deny serving and remain drainage errors. Snapshots reject malformed,
+regressing/conflicting and invalid SQLite images before installation; corrupt
+retained storage cannot become a successful empty recovery. New-instance
+recovery preserves committed SQL and discards only locally unresolved prepares
+after the prior owner is retired, without claiming no remote acceptance.
+
+Selected SQLite/KV services and factories, public assignment/ACK and protected
+interfaces, production host/status/wire/reports/controller and tier policy remain
+unchanged. This is not production migration/serving qualification, full P4/P5
+closure, native execution, hosted/differential parity or power-loss testing.
+Consult the live nextest inventory, the
+[ledger](sf-v1-port-ledger.md#private-real-sqlite-publication-slice-p4-bounded-f02f04f05f07f09f11)
+and [source register](sf-v1-port-provenance.md#private-real-sqlite-publication-slice-p4-bounded-f02f04f05f07f09f11).
+
 ### Built-In Service Operation Delivery
 
 ```bash

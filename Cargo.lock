@@ -1402,6 +1402,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlite-replicated",
  "syn 3.0.9",
  "tempfile",
  "thiserror",
