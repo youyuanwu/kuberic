@@ -32,6 +32,7 @@ use super::super::transport::{Route, wire};
 mod facade;
 mod host;
 mod kv;
+mod sqlite;
 
 struct Provider {
     progress: AtomicI64,
@@ -328,6 +329,7 @@ struct Node<P = Provider> {
     bus: Bus,
     registry: MessageRegistry,
     id: i64,
+    limits: BufferLimits,
 }
 
 impl Node {
@@ -345,6 +347,28 @@ impl<P: StateProvider + 'static> Node<P> {
         registry: MessageRegistry,
         provider: Arc<P>,
     ) -> Self {
+        Self::with_provider_limits(
+            id,
+            persisted,
+            eos,
+            bus,
+            registry,
+            provider,
+            copy_config().buffer_limits,
+        )
+    }
+
+    fn with_provider_limits(
+        id: i64,
+        persisted: bool,
+        eos: bool,
+        bus: Bus,
+        registry: MessageRegistry,
+        provider: Arc<P>,
+        limits: BufferLimits,
+    ) -> Self {
+        let mut copy = copy_config();
+        copy.buffer_limits = limits;
         let send = bus.clone();
         let acks = bus.clone();
         let contexts = bus.clone();
@@ -379,7 +403,7 @@ impl<P: StateProvider + 'static> Node<P> {
                         enable_eos_ack: eos,
                         copy_done: false,
                     },
-                    context: copy_config(),
+                    context: copy,
                     batch_ack: Duration::ZERO,
                     retry_ack: Duration::from_secs(1),
                     max_pending_acks: 4,
@@ -426,6 +450,7 @@ impl<P: StateProvider + 'static> Node<P> {
             bus,
             registry,
             id,
+            limits,
         }
     }
 
@@ -486,6 +511,8 @@ impl<P: StateProvider + 'static> Node<P> {
     }
 
     fn build_parts(&self, to: i64, persisted: bool) -> (BuildConfig, BuildCallbacks) {
+        let mut copy = copy_config();
+        copy.buffer_limits = self.limits;
         let send = self.bus.clone();
         let copies = self.bus.clone();
         let contexts = self.bus.clone();
@@ -494,7 +521,7 @@ impl<P: StateProvider + 'static> Node<P> {
             BuildConfig {
                 route: route(from, to),
                 remote_incarnation: to,
-                copy: copy_config(),
+                copy,
                 context: persisted.then_some(CopyContextConfig {
                     initial_queue_size: 2,
                     max_queue_size: 8,

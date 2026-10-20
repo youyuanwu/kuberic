@@ -888,10 +888,42 @@ qualification, fsync instrumentation or hosted/differential parity.
 No native utility, store dependency, fixture or harness source is imported.
 Microsoft MIT attribution and full notice are retained. Protected traits/types,
 production factories/services/status/host/wire/reports/controller and tier policy
-are unchanged. Public service API migration, SQLite, production serving
+are unchanged. Public service API migration and production serving
 qualification, full P4 and atomic P5 activation remain pending. See the
 [ledger](sf-v1-port-ledger.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11)
-and [selector](testing.md#sf-v1-private-real-kv-commit-slice).
+and [selector](testing.md#sf-v1-private-real-kv-commit-slice). Private SQLite
+preparation is recorded below.
+
+### Private Real SQLite Publication Slice (P4, Bounded F02/F04/F05/F07/F09/F11)
+
+The private [`examples/sqlite/src/v1.rs`](../../../examples/sqlite/src/v1.rs)
+companion reuses the actual SQLite connection, WAL staging VFS and frame log.
+Native-only persistence helpers share the existing fsync/atomic-manifest
+primitives. Versioned copy geometry validation is shared with the selected
+storage implementation without changing its accepted representation; the
+private installer additionally runs SQLite page-size/quick-check validation.
+An unversioned runtime dev path and the example's existing `testing` bridge
+compose the [actual owners](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/sqlite.rs).
+The local protected provider wrapper avoids distinct runtime test/dependency
+crate identities; neutral callbacks do not export engine types.
+
+| Selected immutable native evidence | Service adaptation / representation changes |
+|---|---|
+| [`Store/ReplicatedStore.TransactionReplicator.cpp:606-796`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp#L606-L796), [`848-900`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Store/ReplicatedStore.TransactionReplicator.cpp#L848-L900) | Source-guided service ownership only, not an SF SQLite port. Retained FIFO SQL work runs on a blocking thread; the real synchronous VFS awaits actual quorum and durably commits local frames before publication. Successful SQLite commit/publication confirmation precedes client success. KVS transaction/COM rooting becomes retained Rust task/channel ownership; KVS batching, implicit completion, tombstones and local-store internals are not ported. |
+| Existing F02 assignment/completion and F11 lifetime sources recorded above | Neutral admission returns the actual LSN and completion future. Client cancellation does not release SQL serialization or retract native work. Close retains service drainage; Abort denies late success without promising rollback. Post-admission failure is explicitly ambiguous and reports outside state guards. The Rust-to-SQLite C-ABI boundary contains callback/future panic as terminal fault, not a successful fallback. |
+| Existing F04/F05 receiver, shared stream, parameterless ACK and EOS-fault sources recorded above | Real SQLite secondary persistence completes before ACK. Complete snapshot installation and validation precede copy ACK; EOF/build completion remain separate. Failed durable acceptance does not ACK; the existing EOS-enabled stream-fault path and explicit Abort are exercised without modifying legacy unsupported behavior. |
+| Existing F07 provider enumeration/barrier and F09 provider/role/recovery sources recorded above | Snapshot acquisition waits for service-local commitment through the requested boundary. Versioned whole-image payloads and new-instance local transaction recovery belong to SQLite, not native copy sequence or retained engine queues. Real-file restart/copy and actual receiver-to-primary transfer preserve SQL and inherited next assignment. |
+
+No protected signature/type, production selector/service/HTTP/host/status/wire/
+report/controller, production dependency or tier-policy change is introduced.
+Actual file IO and deterministic gates/cuts are not power-loss qualification,
+native execution, native/hosted differential evidence or old-store rolling
+migration. Production service/API migration and serving qualification, remaining
+host/report adapters, full P4 and atomic P5 activation remain pending. Microsoft
+MIT attribution and full notice are retained; no native store/utility/harness
+dependency source is imported. See the
+[ledger](sf-v1-port-ledger.md#private-real-sqlite-publication-slice-p4-bounded-f02f04f05f07f09f11)
+and [selector](testing.md#sf-v1-private-real-sqlite-publication-slice).
 
 ### P1 documented expectations (historical foundation)
 

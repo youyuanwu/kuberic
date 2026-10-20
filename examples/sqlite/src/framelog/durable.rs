@@ -65,6 +65,26 @@ pub(crate) struct CopyImage {
     image: Vec<u8>,
 }
 
+impl CopyImage {
+    fn validate(&self) -> io::Result<()> {
+        if self.version != VERSION
+            || self.up_to_lsn < 0
+            || self.up_to_lsn == i64::MAX
+            || (self.up_to_lsn == 0) != self.image.is_empty()
+            || (self.up_to_lsn == 0 && self.page_size != 0)
+            || (self.up_to_lsn > 0
+                && (!(512..=65536).contains(&self.page_size) || !self.page_size.is_power_of_two()))
+            || (!self.image.is_empty()
+                && (self.page_size == 0 || !self.image.len().is_multiple_of(self.page_size)))
+        {
+            return Err(io::Error::other(
+                "invalid copy representation or completion boundary",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct CompletedCopy {
     up_to_lsn: i64,
@@ -501,19 +521,8 @@ impl DurableFrameLog {
             .clone();
         let bytes: Vec<u8> = chunks.values().flatten().copied().collect();
         let snapshot: CopyImage = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        if snapshot.version != VERSION
-            || snapshot.up_to_lsn != up_to_lsn
-            || up_to_lsn < 0
-            || up_to_lsn == i64::MAX
-            || (up_to_lsn == 0) != snapshot.image.is_empty()
-            || (up_to_lsn == 0 && snapshot.page_size != 0)
-            || (up_to_lsn > 0
-                && (!(512..=65536).contains(&snapshot.page_size)
-                    || !snapshot.page_size.is_power_of_two()))
-            || (!snapshot.image.is_empty()
-                && (snapshot.page_size == 0
-                    || !snapshot.image.len().is_multiple_of(snapshot.page_size)))
-        {
+        snapshot.validate()?;
+        if snapshot.up_to_lsn != up_to_lsn {
             return Err(io::Error::other(
                 "invalid copy representation or completion boundary",
             ));
@@ -610,6 +619,138 @@ impl DurableFrameLog {
         let _ = fs::remove_file(old_history);
         sync_directory(&self.root)?;
         Ok(self.progress())
+    }
+}
+
+#[cfg_attr(
+    not(feature = "testing"),
+    expect(dead_code, reason = "unselected V1 SQLite preparation")
+)]
+impl DurableFrameLog {
+    pub(crate) fn native_recover(&mut self) -> io::Result<()> {
+        if !matches!(
+            self.meta.recovery,
+            RecoveryState::Healthy | RecoveryState::ReconciliationRequired(_)
+        ) {
+            return Err(io::Error::other(
+                "SQLite recovery requires a complete rebuild",
+            ));
+        }
+        // Validate the entire retained suffix before discarding unresolved prepares.
+        self.image_at(self.meta.applied_lsn)?;
+        let lsn = self.meta.committed_lsn;
+        let image = self.image_at(lsn)?;
+        self.native_base(CopyImage {
+            version: VERSION,
+            up_to_lsn: lsn,
+            page_size: if lsn == 0 { 0 } else { self.meta.page_size },
+            image,
+        })
+    }
+
+    pub(crate) fn native_prepare(
+        &mut self,
+        lsn: i64,
+        data: bytes::Bytes,
+        secondary: bool,
+    ) -> io::Result<()> {
+        if lsn != self.meta.applied_lsn + 1 {
+            return Err(io::Error::other("SQLite native operation gap or retry"));
+        }
+        self.apply(Operation {
+            lsn,
+            committed_lsn: if secondary {
+                lsn
+            } else {
+                self.meta.committed_lsn
+            },
+            data,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn native_commit(&mut self, lsn: i64) -> io::Result<()> {
+        if lsn != self.meta.committed_lsn + 1 {
+            return Err(io::Error::other("SQLite native local commit out of order"));
+        }
+        self.commit(lsn)?;
+        Ok(())
+    }
+
+    pub(crate) fn native_install(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.intact()?;
+        let snapshot: CopyImage = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+        snapshot.validate()?;
+        if snapshot.up_to_lsn < self.meta.applied_lsn {
+            return Err(io::Error::other(
+                "SQLite native snapshot regresses accepted state",
+            ));
+        }
+        if snapshot.up_to_lsn == self.meta.applied_lsn
+            && self.image_at(snapshot.up_to_lsn)? != snapshot.image
+        {
+            return Err(io::Error::other(
+                "SQLite native snapshot conflicts with accepted state",
+            ));
+        }
+        self.native_base(snapshot)
+    }
+
+    fn native_base(&mut self, snapshot: CopyImage) -> io::Result<()> {
+        snapshot.validate()?;
+        let mut meta = self.meta.clone();
+        meta.generation = meta
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("generation exhausted"))?;
+        meta.base_lsn = snapshot.up_to_lsn;
+        meta.base_checksum = crc32fast::hash(&snapshot.image);
+        meta.page_size = snapshot.page_size;
+        meta.applied_lsn = snapshot.up_to_lsn;
+        meta.committed_lsn = snapshot.up_to_lsn;
+        meta.history_len = 0;
+        meta.recovery = RecoveryState::Healthy;
+        meta.staging.clear();
+        meta.completed.clear();
+        let base = self.root.join(format!("base-{}.sqlite", meta.generation));
+        replace(&base, &snapshot.image)?;
+        if !snapshot.image.is_empty() {
+            let connection = rusqlite::Connection::open_with_flags(
+                &base,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(io::Error::other)?;
+            let page_size: u32 = connection
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .map_err(io::Error::other)?;
+            let mut check = connection
+                .prepare("PRAGMA quick_check")
+                .map_err(io::Error::other)?;
+            let checks = check
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(io::Error::other)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io::Error::other)?;
+            if usize::try_from(page_size).map_err(io::Error::other)? != snapshot.page_size
+                || checks != ["ok"]
+            {
+                return Err(io::Error::other(
+                    "SQLite native snapshot failed page/database validation",
+                ));
+            }
+        }
+        replace(
+            &self.root.join(format!("history-{}.log", meta.generation)),
+            &[],
+        )?;
+        let old_base = self.base_path();
+        let old_history = self.history_path();
+        self.publish(meta)?;
+        self.base = snapshot.image;
+        self.operations.clear();
+        let _ = fs::remove_file(old_base);
+        let _ = fs::remove_file(old_history);
+        sync_directory(&self.root)
     }
 }
 

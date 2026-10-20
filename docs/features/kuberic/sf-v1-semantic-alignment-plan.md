@@ -111,8 +111,15 @@ committed read isolation while native access remains Granted, persisted-secondar
 ACK discipline, copy waiting/installation, real-file restart and actual queue
 promotion. A repository-only bridge composes real KV storage with actual private
 V1 owners; no public factory or engine selector is introduced. Production service
-API migration/serving qualification, SQLite adaptation and atomic activation
-remain pending.
+API migration/serving qualification and atomic activation remain pending.
+The [private real-SQLite publication slice](sf-v1-port-ledger.md#private-real-sqlite-publication-slice-p4-bounded-f02f04f05f07f09f11)
+now composes retained real WAL/VFS transactions, service-owned frame commitment
+before WAL publication and separate client success over actual native owners.
+Durable secondary ACK, complete copy/EOF, committed-prefix source barriers,
+real-file restart/promotion and cancellation/failure fencing are exercised
+without activating production SQLite. Named progress/report/schema/controller/
+election/rejoin preparation and authenticated production host integration
+remain next adapter boundaries.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -505,9 +512,11 @@ host-availability quorum, actual role/application/catch-up outcomes and outer
 Close diagnostics, without enabling production grants. A private real-KV
 committer now composes durable prepares, ordered local commit/client success,
 committed read isolation and copy/restart/promotion evidence with actual V1
-owners. Published facade/assignment/ACK integration, production service migration,
-SQLite adaptation and production host/status/reporting integration remain
-pending. This roadmap is not
+owners. A private real-SQLite companion now adds retained WAL/VFS publication
+after service-local frame commitment, distinct client success and durable
+receiver/copy/restart/promotion journeys. Published facade/assignment/ACK
+integration, production service migration and production host/status/reporting
+integration remain pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required

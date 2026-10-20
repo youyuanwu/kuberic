@@ -1,7 +1,7 @@
 # SF V1 Port Foundation Ledger
 
 **P1 foundation, unselected P2 substrate slices and bounded P3 primary,
-secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus bounded private P4 service, protected-facade execution, host access/lifecycle and real-KV commit adapters; no selected replication behavior change.** Native pin:
+secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus bounded private P4 service, protected-facade execution, host access/lifecycle and real-KV/SQLite commit adapters; no selected replication behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
@@ -1215,11 +1215,70 @@ Published KV service/factory/HTTP routes, public assignment/ACK APIs, production
 host/listener/registry/status/wire/reports/schema/controller/election/rejoin and
 protected interfaces remain unchanged. Existing supported KV journeys continue
 to use the old selected engine; unreadable state is explicitly rejected rather
-than treated as a fresh empty store. SQLite adaptation, production service
-migration/serving qualification, full P4 closure and atomic P5 activation remain
+than treated as a fresh empty store. Private SQLite preparation is recorded
+below; production service migration/serving qualification, full P4 closure and atomic P5 activation remain
 pending. File-backed tests are not power-loss qualification, native execution,
 hosted parity or differential evidence. No production dependency or tier-policy
 change is introduced.
+
+### Private Real SQLite Publication Slice (P4, Bounded F02/F04/F05/F07/F09/F11)
+
+The private [`SQLite companion`](../../../examples/sqlite/src/v1.rs) composes the
+existing real SQLite connection, WAL staging VFS and fsynced frame-log storage.
+It is application adaptation, not an SF SQLite implementation or another
+replication algorithm. A repository-only runtime dev dependency and the existing
+example `testing` feature expose neutral byte/LSN/future/IO callbacks to the
+[actual-owner fixtures](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/sqlite.rs),
+not private engine types or a public factory.
+
+A retained FIFO SQL worker owns each blocking SQLite transaction independently
+of client waiters. The real VFS captures complete WAL frames, obtains actual
+native assignment, durably prepares the frames, awaits native quorum completion
+and commits the service-local frame log before releasing WAL publication.
+Client success is selected only after SQLite commits and the application
+confirms publication. LSN assignment, secondary persistence, ACK/quorum, local
+commit, WAL publication and client completion are observed at separate cuts.
+The existing SQL connection authorizer prevents bypass through attached
+databases, journal changes or explicit client transactions. Reads during a
+retained transaction return an explicit busy error, not speculative SQL data.
+Once drained, queries use the committed, serialized real connection; even a
+query-opened connection retains the guarded VFS for subsequent writes.
+
+Definitive SQL/admission rejection does not claim assignment. Post-admission
+prepare, quorum, commit or publication failure is ambiguous, fences serving
+and reports once outside service-state guards. No engine admission or quorum
+is retracted. Abort revokes final success, wakes retained waits and makes no
+rollback promise. Close separately observes retained SQL drainage and caches
+its outcome across cancelled/repeated waits. Callback/future panics are
+contained at the SQLite C-ABI boundary and converted to explicit terminal
+faults, not empty/successful results; fault-reporter panic is diagnostic too.
+
+The service persists secondary frames before native parameterless ACK.
+It installs a complete versioned snapshot before copy ACK and requires distinct
+copy EOF before promotion. Installation rejects malformed, regressing,
+conflicting and invalid SQLite images, including actual SQLite page/quick-check
+validation before durable manifest publication. Source copy waits for local
+commitment, not engine quorum alone. Recovery validates retained records before
+discarding only locally uncommitted prepares, then rematerializes committed SQL.
+Real-file restart/copy and native receiver-to-primary promotion preserve SQL
+and use the actual inherited next assignment. This is not same-lifetime
+rollback, proof of no remote acceptance or old-store rolling migration.
+
+The source-guided application ordering uses the same pinned KVS transaction
+ranges as the preceding KV slice; native assignment/ACK/copy/role algorithms
+remain unchanged. Native host-grant and real filesystem-failure journeys prove
+that quorum can remain ahead of local commit without client success; the
+EOS-enabled secondary failure path withholds ACK and uses existing native
+stream-fault/Abort semantics. See the
+[selector](testing.md#sf-v1-private-real-sqlite-publication-slice) and
+[source register](sf-v1-port-provenance.md#private-real-sqlite-publication-slice-p4-bounded-f02f04f05f07f09f11).
+
+Production SQLite/KV services, public APIs/protected traits, selected factory,
+host/status/listener/registry/wire/reports/schema/controller/election/rejoin and
+tier policy remain unchanged. Public service migration/serving qualification,
+full P4 closure and atomic P5 activation remain pending. No native binary,
+hosted/differential parity, kernel power-loss/fsync qualification or new
+production dependency is claimed.
 
 ## Source families, transitions and substitutions
 
@@ -1409,9 +1468,13 @@ selection, independent host-availability quorum, actual role/catch-up/applicatio
 callbacks and outer Close diagnostics, without activating serving grants.
 A private real-KV committer now adds service-owned durable prepares, ordered
 local commit/client success, committed read isolation and copy/restart/promotion
-evidence over the actual V1 owners. Public facade selection, production service
-migration, SQLite adaptation and production host/reporting integration remain
-pending. P4 prepares service/host
+evidence over the actual V1 owners. A private real-SQLite companion now adds
+retained WAL/VFS transactions, service-local frame commitment before publication,
+distinct client success and durable receiver/copy/restart/promotion journeys.
+Public facade selection, production service migration and production
+host/reporting integration remain pending. Named progress/report/schema/
+controller/election/rejoin preparation and authenticated listener/registry
+integration remain concrete next adapter boundaries. P4 prepares service/host
 adapters. Only P5 atomically switches factory, APIs/services/wire/reports/
 controller and removes the old engine. See the
 [roadmap](sf-v1-semantic-alignment-plan.md); P1 creates no permanent alternate

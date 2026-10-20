@@ -220,6 +220,33 @@ pub(crate) fn persistence_error(error: io::Error) -> kuberic_runtime::RuntimeErr
     kuberic_runtime::RuntimeError::Application(error.to_string())
 }
 
+#[cfg_attr(
+    not(feature = "testing"),
+    expect(dead_code, reason = "unselected V1 SQLite preparation")
+)]
+impl SqlitePersistence {
+    pub(crate) fn native_recover(&self) -> io::Result<()> {
+        self.lock()?.native_recover()
+    }
+
+    pub(crate) fn native_prepare(
+        &self,
+        lsn: i64,
+        data: bytes::Bytes,
+        secondary: bool,
+    ) -> io::Result<()> {
+        self.lock()?.native_prepare(lsn, data, secondary)
+    }
+
+    pub(crate) fn native_commit(&self, lsn: i64) -> io::Result<()> {
+        self.lock()?.native_commit(lsn)
+    }
+
+    pub(crate) fn native_install(&self, data: &[u8]) -> io::Result<()> {
+        self.lock()?.native_install(data)
+    }
+}
+
 #[async_trait::async_trait]
 impl DurableState for SqlitePersistence {
     async fn get_replication_operations(
