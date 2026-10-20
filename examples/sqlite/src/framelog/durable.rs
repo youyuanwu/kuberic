@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::frames::WalFrameSet;
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MANIFEST: &str = "state-v2.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -83,6 +83,58 @@ impl CopyImage {
         }
         Ok(())
     }
+
+    fn validate_database(&self) -> io::Result<()> {
+        self.validate()?;
+        if self.image.is_empty() {
+            return Ok(());
+        }
+        let mut image = self.image.clone();
+        // Deserialized databases cannot use WAL. Check the same pages in memory
+        // using rollback mode, without creating a candidate file or sidecars.
+        if image[18..20] == [2, 2] {
+            image[18..20].copy_from_slice(&[1, 1]);
+        }
+        let connection = rusqlite::Connection::open_in_memory().map_err(io::Error::other)?;
+        let len = i64::try_from(image.len()).map_err(io::Error::other)?;
+        // SQLite borrows this fixed buffer read-only; the connection is dropped
+        // before `image`, and neither FREEONCLOSE nor RESIZEABLE is enabled.
+        let result = unsafe {
+            libsqlite3_sys::sqlite3_deserialize(
+                connection.handle(),
+                c"main".as_ptr(),
+                image.as_mut_ptr(),
+                len,
+                len,
+                libsqlite3_sys::SQLITE_DESERIALIZE_READONLY,
+            )
+        };
+        if result != libsqlite3_sys::SQLITE_OK {
+            return Err(io::Error::other(rusqlite::Error::SqliteFailure(
+                libsqlite3_sys::Error::new(result),
+                None,
+            )));
+        }
+        let page_size: u32 = connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .map_err(io::Error::other)?;
+        let mut check = connection
+            .prepare("PRAGMA quick_check")
+            .map_err(io::Error::other)?;
+        let checks = check
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(io::Error::other)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)?;
+        if usize::try_from(page_size).map_err(io::Error::other)? != self.page_size
+            || checks != ["ok"]
+        {
+            return Err(io::Error::other(
+                "SQLite native snapshot failed page/database validation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -122,6 +174,16 @@ fn manifest_bytes(meta: &Manifest) -> io::Result<Vec<u8>> {
     .map_err(io::Error::other)
 }
 
+#[cfg(test)]
+pub(crate) fn rewrite_manifest_for_test(root: &Path, update: impl FnOnce(&mut serde_json::Value)) {
+    let checked: CheckedManifest =
+        serde_json::from_slice(&fs::read(root.join(MANIFEST)).unwrap()).unwrap();
+    let mut state = serde_json::to_value(checked.state).unwrap();
+    update(&mut state);
+    let meta = serde_json::from_value(state).unwrap();
+    fs::write(root.join(MANIFEST), manifest_bytes(&meta).unwrap()).unwrap();
+}
+
 pub(crate) struct DurableFrameLog {
     root: PathBuf,
     meta: Manifest,
@@ -156,6 +218,8 @@ pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl DurableFrameLog {
+    /// Load accepted state without rewriting corrupt metadata or pruning tails.
+    /// Native recovery validates the database before publishing a new generation.
     pub fn open(root: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(&root)?;
         sync_directory(&root)?;
@@ -210,19 +274,7 @@ impl DurableFrameLog {
             base: Vec::new(),
             operations: BTreeMap::new(),
         };
-        if let Err(error) = log.recover() {
-            let mut meta = log.meta.clone();
-            if let RecoveryState::Rebuilding {
-                required_applied_lsn,
-                required_committed_lsn,
-            } = meta.recovery
-            {
-                meta.applied_lsn = meta.applied_lsn.max(required_applied_lsn);
-                meta.committed_lsn = meta.committed_lsn.max(required_committed_lsn);
-            }
-            meta.recovery = RecoveryState::RebuildRequired(error.to_string());
-            log.publish(meta)?;
-        }
+        log.recover()?;
         Ok(log)
     }
 
@@ -244,10 +296,7 @@ impl DurableFrameLog {
         {
             return Err(io::Error::other("durable base corruption"));
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.history_path())?;
+        let mut file = File::open(self.history_path())?;
         if file.metadata()?.len() < self.meta.history_len {
             return Err(io::Error::other("acknowledged history is missing"));
         }
@@ -284,9 +333,8 @@ impl DurableFrameLog {
                 "history does not cover durable applied progress",
             ));
         }
-        // Only bytes beyond the recorded applied boundary may be discarded.
-        file.set_len(self.meta.history_len)?;
-        file.sync_all()?;
+        // Ignore unpublished tails here. Native recovery validates the database
+        // before replacing this generation; apply truncates before appending.
         Ok(())
     }
 
@@ -622,10 +670,6 @@ impl DurableFrameLog {
     }
 }
 
-#[cfg_attr(
-    not(feature = "testing"),
-    expect(dead_code, reason = "unselected V1 SQLite preparation")
-)]
 impl DurableFrameLog {
     pub(crate) fn native_recover(&mut self) -> io::Result<()> {
         if !matches!(
@@ -637,7 +681,15 @@ impl DurableFrameLog {
             ));
         }
         // Validate the entire retained suffix before discarding unresolved prepares.
-        self.image_at(self.meta.applied_lsn)?;
+        if self.meta.applied_lsn != self.meta.committed_lsn {
+            CopyImage {
+                version: VERSION,
+                up_to_lsn: self.meta.applied_lsn,
+                page_size: self.meta.page_size,
+                image: self.image_at(self.meta.applied_lsn)?,
+            }
+            .validate_database()?;
+        }
         let lsn = self.meta.committed_lsn;
         let image = self.image_at(lsn)?;
         self.native_base(CopyImage {
@@ -697,7 +749,7 @@ impl DurableFrameLog {
     }
 
     fn native_base(&mut self, snapshot: CopyImage) -> io::Result<()> {
-        snapshot.validate()?;
+        snapshot.validate_database()?;
         let mut meta = self.meta.clone();
         meta.generation = meta
             .generation
@@ -714,31 +766,6 @@ impl DurableFrameLog {
         meta.completed.clear();
         let base = self.root.join(format!("base-{}.sqlite", meta.generation));
         replace(&base, &snapshot.image)?;
-        if !snapshot.image.is_empty() {
-            let connection = rusqlite::Connection::open_with_flags(
-                &base,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .map_err(io::Error::other)?;
-            let page_size: u32 = connection
-                .query_row("PRAGMA page_size", [], |row| row.get(0))
-                .map_err(io::Error::other)?;
-            let mut check = connection
-                .prepare("PRAGMA quick_check")
-                .map_err(io::Error::other)?;
-            let checks = check
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(io::Error::other)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(io::Error::other)?;
-            if usize::try_from(page_size).map_err(io::Error::other)? != snapshot.page_size
-                || checks != ["ok"]
-            {
-                return Err(io::Error::other(
-                    "SQLite native snapshot failed page/database validation",
-                ));
-            }
-        }
         replace(
             &self.root.join(format!("history-{}.log", meta.generation)),
             &[],

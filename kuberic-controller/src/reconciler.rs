@@ -287,7 +287,11 @@ fn required_session_renewal(
         let admitted = report.role == member.role
             && match member.role {
                 ReplicaRole::Primary => report.write_status == AccessStatus::Granted,
-                ReplicaRole::ActiveSecondary => report.read_status == AccessStatus::Granted,
+                ReplicaRole::ActiveSecondary => {
+                    report.read_status == AccessStatus::NotPrimary
+                        && report.write_status == AccessStatus::NotPrimary
+                        && report.progress.current().is_some()
+                }
                 _ => false,
             };
         let contained_restart = report.role == ReplicaRole::None
@@ -299,15 +303,6 @@ fn required_session_renewal(
             return Err(ControllerError::InvalidAgentEvidence(
                 "public-v1 process replacement is neither admitted nor fully contained".into(),
             ));
-        }
-        if session_changed
-            && contained_restart
-            && report
-                .replicator_creation_id
-                .as_str()
-                .starts_with("pending-")
-        {
-            return Ok(None);
         }
         if !session_changed && !admitted {
             return Ok(None);
@@ -328,9 +323,18 @@ fn required_session_renewal(
     let Some((predecessor, report)) = changed else {
         return Ok(None);
     };
+    let latest_configuration = reports
+        .iter()
+        .filter_map(|report| report.configuration.as_ref())
+        .map(|observation| observation.voting.current.epoch.configuration_number)
+        .chain(std::iter::once(configuration.epoch.configuration_number))
+        .max()
+        .expect("accepted configuration epoch");
     let renewal_epoch = Epoch::new(
         configuration.epoch.data_loss_number,
-        configuration.epoch.configuration_number + 1,
+        latest_configuration.checked_add(1).ok_or_else(|| {
+            ControllerError::InvalidAgentEvidence("session-renewal epoch exhausted".into())
+        })?,
     );
     let required = ProcessSessionRenewalRequired {
         operation_id: OperationId::new(format!(

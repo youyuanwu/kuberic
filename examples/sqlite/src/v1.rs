@@ -10,11 +10,6 @@
 //! releases WAL publication. Only successful SQLite publication completes a
 //! client write. New-instance recovery requires retirement of the prior owner.
 
-#![cfg_attr(
-    not(feature = "testing"),
-    expect(dead_code, reason = "unselected V1 SQLite preparation")
-)]
-
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -29,6 +24,7 @@ use tokio::task::JoinHandle;
 use crate::SqlitePersistence;
 use crate::commit_barrier::{BarrierError, CommitBarrier, Transaction};
 use crate::connection::SqliteConnection;
+use crate::connection::Statement;
 use crate::frames::{WalFrameSet, frames_from_wal_bytes};
 
 pub struct Assignment {
@@ -41,11 +37,22 @@ pub type Access = Arc<dyn Fn(bool) -> io::Result<()> + Send + Sync>;
 
 pub struct Write {
     assigned: watch::Receiver<Option<i64>>,
-    outcome: oneshot::Receiver<io::Result<i64>>,
-    result: Option<Result<i64, String>>,
+    outcome: oneshot::Receiver<io::Result<Execution>>,
+    result: Option<Result<Execution, (bool, String)>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Execution {
+    pub rows: Vec<usize>,
+    pub rowid: i64,
+    pub lsn: i64,
 }
 
 impl Write {
+    pub(crate) fn admitted_lsn(&self) -> Option<i64> {
+        *self.assigned.borrow()
+    }
+
     pub async fn assigned(&mut self) -> io::Result<i64> {
         loop {
             if let Some(lsn) = *self.assigned.borrow() {
@@ -59,23 +66,56 @@ impl Write {
     }
 
     pub async fn wait(&mut self) -> io::Result<i64> {
+        self.wait_execution().await.map(|execution| execution.lsn)
+    }
+
+    pub async fn wait_execution(&mut self) -> io::Result<Execution> {
         if self.result.is_none() {
             self.result = Some(match (&mut self.outcome).await {
-                Ok(result) => result.map_err(|e| e.to_string()),
-                Err(_) => Err("SQLite worker abandoned client outcome".into()),
+                Ok(result) => result.map_err(|error| (is_abort(&error), error.to_string())),
+                Err(_) => Err((false, "SQLite worker abandoned client outcome".into())),
             });
         }
         self.result
             .as_ref()
             .unwrap()
             .as_ref()
-            .copied()
-            .map_err(error)
+            .cloned()
+            .map_err(|(aborted, reason)| stored_error(*aborted, reason.clone()))
     }
 }
 
 fn error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[derive(Debug)]
+struct Aborted(String);
+
+impl std::fmt::Display for Aborted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Aborted {}
+
+pub(crate) fn is_abort(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|cause| {
+        cause.is::<Aborted>()
+            || matches!(
+                cause.downcast_ref::<kuberic_runtime::RuntimeError>(),
+                Some(kuberic_runtime::RuntimeError::OperationCancelled)
+            )
+    })
+}
+
+fn stored_error(aborted: bool, reason: String) -> io::Error {
+    if aborted {
+        io::Error::new(io::ErrorKind::Interrupted, Aborted(reason))
+    } else {
+        io::Error::other(reason)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,24 +127,26 @@ enum Mode {
 }
 
 struct Request {
-    statements: Vec<String>,
+    statements: Vec<Statement>,
     assigned: watch::Sender<Option<i64>>,
-    reply: oneshot::Sender<io::Result<i64>>,
+    reply: oneshot::Sender<io::Result<Execution>>,
 }
 
 struct State {
     sender: Option<mpsc::UnboundedSender<Request>>,
     fault: Option<String>,
+    aborted: bool,
     mode: Mode,
     admission: Option<Admission>,
     pending: usize,
     assignment: Option<watch::Sender<Option<i64>>>,
     lsn: Option<i64>,
     failure: Option<String>,
+    failure_aborted: bool,
 }
 
 struct Core {
-    store: SqlitePersistence,
+    store: Arc<SqlitePersistence>,
     state: Mutex<State>,
     sql: Mutex<SqliteConnection>,
     changed: Notify,
@@ -125,10 +167,9 @@ struct Core {
 
 impl Core {
     fn healthy(state: &State) -> io::Result<()> {
-        state
-            .fault
-            .as_ref()
-            .map_or(Ok(()), |fault| Err(error(fault)))
+        state.fault.as_ref().map_or(Ok(()), |fault| {
+            Err(stored_error(state.aborted, fault.clone()))
+        })
     }
 
     fn live(state: &State) -> io::Result<()> {
@@ -159,9 +200,9 @@ impl Core {
         {
             let reason = "SQLite fault callback panicked";
             tracing::error!(reason);
-            self.state
-                .lock()
-                .unwrap()
+            let mut state = self.state.lock().unwrap();
+            state.aborted = false;
+            state
                 .fault
                 .as_mut()
                 .unwrap()
@@ -174,7 +215,7 @@ impl Core {
         self.publish_fault(reason, first);
     }
 
-    fn execute(&self, statements: Vec<String>, vfs: &str) -> io::Result<i64> {
+    fn execute(&self, statements: Vec<Statement>, vfs: &str) -> io::Result<Execution> {
         (self.access)(true)?;
         let mut sql = self.sql.lock().unwrap();
         {
@@ -186,27 +227,29 @@ impl Core {
             sql.open(&path, vfs, self.store.progress()?.committed_lsn)
                 .map_err(error)?;
         }
-        let statements: Vec<_> = statements
-            .into_iter()
-            .map(|sql| (sql, Vec::new()))
-            .collect();
         let executed = sql.execute(&statements).map_err(error);
         let lsn = self.state.lock().unwrap().lsn;
         match executed {
-            Ok(_) => {
+            Ok((rows, rowid)) => {
                 if let Some(lsn) = lsn {
                     self.store.confirm_publication(lsn)?;
                     sql.visible_lsn = lsn;
                 }
-                Ok(self.store.progress()?.committed_lsn)
+                Ok(Execution {
+                    rows,
+                    rowid,
+                    lsn: self.store.progress()?.committed_lsn,
+                })
             }
-            Err(sql_error) => Err(self
-                .state
-                .lock()
-                .unwrap()
-                .failure
-                .as_ref()
-                .map_or(sql_error, error)),
+            Err(sql_error) => {
+                let state = self.state.lock().unwrap();
+                if let Some(fault) = state.fault.as_ref().filter(|_| !state.aborted) {
+                    return Err(io::Error::other(fault.clone()));
+                }
+                Err(state.failure.as_ref().map_or(sql_error, |reason| {
+                    stored_error(state.failure_aborted, reason.clone())
+                }))
+            }
         }
     }
 
@@ -271,13 +314,13 @@ impl Barrier {
             core.runtime.block_on(async {
                 tokio::select! {
                     biased;
-                    _ = cancelled.changed() => return Err(io::Error::other("SQLite aborted; admitted outcome unknown")),
+                    _ = cancelled.changed() => return Err(stored_error(true, "SQLite aborted; admitted outcome unknown".into())),
                     result = assignment.completion => result?,
                 }
                 #[cfg(feature = "testing")]
                 tokio::select! {
                     biased;
-                    _ = cancelled.changed() => return Err(io::Error::other("SQLite aborted before local commit")),
+                    _ = cancelled.changed() => return Err(stored_error(true, "SQLite aborted before local commit".into())),
                     _ = core.before_commit.pause() => {},
                 }
                 {
@@ -291,7 +334,7 @@ impl Barrier {
                 #[cfg(feature = "testing")]
                 tokio::select! {
                     biased;
-                    _ = cancelled.changed() => return Err(io::Error::other("SQLite aborted before publication")),
+                    _ = cancelled.changed() => return Err(stored_error(true, "SQLite aborted before publication".into())),
                     _ = core.before_publication.pause() => {},
                 }
                 let state = core.state.lock().unwrap();
@@ -304,12 +347,20 @@ impl Barrier {
         if let Err(error) = &result {
             let mut state = core.state.lock().unwrap();
             state.failure = Some(error.to_string());
+            state.failure_aborted = is_abort(error);
             if state.lsn.is_some() {
                 let reason =
                     format!("SQLite admitted publication failed; outcome unknown: {error}");
                 let first = Core::record_fault(&mut state, &reason);
+                if first && is_abort(error) {
+                    state.aborted = true;
+                }
                 drop(state);
-                core.publish_fault(reason, first);
+                if is_abort(error) {
+                    core.changed.notify_waiters();
+                } else {
+                    core.publish_fault(reason, first);
+                }
             }
         }
         result.map_err(|e| BarrierError::new(e.to_string()))
@@ -343,7 +394,7 @@ impl CommitBarrier for Barrier {
 
 struct Drain {
     worker: Option<JoinHandle<io::Result<()>>>,
-    result: Option<Result<(), String>>,
+    result: Option<Result<(), (bool, String)>>,
 }
 
 pub struct Committer {
@@ -358,6 +409,15 @@ impl Committer {
         report: Arc<dyn Fn(String) + Send + Sync>,
     ) -> io::Result<Self> {
         let store = SqlitePersistence::open(root)?;
+        Self::with_store(Arc::new(store), access, report)
+    }
+
+    pub(crate) fn with_store(
+        store: Arc<SqlitePersistence>,
+        access: Access,
+        report: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> io::Result<Self> {
+        store.initialize()?;
         store.native_recover()?;
         let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
         let (cancel, _) = watch::channel(false);
@@ -371,12 +431,14 @@ impl Committer {
             state: Mutex::new(State {
                 sender: Some(sender),
                 fault: None,
+                aborted: false,
                 mode: Mode::None,
                 admission: None,
                 pending: 0,
                 assignment: None,
                 lsn: None,
                 failure: None,
+                failure_aborted: false,
             }),
             sql: Mutex::new(SqliteConnection::default()),
             changed: Notify::new(),
@@ -406,6 +468,7 @@ impl Committer {
                     state.assignment = Some(request.assigned);
                     state.lsn = None;
                     state.failure = None;
+                    state.failure_aborted = false;
                 }
                 let sql_core = core.clone();
                 let sql_vfs = vfs.clone();
@@ -432,7 +495,10 @@ impl Committer {
                     }
                 }
                 let mut state = core.state.lock().unwrap();
-                let result = Core::healthy(&state).and(result);
+                let result = result.and_then(|execution| {
+                    Core::healthy(&state)?;
+                    Ok(execution)
+                });
                 let uncertain = result.is_err() && state.lsn.is_some();
                 state.pending -= 1;
                 state.assignment.take();
@@ -444,7 +510,7 @@ impl Committer {
                     let first = Core::record_fault(&mut state, &reason);
                     drop(state);
                     core.publish_fault(reason.clone(), first);
-                    failed.get_or_insert(reason);
+                    failed.get_or_insert((is_abort(result.as_ref().unwrap_err()), reason));
                 } else {
                     let _ = request.reply.send(result);
                     drop(state);
@@ -455,7 +521,9 @@ impl Committer {
                 core.changed.notify_waiters();
             }
             core.sql.lock().unwrap().close();
-            failed.map_or(Ok(()), |reason| Err(io::Error::other(reason)))
+            failed.map_or(Ok(()), |(aborted, reason)| {
+                Err(stored_error(aborted, reason))
+            })
         });
         Ok(Self {
             core,
@@ -464,6 +532,22 @@ impl Committer {
                 result: None,
             }),
         })
+    }
+
+    pub(crate) async fn wait_for_role_drain(&self) -> io::Result<()> {
+        loop {
+            let changed = self.core.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.core.state.lock().unwrap();
+                Core::live(&state)?;
+                if state.pending == 0 && !matches!(state.mode, Mode::Copy { .. }) {
+                    return Ok(());
+                }
+            }
+            changed.await;
+        }
     }
 
     pub fn promote(&self, admission: Admission) -> io::Result<()> {
@@ -492,6 +576,15 @@ impl Committer {
     }
 
     pub fn begin_execute(&self, statements: Vec<String>) -> io::Result<Write> {
+        self.begin_statements(
+            statements
+                .into_iter()
+                .map(|sql| (sql, Vec::new()))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn begin_statements(&self, statements: Vec<Statement>) -> io::Result<Write> {
         (self.core.access)(true)?;
         let mut state = self.core.state.lock().unwrap();
         Core::live(&state)?;
@@ -519,6 +612,14 @@ impl Committer {
     }
 
     pub fn query(&self, sql: &str) -> io::Result<Vec<Vec<rusqlite::types::Value>>> {
+        self.query_with_params(sql, &[]).map(|(_, rows)| rows)
+    }
+
+    pub(crate) fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[rusqlite::types::Value],
+    ) -> io::Result<(Vec<String>, Vec<Vec<rusqlite::types::Value>>)> {
         (self.core.access)(false)?;
         let state = self.core.state.lock().unwrap();
         Core::live(&state)?;
@@ -539,10 +640,7 @@ impl Committer {
                 )
                 .map_err(error)?;
         }
-        connection
-            .query(sql, &[])
-            .map(|(_, rows)| rows)
-            .map_err(error)
+        connection.query(sql, params).map_err(error)
     }
 
     pub fn progress(&self) -> io::Result<i64> {
@@ -608,6 +706,7 @@ impl Committer {
             ));
         }
         state.mode = Mode::Secondary;
+        self.core.changed.notify_waiters();
         Ok(())
     }
 
@@ -634,29 +733,49 @@ impl Committer {
     }
 
     pub fn abort(&self) {
-        self.core
-            .fault("SQLite service aborted; admitted outcomes unknown".into());
+        let reason = "SQLite service aborted; admitted outcomes unknown".to_owned();
+        {
+            let mut state = self.core.state.lock().unwrap();
+            let first = Core::record_fault(&mut state, &reason);
+            if first {
+                state.aborted = true;
+            }
+        }
+        self.core.changed.notify_waiters();
         self.core.cancel.send_replace(true);
     }
 
     pub async fn close(&self) -> io::Result<()> {
-        self.core.state.lock().unwrap().sender.take();
+        {
+            let mut state = self.core.state.lock().unwrap();
+            state.sender.take();
+        }
         self.core.changed.notify_waiters();
         let mut drain = self.drain.lock().await;
         if drain.result.is_none() {
             let result = drain.worker.as_mut().unwrap().await;
             drain.worker.take();
+            self.core.state.lock().unwrap().admission.take();
             drain.result = Some(match result {
-                Ok(Ok(())) => self
-                    .core
-                    .state
-                    .lock()
-                    .unwrap()
-                    .fault
-                    .clone()
-                    .map_or(Ok(()), Err),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(error) => Err(format!("SQLite worker failed: {error}")),
+                Ok(Ok(())) => {
+                    let state = self.core.state.lock().unwrap();
+                    state
+                        .fault
+                        .clone()
+                        .map_or(Ok(()), |reason| Err((state.aborted, reason)))
+                }
+                Ok(Err(error)) => {
+                    let state = self.core.state.lock().unwrap();
+                    let mut diagnostic = error.to_string();
+                    if let Some(fault) = &state.fault
+                        && fault != &diagnostic
+                    {
+                        diagnostic.push_str("; ");
+                        diagnostic.push_str(fault);
+                    }
+                    Err((is_abort(&error) && state.aborted, diagnostic))
+                }
+                Err(error) => Err((false, format!("SQLite worker failed: {error}"))),
             });
         }
         let result = drain
@@ -665,7 +784,7 @@ impl Committer {
             .unwrap()
             .as_ref()
             .copied()
-            .map_err(error);
+            .map_err(|(aborted, reason)| stored_error(*aborted, reason.clone()));
         if let Err(error) = &result {
             self.core.fault(error.to_string());
         }

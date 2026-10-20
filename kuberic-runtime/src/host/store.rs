@@ -159,6 +159,10 @@ pub(crate) trait AgentStore: Send + Sync {
         Ok(None)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "store journal conformance seam, not native ACK")
+    )]
     async fn public_v1_terminal_inbound_build_receipt(
         &self,
         _build_id: &OperationId,
@@ -180,6 +184,10 @@ pub(crate) trait AgentStore: Send + Sync {
         Ok(None)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "store journal conformance seam, not native ACK")
+    )]
     async fn complete_public_v1_inbound_build(
         &self,
         _receipt: &PublicInboundBuildReceipt,
@@ -187,12 +195,5 @@ pub(crate) trait AgentStore: Send + Sync {
         Err(crate::host::HostError::CommandRejected(
             "Public V1 inbound build authority is not enabled for this store".into(),
         ))
-    }
-
-    async fn public_v1_storage_is_retired(
-        &self,
-        _storage: &ReplicaStorageIncarnationContext,
-    ) -> Result<bool> {
-        Ok(false)
     }
 }

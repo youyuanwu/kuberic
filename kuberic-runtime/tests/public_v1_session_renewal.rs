@@ -127,6 +127,7 @@ fn build_intent(
     let target_session = ProcessSessionId::new("replacement_schema-target-session");
     let program = PublicOperationProgram::Build(PublicBuildInput {
         attempt: operation_id.clone(),
+        source_address: "https://10.0.0.1:7000".into(),
         epoch: Epoch::new(history.data_loss_number, 7),
         current_configuration_id: Some(kuberic_runtime::protocol::types::ConfigurationId::new(
             "replacement_schema-build-configuration",
@@ -211,6 +212,8 @@ fn ordinary_required(previous_epoch: Epoch, renewal_epoch: Epoch) -> ProcessSess
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity: PublicV1Identity::new(42),
         resource_uid: required.resource_uid.clone(),
         replica: replacement.identity.clone(),
@@ -225,8 +228,10 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
         storage_incarnation: replacement.storage_incarnation.clone(),
         progress: PublicProgress {
             role: PublicProgressRole::Recovery,
-            first: 7,
-            last: 7,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(7),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(7),
         },
         replication_address: None,
         service_location: None,
@@ -989,7 +994,7 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 
 #[tokio::test]
 async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 13);
     let root = test_root("replacement_schema-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicV1Identity::new(42);
@@ -1134,8 +1139,10 @@ async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
                 write_status: AccessStatus::NotPrimary,
                 progress: PublicProgress {
                     role: PublicProgressRole::Primary,
-                    first: 0,
-                    last: 0,
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
                 },
             },
         )

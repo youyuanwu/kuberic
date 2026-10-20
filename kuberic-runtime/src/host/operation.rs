@@ -20,6 +20,9 @@ use crate::protocol::types::{OperationId, ProcessSessionId, ReplicaIdentity};
 pub(crate) enum CallbackContainment {
     /// Joining the root future proves all operation-owned work terminated.
     RootTask,
+    /// The public future observes work retained and fenced by the native owner.
+    /// Joining this observer does not claim that native callbacks have drained.
+    NativeObserver,
     /// Successful callback completion is the public contract boundary; failure or
     /// cancellation still requires object/process containment.
     ObjectOwnedOnInterruption,
@@ -245,9 +248,9 @@ impl PartitionOperation {
             Err(error) => PublicOperationDisposition::Failed(error),
         };
 
-        if (matches!(disposition, PublicOperationDisposition::Failed(_))
-            && containment == CallbackContainment::ObjectOwnedOnInterruption)
-            || !self.descendants_contained().await
+        if (containment == CallbackContainment::ObjectOwnedOnInterruption
+            && matches!(disposition, PublicOperationDisposition::Failed(_)))
+            || (containment == CallbackContainment::RootTask && !self.descendants_contained().await)
         {
             let pending = self
                 .advance(
@@ -375,6 +378,7 @@ impl PartitionOperation {
     ) -> Result<PublicOperationRecord> {
         let containment = *self.containment.lock().await;
         let next = match containment {
+            CallbackContainment::NativeObserver => PublicOperationStage::Completed,
             CallbackContainment::RootTask if self.descendants_contained().await => {
                 PublicOperationStage::Completed
             }
@@ -717,6 +721,44 @@ fn configuration_pending_for_fenced_intent(
     {
         return None;
     }
+    align_configuration_pending(renewal)
+}
+
+fn native_preparation_pending_for_fenced_intent(
+    renewal: &PublicV1SessionRenewalStatus,
+    local_identity: &ReplicaIdentity,
+    intent: &PublicOperationIntent,
+) -> Option<PublicV1SessionRenewalStatus> {
+    if intent.class != PublicOperationClass::Authority
+        || !renewal_endpoint_matches_intent(renewal, local_identity, intent)
+    {
+        return None;
+    }
+    let fresh = &renewal.required.fresh_configuration;
+    match intent.program.as_ref()? {
+        PublicOperationProgram::Epoch { epoch } if *epoch == fresh.epoch => {}
+        PublicOperationProgram::Configuration(configuration)
+        | PublicOperationProgram::CatchUp { configuration, .. }
+            if configuration.current == *fresh
+                && configuration.previous.as_ref().is_some_and(|previous| {
+                    previous.primary_id == fresh.primary_id
+                        && previous.epoch >= renewal.required.previous_epoch
+                        && previous.epoch <= fresh.epoch
+                        && previous.write_quorum == fresh.write_quorum
+                        && previous.members.len() >= fresh.write_quorum as usize
+                        && previous
+                            .members
+                            .iter()
+                            .all(|member| fresh.members.contains(member))
+                }) => {}
+        _ => return None,
+    }
+    align_configuration_pending(renewal)
+}
+
+fn align_configuration_pending(
+    renewal: &PublicV1SessionRenewalStatus,
+) -> Option<PublicV1SessionRenewalStatus> {
     let mut aligned = renewal.clone();
     if aligned.stage == PublicSessionRenewalStage::EpochBarriersPending {
         while let Some(barrier) = aligned
@@ -780,6 +822,97 @@ fn renewal_endpoint_matches_intent(
         .any(|endpoint| {
             endpoint.identity == *local_identity
                 && endpoint.process_session_id == intent.process_session_id
+        })
+}
+
+fn is_retained_replacement_open(
+    renewal: &PublicV1SessionRenewalStatus,
+    local: &ReplicaIdentity,
+    storage: Option<&crate::protocol::types::ReplicaStorageIncarnationContext>,
+    intent: &PublicOperationIntent,
+) -> bool {
+    renewal.stage == PublicSessionRenewalStage::ReplacementRolePending
+        && renewal.required.predecessor_contained
+        && intent.class == PublicOperationClass::Authority
+        && matches!(intent.program.as_ref(),
+            Some(PublicOperationProgram::Open { replica, existing: true }) if replica == local)
+        && renewal
+            .required
+            .replacement
+            .as_ref()
+            .is_some_and(|replacement| {
+                replacement.identity == *local
+                    && replacement.process_session_id == intent.process_session_id
+                    && replacement.process_session_id
+                        != renewal.required.predecessor.process_session_id
+                    && replacement.storage_incarnation
+                        == renewal.required.predecessor.storage_incarnation
+                    && storage == Some(&replacement.storage_incarnation)
+            })
+}
+
+fn is_contained_predecessor_fault(
+    renewal: &PublicV1SessionRenewalStatus,
+    record: &PublicOperationRecord,
+    incoming: &PublicOperationIntent,
+) -> bool {
+    renewal.required.predecessor_contained
+        && record.stage == PublicOperationStage::Completed
+        && record.intent.class == PublicOperationClass::TransientFault
+        && record.intent.identity == incoming.identity
+        && record.intent.process_session_id == renewal.required.predecessor.process_session_id
+        && record.accepted_history.as_ref() == Some(&renewal.required.history)
+        && record.accepted_storage.as_ref()
+            == Some(&renewal.required.predecessor.storage_incarnation)
+        && renewal
+            .required
+            .replacement
+            .as_ref()
+            .is_some_and(|replacement| {
+                replacement.process_session_id == incoming.process_session_id
+                    && replacement.process_session_id != record.intent.process_session_id
+                    && replacement.storage_incarnation
+                        == renewal.required.predecessor.storage_incarnation
+            })
+}
+
+pub(crate) fn contained_transient_reopen(
+    state: &super::state::AgentState,
+    process: &ProcessSessionId,
+) -> bool {
+    if state.reported_fault != Some(crate::protocol::types::FaultType::Transient) {
+        return false;
+    }
+    let Some(preview) = state.public_v1_operation_state.as_ref() else {
+        return false;
+    };
+    let Some(renewal) = preview.session_renewal.as_ref() else {
+        return false;
+    };
+    let Some(open) = preview
+        .current_operation
+        .as_ref()
+        .and_then(|id| preview.operations.get(id))
+    else {
+        return false;
+    };
+    open.intent.process_session_id == *process
+        && matches!(
+            open.stage,
+            PublicOperationStage::Running | PublicOperationStage::CallbackApplied
+        )
+        && open.superseded_by.is_none()
+        && open.accepted_history.as_ref() == Some(&renewal.required.history)
+        && open.accepted_storage.as_ref() == preview.storage_incarnation.as_ref()
+        && is_retained_replacement_open(
+            renewal,
+            &state.identity.local_identity,
+            preview.storage_incarnation.as_ref(),
+            &open.intent,
+        )
+        && preview.operations.values().any(|fault| {
+            is_contained_predecessor_fault(renewal, fault, &open.intent)
+                && fault.superseded_by.as_ref() == Some(&open.intent.operation_id)
         })
 }
 
@@ -888,11 +1021,30 @@ impl PartitionOperationRegistry {
                             preview.history.as_ref() == Some(&renewal.required.history)
                         })
                         .and_then(|renewal| {
+                            if is_retained_replacement_open(
+                                renewal,
+                                &state.identity.local_identity,
+                                preview.storage_incarnation.as_ref(),
+                                intent,
+                            ) || crate::host::public_lifecycle::is_replacement_role_replay(
+                                renewal,
+                                &state.identity.local_identity,
+                                intent,
+                            ) {
+                                return Some((renewal.clone(), renewal.clone()));
+                            }
                             configuration_pending_for_fenced_intent(
                                 renewal,
                                 &state.identity.local_identity,
                                 intent,
                             )
+                            .or_else(|| {
+                                native_preparation_pending_for_fenced_intent(
+                                    renewal,
+                                    &state.identity.local_identity,
+                                    intent,
+                                )
+                            })
                             .map(|aligned| (renewal.clone(), aligned))
                         })
                 })
@@ -1117,6 +1269,15 @@ impl PartitionOperationRegistry {
         let mut blockers = BTreeSet::new();
         let mut superseded = Vec::new();
         let mut attached_to = None;
+        let renewal = if renewal_configuration {
+            self.store
+                .load_state()
+                .await?
+                .public_v1_operation_state
+                .and_then(|preview| preview.session_renewal)
+        } else {
+            None
+        };
         for operation in existing {
             let record = operation.snapshot();
             if record.superseded_by.is_some()
@@ -1137,7 +1298,12 @@ impl PartitionOperationRegistry {
             {
                 continue;
             }
-            let relation = if record.stage == PublicOperationStage::Completed {
+            let relation = if renewal
+                .as_ref()
+                .is_some_and(|renewal| is_contained_predecessor_fault(renewal, &record, &intent))
+            {
+                AdmissionRelation::Supersede
+            } else if record.stage == PublicOperationStage::Completed {
                 retained_relation(&record.intent, &intent)
             } else {
                 active_relation(&record.intent, &intent)
@@ -1433,6 +1599,19 @@ impl PartitionOperationRegistry {
                 });
         }
         Ok(())
+    }
+
+    pub(crate) async fn has_uncontained_predecessors(
+        &self,
+        operation: &PartitionOperation,
+    ) -> bool {
+        let blockers = operation.snapshot().blockers;
+        let state = self.state.lock().await;
+        blockers.iter().any(|id| {
+            state.operations.get(id).is_some_and(|predecessor| {
+                predecessor.snapshot().stage != PublicOperationStage::Completed
+            })
+        })
     }
 
     async fn refresh_waiters(&self) -> Result<()> {
@@ -1745,6 +1924,53 @@ mod tests {
             program: Some(program),
         };
         let configuration_intent = intent_for(configuration_program.clone(), 1);
+        let retained_open = intent_for(
+            PublicOperationProgram::Open {
+                replica: identity.clone(),
+                existing: true,
+            },
+            7,
+        );
+        assert!(is_retained_replacement_open(
+            &role_pending,
+            &identity,
+            Some(&storage),
+            &retained_open,
+        ));
+        assert!(!is_retained_replacement_open(
+            &configuration_pending,
+            &identity,
+            Some(&storage),
+            &retained_open,
+        ));
+        for invalid in [
+            intent_for(
+                PublicOperationProgram::Open {
+                    replica: identity.clone(),
+                    existing: false,
+                },
+                8,
+            ),
+            PublicOperationIntent {
+                process_session_id: ProcessSessionId::new("old-session"),
+                ..retained_open.clone()
+            },
+        ] {
+            assert!(!is_retained_replacement_open(
+                &role_pending,
+                &identity,
+                Some(&storage),
+                &invalid,
+            ));
+        }
+        let mut uncontained = role_pending.clone();
+        uncontained.required.predecessor_contained = false;
+        assert!(!is_retained_replacement_open(
+            &uncontained,
+            &identity,
+            Some(&storage),
+            &retained_open,
+        ));
         let epoch_intent = intent_for(PublicOperationProgram::Epoch { epoch }, 2);
         let role_intent = intent_for(
             PublicOperationProgram::Role {
@@ -1753,6 +1979,10 @@ mod tests {
             },
             3,
         );
+        let replay_intent = PublicOperationIntent {
+            operation_id: crate::host::public_lifecycle::replacement_role_operation_id(&required),
+            ..role_intent.clone()
+        };
         let stages = [
             &required,
             &access_closed,
@@ -1764,6 +1994,14 @@ mod tests {
         ];
 
         for status in stages {
+            assert_eq!(
+                crate::host::public_lifecycle::is_replacement_role_replay(
+                    status,
+                    &identity,
+                    &replay_intent,
+                ),
+                status.stage == PublicSessionRenewalStage::ReplacementRolePending
+            );
             assert_eq!(
                 is_configuration_pending_for_fenced_intent(
                     status,
@@ -1783,6 +2021,33 @@ mod tests {
                 &role_intent
             ));
         }
+        for invalid in [
+            role_intent.clone(),
+            PublicOperationIntent {
+                process_session_id: ProcessSessionId::new("old-session"),
+                ..replay_intent.clone()
+            },
+            PublicOperationIntent {
+                program: Some(PublicOperationProgram::Role {
+                    epoch: Epoch::new(0, 1),
+                    role: ReplicaRole::Primary,
+                }),
+                ..replay_intent.clone()
+            },
+            PublicOperationIntent {
+                program: Some(PublicOperationProgram::Role {
+                    epoch,
+                    role: ReplicaRole::ActiveSecondary,
+                }),
+                ..replay_intent.clone()
+            },
+        ] {
+            assert!(!crate::host::public_lifecycle::is_replacement_role_replay(
+                &role_pending,
+                &identity,
+                &invalid,
+            ));
+        }
         assert_eq!(
             configuration_pending_for_fenced_intent(&barriers, &identity, &configuration_intent)
                 .unwrap(),
@@ -1797,6 +2062,82 @@ mod tests {
             &identity,
             &intent(PublicOperationClass::Authority, 1)
         ));
+        assert_eq!(
+            native_preparation_pending_for_fenced_intent(
+                &configuration_pending,
+                &identity,
+                &epoch_intent,
+            ),
+            Some(configuration_pending.clone()),
+        );
+        assert!(
+            native_preparation_pending_for_fenced_intent(&required, &identity, &epoch_intent,)
+                .is_none()
+        );
+        for invalid in [
+            intent_for(
+                PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 3),
+                },
+                4,
+            ),
+            PublicOperationIntent {
+                process_session_id: ProcessSessionId::new("old-session"),
+                ..epoch_intent.clone()
+            },
+            role_intent,
+        ] {
+            assert!(
+                native_preparation_pending_for_fenced_intent(
+                    &configuration_pending,
+                    &identity,
+                    &invalid,
+                )
+                .is_none()
+            );
+        }
+        let mut joint = PublicConfiguration {
+            current: configuration,
+            previous: Some(ConfigurationDescriptor::new(
+                Epoch::new(0, 1),
+                identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )),
+            replicas: Vec::new(),
+        };
+        let joint_intent = intent_for(
+            PublicOperationProgram::CatchUp {
+                configuration: joint.clone(),
+                mode: crate::protocol::public_operations::PublicCatchUpMode::WriteQuorum,
+            },
+            5,
+        );
+        assert!(
+            native_preparation_pending_for_fenced_intent(
+                &configuration_pending,
+                &identity,
+                &joint_intent,
+            )
+            .is_some()
+        );
+        assert!(!is_configuration_pending_for_fenced_intent(
+            &configuration_pending,
+            &identity,
+            &joint_intent,
+        ));
+        joint.previous.as_mut().unwrap().epoch = Epoch::new(1, 1);
+        assert!(
+            native_preparation_pending_for_fenced_intent(
+                &configuration_pending,
+                &identity,
+                &intent_for(PublicOperationProgram::Configuration(joint), 6),
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1953,6 +2294,25 @@ mod tests {
         )
         .await
         .unwrap();
+        let epoch_program = PublicOperationProgram::Epoch { epoch };
+        let epoch_intent = PublicOperationIntent {
+            input_digest: epoch_program.digest(),
+            replay_disposition: epoch_program.replay_disposition(),
+            program: Some(epoch_program),
+            operation_id: OperationId::new("renewal-release-epoch"),
+            ..intent.clone()
+        };
+        assert!(
+            registry
+                .prepare_fenced_session_renewal_configuration(&epoch_intent)
+                .await
+                .unwrap()
+        );
+        registry
+            .release_session_renewal_fence(&epoch_intent)
+            .await
+            .unwrap();
+        assert!(registry.is_fenced());
         assert!(
             registry
                 .prepare_fenced_session_renewal_configuration(&intent)

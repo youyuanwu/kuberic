@@ -1,7 +1,7 @@
 # Kuberic
 
 > **Experimental** — Kuberic is under active development and is not ready for
-> production use. The classic v1 stack has been removed. Published v2 images
+> production use. The retired Kuberic classic application/operator stack has been removed. Published v2 images
 > and a supported release installation are not available yet.
 
 Kuberic is a stateful replication framework for Kubernetes. The current
@@ -12,8 +12,12 @@ controller and owned-cluster validation harness.
 The production control loop initializes fresh agents, originates exact
 topology authority, renews restarted process sessions, builds and admits
 same-cardinality replacements, and performs delayed failover from observation.
-Committed application state remains provider-owned; agent schema 12 stores
+Committed application state remains provider-owned; agent schema 13 stores
 history and lifecycle authority.
+
+The sole default Replicator now composes the source-guided Service Fabric classic
+V1 owners. Assignment, quorum completion and service-local commitment are
+separate; KVStore2 and SQLite own durable commit and client publication.
 
 ## Repository
 
@@ -136,9 +140,9 @@ formats. See the
 
 ## Distribution Status
 
-Classic source and image publication have been removed. Existing external
-classic registry artifacts, if still present, are unsupported historical
-artifacts.
+Retired Kuberic classic application/operator source and image publication have
+been removed. Existing external classic registry artifacts, if still present,
+are unsupported historical artifacts.
 
 V2 distribution is deferred. Main-branch and version-tag workflows currently
 publish no Kuberic controller or application images. Build from source and use
@@ -147,7 +151,7 @@ the isolated development/CI assets above.
 ## Documentation
 
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
-- [Stateless default Replicator](docs/features/kuberic/stateless-default-replicator.md)
+- [Classic V1 default Replicator](docs/features/kuberic/classic-v1-runtime.md)
 - [Service Fabric alignment](docs/features/kuberic/service-fabric-alignment.md)
 - [Faithful SF V1 replicator port design and plan](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
 - [SF V1 P1 source/scenario ledger](docs/features/kuberic/sf-v1-port-ledger.md) and [provenance/notices](docs/features/kuberic/sf-v1-port-provenance.md)

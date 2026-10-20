@@ -21,7 +21,6 @@ use crate::protocol::types::Epoch;
 use super::operation_queue::QueueOperation;
 
 #[derive(Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 admission seam"))]
 pub(super) struct SenderOperation {
     pub(super) operation: Arc<QueueOperation>,
     /// Supplied by the owner, never inferred from the current sending epoch.
@@ -29,7 +28,6 @@ pub(super) struct SenderOperation {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 sender settings"))]
 pub(super) struct SenderConfig {
     pub(super) initial_window: usize,
     pub(super) max_window: usize,
@@ -50,7 +48,6 @@ impl SenderConfig {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 selected work"))]
 pub(super) enum SendAction {
     Operation(SenderOperation),
     RequestAck,
@@ -59,13 +56,11 @@ pub(super) enum SendAction {
 /// Every selected operation is retained and stamped before the first callback.
 /// Closing a core cannot withdraw this batch. Different batches need not be
 /// globally serialized. A false callback means send queue full, not failed ACK.
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 dispatch seam"))]
 pub(super) struct SendBatch {
     actions: Vec<SendAction>,
     completed_hint: Lsn,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 dispatch seam"))]
 impl SendBatch {
     fn empty(completed_hint: Lsn) -> Self {
         Self {
@@ -74,6 +69,7 @@ impl SendBatch {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.actions.is_empty()
     }
@@ -87,14 +83,12 @@ impl SendBatch {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK result"))]
 pub(super) struct AckResult {
     pub(super) advanced: bool,
     pub(super) sends: SendBatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 progress view"))]
 pub(super) struct SenderProgress {
     pub(super) received: Lsn,
     pub(super) applied: Lsn,
@@ -117,10 +111,6 @@ struct Pending {
     selected_at: Option<Duration>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected native V1 reliable sender")
-)]
 pub(super) struct ReliableOperationSender {
     config: SenderConfig,
     active: bool,
@@ -140,7 +130,6 @@ pub(super) struct ReliableOperationSender {
     apply_average: DecayAverage,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 sender API"))]
 impl ReliableOperationSender {
     pub(super) fn new(config: SenderConfig, last_ack: Lsn, now: Duration) -> Self {
         assert!(config.initial_window > 0 && !config.retry.is_zero());
@@ -186,6 +175,7 @@ impl ReliableOperationSender {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn is_active(&self) -> bool {
         self.active
     }
@@ -194,6 +184,7 @@ impl ReliableOperationSender {
         self.deadline
     }
 
+    #[cfg(test)]
     pub(super) fn window(&self) -> usize {
         self.window
     }
@@ -217,6 +208,7 @@ impl ReliableOperationSender {
         self.pending.values().map(|pending| &pending.operation)
     }
 
+    #[cfg(test)]
     pub(super) fn set_decay_settings(&mut self, factor: f64, interval: Duration) {
         assert!((0.0..=1.0).contains(&factor) && !interval.is_zero());
         self.config.decay_factor = factor;

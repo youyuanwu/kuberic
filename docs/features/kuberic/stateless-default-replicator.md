@@ -1,5 +1,11 @@
 # Stateless Default Replicator
 
+> Historical ownership guide for the removed algorithm, before the connected
+> classic V1 cutover. The statements below describe that baseline, not current
+> selection, protocol, schema, streams or transport authentication. See
+> [Classic V1 Runtime](classic-v1-runtime.md) for the replacement. No compatibility
+> implementation or old-format reader is retained.
+
 ## Status
 
 Public V1 is the sole built-in Kuberic replication path. The legacy managed

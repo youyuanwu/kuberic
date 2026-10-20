@@ -69,6 +69,45 @@ fn accepted() -> kuberic_runtime::protocol::public_operations::PublicV1AcceptedS
     }
 }
 
+#[test]
+fn accepted_native_stage_ledger_preserves_its_capacity_boundary() {
+    use kuberic_runtime::protocol::public_operations::{
+        PublicV1AcceptedOperationCompletion, PublicV1CallKind, PublicV1OperationCompletion,
+        PublicV1OperationResult,
+    };
+    let mut authority = accepted();
+    let program = PublicOperationProgram::Progress { capability: false };
+    for revision in 1..=256 {
+        authority
+            .completed_operations
+            .push(PublicV1AcceptedOperationCompletion::from_completion(
+                &PublicV1OperationCompletion {
+                    operation_id: OperationId::new(format!("native-stage-{revision}")),
+                    revision,
+                    call_kind: PublicV1CallKind::Progress,
+                    process_session_id: ProcessSessionId::new("session-1"),
+                    input_digest: program.digest(),
+                    replay_disposition: program.replay_disposition(),
+                    history: authority.history.clone(),
+                    storage_incarnation: storage(),
+                    previous_configuration_id: None,
+                    current_configuration_id: None,
+                    catch_up_mode: None,
+                    catch_up_specific_quorum: None,
+                    result: PublicV1OperationResult::Succeeded,
+                },
+            ));
+    }
+    authority.validate_evidence().unwrap();
+    let previous = authority.clone();
+    let mut overflow = authority.completed_operations.last().unwrap().clone();
+    overflow.operation_id = OperationId::new("native-stage-overflow");
+    overflow.revision += 1;
+    authority.completed_operations.push(overflow);
+    assert!(authority.is_evidence_successor_of(&previous));
+    assert!(authority.validate_evidence().is_err());
+}
+
 fn renewal_required() -> ProcessSessionRenewalRequired {
     let accepted = accepted();
     let predecessor = ProcessSessionEndpoint {
@@ -233,6 +272,7 @@ fn public_v1_inbound_build_authority_commands_round_trip() {
         },
         history: accepted.history,
         current_configuration_id: ConfigurationId::new("configuration-2"),
+        source_address: "http://pod-1:50052".into(),
         target_address: "http://pod-2:50052".into(),
     };
     for command in [

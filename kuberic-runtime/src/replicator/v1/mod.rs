@@ -23,9 +23,11 @@ mod service_adapter;
 mod session;
 mod transport;
 
+pub(crate) use service_adapter::create_production;
 pub(crate) use service_adapter::{
     Facade, FacadeSetup, FacadeState, LifecycleObservation, matches_binding,
 };
+pub(crate) use service_adapter::{PUBLIC_V1_DATA_SERVICES, PublicV1DataServiceManifest};
 
 #[cfg(test)]
 mod copy_receiver_integration;

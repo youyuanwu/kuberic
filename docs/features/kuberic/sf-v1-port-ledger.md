@@ -1,17 +1,32 @@
 # SF V1 Port Foundation Ledger
 
-**P1 foundation, unselected P2 substrate slices and bounded P3 primary,
+**Current selection:** the connected default-factory cutover composes these
+owners through real authenticated listeners, public assignment/ACK streams,
+service-owned KV/SQLite commitment and named host/controller observations.
+See [Classic V1 Runtime](classic-v1-runtime.md). The slice boundaries below are
+historical, not current selection flags or native differential qualification.
+
+**Historical delivery scope: P1 foundation, unselected P2 substrate slices and bounded P3 primary,
 secondary, copy, role, data-loss, queue-policy, message-ingress and Open/recovery ownership slices, plus bounded private P4 service, protected-facade execution, host access/lifecycle and real-KV/SQLite commit adapters; no selected replication behavior change.** Native pin:
 [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 This ledger implements the foundation deliverables in the
 [faithful-port roadmap](sf-v1-semantic-alignment-plan.md#dependency-ordered-implementation-program).
-The current bespoke engine is the migration/safety baseline, not the native
+The removed bespoke engine is the migration/safety baseline, not the native
 specification. `v1/` destinations below are under
 `kuberic-runtime/src/replicator/`; OperationQueue and the bounded components
-described below are implemented, and none is activated. P1 itself implemented
+described below were implemented without activation at their delivery boundaries. P1 itself implemented
 no component.
 
 ## Evidence and status
+
+The connected public evidence is
+[`classic_v1_production.rs`](../../../kuberic-runtime/tests/classic_v1_production.rs),
+including real host/control/peer RPCs, real service files and an
+[`independent normal-feature provider`](../../../scripts/fixtures/classic-v1-provider/src/lib.rs).
+The public factory no longer selects `replicator/stateless` or the old replication
+RPC. Controller and in-process journeys exercise native copy before voting
+admission, renewed sessions and staged configurations. These are Rust composition
+and application-safety witnesses, not native SF execution or blanket audit closure.
 
 These are the **historical P1 baseline** statuses for the family, contract and
 scenario rows below. Only the explicit slice updates following this table

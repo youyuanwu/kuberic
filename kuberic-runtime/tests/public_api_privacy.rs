@@ -7,6 +7,9 @@ use std::process::{Command, Output};
 fn external_applications_can_use_contracts_but_cannot_forge_host_capabilities() {
     let runtime = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target = runtime.parent().unwrap().join("target");
+    let build_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| target.clone());
     fs::create_dir_all(&target).unwrap();
     let fixture = tempfile::tempdir_in(&target).unwrap();
     fs::create_dir(fixture.path().join("scratch")).unwrap();
@@ -61,7 +64,7 @@ path = "private.rs"
             .arg("--manifest-path")
             .arg(fixture.path().join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(&target)
+            .arg(&build_target)
             .env("TMPDIR", fixture.path().join("scratch"))
             .output()
             .expect("check external application")
@@ -85,10 +88,15 @@ path = "private.rs"
         "struct `ReplicatorCreationReservation` is private",
         "trait `ReplicatorRegistration` is private",
         "trait `PartitionAccessView` is private",
+        "trait `NativeRuntimeControl` is private",
+        "no method named `selected_epoch`",
+        "no method named `idle_replicas`",
+        "no method named `containment`",
         "associated function `new` is private",
         "cannot construct `ReplicatorInterfaces` with struct literal syntax due to private fields",
         "module `command` is private",
         "module `hosting` is private",
+        "module `native_transport` is private",
         "module `operation` is private",
         "module `operation_recovery` is private",
         "module `public_build_store` is private",
@@ -105,6 +113,20 @@ path = "private.rs"
         assert!(
             diagnostics.contains(expected),
             "missing {expected:?}:\n{diagnostics}"
+        );
+    }
+    for constructor in [
+        "StatefulServicePartition::new",
+        "ReplicatorFactoryContext::new",
+        "ReceivedOperation::new",
+        "OperationStream::new",
+    ] {
+        assert!(
+            diagnostics.split("\nerror[").any(|diagnostic| {
+                diagnostic.contains("associated function `new` is private")
+                    && diagnostic.contains(constructor)
+            }),
+            "missing private constructor proof for {constructor}:\n{diagnostics}",
         );
     }
 }

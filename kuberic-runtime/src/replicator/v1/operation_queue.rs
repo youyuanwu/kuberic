@@ -24,10 +24,6 @@ use super::buffers::{self, BufferError, BufferLimits, BufferPolicy};
 /// Minimal operation dependency, not the received-operation ACK state machine.
 /// The owner supplies numbered data and its current completion-blocking state.
 /// Releasing that state is not a provider-persistence or quorum assertion.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 queue entry seam")
-)]
 pub(super) struct QueueOperation {
     lsn: Lsn,
     data: OperationData,
@@ -37,13 +33,6 @@ pub(super) struct QueueOperation {
     enqueued_at: Mutex<tokio::time::Instant>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unselected V1 queue entry constructors and owner ACK predicate"
-    )
-)]
 impl QueueOperation {
     pub(super) fn new(lsn: Lsn, data: OperationData, needs_ack: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -112,10 +101,6 @@ impl QueueOperation {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 queue configuration")
-)]
 pub(super) struct QueueConfig {
     pub(super) initial_capacity: usize,
     /// Zero disables this bound; capacity measures sequence-number positions.
@@ -148,10 +133,6 @@ impl QueueConfig {
 /// All boundaries are exclusive "next" positions; the native invalid/capability
 /// sentinel is zero, distinct from the public API's INVALID_LSN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 queue progress view")
-)]
 pub(super) struct QueueProgress {
     pub(super) retained_head: Lsn,
     pub(super) complete_head: Lsn,
@@ -159,10 +140,6 @@ pub(super) struct QueueProgress {
     pub(super) tail: Lsn,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 queue progress accessors")
-)]
 impl QueueProgress {
     pub(super) fn first_available_completed(self) -> Lsn {
         if self.retained_head == self.complete_head {
@@ -190,20 +167,12 @@ impl QueueProgress {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 queue admission result")
-)]
 pub(super) enum EnqueueError {
     Duplicate,
     Full,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 queue callback control")
-)]
 pub(super) enum CallbackControl {
     Keep,
     Disable,
@@ -213,13 +182,6 @@ pub(super) enum CallbackControl {
 /// point*. Does not promise arbitrary reentrant queue mutation.
 type CommitCallback = Box<dyn FnMut(Arc<QueueOperation>, QueueProgress) -> CallbackControl + Send>;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unselected V1 OperationQueue state, production compiled but not factory selected"
-    )
-)]
 pub(super) struct OperationQueue {
     config: QueueConfig,
     entries: BTreeMap<Lsn, Arc<QueueOperation>>,

@@ -1,4 +1,5 @@
-//! Socket destination routing for repository tests; protocol inputs are untouched.
+//! Socket destination routing for repository tests; native authority and protocol
+//! inputs are untouched. Production without `testing` always dials directly.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -383,18 +384,15 @@ mod tests {
 
     mod attachment {
         use super::*;
-        use crate::application::{
-            CopyChunk, DurableApplicationProgress, Operation, OperationDataStream, StateProvider,
-        };
-        use crate::engine::{DurableState, RetainedOperationStream};
+        use crate::application::{OperationDataStream, StateProvider};
         use crate::host::store::PublicInboundBuildAdmission;
         use crate::protocol::public_operations::{
-            PublicInboundBuildAuthority, PublicInboundBuildReceipt, PublicV1Identity,
-            PublicV1LifecycleBinding, StatePersistence,
+            PublicInboundBuildAuthority, PublicV1Identity, PublicV1LifecycleBinding,
+            StatePersistence,
         };
         use crate::protocol::types::{
-            AccessStatus, AgentGeneration, ConfigurationId, FaultType, LoadMetric, OperationId,
-            PartitionId, PartitionInformation, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+            AccessStatus, AgentGeneration, FaultType, LoadMetric, PartitionId,
+            PartitionInformation, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
             ReplicaStorageIncarnationContext, ResourceUid,
         };
         use crate::replicator::{
@@ -405,8 +403,10 @@ mod tests {
         };
         use crate::{Result, RuntimeError};
 
+        #[derive(Default)]
         struct Fixture {
             fail_registration: std::sync::atomic::AtomicBool,
+            binding: Mutex<Option<(ReplicaIdentity, ProcessSessionId)>>,
         }
 
         #[async_trait]
@@ -434,6 +434,52 @@ mod tests {
 
         #[async_trait]
         impl PartitionAccessView for Fixture {
+            fn validate_native_creation(&self, _: ReplicatorCreationReservation) -> Result<()> {
+                Ok(())
+            }
+            async fn native_credentials(&self) -> Result<Arc<str>> {
+                Ok(Arc::from("route-fixture"))
+            }
+
+            async fn native_local_endpoint(
+                &self,
+                address: String,
+            ) -> Result<(
+                crate::protocol::types::HistoryContext,
+                crate::host::native_transport::NativeEndpoint,
+            )> {
+                let (identity, process_session_id) = self.binding.lock().unwrap().clone().unwrap();
+                let resource = ResourceUid::new(identity.instance_id.as_str());
+                let generation = crate::protocol::types::PublicProtocolGeneration::new(51);
+                let initialization =
+                    crate::protocol::types::derive_history_initialization_id(&resource, generation);
+                let history = crate::protocol::types::derive_bootstrap_history(
+                    &resource,
+                    generation,
+                    &initialization,
+                );
+                let endpoint = crate::host::native_transport::NativeEndpoint {
+                    storage: ReplicaStorageIncarnationContext {
+                        replica: identity.clone(),
+                        storage: crate::protocol::types::ReplicaStorageIdentity::Persistent {
+                            pod_uid: crate::protocol::types::PodUid::new(
+                                identity.instance_id.as_str(),
+                            ),
+                            pvc_uid: crate::protocol::types::PvcUid::new(
+                                identity.instance_id.as_str(),
+                            ),
+                        },
+                        storage_generation: crate::protocol::types::StorageGeneration::new(
+                            identity.instance_id.as_str(),
+                        ),
+                    },
+                    identity,
+                    process_session_id,
+                    address,
+                };
+                Ok((history, endpoint))
+            }
+
             fn partition_information(&self) -> PartitionInformation {
                 PartitionInformation {
                     partition_id: PartitionId::new("routing-evidence"),
@@ -443,15 +489,6 @@ mod tests {
                 unreachable!()
             }
             async fn write_status(&self) -> Result<AccessStatus> {
-                unreachable!()
-            }
-            async fn publish_replacement_progress(&self, _: i64, _: i64, _: bool) -> Result<()> {
-                unreachable!()
-            }
-            async fn replacement_inbound_build_authority(
-                &self,
-                _: &OperationId,
-            ) -> Result<Option<PublicInboundBuildAuthority>> {
                 unreachable!()
             }
             async fn classify_replacement_inbound_build_authority(
@@ -466,38 +503,7 @@ mod tests {
             ) -> Result<()> {
                 unreachable!()
             }
-            async fn replacement_terminal_inbound_build_receipt(
-                &self,
-                _: &OperationId,
-            ) -> Result<Option<PublicInboundBuildReceipt>> {
-                unreachable!()
-            }
             async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
-                unreachable!()
-            }
-            async fn replacement_outbound_build_authority(
-                &self,
-                _: &OperationId,
-                _: &ConfigurationId,
-            ) -> Result<Option<PublicInboundBuildAuthority>> {
-                unreachable!()
-            }
-            async fn complete_replacement_inbound_build(
-                &self,
-                _: &PublicInboundBuildReceipt,
-            ) -> Result<()> {
-                unreachable!()
-            }
-            async fn replacement_storage_is_retired(
-                &self,
-                _: &ReplicaStorageIncarnationContext,
-            ) -> Result<bool> {
-                unreachable!()
-            }
-            async fn replacement_build_storage_is_current(
-                &self,
-                _: &PublicInboundBuildAuthority,
-            ) -> Result<bool> {
                 unreachable!()
             }
             fn release_provider_writer(&self) {}
@@ -532,52 +538,9 @@ mod tests {
             }
         }
 
-        #[async_trait]
-        impl DurableState for Fixture {
-            async fn get_replication_operations(
-                &self,
-                _: i64,
-                _: i64,
-            ) -> Result<RetainedOperationStream> {
-                unreachable!()
-            }
-            async fn apply_copy_chunk(&self, _: &OperationId, _: u64, _: CopyChunk) -> Result<()> {
-                unreachable!()
-            }
-            async fn verify_copy_chunk(
-                &self,
-                _: &OperationId,
-                _: u64,
-                _: &CopyChunk,
-            ) -> Result<bool> {
-                unreachable!()
-            }
-            async fn finish_copy(
-                &self,
-                _: &OperationId,
-                _: i64,
-                _: i64,
-            ) -> Result<DurableApplicationProgress> {
-                unreachable!()
-            }
-            async fn apply(&self, _: Operation) -> Result<DurableApplicationProgress> {
-                unreachable!()
-            }
-            async fn durable_progress(&self) -> Result<DurableApplicationProgress> {
-                unreachable!()
-            }
-            async fn verify_applied(&self, _: &Operation) -> Result<bool> {
-                unreachable!()
-            }
-            async fn commit(&self, _: i64) -> Result<DurableApplicationProgress> {
-                unreachable!()
-            }
-        }
-
         struct CustomFactory;
 
         struct ReplayedFactory {
-            storage: Arc<Fixture>,
             context: Mutex<Option<ReplicatorFactoryContext>>,
         }
 
@@ -590,7 +553,7 @@ mod tests {
                 settings: ReplicatorSettings,
             ) -> Result<ReplicatorInterfaces> {
                 let context = self.context.lock().unwrap().get_or_insert(context).clone();
-                DefaultReplicatorFactory::new(self.storage.clone())
+                DefaultReplicatorFactory::new()
                     .create_replicator(context, provider, settings)
                     .await
             }
@@ -617,6 +580,14 @@ mod tests {
             session: &ProcessSessionId,
             fixture: Arc<Fixture>,
         ) -> StatefulServicePartition {
+            *fixture.binding.lock().unwrap() = Some((
+                ReplicaIdentity {
+                    replica_id: ReplicaId::new(1),
+                    instance_id: ReplicaInstanceId::new(instance),
+                    agent_generation: AgentGeneration::new(instance),
+                },
+                session.clone(),
+            ));
             StatefulServicePartition::new(
                 RuntimeHostToken::new(),
                 fixture.clone(),
@@ -650,6 +621,7 @@ mod tests {
             .unwrap();
             let fixture = Arc::new(Fixture {
                 fail_registration: false.into(),
+                ..Default::default()
             });
             let partition = partition(&instance, &session, fixture.clone());
             let settings = Some(ReplicatorSettings {
@@ -662,8 +634,7 @@ mod tests {
                 .unwrap();
             let custom_id = custom.creation.identity.get().unwrap().to_public_id();
             assert!(!TestingTcpRoute::supports(&session, &custom_id));
-            let partition =
-                partition.with_factory(Arc::new(DefaultReplicatorFactory::new(fixture.clone())));
+            let partition = partition.with_factory(Arc::new(DefaultReplicatorFactory::new()));
             let built_in = partition
                 .create_replicator(Some(fixture.clone()), settings.clone())
                 .await
@@ -688,9 +659,10 @@ mod tests {
             let session = ProcessSessionId::new(instance.clone());
             let fixture = Arc::new(Fixture {
                 fail_registration: false.into(),
+                ..Default::default()
             });
             let partition = partition(&instance, &session, fixture.clone())
-                .with_factory(Arc::new(DefaultReplicatorFactory::new(fixture.clone())));
+                .with_factory(Arc::new(DefaultReplicatorFactory::new()));
             let built_in = partition
                 .create_replicator(
                     Some(fixture),
@@ -717,9 +689,9 @@ mod tests {
             .unwrap();
             let fixture = Arc::new(Fixture {
                 fail_registration: false.into(),
+                ..Default::default()
             });
             let factory = Arc::new(ReplayedFactory {
-                storage: fixture.clone(),
                 context: Mutex::new(None),
             });
             let settings = Some(ReplicatorSettings {
@@ -739,10 +711,8 @@ mod tests {
                 let replayed = partition(&instance, &changed_session, fixture.clone())
                     .with_factory(factory.clone())
                     .create_replicator(Some(fixture.clone()), settings.clone())
-                    .await
-                    .unwrap();
-                let id = replayed.creation.identity.get().unwrap().to_public_id();
-                assert!(!TestingTcpRoute::supports(&changed_session, &id));
+                    .await;
+                assert!(matches!(replayed, Err(RuntimeError::AuthorityNotAdmitted)));
                 assert!(!TestingTcpRoute::supports(&session, &first_id));
             }
         }

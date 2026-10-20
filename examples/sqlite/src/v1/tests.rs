@@ -1,6 +1,68 @@
 use super::*;
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
 use futures::FutureExt;
 use rusqlite::types::Value;
+
+fn application_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn visit(root: &Path, path: &Path, entries: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        let relative = path.strip_prefix(root).unwrap().to_owned();
+        let metadata = fs::symlink_metadata(path).unwrap();
+        if metadata.is_dir() {
+            entries.insert(relative, None);
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), entries);
+            }
+        } else {
+            assert!(metadata.is_file());
+            entries.insert(relative, Some(fs::read(path).unwrap()));
+        }
+    }
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+fn manifest(root: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(root.join("state-v2.json")).unwrap()).unwrap()
+}
+
+fn active_file(root: &Path, base: bool) -> PathBuf {
+    let generation = manifest(root)["state"]["generation"].as_u64().unwrap();
+    root.join(if base {
+        format!("base-{generation}.sqlite")
+    } else {
+        format!("history-{generation}.log")
+    })
+}
+
+fn assert_rejected_open_preserves_tree(root: &Path, expected: &str) {
+    let before = application_tree(root);
+    for _ in 0..2 {
+        let result = Committer::open(
+            root.into(),
+            Arc::new(|_| panic!("rejected Open must not check serving access")),
+            Arc::new(|_| panic!("rejected Open must not start a service worker")),
+        );
+        let error = result.err().expect("corrupt storage must reject Open");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected Open error: {error}"
+        );
+        let after = application_tree(root);
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>()
+        );
+        for (path, bytes) in &before {
+            assert!(after[path] == *bytes, "Open changed {path:?}");
+        }
+    }
+}
 
 fn open(path: &std::path::Path) -> (Committer, Arc<Mutex<Vec<String>>>) {
     let faults = Arc::new(Mutex::new(Vec::new()));
@@ -26,6 +88,67 @@ fn standalone(service: &Committer, start: i64) {
             })
         }))
         .unwrap();
+}
+
+#[tokio::test]
+async fn native_cancellation_before_service_abort_is_typed_and_not_a_new_fault() {
+    for cancelled in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let (service, faults) = open(root.path());
+        service
+            .promote(Arc::new(move |_| {
+                Ok(Assignment {
+                    lsn: 1,
+                    completion: Box::pin(async move {
+                        Err(if cancelled {
+                            io::Error::other(kuberic_runtime::RuntimeError::OperationCancelled)
+                        } else {
+                            io::Error::new(io::ErrorKind::Interrupted, "ordinary worker failure")
+                        })
+                    }),
+                })
+            }))
+            .unwrap();
+        let mut write = execute(&service, "CREATE TABLE t (v INTEGER)");
+        assert_eq!(is_abort(&write.wait().await.unwrap_err()), cancelled);
+        assert_eq!(is_abort(&write.wait().await.unwrap_err()), cancelled);
+        assert_eq!(service.core.store.progress().unwrap().committed_lsn, 0);
+        assert_eq!(faults.lock().unwrap().is_empty(), cancelled);
+        assert_eq!(is_abort(&service.close().await.unwrap_err()), cancelled);
+    }
+}
+
+#[tokio::test]
+async fn prior_fault_is_not_hidden_by_later_native_cancellation() {
+    let root = tempfile::tempdir().unwrap();
+    let (service, faults) = open(root.path());
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (started, released) = (entered.clone(), release.clone());
+    service
+        .promote(Arc::new(move |_| {
+            let (started, released) = (started.clone(), released.clone());
+            Ok(Assignment {
+                lsn: 1,
+                completion: Box::pin(async move {
+                    started.notify_one();
+                    released.notified().await;
+                    Err(io::Error::other(
+                        kuberic_runtime::RuntimeError::OperationCancelled,
+                    ))
+                }),
+            })
+        }))
+        .unwrap();
+    let mut write = execute(&service, "CREATE TABLE t (v INTEGER)");
+    entered.notified().await;
+    service.core.fault("prior application failure".into());
+    release.notify_one();
+    let error = write.wait().await.unwrap_err();
+    assert!(!is_abort(&error));
+    assert!(error.to_string().contains("prior application failure"));
+    assert!(!is_abort(&service.close().await.unwrap_err()));
+    assert_eq!(faults.lock().unwrap().len(), 1);
 }
 
 fn execute(service: &Committer, sql: &str) -> Write {
@@ -189,8 +312,8 @@ async fn cancelled_close_drains_and_abort_revokes_late_success() {
         if abort {
             service.abort();
             assert!(write.wait().await.is_err());
-            assert!(service.close().await.is_err());
-            assert_eq!(faults.lock().unwrap().len(), 1);
+            assert!(super::is_abort(&service.close().await.unwrap_err()));
+            assert!(faults.lock().unwrap().is_empty());
         } else {
             service.before_commit().release();
             write.wait().await.unwrap();
@@ -252,18 +375,171 @@ async fn corruption_is_not_hidden_by_new_instance_recovery() {
     create(&service).await;
     service.close().await.unwrap();
     drop(service);
-    let history = std::fs::read_dir(root.path())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| {
-            p.file_name()
+    fs::write(
+        active_file(root.path(), false),
+        b"corrupt acknowledged history",
+    )
+    .unwrap();
+    assert_rejected_open_preserves_tree(root.path(), "acknowledged history is missing");
+}
+
+#[tokio::test]
+async fn corrupt_supported_base_and_history_reject_open_without_mutation() {
+    for base in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = open(root.path());
+        standalone(&service, 1);
+        create(&service).await;
+        execute(&service, "INSERT INTO t VALUES (7)")
+            .wait()
+            .await
+            .unwrap();
+        service.close().await.unwrap();
+        drop(service);
+        if base {
+            let (service, _) = open(root.path());
+            service.close().await.unwrap();
+            drop(service);
+        }
+        let state = manifest(root.path());
+        assert_eq!(state["state"]["version"], 3);
+        assert_eq!(state["state"]["applied_lsn"], 2);
+        assert_eq!(state["state"]["committed_lsn"], 2);
+        let path = active_file(root.path(), base);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[if base { 0 } else { 8 }] ^= 1;
+        fs::write(path, bytes).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(active_file(root.path(), false))
+            .unwrap()
+            .write_all(b"unaccepted torn tail")
+            .unwrap();
+        fs::create_dir(root.path().join("retained")).unwrap();
+        fs::write(root.path().join("retained/diagnostic"), b"preserve me").unwrap();
+        assert_rejected_open_preserves_tree(
+            root.path(),
+            if base {
+                "durable base corruption"
+            } else {
+                "acknowledged history checksum mismatch"
+            },
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_supported_sqlite_images_reject_open_before_cleanup_or_base_publication() {
+    use crate::framelog::durable::{Record, rewrite_manifest_for_test};
+
+    for base in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = open(root.path());
+        standalone(&service, 1);
+        create(&service).await;
+        service.close().await.unwrap();
+        drop(service);
+        if base {
+            let (service, _) = open(root.path());
+            service.close().await.unwrap();
+            drop(service);
+            let path = active_file(root.path(), true);
+            let mut image = fs::read(&path).unwrap();
+            image[0] ^= 1;
+            fs::write(path, &image).unwrap();
+            rewrite_manifest_for_test(root.path(), |state| {
+                state["base_checksum"] = crc32fast::hash(&image).into();
+            });
+        } else {
+            let path = active_file(root.path(), false);
+            let history = fs::read(&path).unwrap();
+            let len = u32::from_le_bytes(history[..4].try_into().unwrap()) as usize;
+            let mut record: Record = serde_json::from_slice(&history[4..4 + len]).unwrap();
+            let mut frames: WalFrameSet = serde_json::from_slice(&record.data).unwrap();
+            frames
+                .frames
+                .iter_mut()
+                .find(|frame| frame.page_number == 1)
                 .unwrap()
-                .to_string_lossy()
-                .starts_with("history-")
-        })
-        .unwrap();
-    std::fs::write(history, b"corrupt acknowledged history").unwrap();
-    assert!(Committer::open(root.path().into(), Arc::new(|_| Ok(())), Arc::new(|_| {})).is_err());
+                .data[0] ^= 1;
+            frames.checksum = WalFrameSet::compute_checksum(&frames.frames);
+            record.data = serde_json::to_vec(&frames).unwrap();
+            let payload = serde_json::to_vec(&record).unwrap();
+            let mut history = Vec::new();
+            history.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            history.extend_from_slice(&payload);
+            history.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+            fs::write(path, &history).unwrap();
+            rewrite_manifest_for_test(root.path(), |state| {
+                state["history_len"] = history.len().into();
+            });
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .open(active_file(root.path(), false))
+            .unwrap()
+            .write_all(b"unaccepted torn tail")
+            .unwrap();
+        assert_rejected_open_preserves_tree(root.path(), "not a database");
+    }
+}
+
+#[tokio::test]
+async fn healthy_and_reconciliation_restarts_preserve_committed_sql_and_ignore_torn_tails() {
+    for reconcile in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = open(root.path());
+        standalone(&service, 1);
+        create(&service).await;
+        execute(&service, "INSERT INTO t VALUES (7)")
+            .wait()
+            .await
+            .unwrap();
+        if reconcile {
+            service
+                .core
+                .store
+                .require_reconciliation("publication outcome unresolved".into())
+                .unwrap();
+        }
+        service.close().await.unwrap();
+        drop(service);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(active_file(root.path(), false))
+            .unwrap()
+            .write_all(b"unaccepted torn tail")
+            .unwrap();
+        let (service, faults) = open(root.path());
+        assert_eq!(service.progress().unwrap(), 2);
+        assert_eq!(
+            service.core.store.recovery_state().unwrap(),
+            crate::RecoveryState::Healthy
+        );
+        standalone(&service, 3);
+        assert_eq!(
+            service.query("SELECT v FROM t").unwrap(),
+            vec![vec![Value::Integer(7)]]
+        );
+        assert_eq!(
+            execute(&service, "INSERT INTO t VALUES (8)")
+                .wait()
+                .await
+                .unwrap(),
+            3
+        );
+        service.close().await.unwrap();
+        assert!(faults.lock().unwrap().is_empty());
+        drop(service);
+        let (service, _) = open(root.path());
+        standalone(&service, 4);
+        assert_eq!(service.progress().unwrap(), 3);
+        assert_eq!(
+            service.query("SELECT v FROM t ORDER BY v").unwrap(),
+            vec![vec![Value::Integer(7)], vec![Value::Integer(8)]]
+        );
+        service.close().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -366,5 +642,5 @@ async fn dropped_service_cancels_retained_native_waits_and_never_publishes() {
     assert!(write.wait().await.is_err());
     assert!(write.wait().await.is_err());
     assert_eq!(core.store.progress().unwrap().committed_lsn, 0);
-    assert_eq!(faults.lock().unwrap().len(), 1);
+    assert!(faults.lock().unwrap().is_empty());
 }

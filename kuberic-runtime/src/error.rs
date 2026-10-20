@@ -7,6 +7,10 @@ pub enum RuntimeError {
     Closed,
     #[error("runtime is not open")]
     NotOpen,
+    #[error("native progress is not ready")]
+    ProgressNotReady,
+    #[error("operation {lsn} failed after native assignment; outcome unknown: {reason}")]
+    AdmittedOperationFailed { lsn: i64, reason: String },
     #[error("runtime is not primary")]
     NotPrimary,
     #[error("operation was cancelled")]

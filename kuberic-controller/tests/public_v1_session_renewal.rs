@@ -178,6 +178,8 @@ fn requirement(reason: ProcessSessionRenewalReason) -> ProcessSessionRenewalRequ
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity: PublicV1Identity::new(42),
         resource_uid: required.resource_uid.clone(),
         replica: replacement.identity.clone(),
@@ -192,8 +194,10 @@ fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1Agent
         storage_incarnation: replacement.storage_incarnation.clone(),
         progress: PublicProgress {
             role: PublicProgressRole::Recovery,
-            first: 9,
-            last: 9,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(9),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(9),
         },
         replication_address: None,
         service_location: None,

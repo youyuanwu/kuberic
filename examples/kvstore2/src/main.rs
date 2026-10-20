@@ -1,7 +1,3 @@
-mod persistence;
-mod service;
-mod state;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +17,9 @@ use kuberic_runtime::host::{
 use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
 use tokio::sync::watch;
 
-use crate::persistence::KvPersistence;
-use crate::service::KvService;
-use crate::state::CopyGate;
+use kvstore2::persistence::KvPersistence;
+use kvstore2::service::KvService;
+use kvstore2::state::CopyGate;
 
 #[derive(Debug, Parser)]
 struct Config {
@@ -257,7 +253,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    use crate::state::CopyGate;
+    use kvstore2::state::CopyGate;
 
     #[test]
     fn diagnostics_distinguish_terminal_retirement_from_closed_access() {
@@ -271,13 +267,14 @@ mod tests {
                 epoch: "0.2".into(),
                 previous_configuration: None,
                 current_configuration: None,
-                current_progress: 5,
+                current_progress:
+                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(5),
                 verified_replication_lsn: None,
-                committed_lsn: 5,
+                catch_up_capability:
+                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(5),
                 read_status: "NotPrimary".into(),
                 write_status: "NotPrimary".into(),
                 catch_up_boundary_lsn: None,
-                catch_up_complete: false,
                 scale_up_operation: None,
                 retired,
                 pending_operation: None,
@@ -348,7 +345,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert!(gate.is_held());
+        assert!(directory.path().join("copy-gate").is_file());
         gate.release().unwrap();
     }
 

@@ -63,7 +63,7 @@ struct Hosted<F: ApplicationFactory> {
     startup: Option<JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>>,
     running: Option<RunningReplica>,
     data_root: PathBuf,
-    _route: kuberic_runtime::replicator::stateless::TestingTcpRoute,
+    _route: kuberic_runtime::replicator::TestingTcpRoute,
     network: Network,
     uid: String,
 }
@@ -828,15 +828,15 @@ impl<F: ApplicationFactory> Harness<F> {
                 || report.storage_incarnation != session.storage_incarnation
                 || report.process_session_id != session.process_session_id
                 || report.replicator_creation_id != session.replicator_creation_id
-                || report
-                    .replicator_creation_id
-                    .as_str()
-                    .starts_with("pending-")
+                || !report.has_current_open_endpoint()
                 || report.role != session.role
-                || report.read_status != AccessStatus::Granted
+                || (session.role == ReplicaRole::Primary
+                    && report.read_status != AccessStatus::Granted)
+                || (session.role == ReplicaRole::ActiveSecondary
+                    && report.read_status != AccessStatus::NotPrimary)
                 || (report.write_status == AccessStatus::Granted)
                     != (session.role == ReplicaRole::Primary)
-                || report.progress.first != report.progress.last
+                || report.progress.current().is_none()
                 || !report.completed_operations.iter().any(|completion| {
                     completion.process_session_id == session.process_session_id
                         && completion.storage_incarnation == session.storage_incarnation
@@ -1121,7 +1121,7 @@ async fn supervise<F: ApplicationFactory>(
         let (startup_shutdown, receiver) = watch::channel(false);
         let routed_uid = uid.clone();
         let routed_network = network.clone();
-        let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register_with_kind(
+        let route = kuberic_runtime::replicator::TestingTcpRoute::register_with_kind(
             uid.clone(),
             move |kind, destination, endpoint| {
                 let network = routed_network.clone();
@@ -2206,7 +2206,7 @@ impl<F: ApplicationFactory> TestCluster<F> {
         }
         for reference in replicas {
             self.validate(reference).await?;
-            if !kuberic_runtime::replicator::stateless::TestingTcpRoute::supports(
+            if !kuberic_runtime::replicator::TestingTcpRoute::supports(
                 &reference.session,
                 &reference.creation,
             ) {
@@ -2249,7 +2249,7 @@ impl<F: ApplicationFactory> TestCluster<F> {
                     source,
                 )
             })?;
-        if !kuberic_runtime::replicator::stateless::TestingTcpRoute::supports(
+        if !kuberic_runtime::replicator::TestingTcpRoute::supports(
             &report.process_session_id,
             &report.replicator_creation_id,
         ) {
@@ -2535,7 +2535,9 @@ mod readiness_lifecycle_tests {
         )
         .await?;
         let result = async {
-            core.ready().await?;
+            core.ready()
+                .await
+                .context("initial readiness convergence")?;
             let predecessor = core.report(2).await?;
             let pod = core
                 .api
@@ -2569,7 +2571,9 @@ mod readiness_lifecycle_tests {
                 }
                 core.step().await?;
             };
-            core.ready().await?;
+            core.ready()
+                .await
+                .context("replacement readiness convergence")?;
             let replacement = core.report(2).await?;
             core.stop(replacement.replica.instance_id.as_str()).await?;
             core.supervisor
@@ -2588,7 +2592,9 @@ mod readiness_lifecycle_tests {
                 }
                 core.step().await?;
             };
-            core.ready().await?;
+            core.ready()
+                .await
+                .context("renewed-session readiness convergence")?;
             let status = core.set().await?.status.context("status missing")?;
             let mut reports = Vec::new();
             for id in 1..=3 {

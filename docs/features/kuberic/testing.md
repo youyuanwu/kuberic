@@ -3,6 +3,18 @@
 Kuberic validation is split into exact nextest tiers, workspace checks,
 provider-backed smoke tests, and explicitly owned Kubernetes scenarios.
 
+The selected [classic V1 composition](classic-v1-runtime.md) has real public
+host/control/listener journeys in `kuberic-runtime/tests/classic_v1_production.rs`,
+an independently compiled helper-free provider and connected controller/service
+journeys. Component-slice descriptions below retain their historical delivery
+scope. Their former unselected status is not today's factory selection.
+Run the public production target with:
+
+```bash
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test classic_v1_production
+```
+
 The [faithful SF V1 Rust async/tonic port plan](sf-v1-semantic-alignment-plan.md)
 adds native-source/test-vector mapping and a future behavior/capability matrix:
 persisted/volatile services, service-owned primary commit, receiver lifetimes,

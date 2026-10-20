@@ -27,17 +27,12 @@ use super::sender::{
 /// Fixed logical identity supplied by the future demultiplexing owner. Merely
 /// storing it does not validate inbound transport identity or role admission.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 session identity")
-)]
 pub(super) struct SessionIdentity {
     pub(super) primary_endpoint: String,
     pub(super) remote_endpoint: String,
     pub(super) remote_incarnation: i64,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 send intent"))]
 pub(super) enum SendKind {
     StartCopy {
         replication_start: Lsn,
@@ -56,7 +51,6 @@ pub(super) enum SendKind {
     },
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 send intent"))]
 pub(super) struct SendIntent {
     pub(super) identity: SessionIdentity,
     pub(super) kind: SendKind,
@@ -78,7 +72,6 @@ struct AckSnapshot {
     process_copy: bool,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK ingress"))]
 pub(super) struct AckUpdate {
     pub(super) replication_received: Lsn,
     pub(super) replication_applied: Lsn,
@@ -108,12 +101,10 @@ struct State {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected bounded V1 session"))]
 pub(super) struct ReplicationSession {
     state: Arc<Mutex<State>>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 session API"))]
 impl ReplicationSession {
     pub(super) fn new(
         identity: SessionIdentity,
@@ -182,6 +173,7 @@ impl ReplicationSession {
         state.sending_epoch = epoch;
     }
 
+    #[cfg(test)]
     pub(super) fn install_start_copy_sender(&self, sender: ReliableOperationSender) {
         let mut state = self.state.lock().unwrap();
         assert!(state.start_copy.is_none());
@@ -306,6 +298,7 @@ impl ReplicationSession {
 
     /// The copy owner supplies its known finish target; no target is selected
     /// or build completed by this view.
+    #[cfg(test)]
     pub(super) fn idle_progress(&self, finish_copy_target: Option<Lsn>) -> Lsn {
         self.progress(0).idle_progress(finish_copy_target)
     }
@@ -314,6 +307,7 @@ impl ReplicationSession {
         self.state.lock().unwrap().sender.averages()
     }
 
+    #[cfg(test)]
     pub(super) fn reset_average_statistics(&self, now: Duration) {
         self.state
             .lock()
@@ -328,6 +322,7 @@ impl ReplicationSession {
         state.sender.reset_average_statistics(now);
     }
 
+    #[cfg(test)]
     pub(super) fn is_promoted(&self) -> bool {
         self.state.lock().unwrap().promoted
     }
@@ -488,14 +483,12 @@ impl FaultSend {
 }
 
 /// Retains the session and its callback throughout outside-guard dispatch.
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected rooted V1 sends"))]
 pub(super) struct SessionSendBatch {
     session: ReplicationSession,
     batch: SendBatch,
     start_copy: bool,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected rooted V1 sends"))]
 impl SessionSendBatch {
     pub(super) fn dispatch(self) {
         let session = self.session;
@@ -538,16 +531,8 @@ impl SessionSendBatch {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected primary notification")
-)]
 pub(super) struct ProgressNotification(ProgressCallback);
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected primary notification")
-)]
 impl ProgressNotification {
     pub(super) fn dispatch(self) {
         (self.0)();
@@ -556,7 +541,6 @@ impl ProgressNotification {
 
 /// These are ordered HANDOFFS. Copy effects are unresolved until an actual
 /// future owner consumes them. They are not copy/quorum completion results.
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK handoffs"))]
 pub(super) enum AckAction {
     ReplicationSends(SessionSendBatch),
     CopyReplicationGate {
@@ -581,7 +565,6 @@ enum Stage {
 /// Move-only rooted processor. Must be continued through all handoffs, including
 /// after close. Dropping it is not a cancellation/success protocol: the session
 /// stays processing rather than silently declaring unfinished work complete.
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK processor"))]
 pub(super) struct AckProcessor {
     session: ReplicationSession,
     snapshot: AckSnapshot,
@@ -591,19 +574,11 @@ pub(super) struct AckProcessor {
 }
 
 #[must_use = "deliver the handoff outside guards and continue the rooted processor"]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 ACK continuation")
-)]
 pub(super) struct AckHandoff {
     action: AckAction,
     continuation: AckProcessor,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 ACK continuation")
-)]
 impl AckHandoff {
     /// Delivery acknowledgement only, not successful future-owner execution.
     /// Async integration can own the handoff across an await; no guard is held.
@@ -613,7 +588,6 @@ impl AckHandoff {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK processor"))]
 impl AckProcessor {
     pub(super) fn next(mut self, now: Duration) -> Option<AckHandoff> {
         loop {

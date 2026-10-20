@@ -497,17 +497,17 @@ async fn stopped_primary_failover_preserves_acknowledged_data() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepted_recovery_does_not_block_stopped_primary_failover() -> Result<()> {
+async fn retained_commit_observer_does_not_block_stopped_primary_failover() -> Result<()> {
     recovery_before_lifecycle(RecoveryLifecycle::PrimaryFailover).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepted_recovery_does_not_reuse_a_restarted_peer_session() -> Result<()> {
+async fn retained_commit_observer_does_not_reuse_a_restarted_peer_session() -> Result<()> {
     recovery_before_lifecycle(RecoveryLifecycle::PeerRestart).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn accepted_recovery_does_not_retire_the_primary_after_peer_deletion() -> Result<()> {
+async fn retained_commit_observer_does_not_retire_the_primary_after_peer_deletion() -> Result<()> {
     recovery_before_lifecycle(RecoveryLifecycle::PeerReplacement).await
 }
 
@@ -526,13 +526,17 @@ async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
         .await?;
     let mut writes = tokio::task::JoinSet::new();
     let mut phase = "initial topology";
-    let result: Result<()> = async {
+    let result: Result<()> = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         let topology = cluster.settle().await?;
-        phase = "applied write";
+        phase = "acknowledged prefix and pending service commitment";
         let primary = topology.primary().clone();
         let secondary = topology.secondaries().next().unwrap().clone();
         let writer = cluster.service(&primary).await?;
-        let mut gate = writer.persistence().pause_next_apply();
+        let baseline = cluster
+            .probe(writer.replicate_put("retained-prefix".into(), "acknowledged".into()))
+            .await?;
+        let observer = writer.clone();
+        let mut gate = writer.pause_next_commit()?;
         writes.spawn(async move {
             writer
                 .replicate_put("accepted-recovery".into(), "acknowledged".into())
@@ -544,35 +548,37 @@ async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
                 Ok::<_, anyhow::Error>(())
             })
             .await?;
-        let pause = cluster
-            .pause_at(Barrier::intent(PublicV1CallKind::CatchUp))
-            .await?;
-        phase = "write receipt";
-        let command = pause
-            .evidence()
-            .operation()
-            .command()
-            .map_err(anyhow::Error::msg)?;
-        ensure!(matches!(
-            command.intent.program,
-            Some(PublicOperationProgram::CatchUp {
-                mode: kuberic_runtime::protocol::public_operations::PublicCatchUpMode::All,
-                ..
-            })
-        ));
-        gate.release(false);
-        let lsn = cluster
-            .probe(async {
-                let result = writes.join_next().await.context("writer missing")?;
-                Ok::<_, anyhow::Error>(result??)
-            })
-            .await?;
-        ensure!(lsn == 1);
-        cluster.resume(pause).await?;
+        ensure!(observer.get("accepted-recovery").await?.is_none());
+        ensure!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), writes.join_next())
+                .await
+                .is_err(),
+            "native completion cannot prematurely acknowledge local commitment"
+        );
+        let failed_primary = matches!(lifecycle, RecoveryLifecycle::PrimaryFailover);
         let settled = match lifecycle {
             RecoveryLifecycle::PeerRestart => {
                 phase = "peer restart";
-                let fresh = cluster.restart(&secondary).await?;
+                let fresh = {
+                    let restart = cluster.restart(&secondary);
+                    tokio::pin!(restart);
+                    if let Ok(result) =
+                        tokio::time::timeout(std::time::Duration::from_millis(75), &mut restart)
+                            .await
+                    {
+                        result?;
+                        bail!("cold restart bypassed the pending service-owned committed prefix");
+                    }
+                    gate.release();
+                    let lsn = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        writes.join_next(),
+                    )
+                    .await?
+                    .context("writer missing")???;
+                    ensure!(lsn > baseline);
+                    restart.await?
+                };
                 ensure!(fresh.process_session_id() != secondary.process_session_id());
                 ensure!(
                     fresh.identity() == secondary.identity()
@@ -584,6 +590,19 @@ async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
             RecoveryLifecycle::PrimaryFailover => {
                 phase = "primary stop/failover";
                 cluster.stop(&primary).await?;
+                gate.release();
+                ensure!(
+                    cluster
+                        .probe(async {
+                            Ok::<_, anyhow::Error>(
+                                writes.join_next().await.context("writer missing")??,
+                            )
+                        })
+                        .await?
+                        .is_err(),
+                    "Abort must fail the retained local commit observer"
+                );
+                ensure!(observer.get("accepted-recovery").await.is_err());
                 let topology = cluster.settle_members(2).await?;
                 ensure!(topology.primary().identity() != primary.identity());
                 topology
@@ -591,6 +610,17 @@ async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
             RecoveryLifecycle::PeerReplacement => {
                 phase = "peer deletion during accepted recovery";
                 cluster.delete_replica(&secondary).await?;
+                gate.release();
+                ensure!(
+                    cluster
+                        .probe(async {
+                            Ok::<_, anyhow::Error>(
+                                writes.join_next().await.context("writer missing")???,
+                            )
+                        })
+                        .await?
+                        > baseline
+                );
                 loop {
                     let observation = cluster.observe().await?;
                     if !observation
@@ -613,13 +643,28 @@ async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
         };
         for reference in settled.members() {
             let service = cluster.service(reference).await?;
-            ensure!(
-                cluster
-                    .probe(service.get("accepted-recovery"))
-                    .await?
-                    .as_deref()
-                    == Some("acknowledged")
-            );
+            if reference == settled.primary() {
+                ensure!(
+                    cluster
+                        .probe(service.get("retained-prefix"))
+                        .await?
+                        .as_deref()
+                        == Some("acknowledged")
+                );
+                if !failed_primary {
+                    ensure!(
+                        cluster
+                            .probe(service.get("accepted-recovery"))
+                            .await?
+                            .as_deref()
+                            == Some("acknowledged")
+                    );
+                }
+            } else {
+                ensure!(
+                    service.persistence().get("retained-prefix").as_deref() == Some("acknowledged")
+                );
+            }
         }
         ensure!(
             cluster
@@ -633,9 +678,24 @@ async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
                     && status.public_v1_session_renewal.is_none())
         );
         Ok(())
-    }
-    .await;
+    })
+    .await
+    .context("bounded retained service commit/lifecycle journey")
+    .and_then(|outcome| outcome);
     writes.shutdown().await;
+    if result.is_err()
+        && let Ok(observation) = cluster.observe().await
+    {
+        eprintln!(
+            "retained observer pre-cleanup snapshot: {}",
+            serde_json::json!({
+                "set": observation.set(),
+                "reconcileErrors": observation.reconcile_errors(),
+                "agents": observation.replicas()
+                    .map(|reference| observation.report(reference)).collect::<Vec<_>>(),
+            })
+        );
+    }
     if let Err(error) = cluster.finish(result).await {
         eprintln!("accepted recovery failure phase: {phase}");
         if let Some(diagnostics) = error.diagnostics() {
@@ -767,6 +827,9 @@ async fn reject_write(service: &kvstore2::service::KvService, key: &str) -> Resu
         service.replicate_put(key.into(), "ambiguous-attempt".into()),
     )
     .await;
+    if key == "recreation-stale-isolated" {
+        eprintln!("recreation isolated predecessor write observer: {result:?}");
+    }
     ensure!(
         !matches!(result, Ok(Ok(_))),
         "unsafe write acknowledged: {key}"
@@ -775,93 +838,125 @@ async fn reject_write(service: &kvstore2::service::KvService, key: &str) -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_primary_isolation_fails_over_and_rejoins_without_recreation() -> Result<()> {
+async fn live_primary_isolation_fences_retained_observer_before_safe_rejoin() -> Result<()> {
     live_primary_isolation(true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn renewed_primary_returns_without_an_ambiguous_write_suffix() -> Result<()> {
+async fn renewed_primary_rejoins_with_service_owned_committed_prefix() -> Result<()> {
     live_primary_isolation(false).await
 }
 
 async fn live_primary_isolation(attempt_isolated_writes: bool) -> Result<()> {
     let mut harness = Harness::new().await?;
-    let result = async {
+    let mut writes = tokio::task::JoinSet::new();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         harness.write("live-before", "acknowledged").await?;
         harness.assert_values("live-before", "acknowledged").await?;
         let before_restart = harness.report(2).await?;
+        eprintln!("native isolation: retained secondary restart");
         harness.stop(2, true).await?;
         harness.ready().await?;
+        eprintln!("native isolation: physical primary partition");
         ensure!(
             harness.report(2).await?.process_session_id != before_restart.process_session_id,
             "secondary did not renew its session before failover"
         );
         let primary = harness.ready().await?;
         let old = harness.report(primary).await?;
-        ensure!(
-            old.progress.first == old.progress.last,
-            "failover must start with a clean committed tail"
-        );
         let uid = old.replica.instance_id.to_string();
         let service = harness.service(primary).await?;
+        use kuberic_runtime::engine::DurableState;
+        let committed = service.persistence().durable_progress().await?;
+        ensure!(
+            committed.applied_lsn == committed.committed_lsn
+                && old.progress.current() == Some(committed.committed_lsn)
+                && service.get("live-before").await?.as_deref() == Some("acknowledged"),
+            "failover must start with a service-owned committed view and native current observation"
+        );
         let isolation = harness.isolate_uids(std::slice::from_ref(&uid)).await?;
         let promoted = harness.ready_survivors(2, &isolation).await?;
+        eprintln!("native isolation: survivor promotion completed");
         ensure!(promoted != primary);
+        let before_return = harness.report(promoted).await?.completed_operations;
         harness
             .service(promoted)
             .await?
             .replicate_put("live-after".into(), "new-primary".into())
             .await?;
         if attempt_isolated_writes {
-            reject_write(&service, "live-stale-isolated").await?;
+            let writer = service.clone();
+            writes.spawn(async move {
+                writer
+                    .replicate_put("live-stale-isolated".into(), "ambiguous-attempt".into())
+                    .await
+            });
+            if let Ok(result) =
+                tokio::time::timeout(std::time::Duration::from_millis(150), writes.join_next())
+                    .await
+            {
+                ensure!(
+                    result.context("isolated observer missing")??.is_err(),
+                    "isolated old primary granted client success"
+                );
+            }
         }
         ensure!(harness.live_uids().await.contains(&uid));
         harness.heal(isolation).await?;
-        let returned = harness.report_uid(&uid).await?;
-        ensure!(
-            returned.process_session_id == old.process_session_id
-                && returned.replicator_creation_id == old.replicator_creation_id
-                && returned.replica == old.replica
-        );
-        ensure!(std::sync::Arc::ptr_eq(
-            &service,
-            &harness.service_uid(&uid).await?
-        ));
-        if attempt_isolated_writes {
-            reject_write(&service, "live-stale-reconnected").await?;
-        }
+        eprintln!("native isolation: primary healing and retirement");
         harness.ready().await?;
-        let settled = harness.report_uid(&uid).await?;
-        ensure!(
-            settled.process_session_id == old.process_session_id
-                && settled.replicator_creation_id == old.replicator_creation_id
-        );
+        let settled = harness.report(primary).await?;
         ensure!(settled.role == kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary);
-        if !attempt_isolated_writes {
-            let source = harness.report(promoted).await?;
-            ensure!(
-                !source
-                    .completed_operations
+        let same_owner = settled.process_session_id == old.process_session_id
+            && settled.replicator_creation_id == old.replicator_creation_id
+            && settled.replica == old.replica;
+        let source = harness.report(promoted).await?;
+        let rebuilt = source.completed_operations.iter().any(|completion| {
+            completion.call_kind == PublicV1CallKind::Build
+                && !before_return
                     .iter()
-                    .any(|completion| { completion.call_kind == PublicV1CallKind::Build }),
-                "clean committed-tail rejoin must use retained deltas, not snapshot Build"
-            );
+                    .any(|previous| previous.operation_id == completion.operation_id)
+        });
+        if rebuilt {
             ensure!(
-                source.completed_operations.iter().any(|completion| {
-                    completion.call_kind == PublicV1CallKind::CatchUp
-                        && completion.result == PublicV1OperationResult::Succeeded
-                }),
-                "clean return did not complete real catch-up"
+                !same_owner,
+                "native successor copy must replace the process, never reset an old receiver"
+            );
+        } else if same_owner {
+            ensure!(
+                std::sync::Arc::ptr_eq(&service, &harness.service(primary).await?),
+                "retained native owner changed service identity"
             );
         }
-        reject_write(&service, "live-stale-settled").await?;
+        while !writes.is_empty() {
+            ensure!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), writes.join_next())
+                    .await?
+                    .context("retained isolated observer missing")??
+                    .is_err(),
+                "old owner late-granted an isolated admitted write"
+            );
+        }
+        ensure!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                service.replicate_put("live-stale-settled".into(), "forbidden".into())
+            )
+            .await?
+            .is_err(),
+            "retired/secondary old owner admitted a new write"
+        );
         harness.assert_values("live-before", "acknowledged").await?;
         harness.assert_values("live-after", "new-primary").await?;
         harness.write("live-recovered", "quorum").await?;
         harness.assert_values("live-recovered", "quorum").await
-    }
-    .await;
-    harness.finish(result).await
+    })
+    .await
+    .context("bounded native primary isolation and rejoin")
+    .and_then(|outcome| outcome);
+    let result = harness.finish(result).await;
+    writes.shutdown().await;
+    result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -913,15 +1008,22 @@ async fn quorum_loss_rejects_acknowledgements_and_recovers_ambiguous_suffix() ->
         harness.write("quorum-after", "recovered").await?;
         harness.assert_values("quorum-after", "recovered").await?;
         for key in ["quorum-ambiguous", "quorum-lone"] {
-            let value = harness.service(1).await?.get(key).await?;
+            let value = harness.service(primary).await?.get(key).await?;
             ensure!(
                 value
                     .as_deref()
                     .is_none_or(|value| value == "ambiguous-attempt")
             );
-            for id in 2..=3 {
+            for id in 1..=3 {
+                use kuberic_runtime::engine::DurableState;
+                let service = harness.service(id).await?;
+                let committed = service
+                    .persistence()
+                    .durable_progress()
+                    .await?
+                    .committed_lsn;
                 ensure!(
-                    harness.service(id).await?.get(key).await? == value,
+                    service.persistence().snapshot_at(committed)?.get(key) == value.as_ref(),
                     "ambiguous write diverged"
                 );
             }
@@ -933,16 +1035,17 @@ async fn quorum_loss_rejects_acknowledgements_and_recovers_ambiguous_suffix() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sf01_primary_visible_apply_is_fenced_during_physical_quorum_loss() -> Result<()> {
-    use kuberic_runtime::RuntimeError;
+async fn sf01_primary_local_commit_isolation_and_abort_never_late_grants_success() -> Result<()> {
     use kuberic_runtime::engine::DurableState;
     use kuberic_runtime::protocol::types::AccessStatus;
     use std::time::Duration;
 
     let mut harness = Harness::new().await?;
-    let result = async {
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        eprintln!("SF-01: bootstrap and acknowledged prefix");
         harness.write("sf01-before", "committed").await?;
         harness.assert_values("sf01-before", "committed").await?;
+        eprintln!("SF-01: service-local commit barrier");
         let primary = harness.ready().await?;
         let service = harness.service(primary).await?;
         let before = harness.report(primary).await?;
@@ -953,8 +1056,7 @@ async fn sf01_primary_visible_apply_is_fenced_during_physical_quorum_loss() -> R
                 isolated.push(uid);
             }
         }
-        let isolation = harness.isolate_uids(&isolated).await?;
-        let mut gate = service.persistence().pause_next_apply();
+        let mut gate = service.pause_next_commit()?;
         let mut writes = tokio::task::JoinSet::new();
         let writer = service.clone();
         writes.spawn(async move {
@@ -963,39 +1065,75 @@ async fn sf01_primary_visible_apply_is_fenced_during_physical_quorum_loss() -> R
                 .await
         });
         tokio::time::timeout(Duration::from_secs(10), gate.entered()).await?;
-        ensure!(service.persistence().get("sf01-visible").as_deref() == Some("uncommitted"));
+        ensure!(!writes.is_empty());
+        ensure!(
+            tokio::time::timeout(Duration::from_millis(50), writes.join_next())
+                .await
+                .is_err(),
+            "client succeeded before service-local commitment"
+        );
         let raw = service.persistence().durable_progress().await?;
         ensure!(raw.applied_lsn == 2 && raw.committed_lsn == 1);
-        ensure!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), service.get("sf01-visible")).await?,
-            Err(RuntimeError::ReadClosed(AccessStatus::NotPrimary))
-        ));
+        ensure!(
+            tokio::time::timeout(Duration::from_secs(2), service.get("sf01-visible"))
+                .await??
+                .is_none(),
+            "speculative data leaked through the committed service view"
+        );
         let during = harness.report(primary).await?;
         ensure!(
             during.process_session_id == before.process_session_id
                 && during.replicator_creation_id == before.replicator_creation_id
-                && during.progress.last == 1
-                && during.progress.first == 1,
-            "fence must not fabricate progress or replace the host"
+                && during.progress.current() == Some(2)
+                && during.read_status == AccessStatus::Granted,
+            "native completion/access must remain distinct from service-local commitment"
         );
-        gate.release(false);
+        eprintln!("SF-01: physical isolation and explicit owner stop");
+        let isolation = harness.isolate_uids(&isolated).await?;
+        harness.stop(primary, false).await?;
+        gate.release();
         ensure!(
             tokio::time::timeout(Duration::from_secs(10), writes.join_next())
                 .await?
                 .context("writer missing")??
                 .is_err()
         );
-        ensure!(matches!(
-            service.get("sf01-visible").await,
-            Err(RuntimeError::ReadClosed(AccessStatus::NotPrimary))
-        ));
+        ensure!(service.get("sf01-visible").await.is_err());
+        ensure!(
+            service
+                .persistence()
+                .durable_progress()
+                .await?
+                .committed_lsn
+                == 1
+        );
+        ensure!(
+            service
+                .replicate_put("sf01-late".into(), "forbidden".into())
+                .await
+                .is_err()
+        );
+        eprintln!("SF-01: heal and recover acknowledged prefix");
         harness.heal(isolation).await?;
-        ensure!(harness.ready().await? == primary);
-        harness.assert_values("sf01-visible", "uncommitted").await?;
-        harness.write("sf01-after", "committed").await?;
-        harness.assert_values("sf01-after", "committed").await
-    }
-    .await;
+        let topology = harness.cluster.settle_members(2).await?;
+        let promoted = topology.primary().replica_id();
+        harness.refresh().await?;
+        ensure!(promoted != primary);
+        harness
+            .assert_values_on_members("sf01-before", "committed", 2)
+            .await?;
+        harness
+            .service(promoted)
+            .await?
+            .replicate_put("sf01-after".into(), "committed".into())
+            .await?;
+        harness
+            .assert_values_on_members("sf01-after", "committed", 2)
+            .await
+    })
+    .await
+    .context("bounded SF-01 local commitment/Abort journey")
+    .and_then(|outcome| outcome);
     harness.finish(result).await
 }
 
@@ -1448,10 +1586,10 @@ async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Re
         .await;
         tokio::time::timeout(std::time::Duration::from_secs(60), harness.finish(result)).await??;
         for uid in uids {
-            let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
-                uid,
-                |_, endpoint| Box::pin(async move { Ok(endpoint) }),
-            )?;
+            let route =
+                kuberic_runtime::replicator::TestingTcpRoute::register(uid, |_, endpoint| {
+                    Box::pin(async move { Ok(endpoint) })
+                })?;
             drop(route);
         }
         for address in addresses {
@@ -1694,15 +1832,68 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
             "recovery advanced application LSN"
         );
         if failover {
+            let before_probe = predecessor_service.persistence().durable_progress().await?;
             reject_write(&predecessor_service, "recreation-stale-isolated").await?;
+            let after_probe = predecessor_service.persistence().durable_progress().await?;
+            let prepared = predecessor_service.persistence().snapshot_at(after_probe.applied_lsn)?;
+            eprintln!(
+                "recreation predecessor probe: uid={predecessor_uid} session={} before={before_probe:?} after={after_probe:?} prepared={:?} committed_view={:?}",
+                predecessor.process_session_id,
+                prepared.get("recreation-stale-isolated"),
+                predecessor_service.get("recreation-stale-isolated").await,
+            );
             harness.heal(isolation.unwrap()).await?;
             harness.ready().await?;
-            let returned = harness.report_uid(&predecessor_uid).await?;
+            let returned = harness.report(primary).await?;
             ensure!(
-                returned.process_session_id == predecessor.process_session_id
-                    && returned.replicator_creation_id == predecessor.replicator_creation_id
+                returned.role == kuberic_runtime::protocol::types::ReplicaRole::ActiveSecondary,
+                "the old logical member did not safely rejoin as a secondary"
             );
-            reject_write(&predecessor_service, "recreation-stale-returned").await?;
+            let current_service = harness.service(primary).await?;
+            if returned.process_session_id == predecessor.process_session_id {
+                ensure!(
+                    returned.replica == predecessor.replica
+                        && returned.replicator_creation_id == predecessor.replicator_creation_id
+                        && returned.storage_incarnation == predecessor.storage_incarnation
+                        && std::sync::Arc::ptr_eq(&predecessor_service, &current_service),
+                    "retained predecessor owner changed its exact identity"
+                );
+            } else {
+                ensure!(
+                    returned.replicator_creation_id != predecessor.replicator_creation_id
+                        && !std::sync::Arc::ptr_eq(&predecessor_service, &current_service),
+                    "native cold-copy rejoin reused the retired owner"
+                );
+                ensure!(
+                    matches!(
+                        predecessor_service.get("recreation-before").await,
+                        Err(kuberic_runtime::RuntimeError::NotOpen)
+                    ),
+                    "retired predecessor retained client read access"
+                );
+                if returned.replica != predecessor.replica {
+                    ensure!(
+                        !harness.live_uids().await.contains(&predecessor_uid),
+                        "retired predecessor Pod remained live"
+                    );
+                }
+                if returned.storage_incarnation != predecessor.storage_incarnation {
+                    ensure!(
+                        !predecessor_root.exists(),
+                        "retired predecessor storage retained"
+                    );
+                }
+            }
+            ensure!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    predecessor_service
+                        .replicate_put("recreation-stale-returned".into(), "forbidden".into(),),
+                )
+                .await?
+                .is_err(),
+                "retained/retired old owner admitted a write after rejoin"
+            );
         }
         harness
             .assert_values("recreation-before", "acknowledged")

@@ -106,6 +106,33 @@ impl Projection {
         self.service_role == self.target && self.replicator_role == self.target
     }
 
+    /// Production steady-state projection. Membership/readiness is host input,
+    /// separate from native queue progress and service-local commitment.
+    pub(crate) fn activated_access(
+        role: ReplicaRole,
+        minimum: usize,
+        remotes: Vec<RemoteReplica>,
+    ) -> Result<(AccessStatus, AccessStatus), HostError> {
+        Projection {
+            lifecycle: Lifecycle::Opened,
+            target: role,
+            service_role: role,
+            replicator_role: role,
+            replicator_open: true,
+            reconfiguring: false,
+            primary_change: false,
+            stage: ConfigurationStage::Activated,
+            caught_up: true,
+            minimum,
+            remotes,
+            authority_fenced: false,
+            faulted: false,
+            retired: false,
+            close_outcome: None,
+        }
+        .status()
+    }
+
     fn quorum(&self, previous: bool) -> bool {
         if !self.replicator_open {
             return false;
@@ -197,6 +224,14 @@ impl Projection {
             _ => Err(HostError::Input("unknown native access state")),
         }
     }
+}
+
+pub(crate) fn activated_access(
+    role: ReplicaRole,
+    minimum: usize,
+    remotes: Vec<RemoteReplica>,
+) -> Result<(AccessStatus, AccessStatus), HostError> {
+    Projection::activated_access(role, minimum, remotes)
 }
 
 impl PartitionAccess {

@@ -40,62 +40,6 @@ pub enum WireError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicationEnvelope {
-    pub sender: ReplicaIdentity,
-    pub receiver: ReplicaIdentity,
-    pub epoch: Epoch,
-    pub previous_configuration_id: Option<ConfigurationId>,
-    pub current_configuration_id: ConfigurationId,
-    pub lsn: i64,
-    pub committed_lsn: i64,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicationAcknowledgement {
-    pub sender: ReplicaIdentity,
-    pub receiver: ReplicaIdentity,
-    pub epoch: Epoch,
-    pub previous_configuration_id: Option<ConfigurationId>,
-    pub current_configuration_id: ConfigurationId,
-    pub received_lsn: i64,
-    pub applied_lsn: i64,
-    pub committed_lsn: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyEnvelope {
-    pub build_id: OperationId,
-    pub sender: ReplicaIdentity,
-    pub receiver: ReplicaIdentity,
-    pub epoch: Epoch,
-    pub current_configuration_id: ConfigurationId,
-    pub sequence: u64,
-    pub lsn: i64,
-    pub committed_lsn: i64,
-    pub replication_boundary_lsn: i64,
-    pub catch_up_boundary_lsn: Option<i64>,
-    pub final_item: bool,
-    pub snapshot_chunk: bool,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyAcknowledgement {
-    pub build_id: OperationId,
-    pub sender: ReplicaIdentity,
-    pub receiver: ReplicaIdentity,
-    pub epoch: Epoch,
-    pub current_configuration_id: ConfigurationId,
-    pub sequence: u64,
-    pub durable_lsn: i64,
-    pub replication_boundary_lsn: i64,
-    pub catch_up_boundary_lsn: Option<i64>,
-    pub final_item: bool,
-    pub snapshot_chunk: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecuteEnvelope {
     pub resource_uid: ResourceUid,
     pub target: ReplicaIdentity,
@@ -363,9 +307,28 @@ pub fn normalize_public_v1_agent_status_report(
         storage_incarnation,
         progress: PublicProgress {
             role: progress_role,
-            first: public.first_progress,
-            last: public.last_progress,
+            current_progress: progress_query_from_proto(public.current_progress)?,
+            catch_up_capability: progress_query_from_proto(public.catch_up_capability)?,
         },
+        configuration: public
+            .configuration_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    WireError::InvalidAuthority(format!("invalid installed configuration: {error}"))
+                })
+            })
+            .transpose()?,
+        active_operations: public
+            .active_operations_json
+            .into_iter()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    WireError::InvalidAuthority(format!(
+                        "invalid active control observation: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         replication_address: public.replication_address,
         open_mode,
         service_location,
@@ -401,6 +364,18 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
                 OpenMode::Existing => proto::PublicV1OpenMode::Existing as i32,
             },
             replication_address: report.replication_address.clone(),
+            configuration_json: report.configuration.as_ref().map(|configuration| {
+                serde_json::to_string(configuration)
+                    .expect("public configuration serialization is infallible")
+            }),
+            active_operations_json: report
+                .active_operations
+                .iter()
+                .map(|intent| {
+                    serde_json::to_string(intent)
+                        .expect("control observation serialization is infallible")
+                })
+                .collect(),
             role: role_to_proto(report.role) as i32,
             read_status: access_status_to_proto(report.read_status) as i32,
             write_status: access_status_to_proto(report.write_status) as i32,
@@ -409,8 +384,10 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
                 PublicProgressRole::Secondary => proto::PublicV1ProgressRole::Secondary as i32,
                 PublicProgressRole::Recovery => proto::PublicV1ProgressRole::Recovery as i32,
             },
-            first_progress: report.progress.first,
-            last_progress: report.progress.last,
+            current_progress: Some(progress_query_to_proto(&report.progress.current_progress)),
+            catch_up_capability: Some(progress_query_to_proto(
+                &report.progress.catch_up_capability,
+            )),
             completed_operations: report
                 .completed_operations
                 .iter()
@@ -695,8 +672,8 @@ fn public_v1_recovery_from_proto(
             };
             Ok(PublicProgress {
                 role,
-                first: progress.first,
-                last: progress.last,
+                current_progress: progress_query_from_proto(progress.current_progress)?,
+                catch_up_capability: progress_query_from_proto(progress.catch_up_capability)?,
             })
         })
         .transpose()?;
@@ -779,9 +756,46 @@ fn public_v1_recovery_to_proto(
                     PublicProgressRole::Secondary => proto::PublicV1ProgressRole::Secondary,
                     PublicProgressRole::Recovery => proto::PublicV1ProgressRole::Recovery,
                 } as i32,
-                first: progress.first,
-                last: progress.last,
+                current_progress: Some(progress_query_to_proto(&progress.current_progress)),
+                catch_up_capability: Some(progress_query_to_proto(&progress.catch_up_capability)),
             }
+        }),
+    }
+}
+
+fn progress_query_from_proto(
+    query: Option<proto::PublicV1ProgressQuery>,
+) -> Result<crate::protocol::public_operations::ProgressQueryResult, WireError> {
+    use crate::protocol::public_operations::ProgressQueryResult as Query;
+    use proto::public_v1_progress_query::Result as Wire;
+    let outcome = match query.and_then(|query| query.result) {
+        Some(Wire::Value(value)) => Query::Value(value),
+        Some(Wire::NotReady(true)) => Query::NotReady,
+        Some(Wire::Failure(reason)) if !reason.is_empty() => Query::Failed(reason),
+        Some(Wire::NotQueried(reason)) if !reason.is_empty() => Query::NotQueried(reason),
+        _ => {
+            return Err(WireError::InvalidAuthority(
+                "missing or invalid native query outcome".into(),
+            ));
+        }
+    };
+    outcome
+        .validate()
+        .map_err(|error| WireError::InvalidAuthority(error.into()))?;
+    Ok(outcome)
+}
+
+fn progress_query_to_proto(
+    query: &crate::protocol::public_operations::ProgressQueryResult,
+) -> proto::PublicV1ProgressQuery {
+    use crate::protocol::public_operations::ProgressQueryResult as Query;
+    use proto::public_v1_progress_query::Result as Wire;
+    proto::PublicV1ProgressQuery {
+        result: Some(match query {
+            Query::Value(value) => Wire::Value(*value),
+            Query::NotReady => Wire::NotReady(true),
+            Query::NotQueried(reason) => Wire::NotQueried(reason.clone()),
+            Query::Failed(reason) => Wire::Failure(reason.clone()),
         }),
     }
 }
@@ -1480,220 +1494,6 @@ pub fn normalize_execute_request(
         target,
         expected_process_session_id,
         command,
-    })
-}
-
-/// Validates the exact authority carried by one replication item.
-pub fn validate_replication_item(item: &proto::ReplicationItem) -> Result<(), WireError> {
-    normalize_replication_item(item.clone()).map(|_| ())
-}
-
-/// Validates exact sender/receiver authority and monotonic ACK progress.
-pub fn validate_replication_ack(ack: &proto::ReplicationAck) -> Result<(), WireError> {
-    normalize_replication_ack(ack.clone()).map(|_| ())
-}
-
-/// Converts a validated replication item into exact canonical authority.
-pub fn normalize_replication_item(
-    item: proto::ReplicationItem,
-) -> Result<ReplicationEnvelope, WireError> {
-    ensure_supported_version(item.protocol_version)?;
-    let sender = item
-        .sender
-        .ok_or(WireError::MissingField("replication_item.sender"))?
-        .try_into()?;
-    let receiver = item
-        .receiver
-        .ok_or(WireError::MissingField("replication_item.receiver"))?
-        .try_into()?;
-    let epoch = item
-        .epoch
-        .ok_or(WireError::MissingField("replication_item.epoch"))?
-        .into();
-    if item.current_configuration_id.is_empty() {
-        return Err(WireError::MissingField(
-            "replication_item.current_configuration_id",
-        ));
-    }
-    if item.lsn <= 0 || item.committed_lsn < 0 || item.committed_lsn > item.lsn {
-        return Err(WireError::InvalidAuthority(
-            "replication item progress is inconsistent".to_string(),
-        ));
-    }
-    Ok(ReplicationEnvelope {
-        sender,
-        receiver,
-        epoch,
-        previous_configuration_id: (!item.previous_configuration_id.is_empty())
-            .then(|| ConfigurationId::new(item.previous_configuration_id)),
-        current_configuration_id: ConfigurationId::new(item.current_configuration_id),
-        lsn: item.lsn,
-        committed_lsn: item.committed_lsn,
-        data: item.data,
-    })
-}
-
-/// Converts a validated acknowledgement into exact canonical authority.
-pub fn normalize_replication_ack(
-    ack: proto::ReplicationAck,
-) -> Result<ReplicationAcknowledgement, WireError> {
-    ensure_supported_version(ack.protocol_version)?;
-    let sender = ack
-        .sender
-        .ok_or(WireError::MissingField("replication_ack.sender"))?
-        .try_into()?;
-    let receiver = ack
-        .receiver
-        .ok_or(WireError::MissingField("replication_ack.receiver"))?
-        .try_into()?;
-    let epoch = ack
-        .epoch
-        .ok_or(WireError::MissingField("replication_ack.epoch"))?
-        .into();
-    if ack.current_configuration_id.is_empty() {
-        return Err(WireError::MissingField(
-            "replication_ack.current_configuration_id",
-        ));
-    }
-    if ack.received_lsn <= 0
-        || ack.applied_lsn < 0
-        || ack.received_lsn < ack.applied_lsn
-        || ack.committed_lsn < 0
-        || ack.committed_lsn > ack.applied_lsn
-    {
-        return Err(WireError::InvalidAuthority(
-            "replication ACK progress is inconsistent".to_string(),
-        ));
-    }
-    Ok(ReplicationAcknowledgement {
-        sender,
-        receiver,
-        epoch,
-        previous_configuration_id: (!ack.previous_configuration_id.is_empty())
-            .then(|| ConfigurationId::new(ack.previous_configuration_id)),
-        current_configuration_id: ConfigurationId::new(ack.current_configuration_id),
-        received_lsn: ack.received_lsn,
-        applied_lsn: ack.applied_lsn,
-        committed_lsn: ack.committed_lsn,
-    })
-}
-
-pub fn validate_copy_item(item: &proto::CopyItem) -> Result<(), WireError> {
-    normalize_copy_item(item.clone()).map(|_| ())
-}
-
-pub fn validate_copy_ack(ack: &proto::CopyAck) -> Result<(), WireError> {
-    normalize_copy_ack(ack.clone()).map(|_| ())
-}
-
-pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireError> {
-    ensure_supported_version(item.protocol_version)?;
-    if item.build_id.is_empty() {
-        return Err(WireError::MissingField("copy_item.build_id"));
-    }
-    let sender = item
-        .sender
-        .ok_or(WireError::MissingField("copy_item.sender"))?
-        .try_into()?;
-    let receiver = item
-        .receiver
-        .ok_or(WireError::MissingField("copy_item.receiver"))?
-        .try_into()?;
-    let epoch = item
-        .epoch
-        .ok_or(WireError::MissingField("copy_item.epoch"))?
-        .into();
-    if item.current_configuration_id.is_empty() {
-        return Err(WireError::MissingField(
-            "copy_item.current_configuration_id",
-        ));
-    }
-    if item.sequence == 0
-        || item.replication_boundary_lsn < 0
-        || item.committed_lsn < 0
-        || item.final_item != item.catch_up_boundary_lsn.is_some()
-        || item
-            .catch_up_boundary_lsn
-            .is_some_and(|boundary| boundary < item.replication_boundary_lsn)
-        || if item.final_item {
-            item.lsn != item.replication_boundary_lsn
-                || item.committed_lsn != item.replication_boundary_lsn
-                || item.snapshot_chunk
-                || !item.data.is_empty()
-        } else if item.snapshot_chunk {
-            item.lsn != 0 || item.committed_lsn != 0
-        } else {
-            item.lsn <= item.replication_boundary_lsn || item.committed_lsn > item.lsn
-        }
-    {
-        return Err(WireError::InvalidAuthority(
-            "copy item progress is inconsistent".to_string(),
-        ));
-    }
-    Ok(CopyEnvelope {
-        build_id: OperationId::new(item.build_id),
-        sender,
-        receiver,
-        epoch,
-        current_configuration_id: ConfigurationId::new(item.current_configuration_id),
-        sequence: item.sequence,
-        lsn: item.lsn,
-        committed_lsn: item.committed_lsn,
-        replication_boundary_lsn: item.replication_boundary_lsn,
-        catch_up_boundary_lsn: item.catch_up_boundary_lsn,
-        final_item: item.final_item,
-        snapshot_chunk: item.snapshot_chunk,
-        data: item.data,
-    })
-}
-
-pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, WireError> {
-    ensure_supported_version(ack.protocol_version)?;
-    if ack.build_id.is_empty() {
-        return Err(WireError::MissingField("copy_ack.build_id"));
-    }
-    let sender = ack
-        .sender
-        .ok_or(WireError::MissingField("copy_ack.sender"))?
-        .try_into()?;
-    let receiver = ack
-        .receiver
-        .ok_or(WireError::MissingField("copy_ack.receiver"))?
-        .try_into()?;
-    let epoch = ack
-        .epoch
-        .ok_or(WireError::MissingField("copy_ack.epoch"))?
-        .into();
-    if ack.current_configuration_id.is_empty() {
-        return Err(WireError::MissingField("copy_ack.current_configuration_id"));
-    }
-    if ack.sequence == 0
-        || ack.durable_lsn < 0
-        || ack.replication_boundary_lsn < 0
-        || ack.final_item != ack.catch_up_boundary_lsn.is_some()
-        || ack
-            .catch_up_boundary_lsn
-            .is_some_and(|boundary| boundary < ack.replication_boundary_lsn)
-        || (ack.final_item
-            && (ack.snapshot_chunk || ack.durable_lsn != ack.replication_boundary_lsn))
-        || (ack.snapshot_chunk && (ack.final_item || ack.durable_lsn != 0))
-    {
-        return Err(WireError::InvalidAuthority(
-            "copy acknowledgement progress is inconsistent".to_string(),
-        ));
-    }
-    Ok(CopyAcknowledgement {
-        build_id: OperationId::new(ack.build_id),
-        sender,
-        receiver,
-        epoch,
-        current_configuration_id: ConfigurationId::new(ack.current_configuration_id),
-        sequence: ack.sequence,
-        durable_lsn: ack.durable_lsn,
-        replication_boundary_lsn: ack.replication_boundary_lsn,
-        catch_up_boundary_lsn: ack.catch_up_boundary_lsn,
-        final_item: ack.final_item,
-        snapshot_chunk: ack.snapshot_chunk,
     })
 }
 

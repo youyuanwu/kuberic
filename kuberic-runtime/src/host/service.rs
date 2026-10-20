@@ -530,11 +530,33 @@ pub(crate) async fn align_session_renewal(
     ))
 }
 
-async fn replay_role_at_epoch(
+pub(crate) async fn replay_role_at_epoch(
     replicator: &dyn crate::replicator::Replicator,
+    native: Option<(
+        crate::replicator::v1::LifecycleObservation,
+        Option<crate::protocol::types::Epoch>,
+    )>,
     epoch: crate::protocol::types::Epoch,
     role: crate::protocol::types::ReplicaRole,
 ) -> crate::Result<()> {
+    if let Some((observation, selected)) = native {
+        use crate::replicator::v1::LifecycleObservation;
+        match observation {
+            LifecycleObservation::Opened => return replicator.change_role(epoch, role).await,
+            LifecycleObservation::Ready(current) => {
+                if selected != Some(epoch) {
+                    replicator.update_epoch(epoch).await?;
+                }
+                if current != role {
+                    replicator.change_role(epoch, role).await?;
+                }
+                return Ok(());
+            }
+            LifecycleObservation::Closed | LifecycleObservation::Faulted => {
+                return Err(RuntimeError::Closed);
+            }
+        }
+    }
     replicator.update_epoch(epoch).await?;
     replicator.change_role(epoch, role).await
 }
@@ -707,7 +729,14 @@ where
         );
         if !matches!(
             intent.program,
-            Some(PublicOperationProgram::Progress { .. } | PublicOperationProgram::Build(_))
+            Some(
+                PublicOperationProgram::Progress { .. }
+                    | PublicOperationProgram::Build(_)
+                    | PublicOperationProgram::Swap {
+                        controller_composed: false,
+                        ..
+                    }
+            )
         ) {
             self.runtime.fence_replacement_access().await;
         }
@@ -808,6 +837,28 @@ where
     }
 
     async fn execute_session_renewal(&self, command: PublicV1SessionRenewalCommand) -> Result<()> {
+        let registry = self.registry.get().cloned().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "Public V1 operation runtime is unavailable".into(),
+            )
+        })?;
+        let service = self.clone();
+        let (completed, result) = tokio::sync::oneshot::channel();
+        registry.own_control_task(async move {
+            let outcome = service.execute_session_renewal_owned(command).await;
+            let _ = completed.send(outcome);
+        });
+        result.await.map_err(|error| {
+            crate::host::HostError::CommandRejected(format!(
+                "owned session renewal stopped before replying: {error}"
+            ))
+        })?
+    }
+
+    async fn execute_session_renewal_owned(
+        &self,
+        command: PublicV1SessionRenewalCommand,
+    ) -> Result<()> {
         command
             .validate()
             .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
@@ -827,6 +878,45 @@ where
             .await?
             .public_v1_operation_state
             .and_then(|preview| preview.session_renewal);
+        if let PublicV1SessionRenewalCommand::ReplayReplacementRole {
+            process_session_id,
+            epoch,
+            role,
+            ..
+        } = &command
+            && current.as_ref()
+                == Some(
+                    &accepted
+                        .replay_replacement_role(process_session_id, *epoch, *role)
+                        .map_err(|message| {
+                            crate::host::HostError::CommandRejected(message.into())
+                        })?,
+                )
+        {
+            let operation_id =
+                crate::host::public_lifecycle::replacement_role_operation_id(accepted);
+            if self
+                .store
+                .public_operation_records()
+                .await?
+                .iter()
+                .any(|record| {
+                    record.intent.operation_id == operation_id
+                        && crate::host::public_lifecycle::is_replacement_role_replay(
+                            accepted,
+                            &endpoint.identity,
+                            &record.intent,
+                        )
+                        && record.stage == PublicOperationStage::Completed
+                        && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                })
+            {
+                return Ok(());
+            }
+            return Err(crate::host::HostError::CommandRejected(
+                "replacement role replay lacks its successful owned completion".into(),
+            ));
+        }
         let current = match current {
             Some(current)
                 if crate::host::session_renewal_supersedes_local_journal(accepted, &current) =>
@@ -858,8 +948,13 @@ where
                 survivor, epoch, ..
             } => {
                 if survivor.identity == self.store.load_state().await?.identity.local_identity {
-                    replay_role_at_epoch(callbacks.replicator.as_ref(), *epoch, survivor.role)
-                        .await?;
+                    replay_role_at_epoch(
+                        callbacks.replicator.as_ref(),
+                        self.runtime.native_role_epoch()?,
+                        *epoch,
+                        survivor.role,
+                    )
+                    .await?;
                 }
                 accepted.record_epoch_updated(survivor, *epoch)
             }
@@ -869,7 +964,110 @@ where
                 role,
                 ..
             } => {
-                replay_role_at_epoch(callbacks.replicator.as_ref(), *epoch, *role).await?;
+                let records = self.store.public_operation_records().await?;
+                let opened = records.iter().any(|record| {
+                    record.intent.process_session_id == *process_session_id
+                        && record.stage == PublicOperationStage::Completed
+                        && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                        && record.accepted_storage.as_ref() == Some(&endpoint.storage_incarnation)
+                        && matches!(record.intent.program,
+                            Some(PublicOperationProgram::Open { .. }))
+                });
+                if !opened {
+                    let operation_id = crate::protocol::types::OperationId::new(format!(
+                        "{}:replacement-open", accepted.required.operation_id,
+                    ));
+                    let program = PublicOperationProgram::Open {
+                        replica: endpoint.identity.clone(),
+                        existing: true,
+                    };
+                    let intent = match records.iter()
+                        .find(|record| record.intent.operation_id == operation_id)
+                    {
+                        Some(record) if record.intent.program.as_ref() == Some(&program)
+                            && record.intent.process_session_id == *process_session_id
+                            && record.intent.class
+                                == crate::protocol::public_operations::PublicOperationClass::Authority =>
+                            record.intent.clone(),
+                        Some(_) => return Err(crate::host::HostError::DurableEffectConflict(
+                            "replacement Open operation changed captured authority".into(),
+                        )),
+                        None => PublicOperationIntent {
+                            identity: crate::protocol::public_operations::PublicV1Identity::new(
+                                accepted.required.history.protocol_generation.value(),
+                            ),
+                            operation_id,
+                            revision: records.iter().map(|record| record.intent.revision)
+                                .max().unwrap_or(0).checked_add(1).ok_or_else(|| {
+                                    crate::host::HostError::CommandRejected(
+                                        "replacement Open revision exhausted".into(),
+                                    )
+                                })?,
+                            process_session_id: process_session_id.clone(),
+                            class: crate::protocol::public_operations::PublicOperationClass::Authority,
+                            input_digest: program.digest(),
+                            replay_disposition: program.replay_disposition(),
+                            lifecycle: None,
+                            program: Some(program),
+                        },
+                    };
+                    self.execute_public_intent_owned(intent).await?;
+                }
+                let operation_id =
+                    crate::host::public_lifecycle::replacement_role_operation_id(accepted);
+                let records = self.store.public_operation_records().await?;
+                let program = PublicOperationProgram::Role {
+                    epoch: *epoch,
+                    role: *role,
+                };
+                let intent = match records
+                    .iter()
+                    .find(|record| record.intent.operation_id == operation_id)
+                {
+                    Some(record) => record.intent.clone(),
+                    None => PublicOperationIntent {
+                        identity: self
+                            .store
+                            .load_state()
+                            .await?
+                            .public_v1_operation_state
+                            .ok_or_else(|| {
+                                crate::host::HostError::CommandRejected(
+                                    "role replay requires Public V1 state".into(),
+                                )
+                            })?
+                            .identity,
+                        operation_id,
+                        revision: records
+                            .iter()
+                            .map(|record| record.intent.revision)
+                            .max()
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                crate::host::HostError::CommandRejected(
+                                    "role replay revision exhausted".into(),
+                                )
+                            })?,
+                        process_session_id: process_session_id.clone(),
+                        class: crate::protocol::public_operations::PublicOperationClass::Authority,
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
+                    },
+                };
+                let state = self.store.load_state().await?;
+                if !crate::host::public_lifecycle::is_replacement_role_replay(
+                    accepted,
+                    &state.identity.local_identity,
+                    &intent,
+                ) {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "replacement role operation changed captured authority".into(),
+                    ));
+                }
+                self.execute_public_intent_owned(intent).await?;
                 accepted.replay_replacement_role(process_session_id, *epoch, *role)
             }
             PublicV1SessionRenewalCommand::InstallFreshConfiguration { configuration, .. } => {
@@ -1231,7 +1429,7 @@ mod tests {
         let replicator = RenewalReplicator::default();
         let epoch = Epoch::new(0, 2);
 
-        replay_role_at_epoch(&replicator, epoch, ReplicaRole::ActiveSecondary)
+        replay_role_at_epoch(&replicator, None, epoch, ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
 
@@ -1241,6 +1439,28 @@ mod tests {
                 ("epoch", epoch, None),
                 ("role", epoch, Some(ReplicaRole::ActiveSecondary)),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_role_replay_does_not_repeat_same_role_change() {
+        use crate::replicator::v1::LifecycleObservation;
+
+        let replicator = RenewalReplicator::default();
+        let epoch = Epoch::new(0, 2);
+        for selected in [Some(Epoch::new(0, 1)), Some(epoch)] {
+            replay_role_at_epoch(
+                &replicator,
+                Some((LifecycleObservation::Ready(ReplicaRole::Primary), selected)),
+                epoch,
+                ReplicaRole::Primary,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            *replicator.calls.lock().unwrap(),
+            vec![("epoch", epoch, None)]
         );
     }
 
@@ -1407,14 +1627,12 @@ mod tests {
         runtime
             .bind_replica_session(resource_uid.clone(), service.local_session().clone())
             .unwrap();
+        service.public_operation_runtime(identity).await.unwrap();
         let replacement = ProcessSessionEndpoint {
             identity: local.clone(),
             storage_incarnation: storage.clone(),
             process_session_id: service.local_session().clone(),
-            replicator_creation_id: ReplicatorCreationId::new(format!(
-                "pending-{}",
-                service.local_session()
-            )),
+            replicator_creation_id: runtime.replacement_replicator_creation_id().unwrap(),
             role: ReplicaRole::None,
         };
         let renewal_epoch = Epoch::new(0, 2);
@@ -1471,5 +1689,14 @@ mod tests {
                 .stage,
             PublicSessionRenewalStage::AccessClosed
         );
+        service
+            .operation_runtime
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 }

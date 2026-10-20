@@ -194,9 +194,23 @@ impl Fixture {
             .map(tonic::Response::into_inner)
     }
 
-    async fn stop(mut self) {
+    async fn stop(mut self, expected: Option<&str>) {
         self.running.shutdown();
         self.running.wait().await.unwrap();
+        let diagnostic = self.service.shutdown_and_drain().await.unwrap_err();
+        match expected {
+            None => assert!(matches!(
+                diagnostic,
+                kuberic_runtime::RuntimeError::OperationCancelled
+            )),
+            Some(message) => assert!(
+                matches!(
+                    diagnostic,
+                    kuberic_runtime::RuntimeError::Application(ref reason) if reason.contains(message)
+                ),
+                "{diagnostic}"
+            ),
+        }
         drop(self.server);
         drop(self.service);
         drop(self.persistence);
@@ -230,7 +244,6 @@ async fn successful_noop_does_not_advance_or_fence_the_next_write() {
         fixture.persistence.progress().unwrap().committed_lsn,
         created.lsn
     );
-    assert!(!fixture.service.barrier().is_fenced());
 
     let inserted = fixture
         .execute("INSERT INTO data VALUES(1, 'published')")
@@ -241,31 +254,29 @@ async fn successful_noop_does_not_advance_or_fence_the_next_write() {
         fixture.persistence.progress().unwrap().committed_lsn,
         inserted.lsn
     );
-    assert!(!fixture.service.barrier().is_fenced());
 
-    fixture.stop().await;
+    fixture.stop(None).await;
 }
 
 #[tokio::test]
-async fn stale_attempted_publication_returns_no_success_and_fences() {
+async fn failed_local_publication_returns_no_success_and_fences() {
     let fixture = Fixture::start("stale").await;
     fixture
         .execute("CREATE TABLE data(id INTEGER PRIMARY KEY, value TEXT)")
         .await
         .unwrap();
-    fixture.service.barrier().return_stale_receipt_once();
+    fixture
+        .service
+        .committer_for_test()
+        .unwrap()
+        .fail_once(sqlite_replicated::v1_test_bridge::FailureCut::Publication);
 
     let error = fixture
         .execute("INSERT INTO data VALUES(1, 'ambiguous')")
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unknown);
-    assert!(
-        error
-            .message()
-            .contains("non-advancing publication receipt")
-    );
-    assert!(fixture.service.barrier().is_fenced());
+    assert!(error.message().contains("injected SQLite service cut"));
     assert!(
         fixture
             .execute("INSERT INTO data VALUES(2, 'must-not-succeed')")
@@ -273,5 +284,5 @@ async fn stale_attempted_publication_returns_no_success_and_fences() {
             .is_err()
     );
 
-    fixture.stop().await;
+    fixture.stop(Some("injected SQLite service cut")).await;
 }

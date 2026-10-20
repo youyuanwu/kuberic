@@ -1,5 +1,10 @@
 # Service Fabric Alignment and Runtime Simplification
 
+> Historical architecture/alignment baseline preceding the connected native
+> owner cutover. See [Classic V1 Runtime](classic-v1-runtime.md) for the selected
+> factory, service commitment, streams and authenticated carrier. Open audit
+> items below are historical analysis, not automatically closed by selection.
+
 ## Status
 
 The Public V1 replacement is implemented. Kuberic now uses a single

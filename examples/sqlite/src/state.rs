@@ -75,6 +75,20 @@ impl SqlitePersistence {
         })
     }
 
+    pub(crate) fn authorize_open(
+        &self,
+        mode: kuberic_runtime::application::OpenMode,
+    ) -> io::Result<()> {
+        if mode == kuberic_runtime::application::OpenMode::Existing
+            && !self.root.join("state-v2.json").is_file()
+        {
+            return Err(io::Error::other(
+                "established SQLite storage lacks classic V1 metadata; refusing empty recovery",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn initialize(&self) -> io::Result<()> {
         let _opening = self
             .opening
@@ -220,10 +234,6 @@ pub(crate) fn persistence_error(error: io::Error) -> kuberic_runtime::RuntimeErr
     kuberic_runtime::RuntimeError::Application(error.to_string())
 }
 
-#[cfg_attr(
-    not(feature = "testing"),
-    expect(dead_code, reason = "unselected V1 SQLite preparation")
-)]
 impl SqlitePersistence {
     pub(crate) fn native_recover(&self) -> io::Result<()> {
         self.lock()?.native_recover()

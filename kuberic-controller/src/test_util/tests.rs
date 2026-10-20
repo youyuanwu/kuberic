@@ -3,13 +3,9 @@ use super::*;
 use anyhow::{Context, Result, ensure};
 use kuberic_runtime::{
     StateProvider, StatefulServiceReplica,
-    application::{
-        CopyChunk, DurableApplicationProgress, OpenContext, Operation, OperationDataStream,
-        RoleChange,
-    },
-    engine::{DurableState, RetainedOperationStream},
+    application::{OpenContext, OperationDataStream, RoleChange},
     protocol::{public_operations::*, types::*},
-    replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings},
+    replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator},
 };
 use std::sync::Arc;
 
@@ -17,6 +13,8 @@ pub(super) struct EmptyApplication {
     stop: tokio::sync::watch::Sender<bool>,
     streams: tokio::sync::Mutex<tokio::task::JoinSet<kuberic_runtime::Result<()>>>,
     control: tokio::sync::Mutex<Option<Arc<dyn Replicator>>>,
+    state: tokio::sync::Mutex<Option<Arc<dyn StateReplicator>>>,
+    role: std::sync::Mutex<ReplicaRole>,
 }
 impl Default for EmptyApplication {
     fn default() -> Self {
@@ -24,6 +22,8 @@ impl Default for EmptyApplication {
             stop: tokio::sync::watch::channel(false).0,
             streams: Default::default(),
             control: Default::default(),
+            state: Default::default(),
+            role: std::sync::Mutex::new(ReplicaRole::None),
         }
     }
 }
@@ -67,54 +67,6 @@ impl StateProvider for EmptyState {
     }
 }
 #[async_trait::async_trait]
-impl DurableState for EmptyState {
-    async fn get_replication_operations(
-        &self,
-        _: i64,
-        _: i64,
-    ) -> kuberic_runtime::Result<RetainedOperationStream> {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-    async fn apply_copy_chunk(
-        &self,
-        _: &OperationId,
-        _: u64,
-        _: CopyChunk,
-    ) -> kuberic_runtime::Result<()> {
-        Ok(())
-    }
-    async fn verify_copy_chunk(
-        &self,
-        _: &OperationId,
-        _: u64,
-        _: &CopyChunk,
-    ) -> kuberic_runtime::Result<bool> {
-        Ok(true)
-    }
-    async fn finish_copy(
-        &self,
-        _: &OperationId,
-        _: i64,
-        _: i64,
-    ) -> kuberic_runtime::Result<DurableApplicationProgress> {
-        Ok(Default::default())
-    }
-    async fn apply(&self, _: Operation) -> kuberic_runtime::Result<DurableApplicationProgress> {
-        Err(kuberic_runtime::RuntimeError::Application(
-            "readiness-only application has no mutations".into(),
-        ))
-    }
-    async fn durable_progress(&self) -> kuberic_runtime::Result<DurableApplicationProgress> {
-        Ok(Default::default())
-    }
-    async fn verify_applied(&self, _: &Operation) -> kuberic_runtime::Result<bool> {
-        Ok(false)
-    }
-    async fn commit(&self, _: i64) -> kuberic_runtime::Result<DurableApplicationProgress> {
-        Ok(Default::default())
-    }
-}
-#[async_trait::async_trait]
 impl StatefulServiceReplica for EmptyApplication {
     async fn open(
         self: Arc<Self>,
@@ -126,9 +78,7 @@ impl StatefulServiceReplica for EmptyApplication {
         }
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new(Arc::new(
-                EmptyState,
-            ))))
+            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
             .create_replicator(
                 Some(Arc::new(EmptyState)),
                 Some(ReplicatorSettings {
@@ -136,32 +86,61 @@ impl StatefulServiceReplica for EmptyApplication {
                 }),
             )
             .await?;
-        let state = interfaces.state_replicator().unwrap();
-        let streams = [
-            state.get_copy_stream().await?,
-            state.get_replication_stream().await?,
-        ];
-        let mut tasks = self.streams.lock().await;
-        for mut stream in streams {
-            let mut stop = self.stop.subscribe();
-            tasks.spawn(async move {
-                tokio::select! {
-                    _=stop.wait_for(|stopped|*stopped)=>Ok(()),
-                    result=async {
-                        while let Some(operation)=stream.get_operation().await? {
-                            let progress=operation.apply_to(&EmptyState).await?;
-                            operation.acknowledge(progress)?;
-                        }
-                        Ok(())
-                    }=>result,
-                }
-            });
-        }
+        *self.state.lock().await = interfaces.state_replicator();
         let replicator = interfaces.replicator();
         *control = Some(replicator.clone());
         Ok(replicator)
     }
-    async fn change_role(&self, _: ReplicaRole) -> kuberic_runtime::Result<RoleChange> {
+    async fn change_role(&self, role: ReplicaRole) -> kuberic_runtime::Result<RoleChange> {
+        let previous = *self.role.lock().unwrap();
+        if matches!(
+            role,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) && !matches!(
+            previous,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) {
+            let state = self
+                .state
+                .lock()
+                .await
+                .clone()
+                .ok_or(kuberic_runtime::RuntimeError::NotOpen)?;
+            let mut streams = vec![state.replication_operations()?];
+            if previous != ReplicaRole::Primary {
+                streams.push(state.copy_operations()?);
+            }
+            let mut tasks = self.streams.lock().await;
+            for mut stream in streams {
+                let mut stop = self.stop.subscribe();
+                tasks.spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait_for(|stopped| *stopped) => Ok(()),
+                        result = async {
+                            loop {
+                                let operation = match stream.get_operation().await {
+                                    Ok(Some(operation)) => operation,
+                                    Ok(None) | Err(kuberic_runtime::RuntimeError::Closed) => break,
+                                    Err(error) => return Err(error),
+                                };
+                                if !operation.end_of_stream
+                                    && (operation.kind != kuberic_runtime::replicator::stream::OperationKind::Copy
+                                        || operation.data.as_ref() != b"empty-provider-v1")
+                                {
+                                    let reason = "readiness-only application received mutable state".to_owned();
+                                    stream.report_fault(reason.clone())?;
+                                    return Err(kuberic_runtime::RuntimeError::Application(reason));
+                                }
+                                operation.acknowledge()?;
+                            }
+                            Ok(())
+                        } => result,
+                    }
+                });
+            }
+        }
+        *self.role.lock().unwrap() = role;
         Ok(RoleChange {
             service_address: None,
         })
@@ -444,7 +423,7 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
             ),
             ("role", serde_json::json!("none")),
             ("writeStatus", serde_json::json!("granted")),
-            ("readStatus", serde_json::json!("notPrimary")),
+            ("readStatus", serde_json::json!("granted")),
         ] {
             let mut altered = reports.clone();
             let mut report = serde_json::to_value(&altered[1])?;
@@ -464,11 +443,11 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
         ensure!(!Core::settled(&status, &altered, 3));
         for index in 0..reports.len() {
             let mut altered = reports.clone();
-            altered[index].progress.last = altered[index].progress.first + 1;
+            altered[index].progress.current_progress = ProgressQueryResult::NotReady;
             ensure!(
                 !Core::settled(&status, &altered, 3)
                     && !Core::configurations_settled(&status, &altered, &evidence),
-                "uncommitted progress accepted for {:?}",
+                "unavailable native progress accepted for {:?}",
                 altered[index].role
             );
         }
@@ -776,25 +755,31 @@ async fn timed_out_drain_keeps_application_and_route_owners_until_they_join() ->
     .await?;
     for uid in &uids {
         assert!(
-            kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
-                uid.clone(),
-                |_, endpoint| Box::pin(async move { Ok(endpoint) })
-            )
+            kuberic_runtime::replicator::TestingTcpRoute::register(uid.clone(), |_, endpoint| {
+                Box::pin(async move { Ok(endpoint) })
+            })
             .is_err()
         );
     }
     release.notify_waiters();
-    tokio::time::timeout(std::time::Duration::from_secs(2),async {
-        while completed.load(Ordering::Acquire)!=3 {tokio::task::yield_now().await;}
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while completed.load(Ordering::Acquire) != 3 {
+            tokio::task::yield_now().await;
+        }
         for uid in uids {
             loop {
-                if let Ok(route)=kuberic_runtime::replicator::stateless::TestingTcpRoute::register(uid.clone(),|_,endpoint|Box::pin(async move {Ok(endpoint)})) {
-                    drop(route);break;
+                if let Ok(route) = kuberic_runtime::replicator::TestingTcpRoute::register(
+                    uid.clone(),
+                    |_, endpoint| Box::pin(async move { Ok(endpoint) }),
+                ) {
+                    drop(route);
+                    break;
                 }
                 tokio::task::yield_now().await;
             }
         }
-    }).await?;
+    })
+    .await?;
     Ok(())
 }
 
@@ -995,14 +980,23 @@ async fn early_drop_requests_owned_async_drain_without_claiming_completion() -> 
         .map(|reference| reference.instance_id().to_owned())
         .collect::<Vec<_>>();
     drop(cluster);
-    tokio::time::timeout(std::time::Duration::from_secs(5),async {
-        while completed.load(std::sync::atomic::Ordering::Acquire)!=3 {tokio::task::yield_now().await;}
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while completed.load(std::sync::atomic::Ordering::Acquire) != 3 {
+            tokio::task::yield_now().await;
+        }
         for uid in uids {
             loop {
-                if let Ok(route)=kuberic_runtime::replicator::stateless::TestingTcpRoute::register(uid.clone(),|_,endpoint|Box::pin(async move {Ok(endpoint)})) {drop(route);break;}
+                if let Ok(route) = kuberic_runtime::replicator::TestingTcpRoute::register(
+                    uid.clone(),
+                    |_, endpoint| Box::pin(async move { Ok(endpoint) }),
+                ) {
+                    drop(route);
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         }
-    }).await?;
+    })
+    .await?;
     Ok(())
 }

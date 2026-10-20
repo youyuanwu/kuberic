@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::barrier::CommitFailure;
 use crate::connection::Statement;
 use crate::proto;
 use crate::service::SqliteService;
@@ -19,93 +18,22 @@ impl SqliteServer {
     }
 
     async fn write(&self, statements: Vec<Statement>) -> Result<(Vec<usize>, i64, i64), Status> {
-        self.application.access(true).await.map_err(unavailable)?;
-        let permit = self.application.request_gate.clone().lock_owned().await;
-        let (_, recovered) = self.application.access(true).await.map_err(unavailable)?;
-        let application = self.application.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            // A cancelled RPC must not release serialization while SQLite is still
-            // waiting at the barrier or recording successful publication.
-            let _permit = permit;
-            let mut sql = application.sql.lock().expect("SQL connection");
-            application
-                .prepare_sql(&mut sql, recovered)
-                .map_err(|e| Status::failed_precondition(e.to_string()))?;
-            let progress = application
-                .persistence()
-                .progress()
-                .map_err(|e| Status::internal(e.to_string()))?;
-            if progress.applied_lsn != progress.committed_lsn {
-                return Err(Status::failed_precondition(
-                    "an applied suffix must be settled by authority before new SQL writes",
-                ));
-            }
-            let before = progress.committed_lsn;
-            application.barrier().reset_receipt(before);
-            let executed = sql.execute(&statements);
-            let publication_attempted = application.barrier().publication_attempted();
-            let lsn = application.barrier().last_lsn();
-            match executed {
-                Ok((rows, rowid)) => {
-                    if application.barrier().is_fenced() {
-                        return Err(unknown("local publication was interrupted"));
-                    }
-                    if publication_attempted {
-                        if let Err(reason) = require_advanced_publication(before, lsn) {
-                            application.barrier().fence_unknown(reason);
-                            return Err(unknown(reason));
-                        }
-                        if let Err(error) = application.persistence().confirm_publication(lsn) {
-                            application.barrier().fence_unknown(&error.to_string());
-                            return Err(unknown(&error.to_string()));
-                        }
-                        sql.visible_lsn = lsn;
-                    }
-                    Ok((rows, rowid, lsn))
-                }
-                Err(error) => match application.barrier().failure() {
-                    Some(CommitFailure::Unknown(reason)) => Err(unknown(&reason)),
-                    Some(CommitFailure::Definitive(reason)) => Err(Status::unavailable(format!(
-                        "transaction rejected before dispatch: {reason}"
-                    ))),
-                    None if publication_attempted => {
-                        let reason = match require_advanced_publication(before, lsn) {
-                            Ok(()) => error.to_string(),
-                            Err(reason) => reason.to_owned(),
-                        };
-                        application.barrier().fence_unknown(&reason);
-                        Err(unknown(&reason))
-                    }
-                    None => Err(Status::invalid_argument(format!("SQL rejected: {error}"))),
-                },
-            }
-        })
-        .await;
-        match result {
-            Ok(result) => result,
-            Err(error) => {
-                self.application.barrier().fence_unknown(&error.to_string());
-                Err(unknown(&error.to_string()))
-            }
-        }
+        let execution = self
+            .application
+            .execute(statements)
+            .await
+            .map_err(unavailable)?;
+        Ok((execution.rows, execution.rowid, execution.lsn))
     }
-}
-
-fn require_advanced_publication(before: i64, published: i64) -> Result<(), &'static str> {
-    if published <= before {
-        return Err("replication returned a non-advancing publication receipt");
-    }
-    Ok(())
 }
 
 fn unavailable(error: kuberic_runtime::RuntimeError) -> Status {
-    Status::unavailable(error.to_string())
-}
-
-fn unknown(reason: &str) -> Status {
-    Status::unknown(format!(
-        "outcome unknown after replication dispatch: {reason}; reopen/reconcile and verify the transaction before retrying"
-    ))
+    match error {
+        kuberic_runtime::RuntimeError::AdmittedOperationFailed { .. } => {
+            Status::unknown(error.to_string())
+        }
+        error => Status::unavailable(error.to_string()),
+    }
 }
 
 #[tonic::async_trait]
@@ -146,32 +74,21 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
         &self,
         request: Request<proto::QueryRequest>,
     ) -> Result<Response<proto::QueryResponse>, Status> {
-        self.application.access(false).await.map_err(unavailable)?;
-        let permit = self.application.request_gate.clone().lock_owned().await;
-        let (_, recovered) = self.application.access(false).await.map_err(unavailable)?;
         let request = request.into_inner();
-        let application = self.application.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut sql = application.sql.lock().expect("SQL connection");
-            application
-                .prepare_sql(&mut sql, recovered)
-                .map_err(|e| Status::failed_precondition(e.to_string()))?;
-            let (columns, rows) = sql
-                .query(&request.sql, &convert_params(&request.params))
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
-            Ok(Response::new(proto::QueryResponse {
-                columns,
-                rows: rows
-                    .into_iter()
-                    .map(|values| proto::Row {
-                        values: values.into_iter().map(proto_value).collect(),
-                    })
-                    .collect(),
-            }))
-        })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
+        let (columns, rows) = self
+            .application
+            .query(request.sql, convert_params(&request.params))
+            .await
+            .map_err(unavailable)?;
+        Ok(Response::new(proto::QueryResponse {
+            columns,
+            rows: rows
+                .into_iter()
+                .map(|values| proto::Row {
+                    values: values.into_iter().map(proto_value).collect(),
+                })
+                .collect(),
+        }))
     }
 }
 
@@ -204,17 +121,5 @@ fn proto_value(value: rusqlite::types::Value) -> proto::Value {
     proto::Value {
         is_null: kind.is_none(),
         kind,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::require_advanced_publication;
-
-    #[test]
-    fn successful_publication_must_advance_the_committed_watermark() {
-        assert!(require_advanced_publication(3, 4).is_ok());
-        assert!(require_advanced_publication(3, 3).is_err());
-        assert!(require_advanced_publication(3, 2).is_err());
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::RuntimeError;
 use crate::host::state::{PublicCloseChild, PublicInstructionOutcome};
 use crate::protocol::public_operations::{
     DataLossReplay, PublicCatchUpMode, PublicConfiguration, PublicOperationProgram,
@@ -38,7 +39,7 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
             ApplicationRole,
         ],
         Some(P::Build(_)) => vec![Build],
-        Some(P::Remove(_)) => vec![Remove],
+        Some(P::Remove(_) | P::RetireIdleReplica { .. }) => vec![Remove],
         Some(P::Close) => vec![Revoke, ReplicatorClose, ApplicationClose, Cleanup],
         Some(P::Abort) => vec![Revoke, Abort, Cleanup],
         None => intent
@@ -102,26 +103,83 @@ pub(super) fn replica_set(
             .replicas
             .iter()
             .filter(|replica| {
-                configuration.members.iter().any(|member| {
-                    member.identity == replica.identity && member.role == replica.role
-                })
+                configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == replica.identity)
             })
             .cloned()
-            .map(Into::into)
+            .map(|replica| {
+                let mut information: ReplicaInformation = replica.into();
+                information.role = configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity == information.identity)
+                    .expect("filtered configuration member")
+                    .role;
+                information
+            })
             .collect(),
     }
 }
 
 pub(super) async fn install(
+    store: &dyn AgentStore,
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
+    catch_up: bool,
 ) -> crate::Result<()> {
+    input
+        .validate()
+        .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
+    let state = store
+        .load_state()
+        .await
+        .map_err(|error| RuntimeError::Application(error.to_string()))?;
+    let local = &state.identity.local_identity;
+    if !std::iter::once(&input.current)
+        .chain(input.previous.iter())
+        .flat_map(|configuration| &configuration.members)
+        .any(|member| &member.identity == local)
+    {
+        return Err(RuntimeError::AuthorityNotAdmitted);
+    }
+    if let Some(preview) = &state.public_v1_operation_state
+        && input.replicas.iter().any(|replica| {
+            replica
+                .storage_incarnation
+                .as_ref()
+                .is_some_and(|storage| preview.retired_storage_incarnations.contains(storage))
+        })
+    {
+        return Err(RuntimeError::AuthorityNotAdmitted);
+    }
+    if input.current.primary_id != local.replica_id {
+        // The persisted host instruction installs secondary transport authority.
+        // Classic native V1 has no secondary UpdateReplicaSetConfiguration call.
+        // Admission is subsequently rechecked against this journal per frame.
+        return Ok(());
+    }
     if let Some(previous) = &input.previous {
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
                 replica_set(input, &input.current),
                 replica_set(input, previous),
+            )
+            .await?;
+    } else if catch_up {
+        let previous = crate::protocol::types::ConfigurationDescriptor::new(
+            input.current.epoch,
+            input.current.primary_id,
+            Vec::new(),
+            0,
+        );
+        callbacks
+            .primary
+            .update_catch_up_replica_set_configuration(
+                replica_set(input, &input.current),
+                replica_set(input, &previous),
             )
             .await?;
     } else {
@@ -271,8 +329,38 @@ pub(super) async fn execute(
                     _ => unreachable!(),
                 };
                 if instruction == ReplicatorRole {
+                    let state = store.load_state().await?;
+                    let replacement_replay = state
+                        .public_v1_operation_state
+                        .as_ref()
+                        .and_then(|preview| preview.session_renewal.as_ref())
+                        .is_some_and(|renewal| {
+                            super::is_replacement_role_replay(
+                                renewal,
+                                &state.identity.local_identity,
+                                &intent,
+                            )
+                        });
+                    let result = if replacement_replay {
+                        // A replacement may already have this native role. Only the
+                        // exact renewal may advance its epoch without same-role ChangeRole.
+                        crate::host::service::replay_role_at_epoch(
+                            callbacks.replicator.as_ref(),
+                            callbacks
+                                .native_role_epoch
+                                .as_ref()
+                                .map(|observe| observe())
+                                .transpose()?
+                                .flatten(),
+                            epoch,
+                            role,
+                        )
+                        .await
+                    } else {
+                        callbacks.replicator.change_role(epoch, role).await
+                    };
                     super::local_callback(
-                        callbacks.replicator.change_role(epoch, role).await,
+                        result,
                         store.as_ref(),
                         &intent,
                         index,
@@ -314,7 +402,13 @@ pub(super) async fn execute(
             Configuration | StartingConfiguration | RefreshedConfiguration => {
                 let configuration = configuration(program, instruction);
                 super::local_callback(
-                    install(&callbacks, configuration).await,
+                    install(
+                        store.as_ref(),
+                        &callbacks,
+                        configuration,
+                        matches!(program, P::CatchUp { .. } | P::Swap { .. }),
+                    )
+                    .await,
                     store.as_ref(),
                     &intent,
                     index,
@@ -330,7 +424,7 @@ pub(super) async fn execute(
                 if index == start && start > 0 {
                     let configuration = configuration(program, instruction);
                     super::local_callback(
-                        install(&callbacks, configuration).await,
+                        install(store.as_ref(), &callbacks, configuration, true).await,
                         store.as_ref(),
                         &intent,
                         index,
@@ -426,13 +520,12 @@ pub(super) async fn execute(
                 }
             }
             Remove => {
-                let P::Remove(build) = program else {
-                    unreachable!()
+                let replica_id = match program {
+                    P::Remove(build) => build.replica.replica_id,
+                    P::RetireIdleReplica { replica_id } => *replica_id,
+                    _ => unreachable!(),
                 };
-                callbacks
-                    .primary
-                    .remove_replica(build.replica.replica_id)
-                    .await?;
+                callbacks.primary.remove_replica(replica_id).await?;
                 O::Done
             }
             ReplicatorClose | ApplicationClose => {
@@ -479,7 +572,10 @@ pub(super) async fn execute(
                 }
                 O::Done
             }
-            Revoke => O::Done,
+            Revoke => {
+                (callbacks.revoke_access)()?;
+                O::Done
+            }
             _ => unreachable!("role instruction in public program"),
         };
         #[cfg(all(test, feature = "testing"))]

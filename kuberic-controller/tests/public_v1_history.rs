@@ -105,6 +105,8 @@ fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
     );
     let storage = storage();
     let report = PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity: identity.clone(),
         resource_uid: resource_uid.clone(),
         replica: storage.replica.clone(),
@@ -119,8 +121,10 @@ fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
         storage_incarnation: storage.clone(),
         progress: PublicProgress {
             role: PublicProgressRole::Primary,
-            first: 10,
-            last: 10,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(10),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(10),
         },
         replication_address: None,
         service_location: None,
@@ -208,11 +212,13 @@ fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() 
         stage: kuberic_runtime::protocol::public_operations::PublicDataLossRecoveryStage::HistoryPending,
         observed_progress: Some(PublicProgress {
             role: PublicProgressRole::Recovery,
-            first: 7,
-            last: 7,
+            current_progress: kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(7),
+            catch_up_capability: kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(7),
         }),
     };
     let mut report = PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity,
         resource_uid,
         replica: storage.replica.clone(),
@@ -227,8 +233,10 @@ fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() 
         storage_incarnation: storage,
         progress: PublicProgress {
             role: PublicProgressRole::Recovery,
-            first: 7,
-            last: 7,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(7),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(7),
         },
         replication_address: None,
         service_location: None,
@@ -290,6 +298,8 @@ fn public_v1_all_survivor_election_requires_history_and_storage_admission() {
     };
     second_storage.storage_generation = StorageGeneration::new("storage-2");
     let report = |storage: ReplicaStorageIncarnationContext, progress: i64| PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity: identity.clone(),
         resource_uid: resource_uid.clone(),
         replica: storage.replica.clone(),
@@ -310,8 +320,10 @@ fn public_v1_all_survivor_election_requires_history_and_storage_admission() {
         storage_incarnation: storage,
         progress: PublicProgress {
             role: PublicProgressRole::Secondary,
-            first: progress,
-            last: progress,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(progress),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(progress),
         },
         replication_address: None,
         service_location: None,
@@ -477,8 +489,8 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
                 write_status: AccessStatus::Granted,
                 progress: PublicProgress {
                     role: PublicProgressRole::Primary,
-                    first: 10,
-                    last: 10,
+                    current_progress: kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(10),
+                    catch_up_capability: kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(10),
                 },
             },
         )
@@ -586,8 +598,10 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
                 write_status: AccessStatus::NotPrimary,
                 progress: PublicProgress {
                     role: PublicProgressRole::Recovery,
-                    first: 0,
-                    last: 0,
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
                 },
             },
         )
@@ -665,8 +679,10 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
                 write_status: AccessStatus::NotPrimary,
                 progress: PublicProgress {
                     role: PublicProgressRole::Recovery,
-                    first: 0,
-                    last: 0,
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
                 },
             },
         )
@@ -732,6 +748,8 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         program: None,
     };
     let replacement_report = PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity: identity.clone(),
         resource_uid: resource_uid.clone(),
         replica: authorization.provisional_primary.replica.clone(),
@@ -746,8 +764,10 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         storage_incarnation: authorization.provisional_primary.clone(),
         progress: PublicProgress {
             role: PublicProgressRole::Secondary,
-            first: 0,
-            last: 0,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
         },
         replication_address: None,
         service_location: None,
@@ -822,8 +842,10 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
                 write_status: AccessStatus::NotPrimary,
                 progress: PublicProgress {
                     role: PublicProgressRole::Recovery,
-                    first: 0,
-                    last: 0,
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
                 },
             },
         )

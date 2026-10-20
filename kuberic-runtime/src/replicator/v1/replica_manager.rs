@@ -45,7 +45,6 @@ mod policy;
 pub(super) use policy::QueuePolicyConfig;
 
 #[derive(Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 membership seam"))]
 pub(super) struct SessionMember {
     pub(super) replica_id: i64,
     pub(super) session: ReplicationSession,
@@ -53,14 +52,12 @@ pub(super) struct SessionMember {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 replica set"))]
 pub(super) struct ReplicaSet {
     /// Includes the primary's immediate vote, unlike `members`.
     pub(super) write_quorum: usize,
     pub(super) members: Vec<SessionMember>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 configuration"))]
 pub(super) struct EstablishedConfiguration {
     pub(super) current: ReplicaSet,
     /// None deactivates PC. Some(W1, []) is an active primary-only PC.
@@ -69,7 +66,6 @@ pub(super) struct EstablishedConfiguration {
 }
 
 #[derive(Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 idle membership"))]
 pub(super) struct EstablishedIdle {
     pub(super) replica_id: i64,
     pub(super) session: ReplicationSession,
@@ -78,10 +74,6 @@ pub(super) struct EstablishedIdle {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 terminal outcome")
-)]
 pub(super) enum CompletionError {
     /// Native ReplicaManager::CloseInnerObjects cancels remaining replicate ops.
     OperationCanceled,
@@ -90,10 +82,6 @@ pub(super) enum CompletionError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 validation errors")
-)]
 pub(super) enum ConfigurationError {
     InvalidPrimary,
     InvalidEpoch,
@@ -115,7 +103,6 @@ pub(super) enum ConfigurationError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 manager errors"))]
 pub(super) enum ManagerError {
     ObjectClosed,
     ReconfigurationPending,
@@ -143,11 +130,9 @@ impl From<ConfigurationError> for ManagerError {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 completion seam"))]
 pub(super) type CompletionReceiver = oneshot::Receiver<Result<(), CompletionError>>;
 type CompletionSender = oneshot::Sender<Result<(), CompletionError>>;
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 admission"))]
 pub(super) struct Admission {
     pub(super) operation: SenderOperation,
     pub(super) completion: CompletionReceiver,
@@ -155,7 +140,6 @@ pub(super) struct Admission {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 catchup mode"))]
 pub(super) enum CatchupMode {
     All,
     WriteQuorum,
@@ -184,7 +168,6 @@ enum SessionEffect {
 /// success. The integration owner must deliver it, including during shutdown.
 #[must_use = "dispatch sends and terminal completions outside the owner guard"]
 #[derive(Default)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 manager effects"))]
 pub(super) struct ManagerEffects {
     sessions: Vec<SessionEffect>,
     completions: Vec<(CompletionSender, Result<(), CompletionError>)>,
@@ -199,10 +182,6 @@ pub(super) struct ManagerEffects {
     build_wakes: Vec<BuildIdleHandle>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 effects dispatch")
-)]
 impl ManagerEffects {
     /// Always delivers terminal cleanup before reporting a failed final update.
     pub(super) fn dispatch(self, now: Duration) -> Result<(), ManagerError> {
@@ -243,7 +222,6 @@ impl ManagerEffects {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 catchup view"))]
 pub(super) struct CatchupObservation {
     pub(super) quorum: Lsn,
     pub(super) all: Lsn,
@@ -265,7 +243,6 @@ struct Observation {
     normal: Option<(Option<Lsn>, Option<Lsn>)>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 primary owner"))]
 pub(super) struct ReplicaManager {
     queue: ReplicationQueueManager,
     local_replica_id: i64,
@@ -286,10 +263,6 @@ pub(super) struct ReplicaManager {
     catchup_wait: Option<CatchupWait>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 primary owner API")
-)]
 impl ReplicaManager {
     pub(super) fn from_transferred(
         queue_config: QueueConfig,
@@ -441,6 +414,7 @@ impl ReplicaManager {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn build_handle(&self, replica_id: i64) -> Option<BuildIdleHandle> {
         self.builds.get(&replica_id).cloned()
     }
@@ -474,6 +448,14 @@ impl ReplicaManager {
                     .iter()
                     .any(|member| member.replica_id == replica_id)
             })
+    }
+
+    pub(super) fn idle_replica_ids(&self) -> Vec<i64> {
+        self.idle
+            .iter()
+            .filter(|member| self.is_idle(member.replica_id))
+            .map(|member| member.replica_id)
+            .collect()
     }
 
     pub(super) fn build_identity(
@@ -749,6 +731,7 @@ impl ReplicaManager {
     }
 
     /// Caller-established seam retained for isolated quorum scenarios.
+    #[cfg(test)]
     pub(super) fn add_established_idle(
         &mut self,
         idle: EstablishedIdle,
@@ -1013,6 +996,7 @@ impl ReplicaManager {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn catchup_observation(&self) -> Result<Option<CatchupObservation>, ManagerError> {
         self.ensure_active()?;
         Ok(self
@@ -1055,6 +1039,7 @@ impl ReplicaManager {
         Ok((receiver, effects))
     }
 
+    #[cfg(test)]
     pub(super) fn cancel_catchup(&mut self) -> ManagerEffects {
         let mut effects = ManagerEffects::default();
         if let Some(wait) = self.catchup_wait.take() {

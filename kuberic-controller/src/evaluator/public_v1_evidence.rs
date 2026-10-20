@@ -400,6 +400,7 @@ fn consumer_accepts_call(consumer: PublicV1EvidenceConsumer, call: PublicV1CallK
                 | PublicV1CallKind::Configuration
                 | PublicV1CallKind::CatchUp
                 | PublicV1CallKind::Progress
+                | PublicV1CallKind::Remove
         ),
         PublicV1EvidenceConsumer::Failover => matches!(
             call,

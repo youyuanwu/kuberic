@@ -1,5 +1,10 @@
 # Service Fabric Stateful API Semantics and Kuberic Conformance
 
+> Historical pre-cutover contract and audit context. The engine-owned commit,
+> receipt, ordered progress-pair and credential-free transport statements below
+> are superseded by [Classic V1 Runtime](classic-v1-runtime.md). Preserve their
+> source/audit context; they do not describe the selected implementation.
+
 ## Scope
 
 This document summarizes the Service Fabric V1 semantics implemented by
@@ -60,8 +65,8 @@ applied/committed counters, then revalidates authority before entering the
 provider. The abandonment guard cannot claim the allocated LSN before that
 entry. Secondary ingress already publishes the same conservative fence before
 service delivery, without crediting unacknowledged persistence
-([primary:3076-3092](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L3076-L3092);
-[secondary:1186-1205](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1186-L1205)).
+([primary:3076-3092](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L3076-L3092);
+[secondary:1186-1205](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L1186-L1205)).
 
 Provider return, gate release, equal raw counters or caller cancellation is not
 quorum commitment. Ambiguous/error/dropped work stays fenced until verified
@@ -87,7 +92,7 @@ establish admission separately from the
 
 The built-in scalar `Replicator::current_progress` uses the **internal
 replicator role**, not the host's serving-role projection or access status
-([query:2765-2775](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2765-L2775);
+([query:2765-2775](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L2765-L2775);
 [contract:45-58](../../../kuberic-runtime/src/replicator/traits.rs#L45-L58)):
 
 | Internal state | Successful scalar result | Meaning |
@@ -100,11 +105,11 @@ replicator role**, not the host's serving-role projection or access status
 Primary local apply/publication precedes peer quorum; the acknowledged committed
 cache advances only after applicable PC/CC quorum, local durable commit, progress
 validation and exact-authority revalidation
-([write:3103-3195](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L3103-L3195)).
+([write:3103-3195](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L3103-L3195)).
 Cancellation or commit error can leave a retained applied suffix without advancing
 the scalar. Conversely a failed caller can have a real durable committed effect:
 drained epoch/configuration reconciliation validates and adopts provider commitment
-([reconcile:1012-1030](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1012-L1030)).
+([reconcile:1012-1030](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L1012-L1030)).
 The query is conservative acknowledged engine progress, not a fresh read of
 arbitrarily changed provider counters.
 
@@ -112,7 +117,7 @@ arbitrarily changed provider counters.
 Built-in reporting retains `first=committed,last=applied/accepted`; internal
 Primary reporting reads provider commitment while secondary reporting uses
 service-acknowledged counters
-([report pair:130-155](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L130-L155);
+([report pair:130-155](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L130-L155);
 [public report:669-712](../../../kuberic-runtime/src/host/hosting.rs#L669-L712)).
 An access-fenced internal Primary may therefore report Recovery with a retained
 tail larger than its scalar. Election/configuration use these reports, preserving
@@ -120,9 +125,9 @@ the tail; they do not infer serving permission from it.
 
 Open validates the retained suffix. Role change does not commit or truncate it;
 catch-up settlement uses the separate cached pair and exact retained operations
-([open:2532-2564](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2532-L2564);
-[role:2624-2675](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2624-L2675);
-[settlement:1562-1675](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1562-L1675)).
+([open:2532-2564](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L2532-L2564);
+[role:2624-2675](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L2624-L2675);
+[settlement:1562-1675](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L1562-L1675)).
 Thus retained `(applied=11,committed=10)` reports scalar 11 in opened None or
 secondary, 10 after internal promotion, and 11 only after successful settlement.
 The typed data-loss recipe samples progress after becoming internally Primary
@@ -321,8 +326,8 @@ root cancellation and is joined on registry shutdown. The listener join stays
 in a shared retained slot, so cancelling graceful Close cannot detach it and
 turn an empty listener slot into false containment
 ([terminal owner:29-74](../../../kuberic-runtime/src/host/public_lifecycle_terminal.rs#L29-L74);
-[listener join:431-505](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L431-L505);
-[runtime drain:155-186](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L155-L186)).
+[listener join:431-505](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L431-L505);
+[runtime drain:155-186](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L155-L186)).
 
 Supersession cancels authority-scoped operations before successor work proceeds.
 Root termination or a historical failure record alone is not descendant

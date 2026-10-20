@@ -18,16 +18,12 @@ use thiserror::Error;
 use crate::application::Lsn;
 
 use super::operation_queue::{CallbackControl, EnqueueError, OperationQueue, QueueConfig};
-use super::operation_stream::{
-    DispatchEntry, DispatchWake, OperationStream, SharedDispatchQueue, StreamError,
-};
+#[cfg(test)]
+use super::operation_stream::OperationStream;
+use super::operation_stream::{DispatchEntry, DispatchWake, SharedDispatchQueue, StreamError};
 use super::received_operation::{AckError, AckState, AckWork, ReceivedOperation};
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy receiver settings")
-)]
 pub(super) struct SecondaryCopyConfig {
     pub(super) initial_capacity: usize,
     pub(super) max_capacity: usize,
@@ -46,10 +42,6 @@ impl SecondaryCopyConfig {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy receiver errors")
-)]
 pub(super) enum SecondaryCopyError {
     #[error("copy queue capacities must be powers of two, with 1 < initial <= maximum")]
     InvalidCapacity,
@@ -66,23 +58,12 @@ pub(super) enum SecondaryCopyError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy ACK snapshot")
-)]
 pub(super) struct SecondaryCopyAck {
     pub(super) received: Lsn,
     pub(super) applied: Lsn,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "unselected V1 secondary copy admission observation"
-    )
-)]
 pub(super) enum CopyAdmission {
     #[default]
     None,
@@ -94,10 +75,6 @@ pub(super) enum CopyAdmission {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy ACK request")
-)]
 pub(super) struct CopyAckRequest {
     pub(super) check_pending_limit: bool,
 }
@@ -105,10 +82,6 @@ pub(super) struct CopyAckRequest {
 /// No transport send, copy-sender completion, host fault report or drain occurs here.
 #[must_use = "deliver copy ACK scheduling and copy-sender checks to their actual owners"]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy receiver handoffs")
-)]
 pub(super) struct SecondaryCopySignals {
     pub(super) ack: Option<CopyAckRequest>,
     pub(super) check_copy_sender: bool,
@@ -119,10 +92,6 @@ pub(super) struct SecondaryCopySignals {
 
 #[must_use = "dispatch wakeups, rejected inputs, errors and rooted ACK finishes outside the caller's guard"]
 #[derive(Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy receiver effects")
-)]
 pub(super) struct SecondaryCopyEffects {
     wakes: Vec<DispatchWake>,
     ack_work: Option<AckWork>,
@@ -133,10 +102,6 @@ pub(super) struct SecondaryCopyEffects {
     error: Option<SecondaryCopyError>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy effect delivery")
-)]
 impl SecondaryCopyEffects {
     pub(super) fn dispatch(self) -> Result<SecondaryCopySignals, SecondaryCopyError> {
         for wake in self.wakes {
@@ -166,10 +131,6 @@ struct RootedCallback {
     root: Arc<dyn Send + Sync>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy receiver")
-)]
 pub(super) struct SecondaryCopyReceiver {
     config: SecondaryCopyConfig,
     queue: Option<OperationQueue>,
@@ -187,10 +148,6 @@ pub(super) struct SecondaryCopyReceiver {
     rooted_callbacks: Vec<RootedCallback>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary copy receiver API")
-)]
 impl SecondaryCopyReceiver {
     pub(super) fn new(config: SecondaryCopyConfig) -> Result<Self, SecondaryCopyError> {
         if !config.is_valid() {
@@ -246,6 +203,7 @@ impl SecondaryCopyReceiver {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn stream(&self) -> OperationStream {
         self.dispatch.stream()
     }
@@ -254,6 +212,7 @@ impl SecondaryCopyReceiver {
         self.dispatch.clone()
     }
 
+    #[cfg(test)]
     pub(super) fn queue(&self) -> Option<&OperationQueue> {
         self.queue.as_ref()
     }
@@ -266,14 +225,17 @@ impl SecondaryCopyReceiver {
         self.queue.is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn copy_queue_closed(&self) -> bool {
         self.queue_closed
     }
 
+    #[cfg(test)]
     pub(super) fn stream_faulted(&self) -> bool {
         self.stream_faulted
     }
 
+    #[cfg(test)]
     pub(super) fn enqueued_end_of_stream(&self) -> bool {
         self.terminal_enqueued
     }

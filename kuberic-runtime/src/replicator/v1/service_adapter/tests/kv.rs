@@ -446,7 +446,7 @@ async fn cancelled_service_close_retains_work_and_abort_suppresses_late_success(
             assert!(kv.close().await.is_err());
             source.adapter.abort().unwrap();
             source.adapter.drain_retired_builds().await.unwrap();
-            assert_eq!(faults.lock().unwrap().len(), 1);
+            assert!(faults.lock().unwrap().is_empty());
         } else {
             gate.release();
             assert_eq!(write.wait().await.unwrap(), 1);

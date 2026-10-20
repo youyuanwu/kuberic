@@ -54,13 +54,12 @@ pub struct ReplicaDiagnostics {
     pub epoch: String,
     pub previous_configuration: Option<String>,
     pub current_configuration: Option<String>,
-    pub current_progress: i64,
+    pub current_progress: crate::protocol::public_operations::ProgressQueryResult,
     pub verified_replication_lsn: Option<i64>,
-    pub committed_lsn: i64,
+    pub catch_up_capability: crate::protocol::public_operations::ProgressQueryResult,
     pub read_status: String,
     pub write_status: String,
     pub catch_up_boundary_lsn: Option<i64>,
-    pub catch_up_complete: bool,
     pub scale_up_operation: Option<String>,
     pub retired: bool,
     pub pending_operation: Option<String>,
@@ -115,7 +114,7 @@ impl ReplicaHandle {
             read_status,
             write_status,
             current_progress,
-            committed_lsn,
+            catch_up_capability,
         ) = self.runtime.diagnostic_projection().await;
         Ok(ReplicaDiagnostics {
             replica_id: state.identity.local_identity.replica_id.value(),
@@ -141,11 +140,10 @@ impl ReplicaHandle {
             current_configuration: None,
             current_progress,
             verified_replication_lsn: None,
-            committed_lsn,
+            catch_up_capability,
             read_status: format!("{read_status:?}"),
             write_status: format!("{write_status:?}"),
             catch_up_boundary_lsn: None,
-            catch_up_complete: current_progress == committed_lsn,
             scale_up_operation: None,
             retired: state
                 .public_v1_operation_state
@@ -263,6 +261,10 @@ impl ReplicaHandle {
             Some(
                 crate::protocol::public_operations::PublicOperationProgram::Progress { .. }
                     | crate::protocol::public_operations::PublicOperationProgram::Build(_)
+                    | crate::protocol::public_operations::PublicOperationProgram::Swap {
+                        controller_composed: false,
+                        ..
+                    }
             )
         ) {
             self.runtime.fence_replacement_access().await;
@@ -823,6 +825,7 @@ where
             binding.clone(),
             self.config.replication_address,
         ));
+        runtime.configure_native_transport(Arc::from(self.config.bearer_token.as_str()))?;
         let agent = AgentService::new(
             store.clone(),
             runtime.clone(),

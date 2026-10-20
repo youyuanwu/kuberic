@@ -6,6 +6,8 @@ mod command;
 mod error;
 #[allow(clippy::disallowed_types)]
 pub(crate) mod hosting;
+#[allow(clippy::disallowed_types)]
+pub(crate) mod native_transport;
 mod operation;
 mod operation_recovery;
 #[allow(clippy::disallowed_types)]

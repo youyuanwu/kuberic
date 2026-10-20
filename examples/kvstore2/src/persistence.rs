@@ -26,6 +26,8 @@ pub enum Mutation {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedState {
+    #[serde(default)]
+    format_version: u32,
     values: BTreeMap<String, String>,
     #[serde(default)]
     base_values: BTreeMap<String, String>,
@@ -119,14 +121,6 @@ impl KvPersistence {
         self.fail_next_persist.store(true, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
-    pub(crate) fn stream_call_counts(&self) -> (u64, u64) {
-        (
-            self.stream_calls.0.load(Ordering::Acquire),
-            self.stream_calls.1.load(Ordering::Acquire),
-        )
-    }
-
     pub fn is_fresh_empty(root: impl AsRef<Path>) -> Result<bool> {
         let root = root.as_ref();
         if !root.exists() {
@@ -143,17 +137,50 @@ impl KvPersistence {
             .is_none())
     }
 
+    pub(crate) fn authorize_open(
+        &self,
+        mode: kuberic_runtime::application::OpenMode,
+    ) -> Result<()> {
+        if !self.state_path.is_file() {
+            if mode == kuberic_runtime::application::OpenMode::Existing {
+                return Err(RuntimeError::Application("established KV storage is missing classic V1 metadata; no empty state was created".into()));
+            }
+            self.persist(&self.state.lock().unwrap())?;
+        }
+        Ok(())
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
         let state_path = root.join("state.json");
-        let state = match std::fs::read(&state_path) {
+        let state: PersistedState = match std::fs::read(&state_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|error| RuntimeError::Application(error.to_string()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::read_dir(&root)
+                    .map_err(|error| RuntimeError::Application(error.to_string()))?
+                    .next()
+                    .transpose()
+                    .map_err(|error| RuntimeError::Application(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(RuntimeError::Application("established KV storage lacks classic V1 metadata; refusing empty-state recovery".into()));
+                }
+                PersistedState {
+                    format_version: 2,
+                    ..Default::default()
+                }
+            }
             Err(error) => return Err(RuntimeError::Application(error.to_string())),
         };
+        if state.format_version != 2 {
+            return Err(RuntimeError::Application(format!(
+                "unsupported KV storage format {}; expected classic V1 format 2; no migration or reset was performed",
+                state.format_version
+            )));
+        }
         Ok(Self {
             root,
             state_path,
@@ -324,7 +351,7 @@ impl KvPersistence {
             ));
         }
         serde_json::to_vec(&NativeSnapshot {
-            version: 1,
+            version: 2,
             lsn,
             values: Self::values_at(&state, lsn)?,
         })
@@ -336,7 +363,7 @@ impl KvPersistence {
         let snapshot: NativeSnapshot = serde_json::from_slice(&data)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
         let mut state = self.state.lock().unwrap();
-        if snapshot.version != 1
+        if snapshot.version != 2
             || snapshot.lsn < 0
             || snapshot.lsn < state.committed_lsn
             || (snapshot.lsn == state.committed_lsn
@@ -347,6 +374,7 @@ impl KvPersistence {
             ));
         }
         let candidate = PersistedState {
+            format_version: 2,
             values: snapshot.values.clone(),
             base_values: snapshot.values,
             base_lsn: snapshot.lsn,

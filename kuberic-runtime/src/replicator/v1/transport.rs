@@ -806,6 +806,14 @@ pub(super) async fn connect(
     binding: Binding,
     channel: tonic::transport::Channel,
 ) -> Result<ClientDriver, Terminal> {
+    connect_with_metadata(binding, channel, tonic::metadata::MetadataMap::new()).await
+}
+
+pub(super) async fn connect_with_metadata(
+    binding: Binding,
+    channel: tonic::transport::Channel,
+    metadata: tonic::metadata::MetadataMap,
+) -> Result<ClientDriver, Terminal> {
     let binding = Arc::new(binding);
     let limit = binding.shared.limits.max_wire_bytes;
     let mut client = wire::carrier_client::CarrierClient::new(channel)
@@ -819,7 +827,9 @@ pub(super) async fn connect(
         incoming: Box::pin(futures::stream::pending()),
         pending: None,
     });
-    match client.exchange(Request::new(request)).await {
+    let mut request = Request::new(request);
+    *request.metadata_mut() = metadata;
+    match client.exchange(request).await {
         Ok(response) => {
             driver.0.incoming = Box::pin(response.into_inner());
             Ok(driver)

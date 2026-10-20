@@ -115,38 +115,38 @@ fn public_v1_source_uses_no_native_evidence() {
                 "{relative} depends on private/native evidence: {forbidden}"
             );
         }
-
-        let stateless =
-            std::fs::read_to_string(manifest.join("src/replicator/stateless/mod.rs")).unwrap();
-        for forbidden in [
-            "ManagedReplicaStore",
-            "ReplicationProgressStore",
-            "LocalWriteJournal",
-            "BuildAuthorityStore",
-            "BuildProgressStore",
-            "authorize_request",
-            "bearer_token",
-        ] {
-            assert!(
-                !stateless.contains(forbidden),
-                "stateless preview depends on managed state or authorization: {forbidden}"
-            );
-        }
-        let hosting = std::fs::read_to_string(manifest.join("src/host/hosting.rs")).unwrap();
-        let projection = hosting
-            .split("refresh_replacement_projection")
-            .nth(1)
-            .unwrap()
-            .split("pub(crate) fn provider_writer_lease_count")
-            .next()
-            .unwrap();
-        let completed = projection.find("PublicOperationStage::Completed").unwrap();
-        let succeeded = projection
-            .find("PublicOperationDisposition::Succeeded")
-            .unwrap();
-        let granted = projection.find("AccessStatus::Granted").unwrap();
-        assert!(completed < granted && succeeded < granted);
     }
+    assert!(!manifest.join("src/replicator/stateless/mod.rs").exists());
+    let production =
+        std::fs::read_to_string(manifest.join("src/replicator/v1/service_adapter/production.rs"))
+            .unwrap();
+    for forbidden in [
+        "ManagedReplicaStore",
+        "ReplicationProgressStore",
+        "LocalWriteJournal",
+        "BuildAuthorityStore",
+        "BuildProgressStore",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "native composition depends on old engine state: {forbidden}"
+        );
+    }
+    let hosting = std::fs::read_to_string(manifest.join("src/host/hosting.rs")).unwrap();
+    let projection = hosting
+        .split("pub(crate) async fn refresh_replacement_projection")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) fn provider_writer_lease_count")
+        .next()
+        .unwrap();
+    let completed = projection.find("PublicOperationStage::Completed").unwrap();
+    let succeeded = projection
+        .find("PublicOperationDisposition::Succeeded")
+        .unwrap();
+    let access = projection.find("v1_lifecycle::activated_access").unwrap();
+    assert!(completed < access && succeeded < access);
+    assert!(projection.contains("if ready && native_live && role == selected_role"));
 
     let build_store =
         std::fs::read_to_string(manifest.join("src/host/public_build_store.rs")).unwrap();
@@ -178,7 +178,7 @@ fn public_v1_source_uses_no_native_evidence() {
 
 #[tokio::test]
 async fn public_v1_evidence_report_is_structurally_public_only() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 12);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 13);
     let root = test_root("report");
     let path = SqliteStore::metadata_database_path(&root);
     let resource_uid = ResourceUid::new("evidence-resource");
@@ -209,8 +209,10 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
                 write_status: AccessStatus::Granted,
                 progress: PublicProgress {
                     role: PublicProgressRole::Primary,
-                    first: 1,
-                    last: 1,
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(1),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(1),
                 },
             },
         )
@@ -323,8 +325,10 @@ async fn initializing_application_bindings_report_new_without_mutating_storage()
                 write_status: AccessStatus::NotPrimary,
                 progress: PublicProgress {
                     role: PublicProgressRole::Recovery,
-                    first: 0,
-                    last: 0,
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
                 },
             },
         )

@@ -40,6 +40,11 @@ use super::role::{DataLossEnd, Role, RoleConfig, RoleError, RoleReplicator, Role
 use super::secondary::{SecondaryError, SecondaryHandle};
 
 mod facade;
+mod production;
+mod production_transport;
+
+pub(crate) use production::create as create_production;
+pub(crate) use production_transport::{PUBLIC_V1_DATA_SERVICES, PublicV1DataServiceManifest};
 
 pub(crate) use facade::{Facade, FacadeSetup, FacadeState, matches_binding};
 
@@ -388,6 +393,17 @@ pub(super) struct ServiceHandle {
 }
 
 impl ServiceHandle {
+    pub(super) fn idle_replica_ids(&self) -> Result<Vec<i64>, AdapterError> {
+        match self.target()? {
+            Target::Primary(primary) => Ok(primary.idle_replica_ids()?),
+            Target::Secondary(_)
+            | Target::Unavailable(
+                RoleStatus::Opened | RoleStatus::Created | RoleStatus::Ready(Role::None),
+            ) => Ok(Vec::new()),
+            Target::Unavailable(status) => Err(AdapterError::InvalidState(status)),
+        }
+    }
+
     fn target(&self) -> Result<Target, AdapterError> {
         if self.aborted.load(Ordering::Acquire) {
             return Err(RoleError::Aborted.into());
@@ -403,6 +419,7 @@ impl ServiceHandle {
             WriteAccess::Granted => {}
             denied => return Err(AdapterError::WriteAccess(denied)),
         }
+
         match self.target()? {
             Target::Primary(primary) => {
                 let admitted = primary.enqueue(data, self.policy, self.limits)?;
@@ -413,6 +430,13 @@ impl ServiceHandle {
             }
             Target::Secondary(_) => Err(AdapterError::WriteAccess(WriteAccess::NotPrimary)),
             Target::Unavailable(status) => Err(AdapterError::InvalidState(status)),
+        }
+    }
+
+    pub(super) fn progress_query_readiness(&self) -> Result<bool, AdapterError> {
+        match self.target()? {
+            Target::Secondary(secondary) => Ok(secondary.progress_query_readiness()?),
+            Target::Primary(_) | Target::Unavailable(_) => Ok(true),
         }
     }
 

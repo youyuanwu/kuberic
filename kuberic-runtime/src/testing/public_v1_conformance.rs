@@ -1,9 +1,46 @@
-use std::io::Read;
+use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::Stdio;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-const CONFORMANCE_TIMEOUT: Duration = Duration::from_secs(270);
+// Start shared work at partition entry and leave process cleanup plus
+// startup/archive-owner cleanup inside the unchanged outer test timeout.
+const CONFORMANCE_OUTER_TIMEOUT: Duration = Duration::from_secs(270);
+const CONFORMANCE_TIMEOUT: Duration = Duration::from_secs(240);
+const CONFORMANCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const CONFORMANCE_OWNER_MARGIN: Duration = Duration::from_secs(20);
+#[cfg(unix)]
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy)]
+struct CommandDeadline {
+    work: Instant,
+    cleanup: Instant,
+}
+
+impl CommandDeadline {
+    fn new(started: Instant, work: Duration, cleanup: Duration) -> Self {
+        let work = started + work;
+        Self {
+            work,
+            cleanup: work + cleanup,
+        }
+    }
+}
+
+fn partition_deadline(started: Instant) -> CommandDeadline {
+    assert_eq!(
+        CONFORMANCE_TIMEOUT + CONFORMANCE_CLEANUP_TIMEOUT + CONFORMANCE_OWNER_MARGIN,
+        CONFORMANCE_OUTER_TIMEOUT,
+    );
+    CommandDeadline::new(started, CONFORMANCE_TIMEOUT, CONFORMANCE_CLEANUP_TIMEOUT)
+}
 
 #[derive(Debug)]
 struct BoundedOutput {
@@ -12,84 +49,277 @@ struct BoundedOutput {
     stderr: Vec<u8>,
 }
 
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    child: std::process::Child,
+    cleanup_deadline: Instant,
+    terminated: bool,
+    reaped: bool,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn terminate(&mut self) {
+        if !self.terminated {
+            self.cleanup_deadline = self
+                .cleanup_deadline
+                .min(Instant::now() + CONFORMANCE_CLEANUP_TIMEOUT);
+            terminate_process_tree(&mut self.child, self.cleanup_deadline);
+            self.terminated = true;
+        }
+    }
+
+    fn try_reap(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.reaped |= status.is_some();
+        Ok(status)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.terminate();
+            while Instant::now() < self.cleanup_deadline {
+                if !matches!(self.try_reap(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(
+                    PROCESS_POLL_INTERVAL.min(
+                        self.cleanup_deadline
+                            .saturating_duration_since(Instant::now()),
+                    ),
+                );
+            }
+            let _ = self.try_reap();
+        }
+    }
+}
+
+#[cfg(unix)]
+struct CapturedPipe<R> {
+    pipe: Option<R>,
+    bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl<R: Read + AsRawFd> CapturedPipe<R> {
+    fn new(pipe: R) -> Self {
+        Self {
+            pipe: Some(pipe),
+            bytes: Vec::new(),
+        }
+    }
+
+    fn read_ready(&mut self) -> io::Result<()> {
+        if let Some(pipe) = &mut self.pipe {
+            let mut bytes = [0; 8192];
+            match pipe.read(&mut bytes) {
+                Ok(0) => self.pipe = None,
+                Ok(count) => self.bytes.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn poll_output<O: Read + AsRawFd, E: Read + AsRawFd>(
+    stdout: &mut CapturedPipe<O>,
+    stderr: &mut CapturedPipe<E>,
+    deadline: Instant,
+) -> io::Result<()> {
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))]
+    type PollCount = std::os::raw::c_ulong;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "illumos",
+        target_os = "solaris"
+    )))]
+    type PollCount = std::os::raw::c_uint;
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, count: PollCount, timeout: i32) -> i32;
+    }
+    const INPUT: i16 = 1;
+    const ERROR: i16 = 8;
+    const HANGUP: i16 = 16;
+    const INVALID: i16 = 32;
+    let mut fds = [
+        PollFd {
+            fd: stdout.pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+            events: INPUT,
+            revents: 0,
+        },
+        PollFd {
+            fd: stderr.pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+            events: INPUT,
+            revents: 0,
+        },
+    ];
+    let timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(PROCESS_POLL_INTERVAL)
+        .as_millis() as i32;
+    // This owner is the only reader, so a ready pipe read cannot lose its data
+    // to another reader and block after poll. No reader thread outlives the budget.
+    let result = unsafe { poll(fds.as_mut_ptr(), fds.len() as PollCount, timeout) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    if fds.iter().any(|fd| fd.revents & INVALID != 0) {
+        return Err(io::Error::other("captured pipe descriptor became invalid"));
+    }
+    if fds[0].revents & (INPUT | ERROR | HANGUP) != 0 {
+        stdout.read_ready()?;
+    }
+    if fds[1].revents & (INPUT | ERROR | HANGUP) != 0 {
+        stderr.read_ready()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cleanup_command<O: Read + AsRawFd, E: Read + AsRawFd>(
+    owner: &mut ProcessGroupGuard,
+    stdout: &mut CapturedPipe<O>,
+    stderr: &mut CapturedPipe<E>,
+) -> Result<ExitStatus, String> {
+    owner.terminate();
+    let mut status = None;
+    let mut pipe_error = None;
+    loop {
+        if status.is_none() {
+            status = owner
+                .try_reap()
+                .map_err(|error| format!("child reap failed: {error}"))?;
+        }
+        if stdout.pipe.is_none()
+            && stderr.pipe.is_none()
+            && let Some(status) = status
+        {
+            return match pipe_error {
+                Some(error) => Err(format!("pipe drain failed: {error}")),
+                None => Ok(status),
+            };
+        }
+        if Instant::now() >= owner.cleanup_deadline {
+            return Err(format!(
+                "cleanup deadline exhausted: child reaped={}, undrained stdout={}, undrained stderr={}",
+                status.is_some(),
+                stdout.pipe.is_some(),
+                stderr.pipe.is_some(),
+            ));
+        }
+        if let Err(error) = poll_output(stdout, stderr, owner.cleanup_deadline) {
+            pipe_error = Some(error);
+            stdout.pipe = None;
+            stderr.pipe = None;
+        }
+    }
+}
+
+#[cfg(unix)]
 fn bounded_output(
     command: &mut Command,
-    deadline: Instant,
+    deadline: CommandDeadline,
     description: &str,
 ) -> Result<BoundedOutput, String> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+    if Instant::now() >= deadline.work {
+        return Err(format!(
+            "{description} exhausted the shared work deadline before spawn"
+        ));
     }
-    let mut child = command
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    let child = command
         .spawn()
         .map_err(|error| format!("{description} failed to start: {error}"))?;
-    let stdout = child
+    let mut owner = ProcessGroupGuard {
+        child,
+        cleanup_deadline: deadline.cleanup,
+        terminated: false,
+        reaped: false,
+    };
+    let stdout = owner
+        .child
         .stdout
         .take()
         .ok_or_else(|| format!("{description} did not capture stdout"))?;
-    let stderr = child
+    let stderr = owner
+        .child
         .stderr
         .take()
         .ok_or_else(|| format!("{description} did not capture stderr"))?;
-    let stdout = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut stdout = stdout;
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut stderr = stderr;
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("{description} status failed: {error}"))?
-        {
-            break status;
+    let mut stdout = CapturedPipe::new(stdout);
+    let mut stderr = CapturedPipe::new(stderr);
+    let failure = loop {
+        if Instant::now() >= deadline.work {
+            break "exceeded the shared work deadline".to_owned();
         }
-        if Instant::now() >= deadline {
-            terminate_process_tree(&mut child);
-            let status = child
-                .wait()
-                .map_err(|error| format!("{description} reap failed: {error}"))?;
-            let stdout = stdout
-                .join()
-                .map_err(|_| format!("{description} stdout reader panicked"))?
-                .map_err(|error| format!("{description} stdout read failed: {error}"))?;
-            let stderr = stderr
-                .join()
-                .map_err(|_| format!("{description} stderr reader panicked"))?
-                .map_err(|error| format!("{description} stderr read failed: {error}"))?;
-            return Err(format!(
-                "{description} exceeded the shared parent deadline \
-                 (terminated with {status}):\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            ));
+        // Retain the unreaped leader while either pipe is open, pinning its
+        // process-group identity even when it exits before its descendants.
+        if stdout.pipe.is_none() && stderr.pipe.is_none() {
+            match owner.try_reap() {
+                Ok(Some(status)) => {
+                    return Ok(BoundedOutput {
+                        status,
+                        stdout: stdout.bytes,
+                        stderr: stderr.bytes,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => break format!("child status failed: {error}"),
+            }
         }
-        std::thread::sleep(Duration::from_millis(10));
+        if let Err(error) = poll_output(&mut stdout, &mut stderr, deadline.work) {
+            break format!("pipe read failed: {error}");
+        }
     };
-    let stdout = stdout
-        .join()
-        .map_err(|_| format!("{description} stdout reader panicked"))?
-        .map_err(|error| format!("{description} stdout read failed: {error}"))?;
-    let stderr = stderr
-        .join()
-        .map_err(|_| format!("{description} stderr reader panicked"))?
-        .map_err(|error| format!("{description} stderr read failed: {error}"))?;
-    Ok(BoundedOutput {
-        status,
-        stdout,
-        stderr,
-    })
+    let cleanup = match cleanup_command(&mut owner, &mut stdout, &mut stderr) {
+        Ok(status) => format!("child reaped: {status}; captured pipes drained"),
+        Err(error) => error,
+    };
+    Err(format!(
+        "{description} {failure}; cleanup: {cleanup}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdout.bytes),
+        String::from_utf8_lossy(&stderr.bytes),
+    ))
 }
 
-fn terminate_process_tree(child: &mut std::process::Child) {
+#[cfg(not(unix))]
+fn bounded_output(
+    _: &mut Command,
+    _: CommandDeadline,
+    description: &str,
+) -> Result<BoundedOutput, String> {
+    Err(format!(
+        "{description} requires Unix process groups and bounded pipe polling"
+    ))
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(child: &mut std::process::Child, deadline: Instant) {
     #[cfg(unix)]
     {
         unsafe extern "C" {
@@ -101,12 +331,11 @@ fn terminate_process_tree(child: &mut std::process::Child) {
         unsafe {
             kill(process_group, SIGTERM);
         }
-        let grace = Instant::now() + Duration::from_millis(100);
+        let grace = (Instant::now() + Duration::from_millis(100)).min(deadline);
         while Instant::now() < grace {
-            if child.try_wait().ok().flatten().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(
+                Duration::from_millis(5).min(grace.saturating_duration_since(Instant::now())),
+            );
         }
         unsafe {
             kill(process_group, SIGKILL);
@@ -131,12 +360,17 @@ struct Gate {
 
 const PUBLIC_LIFECYCLE: &str = include_str!("../host/public_lifecycle.rs");
 const REPLICATOR: &str = include_str!("../replicator/mod.rs");
+const NATIVE_MODULE_SOURCE: &str = include_str!("../replicator/v1/mod.rs");
+const SERVICE_ADAPTER_SOURCE: &str = include_str!("../replicator/v1/service_adapter.rs");
+const NATIVE_PRODUCTION_SOURCE: &str =
+    include_str!("../replicator/v1/service_adapter/production.rs");
 const HOST_PROCESS: &str = include_str!("../host/process.rs");
 const PUBLIC_OPERATIONS: &str = include_str!("../protocol/public_operations.rs");
 const HOST_OPERATION: &str = include_str!("../host/operation.rs");
 const HOST_LIFECYCLE_PROGRAM: &str = include_str!("../host/public_lifecycle_program.rs");
 const CONTROL_SERVICE_SOURCE: &str = include_str!("../host/service.rs");
-const DATA_SERVICE_SOURCE: &str = include_str!("../replicator/stateless/mod.rs");
+const DATA_SERVICE_SOURCE: &str =
+    include_str!("../replicator/v1/service_adapter/production_transport.rs");
 const CONTROLLER_STARTUP_SOURCE: &str = include_str!("../../../kuberic-controller/src/lib.rs");
 const CONTROL_SERVICE_WITH_UNMANIFESTED_ENDPOINT: &str = concat!(
     include_str!("../host/service.rs"),
@@ -184,11 +418,14 @@ struct ProductionSources<'a> {
     host_lifecycle_program: &'a str,
     controller_manifest: controller_registration::PublicV1ControllerManifest,
     control_service_manifest: crate::host::service::PublicV1ControlServiceManifest,
-    data_service_manifest: crate::replicator::stateless::PublicV1DataServiceManifest,
+    data_service_manifest: crate::replicator::v1::PublicV1DataServiceManifest,
     factory_registrations: Vec<crate::replicator::PublicV1FactoryRegistration>,
     control_service_source: &'a str,
     data_service_source: &'a str,
     factory_source: &'a str,
+    native_module_source: &'a str,
+    service_adapter_source: &'a str,
+    native_production_source: &'a str,
     controller_startup_source: &'a str,
     host_attachments: &'a [&'a str],
     report_branches: &'a [&'a str],
@@ -205,13 +442,16 @@ fn production_sources() -> ProductionSources<'static> {
         host_lifecycle_program: HOST_LIFECYCLE_PROGRAM,
         controller_manifest: controller_registration::PUBLIC_V1_CONTROLLER,
         control_service_manifest: crate::host::service::PUBLIC_V1_CONTROL_SERVICES,
-        data_service_manifest: crate::replicator::stateless::PUBLIC_V1_DATA_SERVICES,
+        data_service_manifest: crate::replicator::v1::PUBLIC_V1_DATA_SERVICES,
         factory_registrations: crate::replicator::PUBLIC_V1_FACTORIES
             .registrations()
             .to_vec(),
         control_service_source: CONTROL_SERVICE_SOURCE,
         data_service_source: DATA_SERVICE_SOURCE,
         factory_source: REPLICATOR,
+        native_module_source: NATIVE_MODULE_SOURCE,
+        service_adapter_source: SERVICE_ADAPTER_SOURCE,
+        native_production_source: NATIVE_PRODUCTION_SOURCE,
         controller_startup_source: CONTROLLER_STARTUP_SOURCE,
         host_attachments: crate::host::hosting::PUBLIC_V1_HOST_ATTACHMENTS,
         report_branches: crate::host::service::PUBLIC_V1_AGENT_REPORT_BRANCHES,
@@ -256,31 +496,47 @@ fn runtime_service_sources_are_manifest_bound(sources: &ProductionSources<'_>) -
         && occurrences(&data, ".add_service(") == 1
         && occurrences(
             &data,
-            ".add_service(PUBLIC_V1_DATA_SERVICES.replication_data(service))",
+            ".add_service(PUBLIC_V1_DATA_SERVICES.carrier(service))",
         ) == 1
-        && occurrences(
-            &data,
-            "proto::replication_data_server::ReplicationDataServer::new(service)",
-        ) == 1
+        && occurrences(&data, "wire::carrier_server::CarrierServer::new(service)") == 1
 }
 
 fn factory_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
     let factory = compact_source(sources.factory_source);
-    let stateless = compact_source(sources.data_service_source);
-    occurrences(&factory, "PUBLIC_V1_FACTORIES.construct_default(storage)") == 1
+    let native = compact_source(sources.native_module_source);
+    let adapter = compact_source(sources.service_adapter_source);
+    let production = compact_source(sources.native_production_source);
+    occurrences(&factory, "PUBLIC_V1_FACTORIES.construct_default()") == 1
         && occurrences(
             &factory,
-            "PUBLIC_V1_FACTORIES.construct_stateless(self.storage.clone())",
+            "v1::create_production(context,state_provider,settings).await",
         ) == 1
+        && !factory.contains("DurableState")
+        && !factory.contains("StatelessReplicatorFactory")
+        && !factory.contains("pubmodstateless;")
+        && occurrences(&factory, "Factory::") == 0
+        && occurrences(&native, "pub(crate)useservice_adapter::create_production;") == 1
         && occurrences(
-            &factory,
-            "stateless::StatelessReplicatorFactory::from_public_v1_manifest(storage)",
+            &adapter,
+            "pub(crate)useproduction::createascreate_production;",
         ) == 1
-        && occurrences(
-            &stateless,
-            "super::PUBLIC_V1_FACTORIES.construct_stateless(storage)",
-        ) == 1
-        && occurrences(&factory, "Factory::") + occurrences(&stateless, "Factory::") == 1
+        && occurrences(&adapter, "modproduction;") == 1
+        && occurrences(&adapter, "modproduction_transport;") == 1
+        && [
+            "context.claim_native_creation()?",
+            "Transport::start(",
+            "ServiceReplicator::new(",
+            "FacadeSetup::new(adapter,config).start(",
+            "Arc::new(Production{",
+            "implReplicatorforProduction{",
+            "implPrimaryReplicatorforProduction{",
+            "implStateReplicatorforProduction{",
+            "implNativeRuntimeControlforProduction{",
+            "Ok(ReplicatorInterfaces::primary(",
+            ".with_native_runtime_control(owner)",
+        ]
+        .into_iter()
+        .all(|binding| occurrences(&production, binding) == 1)
 }
 
 fn controller_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
@@ -434,15 +690,11 @@ pub fn validate_replacement_ownership_inventory(
             "replacement {category} registrations changed: {observed:?}"
         ))
     };
-    if inventory.factories.len() != 2
+    if inventory.factories.len() != 1
         || !inventory
             .factories
             .iter()
             .any(|name| name == "DefaultReplicatorFactory")
-        || !inventory
-            .factories
-            .iter()
-            .any(|name| name == "StatelessReplicatorFactory")
     {
         return reject("factory", &inventory.factories);
     }
@@ -450,7 +702,7 @@ pub fn validate_replacement_ownership_inventory(
         || !inventory.services.iter().all(|name| {
             matches!(
                 name.as_str(),
-                "AgentControlServer" | "ReplicaPeerServer" | "ReplicationDataServer"
+                "AgentControlServer" | "ReplicaPeerServer" | "CarrierServer"
             )
         })
     {
@@ -460,7 +712,7 @@ pub fn validate_replacement_ownership_inventory(
         || !inventory.host_attachments.iter().all(|name| {
             matches!(
                 name.as_str(),
-                "PrimaryReplicator" | "Replicator" | "StateProvider" | "StatelessRuntimeControl"
+                "PrimaryReplicator" | "Replicator" | "StateProvider" | "NativeRuntimeControl"
             )
         })
     {
@@ -530,17 +782,45 @@ fn replacement_ownership_gate() {
         crate::host::service::PUBLIC_V1_CONTROL_SERVICES,
     )
     .unwrap();
-    crate::replicator::stateless::validate_public_v1_data_services(
-        crate::replicator::stateless::PUBLIC_V1_DATA_SERVICES,
-    )
-    .unwrap();
+    assert_eq!(
+        crate::replicator::v1::PUBLIC_V1_DATA_SERVICES
+            .registrations()
+            .map(|registration| registration.name()),
+        ["CarrierServer"],
+    );
     controller_registration::validate_public_v1_controller_registrations(
         controller_registration::PUBLIC_V1_CONTROLLER,
     )
     .unwrap();
     let inventory = replacement_ownership_inventory();
     validate_replacement_ownership_inventory(&inventory).unwrap();
+    let alternate_native_owner = SERVICE_ADAPTER_SOURCE.replacen(
+        "production::create as create_production",
+        "alternate::create as create_production",
+        1,
+    );
+    let alternate_native_factory = discover_inventory(&ProductionSources {
+        service_adapter_source: &alternate_native_owner,
+        ..production_sources()
+    });
+    let alternate_composition = NATIVE_PRODUCTION_SOURCE.replacen(
+        ".with_native_runtime_control(owner)",
+        ".with_alternate_runtime_control(owner)",
+        1,
+    );
+    let alternate_native_composition = discover_inventory(&ProductionSources {
+        native_production_source: &alternate_composition,
+        ..production_sources()
+    });
     for (category, mutation) in [
+        (
+            "unmanifested native factory owner",
+            alternate_native_factory,
+        ),
+        (
+            "unmanifested native interface composition",
+            alternate_native_composition,
+        ),
         (
             "unmanifested runtime service",
             replacement_ownership_inventory_with_extra_endpoint_fixture(),
@@ -572,7 +852,10 @@ const GATES: [Gate; 16] = [
         owner: "lifecycle",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "replicator::v1::role::tests::initial_primary_queries_provider_before_epoch_and_requires_configuration",
+            "native_build_callback_receives_invalid_progress_and_exact_frozen_idle_target",
+            "retained_secondary_promotion_preserves_acknowledged_bytes_and_replaces_service_location",
+            "sf10_quiet_snapshot_build_activates_without_writes_or_fabricated_progress",
         ],
         expected: "primary role completes before primary configuration",
         eligibility: contract_gate,
@@ -583,7 +866,7 @@ const GATES: [Gate; 16] = [
         owner: "recovery",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome",
+            "hosted_public_v1_authorized_data_loss_preserves_effective_outcomes_and_history_scope",
         ],
         expected: "logical authorization distinguishes every callback outcome",
         eligibility: contract_gate,
@@ -594,7 +877,8 @@ const GATES: [Gate; 16] = [
         owner: "lifecycle",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "native_same_role_secondary_epoch_fences_predecessor_binding_and_sending_epoch",
+            "public_v1_peer_withdrawal_advances_epoch_without_role_replay",
         ],
         expected: "same-role epoch renewal fences predecessor traffic",
         eligibility: contract_gate,
@@ -605,7 +889,9 @@ const GATES: [Gate; 16] = [
         owner: "configuration",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "sf10_quiet_snapshot_build_activates_without_writes_or_fabricated_progress",
+            "three_replica_native_quorum_ignores_hung_minority_and_rejects_secondary_origin",
+            "native_configuration_dispatch_rejects_self_idle_and_nonmember_descriptors",
         ],
         expected: "configuration contains only exact ready remote peers",
         eligibility: contract_gate,
@@ -616,22 +902,27 @@ const GATES: [Gate; 16] = [
         owner: "build",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion",
+            "native_build_callback_receives_invalid_progress_and_exact_frozen_idle_target",
+            "hosted_operation_stream_copy_and_eof_wait_for_service_owned_snapshot_ack",
+            "successor_inbound_build_retires_native_receiver_instead_of_resetting_metadata",
+            "native_build_binding_pins_frozen_source_address_even_when_source_is_unreachable",
         ],
         expected: "build target is idle, outside PC/CC, and has invalid progress",
         eligibility: contract_gate,
     },
     Gate {
         id: "KSF-06",
-        name: "build_is_cancelled_and_drained_before_remove",
+        name: "idle_removal_cancels_session_and_retains_callback_drain_ownership",
         owner: "build",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "hung_build_peer_is_bounded_and_drained_before_successor_close",
-            "hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion",
-            "hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session",
+            "native_remove_cancels_session_without_late_install_and_close_drains_retained_provider",
+            "hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline",
+            "hosted_sf06_close_waits_for_synchronous_service_effect_even_if_observer_is_dropped",
+            "hosted_operation_stream_close_and_abort_drain_with_dequeued_or_unconsumed_work",
+            "exact_idle_removal_does_not_reauthorize_retired_service_work",
         ],
-        expected: "build root and descendants drain before removal",
+        expected: "Remove cancels the exact idle session without late install; retained callbacks drain under Close/Abort ownership",
         eligibility: contract_gate,
     },
     Gate {
@@ -640,7 +931,7 @@ const GATES: [Gate; 16] = [
         owner: "swap",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "native_swap_freezes_specific_quorum_and_conservative_all_fallback_inputs",
         ],
         expected: "specific quorum and fallback are captured replay inputs",
         eligibility: contract_gate,
@@ -652,8 +943,14 @@ const GATES: [Gate; 16] = [
         postgres_scenarios: &["public_v1_postgres_data_loss_history_and_replay"],
         replacement_scenarios: &[
             "public_v1_history_partition_seed_is_shared",
-            "ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress",
-            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "native_query_outcome_matrix_survives_rpc_persistence_and_controller_eligibility",
+            "native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_build",
+            "native_query_rejoin_matrix_distinguishes_source_capability_from_target_current",
+            "native_query_outcomes_remain_independent_through_host_wire_and_controller_eligibility",
+            "hosted_public_v1_authorized_data_loss_preserves_effective_outcomes_and_history_scope",
+            "read_fencing::sf_d02_native_quorum_progress_is_not_a_service_commit_or_caller_cancellation_oracle",
+            "read_fencing::sf11_acknowledged_prefix_6_through_10_survives_ambiguous_11_without_history_fabrication",
+            "production_carrier_rejects_crossed_process_storage_history_epoch_and_endpoint",
         ],
         expected: "numeric progress is comparable only inside one history",
         eligibility: contract_gate,
@@ -664,9 +961,9 @@ const GATES: [Gate; 16] = [
         owner: "construction",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth",
+            "production_config_has_no_protocol_selector_or_application_commit_oracle",
         ],
-        expected: "stateless Public V1 is the sole built-in default",
+        expected: "private native Public V1 is the sole built-in default",
         eligibility: replacement_ownership_gate,
     },
     Gate {
@@ -675,7 +972,7 @@ const GATES: [Gate; 16] = [
         owner: "transport",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "public_v1_open_owns_registration_listener_and_writer_exactly_once",
+            "public_v1_open_owns_one_registration_listener_and_writer_and_close_failure_is_retained",
         ],
         expected: "public endpoint lifetime follows Replicator lifecycle",
         eligibility: replacement_ownership_gate,
@@ -685,7 +982,10 @@ const GATES: [Gate; 16] = [
         name: "role_address_is_published_and_cleared",
         owner: "reporting",
         postgres_scenarios: &[],
-        replacement_scenarios: &["hosted_public_v1_role_address_publishes_replaces_and_clears"],
+        replacement_scenarios: &[
+            "retained_secondary_promotion_preserves_acknowledged_bytes_and_replaces_service_location",
+            "public_factory_primary_process_renewal_retains_exact_role_address_authority",
+        ],
         expected: "exact role completion publishes and clears address",
         eligibility: contract_gate,
     },
@@ -695,7 +995,9 @@ const GATES: [Gate; 16] = [
         owner: "operation",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "hosted_public_v1_supersession_cancels_build_root_and_drains_descendant_before_close",
+            "hosted_sf06_close_waits_for_synchronous_service_effect_even_if_observer_is_dropped",
+            "successor_copy_requires_replacement_without_exposing_held_service_install",
+            "hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline",
         ],
         expected: "supersession contains callback roots and descendants",
         eligibility: contract_gate,
@@ -706,9 +1008,12 @@ const GATES: [Gate; 16] = [
         owner: "fault",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_retirement",
-            "hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement",
-            "hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion",
+            "native_transient_fault_restarts_same_storage_under_exact_session_renewal",
+            "native_controller_unreachable_survivor_fences_until_exact_return_or_explicit_retirement",
+            "primary_commit_failure_contains_the_ambiguous_native_quorum_success",
+            "successor_copy_requires_replacement_without_exposing_held_service_install",
+            "service_rejects_corrupt_copy_and_conflicting_retained_history_before_ack",
+            "retained_service_state_reopens_without_replaying_interrupted_application_children",
         ],
         expected: "fault closes access and targets one exact incarnation",
         eligibility: contract_gate,
@@ -719,7 +1024,9 @@ const GATES: [Gate; 16] = [
         owner: "close",
         postgres_scenarios: &["public_v1_postgres_contained_close"],
         replacement_scenarios: &[
-            "hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children",
+            "public_v1_open_owns_one_registration_listener_and_writer_and_close_failure_is_retained",
+            "hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline",
+            "terminal_close_restarts_fenced_without_replaying_application_open",
         ],
         expected: "failed close preserves child diagnostics after abort containment",
         eligibility: contract_gate,
@@ -730,7 +1037,14 @@ const GATES: [Gate; 16] = [
         owner: "replay",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children",
+            "in_process::journeys::sf01_primary_local_commit_isolation_and_abort_never_late_grants_success",
+            "in_process::journeys::failover_recreation_at_persisted_promotion_preserves_effects",
+            "in_process::journeys::failover_recreation_after_durable_promotion_consumes_completion_once",
+            "in_process::journeys::switchover_recreation_after_catch_up_resumes_accepted_handoff",
+            "in_process::journeys::switchover_recreation_after_durable_handoff_resumes_promotion",
+            "public_v1_open_owns_one_registration_listener_and_writer_and_close_failure_is_retained",
+            "exact_idle_removal_does_not_reauthorize_retired_service_work",
+            "terminal_close_restarts_fenced_without_replaying_application_open",
             "public_v1_replacement_schema_failed_build_containment_survives_reopen",
             "public_v1_replacement_schema_rebuild_then_cancellation_survives_reopen",
             "public_v1_history_data_loss_attempt_renews_higher_epoch",
@@ -746,7 +1060,13 @@ const GATES: [Gate; 16] = [
         owner: "cutover",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "replication_ingress_accepts_only_exact_current_primary_in_three_replica_set",
+            "three_replica_native_quorum_ignores_hung_minority_and_rejects_secondary_origin",
+            "production_carrier_rejects_crossed_process_storage_history_epoch_and_endpoint",
+            "native_carrier_bad_payload_and_wrong_sender_cannot_publish_service_progress",
+            "native_replication_body_epochs_cannot_escape_a_valid_admitted_binding",
+            "native_build_start_and_copy_body_epochs_are_checked_before_receiver_mutation",
+            "native_build_binding_pins_frozen_source_address_even_when_source_is_unreachable",
+            "successor_inbound_build_retires_native_receiver_instead_of_resetting_metadata",
         ],
         expected: "current artifact inventories and rejects legacy continuation owners",
         eligibility: replacement_ownership_gate,
@@ -760,13 +1080,271 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn scenario_filter(scenarios: fn(&Gate) -> &'static [&'static str]) -> String {
+const NATIVE_PARTITION: &str = "native-controller";
+const NATIVE_PACKAGES: &[&str] = &["kuberic-runtime", "kuberic-controller"];
+const SERVICE_PACKAGES: &[&str] = &["kuberic-level-tests"];
+
+// Real service recreation journeys partition validation work, not native behavior.
+// Each retains the same shared inventory/execution budget instead of extending it.
+const SERVICE_PARTITIONS: &[(&str, &str)] = &[
+    (
+        "failover-after-durable-promotion",
+        "in_process::journeys::failover_recreation_after_durable_promotion_consumes_completion_once",
+    ),
+    (
+        "failover-at-persisted-promotion",
+        "in_process::journeys::failover_recreation_at_persisted_promotion_preserves_effects",
+    ),
+    (
+        "ambiguous-commit-abort",
+        "in_process::journeys::sf01_primary_local_commit_isolation_and_abort_never_late_grants_success",
+    ),
+    (
+        "switchover-after-catch-up",
+        "in_process::journeys::switchover_recreation_after_catch_up_resumes_accepted_handoff",
+    ),
+    (
+        "switchover-after-durable-handoff",
+        "in_process::journeys::switchover_recreation_after_durable_handoff_resumes_promotion",
+    ),
+];
+
+#[derive(Clone, Debug)]
+struct ExecutionPartition {
+    id: &'static str,
+    packages: &'static [&'static str],
+    scenarios: Vec<&'static str>,
+}
+
+fn registered_replacement_scenarios() -> BTreeSet<&'static str> {
     GATES
         .iter()
-        .flat_map(|gate| scenarios(gate).iter())
-        .map(|scenario| format!("test({scenario})"))
+        .flat_map(|gate| gate.replacement_scenarios.iter().copied())
+        .collect()
+}
+
+fn execution_partitions() -> Vec<ExecutionPartition> {
+    let native = ExecutionPartition {
+        id: NATIVE_PARTITION,
+        packages: NATIVE_PACKAGES,
+        scenarios: registered_replacement_scenarios()
+            .into_iter()
+            .filter(|scenario| !scenario.starts_with("in_process::journeys::"))
+            .collect(),
+    };
+    std::iter::once(native)
+        .chain(
+            SERVICE_PARTITIONS
+                .iter()
+                .map(|&(id, scenario)| ExecutionPartition {
+                    id,
+                    packages: SERVICE_PACKAGES,
+                    scenarios: vec![scenario],
+                }),
+        )
+        .collect()
+}
+
+fn validate_execution_partitions(partitions: &[ExecutionPartition]) -> Result<(), String> {
+    let registered = registered_replacement_scenarios();
+    let mut ids = BTreeSet::new();
+    let mut observed = BTreeSet::new();
+    for partition in partitions {
+        if !ids.insert(partition.id) || partition.scenarios.is_empty() {
+            return Err(format!(
+                "duplicate or empty execution partition: {}",
+                partition.id
+            ));
+        }
+        if partition.id == NATIVE_PARTITION {
+            if partition.packages != NATIVE_PACKAGES
+                || partition
+                    .scenarios
+                    .iter()
+                    .any(|name| name.starts_with("in_process::journeys::"))
+            {
+                return Err("native partition crossed its package/scenario boundary".into());
+            }
+        } else {
+            let Some(&(_, scenario)) = SERVICE_PARTITIONS
+                .iter()
+                .find(|&&(id, _)| id == partition.id)
+            else {
+                return Err(format!(
+                    "unregistered execution partition: {}",
+                    partition.id
+                ));
+            };
+            if partition.packages != SERVICE_PACKAGES || partition.scenarios != [scenario] {
+                return Err(format!(
+                    "service partition must select its one exact journey: {}",
+                    partition.id
+                ));
+            }
+        }
+        for &scenario in &partition.scenarios {
+            if !registered.contains(scenario) || !observed.insert(scenario) {
+                return Err(format!(
+                    "unregistered or overlapping partition scenario: {scenario}"
+                ));
+            }
+        }
+    }
+    let expected_ids = std::iter::once(NATIVE_PARTITION)
+        .chain(SERVICE_PARTITIONS.iter().map(|&(id, _)| id))
+        .collect::<BTreeSet<_>>();
+    if ids != expected_ids || observed != registered {
+        return Err(format!(
+            "partition coverage mismatch: missing partitions {:?}, missing scenarios {:?}, extra scenarios {:?}",
+            expected_ids.difference(&ids).collect::<Vec<_>>(),
+            registered.difference(&observed).collect::<Vec<_>>(),
+            observed.difference(&registered).collect::<Vec<_>>(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn assert_public_v1_conformance_partition_coverage() {
+    let partitions = execution_partitions();
+    validate_execution_partitions(&partitions).unwrap();
+
+    let mut omitted = partitions.clone();
+    omitted[0].scenarios.pop();
+    let mut overlapping = partitions.clone();
+    overlapping[0].scenarios.push(partitions[0].scenarios[0]);
+    let mut missing_partition = partitions.clone();
+    missing_partition.pop();
+    let mut unregistered = partitions.clone();
+    unregistered[0].scenarios.push("unregistered-observation");
+    let mut broadened = partitions.clone();
+    broadened[1].packages = NATIVE_PACKAGES;
+    for mutation in [
+        omitted,
+        overlapping,
+        missing_partition,
+        unregistered,
+        broadened,
+    ] {
+        assert!(
+            validate_execution_partitions(&mutation).is_err(),
+            "execution partition validator accepted missing, overlapping, or broadened coverage",
+        );
+    }
+
+    assert_exact_inventory_fixtures();
+}
+
+fn scenario_filter(scenarios: &[&str]) -> String {
+    scenarios
+        .iter()
+        .map(|scenario| format!("test(={scenario})"))
         .collect::<Vec<_>>()
         .join(" or ")
+}
+
+fn validate_scenario_inventory(
+    inventory: &serde_json::Value,
+    partition: &ExecutionPartition,
+) -> Result<(), String> {
+    let expected = partition
+        .scenarios
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    let suites = inventory
+        .get("rust-suites")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("conformance inventory has no Rust suites")?;
+    let mut selected = BTreeSet::new();
+    for (binary, suite) in suites {
+        let package = suite
+            .get("package-name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("conformance inventory has no package name")?;
+        let cases = suite
+            .get("testcases")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("conformance inventory has no test cases")?;
+        for (name, case) in cases {
+            if case["filter-match"]["status"] != "matches" {
+                continue;
+            }
+            if case.get("ignored").and_then(serde_json::Value::as_bool) != Some(false) {
+                return Err(format!(
+                    "partition {} selected an ignored case: {binary}::{name}",
+                    partition.id
+                ));
+            }
+            if !partition.packages.contains(&package) || !expected.contains(name) {
+                return Err(format!(
+                    "partition {} selected an unexpected case: {binary}::{name}",
+                    partition.id
+                ));
+            }
+            if !selected.insert(name.clone()) {
+                return Err(format!(
+                    "partition {} selected the same observation in multiple binaries: {name}",
+                    partition.id
+                ));
+            }
+        }
+    }
+    if selected != expected {
+        return Err(format!(
+            "partition {} omitted exact scenarios: {:?}",
+            partition.id,
+            expected.difference(&selected).collect::<Vec<_>>(),
+        ));
+    }
+    Ok(())
+}
+
+fn assert_exact_inventory_fixtures() {
+    let partition = ExecutionPartition {
+        id: "exact-inventory-fixture",
+        packages: NATIVE_PACKAGES,
+        scenarios: vec!["exact-observation"],
+    };
+    let inventory = serde_json::json!({
+        "rust-suites": {
+            "kuberic-runtime::fixture": {
+                "package-name": "kuberic-runtime",
+                "testcases": {
+                    "exact-observation": {
+                        "ignored": false,
+                        "filter-match": {"status": "matches"},
+                    },
+                },
+            },
+        },
+    });
+    validate_scenario_inventory(&inventory, &partition).unwrap();
+    let mut omitted = inventory.clone();
+    omitted["rust-suites"]["kuberic-runtime::fixture"]["testcases"]
+        .as_object_mut()
+        .unwrap()
+        .clear();
+    let mut ignored = inventory.clone();
+    ignored["rust-suites"]["kuberic-runtime::fixture"]["testcases"]["exact-observation"]["ignored"] =
+        true.into();
+    let mut suffix = inventory.clone();
+    let cases = suffix["rust-suites"]["kuberic-runtime::fixture"]["testcases"]
+        .as_object_mut()
+        .unwrap();
+    let case = cases.remove("exact-observation").unwrap();
+    cases.insert("exact-observation-suffix".into(), case);
+    let mut foreign = inventory.clone();
+    foreign["rust-suites"]["kuberic-runtime::fixture"]["package-name"] =
+        "kuberic-level-tests".into();
+    let mut duplicated = inventory.clone();
+    duplicated["rust-suites"]["kuberic-runtime::duplicate"] =
+        inventory["rust-suites"]["kuberic-runtime::fixture"].clone();
+    for mutation in [omitted, ignored, suffix, foreign, duplicated] {
+        assert!(
+            validate_scenario_inventory(&mutation, &partition).is_err(),
+            "exact inventory validator accepted missing, ignored, prefix-only, crossed, or duplicate evidence",
+        );
+    }
 }
 
 fn conformance_command(action: &str, root: &Path, archive: Option<&Path>) -> Command {
@@ -781,19 +1359,18 @@ fn conformance_command(action: &str, root: &Path, archive: Option<&Path>) -> Com
     command
 }
 
-fn run_scenarios(
-    subject: &str,
-    packages: &[&str],
-    scenarios: fn(&Gate) -> &'static [&'static str],
-    deadline: Instant,
-) {
+fn run_scenarios(subject: &str, partition: &ExecutionPartition, deadline: CommandDeadline) {
     let root = workspace_root();
-    let packages = packages
+    let packages = partition
+        .packages
         .iter()
         .map(|package| format!("package(={package})"))
         .collect::<Vec<_>>()
         .join(" or ");
-    let filter = format!("({packages}) and ({})", scenario_filter(scenarios));
+    let filter = format!(
+        "({packages}) and ({})",
+        scenario_filter(&partition.scenarios)
+    );
     let archive = std::env::var_os("NEXTEST_ARCHIVE")
         .map(PathBuf::from)
         .map(|path| {
@@ -806,12 +1383,20 @@ fn run_scenarios(
         .filter(|path| path.is_file());
     let mut list = conformance_command("list", &root, archive.as_deref());
     list.args([
+        "--message-format",
+        "json",
         "--profile",
         "ordinary",
         "--ignore-default-filter",
         "-E",
         &filter,
     ]);
+    let inventory_started = Instant::now();
+    eprintln!(
+        "Public V1 partition {}: inventory and serial execution share {:?}",
+        partition.id,
+        deadline.work.saturating_duration_since(inventory_started),
+    );
     let list = bounded_output(&mut list, deadline, "list Public V1 conformance scenarios")
         .unwrap_or_else(|error| panic!("{error}"));
     assert!(
@@ -819,17 +1404,14 @@ fn run_scenarios(
         "replacement Public V1 conformance inventory failed: {}",
         String::from_utf8_lossy(&list.stderr)
     );
-    let inventory = String::from_utf8(list.stdout).expect("nextest inventory is UTF-8");
-    for gate in &GATES {
-        for scenario in scenarios(gate) {
-            assert!(
-                inventory.contains(scenario),
-                "{} scenario is not selected: {}",
-                gate.id,
-                scenario
-            );
-        }
-    }
+    let inventory = serde_json::from_slice(&list.stdout).expect("nextest inventory is JSON");
+    validate_scenario_inventory(&inventory, partition).unwrap();
+    eprintln!(
+        "Public V1 partition {}: exact inventory validated in {:?}; remaining shared budget {:?}",
+        partition.id,
+        inventory_started.elapsed(),
+        deadline.work.saturating_duration_since(Instant::now()),
+    );
 
     let mut run = conformance_command("run", &root, archive.as_deref());
     run.args(["-j", "1"]);
@@ -853,10 +1435,14 @@ fn run_scenarios(
         "-E",
         &filter,
     ]);
+    let execution_started = Instant::now();
     let result = bounded_output(
         &mut run,
         deadline,
-        &format!("run {subject} Public V1 conformance scenarios"),
+        &format!(
+            "run {subject} Public V1 conformance partition {}",
+            partition.id
+        ),
     );
     if let Some(extract) = extract {
         let _ = std::fs::remove_dir_all(extract);
@@ -867,6 +1453,13 @@ fn run_scenarios(
         "{subject} Public V1 conformance scenarios failed:\n{}\n{}",
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
+    );
+    eprintln!(
+        "Public V1 partition {}: serial execution passed in {:?}\n{}\n{}",
+        partition.id,
+        execution_started.elapsed(),
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
     );
 }
 
@@ -903,6 +1496,117 @@ mod bounded_process_tests {
     }
 
     #[test]
+    fn partition_budget_reserves_cleanup_and_outer_owner_margin() {
+        let started = Instant::now();
+        let deadline = partition_deadline(started);
+        assert_eq!(
+            deadline.work.duration_since(started),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            deadline.cleanup.duration_since(deadline.work),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            (started + CONFORMANCE_OUTER_TIMEOUT).duration_since(deadline.cleanup),
+            Duration::from_secs(20),
+        );
+    }
+
+    #[test]
+    fn exhausted_shared_budget_never_spawns_a_later_command() {
+        let root = workspace_root()
+            .join("target")
+            .join(format!("conformance-exhausted-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("unexpected-spawn");
+        let started = Instant::now();
+        let deadline = CommandDeadline::new(
+            started,
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("printf started > '{}'", marker.display())]);
+        let error = bounded_output(&mut command, deadline, "exhausted subject").unwrap_err();
+        assert!(error.contains("before spawn"), "{error}");
+        assert!(!marker.exists());
+        assert!(started.elapsed() < Duration::from_millis(200));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn direct_child_exit_with_open_descendant_pipes_is_deadline_bounded() {
+        let root = workspace_root()
+            .join("target")
+            .join(format!("conformance-exit-pipes-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("descendant.pid");
+        let started = Instant::now();
+        let deadline = CommandDeadline::new(
+            started,
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        );
+        let outer_deadline = started + Duration::from_millis(800);
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "trap '' TERM; sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; \
+             printf leader-exited; printf retained-stderr >&2; exit 0",
+            pid_file.display()
+        ));
+        let error = bounded_output(&mut command, deadline, "exited leader subject").unwrap_err();
+        assert!(error.contains("shared work deadline"), "{error}");
+        assert!(error.contains("child reaped: exit status: 0"), "{error}");
+        assert!(error.contains("leader-exited") && error.contains("retained-stderr"));
+        assert!(Instant::now() < deadline.cleanup);
+        let descendant = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        while process_exists(descendant) && Instant::now() < outer_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !process_exists(descendant),
+            "owned descendant survived cleanup"
+        );
+        assert!(Instant::now() < outer_deadline);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undrained_pipe_is_an_explicit_bounded_failure() {
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+
+        let (stdout, _held_stdout) = UnixStream::pair().unwrap();
+        let (stderr, _held_stderr) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let cleanup_deadline = started + Duration::from_millis(150);
+        let child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut owner = ProcessGroupGuard {
+            child,
+            cleanup_deadline,
+            terminated: false,
+            reaped: false,
+        };
+        let error = cleanup_command(
+            &mut owner,
+            &mut CapturedPipe::new(stdout),
+            &mut CapturedPipe::new(stderr),
+        )
+        .unwrap_err();
+        assert!(error.contains("undrained stdout=true"), "{error}");
+        assert!(error.contains("undrained stderr=true"), "{error}");
+        assert!(owner.reaped && !process_exists(pid));
+        assert!(started.elapsed() < Duration::from_millis(300));
+    }
+
+    #[test]
     fn shared_deadline_does_not_reset_and_reaps_nested_process_tree() {
         let root = workspace_root()
             .join("target")
@@ -910,8 +1614,12 @@ mod bounded_process_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let pid_file = root.join("descendant.pid");
-        let deadline = Instant::now() + Duration::from_millis(400);
         let started = Instant::now();
+        let deadline = CommandDeadline::new(
+            started,
+            Duration::from_millis(400),
+            Duration::from_millis(200),
+        );
         let mut first = Command::new("sh");
         first.args(["-c", "sleep 0.25"]);
         let first = bounded_output(&mut first, deadline, "first shared-deadline subject").unwrap();
@@ -926,7 +1634,7 @@ mod bounded_process_tests {
             bounded_output(&mut command, deadline, "second shared-deadline subject").unwrap_err();
         assert!(error.contains("exceeded"));
         assert!(
-            started.elapsed() < Duration::from_millis(550),
+            started.elapsed() < Duration::from_millis(650),
             "the second subject reset the shared deadline"
         );
         let descendant: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
@@ -967,18 +1675,30 @@ pub fn assert_public_v1_conformance_subject(subject: &str) {
 }
 
 pub fn execute_public_v1_conformance_subject(subject: &str) {
+    execute_public_v1_conformance_partition(subject, NATIVE_PARTITION);
+}
+
+pub fn execute_public_v1_conformance_partition(subject: &str, partition: &str) {
+    let deadline = partition_deadline(Instant::now());
     assert_public_v1_conformance_subject(subject);
     assert_eq!(
         subject, "built-in-replacement",
         "only the built-in replacement subject has an executable nested gate"
     );
-    let deadline = Instant::now() + CONFORMANCE_TIMEOUT;
-    run_scenarios(
-        "built-in-replacement",
-        &["kuberic-runtime", "kuberic-controller"],
-        |gate| gate.replacement_scenarios,
-        deadline,
+    assert_public_v1_conformance_partition_coverage();
+    let partition = execution_partitions()
+        .into_iter()
+        .find(|candidate| candidate.id == partition)
+        .unwrap_or_else(|| panic!("unknown Public V1 execution partition: {partition}"));
+    eprintln!(
+        "Public V1 partition {}: {:?} shared work, {:?} bounded process cleanup, {:?} outer-owner margin inside {:?}",
+        partition.id,
+        CONFORMANCE_TIMEOUT,
+        CONFORMANCE_CLEANUP_TIMEOUT,
+        CONFORMANCE_OWNER_MARGIN,
+        CONFORMANCE_OUTER_TIMEOUT,
     );
+    run_scenarios("built-in-replacement", &partition, deadline);
 }
 
 pub fn assert_public_v1_conformance_gate(subject: &str, id: &str, scenario: &str) {

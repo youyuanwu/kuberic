@@ -244,11 +244,14 @@ impl Fixture {
             replicator: replication.clone(),
             primary: replication,
             application_control_match: None,
+            native_role_epoch: None,
+            revoke_access: Arc::new(|| Ok(())),
             capabilities: ReplicatorCapabilities::conservative(),
             replicator_creation_id: ReplicatorCreationId::new("creation"),
             open_context: None,
             containment: None,
             wait_for_containment: false,
+            preempt_retained_owner: false,
             terminal_drain: Arc::new(move || {
                 let probe = drain_probe.clone();
                 Box::pin(async move {
@@ -443,6 +446,7 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
     };
     let build = PublicBuildInput {
         attempt: OperationId::new("first-build"),
+        source_address: "http://127.0.0.1:1".into(),
         epoch: Epoch::new(0, 1),
         current_configuration_id: Some(
             ConfigurationDescriptor::new(
@@ -544,14 +548,34 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
                     role: ReplicaRole::ActiveSecondary,
                 },
                 ConfigurationMember {
-                    identity: epoch_primary,
+                    identity: epoch_primary.clone(),
                     role: ReplicaRole::Primary,
                 },
             ],
             1,
         ),
         previous: None,
-        replicas: vec![descriptor(target_storage.clone())],
+        replicas: vec![
+            descriptor(target_storage.clone()),
+            PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: epoch_primary.clone(),
+                replication_address: "http://127.0.0.1:4".into(),
+                process_session_id: ProcessSessionId::new("epoch-primary-session"),
+                storage_incarnation: Some(ReplicaStorageIncarnationContext {
+                    replica: epoch_primary,
+                    storage: ReplicaStorageIdentity::Persistent {
+                        pod_uid: PodUid::new("epoch-primary"),
+                        pvc_uid: PvcUid::new("epoch-primary-pvc"),
+                    },
+                    storage_generation: StorageGeneration::new("epoch-primary-storage"),
+                }),
+                role: ReplicaRole::Primary,
+                current_progress: 0,
+                catch_up_capability: 0,
+                must_catchup: false,
+            },
+        ],
         data_loss_recovery: None,
     };
     let mut epoch_intent = fixture.intent(
@@ -635,10 +659,45 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
             assert_eq!(fixture.store.load_state().await.unwrap(), before);
         }
     }
+    let before = fixture.store.load_state().await.unwrap();
+    assert!(
+        fixture
+            .registry
+            .admit(build_intent(successor.clone(), 4))
+            .await
+            .is_err(),
+        "a promoted logical replica must leave voting membership before its successor Build",
+    );
+    assert_eq!(fixture.store.load_state().await.unwrap(), before);
+    let retained = ConfigurationDescriptor::new(
+        Epoch::new(0, 5),
+        source.replica_id,
+        vec![ConfigurationMember {
+            identity: source,
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let released = fixture
+        .launch(
+            PublicOperationProgram::Configuration(PublicConfiguration {
+                current: retained.clone(),
+                previous: None,
+                replicas: Vec::new(),
+            }),
+            5,
+        )
+        .await;
+    assert_eq!(
+        completed(&released).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    successor.epoch = retained.epoch;
+    successor.current_configuration_id = Some(retained.configuration_id);
     let next = launch(
         &fixture.registry,
         fixture.store.clone(),
-        build_intent(successor, 4),
+        build_intent(successor, 5),
         fixture.callbacks.clone(),
     )
     .await
@@ -852,6 +911,79 @@ async fn sf06_shutdown_cancels_roots_before_joining_terminal_owners() {
     assert_eq!(close.snapshot().stage, PublicOperationStage::Completed);
 }
 
+fn tracked_listener_test_hooks(
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<crate::Result<()>>,
+) -> (TerminalDrain, TerminalDrain, Arc<dyn Fn() + Send + Sync>) {
+    // Exercise the TaskTracker ownership used by the selected carrier, including
+    // a child poll that cannot acknowledge Abort until it returns from native code.
+    let tracker = tokio_util::task::TaskTracker::new();
+    let outcome = Arc::new(Mutex::new(None::<std::result::Result<(), String>>));
+    let completed = outcome.clone();
+    let abort = task.abort_handle();
+    tracker.spawn(async move {
+        let result = match task.await {
+            Ok(Ok(())) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        *completed.lock().unwrap() = Some(result);
+    });
+    tracker.close();
+    let close_tracker = tracker.clone();
+    let close_shutdown = shutdown.clone();
+    let close_abort = abort.clone();
+    let close_outcome = outcome.clone();
+    let close: TerminalDrain = Arc::new(move || {
+        let tracker = close_tracker.clone();
+        let shutdown = close_shutdown.clone();
+        let abort = close_abort.clone();
+        let outcome = close_outcome.clone();
+        Box::pin(async move {
+            shutdown.send_replace(true);
+            if tokio::time::timeout(Duration::from_millis(30), tracker.wait())
+                .await
+                .is_err()
+            {
+                abort.abort();
+                tracker.wait().await;
+                return Err(RuntimeError::OperationCancelled);
+            }
+            outcome
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("tracked listener terminal")
+                .as_ref()
+                .map_err(|error| RuntimeError::Application(error.clone()))
+                .copied()
+        })
+    });
+    let drain_tracker = tracker.clone();
+    let drain_outcome = outcome.clone();
+    let drain: TerminalDrain = Arc::new(move || {
+        let tracker = drain_tracker.clone();
+        let outcome = drain_outcome.clone();
+        Box::pin(async move {
+            tracker.wait().await;
+            outcome
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("tracked listener terminal")
+                .as_ref()
+                .map_err(|error| RuntimeError::Application(error.clone()))
+                .copied()
+        })
+    });
+    let abort_hook = Arc::new(move || {
+        shutdown.send_replace(true);
+        abort.abort();
+    });
+    (close, drain, abort_hook)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sf06_listener_join_survives_close_supersession_and_registry_shutdown() {
     for shutdown_registry in [false, true] {
@@ -869,8 +1001,7 @@ async fn sf06_listener_join_survives_close_supersession_and_registry_shutdown() 
         let listener = task.abort_handle();
         entered.notified().await;
         let (shutdown, mut closing) = tokio::sync::watch::channel(false);
-        let (close_hook, drain_hook, abort_hook) =
-            crate::replicator::stateless::sf06_listener_test_hooks(shutdown, task);
+        let (close_hook, drain_hook, abort_hook) = tracked_listener_test_hooks(shutdown, task);
         *fixture.probe.listener_close.lock().unwrap() = Some(close_hook);
         *fixture.probe.listener_abort.lock().unwrap() = Some(abort_hook);
         fixture.callbacks.terminal_drain = drain_hook;

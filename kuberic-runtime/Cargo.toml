@@ -26,6 +26,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tokio-stream = { workspace = true, features = ["net"], optional = true }
 tonic.workspace = true
 tonic-prost.workspace = true
@@ -36,6 +37,7 @@ uuid = { workspace = true, features = ["v4"] }
 tonic-prost-build.workspace = true
 
 [dev-dependencies]
+external-classic-v1-provider = { path = "../scripts/fixtures/classic-v1-provider" }
 # Repository-only cross-crate proofs; Cargo omits unversioned dev paths on publication.
 k8s-openapi.workspace = true
 kube.workspace = true

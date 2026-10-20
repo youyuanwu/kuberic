@@ -853,6 +853,13 @@ impl SqliteStore {
                 read_status: projection.read_status,
                 write_status: projection.write_status,
                 progress: projection.progress,
+                progress_history: self
+                    .inner
+                    .load_state()
+                    .await?
+                    .public_v1_operation_state
+                    .and_then(|preview| preview.history),
+                native_idle_replicas: Some(Vec::new()),
             },
         )
         .await

@@ -328,6 +328,13 @@ impl Root {
 pub(super) struct PrimaryHandle(Weak<Root>);
 
 impl PrimaryHandle {
+    pub(super) fn idle_replica_ids(&self) -> Result<Vec<i64>, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        Ok(root.manager.lock().unwrap().idle_replica_ids())
+    }
+
     fn root(&self) -> Result<Arc<Root>, PrimaryError> {
         let root = self.0.upgrade().ok_or(PrimaryError::OwnerDropped)?;
         if !root.alive.load(Ordering::Acquire) {

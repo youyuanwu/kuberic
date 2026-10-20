@@ -13,10 +13,17 @@ use kuberic_runtime::host::{
     ApplicationStorageState, KubernetesDnsResolver, ReplicaDiagnostics, ReplicaEndpointResolver,
     ReplicaHandle, ReplicaHost, ReplicaProcessConfig, RunningReplica,
 };
+use kuberic_runtime::protocol::public_operations::{
+    ProgressQueryResult, PublicBuildInput, PublicConfiguration, PublicInboundBuildAuthority,
+    PublicOperationIntent, PublicOperationProgram, PublicOperationReplayDisposition,
+    PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1InstalledConfiguration,
+};
 use kuberic_runtime::protocol::types::{Epoch, OperationId, ReplicaId, ReplicaRole};
+use kuberic_runtime::replicator::stream::{OperationKind, OperationStream, ReceivedOperation};
 use kuberic_runtime::replicator::{
-    PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
-    Replicator, ReplicatorCapabilities, ReplicatorInterfaces,
+    DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
+    ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities, ReplicatorInterfaces,
+    ReplicatorSettings, StateReplicator,
 };
 
 // These external identities deliberately expand aliases in both directions.
@@ -116,6 +123,124 @@ impl StateProvider for ProtectedContracts {
     async fn on_data_loss(&self) -> Result<bool> {
         Ok(false)
     }
+}
+
+#[async_trait]
+impl StateReplicator for ProtectedContracts {
+    fn begin_replicate(&self, _: OperationData) -> Result<Replication> {
+        Ok(Replication {
+            lsn: 1,
+            completion: Box::pin(async { Ok(()) }),
+        })
+    }
+
+    fn replication_operations(&self) -> Result<OperationStream> {
+        Err(kuberic_runtime::RuntimeError::Application(
+            "no receiver".into(),
+        ))
+    }
+
+    fn copy_operations(&self) -> Result<OperationStream> {
+        Err(kuberic_runtime::RuntimeError::Application(
+            "no receiver".into(),
+        ))
+    }
+
+    async fn update_replicator_settings(&self, _: ReplicatorSettings) -> Result<()> {
+        Ok(())
+    }
+}
+
+async fn native_replication_api(state: &dyn StateReplicator) -> Result<Lsn> {
+    let Replication { lsn, completion } = state.begin_replicate(Bytes::new())?;
+    let _: Lsn = lsn;
+    completion.await?;
+    let _: Lsn = state.replicate(Bytes::new()).await?;
+    let _ = DefaultReplicatorFactory::new();
+    let mut streams = [state.replication_operations()?, state.copy_operations()?];
+    for stream in &mut streams {
+        if let Some(operation) = stream.get_operation().await? {
+            let _: &ReceivedOperation = &operation;
+            let _: OperationKind = operation.kind;
+            let _: Lsn = operation.lsn;
+            let _: Epoch = operation.epoch;
+            let _: &Bytes = &operation.data;
+            let _: bool = operation.end_of_stream;
+            operation.acknowledge()?;
+        }
+    }
+    Ok(lsn)
+}
+
+fn independent_progress_api() -> PublicProgress {
+    let outcomes = [
+        ProgressQueryResult::Value(7),
+        ProgressQueryResult::NotQueried("no role".into()),
+        ProgressQueryResult::NotReady,
+        ProgressQueryResult::Failed("provider failed".into()),
+    ];
+    let _ = outcomes;
+    PublicProgress {
+        role: PublicProgressRole::Primary,
+        current_progress: ProgressQueryResult::Value(7),
+        catch_up_capability: ProgressQueryResult::Value(11),
+    }
+}
+
+fn installed_configuration_api(
+    report: &mut PublicV1AgentReport,
+    voting: PublicConfiguration,
+    idle_replicas: Vec<ReplicaId>,
+    wire: &mut kuberic_runtime::control::proto::PublicV1AgentStatus,
+) {
+    let installed = PublicV1InstalledConfiguration {
+        voting,
+        idle_replicas,
+    };
+    report.configuration = Some(installed);
+    let _: &Option<PublicV1InstalledConfiguration> = &report.configuration;
+    let _: &Option<String> = &wire.configuration_json;
+    wire.configuration_json = None;
+}
+
+fn active_control_observers_api(
+    report: &mut PublicV1AgentReport,
+    active_operations: Vec<PublicOperationIntent>,
+    wire: &mut kuberic_runtime::control::proto::PublicV1AgentStatus,
+) {
+    report.active_operations = active_operations;
+    let _: &Vec<PublicOperationIntent> = &report.active_operations;
+    let _: &Vec<String> = &wire.active_operations_json;
+    wire.active_operations_json = Vec::new();
+}
+
+fn frozen_build_endpoints_api(
+    build: &PublicBuildInput,
+    authority: &mut PublicInboundBuildAuthority,
+) {
+    let _: &String = &build.source_address;
+    authority.source_address = build.source_address.clone();
+    authority.target_address = build.replication_address.clone();
+    let _: &String = &authority.source_address;
+}
+
+fn conservative_native_creation_api(
+    interfaces: ReplicatorInterfaces,
+    primary: Arc<ProtectedContracts>,
+) -> Result<ReplicatorInterfaces> {
+    let state = interfaces.state_replicator();
+    let wrapped = interfaces.wrap_primary(primary, state);
+    kuberic_runtime::testing::without_catch_up_specific_quorum(wrapped)
+}
+
+async fn source_idle_retirement_api(
+    primary: &dyn PrimaryReplicator,
+    replica_id: ReplicaId,
+) -> Result<PublicOperationProgram> {
+    let retirement = PublicOperationProgram::RetireIdleReplica { replica_id };
+    let _: PublicOperationReplayDisposition = retirement.replay_disposition();
+    primary.remove_replica(replica_id).await?;
+    Ok(retirement)
 }
 
 fn supported_trait_reexports(
