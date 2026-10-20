@@ -51,8 +51,12 @@ for expected in \
     'struct `ReplicatorCreationReservation` is private' \
     'trait `ReplicatorRegistration` is private' \
     'trait `PartitionAccessView` is private' \
+    'trait `NativeRuntimeControl` is private' \
     'module `capabilities` is private' \
-    'module `hosting` is private'; do
+    'module `hosting` is private' \
+    'module `native_transport` is private' \
+    'module `v1` is private' \
+    'could not find `testing` in `kuberic_runtime`'; do
     if ! grep -Fq "$expected" "$fixture_output"; then
         cat "$fixture_output" >&2
         echo "The external fixture failed for an unexpected reason: $expected" >&2
@@ -64,7 +68,7 @@ if [[ "$rustdoc_only" == true ]]; then
     echo "kuberic-runtime rustdoc allowlist and external API-leak fixture guards passed."
 else
     cargo test -p kuberic-runtime --all-features \
-        --test public_api_inventory --quiet
+        --test public_api_inventory --test lifecycle_capability_boundaries --quiet
     cargo test -p kuberic-runtime --all-features \
         --test public_api_privacy --quiet -- --ignored
 

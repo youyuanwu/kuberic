@@ -1,6 +1,5 @@
-//! One replicated SQLite application on the public level-triggered v2 stack.
+//! Replicated SQLite with service-owned WAL commitment and publication.
 
-pub mod barrier;
 mod commit_barrier;
 mod connection;
 pub mod framelog;

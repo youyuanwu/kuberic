@@ -3,12 +3,10 @@
 Kuberic hosts built-in and application-owned Replicators through the same
 Service Fabric-shaped public interfaces.
 
-This page describes today's ownership. The
-[faithful native V1 Rust async/tonic port design](sf-v1-semantic-alignment-plan.md)
-plans source-guided queue/session/state-machine replacement with service-owned
-primary commit, independent assignment/completion and receiver-lifetime streams.
-Those changes are not implemented yet; the existing
-engine-owned primary persistence and durable-ACK rules below remain current.
+The sole built-in factory composes the source-guided native classic V1 owners.
+See the [runtime guide](classic-v1-runtime.md) for assignment, stream, controller,
+transport and restart behavior. The [port plan](sf-v1-semantic-alignment-plan.md)
+retains the source baseline and intentionally separate parity/qualification gates.
 
 ## Public Interfaces
 
@@ -16,14 +14,14 @@ engine-owned primary persistence and durable-ACK rules below remain current.
 - `Replicator` / `PrimaryReplicator`;
 - optional `StateReplicator`;
 - optional `StateProvider`;
-- built-in persistence adapter `DurableState`.
+- application-owned persistence; `DurableState` is not a factory prerequisite.
 
 The protected method sets are unchanged. Applications receive no agent store,
 authority setter, Kubernetes client, or private lifecycle capability.
 
 ## Sole Built-In Path
 
-`DefaultReplicatorFactory` constructs the stateless Public V1 engine. There is
+`DefaultReplicatorFactory::new()` constructs the classic V1 composition. There is
 no managed factory, engine selector, preview selector, or fallback.
 
 One creation reservation binds:
@@ -47,19 +45,18 @@ operations, and copy snapshots.
 
 The Replicator owns live queues, peers, ACK aggregation, copy/replication
 streams, and authority-scoped tasks. Those process-local objects are rebuilt
-after restart.
+after restart; native secondary readiness requires real copy.
 
 Receiver copy/replication effects belong to the service consuming the built-in
-streams, not a second direct engine persistence path. Explicit durable service
-ACK and exact post-ACK verification precede successful transport completion.
-Primary-local persistence remains engine-owned. The optional
-`StreamOperation::apply_to` adapter is explicitly service-invoked; missing
-consumers never receive an implicit success fallback.
+streams, not a second direct engine persistence path. Persisted services durably
+accept before parameterless ACK. Volatile dispatch can complete without service
+ACK. Primary preparation, ordered commitment, publication and client success
+are service-owned and separate from native quorum completion.
 
-Both streams live for the replica lifetime. CopyComplete is a per-build
-operation, not EOF. Service effects use cancellation-aware execution and
-remain owned until drained; cancelled requests do not imply durable rollback.
-See [service operation delivery](service-fabric-api-semantics.md#service-operation-delivery).
+Streams share the native receiver lifetime; an explicit end-of-stream operation
+has its own ACK rules. Retirement is typed `RuntimeError::Closed`, not successful
+EOF. Missing consumers do not manufacture required service ACKs. Cancelled
+observers do not cancel accepted native or application work.
 
 ## Public Completion Evidence
 
@@ -88,12 +85,11 @@ production cutover.
 
 ## Transport Boundary
 
-The Replicator owns its replication endpoint lifetime. Public V1 transport is
-credential-free. Identity/session/epoch/history/storage/build values fence
-correctness but are not authentication.
-
-The bearer token protects the separate agent command endpoint. Kubernetes
-namespace RBAC protects controller resource mutation.
+The Replicator owns its bounded tonic carrier endpoint lifetime. The host's
+bearer credential authenticates peer connections; exact process, storage,
+history, configuration and endpoint bindings independently fence each delivery.
+The control endpoint also uses the bearer credential. Neither endpoint supplies
+TLS; Kubernetes namespace RBAC and deployment network isolation remain necessary.
 
 ## Custom Replicators
 

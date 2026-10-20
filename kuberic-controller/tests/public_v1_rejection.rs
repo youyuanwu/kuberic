@@ -93,6 +93,8 @@ fn old_and_partial_controller_inputs_reject_without_mutation() {
     let partial = proto::AgentStatusReport {
         protocol_version: 11,
         public_v1: Some(proto::PublicV1AgentStatus {
+            configuration_json: None,
+            active_operations_json: Vec::new(),
             protocol_version: 11,
             generation: 1,
             resource_uid: "resource".into(),

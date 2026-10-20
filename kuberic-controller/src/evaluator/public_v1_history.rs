@@ -87,9 +87,9 @@ pub fn compare_election_reports(
     }
     compare_election_progress(
         &left.history,
-        left.progress.last,
+        left.progress.current()?,
         &right.history,
-        right.progress.last,
+        right.progress.current()?,
     )
 }
 
@@ -98,6 +98,13 @@ pub fn election_status(
     admitted_storage: &[ReplicaStorageIncarnationContext],
 ) -> PublicV1ElectionStatus {
     if report.validate().is_err() {
+        return PublicV1ElectionStatus::Ineligible;
+    }
+    if report
+        .progress
+        .current()
+        .is_none_or(|progress| progress < 0)
+    {
         return PublicV1ElectionStatus::Ineligible;
     }
     if let Some(recovery) = &report.data_loss_recovery {

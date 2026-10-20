@@ -27,10 +27,12 @@ not package(=postgres-replicated) and not (
     or binary_id(=kuberic-runtime::public_api_privacy)
     or binary_id(=kuberic-runtime::lifecycle_capability_boundaries)
     or binary_id(=kuberic-runtime::public_v1_conformance)
+    or (binary_id(=kuberic-runtime)
+        and test(/^testing::public_v1_conformance::bounded_process_tests::/))
     or (binary_id(=kuberic-runtime::public_v1_evidence)
         and test(=public_v1_source_uses_no_native_evidence))
     or (binary_id(=kuberic-runtime::public_v1_recovery)
-        and test(=production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth))
+        and test(=production_config_has_no_protocol_selector_or_application_commit_oracle))
     or (binary_id(=kuberic-controller)
         and test(=cluster_api::tests::production_kubernetes_api_requires_one_exact_namespace))
     or (binary_id(=kuberic-controller::public_api)
@@ -51,10 +53,12 @@ binary_id(=kuberic-runtime::public_api_inventory)
 or binary_id(=kuberic-runtime::public_api_privacy)
 or binary_id(=kuberic-runtime::lifecycle_capability_boundaries)
 or binary_id(=kuberic-runtime::public_v1_conformance)
+or (binary_id(=kuberic-runtime)
+    and test(/^testing::public_v1_conformance::bounded_process_tests::/))
 or (binary_id(=kuberic-runtime::public_v1_evidence)
     and test(=public_v1_source_uses_no_native_evidence))
 or (binary_id(=kuberic-runtime::public_v1_recovery)
-    and test(=production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth))
+    and test(=production_config_has_no_protocol_selector_or_application_commit_oracle))
 or (binary_id(=kuberic-controller)
     and test(=cluster_api::tests::production_kubernetes_api_requires_one_exact_namespace))
 or (binary_id(=kuberic-controller::public_api)
@@ -110,7 +114,12 @@ slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 
 [[profile.default.overrides]]
-filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(=public_v1_conformance_executes_built_in_replacement_scenarios)'
+filter = 'binary_id(=kuberic-runtime::public_v1_conformance) and test(/^public_v1_conformance_executes_/)'
+slow-timeout = { period = "270s", terminate-after = 1 }
+test-group = 'process-boundaries'
+
+[[profile.default.overrides]]
+filter = 'binary_id(=kuberic-runtime) and test(/^testing::public_v1_conformance::bounded_process_tests::/)'
 slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 

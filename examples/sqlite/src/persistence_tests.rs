@@ -472,7 +472,7 @@ async fn copy_retries_incomplete_restart_install_cleanup_and_completion_conflict
 }
 
 #[tokio::test]
-async fn unrecorded_torn_tail_is_discarded_but_acknowledged_corruption_requires_rebuild() {
+async fn unrecorded_torn_tail_is_ignored_but_acknowledged_corruption_rejects_open() {
     let ops = operations();
     for corrupt in [false, true] {
         let dir = directory();
@@ -496,65 +496,101 @@ async fn unrecorded_torn_tail_is_discarded_but_acknowledged_corruption_requires_
                 .unwrap();
             let reopened = open(&dir);
             assert_eq!(reopened.recovery_state().unwrap(), RecoveryState::Healthy);
-            assert_eq!(fs::metadata(&history).unwrap().len(), recorded_len);
+            assert_eq!(fs::metadata(&history).unwrap().len(), recorded_len + 15);
             assert_eq!(rows(&reopened), 1);
+            // Appending accepted history may discard only the unpublished tail.
+            reopened.apply(ops[2].clone()).await.unwrap();
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.path().join("state-v2.json")).unwrap())
+                    .unwrap();
+            let accepted_len = manifest["state"]["history_len"].as_u64().unwrap();
+            assert_eq!(fs::metadata(&history).unwrap().len(), accepted_len);
             drop(reopened);
             OpenOptions::new()
                 .write(true)
                 .open(&history)
                 .unwrap()
-                .set_len(recorded_len - 1)
+                .set_len(accepted_len - 1)
                 .unwrap();
         }
-        let state = open(&dir);
-        assert_eq!(state.durable_progress().await.unwrap(), progress(2, 2));
-        assert!(matches!(
-            state.recovery_state().unwrap(),
-            RecoveryState::RebuildRequired(_)
-        ));
-        assert!(state.commit(2).await.is_err());
-        assert!(state.apply(ops[2].clone()).await.is_err());
-        assert!(state.snapshot(2).is_err());
-        assert!(state.materialize_committed().is_err());
-        assert!(state.complete_reconciliation().is_err());
-        drop(state);
-        let state = open(&dir);
-        assert!(matches!(
-            state.recovery_state().unwrap(),
-            RecoveryState::RebuildRequired(_)
-        ));
-        let source_dir = directory();
-        let source = open(&source_dir);
-        for op in &ops[..2] {
-            source.apply(op.clone()).await.unwrap();
-        }
-        let bytes = source.snapshot(1).unwrap();
-        let build = OperationId::new("rebuild");
-        stage(&state, &build, &bytes).await;
-        state.finish_copy(&build, 1, 1).await.unwrap();
-        assert!(matches!(
-            state.recovery_state().unwrap(),
-            RecoveryState::Rebuilding { .. }
-        ));
-        assert!(state.materialize_committed().is_err());
-        assert!(state.complete_reconciliation().is_err());
-        drop(state);
-        let state = open(&dir);
-        assert!(matches!(
-            state.recovery_state().unwrap(),
-            RecoveryState::Rebuilding { .. }
-        ));
-        state.apply(ops[1].clone()).await.unwrap();
-        assert!(state.materialize_committed().is_err());
-        assert!(
-            state
-                .require_reconciliation("cannot override rebuilding".into())
-                .is_err()
+        let meta_before = fs::read(dir.path().join("state-v2.json")).unwrap();
+        let history_before = fs::read(&history).unwrap();
+        let error = SqlitePersistence::open(dir.path().to_owned())
+            .err()
+            .expect("acknowledged corruption must reject Open");
+        assert_eq!(
+            error.to_string(),
+            if corrupt {
+                "acknowledged history checksum mismatch"
+            } else {
+                "acknowledged history is missing"
+            }
         );
-        state.commit(2).await.unwrap();
-        assert_eq!(state.recovery_state().unwrap(), RecoveryState::Healthy);
-        assert_eq!(rows(&state), 1);
+        assert_eq!(
+            fs::read(dir.path().join("state-v2.json")).unwrap(),
+            meta_before
+        );
+        assert_eq!(fs::read(history).unwrap(), history_before);
     }
+}
+
+#[tokio::test]
+async fn explicit_rebuild_marker_requires_snapshot_and_committed_catchup() {
+    let ops = operations();
+    let dir = directory();
+    let state = open(&dir);
+    for op in &ops[..2] {
+        state.apply(op.clone()).await.unwrap();
+    }
+    state.commit(2).await.unwrap();
+    drop(state);
+    crate::framelog::durable::rewrite_manifest_for_test(dir.path(), |state| {
+        state["recovery"] = serde_json::json!({"RebuildRequired": "explicit test rebuild"});
+    });
+    let state = open(&dir);
+    assert_eq!(state.durable_progress().await.unwrap(), progress(2, 2));
+    assert!(state.commit(2).await.is_err());
+    assert!(state.apply(ops[2].clone()).await.is_err());
+    assert!(state.snapshot(2).is_err());
+    assert!(state.materialize_committed().is_err());
+    assert!(state.complete_reconciliation().is_err());
+    drop(state);
+    let state = open(&dir);
+    assert!(matches!(
+        state.recovery_state().unwrap(),
+        RecoveryState::RebuildRequired(_)
+    ));
+    let source_dir = directory();
+    let source = open(&source_dir);
+    for op in &ops[..2] {
+        source.apply(op.clone()).await.unwrap();
+    }
+    let bytes = source.snapshot(1).unwrap();
+    let build = OperationId::new("rebuild");
+    stage(&state, &build, &bytes).await;
+    state.finish_copy(&build, 1, 1).await.unwrap();
+    assert!(matches!(
+        state.recovery_state().unwrap(),
+        RecoveryState::Rebuilding { .. }
+    ));
+    assert!(state.materialize_committed().is_err());
+    assert!(state.complete_reconciliation().is_err());
+    drop(state);
+    let state = open(&dir);
+    assert!(matches!(
+        state.recovery_state().unwrap(),
+        RecoveryState::Rebuilding { .. }
+    ));
+    state.apply(ops[1].clone()).await.unwrap();
+    assert!(state.materialize_committed().is_err());
+    assert!(
+        state
+            .require_reconciliation("cannot override rebuilding".into())
+            .is_err()
+    );
+    state.commit(2).await.unwrap();
+    assert_eq!(state.recovery_state().unwrap(), RecoveryState::Healthy);
+    assert_eq!(rows(&state), 1);
 }
 
 #[tokio::test]
@@ -626,12 +662,15 @@ async fn malformed_frames_progress_and_missing_base_fail_closed() {
     state.apply(op).await.unwrap();
     drop(state);
     fs::remove_file(dir.path().join("base-0.sqlite")).unwrap();
-    let state = open(&dir);
-    assert!(matches!(
-        state.recovery_state().unwrap(),
-        RecoveryState::RebuildRequired(_)
-    ));
-    assert_eq!(state.durable_progress().await.unwrap(), progress(1, 0));
+    let meta_before = fs::read(dir.path().join("state-v2.json")).unwrap();
+    let error = SqlitePersistence::open(dir.path().to_owned())
+        .err()
+        .expect("missing accepted base must reject Open");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        fs::read(dir.path().join("state-v2.json")).unwrap(),
+        meta_before
+    );
 }
 
 #[test]

@@ -53,7 +53,8 @@ pub fn plan_public_v1_topology(
     let mut observed = replicas
         .iter()
         .filter(|replica| {
-            replica.report.identity == accepted.identity
+            replica.report.validate().is_ok()
+                && replica.report.identity == accepted.identity
                 && replica.report.resource_uid == accepted.history.resource_uid
                 && replica.report.history == accepted.history
                 && replica.report.replica.replica_id.value() > 0
@@ -76,9 +77,104 @@ pub fn plan_public_v1_topology(
         return Ok(PublicV1TopologyPlan::Wait);
     }
 
-    let primary_id = choose_primary(current, &eligible, switchover_target)?;
-    let next = desired_configuration(current, &eligible, primary_id)?;
-    if current == Some(&next) && configuration_is_admitted(&next, &eligible) {
+    let unopened = eligible
+        .iter()
+        .any(|replica| !replica.report.has_current_open_endpoint());
+    let primary_id = if unopened {
+        // A deterministic provisional ID only addresses Open work. No role,
+        // configuration or election is admitted until native queries exist.
+        current
+            .map(|configuration| configuration.primary_id)
+            .filter(|primary| {
+                eligible
+                    .iter()
+                    .any(|replica| replica.report.replica.replica_id == *primary)
+            })
+            .or_else(|| {
+                eligible
+                    .iter()
+                    .map(|replica| replica.report.replica.replica_id)
+                    .min()
+            })
+            .ok_or("no replica can be opened")?
+    } else {
+        if current.is_some_and(|configuration| {
+            eligible.iter().any(|replica| {
+                replica.report.replica.replica_id == configuration.primary_id
+                    && replica.report.progress.current().is_none()
+            })
+        }) || eligible
+            .iter()
+            .all(|replica| replica.report.progress.current().is_none())
+        {
+            return Ok(PublicV1TopologyPlan::Wait);
+        }
+        choose_primary(current, &eligible, switchover_target)?
+    };
+    let bootstrap = current.is_none().then(|| {
+        eligible
+            .iter()
+            .filter(|replica| replica.report.replica.replica_id == primary_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let mut next = desired_configuration(
+        current,
+        bootstrap.as_deref().unwrap_or(&eligible),
+        primary_id,
+        accepted.history.data_loss_number,
+    )?;
+    if let Some(known) = eligible
+        .iter()
+        .find(|replica| replica.report.replica.replica_id == primary_id)
+        .and_then(|replica| replica.report.configuration.as_ref())
+        .filter(|observation| observation.voting.current.primary_id == primary_id)
+        .map(|observation| &observation.voting)
+    {
+        let same_members = known.current.primary_id == next.primary_id
+            && known.current.members == next.members
+            && known.current.write_quorum == next.write_quorum
+            && known
+                .replicas
+                .iter()
+                .filter(|peer| {
+                    known
+                        .current
+                        .members
+                        .iter()
+                        .any(|member| member.identity == peer.identity)
+                })
+                .all(|peer| {
+                    eligible.iter().any(|replica| {
+                        replica.report.replica == peer.identity
+                            && replica.report.process_session_id == peer.process_session_id
+                            && Some(&replica.report.storage_incarnation)
+                                == peer.storage_incarnation.as_ref()
+                            && replica.replication_address == peer.replication_address
+                    })
+                });
+        let number = if same_members {
+            next.epoch
+                .configuration_number
+                .max(known.current.epoch.configuration_number)
+        } else {
+            next.epoch.configuration_number.max(
+                known
+                    .current
+                    .epoch
+                    .configuration_number
+                    .checked_add(1)
+                    .ok_or("native configuration epoch exhausted")?,
+            )
+        };
+        next = ConfigurationDescriptor::new(
+            Epoch::new(accepted.history.data_loss_number, number),
+            next.primary_id,
+            next.members,
+            next.write_quorum,
+        );
+    }
+    if current == Some(&next) && configuration_is_admitted(accepted, &next, &eligible) {
         return Ok(PublicV1TopologyPlan::Stable);
     }
     if current == Some(&next)
@@ -324,6 +420,9 @@ pub fn plan_public_v1_topology(
                         )?),
                     ),
                 ] {
+                    if step == "role" && peer.report.role == ReplicaRole::ActiveSecondary {
+                        continue;
+                    }
                     let prefix = format!(
                         "{base}-prepare-{}-{}-{step}-",
                         peer.report.replica.replica_id, peer.report.process_session_id
@@ -380,6 +479,15 @@ pub fn plan_public_v1_topology(
                 .iter()
                 .any(|member| member.identity == replica.report.replica)
                 && !retained_rejoins.contains(&replica.report.replica)
+                && !eligible.iter().any(|source| {
+                    current.members.iter().any(|member| {
+                        member.role == ReplicaRole::Primary
+                            && member.identity == source.report.replica
+                    }) && accepted.completed_operations.iter().any(|completion| {
+                        completion.operation_id == topology_build_id(current, source, replica)
+                            && completion.result == PublicV1AcceptedResult::Succeeded
+                    })
+                })
         })
     {
         let role = (
@@ -389,13 +497,7 @@ pub fn plan_public_v1_topology(
                 role: ReplicaRole::IdleSecondary,
             },
         );
-        let epoch = (
-            "build-epoch",
-            PublicOperationProgram::Epoch {
-                epoch: current.epoch,
-            },
-        );
-        let preparation = [epoch, role];
+        let preparation = [role];
         for (step, program) in preparation {
             let operation_id = content_addressed_operation_id(
                 format!(
@@ -456,15 +558,43 @@ pub fn plan_public_v1_topology(
                     resource_version,
                 );
             }
+            if let Some((identity, program)) =
+                native_cold_copy_step(&eligible, source, target, operational_next.epoch)?
+            {
+                let replica = eligible
+                    .iter()
+                    .find(|replica| replica.report.replica == identity)
+                    .ok_or("native copy preparation lost its exact participant")?;
+                return begin_plan(
+                    accepted,
+                    replica,
+                    program,
+                    &format!(
+                        "topology-{}-prepare-copy-{}-{}-{}-{}-",
+                        current.configuration_id,
+                        target.report.replica.replica_id,
+                        target.report.process_session_id,
+                        replica.report.replica.replica_id,
+                        replica.report.process_session_id
+                    ),
+                    resource_version,
+                );
+            }
             if source.report.role != ReplicaRole::Primary
-                || source.report.write_status
+                || source.report.read_status
                     != kuberic_runtime::protocol::types::AccessStatus::Granted
             {
                 return Ok(PublicV1TopologyPlan::Wait);
             }
+            let build_base = source
+                .report
+                .configuration
+                .as_ref()
+                .map(|observation| &observation.voting.current)
+                .unwrap_or(current);
             return begin_build(
                 accepted,
-                current,
+                build_base,
                 source,
                 target,
                 build_id,
@@ -476,7 +606,39 @@ pub fn plan_public_v1_topology(
             });
         }
     }
-    let mut ordered_replicas = operational_replicas.iter().collect::<Vec<_>>();
+    if operational_replicas.iter().any(|replica| {
+        replica.report.replica.replica_id == operational_next.primary_id
+            && replica.report.role == ReplicaRole::Primary
+            && replica.report.configuration.is_some()
+    }) && let Some((identity, program)) =
+        native_configuration_step(operational_replicas, operational_next)?
+    {
+        let replica = operational_replicas
+            .iter()
+            .find(|replica| replica.report.replica == identity)
+            .ok_or("native configuration lost its exact participant")?;
+        return begin_plan(
+            accepted,
+            replica,
+            program,
+            &format!(
+                "topology-{}-native-{}-{}-",
+                operational_next.configuration_id,
+                replica.report.replica.replica_id,
+                replica.report.process_session_id
+            ),
+            resource_version,
+        );
+    }
+    let mut ordered_replicas = operational_replicas
+        .iter()
+        .filter(|replica| {
+            operational_next
+                .members
+                .iter()
+                .any(|member| member.identity == replica.report.replica)
+        })
+        .collect::<Vec<_>>();
     let changing_primary = current
         .is_some_and(|configuration| configuration.primary_id != operational_next.primary_id);
     if changing_primary || !retained_rejoins.is_empty() {
@@ -485,6 +647,21 @@ pub fn plan_public_v1_topology(
         });
     }
     for replica in ordered_replicas {
+        if replica.report.configuration.as_ref().is_some_and(|observation| {
+            let configuration = &observation.voting;
+            configuration.current == *operational_next && configuration.previous.is_none()
+        }) && replica.report.completed_operations.iter().any(|completion| {
+            completion.current_configuration_id.as_ref()
+                == Some(&operational_next.configuration_id)
+                && completion.process_session_id == replica.report.process_session_id
+                && completion.storage_incarnation == replica.report.storage_incarnation
+                && completion.result == PublicV1OperationResult::Succeeded
+                && accepted.completed_operations.contains(
+                    &kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::from_completion(completion),
+                )
+        }) {
+            continue;
+        }
         let prebuilt = current.is_some_and(|configuration| {
             !configuration
                 .members
@@ -619,6 +796,7 @@ pub fn plan_public_v1_topology(
     ) -> Result<(PublicV1AcceptedTransitionStatus, PublicV1OperationCommand), String> {
         let remove = PublicBuildInput {
             attempt: operation_id.clone(),
+            source_address: source.replication_address.clone(),
             epoch: next.epoch,
             current_configuration_id: Some(current.configuration_id.clone()),
             replica: target.report.replica.clone(),
@@ -702,11 +880,30 @@ fn can_rejoin_retained_member(
     let report = &target.report;
     report.validate().is_ok()
         && report.history == accepted.history
-        && report.progress.first == report.progress.last
+        && report
+            .progress
+            .current()
+            .is_some_and(|progress| progress >= 0)
         && replicas.iter().any(|source| {
             current.members.iter().any(|member| {
                 member.role == ReplicaRole::Primary && member.identity == source.report.replica
-            }) && source.report.progress.first >= report.progress.last
+            }) && source
+                .report
+                .progress
+                .current()
+                .zip(report.progress.current())
+                .is_some_and(|(source_progress, target_progress)| {
+                    source_progress >= target_progress
+                })
+                && source
+                    .report
+                    .progress
+                    .capability()
+                    .zip(report.progress.current())
+                    .is_some_and(|(retained, target_progress)| {
+                        source.report.progress.current() == Some(target_progress)
+                            || (retained > 0 && retained <= target_progress.saturating_add(1))
+                    })
                 && !accepted.completed_operations.iter().any(|completion| {
                     completion.operation_id == topology_build_id(current, source, target)
                         && completion.result == PublicV1AcceptedResult::Succeeded
@@ -754,6 +951,7 @@ fn begin_build(
 ) -> Result<(PublicV1AcceptedTransitionStatus, PublicV1OperationCommand), String> {
     let build = PublicBuildInput {
         attempt: operation_id.clone(),
+        source_address: source.replication_address.clone(),
         epoch: current.epoch,
         current_configuration_id: Some(current.configuration_id.clone()),
         replica: target.report.replica.clone(),
@@ -823,7 +1021,10 @@ fn begin_build(
     ))
 }
 
-fn content_addressed_operation_id(prefix: String, program: &PublicOperationProgram) -> OperationId {
+pub(crate) fn content_addressed_operation_id(
+    prefix: String,
+    program: &PublicOperationProgram,
+) -> OperationId {
     OperationId::new(format!("{prefix}-{}", program.digest().sha256()))
 }
 
@@ -866,11 +1067,24 @@ fn choose_primary(
     replicas: &[PublicV1TopologyReplica],
     switchover_target: Option<ReplicaId>,
 ) -> Result<ReplicaId, String> {
+    let admitted_member = |replica: &&PublicV1TopologyReplica| {
+        current.is_none_or(|configuration| {
+            configuration
+                .members
+                .iter()
+                .any(|member| member.identity == replica.report.replica)
+        })
+    };
     if let Some(target) = switchover_target {
-        if replicas
-            .iter()
-            .any(|replica| replica.report.replica.replica_id == target)
-        {
+        if replicas.iter().any(|replica| {
+            replica.report.replica.replica_id == target
+                && admitted_member(&replica)
+                && replica
+                    .report
+                    .progress
+                    .current()
+                    .is_some_and(|progress| progress >= 0)
+        }) {
             return Ok(target);
         }
         return Err("planned switchover target is unavailable".into());
@@ -886,7 +1100,15 @@ fn choose_primary(
     }
     let promoted = replicas
         .iter()
-        .filter(|replica| replica.report.role == ReplicaRole::Primary)
+        .filter(admitted_member)
+        .filter(|replica| {
+            replica.report.role == ReplicaRole::Primary
+                && replica
+                    .report
+                    .progress
+                    .current()
+                    .is_some_and(|progress| progress >= 0)
+        })
         .map(|replica| replica.report.replica.replica_id)
         .collect::<Vec<_>>();
     match promoted.as_slice() {
@@ -896,13 +1118,28 @@ fn choose_primary(
     }
     replicas
         .iter()
+        .filter(admitted_member)
+        .filter(|replica| {
+            replica
+                .report
+                .progress
+                .current()
+                .is_some_and(|progress| progress >= 0)
+        })
         .max_by(|left, right| {
             left.report
                 .history
                 .compare_progress(
-                    left.report.progress.last,
+                    left.report
+                        .progress
+                        .current()
+                        .expect("filtered successful native query"),
                     &right.report.history,
-                    right.report.progress.last,
+                    right
+                        .report
+                        .progress
+                        .current()
+                        .expect("filtered successful native query"),
                 )
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
@@ -921,6 +1158,7 @@ fn desired_configuration(
     current: Option<&ConfigurationDescriptor>,
     replicas: &[PublicV1TopologyReplica],
     primary_id: ReplicaId,
+    data_loss_number: i64,
 ) -> Result<ConfigurationDescriptor, String> {
     let members = replicas
         .iter()
@@ -946,13 +1184,14 @@ fn desired_configuration(
             current.epoch.configuration_number + 1,
         )
     } else {
-        Epoch::new(0, 1)
+        Epoch::new(data_loss_number, 1)
     };
+    let write_quorum = majority(members.len());
     Ok(ConfigurationDescriptor::new(
         epoch,
         primary_id,
         members,
-        majority(replicas.len()),
+        write_quorum,
     ))
 }
 
@@ -961,25 +1200,47 @@ fn majority(count: usize) -> u32 {
 }
 
 fn configuration_is_admitted(
+    accepted: &PublicV1AcceptedStatus,
     configuration: &ConfigurationDescriptor,
     replicas: &[PublicV1TopologyReplica],
 ) -> bool {
     configuration.members.iter().all(|member| {
         replicas.iter().any(|replica| {
             replica.report.replica == member.identity
+                && replica.report.validate().is_ok()
+                && replica.report.progress.current().is_some()
                 && !replica.replication_address.is_empty()
                 && replica.report.role == member.role
                 && match member.role {
                     ReplicaRole::Primary => {
                         replica.report.write_status
                             == kuberic_runtime::protocol::types::AccessStatus::Granted
+                            || (configuration.members.len() == 1
+                                && replica.report.read_status
+                                    == kuberic_runtime::protocol::types::AccessStatus::Granted
+                                && replica.report.write_status
+                                    == kuberic_runtime::protocol::types::AccessStatus::NoWriteQuorum)
                     }
-                    ReplicaRole::ActiveSecondary => {
-                        replica.report.read_status
-                            == kuberic_runtime::protocol::types::AccessStatus::Granted
-                    }
+                    ReplicaRole::ActiveSecondary => replica.report.write_status
+                        == kuberic_runtime::protocol::types::AccessStatus::NotPrimary
+                        && replica.report.read_status
+                            == kuberic_runtime::protocol::types::AccessStatus::NotPrimary,
                     _ => false,
                 }
+                && replica.report.completed_operations.iter().any(|completion| {
+                    completion.process_session_id == replica.report.process_session_id
+                        && completion.storage_incarnation == replica.report.storage_incarnation
+                        && completion.history == accepted.history
+                        && completion.current_configuration_id.as_ref() == Some(&configuration.configuration_id)
+                        && matches!(completion.call_kind,
+                            PublicV1CallKind::Configuration | PublicV1CallKind::CatchUp
+                            | PublicV1CallKind::InitialPrimary | PublicV1CallKind::FailoverPromotion
+                            | PublicV1CallKind::SecondaryEpochAdvance)
+                        && completion.result == PublicV1OperationResult::Succeeded
+                        && accepted.completed_operations.contains(
+                            &kuberic_runtime::protocol::public_operations::PublicV1AcceptedOperationCompletion::from_completion(completion)
+                        )
+                })
         })
     })
 }
@@ -1000,6 +1261,7 @@ fn operation_sequence(
         .ok_or_else(|| "local replica is not in desired configuration".to_string())?;
     let public_configuration =
         public_configuration(&local.report.replica, replicas, configuration)?;
+    let unchanged_role = local.report.role == role;
     let role = (
         "role",
         PublicOperationProgram::Role {
@@ -1027,7 +1289,9 @@ fn operation_sequence(
             PublicOperationProgram::Configuration(public_configuration),
         )
     };
-    if role_before_epoch(local.report.role, prebuilt, prepare_retained) {
+    if unchanged_role {
+        Ok(vec![epoch, configuration])
+    } else if role_before_epoch(local.report.role, prebuilt, prepare_retained) {
         Ok(vec![role, epoch, configuration])
     } else {
         Ok(vec![epoch, role, configuration])
@@ -1060,8 +1324,16 @@ fn public_configuration(
                 process_session_id: replica.report.process_session_id.clone(),
                 storage_incarnation: Some(replica.report.storage_incarnation.clone()),
                 role: member.role,
-                current_progress: replica.report.progress.last,
-                catch_up_capability: replica.report.progress.first,
+                current_progress: replica
+                    .report
+                    .progress
+                    .current()
+                    .ok_or("native current progress unavailable")?,
+                catch_up_capability: replica
+                    .report
+                    .progress
+                    .capability()
+                    .ok_or("native catch-up capability unavailable")?,
                 must_catchup: false,
             })
         })
@@ -1077,6 +1349,301 @@ fn public_configuration(
 
 fn role_before_epoch(role: ReplicaRole, prebuilt: bool, prepare_retained: bool) -> bool {
     prepare_retained && role == ReplicaRole::None && !prebuilt
+}
+
+fn completed_program(replica: &PublicV1TopologyReplica, program: &PublicOperationProgram) -> bool {
+    let digest = program.digest();
+    replica
+        .report
+        .completed_operations
+        .iter()
+        .any(|completion| {
+            completion.process_session_id == replica.report.process_session_id
+                && completion.storage_incarnation == replica.report.storage_incarnation
+                && completion.history == replica.report.history
+                && completion.input_digest == digest
+                && completion.result == PublicV1OperationResult::Succeeded
+        })
+}
+
+fn same_bindings(left: &PublicConfiguration, right: &PublicConfiguration) -> bool {
+    left.current == right.current
+        && left.previous == right.previous
+        && left.replicas.len() == right.replicas.len()
+        && left.replicas.iter().all(|peer| {
+            right.replicas.iter().any(|other| {
+                peer.identity == other.identity
+                    && peer.process_session_id == other.process_session_id
+                    && peer.storage_incarnation == other.storage_incarnation
+                    && peer.replication_address == other.replication_address
+                    && peer.role == other.role
+            })
+        })
+}
+
+pub(crate) fn native_public_configuration(
+    local: &kuberic_runtime::protocol::types::ReplicaIdentity,
+    replicas: &[PublicV1TopologyReplica],
+    current: &ConfigurationDescriptor,
+    previous: Option<&ConfigurationDescriptor>,
+    known: Option<&PublicConfiguration>,
+) -> Result<PublicConfiguration, String> {
+    let mut peers = Vec::new();
+    for member in current.members.iter().chain(
+        previous
+            .into_iter()
+            .flat_map(|configuration| &configuration.members),
+    ) {
+        if member.identity == *local
+            || peers
+                .iter()
+                .any(|peer: &PublicReplicaDescriptor| peer.identity == member.identity)
+        {
+            continue;
+        }
+        let in_current = current
+            .members
+            .iter()
+            .any(|current| current.identity == member.identity);
+        let historical = known.and_then(|configuration| {
+            configuration
+                .replicas
+                .iter()
+                .find(|peer| peer.identity == member.identity)
+        });
+        let observed = replicas
+            .iter()
+            .find(|replica| replica.report.replica == member.identity);
+        let mut peer = if let Some(historical) = historical.filter(|_| !in_current) {
+            let mut peer = historical.clone();
+            peer.current_progress = kuberic_runtime::protocol::public_operations::INVALID_LSN;
+            peer.catch_up_capability = kuberic_runtime::protocol::public_operations::INVALID_LSN;
+            peer
+        } else {
+            let observed = observed.ok_or("configuration lacks exact peer authority")?;
+            PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: observed.report.replica.clone(),
+                replication_address: observed.replication_address.clone(),
+                process_session_id: observed.report.process_session_id.clone(),
+                storage_incarnation: Some(observed.report.storage_incarnation.clone()),
+                role: member.role,
+                current_progress: observed
+                    .report
+                    .progress
+                    .current()
+                    .ok_or("current native peer progress is unavailable")?,
+                catch_up_capability: observed
+                    .report
+                    .progress
+                    .capability()
+                    .unwrap_or(kuberic_runtime::protocol::public_operations::INVALID_LSN),
+                must_catchup: false,
+            }
+        };
+        peer.role = member.role;
+        peers.push(peer);
+    }
+    let input = PublicConfiguration {
+        current: current.clone(),
+        previous: previous.cloned(),
+        replicas: peers,
+    };
+    input.validate().map_err(str::to_owned)?;
+    if input.replicas.iter().any(|peer| peer.identity == *local)
+        || !input
+            .current
+            .members
+            .iter()
+            .chain(input.previous.iter().flat_map(|previous| &previous.members))
+            .any(|member| member.identity == *local)
+    {
+        return Err("configuration does not describe its exact local participant".into());
+    }
+    Ok(input)
+}
+
+pub(crate) fn native_configuration_step(
+    replicas: &[PublicV1TopologyReplica],
+    desired: &ConfigurationDescriptor,
+) -> Result<
+    Option<(
+        kuberic_runtime::protocol::types::ReplicaIdentity,
+        PublicOperationProgram,
+    )>,
+    String,
+> {
+    let source = replicas
+        .iter()
+        .find(|replica| replica.report.replica.replica_id == desired.primary_id)
+        .ok_or("configuration has no exact primary observation")?;
+    let known = source
+        .report
+        .configuration
+        .as_ref()
+        .map(|observation| &observation.voting);
+    let installed =
+        native_public_configuration(&source.report.replica, replicas, desired, None, known)?;
+    let previous = known
+        .filter(|known| known.current != *desired || !same_bindings(known, &installed))
+        .map(|known| &known.current);
+    let previous = match known {
+        Some(known) if known.current == *desired && known.previous.is_some() => {
+            known.previous.as_ref()
+        }
+        _ => previous,
+    };
+    for member in &desired.members {
+        if member.identity == source.report.replica {
+            continue;
+        }
+        let replica = replicas
+            .iter()
+            .find(|replica| replica.report.replica == member.identity)
+            .ok_or("configuration member has no exact report")?;
+        let role = PublicOperationProgram::Role {
+            epoch: desired.epoch,
+            role: member.role,
+        };
+        if replica.report.role != member.role {
+            return Ok(Some((member.identity.clone(), role)));
+        }
+        let epoch = PublicOperationProgram::Epoch {
+            epoch: desired.epoch,
+        };
+        if !completed_program(replica, &epoch) {
+            return Ok(Some((member.identity.clone(), epoch)));
+        }
+        let input =
+            native_public_configuration(&member.identity, replicas, desired, previous, known)?;
+        if !replica
+            .report
+            .configuration
+            .as_ref()
+            .is_some_and(|known| same_bindings(&known.voting, &input))
+        {
+            return Ok(Some((
+                member.identity.clone(),
+                PublicOperationProgram::Configuration(input),
+            )));
+        }
+    }
+    let epoch = PublicOperationProgram::Epoch {
+        epoch: desired.epoch,
+    };
+    if !completed_program(source, &epoch) {
+        return Ok(Some((source.report.replica.clone(), epoch)));
+    }
+    if let Some(previous) = previous
+        && !known.is_some_and(|known| {
+            known.current == *desired && known.previous.as_ref() == Some(previous)
+        })
+    {
+        return Ok(Some((
+            source.report.replica.clone(),
+            PublicOperationProgram::CatchUp {
+                configuration: native_public_configuration(
+                    &source.report.replica,
+                    replicas,
+                    desired,
+                    Some(previous),
+                    known,
+                )?,
+                mode: PublicCatchUpMode::WriteQuorum,
+            },
+        )));
+    }
+    if !known.is_some_and(|known| same_bindings(known, &installed)) {
+        return Ok(Some((
+            source.report.replica.clone(),
+            PublicOperationProgram::Configuration(installed),
+        )));
+    }
+    Ok(None)
+}
+
+pub(crate) fn native_cold_copy_step(
+    replicas: &[PublicV1TopologyReplica],
+    source: &PublicV1TopologyReplica,
+    target: &PublicV1TopologyReplica,
+    epoch: Epoch,
+) -> Result<
+    Option<(
+        kuberic_runtime::protocol::types::ReplicaIdentity,
+        PublicOperationProgram,
+    )>,
+    String,
+> {
+    let Some(observation) = source.report.configuration.as_ref() else {
+        return Ok(None);
+    };
+    let installed = &observation.voting;
+    if installed
+        .current
+        .members
+        .iter()
+        .any(|member| member.identity.replica_id == target.report.replica.replica_id)
+    {
+        let members = installed
+            .current
+            .members
+            .iter()
+            .filter(|member| {
+                member.identity == source.report.replica
+                    || (member.identity.replica_id != target.report.replica.replica_id
+                        && replicas.iter().any(|replica| {
+                            replica.report.replica == member.identity
+                                && replica.report.progress.current().is_some()
+                                && installed.replicas.iter().any(|known| {
+                                    known.identity == replica.report.replica
+                                        && known.process_session_id
+                                            == replica.report.process_session_id
+                                        && known.storage_incarnation.as_ref()
+                                            == Some(&replica.report.storage_incarnation)
+                                        && known.replication_address == replica.replication_address
+                                })
+                        }))
+            })
+            .cloned()
+            .map(|mut member| {
+                member.role = if member.identity == source.report.replica {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                };
+                member
+            })
+            .collect::<Vec<_>>();
+        let number = installed
+            .current
+            .epoch
+            .configuration_number
+            .checked_add(1)
+            .ok_or("native configuration epoch exhausted")?
+            .max(epoch.configuration_number);
+        let retained = ConfigurationDescriptor::new(
+            Epoch::new(epoch.data_loss_number, number),
+            source.report.replica.replica_id,
+            members.clone(),
+            installed.current.write_quorum.min(members.len() as u32),
+        );
+        return native_configuration_step(replicas, &retained);
+    }
+    if installed.previous.is_some() {
+        return native_configuration_step(replicas, &installed.current);
+    }
+    if observation
+        .idle_replicas
+        .contains(&target.report.replica.replica_id)
+    {
+        return Ok(Some((
+            source.report.replica.clone(),
+            PublicOperationProgram::RetireIdleReplica {
+                replica_id: target.report.replica.replica_id,
+            },
+        )));
+    }
+    Ok(None)
 }
 
 fn begin_operation(
@@ -1237,7 +1804,9 @@ fn call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind, String>
         Some(PublicOperationProgram::Progress { .. }) => Ok(PublicV1CallKind::Progress),
         Some(PublicOperationProgram::Swap { .. }) => Ok(PublicV1CallKind::Swap),
         Some(PublicOperationProgram::Build(_)) => Ok(PublicV1CallKind::Build),
-        Some(PublicOperationProgram::Remove(_)) => Ok(PublicV1CallKind::Remove),
+        Some(
+            PublicOperationProgram::Remove(_) | PublicOperationProgram::RetireIdleReplica { .. },
+        ) => Ok(PublicV1CallKind::Remove),
         Some(PublicOperationProgram::Close) => Ok(PublicV1CallKind::Close),
         Some(PublicOperationProgram::Abort) => Ok(PublicV1CallKind::Abort),
         None => Err("public-v1 topology intent lacks a program".into()),
@@ -1289,6 +1858,8 @@ mod tests {
         };
         let mut replica = PublicV1TopologyReplica {
             report: PublicV1AgentReport {
+                active_operations: Vec::new(),
+                configuration: None,
                 identity: PublicV1Identity::new(1),
                 resource_uid: resource_uid.clone(),
                 replica: identity.clone(),
@@ -1297,10 +1868,10 @@ mod tests {
                 report_sequence: 1,
                 open_mode: OpenMode::Existing,
                 role,
-                read_status: if role == ReplicaRole::None {
-                    AccessStatus::NotPrimary
-                } else {
+                read_status: if role == ReplicaRole::Primary {
                     AccessStatus::Granted
+                } else {
+                    AccessStatus::NotPrimary
                 },
                 write_status: if role == ReplicaRole::Primary {
                     AccessStatus::Granted
@@ -1324,8 +1895,10 @@ mod tests {
                         }
                         ReplicaRole::None => PublicProgressRole::Recovery,
                     },
-                    first: 0,
-                    last: 0,
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
                 },
                 replication_address: Some(format!("http://10.0.0.{id}:50052")),
                 service_location: None,
@@ -1392,18 +1965,19 @@ mod tests {
         ) = match command.intent.program.as_ref().expect("program") {
             PublicOperationProgram::Open { .. } => {
                 report.report.open_mode = OpenMode::Existing;
+                if !report.replication_address.is_empty() {
+                    report.report.replication_address = Some(report.replication_address.clone());
+                }
                 (PublicV1CallKind::Open, None, None, None, None)
             }
             PublicOperationProgram::Role { role, .. } => {
-                report.report.role = if *role == ReplicaRole::IdleSecondary {
-                    ReplicaRole::None
-                } else {
-                    *role
-                };
+                report.report.role = *role;
                 report.report.progress.role = match report.report.role {
                     ReplicaRole::Primary => PublicProgressRole::Primary,
-                    ReplicaRole::ActiveSecondary => PublicProgressRole::Secondary,
-                    ReplicaRole::IdleSecondary | ReplicaRole::None => PublicProgressRole::Recovery,
+                    ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary => {
+                        PublicProgressRole::Secondary
+                    }
+                    ReplicaRole::None => PublicProgressRole::Recovery,
                 };
                 report.report.read_status = AccessStatus::NotPrimary;
                 report.report.write_status = AccessStatus::NotPrimary;
@@ -1413,7 +1987,17 @@ mod tests {
                 (PublicV1CallKind::Epoch, None, None, None, None)
             }
             PublicOperationProgram::Configuration(configuration) => {
-                report.report.read_status = AccessStatus::Granted;
+                report.report.configuration = Some(
+                    kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration {
+                        voting: configuration.clone(),
+                        idle_replicas: Vec::new(),
+                    },
+                );
+                report.report.read_status = if report.report.role == ReplicaRole::Primary {
+                    AccessStatus::Granted
+                } else {
+                    AccessStatus::NotPrimary
+                };
                 report.report.write_status = if report.report.role == ReplicaRole::Primary {
                     AccessStatus::Granted
                 } else {
@@ -1434,6 +2018,12 @@ mod tests {
                 configuration,
                 mode,
             } => {
+                report.report.configuration = Some(
+                    kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration {
+                        voting: configuration.clone(),
+                        idle_replicas: Vec::new(),
+                    },
+                );
                 report.report.read_status = AccessStatus::Granted;
                 report.report.write_status = AccessStatus::Granted;
                 (
@@ -1464,14 +2054,20 @@ mod tests {
             catch_up_specific_quorum,
             result: PublicV1OperationResult::Succeeded,
         };
-        if call_kind == PublicV1CallKind::Open {
+        if let Some(existing) = report
+            .report
+            .completed_operations
+            .iter()
+            .find(|existing| existing.operation_id == completion.operation_id)
+        {
+            assert_eq!(existing, &completion);
+        } else {
             report.report.completed_operations.push(completion.clone());
         }
-        accepted
-            .completed_operations
-            .push(PublicV1AcceptedOperationCompletion::from_completion(
-                &completion,
-            ));
+        let completion = PublicV1AcceptedOperationCompletion::from_completion(&completion);
+        if !accepted.completed_operations.contains(&completion) {
+            accepted.completed_operations.push(completion);
+        }
     }
 
     #[test]
@@ -1650,7 +2246,7 @@ mod tests {
                 replica(2, ReplicaRole::ActiveSecondary),
                 replica(3, ReplicaRole::ActiveSecondary),
             ];
-            let current = desired_configuration(None, &replicas, ReplicaId::new(1)).unwrap();
+            let current = desired_configuration(None, &replicas, ReplicaId::new(1), 0).unwrap();
             let mut accepted = accepted(&replicas[0]);
             replicas[2].report.replica.instance_id = ReplicaInstanceId::new("replacement-pod");
             replicas[2].report.storage_incarnation.replica = replicas[2].report.replica.clone();
@@ -1747,7 +2343,7 @@ mod tests {
             replica(3, ReplicaRole::ActiveSecondary),
         ];
         let mut accepted = accepted(&replicas[0]);
-        let original = desired_configuration(None, &replicas, ReplicaId::new(1)).unwrap();
+        let original = desired_configuration(None, &replicas, ReplicaId::new(1), 0).unwrap();
         let program = PublicOperationProgram::Configuration(
             public_configuration(&replicas[0].report.replica, &replicas, &original).unwrap(),
         );
@@ -1760,32 +2356,17 @@ mod tests {
         )
         .unwrap();
         accept_command(&mut accepted, &mut replicas, &command);
-        let storage_incarnation = replicas[0].report.storage_incarnation.clone();
-        replicas[0]
-            .report
-            .completed_operations
-            .push(PublicV1OperationCompletion {
-                operation_id: command.intent.operation_id.clone(),
-                revision: command.intent.revision,
-                call_kind: PublicV1CallKind::Configuration,
-                process_session_id: command.intent.process_session_id.clone(),
-                input_digest: command.intent.input_digest.clone(),
-                replay_disposition: command.intent.replay_disposition,
-                history: accepted.history.clone(),
-                storage_incarnation,
-                previous_configuration_id: None,
-                current_configuration_id: Some(original.configuration_id.clone()),
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
-                result: PublicV1OperationResult::Succeeded,
-            });
-        replicas[0].report.progress.first = 1;
-        replicas[0].report.progress.last = 1;
+        replicas[0].report.progress.catch_up_capability =
+            kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(1);
+        replicas[0].report.progress.current_progress =
+            kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(1);
         replicas[1] = replica(2, ReplicaRole::Primary);
-        replicas[1].report.progress.first = 2;
-        replicas[1].report.progress.last = 2;
+        replicas[1].report.progress.catch_up_capability =
+            kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(2);
+        replicas[1].report.progress.current_progress =
+            kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(2);
         let current =
-            desired_configuration(Some(&original), &replicas[1..], ReplicaId::new(2)).unwrap();
+            desired_configuration(Some(&original), &replicas[1..], ReplicaId::new(2), 0).unwrap();
         assert!(can_rejoin_retained_member(
             &accepted,
             &current,
@@ -1805,12 +2386,17 @@ mod tests {
                     target.report.history.history_id =
                         kuberic_runtime::protocol::types::HistoryId::new("other-history")
                 }
-                3 => target.report.progress.last = 2,
+                3 => {
+                    target.report.progress.current_progress =
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady
+                }
                 4 => target.report.completed_operations.clear(),
                 5 => evidence.completed_operations.clear(),
                 6 => {
-                    target.report.progress.first = 3;
-                    target.report.progress.last = 3;
+                    target.report.progress.catch_up_capability =
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(3);
+                    target.report.progress.current_progress =
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(3);
                 }
                 7 => {
                     let mut built = evidence.completed_operations[0].clone();
@@ -1871,6 +2457,8 @@ mod tests {
         };
         fresh_primary.report.storage_incarnation.storage_generation =
             StorageGeneration::new("storage-1-fresh");
+        fresh_primary.report.completed_operations.clear();
+        fresh_primary.report.replication_address = None;
         let second = replica(2, ReplicaRole::ActiveSecondary);
         let third = replica(3, ReplicaRole::ActiveSecondary);
         let mut current = ConfigurationDescriptor::new(

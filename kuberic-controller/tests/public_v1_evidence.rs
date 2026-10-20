@@ -99,6 +99,8 @@ fn report(
     completion: PublicV1OperationCompletion,
 ) -> PublicV1AgentReport {
     PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity: accepted.identity.clone(),
         resource_uid: accepted.history.resource_uid.clone(),
         replica: replica(1),
@@ -113,8 +115,10 @@ fn report(
         storage_incarnation: storage(1),
         progress: PublicProgress {
             role: PublicProgressRole::Primary,
-            first: 1,
-            last: 1,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(1),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(1),
         },
         replication_address: None,
         service_location: None,
@@ -305,6 +309,7 @@ async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_pro
         };
         let build = |attempt: &str| PublicBuildInput {
             attempt: OperationId::new(attempt),
+            source_address: "http://127.0.0.1:1".into(),
             epoch,
             current_configuration_id: Some(configuration(epoch).current.configuration_id),
             replica: target.clone(),

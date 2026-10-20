@@ -30,19 +30,25 @@ use crate::replicator::{
 
 use super::super::ingress::{MessageIngress, Target as IngressTarget};
 use super::super::primary::{Primary, ReplicaDescriptor};
+use super::super::replica_manager::CompletionError;
 use super::*;
 
 /// The host must supply the exact admitted process/storage/transport binding.
 /// This private snapshot is not an authenticated or dynamic host registry.
+#[derive(Clone)]
 pub(super) struct PeerBinding {
     pub(super) information: ReplicaInformation,
     pub(super) build: BuildConfig,
     pub(super) callbacks: BuildCallbacks,
 }
 
+type PeerResolver =
+    Arc<dyn Fn(&ReplicaInformation) -> Result<PeerBinding, FacadeError> + Send + Sync>;
+
 pub(super) struct FacadeConfig {
     pub(super) local: ReplicaIdentity,
     pub(super) peers: Vec<PeerBinding>,
+    pub(super) resolve_peer: Option<PeerResolver>,
     pub(super) close_quorum_wait: Duration,
 }
 
@@ -127,9 +133,33 @@ impl From<FacadeError> for RuntimeError {
     fn from(error: FacadeError) -> Self {
         match error {
             FacadeError::Aborted | FacadeError::Closed => Self::Closed,
+            FacadeError::Adapter(AdapterError::Stream(StreamError::Closed)) => Self::Closed,
+            FacadeError::Adapter(AdapterError::Completion(CompletionError::OperationCanceled)) => {
+                Self::OperationCancelled
+            }
+            FacadeError::Adapter(AdapterError::Completion(CompletionError::ObjectClosed)) => {
+                Self::Closed
+            }
             FacadeError::Adapter(AdapterError::Role(RoleError::Busy)) => {
                 Self::ReconfigurationPending
             }
+            FacadeError::Adapter(AdapterError::Secondary(SecondaryError::NotReady)) => {
+                Self::ProgressNotReady
+            }
+            FacadeError::Adapter(
+                AdapterError::Role(
+                    RoleError::Provider(provider)
+                    | RoleError::Primary(PrimaryError::Provider(provider))
+                    | RoleError::Secondary(SecondaryError::Provider(provider)),
+                )
+                | AdapterError::Primary(PrimaryError::Provider(provider))
+                | AdapterError::Secondary(SecondaryError::Provider(provider)),
+            ) => match provider.as_ref() {
+                Self::ReplicaRebuildRequired(required) => {
+                    Self::ReplicaRebuildRequired(required.clone())
+                }
+                error => Self::ControlPlane(error.to_string()),
+            },
             error => Self::ControlPlane(error.to_string()),
         }
     }
@@ -209,6 +239,7 @@ pub(crate) struct Facade {
     requests: mpsc::Sender<Request>,
     abort: Arc<Abort>,
     join: AsyncMutex<Join>,
+    retained_driver: AtomicBool,
 }
 
 impl Facade {
@@ -239,6 +270,7 @@ impl Facade {
                 task: Some(task),
                 result: None,
             }),
+            retained_driver: AtomicBool::new(true),
         }))
     }
 
@@ -252,6 +284,7 @@ impl Facade {
         if join.result.is_none() {
             let result = join.task.as_mut().expect("unobserved driver").await;
             join.task = None;
+            self.retained_driver.store(false, Ordering::Release);
             join.result = Some(
                 result
                     .map_err(|error| FacadeError::Join(error.to_string()))
@@ -263,6 +296,10 @@ impl Facade {
 
     pub(crate) async fn drain(&self) -> crate::Result<()> {
         self.join().await.map_err(RuntimeError::from)
+    }
+
+    pub(super) fn retained_task_count(&self) -> usize {
+        usize::from(self.retained_driver.load(Ordering::Acquire))
     }
 
     async fn call(&self, command: Command) -> crate::Result<Value> {
@@ -331,15 +368,27 @@ impl FacadeConfig {
         Ok(())
     }
 
-    fn peer(&self, info: &ReplicaInformation) -> Result<&PeerBinding, FacadeError> {
+    fn peer(&self, info: &ReplicaInformation) -> Result<PeerBinding, FacadeError> {
         info.validate_public_progress()
             .map_err(|error| FacadeError::Input(error.to_string()))?;
+        if let Some(resolve) = &self.resolve_peer {
+            let peer = resolve(info)?;
+            if !matches_binding(&peer.information, info) {
+                return Err(FacadeError::Input("resolved peer binding changed".into()));
+            }
+            peer.build
+                .route
+                .validate()
+                .map_err(|error| FacadeError::Input(error.to_string()))?;
+            return Ok(peer);
+        }
         self.peers
             .iter()
             .find(|peer| {
                 let bound = &peer.information;
                 matches_binding(bound, info)
             })
+            .cloned()
             .ok_or_else(|| FacadeError::Input("no exact admitted peer binding".into()))
     }
 
@@ -417,6 +466,12 @@ impl FacadeConfig {
     }
 }
 
+pub(super) fn empty_previous(configuration: &ReplicaSetConfiguration) -> bool {
+    configuration.configuration.members.is_empty()
+        && configuration.configuration.write_quorum == 0
+        && configuration.replicas.is_empty()
+}
+
 pub(crate) fn matches_binding(bound: &ReplicaInformation, input: &ReplicaInformation) -> bool {
     bound.identity == input.identity
         && bound.process_session_id == input.process_session_id
@@ -491,9 +546,13 @@ fn handle(
                 owner.begin_close(config.close_quorum_wait)
             })?,
             Command::CatchupConfiguration(current, previous) => {
-                let previous = config.configuration(&previous, false)?;
+                let previous = if empty_previous(&previous) {
+                    None
+                } else {
+                    Some(config.configuration(&previous, false)?)
+                };
                 let current = config.configuration(&current, false)?;
-                adapter.update_catchup_configuration(Some(previous), current)?;
+                adapter.update_catchup_configuration(previous, current)?;
                 return Ok(Some(Value::Completed));
             }
             Command::CurrentConfiguration(current) => {

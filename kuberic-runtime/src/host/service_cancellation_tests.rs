@@ -81,9 +81,7 @@ impl StatefulServiceReplica for Application {
     async fn open(self: Arc<Self>, context: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
         Ok(context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new(Arc::new(
-                EmptyProvider,
-            ))))
+            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
             .create_replicator(
                 Some(Arc::new(EmptyProvider)),
                 Some(ReplicatorSettings {
@@ -160,6 +158,9 @@ async fn cancelled_configuration_request_does_not_strand_durable_completion_behi
         binding,
         "127.0.0.1:0".parse().unwrap(),
     ));
+    runtime
+        .configure_native_transport(Arc::from("test-token"))
+        .unwrap();
     let service = AgentService::new(store.clone(), runtime.clone(), "test-token").unwrap();
     runtime
         .bind_replica_session(uid, service.local_session().clone())

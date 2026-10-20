@@ -1,6 +1,5 @@
 fn main() {
     println!("cargo:rerun-if-changed=proto/kuberic.proto");
-    println!("cargo:rerun-if-changed=proto/replication.proto");
     println!("cargo:rerun-if-changed=proto/sf_v1.proto");
     println!("cargo:rerun-if-env-changed=KUBERIC_WORKSPACE_TESTS");
     println!("cargo:rustc-check-cfg=cfg(kuberic_workspace_tests)");
@@ -34,10 +33,7 @@ fn main() {
         )
         .boxed(".kuberic.level.v1.ScaleUpConfigurationEvidence.evidence.admission")
         .boxed(".kuberic.level.v1.ScaleUpConfigurationEvidence.evidence.failover")
-        .compile_protos(
-            &["proto/kuberic.proto", "proto/replication.proto"],
-            &["proto"],
-        )
+        .compile_protos(&["proto/kuberic.proto"], &["proto"])
         .expect("failed to compile level-triggered Kuberic protobuf schema");
 
     tonic_prost_build::configure()
@@ -45,5 +41,5 @@ fn main() {
         .build_client(true)
         .bytes(".kuberic.sf.v1")
         .compile_protos(&["proto/sf_v1.proto"], &["proto"])
-        .expect("failed to compile private SF V1 carrier protobuf schema");
+        .expect("failed to compile classic V1 carrier protobuf schema");
 }

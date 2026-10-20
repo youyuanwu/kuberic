@@ -10,7 +10,7 @@ use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
 use sqlite_replicated::{SqlitePersistence, proto, server::SqliteServer, service::SqliteService};
 
 #[derive(Parser)]
-#[command(name = "sqlite-replicated", about = "V2 replicated SQLite")]
+#[command(name = "sqlite-replicated", about = "Replicated SQLite for Kuberic")]
 struct Config {
     #[arg(long, env = "KUBERIC_RESOURCE_UID")]
     resource_uid: String,

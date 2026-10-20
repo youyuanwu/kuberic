@@ -13,26 +13,26 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::Duration;
 
 use thiserror::Error;
 
+#[cfg(test)]
+use super::ack::{AckDispatch, AckSender};
 use crate::application::Lsn;
 use crate::protocol::types::Epoch;
 
-use super::ack::{AckDispatch, AckSender};
 use super::operation_queue::{CallbackControl, EnqueueError, OperationQueue, QueueConfig};
+#[cfg(test)]
+use super::operation_stream::OperationStream;
 use super::operation_stream::{
-    DispatchEntry, DispatchWake, EpochBarrier, OperationStream, SharedDispatchQueue, StreamError,
+    DispatchEntry, DispatchWake, EpochBarrier, SharedDispatchQueue, StreamError,
 };
 use super::received_operation::{AckError, AckState, AckWork, ReceivedOperation};
 use super::replication_queue_manager::QueueTransfer;
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 receiver settings")
-)]
 pub(super) struct ReceiverConfig {
     pub(super) queue: QueueConfig,
     pub(super) has_persisted_state: bool,
@@ -41,7 +41,6 @@ pub(super) struct ReceiverConfig {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 receiver errors"))]
 pub(super) enum ReceiverError {
     #[error("receiver has not received StartCopy initialization")]
     NotInitialized,
@@ -78,17 +77,12 @@ pub(super) enum ReceiverError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK snapshot"))]
 pub(super) struct ReceiverAck {
     pub(super) received: Lsn,
     pub(super) applied: Lsn,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 batch observation")
-)]
 pub(super) struct BatchObservation {
     pub(super) admitted: usize,
     pub(super) duplicates: usize,
@@ -103,22 +97,16 @@ pub(super) struct AckRequest {
 
 /// These are owner obligations, not provider/transport successes.
 #[must_use = "deliver ACK scheduling and provider epoch handoffs to their actual owners"]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 receiver handoffs")
-)]
 pub(super) struct ReceiverSignals {
     pub(super) ack: Option<AckRequest>,
+    #[cfg(test)]
     pub(super) update_epoch: Option<EpochBarrier>,
+    #[cfg(test)]
     pub(super) batch: BatchObservation,
 }
 
 #[must_use = "dispatch wakeups and finish rooted ACK callbacks outside the receiver guard"]
 #[derive(Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 receiver effects")
-)]
 pub(super) struct ReceiverEffects {
     wakes: Vec<DispatchWake>,
     ack_work: Option<AckWork>,
@@ -128,7 +116,6 @@ pub(super) struct ReceiverEffects {
     fault: Option<String>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 effect delivery"))]
 impl ReceiverEffects {
     pub(super) fn epoch_request(&self) -> Option<EpochBarrier> {
         self.update_epoch
@@ -146,7 +133,9 @@ impl ReceiverEffects {
         }
         Ok(ReceiverSignals {
             ack: self.ack,
+            #[cfg(test)]
             update_epoch: self.update_epoch,
+            #[cfg(test)]
             batch: self.batch,
         })
     }
@@ -161,10 +150,6 @@ struct DispatchState {
     require_ack: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 secondary receiver")
-)]
 pub(super) struct SecondaryReceiver {
     config: ReceiverConfig,
     require_ack: bool,
@@ -181,7 +166,6 @@ pub(super) struct SecondaryReceiver {
     eos_acked: bool,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 receiver API"))]
 impl SecondaryReceiver {
     pub(super) fn new(config: ReceiverConfig) -> Self {
         let require_ack = config.has_persisted_state || config.require_service_ack;
@@ -209,6 +193,7 @@ impl SecondaryReceiver {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn requires_service_ack(&self) -> bool {
         self.require_ack
     }
@@ -372,6 +357,7 @@ impl SecondaryReceiver {
             .retain(|lsn, _| queue.get_operation(*lsn).is_some());
     }
 
+    #[cfg(test)]
     pub(super) fn stream(&self) -> OperationStream {
         self.dispatch.stream()
     }
@@ -399,6 +385,7 @@ impl SecondaryReceiver {
             .first_available_completed())
     }
 
+    #[cfg(test)]
     pub(super) fn provider_epoch(&self) -> Option<Epoch> {
         self.callback.lock().unwrap().provider_epoch
     }
@@ -450,6 +437,7 @@ impl SecondaryReceiver {
     }
 
     /// Copy progress is supplied by its real owner; it is not assumed complete.
+    #[cfg(test)]
     pub(super) fn schedule_ack(
         &self,
         sender: &mut AckSender,
@@ -746,6 +734,7 @@ impl SecondaryReceiver {
 
     /// Explicit terminal containment; native graceful Close has additional
     /// provider/dispatch/role drains owned by the future SecondaryReplicator.
+    #[cfg(test)]
     pub(super) fn retire(&mut self, owner: Arc<dyn Send + Sync>) -> ReceiverEffects {
         self.clean_queue(owner, true, true);
         self.retired = true;

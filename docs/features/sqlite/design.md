@@ -1,5 +1,26 @@
 # SQLite: Replicated SQLite on Kuberic Public V1
 
+## Selected classic V1 companion
+
+The application now selects `src/v1.rs` for retained SQL/WAL publication and uses
+the no-store default factory. The [classic V1 runtime](../kuberic/classic-v1-runtime.md)
+separates early assignment, native quorum completion, durable frame commitment,
+WAL publication and client success. Secondary durability precedes parameterless
+ACK; pending native progress is not a SQL visibility grant.
+
+The selected wire/agent formats are protocol 12 / schema 13. Old formats reject
+without migration or silent reset. Close drains accepted queued transactions;
+intentional Abort cancellation remains distinct from worker, storage, reporter
+and publication failures. The old `src/barrier.rs` receipt bridge is removed.
+
+The following original design records the preceding implementation's storage,
+SQL API and failure rationale. Its engine-owned commitment, receipt-envelope,
+watermark and old protocol details are historical, not the selected data-plane
+contract. Current real-file publication/copy/restart evidence lives in the
+service's `v1` tests and runtime `classic_v1_production` target.
+
+## Original design baseline
+
 The `examples/sqlite` application (`sqlite-replicated`) uses the level-triggered
 Public V1 stack. There is no second SQLite application or classic
 runtime/operator dependency. The primary serves SQL over gRPC;

@@ -30,14 +30,27 @@ async fn assert_values(
     let topology = cluster.settle_members(members).await?;
     let mut services = Vec::new();
     for replica in topology.members() {
-        services.push(cluster.service(replica).await?);
+        services.push((
+            cluster.service(replica).await?,
+            replica == topology.primary(),
+        ));
     }
     cluster
         .drive(async {
             loop {
                 let mut matches = 0;
-                for service in &services {
-                    if service.read().await? == expected {
+                for (service, primary) in &services {
+                    if *primary {
+                        ensure!(service.read().await? == service.committed_value()?);
+                    } else {
+                        ensure!(matches!(
+                            service.read().await,
+                            Err(kuberic_runtime::RuntimeError::ReadClosed(
+                                AccessStatus::NotPrimary
+                            ))
+                        ));
+                    }
+                    if service.committed_value()? == expected {
                         matches += 1;
                     }
                 }
@@ -65,10 +78,19 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
             .drive(async { Ok::<_, anyhow::Error>(writer.set(17).await?) })
             .await?;
         let secondary = topology.secondaries().next().unwrap().clone();
-        let reopened = cluster.restart(&secondary).await?;
+        let reopened = cluster
+            .restart(&secondary)
+            .await
+            .context("restart secondary after acknowledged counter write")?;
         let service = cluster.service(&reopened).await?;
         ensure!(service.open_modes() == [OpenMode::Existing]);
-        ensure!(service.read().await? == 17);
+        ensure!(service.committed_value()? == 17);
+        ensure!(matches!(
+            service.read().await,
+            Err(kuberic_runtime::RuntimeError::ReadClosed(
+                AccessStatus::NotPrimary
+            ))
+        ));
         ensure!(
             cluster.service(&secondary).await.is_err(),
             "old session reference resolved"
@@ -280,7 +302,16 @@ async fn real_live_isolation_and_group_quorum_loss_restore_the_application() -> 
             .await?;
         ensure!(
             cluster
-                .probe(async { Ok::<_, anyhow::Error>(old_service.set(99).await?) })
+                .probe(async {
+                    // Native quorum work may remain pending after the client observer times out.
+                    Ok::<_, anyhow::Error>(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(250),
+                            old_service.set(99),
+                        )
+                        .await??,
+                    )
+                })
                 .await
                 .is_err()
         );
@@ -294,7 +325,12 @@ async fn real_live_isolation_and_group_quorum_loss_restore_the_application() -> 
         let isolation = cluster.isolate(&isolated).await?;
         ensure!(
             cluster
-                .probe(async { Ok::<_, anyhow::Error>(writer.set(53).await?) })
+                .probe(async {
+                    Ok::<_, anyhow::Error>(
+                        tokio::time::timeout(std::time::Duration::from_millis(250), writer.set(53))
+                            .await??,
+                    )
+                })
                 .await
                 .is_err()
         );

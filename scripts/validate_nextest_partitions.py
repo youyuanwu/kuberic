@@ -37,6 +37,38 @@ class ListedTest:
     matches: bool
 
 
+# These source-only cases change validation granularity for actual native/service
+# journeys; they retain the same bounds and every registered behavioral selector.
+CONFORMANCE_EXECUTION_TESTS = {
+    TestId("kuberic-runtime", "kuberic-runtime::public_v1_conformance", name)
+    for name in [
+        "public_v1_conformance_executes_built_in_replacement_scenarios",
+        "public_v1_conformance_executes_service_failover_after_durable_promotion",
+        "public_v1_conformance_executes_service_failover_at_persisted_promotion",
+        "public_v1_conformance_executes_service_ambiguous_commit_abort",
+        "public_v1_conformance_executes_service_switchover_after_catch_up",
+        "public_v1_conformance_executes_service_switchover_after_durable_handoff",
+    ]
+}
+
+# Deadline/pipe ownership is source infrastructure, not ordinary native behavior.
+CONFORMANCE_HELPER_TESTS = {
+    TestId(
+        "kuberic-runtime",
+        "kuberic-runtime",
+        f"testing::public_v1_conformance::bounded_process_tests::{name}",
+    )
+    for name in [
+        "nested_commands_reuse_workspace_features_or_the_exact_archive",
+        "partition_budget_reserves_cleanup_and_outer_owner_margin",
+        "exhausted_shared_budget_never_spawns_a_later_command",
+        "direct_child_exit_with_open_descendant_pipes_is_deadline_bounded",
+        "undrained_pipe_is_an_explicit_bounded_failure",
+        "shared_deadline_does_not_reset_and_reaps_nested_process_tree",
+    ]
+}
+
+
 SOURCE_TESTS = {
     TestId(
         "kuberic-runtime",
@@ -48,6 +80,7 @@ SOURCE_TESTS = {
         "source_public_api_matches_reviewed_inventory",
         "host_capabilities_are_not_source_public_even_when_doc_hidden",
         "control_inventory_tracks_ownership_not_referenced_types",
+        "retired_replication_data_protocol_is_not_source_public",
     ]
 } | {
     TestId(
@@ -59,6 +92,7 @@ SOURCE_TESTS = {
         "protected_public_trait_method_sets_are_unchanged",
         "replacement_runtime_has_no_managed_default_or_agent_replication_owner",
         "public_operation_owners_are_ordinary_modules",
+        "native_production_owners_remain_private",
     ]
 } | {
     TestId(
@@ -68,7 +102,7 @@ SOURCE_TESTS = {
     )
     for name in [
         "public_v1_conformance_oracle_has_exactly_ksf_01_through_ksf_16",
-        "public_v1_conformance_executes_built_in_replacement_scenarios",
+        "public_v1_conformance_partitions_cover_every_registered_observation_once",
         "built_in_replacement_ksf_mappings_require_each_authorized_observation",
     ]
 } | {
@@ -107,7 +141,7 @@ SOURCE_TESTS = {
     TestId(
         "kuberic-runtime",
         "kuberic-runtime::public_v1_recovery",
-        "production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth",
+        "production_config_has_no_protocol_selector_or_application_commit_oracle",
     ),
     TestId(
         "kuberic-controller",
@@ -124,7 +158,7 @@ SOURCE_TESTS = {
         "kuberic-level-tests::source_checks",
         "packaged_controller_test_util_boundary",
     ),
-}
+} | CONFORMANCE_EXECUTION_TESTS | CONFORMANCE_HELPER_TESTS
 
 IGNORED_SOURCE_TESTS = {
     TestId(
@@ -133,16 +167,11 @@ IGNORED_SOURCE_TESTS = {
         "external_applications_can_use_contracts_but_cannot_forge_host_capabilities",
     ),
     TestId(
-        "kuberic-runtime",
-        "kuberic-runtime::public_v1_conformance",
-        "public_v1_conformance_executes_built_in_replacement_scenarios",
-    ),
-    TestId(
         "kuberic-level-tests",
         "kuberic-level-tests::source_checks",
         "packaged_controller_test_util_boundary",
     ),
-}
+} | CONFORMANCE_EXECUTION_TESTS
 
 
 def postgres_test(name: str, binary: str = POSTGRES_LIBRARY_BINARY) -> TestId:
@@ -331,6 +360,7 @@ def validate_partitions(
 
 def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> None:
     validate_kind_contract(root)
+    validate_conformance_execution_contract(root)
     inventory = listed_tests(nextest_json(root, extracted))
     assignments: dict[str, set[TestId]] = {}
     unassigned: list[TestId] = []
@@ -445,6 +475,104 @@ def validate(args: argparse.Namespace, root: Path, extracted: Path | None) -> No
     print(f"ordinary slice counts: {ordinary_counts}")
     print(f"postgres hash counts: {postgres_counts}")
     print("exact-once tier and partition validation passed")
+
+
+def validate_conformance_execution_cases(helper: str, tests: str) -> None:
+    service_manifest = re.search(
+        r"const SERVICE_PARTITIONS:[^=]+=\s*&\[(.*?)^\];", helper, re.S | re.M
+    )
+    if service_manifest is None:
+        raise ValueError("conformance service partition manifest is missing")
+    services = re.findall(
+        r'\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,?\s*\)', service_manifest.group(1)
+    )
+    ids = [partition for partition, _ in services]
+    observations = [scenario for _, scenario in services]
+    if not ids or len(set(ids)) != len(ids) or len(set(observations)) != len(observations):
+        raise ValueError("conformance service partitions are empty or overlap")
+
+    cases = re.findall(
+        r"fn\s+(public_v1_conformance_executes_\w+)\s*\(\)\s*\{(.*?)^\}",
+        tests,
+        re.S | re.M,
+    )
+    expected = {test.name for test in CONFORMANCE_EXECUTION_TESTS}
+    if {name for name, _ in cases} != expected or len(cases) != len(expected):
+        raise ValueError("conformance execution cases differ from the source inventory")
+    dispatched = []
+    for name, body in cases:
+        if name == "public_v1_conformance_executes_built_in_replacement_scenarios":
+            if not re.fullmatch(
+                r'\s*kuberic_runtime::testing::execute_public_v1_conformance_subject'
+                r'\(\s*"built-in-replacement"\s*,?\s*\)\s*;\s*',
+                body,
+            ):
+                raise ValueError("native/controller conformance dispatch changed")
+            continue
+        dispatch = re.fullmatch(
+            r"\s*kuberic_runtime::testing::execute_public_v1_conformance_partition"
+            r'\(\s*"built-in-replacement"\s*,\s*"([^"]+)"\s*,?\s*\)\s*;\s*',
+            body,
+        )
+        if dispatch is None:
+            raise ValueError(f"service conformance case has no exact dispatch: {name}")
+        dispatched.append(dispatch.group(1))
+    if set(dispatched) != set(ids) or len(dispatched) != len(ids):
+        raise ValueError("source execution cases omit or repeat a service partition")
+
+
+def validate_conformance_execution_contract(root: Path) -> None:
+    helper = (root / "kuberic-runtime/src/testing/public_v1_conformance.rs").read_text()
+    validate_conformance_execution_cases(
+        helper,
+        (root / "kuberic-runtime/tests/public_v1_conformance.rs").read_text(),
+    )
+    budgets = {
+        "CONFORMANCE_OUTER_TIMEOUT": 270,
+        "CONFORMANCE_TIMEOUT": 240,
+        "CONFORMANCE_CLEANUP_TIMEOUT": 10,
+        "CONFORMANCE_OWNER_MARGIN": 20,
+    }
+    for name, seconds in budgets.items():
+        configured = re.search(
+            rf"const {name}:\s*Duration\s*=\s*Duration::from_secs\((\d+)\);",
+            helper,
+        )
+        if configured is None or int(configured.group(1)) != seconds:
+            raise ValueError(f"conformance budget must retain {name}={seconds}s")
+    if not re.search(
+        r"pub fn execute_public_v1_conformance_partition\([^{}]*\)\s*\{"
+        r"\s*let deadline = partition_deadline\(Instant::now\(\)\);",
+        helper,
+        re.S,
+    ):
+        raise ValueError("conformance budget must start before eligibility or partition checks")
+    config = tomllib.loads((root / ".config/nextest.toml").read_text())
+    if (
+        config["profile"]["source"]["test-threads"] != 1
+        or config["test-groups"]["process-boundaries"]["max-threads"] != 1
+    ):
+        raise ValueError("conformance source partitions must retain serial isolation")
+    execution_filter = (
+        "binary_id(=kuberic-runtime::public_v1_conformance) "
+        "and test(/^public_v1_conformance_executes_/)"
+    )
+    helper_filter = (
+        "binary_id(=kuberic-runtime) "
+        "and test(/^testing::public_v1_conformance::bounded_process_tests::/)"
+    )
+    for required_filter in [execution_filter, helper_filter]:
+        overrides = [
+            item
+            for item in config["profile"]["default"]["overrides"]
+            if item["filter"] == required_filter
+        ]
+        if len(overrides) != 1 or overrides[0] != {
+            "filter": required_filter,
+            "slow-timeout": {"period": "270s", "terminate-after": 1},
+            "test-group": "process-boundaries",
+        }:
+            raise ValueError("conformance partitions/helpers changed their process group or timeout")
 
 
 def validate_kind_contract(root: Path) -> None:

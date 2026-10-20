@@ -877,7 +877,11 @@ impl AgentStore for SqliteStore {
                         .active_builds
                         .get(&build.replica.replica_id)
                         .filter(|active| {
-                            active.replica != build.replica && build_was_promoted(preview, active)
+                            (active.replica != build.replica
+                                || active.process_session_id != build.process_session_id
+                                || active.target_storage != build.target_storage
+                                || active.replication_address != build.replication_address)
+                                && build_was_promoted(preview, active)
                         })
                         .cloned();
                     if let Some(predecessor) = predecessor {
@@ -885,7 +889,8 @@ impl AgentStore for SqliteStore {
                         // incarnation may retire that idle slot, not an unfinished Build.
                         preview.active_builds.remove(&build.replica.replica_id);
                         preview.absent_builds.insert(predecessor.attempt.clone());
-                        if !preview
+                        if predecessor.target_storage != build.target_storage
+                            && !preview
                             .retired_storage_incarnations
                             .contains(&predecessor.target_storage)
                         {
@@ -932,7 +937,7 @@ impl AgentStore for SqliteStore {
                                 configuration
                                     .members
                                     .iter()
-                                    .any(|member| member.identity == build.replica)
+                                    .any(|member| member.identity.replica_id == build.replica.replica_id)
                             };
                             record.intent.lifecycle.as_ref().is_some_and(|input| {
                                 contains(&input.current)
@@ -1035,6 +1040,28 @@ impl AgentStore for SqliteStore {
                         "open target is not the local replica".into(),
                     ));
                 }
+                Some(PublicOperationProgram::Open { .. }) => {
+                    // Native BuildIdle membership is process-local. A completed
+                    // predecessor-process build is not a live session in this
+                    // newly opened owner. Retire that logical slot, not the
+                    // target's service storage or acknowledged application data.
+                    let predecessors = preview.build_records.values()
+                        .filter(|record| {
+                            record.source_session != intent.process_session_id
+                                && record.retirement == PublicV1BuildRetirement::Retain
+                                && record.result == Some(crate::protocol::public_operations::PublicV1OperationResult::Succeeded)
+                        })
+                        .map(|record| (record.operation_id.clone(), record.target.replica_id, record.build_id.clone()))
+                        .collect::<Vec<_>>();
+                    for (operation, target, build) in predecessors {
+                        if preview.active_builds.get(&target).is_some_and(|active| active.attempt == build) {
+                            preview.active_builds.remove(&target);
+                        }
+                        preview.absent_builds.insert(build);
+                        preview.build_records.get_mut(&operation).expect("captured predecessor build")
+                            .retirement = PublicV1BuildRetirement::Retired;
+                    }
+                }
                 _ => {}
             }
             if let Some(input) = &intent.lifecycle {
@@ -1102,7 +1129,17 @@ impl AgentStore for SqliteStore {
                         preview.build_records.clear();
                         preview.absent_builds.clear();
                         preview.current_inbound_build_authority = None;
-                        preview.operations.clear();
+                        preview.operations.retain(|_, record| {
+                            record.stage == PublicOperationStage::Completed
+                                && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                                && record.intent.process_session_id == intent.process_session_id
+                                && record.accepted_storage.as_ref()
+                                    == Some(&recovery.authorization.provisional_primary)
+                                && matches!(
+                                    record.intent.program,
+                                    Some(crate::protocol::public_operations::PublicOperationProgram::Open { .. })
+                                )
+                        });
                         preview.current_topology_operation = None;
                         preview.current_operation = None;
                         preview.data_loss_authorization =
@@ -1499,6 +1536,11 @@ impl AgentStore for SqliteStore {
                 )));
             }
             let mut state = load_state_from_connection(transaction)?;
+            let contained_transient_reopen = next == PublicOperationStage::Completed
+                && disposition == Some(PublicOperationDisposition::Succeeded)
+                && state.public_v1_operation_state.as_ref()
+                    .and_then(|preview| preview.current_operation.as_ref()) == Some(operation_id)
+                && crate::host::operation::contained_transient_reopen(&state, expected_process_session);
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
@@ -1595,6 +1637,10 @@ impl AgentStore for SqliteStore {
                 build_record.validate().map_err(|message| {
                     crate::host::HostError::DurableEffectConflict(message.into())
                 })?;
+            }
+            if contained_transient_reopen {
+                preview.terminal = false;
+                state.reported_fault = None;
             }
             write_agent_state(transaction, &state)?;
             Ok(result)
@@ -1911,8 +1957,8 @@ impl AgentStore for SqliteStore {
                             Some(crate::protocol::public_operations::PublicProgress {
                                 role: crate::protocol::public_operations::PublicProgressRole::
                                     Recovery,
-                                first: *progress,
-                                last: *progress,
+                                current_progress: crate::protocol::public_operations::ProgressQueryResult::Value(*progress),
+                                catch_up_capability: crate::protocol::public_operations::ProgressQueryResult::NotReady,
                             });
                     }
                     if matches!(
@@ -1961,6 +2007,15 @@ impl AgentStore for SqliteStore {
                     }
                     if instruction == PublicInstruction::Access && !preview.terminal {
                         preview.writes_revoked = false;
+                    }
+                    if instruction == PublicInstruction::Remove
+                        && let Some(
+                            crate::protocol::public_operations::PublicOperationProgram::RetireIdleReplica {
+                                replica_id,
+                            },
+                        ) = &intent.program
+                    {
+                        preview.active_builds.remove(replica_id);
                     }
                     if instruction == PublicInstruction::Remove
                         && let Some(
@@ -2173,6 +2228,7 @@ impl AgentStore for SqliteStore {
                 },
                 history: record.history.clone(),
                 current_configuration_id: current_configuration_id.clone(),
+                source_address: build.source_address.clone(),
                 target_address: record.target_address.clone(),
             },
         ))
@@ -2223,17 +2279,6 @@ impl AgentStore for SqliteStore {
                 .insert(receipt.authority.attempt.build_id.clone(), receipt.clone());
             write_agent_state(transaction, &state)
         })
-    }
-
-    async fn public_v1_storage_is_retired(
-        &self,
-        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
-    ) -> Result<bool> {
-        Ok(self
-            .load_state()
-            .await?
-            .public_v1_operation_state
-            .is_some_and(|preview| preview.retired_storage_incarnations.contains(storage)))
     }
 }
 
@@ -2651,6 +2696,7 @@ mod tests {
             },
             history,
             current_configuration_id: ConfigurationId::new("receipt-configuration"),
+            source_address: "http://127.0.0.1:2".into(),
             target_address: "http://127.0.0.1:1".into(),
         };
         store

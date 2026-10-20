@@ -1,7 +1,3 @@
-mod persistence;
-mod service;
-mod state;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +17,9 @@ use kuberic_runtime::host::{
 use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ResourceUid};
 use tokio::sync::watch;
 
-use crate::persistence::KvPersistence;
-use crate::service::KvService;
-use crate::state::CopyGate;
+use kvstore2::persistence::KvPersistence;
+use kvstore2::service::KvService;
+use kvstore2::state::CopyGate;
 
 #[derive(Debug, Parser)]
 struct Config {
@@ -92,27 +88,9 @@ async fn main() -> Result<()> {
         format!("http://{}:50052", config.pod_ip),
         copy_gate.clone(),
     ));
-    let mut replica = ReplicaHost::new(
-        ReplicaProcessConfig {
-            resource_uid: ResourceUid::new(&config.resource_uid),
-            replica_id: ReplicaId::new(config.replica_id),
-            pod_uid: PodUid::new(&config.pod_uid),
-            pvc_uid: PvcUid::new(&config.pvc_uid),
-            data_root: config.data_root.clone(),
-            replication_address: config.replication_address,
-            bearer_token: config.bearer_token.clone(),
-            rpc_deadline: Duration::from_secs(5),
-            transport_window_capacity: 256,
-        },
-        application.clone(),
-        application_storage,
-        Arc::new(KubernetesDnsResolver::new(
-            ResourceUid::new(&config.resource_uid),
-            config.namespace.clone(),
-        )),
-    )
-    .start(tokio::net::TcpListener::bind(config.control_address).await?)
-    .await?;
+    let mut replica = replica_host(&config, application.clone(), application_storage)
+        .start(tokio::net::TcpListener::bind(config.control_address).await?)
+        .await?;
     let shutdown_rx = replica.shutdown_signal();
     let http_state = HttpState {
         application: application.clone(),
@@ -168,6 +146,36 @@ async fn main() -> Result<()> {
     .collect::<Vec<_>>();
     anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
     Ok(())
+}
+
+fn replica_host(
+    config: &Config,
+    application: Arc<KvService>,
+    application_storage: ApplicationStorageState,
+) -> ReplicaHost<KvService, KubernetesDnsResolver> {
+    ReplicaHost::new(
+        ReplicaProcessConfig {
+            resource_uid: ResourceUid::new(&config.resource_uid),
+            replica_id: ReplicaId::new(config.replica_id),
+            pod_uid: PodUid::new(&config.pod_uid),
+            pvc_uid: PvcUid::new(&config.pvc_uid),
+            data_root: config.data_root.clone(),
+            replication_address: config.replication_address,
+            bearer_token: config.bearer_token.clone(),
+            rpc_deadline: Duration::from_secs(5),
+            transport_window_capacity: 256,
+        },
+        application,
+        application_storage,
+        Arc::new(KubernetesDnsResolver::new(
+            ResourceUid::new(&config.resource_uid),
+            config.namespace.clone(),
+        )),
+    )
+    .with_application_storage_paths(std::collections::BTreeMap::from([(
+        "application".into(),
+        config.data_root.join("application"),
+    )]))
 }
 
 fn application_router(state: HttpState) -> Router {
@@ -257,7 +265,215 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    use crate::state::CopyGate;
+    use kvstore2::state::CopyGate;
+
+    #[tokio::test]
+    async fn production_host_opens_fresh_application_storage() -> anyhow::Result<()> {
+        use kuberic_runtime::application::OpenMode;
+        use kuberic_runtime::control::{convert, proto};
+        use kuberic_runtime::protocol::command::PublicV1OperationCommand;
+        use kuberic_runtime::protocol::public_operations::{
+            PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+        };
+        use kuberic_runtime::protocol::types::{
+            ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, ReplicaIdentity,
+            ReplicaInstanceId, ReplicaRole, derive_agent_generation, derive_initialization_id,
+        };
+
+        fn authorized<T>(message: T) -> tonic::Request<T> {
+            let mut request = tonic::Request::new(message);
+            request
+                .metadata_mut()
+                .insert("authorization", "Bearer startup-token".parse().unwrap());
+            request
+        }
+
+        let root = tempfile::tempdir()?;
+        let config = super::Config {
+            resource_uid: "binary-startup-resource".into(),
+            replica_id: 1,
+            pod_uid: "binary-startup-pod".into(),
+            pvc_uid: "binary-startup-pvc".into(),
+            pod_ip: "127.0.0.1".into(),
+            set_name: "binary-startup".into(),
+            namespace: "default".into(),
+            bearer_token: "startup-token".into(),
+            data_root: root.path().to_path_buf(),
+            control_address: "127.0.0.1:0".parse()?,
+            replication_address: "127.0.0.1:0".parse()?,
+            application_address: "127.0.0.1:0".parse()?,
+            live_test_copy_gate_address: None,
+        };
+        let application_path = root.path().join("application");
+        assert!(super::KvPersistence::is_fresh_empty(&application_path)?);
+        let application = super::Arc::new(super::KvService::new(
+            super::Arc::new(super::KvPersistence::open(&application_path)?),
+            "http://127.0.0.1:0".into(),
+            CopyGate::disabled(),
+        ));
+        let host = super::replica_host(
+            &config,
+            application.clone(),
+            super::ApplicationStorageState::FreshEmpty,
+        );
+        let listener = tokio::net::TcpListener::bind(config.control_address).await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let (ready, mut ready_receiver) = tokio::sync::watch::channel(false);
+        let startup = tokio::spawn(async move {
+            if let Some(mut running) = host.start_with_shutdown(listener, receiver.clone()).await? {
+                ready.send_replace(true);
+                super::wait_shutdown(receiver).await;
+                running.shutdown();
+                running.wait().await?;
+            }
+            Ok::<_, kuberic_runtime::host::HostError>(())
+        });
+        let result = tokio::time::timeout(super::Duration::from_secs(20), async {
+            let mut client =
+                proto::agent_control_client::AgentControlClient::connect(address.clone()).await?;
+            let status_request = proto::GetAgentStatusRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: config.resource_uid.clone(),
+                replica_id: config.replica_id,
+                expected_instance_id: config.pod_uid.clone(),
+            };
+            let status = client
+                .get_status(authorized(status_request.clone()))
+                .await?
+                .into_inner();
+            anyhow::ensure!(status.storage_state == proto::AgentStorageState::Uninitialized as i32);
+            let resource = super::ResourceUid::new(&config.resource_uid);
+            let replica_id = super::ReplicaId::new(config.replica_id);
+            let initialization = derive_initialization_id(
+                &resource,
+                replica_id,
+                &super::PodUid::new(&config.pod_uid),
+                &super::PvcUid::new(&config.pvc_uid),
+            );
+            let identity = ReplicaIdentity {
+                replica_id,
+                instance_id: ReplicaInstanceId::new(&config.pod_uid),
+                agent_generation: derive_agent_generation(&initialization),
+            };
+            let configuration = ConfigurationDescriptor::new(
+                Epoch::new(0, 1),
+                replica_id,
+                vec![ConfigurationMember {
+                    identity: identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            );
+            client
+                .execute(authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: resource.to_string(),
+                    target: Some(identity.clone().into()),
+                    expected_process_session_id: status.process_session_id,
+                    command: Some(
+                        proto::execute_command_request::Command::InitializeAgentStore(
+                            proto::InitializeAgentStoreCommand {
+                                initialization_id: initialization.to_string(),
+                                resource_uid: resource.to_string(),
+                                local_replica_id: replica_id.value(),
+                                expected_instance_id: config.pod_uid.clone(),
+                                expected_pod_uid: config.pod_uid.clone(),
+                                expected_pvc_uid: config.pvc_uid.clone(),
+                                assigned_agent_generation: identity.agent_generation.to_string(),
+                                effective_policy: Some(proto::EffectivePolicy {
+                                    replica_set_size: 1,
+                                    write_quorum: 1,
+                                    read_quorum: 1,
+                                    failover_delay_seconds: 1,
+                                }),
+                                bootstrap_configuration: Some(configuration.into()),
+                                provisioning: None,
+                            },
+                        ),
+                    ),
+                }))
+                .await?;
+            drop(client);
+            ready_receiver.wait_for(|ready| *ready).await?;
+            let mut client =
+                proto::agent_control_client::AgentControlClient::connect(address).await?;
+            let report = convert::normalize_public_v1_agent_status_report(
+                client
+                    .get_status(authorized(status_request.clone()))
+                    .await?
+                    .into_inner(),
+            )?;
+            anyhow::ensure!(
+                report.open_mode == OpenMode::New,
+                "fresh production storage must authorize New, not Existing"
+            );
+            let program = PublicOperationProgram::Open {
+                replica: identity.clone(),
+                existing: false,
+            };
+            let mut command = PublicV1OperationCommand {
+                target: identity,
+                intent: PublicOperationIntent {
+                    identity: report.identity,
+                    operation_id: OperationId::new("binary-first-open"),
+                    revision: 1,
+                    process_session_id: report.process_session_id.clone(),
+                    class: PublicOperationClass::Authority,
+                    input_digest: program.digest(),
+                    replay_disposition: program.replay_disposition(),
+                    lifecycle: None,
+                    program: Some(program),
+                },
+            };
+            client
+                .execute(authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: resource.to_string(),
+                    target: Some(command.target.clone().into()),
+                    expected_process_session_id: report.process_session_id.to_string(),
+                    command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                        convert::public_v1_operation_command_to_proto(&command)?,
+                    )),
+                }))
+                .await?;
+            let opened = convert::normalize_public_v1_agent_status_report(
+                client
+                    .get_status(authorized(status_request))
+                    .await?
+                    .into_inner(),
+            )?;
+            anyhow::ensure!(opened.open_mode == OpenMode::Existing);
+            anyhow::ensure!(application_path.join("state.json").is_file());
+            let close = PublicOperationProgram::Close;
+            command.intent.operation_id = OperationId::new("binary-close");
+            command.intent.revision += 1;
+            command.intent.class = PublicOperationClass::Close;
+            command.intent.input_digest = close.digest();
+            command.intent.replay_disposition = close.replay_disposition();
+            command.intent.program = Some(close);
+            client
+                .execute(authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: resource.to_string(),
+                    target: Some(command.target.clone().into()),
+                    expected_process_session_id: report.process_session_id.to_string(),
+                    command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                        convert::public_v1_operation_command_to_proto(&command)?,
+                    )),
+                }))
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        shutdown.send_replace(true);
+        let host_result = startup.await?;
+        let application_result = application.shutdown_and_drain().await;
+        result??;
+        host_result?;
+        application_result?;
+        Ok(())
+    }
 
     #[test]
     fn diagnostics_distinguish_terminal_retirement_from_closed_access() {
@@ -271,13 +487,14 @@ mod tests {
                 epoch: "0.2".into(),
                 previous_configuration: None,
                 current_configuration: None,
-                current_progress: 5,
+                current_progress:
+                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(5),
                 verified_replication_lsn: None,
-                committed_lsn: 5,
+                catch_up_capability:
+                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(5),
                 read_status: "NotPrimary".into(),
                 write_status: "NotPrimary".into(),
                 catch_up_boundary_lsn: None,
-                catch_up_complete: false,
                 scale_up_operation: None,
                 retired,
                 pending_operation: None,
@@ -348,7 +565,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert!(gate.is_held());
+        assert!(directory.path().join("copy-gate").is_file());
         gate.release().unwrap();
     }
 

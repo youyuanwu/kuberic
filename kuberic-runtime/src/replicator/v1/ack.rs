@@ -15,13 +15,11 @@ type AckCallback = Arc<dyn Fn(bool) -> bool + Send + Sync>;
 
 /// Owns the callback/owner, not a stale progress snapshot. Dispatch outside the
 /// caller's guard. `should_trace` is NOT a final/force bit in an ACK message.
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK dispatch"))]
 pub(super) struct AckDispatch {
     callback: AckCallback,
     should_trace: bool,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK dispatch"))]
 impl AckDispatch {
     pub(super) fn dispatch(self) {
         // Issuance, not acceptance. Native ignores false and does not requeue.
@@ -29,7 +27,6 @@ impl AckDispatch {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 ACK scheduler"))]
 pub(super) struct AckSender {
     batch: Duration,
     retry: Duration,
@@ -42,10 +39,6 @@ pub(super) struct AckSender {
     last_issued: Option<Duration>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 ACK scheduler API")
-)]
 impl AckSender {
     pub(super) fn new(
         batch: Duration,

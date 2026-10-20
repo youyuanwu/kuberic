@@ -12,7 +12,7 @@ use kuberic_runtime::application::{
     RoleChange,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
-use kuberic_runtime::protocol::types::{AccessStatus, Epoch, OperationId, ReplicaRole};
+use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, OperationId, ReplicaRole};
 use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
@@ -21,11 +21,15 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, oneshot, watch};
 use tokio::task::JoinSet;
 
 fn app_error(error: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Application(error.to_string())
+}
+
+fn trace_counter() -> bool {
+    cfg!(test) || std::env::var_os("KUBERIC_COUNTER_TRACE").is_some()
 }
 
 fn decode(bytes: &[u8]) -> Result<i64> {
@@ -36,12 +40,14 @@ fn decode(bytes: &[u8]) -> Result<i64> {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Record {
     value: i64,
     committed: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CounterState {
     format: u32,
     epoch: Epoch,
@@ -69,6 +75,8 @@ impl Default for CounterState {
 impl CounterState {
     fn validate(&self) -> Result<()> {
         if self.format != 1
+            || self.epoch.data_loss_number < 0
+            || self.epoch.configuration_number < 0
             || self.base_lsn < 0
             || self.committed < self.base_lsn
             || self.applied < self.committed
@@ -113,6 +121,7 @@ impl CounterState {
 pub struct CounterStore {
     root: PathBuf,
     state: Mutex<CounterState>,
+    changed: Notify,
 }
 
 impl CounterStore {
@@ -132,6 +141,7 @@ impl CounterStore {
             Self {
                 root: root.to_owned(),
                 state: Mutex::new(state),
+                changed: Notify::new(),
             },
             fresh,
         ))
@@ -151,9 +161,42 @@ impl CounterStore {
             .map_err(app_error)
     }
 
+    fn authorize_open(&self, mode: OpenMode) -> Result<()> {
+        if mode == OpenMode::Existing && !self.root.join("counter.json").is_file() {
+            return Err(app_error(
+                "established counter storage is missing metadata; refusing empty recovery",
+            ));
+        }
+        self.persist(&self.state.lock().unwrap())
+    }
+
     fn copy_directory(&self, id: &OperationId) -> PathBuf {
         let digest = Bytes::copy_from_slice(&Sha256::digest(id.as_str().as_bytes()));
         self.root.join("copy").join(format!("{digest:x}"))
+    }
+
+    fn install_snapshot(&self, bytes: &[u8]) -> Result<()> {
+        let snapshot: CounterState = serde_json::from_slice(bytes).map_err(app_error)?;
+        snapshot.validate()?;
+        let mut state = self.state.lock().unwrap();
+        if snapshot.committed < state.committed
+            || (state.committed > 0
+                && (state.committed < snapshot.base_lsn
+                    || snapshot.value_at(state.committed)? != state.value_at(state.committed)?))
+        {
+            return Err(app_error("copy conflicts with acknowledged counter state"));
+        }
+        self.persist(&snapshot)?;
+        *state = snapshot;
+        self.changed.notify_waiters();
+        if trace_counter() {
+            eprintln!(
+                "counter {} installed snapshot at {}",
+                self.root.display(),
+                state.committed
+            );
+        }
+        Ok(())
     }
 }
 
@@ -253,6 +296,7 @@ impl DurableState for CounterStore {
         };
         self.persist(&candidate)?;
         *state = candidate;
+        self.changed.notify_waiters();
         Ok(state.progress())
     }
 
@@ -280,6 +324,7 @@ impl DurableState for CounterStore {
         candidate.committed = candidate.committed.max(operation.committed_lsn);
         self.persist(&candidate)?;
         *state = candidate;
+        self.changed.notify_waiters();
         Ok(state.progress())
     }
 
@@ -309,6 +354,7 @@ impl DurableState for CounterStore {
         candidate.committed = candidate.committed.max(committed);
         self.persist(&candidate)?;
         *state = candidate;
+        self.changed.notify_waiters();
         Ok(state.progress())
     }
 }
@@ -332,6 +378,9 @@ impl StateProvider for CounterStore {
     }
 
     async fn get_copy_context(&self) -> Result<OperationDataStream> {
+        if trace_counter() {
+            eprintln!("counter {} get_copy_context", self.root.display());
+        }
         Ok(Box::pin(stream::empty()))
     }
 
@@ -340,15 +389,50 @@ impl StateProvider for CounterStore {
         up_to: i64,
         mut context: OperationDataStream,
     ) -> Result<OperationDataStream> {
+        if trace_counter() {
+            eprintln!(
+                "counter {} get_copy_state through {up_to}",
+                self.root.display()
+            );
+        }
         if context.next().await.is_some() {
             return Err(app_error("counter does not accept copy context"));
         }
-        let state = self.state.lock().unwrap();
-        if up_to > state.committed {
-            return Err(app_error("counter snapshot is not committed"));
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let snapshot = {
+                let state = self.state.lock().unwrap();
+                if up_to < 0 {
+                    return Err(app_error("negative counter snapshot boundary"));
+                }
+                if up_to <= state.committed {
+                    if up_to < state.base_lsn {
+                        return Err(app_error("counter snapshot boundary is not retained"));
+                    }
+                    // Retain evidence needed to verify an older acknowledged target prefix.
+                    let mut snapshot = state.clone();
+                    snapshot.applied = up_to;
+                    snapshot.committed = up_to;
+                    snapshot.operations.retain(|lsn, _| *lsn <= up_to);
+                    Some(snapshot)
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                if trace_counter() {
+                    eprintln!(
+                        "counter {} snapshot ready through {up_to}",
+                        self.root.display()
+                    );
+                }
+                let bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(app_error)?);
+                return Ok(Box::pin(stream::iter([Ok(bytes)])));
+            }
+            changed.await;
         }
-        let bytes = Bytes::copy_from_slice(&state.value_at(up_to)?.to_le_bytes());
-        Ok(Box::pin(stream::iter([Ok(bytes)])))
     }
 
     async fn on_data_loss(&self) -> Result<bool> {
@@ -365,6 +449,37 @@ pub struct CounterService {
     control: RwLock<Option<Arc<dyn Replicator>>>,
     stop: watch::Sender<bool>,
     consumers: AsyncMutex<JoinSet<Result<()>>>,
+    writes: AsyncMutex<JoinSet<Result<()>>>,
+    write_gate: Arc<AsyncMutex<()>>,
+    role: Mutex<ReplicaRole>,
+    drain: AsyncMutex<DrainOutcome>,
+}
+
+#[derive(Default)]
+struct DrainOutcome {
+    cancelled: bool,
+    failures: Vec<String>,
+}
+
+impl DrainOutcome {
+    fn record(&mut self, joined: std::result::Result<Result<()>, tokio::task::JoinError>) {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(RuntimeError::OperationCancelled)) => self.cancelled = true,
+            Ok(Err(error)) => self.failures.push(error.to_string()),
+            Err(error) => self.failures.push(error.to_string()),
+        }
+    }
+
+    fn result(&self) -> Result<()> {
+        if !self.failures.is_empty() {
+            Err(app_error(self.failures.join("; ")))
+        } else if self.cancelled {
+            Err(RuntimeError::OperationCancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl CounterService {
@@ -378,6 +493,10 @@ impl CounterService {
             control: RwLock::new(None),
             stop: watch::channel(false).0,
             consumers: AsyncMutex::new(JoinSet::new()),
+            writes: AsyncMutex::new(JoinSet::new()),
+            write_gate: Arc::new(AsyncMutex::new(())),
+            role: Mutex::new(ReplicaRole::None),
+            drain: AsyncMutex::new(DrainOutcome::default()),
         }
     }
 
@@ -386,13 +505,81 @@ impl CounterService {
     }
 
     pub async fn set(&self, value: i64) -> Result<i64> {
-        self.state
+        let permit = self.write_gate.clone().lock_owned().await;
+        let mut writes = self.writes.lock().await;
+        if *self.stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
+        if *self.role.lock().unwrap() != ReplicaRole::Primary {
+            return Err(RuntimeError::NotPrimary);
+        }
+        let partition = self
+            .partition
+            .read()
+            .await
+            .clone()
+            .ok_or(RuntimeError::NotOpen)?;
+        let access = partition.get_write_status().await?;
+        if access != AccessStatus::Granted {
+            return Err(RuntimeError::WriteClosed(access));
+        }
+        let data = Bytes::copy_from_slice(&value.to_le_bytes());
+        let admitted = self
+            .state
             .read()
             .await
             .clone()
             .ok_or(RuntimeError::NotOpen)?
-            .replicate(Bytes::copy_from_slice(&value.to_le_bytes()))
-            .await
+            .begin_replicate(data.clone())?;
+        if trace_counter() {
+            eprintln!(
+                "counter {} admitted value {value} at {}",
+                self.store.root.display(),
+                admitted.lsn,
+            );
+        }
+        let store = self.store.clone();
+        let (outcome, observer) = oneshot::channel();
+        writes.spawn(async move {
+            let _permit = permit;
+            let result = async {
+                admitted.completion.await?;
+                store
+                    .apply(Operation {
+                        lsn: admitted.lsn,
+                        committed_lsn: admitted.lsn - 1,
+                        data,
+                    })
+                    .await?;
+                store.commit(admitted.lsn).await?;
+                Ok(admitted.lsn)
+            }
+            .await;
+            if trace_counter() {
+                eprintln!(
+                    "counter {} write {} settled {result:?}",
+                    store.root.display(),
+                    admitted.lsn,
+                );
+            }
+            let cancelled = matches!(result, Err(RuntimeError::OperationCancelled));
+            let error = result.as_ref().err().map(ToString::to_string);
+            let _ = outcome.send(result);
+            if cancelled {
+                return Err(RuntimeError::OperationCancelled);
+            }
+            if let Some(error) = error {
+                if let Err(report) = partition.report_fault(FaultType::Transient).await {
+                    return Err(app_error(format!(
+                        "{error}; fault reporting failed: {report}"
+                    )));
+                }
+                return Err(app_error(error));
+            }
+            Ok(())
+        });
+        drop(writes);
+        observer.await.map_err(app_error)?
     }
 
     pub async fn read(&self) -> Result<i64> {
@@ -410,37 +597,106 @@ impl CounterService {
         state.value_at(state.committed)
     }
 
+    /// Fixture diagnostic of service-owned durable state, not a serving read.
+    pub fn committed_value(&self) -> Result<i64> {
+        let state = self.store.state.lock().unwrap();
+        state.value_at(state.committed)
+    }
+
     pub async fn shutdown_and_drain(&self) -> Result<()> {
-        self.close().await?;
-        let mut tasks = self.consumers.lock().await;
-        let mut failures = Vec::new();
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => failures.push(error.to_string()),
-                Err(error) => failures.push(error.to_string()),
+        match self.close().await {
+            Err(RuntimeError::OperationCancelled) => {
+                if self.read().await.is_ok() || self.set(0).await.is_ok() {
+                    return Err(app_error("cancelled counter service still permits serving"));
+                }
+                Ok(())
             }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(app_error(failures.join("; ")))
+            result => result,
         }
     }
 
-    fn spawn_consumer(&self, tasks: &mut JoinSet<Result<()>>, mut stream: OperationStream) {
+    async fn drain_owned_tasks(&self) -> Result<()> {
+        let mut outcome = self.drain.lock().await;
+        let mut tasks = self.consumers.lock().await;
+        while let Some(joined) = tasks.join_next().await {
+            outcome.record(joined);
+        }
+        let mut writes = self.writes.lock().await;
+        while let Some(joined) = writes.join_next().await {
+            outcome.record(joined);
+        }
+        outcome.result()
+    }
+
+    fn spawn_consumer(
+        &self,
+        tasks: &mut JoinSet<Result<()>>,
+        mut stream: OperationStream,
+        mut copied: watch::Receiver<bool>,
+        copy_done: Option<watch::Sender<bool>>,
+        partition: StatefulServicePartition,
+    ) {
         let mut stop = self.stop.subscribe();
         let store = self.store.clone();
+        let kind = if copy_done.is_some() {
+            "copy"
+        } else {
+            "replication"
+        };
         tasks.spawn(async move {
             tokio::select! {
                 biased;
                 _ = stop.wait_for(|stopped| *stopped) => Ok(()),
                 result = async {
-                    while let Some(operation) = stream.get_operation().await? {
-                        match operation.apply_to(store.as_ref()).await {
-                            Ok(progress) => { let _ = operation.acknowledge(progress); }
-                            Err(error) => { let _ = operation.reject(error); }
+                    let wait_for_copy = copy_done.is_none() && !*copied.borrow();
+                    if wait_for_copy && copied.wait_for(|done| *done).await.is_err() {
+                        // The copy observer retains any fault; no copy completion
+                        // or replication ACK is manufactured by its retirement.
+                        return Ok(());
+                    }
+                    let mut ended = false;
+                    loop {
+                        let operation = match stream.get_operation().await {
+                            Ok(Some(operation)) => operation,
+                            Ok(None) => break,
+                            Err(RuntimeError::Closed) => return Ok(()),
+                            Err(error) => return Err(app_error(format!(
+                                "counter {kind} get_operation: {error}",
+                            ))),
+                        };
+                        if trace_counter() {
+                            eprintln!(
+                                "counter {} received {kind} {} end={}",
+                                store.root.display(),
+                                operation.lsn,
+                                operation.end_of_stream,
+                            );
                         }
+                        let result = async {
+                            if operation.end_of_stream {
+                                ended = true;
+                            } else if copy_done.is_some() {
+                                store.install_snapshot(&operation.data)?;
+                            } else {
+                                store.apply(Operation {
+                                    lsn: operation.lsn,
+                                    committed_lsn: operation.lsn - 1,
+                                    data: operation.data.clone(),
+                                }).await?;
+                                store.commit(operation.lsn).await?;
+                            }
+                            operation.acknowledge()
+                        }.await;
+                        if let Err(RuntimeError::Closed) = result {
+                            return Ok(());
+                        } else if let Err(error) = result {
+                            let _ = stream.report_fault(error.to_string());
+                            partition.report_fault(FaultType::Transient).await?;
+                            return Err(error);
+                        }
+                    }
+                    if ended && let Some(copy_done) = copy_done {
+                        copy_done.send_replace(true);
                     }
                     Ok(())
                 } => result,
@@ -453,16 +709,16 @@ impl CounterService {
 impl StatefulServiceReplica for CounterService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
         self.open_modes.lock().unwrap().push(context.mode);
-        let mut tasks = self.consumers.lock().await;
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);
         }
         if let Some(control) = self.control.read().await.clone() {
             return Ok(control);
         }
+        self.store.authorize_open(context.mode)?;
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new(self.store.clone())))
+            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
             .create_replicator(
                 Some(self.store.clone()),
                 Some(ReplicatorSettings {
@@ -471,8 +727,6 @@ impl StatefulServiceReplica for CounterService {
             )
             .await?;
         let state = interfaces.state_replicator().ok_or(RuntimeError::NotOpen)?;
-        self.spawn_consumer(&mut tasks, state.get_replication_stream().await?);
-        self.spawn_consumer(&mut tasks, state.get_copy_stream().await?);
         *self.partition.write().await = Some(context.partition);
         *self.state.write().await = Some(state);
         let control = interfaces.replicator();
@@ -481,6 +735,56 @@ impl StatefulServiceReplica for CounterService {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        let previous = *self.role.lock().unwrap();
+        if trace_counter() {
+            eprintln!(
+                "counter {} role {previous:?} -> {role:?}",
+                self.store.root.display(),
+            );
+        }
+        if role == ReplicaRole::Primary || previous == ReplicaRole::Primary {
+            let _drained = self.write_gate.lock().await;
+        }
+        if matches!(
+            role,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) && !matches!(
+            previous,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) {
+            let state = self
+                .state
+                .read()
+                .await
+                .clone()
+                .ok_or(RuntimeError::NotOpen)?;
+            let partition = self
+                .partition
+                .read()
+                .await
+                .clone()
+                .ok_or(RuntimeError::NotOpen)?;
+            let copy = role == ReplicaRole::IdleSecondary || previous != ReplicaRole::Primary;
+            let (copied, completion) = watch::channel(!copy);
+            let mut tasks = self.consumers.lock().await;
+            if copy {
+                self.spawn_consumer(
+                    &mut tasks,
+                    state.copy_operations()?,
+                    completion.clone(),
+                    Some(copied),
+                    partition.clone(),
+                );
+            }
+            self.spawn_consumer(
+                &mut tasks,
+                state.replication_operations()?,
+                completion,
+                None,
+                partition,
+            );
+        }
+        *self.role.lock().unwrap() = role;
         Ok(RoleChange {
             service_address: (role == ReplicaRole::Primary).then(|| "in-process/counter".into()),
         })
@@ -491,7 +795,8 @@ impl StatefulServiceReplica for CounterService {
         self.state.write().await.take();
         self.control.write().await.take();
         self.partition.write().await.take();
-        Ok(())
+        *self.role.lock().unwrap() = ReplicaRole::None;
+        self.drain_owned_tasks().await
     }
 
     fn abort(&self) {
@@ -511,9 +816,91 @@ mod journeys;
 mod provider_tests {
     use super::*;
 
+    #[test]
+    fn typed_cancellation_cache_never_suppresses_application_errors() {
+        let mut outcome = DrainOutcome::default();
+        outcome.record(Ok(Err(RuntimeError::OperationCancelled)));
+        assert!(matches!(
+            outcome.result(),
+            Err(RuntimeError::OperationCancelled)
+        ));
+        assert!(matches!(
+            outcome.result(),
+            Err(RuntimeError::OperationCancelled)
+        ));
+        outcome.record(Ok(Err(app_error(
+            "operation cancelled; actual persistence failure",
+        ))));
+        assert!(
+            matches!(outcome.result(), Err(RuntimeError::Application(error))
+            if error.contains("actual persistence failure"))
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_cleanup_accepts_only_typed_cancellation_and_retains_worker_failures()
+    -> Result<()> {
+        let root =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
+        for failed in [false, true] {
+            let (store, _) = CounterStore::open(&root.path().join(failed.to_string()))?;
+            let service = CounterService::new(store, "http://127.0.0.1:0".into());
+            let mut writes = service.writes.lock().await;
+            writes.spawn(async { Err(RuntimeError::OperationCancelled) });
+            if failed {
+                writes.spawn(async {
+                    Err(app_error(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "actual storage interruption",
+                    )))
+                });
+            }
+            drop(writes);
+            if failed {
+                for _ in 0..2 {
+                    assert!(matches!(service.shutdown_and_drain().await,
+                        Err(RuntimeError::Application(error))
+                            if error.contains("actual storage interruption")));
+                }
+            } else {
+                assert!(matches!(
+                    service.close().await,
+                    Err(RuntimeError::OperationCancelled)
+                ));
+                service.shutdown_and_drain().await?;
+                assert!(service.read().await.is_err());
+                assert!(service.set(99).await.is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn existing_open_never_initializes_missing_service_metadata() -> Result<()> {
+        let root =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
+        let (store, fresh) = CounterStore::open(root.path())?;
+        assert!(fresh);
+        assert!(store.authorize_open(OpenMode::Existing).is_err());
+        assert!(
+            std::fs::read_dir(root.path())
+                .map_err(app_error)?
+                .next()
+                .is_none()
+        );
+        store.authorize_open(OpenMode::New)?;
+        drop(store);
+        let (store, fresh) = CounterStore::open(root.path())?;
+        assert!(!fresh);
+        store.authorize_open(OpenMode::Existing)?;
+        assert_eq!(store.state.lock().unwrap().committed, 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn own_provider_persists_reopens_and_builds_a_frozen_snapshot() -> Result<()> {
-        let source = tempfile::tempdir().map_err(app_error)?;
+        let source =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
         let (store, fresh) = CounterStore::open(source.path())?;
         assert!(fresh);
         store
@@ -525,19 +912,17 @@ mod provider_tests {
             .await?;
         store.commit(1).await?;
         let mut snapshot = store.get_copy_state(1, Box::pin(stream::empty())).await?;
-        let target = tempfile::tempdir().map_err(app_error)?;
+        let target =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
         let (copy, _) = CounterStore::open(target.path())?;
-        let build = OperationId::new("independent-counter-build");
-        let mut sequence = 0;
-        while let Some(data) = snapshot.next().await {
-            let chunk = CopyChunk { data: data? };
-            copy.apply_copy_chunk(&build, sequence, chunk.clone())
-                .await?;
-            assert!(copy.verify_copy_chunk(&build, sequence, &chunk).await?);
-            sequence += 1;
-        }
-        copy.finish_copy(&build, 1, 1).await?;
+        let bytes = snapshot.next().await.unwrap()?;
+        assert!(snapshot.next().await.is_none());
+        copy.install_snapshot(&bytes)?;
         assert_eq!(copy.state.lock().unwrap().value_at(1)?, 17);
+        let (reopened_copy, fresh) = CounterStore::open(target.path())?;
+        assert!(!fresh);
+        assert_eq!(reopened_copy.last_committed_lsn().await?, 1);
+        assert_eq!(reopened_copy.state.lock().unwrap().value_at(1)?, 17);
         drop(store);
         let (reopened, fresh) = CounterStore::open(source.path())?;
         assert!(!fresh);
@@ -546,9 +931,99 @@ mod provider_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn native_copy_snapshot_is_frozen_and_malformed_copy_cannot_mutate_state() -> Result<()> {
+        let root =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
+        let (store, _) = CounterStore::open(root.path())?;
+        store
+            .apply(Operation {
+                lsn: 1,
+                committed_lsn: 0,
+                data: Bytes::copy_from_slice(&17_i64.to_le_bytes()),
+            })
+            .await?;
+        store.commit(1).await?;
+        let mut snapshot = store.get_copy_state(1, Box::pin(stream::empty())).await?;
+        store
+            .apply(Operation {
+                lsn: 2,
+                committed_lsn: 1,
+                data: Bytes::copy_from_slice(&23_i64.to_le_bytes()),
+            })
+            .await?;
+        store.commit(2).await?;
+        let bytes = snapshot.next().await.unwrap()?;
+        let snapshot: CounterState = serde_json::from_slice(&bytes).map_err(app_error)?;
+        assert_eq!(snapshot.committed, 1);
+        assert_eq!(snapshot.value_at(1)?, 17);
+        let before = std::fs::read(root.path().join("counter.json")).map_err(app_error)?;
+        assert!(store.install_snapshot(b"invalid snapshot").is_err());
+        assert!(
+            store.install_snapshot(&bytes).is_err(),
+            "copy rolled back acknowledged state"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("counter.json")).map_err(app_error)?,
+            before
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_snapshot_advances_retained_secondary_only_with_matching_acknowledged_prefix()
+    -> Result<()> {
+        let source =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
+        let target =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
+        let (store, _) = CounterStore::open(source.path())?;
+        let (copy, _) = CounterStore::open(target.path())?;
+        for (lsn, value) in [(1, 17_i64), (2, 23)] {
+            store
+                .apply(Operation {
+                    lsn,
+                    committed_lsn: lsn - 1,
+                    data: Bytes::copy_from_slice(&value.to_le_bytes()),
+                })
+                .await?;
+            store.commit(lsn).await?;
+            let mut stream = store.get_copy_state(lsn, Box::pin(stream::empty())).await?;
+            let bytes = stream.next().await.unwrap()?;
+            assert!(stream.next().await.is_none());
+            if lsn == 2 {
+                let mut crossed: CounterState =
+                    serde_json::from_slice(&bytes).map_err(app_error)?;
+                crossed.operations.get_mut(&1).unwrap().value = 99;
+                let before =
+                    std::fs::read(target.path().join("counter.json")).map_err(app_error)?;
+                assert!(
+                    copy.install_snapshot(&serde_json::to_vec(&crossed).map_err(app_error)?)
+                        .is_err()
+                );
+                assert_eq!(
+                    std::fs::read(target.path().join("counter.json")).map_err(app_error)?,
+                    before
+                );
+                assert_eq!(copy.last_committed_lsn().await?, 1);
+            }
+            copy.install_snapshot(&bytes)?;
+            assert_eq!(copy.last_committed_lsn().await?, lsn);
+            assert_eq!(copy.state.lock().unwrap().value_at(1)?, 17);
+            assert_eq!(copy.state.lock().unwrap().value_at(lsn)?, value);
+        }
+        let (reopened, fresh) = CounterStore::open(target.path())?;
+        assert!(!fresh);
+        assert_eq!(reopened.last_committed_lsn().await?, 2);
+        assert_eq!(reopened.state.lock().unwrap().value_at(1)?, 17);
+        assert_eq!(reopened.state.lock().unwrap().value_at(2)?, 23);
+        Ok(())
+    }
+
     #[test]
     fn incompatible_application_state_rejects_without_mutation() -> Result<()> {
-        let root = tempfile::tempdir().map_err(app_error)?;
+        let root =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
         let path = root.path().join("counter.json");
         std::fs::write(&path, b"incompatible provider").map_err(app_error)?;
         assert!(CounterStore::open(root.path()).is_err());
@@ -561,7 +1036,8 @@ mod provider_tests {
 
     #[tokio::test]
     async fn malformed_operation_does_not_publish_progress() -> Result<()> {
-        let root = tempfile::tempdir().map_err(app_error)?;
+        let root =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
         let (store, _) = CounterStore::open(root.path())?;
         assert!(
             store

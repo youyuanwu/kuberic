@@ -19,7 +19,7 @@ impl ApplicationFactory for KvFactory {
     ) -> kuberic_controller::test_util::Result<CreatedApplication<KvService>> {
         let root = context.application_root().to_owned();
         let fresh = KvPersistence::is_fresh_empty(&root).map_err(anyhow::Error::from)?;
-        let persistence = Arc::new(KvPersistence::open(root).map_err(anyhow::Error::from)?);
+        let persistence = Arc::new(KvPersistence::open(&root).map_err(anyhow::Error::from)?);
         Ok(CreatedApplication::new(
             Arc::new(KvService::new(
                 persistence,
@@ -31,16 +31,32 @@ impl ApplicationFactory for KvFactory {
             } else {
                 ApplicationStorageState::Established
             },
-        ))
+        )
+        .with_storage_paths([root]))
     }
     async fn shutdown_and_drain(
         &self,
         service: Arc<KvService>,
     ) -> kuberic_controller::test_util::Result<()> {
-        service
-            .shutdown_and_drain()
-            .await
-            .map_err(anyhow::Error::from)?;
+        use kuberic_runtime::RuntimeError;
+        if let Err(error) = service.shutdown_and_drain().await {
+            if !matches!(error, RuntimeError::OperationCancelled) {
+                return Err(anyhow::Error::from(error).into());
+            }
+            // Only typed retirement is expected; application faults remain fatal.
+            if !matches!(
+                service.get("__retired_probe").await,
+                Err(RuntimeError::NotOpen)
+            ) || !matches!(
+                service
+                    .replicate_put("__retired_probe".into(), "forbidden".into())
+                    .await,
+                Err(RuntimeError::NotOpen)
+            ) {
+                return Err(anyhow::anyhow!("aborted KV service retained client access").into());
+            }
+            eprintln!("verified retired KV service: {error}");
+        }
         Ok(())
     }
 }
@@ -241,7 +257,33 @@ impl Harness {
             let mut matching = 0;
             for reference in topology.members() {
                 let service = self.cluster.service(reference).await?;
-                if self.cluster.probe(service.get(key)).await?.as_deref() == Some(value) {
+                let found = if reference.identity() == topology.primary().identity() {
+                    self.cluster.probe(service.get(key)).await?
+                } else {
+                    use kuberic_runtime::RuntimeError;
+                    use kuberic_runtime::protocol::types::AccessStatus;
+                    self.cluster
+                        .probe(async {
+                            anyhow::ensure!(matches!(
+                                service.get(key).await,
+                                Err(RuntimeError::ReadClosed(AccessStatus::NotPrimary))
+                            ));
+                            Ok::<_, anyhow::Error>(())
+                        })
+                        .await?;
+                    use kuberic_runtime::engine::DurableState;
+                    let committed = service
+                        .persistence()
+                        .durable_progress()
+                        .await?
+                        .committed_lsn;
+                    service
+                        .persistence()
+                        .snapshot_at(committed)?
+                        .get(key)
+                        .cloned()
+                };
+                if found.as_deref() == Some(value) {
                     matching += 1;
                 }
             }
@@ -251,7 +293,21 @@ impl Harness {
             self.step().await?;
         }
     }
-    pub async fn finish(self, result: Result<()>) -> Result<()> {
+    pub async fn finish(mut self, result: Result<()>) -> Result<()> {
+        if result.is_err()
+            && let Ok(observation) = self.cluster.observe().await
+        {
+            eprintln!(
+                "in-process pre-cleanup snapshot: {}",
+                serde_json::json!({
+                    "set": observation.set(),
+                    "reconcileErrors": observation.reconcile_errors(),
+                    "agents": observation.replicas()
+                        .map(|reference| observation.report(reference))
+                        .collect::<Vec<_>>(),
+                })
+            );
+        }
         if let Err(error) = self.cluster.finish(result).await {
             if let Some(diagnostics) = error.diagnostics() {
                 eprintln!("in-process failure diagnostics: {diagnostics}");

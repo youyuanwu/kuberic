@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use kuberic_runtime::replicator::stateless::TestingTcpRouteKind;
+use kuberic_runtime::replicator::TestingTcpRouteKind;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};

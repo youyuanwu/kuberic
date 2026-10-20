@@ -10,11 +10,6 @@
 //! The caller drives native roles/streams and supplies actual host access/fault
 //! callbacks. The repository testing bridge exposes no private engine types.
 
-#![cfg_attr(
-    not(feature = "testing"),
-    expect(dead_code, reason = "unselected V1 KV preparation")
-)]
-
 use std::future::Future;
 use std::io;
 use std::path::Path;
@@ -35,7 +30,7 @@ pub struct Assignment {
 pub struct Write {
     pub lsn: i64,
     outcome: oneshot::Receiver<io::Result<i64>>,
-    result: Option<Result<i64, String>>,
+    result: Option<Result<i64, (bool, String)>>,
 }
 
 impl Write {
@@ -47,14 +42,14 @@ impl Write {
                     "KV commit worker abandoned client outcome",
                 )),
             };
-            self.result = Some(result.map_err(|error| error.to_string()));
+            self.result = Some(result.map_err(|error| (is_abort(&error), error.to_string())));
         }
         self.result
             .as_ref()
             .unwrap()
             .as_ref()
             .copied()
-            .map_err(|reason| io::Error::other(reason.clone()))
+            .map_err(|(aborted, reason)| stored_error(*aborted, reason.clone()))
     }
 }
 
@@ -74,6 +69,7 @@ struct Pending {
 struct State {
     sender: Option<mpsc::UnboundedSender<Pending>>,
     fault: Option<String>,
+    aborted: bool,
     mode: Mode,
     pending: usize,
     #[cfg(feature = "testing")]
@@ -82,7 +78,7 @@ struct State {
 
 struct Drain {
     worker: Option<JoinHandle<io::Result<()>>>,
-    result: Option<Result<(), String>>,
+    result: Option<Result<(), (bool, String)>>,
 }
 
 pub struct Committer {
@@ -98,9 +94,38 @@ fn error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+#[derive(Debug)]
+struct Aborted(String);
+
+impl std::fmt::Display for Aborted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Aborted {}
+
+pub(crate) fn is_abort(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|cause| {
+        cause.is::<Aborted>()
+            || matches!(
+                cause.downcast_ref::<kuberic_runtime::RuntimeError>(),
+                Some(kuberic_runtime::RuntimeError::OperationCancelled)
+            )
+    })
+}
+
+fn stored_error(aborted: bool, reason: String) -> io::Error {
+    if aborted {
+        io::Error::new(io::ErrorKind::Interrupted, Aborted(reason))
+    } else {
+        io::Error::other(reason)
+    }
+}
+
 fn live(state: &State) -> io::Result<()> {
-    if let Some(fault) = &state.fault {
-        return Err(io::Error::other(fault.clone()));
+    if let Some(error) = fault_error(state) {
+        return Err(error);
     }
     if state
         .sender
@@ -110,6 +135,13 @@ fn live(state: &State) -> io::Result<()> {
         return Err(io::Error::other("KV service is closing"));
     }
     Ok(())
+}
+
+fn fault_error(state: &State) -> Option<io::Error> {
+    state
+        .fault
+        .as_ref()
+        .map(|reason| stored_error(state.aborted, reason.clone()))
 }
 
 fn record_fault(state: &mut State, reason: &str) -> bool {
@@ -139,12 +171,20 @@ impl Committer {
         report: Arc<dyn Fn(String) + Send + Sync>,
     ) -> io::Result<Self> {
         let store = Arc::new(KvPersistence::open(root).map_err(error)?);
+        Self::with_store(store, report)
+    }
+
+    pub(crate) fn with_store(
+        store: Arc<KvPersistence>,
+        report: Arc<dyn Fn(String) + Send + Sync>,
+    ) -> io::Result<Self> {
         store.native_recover().map_err(error)?;
         let (sender, mut receiver) = mpsc::unbounded_channel::<Pending>();
         let (cancel, mut cancelled) = watch::channel(false);
         let state = Arc::new(Mutex::new(State {
             sender: Some(sender),
             fault: None,
+            aborted: false,
             mode: Mode::None,
             pending: 0,
             #[cfg(feature = "testing")]
@@ -158,16 +198,12 @@ impl Committer {
         let worker = tokio::spawn(async move {
             let mut failure = None;
             while let Some(mut pending) = receiver.recv().await {
-                let replicated = if let Some(fault) = &worker_state.lock().unwrap().fault {
-                    Err(io::Error::other(fault.clone()))
-                } else {
-                    Ok(())
-                };
+                let replicated = fault_error(&worker_state.lock().unwrap()).map_or(Ok(()), Err);
                 let replicated = match replicated {
                     Err(error) => Err(error),
                     Ok(()) => tokio::select! {
                         biased;
-                        _ = cancelled.changed() => Err(io::Error::other("KV service aborted; admitted outcome is unknown")),
+                        _ = cancelled.changed() => Err(stored_error(true, "KV service aborted; admitted outcome is unknown".into())),
                         result = &mut pending.assignment.completion => result,
                     },
                 };
@@ -185,14 +221,19 @@ impl Committer {
                 }
                 let mut state = worker_state.lock().unwrap();
                 let result = replicated.and_then(|()| {
-                    if let Some(fault) = &state.fault {
-                        return Err(io::Error::other(fault.clone()));
+                    if let Some(error) = fault_error(&state) {
+                        return Err(error);
                     }
                     worker_store
                         .native_commit(pending.assignment.lsn)
                         .map_err(error)?;
                     Ok(pending.assignment.lsn)
                 });
+                let result = if result.as_ref().err().is_some_and(is_abort) && !state.aborted {
+                    fault_error(&state).map_or(result, Err)
+                } else {
+                    result
+                };
                 state.pending -= 1;
                 match result {
                     Ok(lsn) => {
@@ -201,20 +242,28 @@ impl Committer {
                         worker_changed.notify_waiters();
                     }
                     Err(error) => {
+                        let aborted = is_abort(&error);
                         let reason = format!(
                             "KV admitted write {} failed: {error}",
                             pending.assignment.lsn
                         );
-                        failure.get_or_insert_with(|| reason.clone());
+                        failure.get_or_insert_with(|| (aborted, reason.clone()));
                         let first = record_fault(&mut state, &reason);
+                        if first && aborted {
+                            state.aborted = true;
+                        }
                         drop(state);
-                        publish_fault(&worker_changed, worker_report.as_ref(), reason, first);
+                        if aborted {
+                            worker_changed.notify_waiters();
+                        } else {
+                            publish_fault(&worker_changed, worker_report.as_ref(), reason, first);
+                        }
                         let _ = pending.reply.send(Err(error));
                     }
                 }
             }
             match failure {
-                Some(reason) => Err(io::Error::other(reason)),
+                Some((aborted, reason)) => Err(stored_error(aborted, reason)),
                 None => Ok(()),
             }
         });
@@ -229,6 +278,22 @@ impl Committer {
             }),
             report,
         })
+    }
+
+    pub(crate) async fn wait_for_role_drain(&self) -> io::Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().unwrap();
+                live(&state)?;
+                if state.pending == 0 && !matches!(state.mode, Mode::Copy { .. }) {
+                    return Ok(());
+                }
+            }
+            changed.await;
+        }
     }
 
     pub fn promote(&self) -> io::Result<()> {
@@ -252,6 +317,7 @@ impl Committer {
             ));
         }
         state.mode = Mode::Secondary;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -379,6 +445,7 @@ impl Committer {
             return Err(io::Error::other("KV copy EOF before durable snapshot"));
         }
         state.mode = Mode::Secondary;
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -407,12 +474,15 @@ impl Committer {
     }
 
     pub fn abort(&self) {
-        fence(
-            &self.state,
-            &self.changed,
-            self.report.as_ref(),
-            "KV service aborted; admitted outcomes are unknown".into(),
-        );
+        let reason = "KV service aborted; admitted outcomes are unknown".to_owned();
+        {
+            let mut state = self.state.lock().unwrap();
+            let first = record_fault(&mut state, &reason);
+            if first {
+                state.aborted = true;
+            }
+        }
+        self.changed.notify_waiters();
         self.cancel.send_replace(true);
     }
 
@@ -425,11 +495,12 @@ impl Committer {
         if drain.result.is_none() {
             let result = drain.worker.as_mut().unwrap().await;
             drain.worker.take();
-            let fault = self.state.lock().unwrap().fault.clone();
+            let fault = fault_error(&self.state.lock().unwrap())
+                .map(|error| (is_abort(&error), error.to_string()));
             drain.result = Some(match result {
                 Ok(Ok(())) => fault.map_or(Ok(()), Err),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(error) => Err(format!("KV worker failed: {error}")),
+                Ok(Err(error)) => Err((is_abort(&error), error.to_string())),
+                Err(error) => Err((false, format!("KV worker failed: {error}"))),
             });
         }
         let result = drain
@@ -438,7 +509,7 @@ impl Committer {
             .unwrap()
             .as_ref()
             .copied()
-            .map_err(|reason| io::Error::other(reason.clone()));
+            .map_err(|(aborted, reason)| stored_error(*aborted, reason.clone()));
         if let Err(error) = &result {
             fence(
                 &self.state,
@@ -523,6 +594,70 @@ mod tests {
             lsn,
             completion: Box::pin(async { Ok(()) }),
         }
+    }
+
+    #[tokio::test]
+    async fn native_cancellation_before_service_abort_is_typed_and_not_a_new_fault() {
+        for cancelled in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let (kv, faults) = open(directory.path());
+            kv.promote().unwrap();
+            let cause = if cancelled {
+                io::Error::other(kuberic_runtime::RuntimeError::OperationCancelled)
+            } else {
+                io::Error::new(io::ErrorKind::Interrupted, "ordinary worker failure")
+            };
+            let mut write = kv
+                .begin_put("k".into(), "uncommitted".into(), |_| {
+                    Ok(Assignment {
+                        lsn: 1,
+                        completion: Box::pin(async move { Err(cause) }),
+                    })
+                })
+                .unwrap();
+            assert_eq!(is_abort(&write.wait().await.unwrap_err()), cancelled);
+            assert_eq!(is_abort(&write.wait().await.unwrap_err()), cancelled);
+            assert_eq!(kv.store.native_progress(), 0);
+            assert_eq!(faults.lock().unwrap().is_empty(), cancelled);
+            assert_eq!(is_abort(&kv.close().await.unwrap_err()), cancelled);
+        }
+    }
+
+    #[tokio::test]
+    async fn prior_fault_is_not_hidden_by_later_native_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (kv, faults) = open(directory.path());
+        kv.promote().unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (started, released) = (entered.clone(), release.clone());
+        let mut write = kv
+            .begin_put("k".into(), "uncommitted".into(), |_| {
+                Ok(Assignment {
+                    lsn: 1,
+                    completion: Box::pin(async move {
+                        started.notify_one();
+                        released.notified().await;
+                        Err(io::Error::other(
+                            kuberic_runtime::RuntimeError::OperationCancelled,
+                        ))
+                    }),
+                })
+            })
+            .unwrap();
+        entered.notified().await;
+        fence(
+            &kv.state,
+            &kv.changed,
+            kv.report.as_ref(),
+            "prior application failure".into(),
+        );
+        release.notify_one();
+        let error = write.wait().await.unwrap_err();
+        assert!(!is_abort(&error));
+        assert!(error.to_string().contains("prior application failure"));
+        assert!(!is_abort(&kv.close().await.unwrap_err()));
+        assert_eq!(faults.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

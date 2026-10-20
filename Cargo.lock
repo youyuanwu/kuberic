@@ -637,6 +637,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "external-classic-v1-provider"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "kuberic-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,6 +1404,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
+ "external-classic-v1-provider",
  "futures",
  "k8s-openapi",
  "kube",
@@ -1408,6 +1423,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -2743,6 +2759,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "slab",

@@ -1,47 +1,62 @@
-//! Public v2 lifecycle/provider adapter. Authority stays in ReplicaHost.
+//! Production SQLite service over native V1 assignment and service-owned WAL
+//! commitment/publication. No engine can open or commit the application store.
+
 use std::path::PathBuf;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::{StreamExt, stream};
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
-use kuberic_runtime::engine::DurableState;
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
 use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorSettings, StateReplicator,
+    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
     StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
+use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::task::JoinSet;
 
-use crate::barrier::ReplicationBarrier;
-use crate::connection::SqliteConnection;
-use crate::state::{RecoveryState, SqlitePersistence, persistence_error};
+use crate::SqlitePersistence;
+use crate::connection::Statement;
+use crate::state::persistence_error;
+use crate::v1::{Assignment, Committer, Execution};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyCompletion {
+    Pending,
+    Complete,
+    Retired,
+}
 
 pub struct SqliteProvider {
-    persistence: Arc<SqlitePersistence>,
+    committer: Arc<OnceLock<Arc<Committer>>>,
     #[cfg(any(test, feature = "testing"))]
     copy_snapshot: crate::testing::PauseGate,
+}
+
+impl SqliteProvider {
+    fn committer(&self) -> Result<&Arc<Committer>> {
+        self.committer.get().ok_or(RuntimeError::NotOpen)
+    }
 }
 
 #[async_trait]
 impl StateProvider for SqliteProvider {
     async fn update_epoch(&self, _epoch: Epoch, previous_epoch_last_lsn: i64) -> Result<()> {
-        // Agent authority fences epochs; immutable application history must not
-        // discard an unresolved reservation or an acknowledged prefix here.
         if previous_epoch_last_lsn < 0 {
             return Err(RuntimeError::Application(
-                "negative previous epoch boundary".into(),
+                "negative SQLite epoch boundary".into(),
             ));
         }
+        // SQLite has no epoch-indexed application state to mutate. Native owner
+        // barriers, not an independent service oracle, sequence this callback.
+        self.committer()?.progress().map_err(persistence_error)?;
         Ok(())
     }
     async fn last_committed_lsn(&self) -> Result<i64> {
-        Ok(self.persistence.durable_progress().await?.committed_lsn)
+        self.committer()?.progress().map_err(persistence_error)
     }
     async fn get_copy_context(&self) -> Result<OperationDataStream> {
         Ok(Box::pin(stream::empty()))
@@ -51,45 +66,44 @@ impl StateProvider for SqliteProvider {
         up_to_lsn: i64,
         mut context: OperationDataStream,
     ) -> Result<OperationDataStream> {
-        if context.next().await.is_some() {
+        if let Some(item) = context.next().await {
+            item?;
             return Err(RuntimeError::Application(
                 "SQLite does not use copy context".into(),
             ));
         }
         let data = self
-            .persistence
+            .committer()?
             .snapshot(up_to_lsn)
+            .await
             .map_err(persistence_error)?;
         #[cfg(any(test, feature = "testing"))]
         self.copy_snapshot.pause().await;
-        Ok(Box::pin(stream::iter([Ok(Bytes::from(data))])))
+        Ok(Box::pin(stream::iter([Ok(data)])))
     }
     async fn on_data_loss(&self) -> Result<bool> {
         Ok(false)
     }
 }
 
+#[derive(Default)]
+struct Consumers {
+    tasks: JoinSet<Result<()>>,
+    errors: Vec<String>,
+}
+
 pub struct SqliteService {
-    pub(crate) sql: Arc<Mutex<SqliteConnection>>,
-    pub(crate) request_gate: Arc<tokio::sync::Mutex<()>>,
-    pub(crate) active: Arc<AtomicBool>,
-    pub(crate) vfs_name: String,
     persistence: Arc<SqlitePersistence>,
-    barrier: Arc<ReplicationBarrier>,
     provider: Arc<SqliteProvider>,
-    partition: Mutex<Option<StatefulServicePartition>>,
+    partition: Arc<Mutex<Option<StatefulServicePartition>>>,
     control: Mutex<Option<Arc<dyn Replicator>>>,
     replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
-    streams: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    #[cfg(any(test, feature = "testing"))]
-    controlled_operations: Mutex<
-        Option<
-            tokio::sync::mpsc::UnboundedSender<
-                kuberic_runtime::replicator::stream::StreamOperation,
-            >,
-        >,
-    >,
+    committer: Arc<OnceLock<Arc<Committer>>>,
+    active: Arc<AtomicBool>,
+    role: Mutex<ReplicaRole>,
     replication_address: String,
+    stop: watch::Sender<bool>,
+    consumers: AsyncMutex<Consumers>,
 }
 
 impl SqliteService {
@@ -97,94 +111,87 @@ impl SqliteService {
         persistence: Arc<SqlitePersistence>,
         replication_address: String,
     ) -> std::io::Result<Self> {
-        let committed_lsn = persistence.progress()?.committed_lsn;
-        Self::with_persistence(persistence, replication_address, committed_lsn)
+        Self::with_store(persistence, replication_address)
     }
-
-    /// Construct without touching application files. ReplicaHost must authorize
-    /// agent storage before invoking Open, which opens application persistence.
     pub fn deferred(root: PathBuf, replication_address: String) -> std::io::Result<Self> {
-        Self::with_persistence(
+        Self::with_store(
             Arc::new(SqlitePersistence::deferred(root)?),
             replication_address,
-            0,
         )
     }
-
-    fn with_persistence(
+    fn with_store(
         persistence: Arc<SqlitePersistence>,
         replication_address: String,
-        committed_lsn: i64,
     ) -> std::io::Result<Self> {
-        let (barrier, vfs_name) =
-            ReplicationBarrier::register_with_lsn(persistence.clone(), committed_lsn)?;
+        let committer = Arc::new(OnceLock::new());
         Ok(Self {
-            sql: Arc::new(Mutex::new(SqliteConnection::default())),
-            request_gate: Arc::new(tokio::sync::Mutex::new(())),
-            active: Arc::new(AtomicBool::new(false)),
-            vfs_name,
-            provider: Arc::new(SqliteProvider {
-                persistence: persistence.clone(),
-                #[cfg(any(test, feature = "testing"))]
-                copy_snapshot: crate::testing::PauseGate::default(),
-            }),
             persistence,
-            barrier,
-            partition: Mutex::new(None),
+            provider: Arc::new(SqliteProvider {
+                committer: committer.clone(),
+                #[cfg(any(test, feature = "testing"))]
+                copy_snapshot: Default::default(),
+            }),
+            partition: Arc::new(Mutex::new(None)),
             control: Mutex::new(None),
             replicator: Mutex::new(None),
-            streams: Mutex::new(Vec::new()),
-            #[cfg(any(test, feature = "testing"))]
-            controlled_operations: Mutex::new(None),
+            committer,
+            active: Arc::new(AtomicBool::new(false)),
+            role: Mutex::new(ReplicaRole::None),
             replication_address,
+            stop: watch::channel(false).0,
+            consumers: AsyncMutex::new(Consumers::default()),
         })
     }
-
     pub fn persistence(&self) -> &Arc<SqlitePersistence> {
         &self.persistence
-    }
-    pub fn barrier(&self) -> &Arc<ReplicationBarrier> {
-        &self.barrier
     }
     pub fn provider(&self) -> &Arc<SqliteProvider> {
         &self.provider
     }
-    #[cfg(any(test, feature = "testing"))]
-    pub fn copy_snapshot_gate(&self) -> &crate::testing::PauseGate {
-        &self.provider.copy_snapshot
-    }
-    /// Let a test service explicitly persist and ACK actual factory deliveries.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn control_stream_operations_for_test(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<kuberic_runtime::replicator::stream::StreamOperation>
-    {
-        assert!(self.control.lock().expect("control").is_none());
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        *self
-            .controlled_operations
-            .lock()
-            .expect("controlled operations") = Some(sender);
-        receiver
-    }
-    pub fn vfs_name(&self) -> &str {
-        &self.vfs_name
-    }
-
-    #[cfg(any(test, feature = "testing"))]
-    pub fn primary_application_active_for_test(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
-    }
     pub fn partition(&self) -> Result<StatefulServicePartition> {
         self.partition
             .lock()
-            .expect("partition")
+            .unwrap()
             .clone()
             .ok_or(RuntimeError::NotOpen)
     }
+    fn committer(&self) -> Result<&Arc<Committer>> {
+        self.committer.get().ok_or(RuntimeError::NotOpen)
+    }
 
-    pub(crate) async fn access(&self, write: bool) -> Result<(StatefulServicePartition, bool)> {
-        if !self.active.load(Ordering::SeqCst) {
+    pub(crate) async fn execute(&self, statements: Vec<Statement>) -> Result<Execution> {
+        self.check_access(true).await?;
+        let mut write = self
+            .committer()?
+            .begin_statements(statements)
+            .map_err(persistence_error)?;
+        match write.wait_execution().await {
+            Ok(execution) => Ok(execution),
+            Err(error) => Err(match write.admitted_lsn() {
+                Some(lsn) => RuntimeError::AdmittedOperationFailed {
+                    lsn,
+                    reason: error.to_string(),
+                },
+                None => persistence_error(error),
+            }),
+        }
+    }
+
+    pub(crate) async fn query(
+        &self,
+        sql: String,
+        params: Vec<rusqlite::types::Value>,
+    ) -> Result<(Vec<String>, Vec<Vec<rusqlite::types::Value>>)> {
+        self.check_access(false).await?;
+        let committer = self.committer()?.clone();
+        tokio::task::spawn_blocking(move || committer.query_with_params(&sql, &params))
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .map_err(persistence_error)
+    }
+
+    async fn check_access(&self, write: bool) -> Result<()> {
+        if !self.active.load(Ordering::Acquire) {
             return Err(RuntimeError::NotPrimary);
         }
         let partition = self.partition()?;
@@ -200,73 +207,233 @@ impl SqliteService {
                 RuntimeError::ReadClosed(status)
             });
         }
-        // A write grant follows the runtime's exact local-journal recovery. Reads
-        // alone must not clear a reservation-only reconciliation marker.
-        let recovered = partition.get_write_status().await? == AccessStatus::Granted;
-        Ok((partition, recovered))
+        Ok(())
     }
 
-    /// Grant-time journal recovery can advance commitment after the Primary
-    /// callback. Under the request/connection locks, refresh that materialization
-    /// before the first SQL request can observe it or issue a different write.
-    pub(crate) fn prepare_sql(
-        &self,
-        sql: &mut SqliteConnection,
-        recovered: bool,
-    ) -> std::io::Result<()> {
-        if !self.active.load(Ordering::SeqCst) || self.barrier.is_fenced() {
-            return Err(std::io::Error::other(
-                "SQL is fenced for this service instance",
-            ));
-        }
-        let recovery = self.persistence.recovery_state()?;
-        if matches!(
-            recovery,
-            RecoveryState::RebuildRequired(_) | RecoveryState::Rebuilding { .. }
-        ) {
-            return Err(std::io::Error::other(
-                "acknowledged history requires rebuild",
-            ));
-        }
-        let committed = self.persistence.progress()?.committed_lsn;
-        if !sql.is_open() || sql.visible_lsn != committed || recovery != RecoveryState::Healthy {
-            sql.close();
-            if recovery != RecoveryState::Healthy {
-                if !recovered {
-                    return Err(std::io::Error::other(
-                        "agent journal reconciliation is incomplete",
-                    ));
-                }
-                self.persistence.complete_reconciliation()?;
+    #[cfg(any(test, feature = "testing"))]
+    pub fn copy_snapshot_gate(&self) -> &crate::testing::PauseGate {
+        &self.provider.copy_snapshot
+    }
+    #[cfg(any(test, feature = "testing"))]
+    pub fn primary_application_active_for_test(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+    #[cfg(feature = "testing")]
+    pub fn committer_for_test(&self) -> Result<Arc<crate::v1_test_bridge::Committer>> {
+        self.committer().cloned()
+    }
+
+    async fn start_secondary(&self, copy: bool) -> Result<()> {
+        let replicator = self
+            .replicator
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(RuntimeError::NotOpen)?;
+        let store = self.committer()?.clone();
+        let partition = self.partition()?;
+        let mut consumers = self.consumers.lock().await;
+        while let Some(result) = consumers.tasks.try_join_next() {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => consumers.errors.push(error.to_string()),
+                Err(error) => consumers.errors.push(error.to_string()),
             }
-            let path = self.persistence.materialize_committed()?;
-            self.barrier.reset_receipt(committed);
-            sql.open(&path, &self.vfs_name, committed)
-                .map_err(std::io::Error::other)?;
         }
+        if !consumers.errors.is_empty() {
+            return Err(RuntimeError::Application(consumers.errors.join("; ")));
+        }
+        let (copied, completion) = watch::channel(if copy {
+            CopyCompletion::Pending
+        } else {
+            CopyCompletion::Complete
+        });
+        if copy {
+            store.begin_copy().map_err(persistence_error)?;
+            let mut stream = replicator.copy_operations()?;
+            let store = store.clone();
+            let partition = partition.clone();
+            let mut stop = self.stop.subscribe();
+            consumers.tasks.spawn(async move {
+                let receive = async move {
+                    let mut completed = false;
+                    while let Some(operation) = match stream.get_operation().await {
+                        Ok(operation) => operation,
+                        Err(RuntimeError::Closed) => {
+                            tracing::debug!("SQLite copy receiver retired");
+                            copied.send_replace(CopyCompletion::Retired);
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error),
+                    } {
+                        if !operation.end_of_stream
+                            && let Err(error) = store.install_copy(operation.data.clone())
+                        {
+                            return failed(stream, partition, error.to_string()).await;
+                        }
+                        completed |= operation.end_of_stream;
+                        operation.acknowledge()?;
+                    }
+                    if !completed {
+                        return failed(
+                            stream,
+                            partition,
+                            "copy receiver ended before native EOF".into(),
+                        )
+                        .await;
+                    }
+                    if let Err(error) = store.finish_copy() {
+                        return failed(stream, partition, error.to_string()).await;
+                    }
+                    copied.send_replace(CopyCompletion::Complete);
+                    Ok(())
+                };
+                tokio::select! {
+                    biased;
+                    _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => Ok(()),
+                    result = receive => result,
+                }
+            });
+        }
+        let mut stream = replicator.replication_operations()?;
+        let mut stop = self.stop.subscribe();
+        consumers.tasks.spawn(async move {
+            let receive = async move {
+                let mut completion = completion;
+                let mut copied = *completion.borrow();
+                if copied == CopyCompletion::Pending {
+                    let status = completion
+                        .wait_for(|state| *state != CopyCompletion::Pending)
+                        .await
+                        .map(|state| *state);
+                    match status {
+                        Ok(state) => copied = state,
+                        Err(_) => {
+                            return failed(
+                                stream,
+                                partition,
+                                "copy receiver stopped before durable completion".into(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                if copied == CopyCompletion::Retired {
+                    tracing::debug!("SQLite replication observer retired with its copy receiver");
+                    return Ok(());
+                }
+                while let Some(operation) = match stream.get_operation().await {
+                    Ok(operation) => operation,
+                    Err(RuntimeError::Closed) => {
+                        tracing::debug!("SQLite replication receiver retired");
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                } {
+                    if !operation.end_of_stream
+                        && let Err(error) =
+                            store.apply_secondary(operation.lsn, operation.data.clone())
+                    {
+                        return failed(stream, partition, error.to_string()).await;
+                    }
+                    operation.acknowledge()?;
+                }
+                Ok(())
+            };
+            tokio::select! {
+                biased;
+                _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => Ok(()),
+                result = receive => result,
+            }
+        });
         Ok(())
+    }
+
+    pub async fn shutdown_and_drain(&self) -> Result<()> {
+        let service = self.close().await;
+        let mut consumers = self.consumers.lock().await;
+        while let Some(result) = consumers.tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => consumers.errors.push(error.to_string()),
+                Err(error) => consumers.errors.push(error.to_string()),
+            }
+        }
+        if consumers.errors.is_empty() {
+            service
+        } else {
+            Err(RuntimeError::Application(consumers.errors.join("; ")))
+        }
     }
 }
 
 #[async_trait]
 impl StatefulServiceReplica for SqliteService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
-        if let Some(control) = self.control.lock().expect("control").clone() {
+        if *self.stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
+        if let Some(control) = self.control.lock().unwrap().clone() {
             return Ok(control);
         }
-        self.persistence.initialize().map_err(persistence_error)?;
-        self.barrier.reset_receipt(
-            self.persistence
-                .progress()
-                .map_err(persistence_error)?
-                .committed_lsn,
+        self.persistence
+            .authorize_open(context.mode)
+            .map_err(persistence_error)?;
+        *self.partition.lock().unwrap() = Some(context.partition.clone());
+        let partitions = self.partition.clone();
+        let active = self.active.clone();
+        let (fault, mut faults) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let committer = Arc::new(
+            Committer::with_store(
+                self.persistence.clone(),
+                Arc::new(move |write| {
+                    if !active.load(Ordering::Acquire) {
+                        return Err(std::io::Error::other("SQLite service is not primary"));
+                    }
+                    let partition = partitions
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .ok_or_else(|| std::io::Error::other("SQLite service is not open"))?;
+                    let status = if write {
+                        partition.get_write_status_now()
+                    } else {
+                        partition.get_read_status_now()
+                    };
+                    if status != AccessStatus::Granted {
+                        return Err(std::io::Error::other(format!(
+                            "SQLite host access {status:?}"
+                        )));
+                    }
+                    Ok(())
+                }),
+                Arc::new(move |reason| {
+                    let _ = fault.send(reason);
+                }),
+            )
+            .map_err(persistence_error)?,
         );
-        *self.partition.lock().expect("partition") = Some(context.partition.clone());
-        let factory: Arc<dyn ReplicatorFactory> =
-            Arc::new(DefaultReplicatorFactory::new(self.persistence.clone()));
+        self.committer
+            .set(committer)
+            .map_err(|_| RuntimeError::Application("SQLite committer already bound".into()))?;
+        let partition = context.partition.clone();
+        let mut stop = self.stop.subscribe();
+        self.consumers.lock().await.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => Ok(()),
+                reason = faults.recv() => {
+                    if let Some(reason) = reason {
+                        tracing::error!(%reason, "SQLite service commitment/publication fault");
+                        partition.report_fault(FaultType::Transient).await?;
+                    }
+                    Ok(())
+                }
+            }
+        });
         let interfaces = context
             .partition
-            .with_factory(factory)
+            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
             .create_replicator(
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
@@ -275,240 +442,110 @@ impl StatefulServiceReplica for SqliteService {
             )
             .await?;
         let control = interfaces.replicator();
-        let replicator = interfaces
-            .state_replicator()
-            .expect("default operation/copy capability");
-        for stream in [
-            replicator.get_copy_stream().await?,
-            replicator.get_replication_stream().await?,
-        ] {
-            #[cfg(any(test, feature = "testing"))]
-            let controlled = self
-                .controlled_operations
-                .lock()
-                .expect("controlled operations")
-                .clone();
-            let persistence = self.persistence.clone();
-            let task = tokio::spawn(async move {
-                #[cfg(any(test, feature = "testing"))]
-                if let Some(controlled) = controlled {
-                    let mut stream = stream;
-                    while let Ok(Some(operation)) = stream.get_operation().await {
-                        if controlled.send(operation).is_err() {
-                            break;
-                        }
-                    }
-                    return;
-                }
-                consume_stream(persistence, stream).await;
-            });
-            self.streams.lock().expect("streams").push(task);
+        if *self.stop.borrow() {
+            control.abort();
+            return Err(RuntimeError::Closed);
         }
-        *self.replicator.lock().expect("replicator") = Some(replicator);
-        *self.control.lock().expect("control") = Some(control.clone());
-        if matches!(
-            self.persistence
-                .recovery_state()
-                .map_err(persistence_error)?,
-            RecoveryState::RebuildRequired(_) | RecoveryState::Rebuilding { .. }
-        ) {
-            self.partition()?.report_fault(FaultType::Permanent).await?;
-        }
+        *self.replicator.lock().unwrap() = interfaces.state_replicator();
+        *self.control.lock().unwrap() = Some(control.clone());
         Ok(control)
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
-        self.active.store(false, Ordering::SeqCst);
-        self.barrier.uninstall();
-        let state = self.sql.clone();
-        tokio::task::spawn_blocking(move || state.lock().expect("SQL connection").close())
-            .await
-            .map_err(|e| RuntimeError::Application(e.to_string()))?;
-        if role == ReplicaRole::Primary {
-            if self.barrier.is_fenced() {
-                return Err(RuntimeError::Application(
-                    "reopen the fenced service before promotion".into(),
-                ));
-            }
-            let replicator = self
-                .replicator
-                .lock()
-                .expect("replicator")
-                .clone()
-                .ok_or(RuntimeError::NotOpen)?;
-            self.barrier.install(replicator, self.partition()?);
-            let state = self.sql.clone();
-            let persistence = self.persistence.clone();
-            let vfs = self.vfs_name.clone();
-            let barrier = self.barrier.clone();
-            let opened = tokio::task::spawn_blocking(move || {
-                let mut state = state.lock().expect("SQL connection");
-                let path = persistence.materialize_committed()?;
-                let committed = persistence.progress()?.committed_lsn;
-                barrier.reset_receipt(committed);
-                state
-                    .open(&path, &vfs, committed)
-                    .map_err(std::io::Error::other)
-            })
-            .await
-            .map_err(|e| RuntimeError::Application(e.to_string()))?;
-            if let Err(error) = opened {
-                self.barrier.uninstall();
-                return Err(persistence_error(error));
-            }
-            self.active.store(true, Ordering::SeqCst);
+        self.active.store(false, Ordering::Release);
+        let previous = *self.role.lock().unwrap();
+        if role == ReplicaRole::Primary || previous == ReplicaRole::Primary {
+            self.committer()?
+                .wait_for_role_drain()
+                .await
+                .map_err(persistence_error)?;
         }
+        match role {
+            ReplicaRole::Primary => {
+                let replicator = self
+                    .replicator
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or(RuntimeError::NotOpen)?;
+                self.committer()?
+                    .promote(Arc::new(move |data| {
+                        let admitted = replicator
+                            .begin_replicate(data)
+                            .map_err(std::io::Error::other)?;
+                        Ok(Assignment {
+                            lsn: admitted.lsn,
+                            completion: Box::pin(async move {
+                                admitted.completion.await.map_err(std::io::Error::other)
+                            }),
+                        })
+                    }))
+                    .map_err(persistence_error)?;
+                self.active.store(true, Ordering::Release);
+            }
+            ReplicaRole::IdleSecondary => self.start_secondary(true).await?,
+            ReplicaRole::ActiveSecondary if previous == ReplicaRole::Primary => {
+                self.committer()?.demote().map_err(persistence_error)?;
+                self.start_secondary(false).await?;
+            }
+            ReplicaRole::ActiveSecondary if previous == ReplicaRole::None => {
+                self.start_secondary(true).await?
+            }
+            ReplicaRole::None if previous == ReplicaRole::Primary => {
+                self.committer()?.demote().map_err(persistence_error)?
+            }
+            ReplicaRole::ActiveSecondary | ReplicaRole::None => {}
+        }
+        *self.role.lock().unwrap() = role;
         Ok(RoleChange {
             service_address: None,
         })
     }
-
     async fn close(&self) -> Result<()> {
-        self.abort();
-        let state = self.sql.clone();
-        tokio::task::spawn_blocking(move || state.lock().expect("SQL connection").close())
-            .await
-            .map_err(|e| RuntimeError::Application(e.to_string()))?;
-        Ok(())
-    }
-
-    fn abort(&self) {
-        self.active.store(false, Ordering::SeqCst);
-        self.barrier.uninstall();
-        self.partition.lock().expect("partition").take();
-        self.replicator.lock().expect("replicator").take();
-        self.control.lock().expect("control").take();
-        for task in self.streams.lock().expect("streams").drain(..) {
-            task.abort();
-        }
-        if let Ok(mut state) = self.sql.try_lock() {
-            state.close();
-        }
-    }
-}
-
-async fn consume_stream(persistence: Arc<SqlitePersistence>, mut stream: OperationStream) {
-    while let Ok(Some(operation)) = stream.get_operation().await {
-        let result = operation.apply_to(persistence.as_ref()).await;
-        match result {
-            Ok(progress) => {
-                let _ = operation.acknowledge(progress);
-            }
-            Err(error) => {
-                let _ = operation.reject(error);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod stream_tests {
-    use super::*;
-    use crate::frames::{WalFrame, WalFrameSet};
-    use crate::state::PersistenceFault;
-    use kuberic_runtime::replicator::stream::OperationMetadata;
-
-    #[tokio::test]
-    async fn stream_cancellation_after_durable_apply_does_not_commit() {
-        let directory = tempfile::Builder::new()
-            .prefix("sqlite-stream-cancel-")
-            .tempdir_in(".")
-            .unwrap();
-        let persistence =
-            Arc::new(SqlitePersistence::open(directory.path().to_path_buf()).unwrap());
-        let (sender, stream) = OperationStream::channel(1);
-        let consumer = tokio::spawn(consume_stream(persistence.clone(), stream));
-        let frames = vec![WalFrame {
-            page_number: 1,
-            data: vec![9; 512],
-        }];
-        let payload: Bytes = serde_json::to_vec(&WalFrameSet {
-            checksum: WalFrameSet::compute_checksum(&frames),
-            frames,
-            db_size_pages: 1,
-        })
-        .unwrap()
-        .into();
-        persistence.after_apply.arm();
-        let request = tokio::spawn({
-            let sender = sender.clone();
-            async move {
-                sender
-                    .send(
-                        OperationMetadata::Replication {
-                            lsn: 1,
-                            committed_lsn: 1,
-                        },
-                        payload,
-                    )
-                    .await
-            }
-        });
-        persistence.after_apply.wait_entered().await;
-        request.abort();
-        let _ = request.await;
-        sender.close();
-        tokio::time::timeout(std::time::Duration::from_secs(5), consumer)
-            .await
-            .unwrap()
-            .unwrap();
-        persistence.after_apply.release();
-        let progress = persistence.durable_progress().await.unwrap();
-        assert_eq!((progress.applied_lsn, progress.committed_lsn), (1, 0));
-        assert_eq!(persistence.stream_calls.0.load(Ordering::Acquire), 1);
-        assert_eq!(persistence.stream_calls.1.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn stream_replication_commits_without_reapplying_duplicate_payload() {
-        let directory = tempfile::Builder::new()
-            .prefix("sqlite-stream-")
-            .tempdir_in(".")
-            .unwrap();
-        let persistence =
-            Arc::new(SqlitePersistence::open(directory.path().to_path_buf()).unwrap());
-        let (sender, stream) = OperationStream::channel(1);
-        let consumer = tokio::spawn(consume_stream(persistence.clone(), stream));
-        let frames = vec![WalFrame {
-            page_number: 1,
-            data: vec![7; 512],
-        }];
-        let payload: Bytes = serde_json::to_vec(&WalFrameSet {
-            checksum: WalFrameSet::compute_checksum(&frames),
-            frames,
-            db_size_pages: 1,
-        })
-        .unwrap()
-        .into();
-        let send = |committed_lsn, data| {
-            sender.send(
-                OperationMetadata::Replication {
-                    lsn: 1,
-                    committed_lsn,
-                },
-                data,
-            )
+        self.active.store(false, Ordering::Release);
+        let result = if let Some(committer) = self.committer.get() {
+            committer.close().await.map_err(|error| {
+                if crate::v1::is_abort(&error) {
+                    RuntimeError::OperationCancelled
+                } else {
+                    persistence_error(error)
+                }
+            })
+        } else {
+            Ok(())
         };
-        assert_eq!(send(0, payload.clone()).await.unwrap().committed_lsn, 0);
-        persistence.fail_once(PersistenceFault::AfterCommit);
-        assert!(
-            send(1, payload.clone()).await.is_err(),
-            "after-commit failure must not ACK"
-        );
-        assert_eq!(
-            persistence.durable_progress().await.unwrap().committed_lsn,
-            1
-        );
-        assert_eq!(send(1, payload.clone()).await.unwrap().committed_lsn, 1);
-        assert!(send(1, Bytes::from_static(b"corrupt")).await.is_err());
-        let inspection = persistence.inspect_for_test().unwrap();
-        assert_eq!(persistence.stream_calls.0.load(Ordering::Acquire), 1);
-        assert_eq!(persistence.stream_calls.1.load(Ordering::Acquire), 1);
-        assert_eq!(inspection.operations.len(), 1);
-        assert_eq!(inspection.operations[0].committed_lsn, 0);
-        assert_eq!(inspection.operations[0].data, payload);
-        assert_eq!(inspection.image, vec![7; 512]);
-        sender.close();
-        consumer.await.unwrap();
+        self.stop.send_replace(true);
+        self.control.lock().unwrap().take();
+        self.replicator.lock().unwrap().take();
+        self.partition.lock().unwrap().take();
+        result
     }
+    fn abort(&self) {
+        self.active.store(false, Ordering::Release);
+        if let Some(committer) = self.committer.get() {
+            committer.abort();
+        }
+        self.stop.send_replace(true);
+        if let Ok(mut partition) = self.partition.try_lock() {
+            partition.take();
+        }
+        if let Ok(mut replicator) = self.replicator.try_lock() {
+            replicator.take();
+        }
+        if let Ok(mut control) = self.control.try_lock() {
+            control.take();
+        }
+    }
+}
+
+async fn failed(
+    stream: OperationStream,
+    partition: StatefulServicePartition,
+    reason: String,
+) -> Result<()> {
+    let native = stream.report_fault(reason.clone());
+    let host = partition.report_fault(FaultType::Transient).await;
+    native?;
+    host?;
+    Err(RuntimeError::Application(reason))
 }

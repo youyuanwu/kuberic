@@ -10,11 +10,12 @@ use kuberic_runtime::application::{OperationDataStream, StateProvider};
 use kuberic_runtime::protocol::types::Epoch;
 use kuberic_runtime::{Result, RuntimeError};
 
-use crate::persistence::{KvPersistence, snapshot_stream};
+use crate::persistence::KvPersistence;
 
 pub struct KvStateProvider {
     persistence: Arc<KvPersistence>,
     copy_gate: CopyGate,
+    committer: Mutex<Option<Arc<crate::v1::Committer>>>,
 }
 
 impl KvStateProvider {
@@ -22,11 +23,31 @@ impl KvStateProvider {
         Self {
             persistence,
             copy_gate,
+            committer: Mutex::new(None),
         }
     }
 
     pub fn persistence(&self) -> &Arc<KvPersistence> {
         &self.persistence
+    }
+
+    pub(crate) fn bind_committer(&self, committer: Arc<crate::v1::Committer>) -> Result<()> {
+        let mut bound = self.committer.lock().unwrap();
+        if bound.is_some() {
+            return Err(RuntimeError::Application(
+                "KV committer is already bound".into(),
+            ));
+        }
+        *bound = Some(committer);
+        Ok(())
+    }
+
+    fn committer(&self) -> Result<Arc<crate::v1::Committer>> {
+        self.committer
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(RuntimeError::NotOpen)
     }
 }
 
@@ -248,8 +269,7 @@ impl StateProvider for KvStateProvider {
     }
 
     async fn last_committed_lsn(&self) -> Result<i64> {
-        use kuberic_runtime::engine::DurableState;
-        Ok(self.persistence.durable_progress().await?.committed_lsn)
+        self.committer()?.progress().map_err(copy_gate_error)
     }
 
     async fn get_copy_context(&self) -> Result<OperationDataStream> {
@@ -262,13 +282,19 @@ impl StateProvider for KvStateProvider {
         mut copy_context: OperationDataStream,
     ) -> Result<OperationDataStream> {
         use futures::StreamExt;
-        if copy_context.next().await.is_some() {
+        if let Some(item) = copy_context.next().await {
+            item?;
             return Err(RuntimeError::Application(
                 "kvstore2 does not use a copy context".into(),
             ));
         }
         self.copy_gate.wait_until_released().await?;
-        snapshot_stream(self.persistence.snapshot_at(up_to_lsn)?)
+        let data = self
+            .committer()?
+            .snapshot(up_to_lsn)
+            .await
+            .map_err(copy_gate_error)?;
+        Ok(Box::pin(stream::iter([Ok(data)])))
     }
 
     async fn on_data_loss(&self) -> Result<bool> {
@@ -278,14 +304,24 @@ impl StateProvider for KvStateProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use bytes::Bytes;
     use futures::{StreamExt, stream};
     use kuberic_runtime::application::Operation;
     use kuberic_runtime::engine::DurableState;
 
     use super::*;
+
+    fn bound_provider(
+        persistence: Arc<KvPersistence>,
+        gate: CopyGate,
+    ) -> (KvStateProvider, Arc<crate::v1::Committer>) {
+        let committer = Arc::new(
+            crate::v1::Committer::with_store(persistence.clone(), Arc::new(|_| {})).unwrap(),
+        );
+        let provider = KvStateProvider::new(persistence, gate);
+        provider.bind_committer(committer.clone()).unwrap();
+        (provider, committer)
+    }
 
     async fn collect_copy(mut copy: OperationDataStream) -> Vec<Bytes> {
         let mut chunks = Vec::new();
@@ -299,16 +335,18 @@ mod tests {
     async fn provider_freezes_copy_before_post_boundary_write_and_replays_identically() {
         let directory = tempfile::tempdir().unwrap();
         let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
-        persistence
-            .apply(Operation {
-                lsn: 1,
-                committed_lsn: 0,
-                data: KvPersistence::encode_put("key".into(), "old".into()).unwrap(),
+        let (provider, committer) = bound_provider(persistence.clone(), CopyGate::disabled());
+        committer.promote().unwrap();
+        let mut before_boundary = committer
+            .begin_put("key".into(), "old".into(), |_| {
+                Ok(crate::v1::Assignment {
+                    lsn: 1,
+                    completion: Box::pin(async { Ok(()) }),
+                })
             })
-            .await
             .unwrap();
-        persistence.commit(1).await.unwrap();
-        let provider = KvStateProvider::new(persistence.clone(), CopyGate::disabled());
+        assert_eq!(before_boundary.wait().await.unwrap(), 1);
+        assert_eq!(provider.last_committed_lsn().await.unwrap(), 1);
         let frozen = provider
             .get_copy_state(1, Box::pin(stream::empty()))
             .await
@@ -316,11 +354,19 @@ mod tests {
 
         let post_boundary = Operation {
             lsn: 2,
-            committed_lsn: 1,
+            committed_lsn: 0,
             data: KvPersistence::encode_put("key".into(), "new".into()).unwrap(),
         };
-        persistence.apply(post_boundary.clone()).await.unwrap();
-        persistence.commit(2).await.unwrap();
+        let mut after_boundary = committer
+            .begin_put("key".into(), "new".into(), |_| {
+                Ok(crate::v1::Assignment {
+                    lsn: 2,
+                    completion: Box::pin(async { Ok(()) }),
+                })
+            })
+            .unwrap();
+        assert_eq!(after_boundary.wait().await.unwrap(), 2);
+        assert_eq!(provider.last_committed_lsn().await.unwrap(), 2);
 
         let first = collect_copy(frozen).await;
         let second = collect_copy(
@@ -331,8 +377,11 @@ mod tests {
         )
         .await;
         assert_eq!(first, second);
-        let snapshot: BTreeMap<String, String> = serde_json::from_slice(&first.concat()).unwrap();
-        assert_eq!(snapshot.get("key").map(String::as_str), Some("old"));
+        let snapshot: serde_json::Value = serde_json::from_slice(&first.concat()).unwrap();
+        assert_eq!(
+            snapshot,
+            serde_json::json!({"version": 2, "lsn": 1, "values": {"key": "old"}})
+        );
 
         let retained = persistence
             .get_replication_operations(2, 2)
@@ -342,6 +391,29 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
         assert_eq!(retained, vec![post_boundary]);
+        let receiver_directory = tempfile::tempdir().unwrap();
+        let receiver =
+            crate::v1::Committer::open(receiver_directory.path(), Arc::new(|_| {})).unwrap();
+        receiver.begin_copy().unwrap();
+        receiver.install_copy(Bytes::from(first.concat())).unwrap();
+        receiver.finish_copy().unwrap();
+        assert_eq!(receiver.progress().unwrap(), 1);
+        assert_eq!(
+            receiver.get("key", || Ok(())).unwrap().as_deref(),
+            Some("old")
+        );
+        for operation in retained {
+            receiver
+                .apply_secondary(operation.lsn, operation.data)
+                .unwrap();
+        }
+        assert_eq!(receiver.progress().unwrap(), 2);
+        assert_eq!(
+            receiver.get("key", || Ok(())).unwrap().as_deref(),
+            Some("new")
+        );
+        receiver.close().await.unwrap();
+        committer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -350,7 +422,8 @@ mod tests {
         let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
         let gate = CopyGate::enabled(directory.path().join("copy-gate")).unwrap();
         gate.hold().unwrap();
-        let provider = Arc::new(KvStateProvider::new(persistence, gate.clone()));
+        let (provider, committer) = bound_provider(persistence, gate.clone());
+        let provider = Arc::new(provider);
         let pending = tokio::spawn({
             let provider = provider.clone();
             async move { provider.get_copy_state(0, Box::pin(stream::empty())).await }
@@ -365,9 +438,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             stream.next().await.unwrap().unwrap(),
-            Bytes::from_static(b"{}")
+            Bytes::from_static(b"{\"version\":2,\"lsn\":0,\"values\":{}}")
         );
         assert!(stream.next().await.is_none());
+        committer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -380,7 +454,7 @@ mod tests {
         )
         .unwrap();
         gate.hold().unwrap();
-        let provider = KvStateProvider::new(persistence, gate.clone());
+        let (provider, committer) = bound_provider(persistence, gate.clone());
         let mut stream = tokio::time::timeout(
             Duration::from_secs(1),
             provider.get_copy_state(0, Box::pin(stream::empty())),
@@ -390,9 +464,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             stream.next().await.unwrap().unwrap(),
-            Bytes::from_static(b"{}")
+            Bytes::from_static(b"{\"version\":2,\"lsn\":0,\"values\":{}}")
         );
         assert!(!gate.is_held());
+        assert!(stream.next().await.is_none());
+        committer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -401,16 +477,18 @@ mod tests {
         let sentinel = directory.path().join("copy-gate");
         std::fs::write(&sentinel, b"not-a-deadline").unwrap();
         let persistence = Arc::new(KvPersistence::open(directory.path().join("data")).unwrap());
-        let provider = KvStateProvider::new(persistence, CopyGate::disabled());
+        let (provider, committer) = bound_provider(persistence, CopyGate::disabled());
         let mut copy = provider
             .get_copy_state(0, Box::pin(stream::empty()))
             .await
             .unwrap();
         assert_eq!(
             copy.next().await.unwrap().unwrap(),
-            Bytes::from_static(b"{}")
+            Bytes::from_static(b"{\"version\":2,\"lsn\":0,\"values\":{}}")
         );
+        assert!(copy.next().await.is_none());
         assert!(sentinel.exists());
+        committer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -457,7 +535,8 @@ mod tests {
         )
         .unwrap();
         gate.hold().unwrap();
-        let provider = Arc::new(KvStateProvider::new(persistence, gate.clone()));
+        let (provider, committer) = bound_provider(persistence, gate.clone());
+        let provider = Arc::new(provider);
         let waiting =
             tokio::spawn(
                 async move { provider.get_copy_state(0, Box::pin(stream::empty())).await },
@@ -472,6 +551,7 @@ mod tests {
         })
         .await
         .unwrap();
+        committer.close().await.unwrap();
     }
 
     #[test]
@@ -498,7 +578,8 @@ mod tests {
     async fn provider_empty_state_copy_uses_boundary_zero() {
         let directory = tempfile::tempdir().unwrap();
         let persistence = Arc::new(KvPersistence::open(directory.path()).unwrap());
-        let provider = KvStateProvider::new(persistence, CopyGate::disabled());
+        let (provider, committer) = bound_provider(persistence, CopyGate::disabled());
+        assert_eq!(provider.last_committed_lsn().await.unwrap(), 0);
         let chunks = collect_copy(
             provider
                 .get_copy_state(0, Box::pin(stream::empty()))
@@ -506,7 +587,11 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        let snapshot: BTreeMap<String, String> = serde_json::from_slice(&chunks.concat()).unwrap();
-        assert!(snapshot.is_empty());
+        let snapshot: serde_json::Value = serde_json::from_slice(&chunks.concat()).unwrap();
+        assert_eq!(
+            snapshot,
+            serde_json::json!({"version": 2, "lsn": 0, "values": {}})
+        );
+        committer.close().await.unwrap();
     }
 }

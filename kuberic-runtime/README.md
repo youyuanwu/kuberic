@@ -32,13 +32,14 @@ The public Service Fabric-shaped interfaces are:
 | `StateProvider` | provider epoch/progress/copy/data-loss behavior |
 | `StatefulServicePartition` | identity, access, factory creation, load/fault reporting |
 
-The protected method sets are unchanged by the Public V1 replacement.
+The protected `Replicator`, `PrimaryReplicator` and `StateProvider` method sets
+are unchanged. Assignment and stream APIs intentionally change.
 
 ## Built-In Replicator
 
-`DefaultReplicatorFactory` is the sole built-in factory. It constructs the
-stateless Public V1 engine; there is no legacy engine, selector, preview mode,
-or fallback.
+`DefaultReplicatorFactory::new()` is the sole built-in factory. It constructs the
+source-guided Service Fabric classic V1 owners, with no engine persistence
+argument, selector, shadow writer, or fallback.
 
 Applications call:
 
@@ -54,7 +55,7 @@ at most one provider writer.
 
 ## Durable Ownership
 
-- agent schema 12: identity, history, lifecycle/operation authority, terminal
+- agent schema 13: identity, history, lifecycle/operation authority, terminal
   completion;
 - provider: application bytes, progress, retained operations, copy state;
 - Replicator memory: queues, peers, ACKs, copy/replication tasks.
@@ -62,22 +63,26 @@ at most one provider writer.
 Old schemas and supported prior provider formats reject without mutation.
 There is no migration or compatibility reader.
 
-Process restart reconstructs the built-in engine from schema-12 authority and
-provider state. A contained process first reopens existing state, then the
-controller renews the exact process/creation session through access closure,
-survivor epoch barriers, replacement role replay, and exact fresh
-configuration. Participant journals advance through validated adjacent stages;
+Process restart reconstructs native process-local queues from schema-13 authority
+and provider state. A cold secondary requires real copy even when it retains
+application data. The host reserves a real opaque creation identity before
+Open; attachment consumes that same identity. The controller can capture the
+exact process/creation session under closed access before survivor epoch barriers,
+owned existing-state Open, replacement role replay and exact fresh configuration.
+Participant journals advance through validated adjacent stages;
 obsolete journals can be superseded only after the accepted topology epoch has
 advanced.
 
 ## Public V1 Protocol
 
-Protocol version 11 is the only built-in identity. Serialized public values use
-the `identity` field. Protocol 10 and old report/command branches are rejected.
+Protocol version 12 is the only built-in identity. Serialized public values use
+the `identity` field. Prior identities and old report/command branches are rejected.
 
-Replication transport has no authentication contract. Exact identity,
-session, epoch, history, storage, configuration, operation, and build values
-provide correctness fencing.
+The bounded tonic carrier authenticates with the host's agent bearer credential.
+Exact identity, session, epoch, history, storage, configuration, operation, and
+build bindings are checked independently at connection and message admission.
+This is not TLS, native SF wire interoperability, or a replacement for network
+isolation and namespace RBAC.
 
 Agent control uses port 50051. Replication/copy data uses the independently
 advertised port 50052. Application traffic is outside both protocol surfaces.
@@ -100,6 +105,11 @@ just nextest-test
 just nextest-source
 ```
 
-See [Stateless Default Replicator](../docs/features/kuberic/stateless-default-replicator.md),
+`begin_replicate` returns the assigned LSN before its separate quorum completion.
+Neither that completion nor native progress certifies application commitment.
+Services own durable preparation, ordered commitment, visibility and client
+success; persisted secondaries durably accept before parameterless ACK.
+
+See [Classic V1 Runtime](../docs/features/kuberic/classic-v1-runtime.md),
 [Replicator Boundary](../docs/features/kuberic/replicator-boundary.md), and
 [Testing](../docs/features/kuberic/testing.md).

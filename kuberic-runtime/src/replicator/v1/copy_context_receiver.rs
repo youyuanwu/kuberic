@@ -52,10 +52,6 @@ use super::operation_stream::{
 use super::received_operation::{AckState, ReceivedOperation};
 
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context receiver settings")
-)]
 pub(super) struct CopyContextConfig {
     pub(super) initial_queue_size: usize,
     pub(super) max_queue_size: usize,
@@ -66,10 +62,6 @@ pub(super) struct CopyContextConfig {
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context receiver errors")
-)]
 pub(super) enum CopyContextError {
     #[error("copy-context count limits must be ordered powers of two greater than one")]
     InvalidQueueConfig,
@@ -96,20 +88,12 @@ pub(super) enum CopyContextError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context ACK payload")
-)]
 pub(super) struct CopyContextAck {
     pub(super) completed: Lsn,
     pub(super) error_code: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context admission result")
-)]
 pub(super) enum ContextAdmission {
     NoInput,
     Accepted,
@@ -121,10 +105,6 @@ pub(super) enum ContextAdmission {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context observation")
-)]
 pub(super) struct ContextObservation {
     pub(super) admission: ContextAdmission,
     /// Native ProcessCopyContext's true result, not transport acceptance.
@@ -136,10 +116,6 @@ pub(super) struct ContextObservation {
 /// the caller's guard. Errors are delivered there rather than dropping input in
 /// an early `Result::Err` return while the owner remains serialized.
 #[must_use = "dispatch context wakeups, transport callbacks and retirement outside owner guards"]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context staged effects")
-)]
 pub(super) struct CopyContextEffects {
     wakes: Vec<DispatchWake>,
     acknowledgements: Vec<AckDispatch>,
@@ -147,10 +123,6 @@ pub(super) struct CopyContextEffects {
     outcome: Result<ContextObservation, CopyContextError>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context effect delivery")
-)]
 impl CopyContextEffects {
     fn new(admission: ContextAdmission) -> Self {
         Self {
@@ -198,10 +170,6 @@ impl AckSnapshot {
 
 type SendContextAck = Arc<dyn Fn(CopyContextAck, bool) -> bool + Send + Sync>;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 data-only context stream")
-)]
 pub(super) struct CopyContextStream {
     inner: OperationStream,
     explicitly_closed: Arc<Mutex<Option<i32>>>,
@@ -265,10 +233,6 @@ impl Stream for CopyContextStream {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 primary-side copy-context owner")
-)]
 pub(super) struct CopyContextReceiver {
     queue: OperationQueue,
     operations: BTreeMap<Lsn, ReceivedOperation>,
@@ -283,10 +247,6 @@ pub(super) struct CopyContextReceiver {
     all_received: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 copy-context owner API")
-)]
 impl CopyContextReceiver {
     pub(super) fn new(config: CopyContextConfig) -> Result<Self, CopyContextError> {
         if config.initial_queue_size <= 1
@@ -394,10 +354,12 @@ impl CopyContextReceiver {
         self.queue.progress().complete_head - 1
     }
 
+    #[cfg(test)]
     pub(super) fn current_ack(&self) -> CopyContextAck {
         self.snapshot.lock().unwrap().current()
     }
 
+    #[cfg(test)]
     pub(super) fn last_ack_sent(&self) -> Lsn {
         self.snapshot.lock().unwrap().last_ack_sent
     }
@@ -406,6 +368,7 @@ impl CopyContextReceiver {
         self.ack_sender.deadline()
     }
 
+    #[cfg(test)]
     pub(super) fn last_ack_issued_at(&self) -> Option<Duration> {
         self.ack_sender.last_issued()
     }

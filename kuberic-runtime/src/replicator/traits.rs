@@ -45,24 +45,23 @@ pub trait Replicator: Send + Sync {
     /// Returns the current LSN used for primary selection and supplied to the
     /// primary's catch-up configuration.
     ///
-    /// Primary: locally durable quorum-committed progress, even while serving
-    /// access is closed. Secondary: highest contiguous durably accepted progress,
-    /// which may exceed commitment and is not a readable-data assertion.
-    ///
-    /// In the built-in engine, opened role-None recovery returns the validated
-    /// durable retained applied tail for election only, with read/write access
-    /// closed. Once internally Primary, recovery returns committed progress,
-    /// not that tail. Internal role, not access status, selects these semantics.
-    /// Independent host reports retain both applied/accepted and committed
-    /// boundaries for election and suffix recovery. No scalar is an access grant.
+    /// Primary progress is native queue/quorum progress, not a primary-local
+    /// service commit receipt. Secondary progress follows its native receiver's
+    /// ACK mode and is unavailable before copy completes. An explicit premature
+    /// secondary query retains native fault behavior. Opened recovery obtains
+    /// the protected provider's last committed LSN, normalizing successful
+    /// negative values as native empty progress. No scalar grants serving access.
     async fn current_progress(&self) -> Result<Lsn>;
 
-    /// Earliest retained public progress that can catch up an admitted peer.
+    /// Native catch-up capability, distinct from current progress and application
+    /// durability. The built-in primary reports its first committed operation
+    /// boundary, or zero when that queue observation has no committed range.
     /// As a query result, `INVALID_LSN` means the capability is not currently
     /// known or applicable, unlike omitted known-replica configuration input.
     ///
-    /// Together with the peer's current progress, this determines whether
-    /// retained history can catch the peer up or a fresh copy is required.
+    /// Native queue/session validation still determines whether an exact peer
+    /// can replay retained history or requires copy; this scalar alone is not a
+    /// durability proof or an ordered range paired with current progress.
     async fn catch_up_capability(&self) -> Result<Lsn>;
 }
 
@@ -153,47 +152,43 @@ pub trait PrimaryReplicator: Replicator {
 /// Services use this interface to replicate state changes for high availability
 /// and consume secondary copy and replication operations.
 ///
-/// Built-in receivers deliver copy and replication through these streams and
-/// wait for explicit durable service acknowledgement before completing ingress.
-/// Services may use [`super::stream::StreamOperation::apply_to`] with their
-/// durable store, or cancellation-aware execution with their own persistence.
-/// Primary-local persistence remains owned by the replicator.
+/// Native queue assignment and replication completion do not persist or commit
+/// primary-local service state. The service owns preparation, ordered local
+/// commitment, visibility and client completion. Persisted receivers require a
+/// parameterless service ACK after durable application acceptance; volatile
+/// receivers retain their configured native dispatch/ACK behavior.
 #[async_trait]
 pub trait StateReplicator: Send + Sync {
+    /// Admits work and returns its sequence separately from native completion.
+    /// Service-local commitment and client success remain application-owned.
+    fn begin_replicate(&self, data: OperationData) -> Result<super::Replication>;
+
+    /// Obtain a handle to the current secondary's shared replication receiver.
+    /// Obtain streams after the secondary role exists; repeated handles do not
+    /// rewind delivery or create independent copies of the receiver.
+    fn replication_operations(&self) -> Result<OperationStream>;
+
+    /// Obtain a handle to the current secondary's shared copy receiver. Copy
+    /// enumeration EOF, a native EOS operation, native Build completion and
+    /// configuration admission are distinct events.
+    fn copy_operations(&self) -> Result<OperationStream>;
+
     /// Replicates `data`, representing a primary's state change, to secondaries
     /// and returns the operation's LSN after quorum acknowledgement.
     ///
-    /// Completes only after durable local acceptance and the admitted PC/CC write
-    /// quorums. Check
+    /// This convenience wait observes native completion only; it is not a
+    /// service-local commit or a successful client transaction. Check
     /// [`StatefulServicePartition::get_write_status`](super::StatefulServicePartition::get_write_status)
     /// before servicing a client write; primary role alone does not grant write
     /// access.
     ///
     /// The LSN becomes available only when this async call completes. Dropping
     /// the future is not proof that no replica accepted the operation's bytes.
-    async fn replicate(&self, data: OperationData) -> Result<Lsn>;
-
-    /// Returns the stream of replicated operations for the service to apply
-    /// and durably acknowledge on a secondary.
-    ///
-    /// Operations originate from the primary's [`Self::replicate`] calls.
-    /// Keep both consumers alive: the built-in engine waits for acknowledged
-    /// copy completion before delivering retained build replication. Replication
-    /// metadata requests a committed watermark as well as payload application;
-    /// duplicate payloads may advance commitment without being applied twice.
-    /// `None` from [`OperationStream::get_operation`] means terminal shutdown,
-    /// not temporary emptiness or completion of one build.
-    async fn get_replication_stream(&self) -> Result<OperationStream>;
-
-    /// Returns the stream of copy operations used to initialize a replica's state.
-    ///
-    /// These payloads originate from the primary provider's
-    /// [`StateProvider::get_copy_state`] stream. The secondary obtains the
-    /// stream, applies its operations, and explicitly acknowledges them while
-    /// participating in the copy-context exchange. Each build includes an
-    /// explicit copy-complete operation, including an empty snapshot.
-    /// `None` from [`OperationStream::get_operation`] means terminal shutdown.
-    async fn get_copy_stream(&self) -> Result<OperationStream>;
+    async fn replicate(&self, data: OperationData) -> Result<Lsn> {
+        let admitted = self.begin_replicate(data)?;
+        admitted.completion.await?;
+        Ok(admitted.lsn)
+    }
 
     /// Updates replication settings without changing the registered replication
     /// address or replica identity.

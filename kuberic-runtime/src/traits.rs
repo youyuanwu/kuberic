@@ -84,7 +84,7 @@ pub trait StateProvider: Send + Sync {
     /// and Kuberic's current source-local behavior.
     ///
     /// With service-stream delivery, the output goes through the secondary's
-    /// [`get_copy_stream`](crate::replicator::StateReplicator::get_copy_stream).
+    /// [`copy_operations`](crate::replicator::StateReplicator::copy_operations).
     /// Repeating an authorized build, including after restart, must reproduce
     /// identical bytes from the same frozen boundary while later replication
     /// remains ordered as retained catch-up.

@@ -73,6 +73,8 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
         agent_generation: derive_agent_generation(&initialization_id),
     };
     let report = PublicV1AgentReport {
+        active_operations: Vec::new(),
+        configuration: None,
         identity: PublicV1Identity::new(1),
         resource_uid,
         replica: identity.clone(),
@@ -93,8 +95,10 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
         },
         progress: PublicProgress {
             role: PublicProgressRole::Recovery,
-            first: 0,
-            last: 0,
+            current_progress:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+            catch_up_capability:
+                kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
         },
         replication_address: None,
         service_location: None,
@@ -544,13 +548,16 @@ async fn production_reconciler_originates_failover_and_retargets_writer() {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let primary_installation = authority_installations.iter()
+            .position(|(replica_id, _)| *replica_id == writer[0].replica.replica_id)
+            .expect("new primary catch-up configuration");
         assert_eq!(
-            authority_installations.last(),
-            Some(&(writer[0].replica.replica_id, true)),
-            "failover must configure the new primary after its surviving secondaries"
+            authority_installations[primary_installation],
+            (writer[0].replica.replica_id, true),
         );
+        assert!(primary_installation > 0);
         assert!(
-            authority_installations[..authority_installations.len() - 1]
+            authority_installations[..primary_installation]
                 .iter()
                 .all(|(replica_id, _)| *replica_id != writer[0].replica.replica_id),
             "failover configured the new primary before a surviving secondary"
@@ -1172,27 +1179,21 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                     )
             ))
             .expect("replacement pre-Build Role effect");
-        let replacement_epoch = effects[effects_start..]
+        assert!(replacement_open < replacement_build);
+        assert!(replacement_open < replacement_role);
+        assert!(replacement_role < replacement_build);
+        assert!(!effects[effects_start..effects_start + replacement_build]
             .iter()
-            .position(|effect| matches!(
+            .any(|effect| matches!(
                 effect,
                 EffectRecord::Execute(
                     kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
                 ) if command.target == replacement.replica
                     && matches!(
                         command.intent.program,
-                        Some(
-                            kuberic_runtime::protocol::public_operations::PublicOperationProgram::Epoch {
-                                epoch
-                            }
-                        ) if epoch == predecessor_epoch
+                        Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Epoch { .. })
                     )
-            ))
-            .expect("replacement pre-Build Epoch effect");
-        assert!(replacement_open < replacement_build);
-        assert!(replacement_open < replacement_role);
-        assert!(replacement_epoch < replacement_role);
-        assert!(replacement_role < replacement_build);
+            )), "native epoch barriers require completed copy before replay");
         let build_command = match &effects[effects_start + replacement_build] {
             EffectRecord::Execute(
                 kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command),
@@ -1224,7 +1225,20 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
         else {
             unreachable!()
         };
-        assert_eq!(build.epoch, predecessor_epoch);
+        let installed = effects[..effects_start + replacement_build]
+            .iter().rev().find_map(|effect| match effect {
+                EffectRecord::Execute(
+                    kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
+                ) if command.target == build_command.target => match command.intent.program.as_ref() {
+                    Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(configuration)
+                        | kuberic_runtime::protocol::public_operations::PublicOperationProgram::CatchUp { configuration, .. }) => Some(&configuration.current),
+                    _ => None,
+                },
+                _ => None,
+            }).expect("installed source configuration before copy");
+        assert!(installed.epoch > predecessor_epoch);
+        assert_eq!(build.epoch, installed.epoch);
+        assert_eq!(build.current_configuration_id.as_ref(), Some(&installed.configuration_id));
         assert!(observed.pvcs.iter().any(|pvc| {
             pvc.labels()
                 .get(kuberic_controller::crd::REPLICA_ID_LABEL)
@@ -1273,9 +1287,9 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                     )
             ))
             .expect("retained primary Epoch effect");
-        let primary_role = effects[effects_start..]
+        assert!(!effects[effects_start..]
             .iter()
-            .position(|effect| matches!(
+            .any(|effect| matches!(
                 effect,
                 EffectRecord::Execute(
                     kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
@@ -1289,12 +1303,8 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                             }
                         ) if epoch == topology.epoch
                     )
-            ))
-            .expect("retained primary Role effect");
-        assert!(
-            primary_epoch < primary_role,
-            "retained primary must advance the epoch before replaying its unchanged role"
-        );
+            )), "retained native primary must not repeat ChangeRole");
+        assert!(primary_epoch > replacement_build);
         let replacement_epoch = effects[effects_start..]
             .iter()
             .position(|effect| matches!(
@@ -1330,10 +1340,8 @@ async fn production_reconciler_replaces_admitted_replica_with_fresh_storage() {
                     )
             ))
             .expect("replacement successor Role effect");
-        assert!(
-            replacement_epoch < replacement_role,
-            "prebuilt replacement must advance the successor epoch before ActiveSecondary role"
-        );
+        assert!(replacement_build < replacement_epoch);
+        assert!(replacement_build < replacement_role);
         assert_eq!(
             observed
                 .agents
@@ -2120,7 +2128,9 @@ async fn production_reconciler_requires_retirement_evidence_before_dropping_a_se
                 .expect("authorized reconfiguration")
                 .command()
                 .unwrap();
-            assert_eq!(command.target.replica_id, topology.primary_id);
+            assert!(topology.sessions.iter().any(|member| {
+                member.identity == command.target && member.identity.replica_id != missing
+            }));
             assert_eq!(
                 command.intent.program,
                 Some(
@@ -2172,7 +2182,7 @@ async fn production_reconciler_replays_topology_after_process_restart() {
             kuberic_runtime::protocol::types::ProcessSessionId::new("restarted-primary-session");
         restarted.replicator_creation_id =
             kuberic_runtime::protocol::types::ReplicatorCreationId::new(
-                "pending-restarted-primary-session",
+                "reserved-restarted-primary-creation",
             );
         restarted.report_sequence = 1;
         restarted.role = ReplicaRole::None;
@@ -2180,6 +2190,7 @@ async fn production_reconciler_replays_topology_after_process_restart() {
         restarted.write_status = AccessStatus::NotPrimary;
         restarted.progress.role = PublicProgressRole::Recovery;
         restarted.service_location = None;
+        restarted.configuration = None;
         restarted.completed_operations.clear();
         let predecessor = observed
             .set
@@ -2207,68 +2218,6 @@ async fn production_reconciler_replays_topology_after_process_restart() {
         );
         api.set_observation(observed).await;
         let effects_start = api.effects().await.len();
-
-        let mut opened = None;
-        for _ in 0..20 {
-            reconciler.reconcile("default", "sample").await.unwrap();
-            let observation = api.observation().await;
-            assert!(
-                observation
-                    .set
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.public_v1_session_renewal.as_ref())
-                    .is_none()
-            );
-            let open_effects = api.effects().await;
-            assert!(open_effects[effects_start..].iter().all(|effect| {
-                !matches!(
-                    effect,
-                    EffectRecord::Execute(
-                        kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
-                    ) if command.target == restarted.replica
-                        && matches!(
-                            command.intent.program,
-                            Some(
-                                kuberic_runtime::protocol::public_operations::
-                                    PublicOperationProgram::Epoch { .. }
-                                    | kuberic_runtime::protocol::public_operations::
-                                        PublicOperationProgram::Role { .. }
-                                    | kuberic_runtime::protocol::public_operations::
-                                        PublicOperationProgram::Configuration(_)
-                            )
-                        )
-                )
-            }));
-            if open_effects[effects_start..].iter().any(|effect| matches!(
-                effect,
-                EffectRecord::Execute(
-                    kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
-                ) if command.target == restarted.replica
-                    && matches!(
-                        command.intent.program,
-                        Some(
-                            kuberic_runtime::protocol::public_operations::
-                                PublicOperationProgram::Open { existing: true, .. }
-                        )
-                    )
-            )) {
-                opened = Some(observation);
-                break;
-            }
-        }
-        let mut opened = opened.expect("contained restart Open was not dispatched");
-        let RawAgentObservation::PublicV1Report(opened_report) =
-            opened.agents.get_mut(&key).expect("opened restart report")
-        else {
-            panic!("expected Public V1 restart report");
-        };
-        opened_report.replicator_creation_id =
-            kuberic_runtime::protocol::types::ReplicatorCreationId::new(
-                "restarted-primary-creation",
-            );
-        restarted.replicator_creation_id = opened_report.replicator_creation_id.clone();
-        api.set_observation(opened).await;
 
         let renewal_effects_start = api.effects().await.len();
         let mut admitted_renewal = None;
@@ -2307,6 +2256,10 @@ async fn production_reconciler_replays_topology_after_process_restart() {
         }
         let renewal = admitted_renewal.expect("contained restart must persist renewal");
         assert_eq!(renewal.required.predecessor, predecessor);
+        assert_eq!(
+            renewal.required.replacement.as_ref().unwrap().replicator_creation_id,
+            restarted.replicator_creation_id,
+        );
         assert_eq!(
             renewal
                 .required
@@ -2367,6 +2320,26 @@ async fn production_reconciler_replays_topology_after_process_restart() {
             1
         );
         let effects = api.effects().await;
+        let open = effects[effects_start..].iter().position(|effect| matches!(
+            effect,
+            EffectRecord::Execute(
+                kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
+            ) if command.target == restarted.replica
+                && matches!(command.intent.program,
+                    Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Open {
+                        existing: true, ..
+                    }))
+        )).expect("captured replacement must reopen existing state");
+        assert!(effects[effects_start..effects_start + open].iter().all(|effect| !matches!(
+            effect,
+            EffectRecord::Execute(
+                kuberic_runtime::protocol::command::ProtocolCommand::PublicV1Operation(command)
+            ) if command.target == restarted.replica
+                && matches!(command.intent.program,
+                    Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Role { .. }
+                        | kuberic_runtime::protocol::public_operations::PublicOperationProgram::Epoch { .. }
+                        | kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(_)))
+        )), "replacement role/epoch/configuration must not precede actual Open");
         assert!(effects[effects_start..].iter().any(|effect| matches!(
             effect,
             EffectRecord::Execute(
@@ -2895,12 +2868,15 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
             reconciler.reconcile("default", "sample").await.unwrap();
             let observed = api.observation().await;
             if observed.set.status.as_ref().is_some_and(|status| {
-                status.public_v1_topology.is_none()
+                status.public_v1_topology.as_ref().is_some_and(|topology| {
+                    topology.configuration().is_ok_and(|configuration| configuration.members.len() == 1)
+                })
                     && status.public_v1_transition.is_none()
-                    && status
-                        .public_v1_authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.completed_operation_count >= 12)
+                    && observed.agents.values().any(|agent| matches!(
+                        agent,
+                        RawAgentObservation::PublicV1Report(report)
+                            if report.role == ReplicaRole::ActiveSecondary
+                    ))
             }) {
                 break;
             }
@@ -2912,8 +2888,10 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
                 .set
                 .status
                 .as_ref()
-                .is_some_and(|status| status.public_v1_topology.is_none()),
-            "test must interrupt initial topology before it is persisted"
+                .is_some_and(|status| status.public_v1_topology.as_ref().is_some_and(|topology| {
+                    topology.configuration().is_ok_and(|configuration| configuration.members.len() == 1)
+                })),
+            "test must interrupt bootstrap before desired voting membership is admitted"
         );
         let primary = observed
             .agents
@@ -2982,7 +2960,7 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
             )
         ));
         let mut refreshed = None;
-        for _ in 0..8 {
+        for _ in 0..32 {
             reconciler.reconcile("default", "sample").await.unwrap();
             let observation = api.observation().await;
             if let Some(operation) = observation
@@ -2992,7 +2970,11 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
                 .and_then(|status| status.public_v1_operation.as_ref())
             {
                 let command = operation.command().unwrap();
-                if command.target == primary {
+                if command.target == primary && matches!(
+                    command.intent.program.as_ref(),
+                    Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(_)
+                        | kuberic_runtime::protocol::public_operations::PublicOperationProgram::CatchUp { .. })
+                ) {
                     assert!(observation.agents.values().any(|agent| matches!(
                         agent,
                         RawAgentObservation::PublicV1Report(report)
@@ -3006,15 +2988,6 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
         }
         let command = refreshed.expect("refreshed primary configuration after current peer Open");
         assert_eq!(command.target, primary);
-        assert!(matches!(
-            command.intent.program.as_ref(),
-            Some(
-                kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(
-                    _
-                )
-            )
-        ));
-
         let mut observed = api.observation().await;
         let report = observed
             .agents
@@ -3028,20 +3001,20 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
                 _ => None,
             })
             .expect("primary report");
-        let Some(
-            kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(
-                configuration,
-            ),
-        ) = command.intent.program.as_ref()
-        else {
-            unreachable!()
+        let (configuration, call_kind, catch_up_mode) = match command.intent.program.as_ref() {
+            Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Configuration(configuration)) => {
+                (configuration, kuberic_runtime::protocol::public_operations::PublicV1CallKind::Configuration, None)
+            }
+            Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::CatchUp { configuration, mode }) => {
+                (configuration, kuberic_runtime::protocol::public_operations::PublicV1CallKind::CatchUp, Some(*mode))
+            }
+            _ => unreachable!(),
         };
         report.completed_operations.push(
             kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion {
                 operation_id: command.intent.operation_id.clone(),
                 revision: command.intent.revision,
-                call_kind:
-                    kuberic_runtime::protocol::public_operations::PublicV1CallKind::Configuration,
+                call_kind,
                 process_session_id: command.intent.process_session_id.clone(),
                 input_digest: command.intent.input_digest.clone(),
                 replay_disposition: command.intent.replay_disposition,
@@ -3054,7 +3027,7 @@ async fn production_reconciler_refreshes_primary_configuration_for_new_peer_sess
                 current_configuration_id: Some(
                     configuration.current.configuration_id.clone(),
                 ),
-                catch_up_mode: None,
+                catch_up_mode,
                 catch_up_specific_quorum: None,
                 result:
                     kuberic_runtime::protocol::public_operations::PublicV1OperationResult::Succeeded,

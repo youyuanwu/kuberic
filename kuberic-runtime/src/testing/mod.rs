@@ -15,6 +15,14 @@ pub mod state;
 
 use serde::{Serialize, de::DeserializeOwned};
 
+/// Conservatively omits the specific-quorum advertisement before host attachment.
+/// The actual control/state bundle and its opaque native ownership are unchanged.
+pub fn without_catch_up_specific_quorum(
+    interfaces: crate::replicator::ReplicatorInterfaces,
+) -> crate::Result<crate::replicator::ReplicatorInterfaces> {
+    interfaces.without_catch_up_specific_quorum()
+}
+
 fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> U {
     serde_json::from_value(serde_json::to_value(value).expect("serialize fixture record"))
         .expect("fixture record matches the durable host format")
@@ -23,7 +31,8 @@ fn convert<T: Serialize, U: DeserializeOwned>(value: T) -> U {
 #[cfg(kuberic_workspace_tests)]
 pub use public_v1_conformance::{
     ReplacementOwnershipInventory, assert_public_v1_conformance_gate,
-    assert_public_v1_conformance_not_applicable, assert_public_v1_conformance_subject,
+    assert_public_v1_conformance_not_applicable, assert_public_v1_conformance_partition_coverage,
+    assert_public_v1_conformance_subject, execute_public_v1_conformance_partition,
     execute_public_v1_conformance_subject, public_v1_postgres_conformance_scenarios,
     replacement_ownership_inventory,
     replacement_ownership_inventory_with_alternate_controller_fixture,

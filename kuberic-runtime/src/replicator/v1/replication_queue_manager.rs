@@ -56,10 +56,6 @@ pub(super) struct CatchupProgress {
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected queue-only normalization errors")
-)]
 pub(super) enum QueueNormalizationError {
     #[error("invalid destination queue configuration")]
     InvalidQueueConfig,
@@ -82,10 +78,6 @@ pub(super) struct QueueTransfer {
     pub(super) original_epochs: BTreeMap<Lsn, Epoch>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 primary queue owner")
-)]
 pub(super) struct ReplicationQueueManager {
     queue: OperationQueue,
     next_sequence_number: Lsn,
@@ -94,10 +86,6 @@ pub(super) struct ReplicationQueueManager {
     previous_config_quorum_lsn: Lsn,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 primary queue API")
-)]
 impl ReplicationQueueManager {
     pub(super) fn new(config: QueueConfig, initial_progress: Lsn) -> Self {
         let start = Self::initial_cursor(initial_progress)
@@ -347,10 +335,12 @@ impl ReplicationQueueManager {
         self.queue.progress().complete_head
     }
 
+    #[cfg(test)]
     pub(super) fn previous_config_catchup_lsn(&self) -> Lsn {
         self.previous_config_catchup_lsn
     }
 
+    #[cfg(test)]
     pub(super) fn previous_config_quorum_lsn(&self) -> Lsn {
         self.previous_config_quorum_lsn
     }
@@ -369,6 +359,7 @@ impl ReplicationQueueManager {
             .map(|operation| operation.age())
     }
 
+    #[cfg(test)]
     pub(super) fn total_bytes(&self) -> usize {
         self.queue.total_bytes()
     }

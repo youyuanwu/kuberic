@@ -23,10 +23,6 @@ use crate::protocol::types::Epoch;
 use super::operation_queue::QueueOperation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 received-operation ACK states")
-)]
 pub(super) enum AckState {
     NotCalled,
     ReadyToRun,
@@ -36,10 +32,6 @@ pub(super) enum AckState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 received-operation ACK errors")
-)]
 pub(super) enum AckError {
     #[error("the operation ACK callback is not in a valid state for this transition")]
     InvalidOperation,
@@ -62,10 +54,6 @@ struct Inner {
 
 /// Clones refer to one callback instance, not merely the same sequence number.
 #[derive(Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 received-operation identity")
-)]
 pub(super) struct ReceivedOperation {
     inner: Arc<Inner>,
 }
@@ -81,10 +69,6 @@ impl fmt::Debug for ReceivedOperation {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 received-operation ACK API")
-)]
 impl ReceivedOperation {
     /// The caller supplies a fresh queue entry with its ACK predicate set.
     pub(super) fn new(
@@ -207,18 +191,10 @@ impl ReceivedOperation {
 /// Abandonment leaves the callback pending and any retained owner untouched.
 #[derive(Debug)]
 #[must_use = "selected ACK work must be explicitly started and finished by its receiver"]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 rooted received-operation ACK work")
-)]
 pub(super) struct AckWork {
     operation: ReceivedOperation,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 ACK callback handoff API")
-)]
 impl AckWork {
     pub(super) fn operation(&self) -> &ReceivedOperation {
         &self.operation

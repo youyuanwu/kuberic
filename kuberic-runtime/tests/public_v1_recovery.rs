@@ -1,11 +1,12 @@
 #![cfg(feature = "testing")]
 
-// Hosted Public V1 replacement lifecycle and recovery journeys.
+// These journeys exercise native receiver lifetimes and service-owned durable
+// state. Transport replies and native progress are deliberately not commit receipts.
 
 #[path = "support/read_fencing.rs"]
 mod read_fencing;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,833 +16,813 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use kuberic_controller::cluster_api::PublicV1Scope;
-use kuberic_controller::evaluator::testing::{
-    HostedPublicV1Harness, HostedPublicV1Replica, PublicV1AcceptedTransitionIntent,
-    PublicV1AcceptedTransitionStatus, PublicV1EvaluationConfig, PublicV1EvidenceApi,
-    PublicV1EvidenceConsumer, PublicV1EvidenceResource, PublicV1EvidenceState, PublicV1HistoryApi,
-    PublicV1LifecycleTransition, PublicV1OperationApi, PublicV1ResourceAuthority,
-    PublicV1ResourceDisposition, PublicV1ResourceProof, PublicV1SessionRenewalApi,
-    PublicV1SessionRenewalPlan, accept_public_v1_session_renewal,
-    accept_public_v1_survivor_retired, execute_public_v1_history, execute_public_v1_operation,
-    execute_public_v1_session_renewal, plan_public_v1_data_loss_recovery, plan_public_v1_lifecycle,
-    plan_public_v1_recovery_report, plan_public_v1_session_renewal, reconcile_public_v1_consumer,
-    reconcile_public_v1_operation,
-};
-use kuberic_runtime::application::{
-    CopyChunk, DurableApplicationProgress, OpenContext, Operation, OperationDataStream, RoleChange,
-};
-use kuberic_runtime::control::proto;
-use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
+use kuberic_controller::evaluator::testing::*;
+#[allow(
+    clippy::disallowed_types,
+    reason = "observes protected callbacks on the same native creation"
+)]
+use kuberic_runtime::PrimaryReplicator;
+use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::host::{
-    ApplicationStorageState, ReplicaHost, ReplicaProcessConfig, RunningReplica,
+    ApplicationStorageState, ReplicaHandle, ReplicaHost, ReplicaProcessConfig, RunningReplica,
 };
-use kuberic_runtime::protocol::command::{ProtocolCommand, PublicV1OperationCommand};
-use kuberic_runtime::protocol::public_operations::{
-    DataLossAttempt, DataLossAuthorization, DataLossReplay, LocalProviderRebuildRequired,
-    PossibleDataLossIntent, ProcessAttemptContext, ProcessSessionRenewalRequired,
-    ProviderProgressReset, ProviderReplicaIdentity, PublicBuildAttemptReference, PublicBuildInput,
-    PublicConfiguration, PublicDataLossRecoveryInput, PublicInboundBuildAuthority,
-    PublicLifecycleInput, PublicLifecycleRecipe, PublicOperationClass, PublicOperationIntent,
-    PublicOperationProgram, PublicOperationReplayDisposition, PublicReplicaDescriptor,
-    PublicV1AcceptedStatus, PublicV1CallKind, PublicV1Identity, PublicV1LifecycleBinding,
-    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason,
-    ReplicaRebuildRequired, StatePersistence,
+use kuberic_runtime::protocol::command::{
+    ProtocolCommand, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
 };
-use kuberic_runtime::protocol::types::{
-    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
-    Epoch, InitializationId, OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId,
-    ProcessSessionRenewalReason, PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ReplicaStorageIdentity, ReplicaStorageIncarnationContext,
-    ReplicatorCreationId, ResourceUid, StorageGeneration, derive_agent_generation,
-    derive_bootstrap_history, derive_data_loss_history, derive_history_initialization_id,
-    derive_initialization_id,
-};
-use kuberic_runtime::replicator::stateless::{
-    StatelessReplicatorFactory, testing_pause_inbound_build_after_classification,
-};
+use kuberic_runtime::protocol::public_operations::*;
+use kuberic_runtime::protocol::types::*;
+use kuberic_runtime::replicator::stream::{OperationKind, OperationStream, ReceivedOperation};
 use kuberic_runtime::replicator::{
+    DefaultReplicatorFactory, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
-    ReplicatorSettings, StateReplicator, StatefulServicePartition,
+    ReplicatorSettings, StateReplicator, StatefulServicePartition, TestingTcpRoute,
+    TestingTcpRouteKind,
 };
 use kuberic_runtime::testing::sqlite_store::SqliteStore;
-use kuberic_runtime::testing::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
-use serde::Deserialize;
-use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, oneshot, watch};
 use tonic::Request;
 
-static NEXT_ROOT: AtomicU64 = AtomicU64::new(1);
-
-fn test_scope(resource_uid: &ResourceUid) -> PublicV1Scope {
-    PublicV1Scope {
-        namespace: "kuberic-system".into(),
-        name: resource_uid.to_string(),
-        resource_uid: resource_uid.clone(),
-    }
+#[allow(dead_code, reason = "independently compiled native carrier fixture")]
+mod native_wire {
+    tonic::include_proto!("kuberic.sf.v1");
 }
 
-fn test_root(name: &str) -> PathBuf {
-    let root = std::env::current_dir()
+const TOKEN: &str = "preview-token";
+const EPOCH: Epoch = Epoch::new(0, 1);
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn failure(error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::Application(error.to_string())
+}
+
+fn root() -> tempfile::TempDir {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/paw-tmp");
+    std::fs::create_dir_all(&directory).unwrap();
+    tempfile::Builder::new()
+        .prefix("native-recovery-")
+        .tempdir_in(directory)
         .unwrap()
-        .join("target")
-        .join("stateless-preview")
-        .join(format!(
-            "{name}-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-    std::fs::create_dir_all(&root).unwrap();
-    root
 }
 
-fn free_address() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    address
+#[derive(Default)]
+struct Gate {
+    held: AtomicBool,
+    entered: Notify,
+    released: Notify,
 }
 
-fn authorized<T>(message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert("authorization", "Bearer preview-token".parse().unwrap());
-    request
-}
-
-type HungReplicationStream =
-    Pin<Box<dyn Stream<Item = std::result::Result<proto::ReplicationAck, tonic::Status>> + Send>>;
-type HungBuildStream =
-    Pin<Box<dyn Stream<Item = std::result::Result<proto::CopyAck, tonic::Status>> + Send>>;
-
-struct HungBuildService {
-    entered: Arc<Notify>,
-}
-
-#[tonic::async_trait]
-impl proto::replication_data_server::ReplicationData for HungBuildService {
-    type ReplicateStream = HungReplicationStream;
-    type BuildStream = HungBuildStream;
-
-    async fn replicate(
-        &self,
-        _request: Request<tonic::Streaming<proto::ReplicationItem>>,
-    ) -> std::result::Result<tonic::Response<Self::ReplicateStream>, tonic::Status> {
-        Ok(tonic::Response::new(Box::pin(stream::empty())))
+impl Gate {
+    fn hold(&self) {
+        self.held.store(true, Ordering::Release);
     }
 
-    async fn build(
-        &self,
-        _request: Request<tonic::Streaming<proto::CopyItem>>,
-    ) -> std::result::Result<tonic::Response<Self::BuildStream>, tonic::Status> {
-        self.entered.notify_one();
-        Ok(tonic::Response::new(Box::pin(stream::pending())))
+    fn release(&self) {
+        self.held.store(false, Ordering::Release);
+        self.released.notify_waiters();
     }
-}
 
-async fn drive_session_renewal(
-    adapter: &HostedPublicV1Harness,
-    resource_uid: &ResourceUid,
-    unreachable: &[ProcessSessionId],
-    retire_unreachable: bool,
-) {
-    loop {
-        let accepted = adapter
-            .observe_public_v1_session_renewal(&test_scope(resource_uid))
-            .await
-            .unwrap()
-            .unwrap();
-        let plan = plan_public_v1_session_renewal(&accepted, unreachable).unwrap();
-        match plan {
-            PublicV1SessionRenewalPlan::Stable => break,
-            PublicV1SessionRenewalPlan::WaitForSurvivor { survivor, .. } if retire_unreachable => {
-                let next = accept_public_v1_survivor_retired(
-                    &accepted,
-                    &survivor,
-                    OperationId::new(format!(
-                        "{}-retire-unreachable-{}",
-                        accepted.required.operation_id, survivor.identity.replica_id
-                    )),
-                )
-                .unwrap();
-                adapter
-                    .persist_public_v1_session_renewal(
-                        &test_scope(resource_uid),
-                        Some(&accepted),
-                        &next,
-                    )
-                    .await
-                    .unwrap();
+    async fn wait(&self) {
+        if self.held.load(Ordering::Acquire) {
+            self.entered.notify_one();
+        }
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.held.load(Ordering::Acquire) {
+                return;
             }
-            plan => execute_public_v1_session_renewal(adapter, &test_scope(resource_uid), plan)
-                .await
-                .unwrap(),
+            released.await;
         }
     }
 }
 
-fn replica() -> ReplicaIdentity {
-    replica_named(1, "preview-pod-uid", "preview-agent")
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceState {
+    format: String,
+    epoch: Epoch,
+    values: Vec<Bytes>,
 }
 
-fn replica_named(id: i64, instance: &str, generation: &str) -> ReplicaIdentity {
-    ReplicaIdentity {
-        replica_id: ReplicaId::new(id),
-        instance_id: ReplicaInstanceId::new(instance),
-        agent_generation: AgentGeneration::new(generation),
+impl Default for ServiceState {
+    fn default() -> Self {
+        Self {
+            format: "native-recovery-service-v1".into(),
+            epoch: Epoch::default(),
+            values: Vec::new(),
+        }
     }
 }
 
-fn storage_proto(storage: &ReplicaStorageIncarnationContext) -> proto::PublicV1StorageIncarnation {
-    let (kind, pod_uid, pvc_uid, volatile_identity) = match &storage.storage {
-        ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } => (
-            proto::PublicV1StorageKind::Persistent as i32,
-            pod_uid.to_string(),
-            pvc_uid.to_string(),
-            String::new(),
-        ),
-        ReplicaStorageIdentity::Volatile { identity } => (
-            proto::PublicV1StorageKind::Volatile as i32,
-            String::new(),
-            String::new(),
-            identity.clone(),
-        ),
-    };
-    proto::PublicV1StorageIncarnation {
-        replica: Some(storage.replica.clone().into()),
-        kind,
-        pod_uid,
-        pvc_uid,
-        volatile_identity,
-        storage_generation: storage.storage_generation.to_string(),
+impl ServiceState {
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let state: Self = serde_json::from_slice(bytes).map_err(failure)?;
+        if state.format != Self::default().format
+            || state.epoch.data_loss_number < 0
+            || state.epoch.configuration_number < 0
+        {
+            return Err(failure("incompatible service snapshot"));
+        }
+        Ok(state)
     }
 }
 
-fn history_proto(
-    history: &kuberic_runtime::protocol::types::HistoryContext,
-) -> proto::PublicV1HistoryContext {
-    proto::PublicV1HistoryContext {
-        resource_uid: history.resource_uid.to_string(),
-        protocol_generation: history.protocol_generation.value(),
-        history_id: history.history_id.to_string(),
-        data_loss_number: history.data_loss_number,
-    }
-}
-
-fn storage_incarnation(replica: ReplicaIdentity) -> ReplicaStorageIncarnationContext {
-    storage_named(replica, "preview-pod-uid", "preview-pvc-uid")
-}
-
-fn storage_named(
-    replica: ReplicaIdentity,
-    pod_uid: &str,
-    pvc_uid: &str,
-) -> ReplicaStorageIncarnationContext {
-    ReplicaStorageIncarnationContext {
-        replica,
-        storage: ReplicaStorageIdentity::Persistent {
-            pod_uid: PodUid::new(pod_uid),
-            pvc_uid: PvcUid::new(pvc_uid),
-        },
-        storage_generation: StorageGeneration::new(format!("{pod_uid}-storage")),
-    }
-}
-
-fn store_identity(resource_uid: ResourceUid) -> StorageIdentity {
-    store_identity_named(
-        resource_uid,
-        replica(),
-        "preview-pod-uid",
-        "preview-pvc-uid",
-    )
-}
-
-fn store_identity_named(
-    resource_uid: ResourceUid,
-    replica: ReplicaIdentity,
-    pod_uid: &str,
-    pvc_uid: &str,
-) -> StorageIdentity {
-    StorageIdentity {
-        schema_version: SCHEMA_VERSION,
-        resource_uid,
-        pod_uid: PodUid::new(pod_uid),
-        pvc_uid: PvcUid::new(pvc_uid),
-        initialization_id: InitializationId::new(format!("{pod_uid}-initialization")),
-        local_identity: replica,
-        effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
-    }
-}
-
-#[derive(Default)]
-struct MemoryState {
-    default_factory: AtomicBool,
-    stream_mode: AtomicU64,
-    apply_calls: AtomicU64,
-    commit_calls: AtomicU64,
-    progress: Mutex<DurableApplicationProgress>,
-    operations: Mutex<Vec<Operation>>,
-    copy_chunks: Mutex<Vec<Bytes>>,
-    epoch_tails: Mutex<Vec<i64>>,
-    block_apply: AtomicBool,
-    block_commit: AtomicBool,
+struct Provider {
+    root: PathBuf,
+    state: Mutex<ServiceState>,
+    identity: Mutex<Option<ReplicaIdentity>>,
+    copy: Gate,
+    install: Gate,
+    commit: Gate,
+    recovery: Gate,
+    changed: Notify,
     fail_commit: AtomicBool,
-    block_copy: AtomicBool,
-    block_finish_copy: AtomicBool,
-    spawn_copy_descendant: AtomicBool,
-    data_loss_changed: AtomicBool,
-    fail_data_loss: AtomicBool,
-    data_loss_rebuild: Mutex<Option<ReplicaIdentity>>,
-    data_loss_calls: AtomicU64,
-    commit_entered: Notify,
-    release_commit: Notify,
-    apply_entered: Notify,
-    release_apply: Notify,
-    copy_entered: Notify,
-    release_copy: Notify,
-    finish_copy_entered: Notify,
-    release_finish_copy: Notify,
-    copy_descendant_entered: Arc<Notify>,
-    release_copy_descendant: Arc<Notify>,
-    cancelled_copy_descendants: Arc<AtomicU64>,
-    copy_descendant_mutations: Arc<AtomicU64>,
+    corrupt_copy: AtomicBool,
+    recovery_outcome: AtomicU64,
+    recovery_calls: AtomicU64,
+    epoch_tails: Mutex<Vec<i64>>,
+    synchronous_install: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    synchronous_entered: Notify,
+    installs: AtomicU64,
+    copy_active: AtomicU64,
+    copy_interrupted: AtomicU64,
+    copy_context_calls: AtomicU64,
+    copy_calls: AtomicU64,
+    progress_calls: AtomicU64,
+    query_current: AtomicU64,
+    query_capability: AtomicU64,
+    conservative_quorum: AtomicBool,
+    probe_fenced_admission: AtomicBool,
 }
 
-impl MemoryState {
-    fn block_apply(&self) {
-        self.block_apply.store(true, Ordering::Release);
+impl Provider {
+    fn new(root: PathBuf) -> Result<Self> {
+        let state = match std::fs::read(root.join("service.json")) {
+            Ok(bytes) => ServiceState::decode(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if root.exists() && std::fs::read_dir(&root).map_err(failure)?.next().is_some() {
+                    return Err(failure("established service metadata is missing"));
+                }
+                ServiceState::default()
+            }
+            Err(error) => return Err(failure(error)),
+        };
+        Ok(Self {
+            root,
+            state: Mutex::new(state),
+            identity: Mutex::new(None),
+            copy: Gate::default(),
+            install: Gate::default(),
+            commit: Gate::default(),
+            recovery: Gate::default(),
+            changed: Notify::new(),
+            fail_commit: AtomicBool::new(false),
+            corrupt_copy: AtomicBool::new(false),
+            recovery_outcome: AtomicU64::new(0),
+            recovery_calls: AtomicU64::new(0),
+            epoch_tails: Mutex::new(Vec::new()),
+            synchronous_install: Mutex::new(None),
+            synchronous_entered: Notify::new(),
+            installs: AtomicU64::new(0),
+            copy_active: AtomicU64::new(0),
+            copy_interrupted: AtomicU64::new(0),
+            copy_context_calls: AtomicU64::new(0),
+            copy_calls: AtomicU64::new(0),
+            progress_calls: AtomicU64::new(0),
+            query_current: AtomicU64::new(0),
+            query_capability: AtomicU64::new(0),
+            conservative_quorum: AtomicBool::new(false),
+            probe_fenced_admission: AtomicBool::new(false),
+        })
     }
 
-    fn block_commit(&self) {
-        self.block_commit.store(true, Ordering::Release);
+    fn persist(&self, state: &ServiceState) -> Result<()> {
+        std::fs::create_dir_all(&self.root).map_err(failure)?;
+        let bytes = serde_json::to_vec(state).map_err(failure)?;
+        let pending = self.root.join("service.pending");
+        std::fs::write(&pending, bytes).map_err(failure)?;
+        std::fs::File::open(&pending)
+            .and_then(|file| file.sync_all())
+            .map_err(failure)?;
+        std::fs::rename(pending, self.root.join("service.json")).map_err(failure)?;
+        std::fs::File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(failure)
     }
 
-    fn fail_next_commit(&self) {
-        self.fail_commit.store(true, Ordering::Release);
+    fn values(&self) -> Vec<Bytes> {
+        self.state.lock().unwrap().values.clone()
     }
 
-    fn block_copy(&self) {
-        self.block_copy.store(true, Ordering::Release);
+    fn callback_counts(&self) -> (u64, u64, u64, usize, u64) {
+        (
+            self.progress_calls.load(Ordering::SeqCst),
+            self.copy_context_calls.load(Ordering::SeqCst),
+            self.copy_calls.load(Ordering::SeqCst),
+            self.epoch_tails.lock().unwrap().len(),
+            self.recovery_calls.load(Ordering::SeqCst),
+        )
     }
 
-    fn block_finish_copy(&self) {
-        self.block_finish_copy.store(true, Ordering::Release);
+    fn commit(&self, lsn: i64, data: Bytes) -> Result<()> {
+        if self.fail_commit.swap(false, Ordering::AcqRel) {
+            return Err(failure("injected service persistence failure"));
+        }
+        let mut state = self.state.lock().unwrap();
+        if lsn <= 0 {
+            return Err(failure("invalid service LSN"));
+        }
+        if lsn <= state.values.len() as i64 {
+            return if state.values.get((lsn - 1) as usize) == Some(&data) {
+                Ok(())
+            } else {
+                Err(failure("service history conflicts at an existing LSN"))
+            };
+        }
+        if lsn != state.values.len() as i64 + 1 {
+            return Err(failure("service history has a gap"));
+        }
+        let mut candidate = state.clone();
+        candidate.values.push(data);
+        self.persist(&candidate)?;
+        *state = candidate;
+        self.changed.notify_waiters();
+        Ok(())
     }
 
-    fn block_copy_with_descendant(&self) {
-        self.block_copy();
-        self.spawn_copy_descendant.store(true, Ordering::Release);
-    }
-
-    fn change_on_data_loss(&self) {
-        self.data_loss_changed.store(true, Ordering::Release);
-    }
-
-    fn fail_next_data_loss(&self) {
-        self.fail_data_loss.store(true, Ordering::Release);
-    }
-
-    fn rebuild_on_data_loss(&self, replica: ReplicaIdentity) {
-        *self.data_loss_rebuild.lock().unwrap() = Some(replica);
+    async fn persist_received(&self, operation: &ReceivedOperation) -> Result<()> {
+        if operation.end_of_stream {
+            return Ok(());
+        }
+        match operation.kind {
+            OperationKind::Replication => {
+                self.commit.wait().await;
+                self.commit(operation.lsn, operation.data.clone())
+            }
+            OperationKind::Copy => {
+                let snapshot = ServiceState::decode(&operation.data)?;
+                self.install.wait().await;
+                let synchronous = self.synchronous_install.lock().unwrap().take();
+                if let Some(blocked) = synchronous {
+                    self.synchronous_entered.notify_one();
+                    blocked
+                        .recv_timeout(Duration::from_secs(15))
+                        .map_err(failure)?;
+                }
+                let mut state = self.state.lock().unwrap();
+                if !snapshot.values.starts_with(&state.values) {
+                    return Err(failure("copy conflicts with committed service history"));
+                }
+                self.persist(&snapshot)?;
+                *state = snapshot;
+                self.installs.fetch_add(1, Ordering::SeqCst);
+                self.changed.notify_waiters();
+                Ok(())
+            }
+        }
     }
 }
 
 #[async_trait]
-impl StateProvider for MemoryState {
-    async fn update_epoch(&self, _epoch: Epoch, previous_epoch_last_lsn: i64) -> Result<()> {
-        if previous_epoch_last_lsn < 0 {
-            return Err(RuntimeError::Application(
-                "negative previous epoch LSN".into(),
-            ));
+impl StateProvider for Provider {
+    async fn update_epoch(&self, epoch: Epoch, previous_epoch_last_lsn: i64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if epoch < state.epoch || previous_epoch_last_lsn < 0 {
+            return Err(failure("service epoch regressed"));
         }
         self.epoch_tails
             .lock()
             .unwrap()
             .push(previous_epoch_last_lsn);
+        let mut next = state.clone();
+        next.epoch = epoch;
+        self.persist(&next)?;
+        *state = next;
         Ok(())
     }
 
     async fn last_committed_lsn(&self) -> Result<i64> {
-        Ok(self.progress.lock().unwrap().committed_lsn)
+        self.progress_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.state.lock().unwrap().values.len() as i64)
     }
 
     async fn get_copy_context(&self) -> Result<OperationDataStream> {
+        self.copy_context_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(stream::empty()))
     }
 
     async fn get_copy_state(
         &self,
-        _up_to_lsn: i64,
-        _copy_context: OperationDataStream,
+        up_to: i64,
+        mut context: OperationDataStream,
     ) -> Result<OperationDataStream> {
-        if self.block_copy.load(Ordering::Acquire) {
-            struct AbortDescendant(tokio::task::JoinHandle<()>);
-
-            impl Drop for AbortDescendant {
-                fn drop(&mut self) {
-                    self.0.abort();
+        self.copy_calls.fetch_add(1, Ordering::SeqCst);
+        struct Activity<'a> {
+            active: &'a AtomicU64,
+            interrupted: &'a AtomicU64,
+            completed: bool,
+        }
+        impl Drop for Activity<'_> {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                if !self.completed {
+                    self.interrupted.fetch_add(1, Ordering::SeqCst);
                 }
             }
-
-            let descendant = self
-                .spawn_copy_descendant
-                .swap(false, Ordering::AcqRel)
-                .then(|| {
-                    let entered = self.copy_descendant_entered.clone();
-                    let release = self.release_copy_descendant.clone();
-                    let cancelled = self.cancelled_copy_descendants.clone();
-                    let mutations = self.copy_descendant_mutations.clone();
-                    AbortDescendant(tokio::spawn(async move {
-                        struct CancellationProbe {
-                            cancelled: Arc<AtomicU64>,
-                            completed: bool,
-                        }
-
-                        impl Drop for CancellationProbe {
-                            fn drop(&mut self) {
-                                if !self.completed {
-                                    self.cancelled.fetch_add(1, Ordering::SeqCst);
-                                }
-                            }
-                        }
-
-                        let mut probe = CancellationProbe {
-                            cancelled,
-                            completed: false,
-                        };
-                        entered.notify_one();
-                        release.notified().await;
-                        mutations.fetch_add(1, Ordering::SeqCst);
-                        probe.completed = true;
-                    }))
-                });
-            self.copy_entered.notify_waiters();
-            self.release_copy.notified().await;
-            self.block_copy.store(false, Ordering::Release);
-            drop(descendant);
         }
-        Ok(Box::pin(stream::iter(
-            self.copy_chunks.lock().unwrap().clone().into_iter().map(Ok),
-        )))
+        self.copy_active.fetch_add(1, Ordering::SeqCst);
+        let mut activity = Activity {
+            active: &self.copy_active,
+            interrupted: &self.copy_interrupted,
+            completed: false,
+        };
+        if let Some(item) = context.next().await {
+            item?;
+            return Err(failure("unexpected service copy context"));
+        }
+        let snapshot = loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let snapshot = {
+                let state = self.state.lock().unwrap();
+                if up_to < 0 {
+                    return Err(failure("negative service snapshot boundary"));
+                }
+                (state.values.len() as i64 >= up_to).then(|| {
+                    let mut snapshot = state.clone();
+                    snapshot.values.truncate(up_to as usize);
+                    snapshot
+                })
+            };
+            if let Some(snapshot) = snapshot {
+                break snapshot;
+            }
+            changed.await;
+        };
+        self.copy.wait().await;
+        activity.completed = true;
+        if self.corrupt_copy.load(Ordering::Acquire) {
+            return Ok(Box::pin(stream::iter([Ok(Bytes::from_static(
+                b"invalid-service-snapshot",
+            ))])));
+        }
+        let bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(failure)?);
+        Ok(Box::pin(stream::iter([Ok(bytes)])))
     }
 
     async fn on_data_loss(&self) -> Result<bool> {
-        self.data_loss_calls.fetch_add(1, Ordering::SeqCst);
-        if let Some(replica) = self.data_loss_rebuild.lock().unwrap().take() {
-            return Err(RuntimeError::ReplicaRebuildRequired(Box::new(
+        self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+        self.recovery.wait().await;
+        match self.recovery_outcome.load(Ordering::Acquire) {
+            0 => Ok(false),
+            1 => {
+                let mut state = self.state.lock().unwrap();
+                let mut next = state.clone();
+                next.values.clear();
+                self.persist(&next)?;
+                *state = next;
+                Ok(true)
+            }
+            2 => Err(failure("injected data-loss callback failure")),
+            _ => Err(RuntimeError::ReplicaRebuildRequired(Box::new(
                 ReplicaRebuildRequired::LocalProvider(LocalProviderRebuildRequired {
                     reason: ReplicaRebuildReason::IncompatibleRetainedHistory,
-                    provider: ProviderReplicaIdentity { replica },
+                    provider: ProviderReplicaIdentity {
+                        replica: self.identity.lock().unwrap().clone().unwrap(),
+                    },
                 }),
-            )));
+            ))),
         }
-        if self.fail_data_loss.swap(false, Ordering::AcqRel) {
-            return Err(RuntimeError::Application(
-                "injected data-loss callback failure".into(),
-            ));
-        }
-        Ok(self.data_loss_changed.swap(false, Ordering::AcqRel))
     }
 }
 
+struct CountingFactory {
+    calls: Arc<AtomicU64>,
+    observed: Arc<Mutex<Vec<NativeCall>>>,
+    provider: Arc<Provider>,
+}
+
+#[derive(Clone, Debug)]
+enum NativeCall {
+    Role(Epoch, ReplicaRole),
+    Epoch(Epoch),
+    Current(ReplicaSetConfiguration),
+    CatchUp(ReplicaSetConfiguration, ReplicaSetConfiguration),
+    Wait(ReplicaSetQuorumMode, AccessStatus),
+    FencedBegin(AccessStatus, String),
+    Build(ReplicaInformation),
+    RemoveBegin(ReplicaId, u64),
+    RemoveEnd(ReplicaId, u64),
+}
+
+struct ObservedPrimary {
+    #[allow(
+        clippy::disallowed_types,
+        reason = "delegates every protected callback to the same native owner"
+    )]
+    inner: Arc<dyn PrimaryReplicator>,
+    state: Arc<dyn StateReplicator>,
+    context: ReplicatorFactoryContext,
+    observed: Arc<Mutex<Vec<NativeCall>>>,
+    provider: Arc<Provider>,
+}
+
 #[async_trait]
-impl DurableState for MemoryState {
-    async fn get_replication_operations(
-        &self,
-        from_lsn: i64,
-        to_lsn: i64,
-    ) -> Result<RetainedOperationStream> {
-        let operations = self
-            .operations
+impl Replicator for ObservedPrimary {
+    async fn open(&self) -> Result<String> {
+        self.inner.open().await
+    }
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
+    }
+    fn abort(&self) {
+        self.inner.abort();
+    }
+    async fn current_progress(&self) -> Result<i64> {
+        match self.provider.query_current.load(Ordering::Acquire) {
+            1 => Err(RuntimeError::ProgressNotReady),
+            2 => Err(failure("injected current-progress query failure")),
+            _ => self.inner.current_progress().await,
+        }
+    }
+    async fn catch_up_capability(&self) -> Result<i64> {
+        match self.provider.query_capability.load(Ordering::Acquire) {
+            1 => Err(RuntimeError::ProgressNotReady),
+            2 => Err(failure("injected catch-up-capability query failure")),
+            _ => self.inner.catch_up_capability().await,
+        }
+    }
+    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        self.inner.change_role(epoch, role).await?;
+        self.observed
             .lock()
             .unwrap()
-            .iter()
-            .filter(|operation| operation.lsn >= from_lsn && operation.lsn <= to_lsn)
-            .cloned()
-            .map(Ok)
-            .collect::<Vec<_>>();
-        Ok(Box::pin(stream::iter(operations)))
-    }
-
-    async fn apply_copy_chunk(
-        &self,
-        _build_id: &OperationId,
-        sequence: u64,
-        chunk: CopyChunk,
-    ) -> Result<()> {
-        let mut chunks = self.copy_chunks.lock().unwrap();
-        let index = sequence as usize;
-        if let Some(existing) = chunks.get(index) {
-            if existing != &chunk.data {
-                return Err(RuntimeError::Application("copy chunk changed".into()));
-            }
-        } else if index == chunks.len() {
-            chunks.push(chunk.data);
-        } else {
-            return Err(RuntimeError::Application("copy sequence has a gap".into()));
-        }
+            .push(NativeCall::Role(epoch, role));
         Ok(())
     }
-
-    async fn verify_copy_chunk(
-        &self,
-        _build_id: &OperationId,
-        sequence: u64,
-        chunk: &CopyChunk,
-    ) -> Result<bool> {
-        Ok(self.copy_chunks.lock().unwrap().get(sequence as usize) == Some(&chunk.data))
+    async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        self.inner.update_epoch(epoch).await?;
+        self.observed.lock().unwrap().push(NativeCall::Epoch(epoch));
+        Ok(())
     }
-
-    async fn finish_copy(
-        &self,
-        _build_id: &OperationId,
-        up_to_lsn: i64,
-        committed_lsn: i64,
-    ) -> Result<DurableApplicationProgress> {
-        if self.block_finish_copy.load(Ordering::Acquire) {
-            self.finish_copy_entered.notify_one();
-            self.release_finish_copy.notified().await;
-            self.block_finish_copy.store(false, Ordering::Release);
-        }
-        let mut progress = self.progress.lock().unwrap();
-        progress.applied_lsn = up_to_lsn;
-        progress.committed_lsn = committed_lsn;
-        Ok(*progress)
-    }
-
-    async fn apply(&self, operation: Operation) -> Result<DurableApplicationProgress> {
-        self.apply_calls.fetch_add(1, Ordering::AcqRel);
-        let result = {
-            let mut operations = self.operations.lock().unwrap();
-            if let Some(existing) = operations
-                .iter()
-                .find(|existing| existing.lsn == operation.lsn)
-            {
-                if existing != &operation {
-                    return Err(RuntimeError::Application("operation bytes changed".into()));
-                }
-            } else {
-                operations.push(operation.clone());
-            }
-            let mut progress = self.progress.lock().unwrap();
-            progress.applied_lsn = progress.applied_lsn.max(operation.lsn);
-            *progress
-        };
-        if self.block_apply.load(Ordering::Acquire) {
-            self.apply_entered.notify_one();
-            self.release_apply.notified().await;
-            self.block_apply.store(false, Ordering::Release);
-        }
-        Ok(result)
-    }
-
-    async fn durable_progress(&self) -> Result<DurableApplicationProgress> {
-        Ok(*self.progress.lock().unwrap())
-    }
-
-    async fn verify_applied(&self, operation: &Operation) -> Result<bool> {
-        Ok(self.operations.lock().unwrap().contains(operation))
-    }
-
-    async fn commit(&self, committed_lsn: i64) -> Result<DurableApplicationProgress> {
-        self.commit_calls.fetch_add(1, Ordering::AcqRel);
-        if self.block_commit.load(Ordering::Acquire) {
-            self.commit_entered.notify_one();
-            self.release_commit.notified().await;
-            self.block_commit.store(false, Ordering::Release);
-        }
-        if self.fail_commit.swap(false, Ordering::AcqRel) {
-            return Err(RuntimeError::Application(
-                "injected provider commit failure".into(),
-            ));
-        }
-        let mut progress = self.progress.lock().unwrap();
-        if committed_lsn > progress.applied_lsn {
-            return Err(RuntimeError::Application("commit exceeds apply".into()));
-        }
-        progress.committed_lsn = progress.committed_lsn.max(committed_lsn);
-        Ok(*progress)
-    }
-}
-
-struct CountingStatelessFactory {
-    storage: Arc<MemoryState>,
-    calls: Arc<AtomicU64>,
 }
 
 #[async_trait]
-impl ReplicatorFactory for CountingStatelessFactory {
+impl PrimaryReplicator for ObservedPrimary {
+    async fn on_data_loss(&self) -> Result<bool> {
+        self.inner.on_data_loss().await
+    }
+    async fn update_current_replica_set_configuration(
+        &self,
+        current: ReplicaSetConfiguration,
+    ) -> Result<()> {
+        self.inner
+            .update_current_replica_set_configuration(current.clone())
+            .await?;
+        self.observed
+            .lock()
+            .unwrap()
+            .push(NativeCall::Current(current));
+        Ok(())
+    }
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        current: ReplicaSetConfiguration,
+        previous: ReplicaSetConfiguration,
+    ) -> Result<()> {
+        self.inner
+            .update_catch_up_replica_set_configuration(current.clone(), previous.clone())
+            .await?;
+        self.observed
+            .lock()
+            .unwrap()
+            .push(NativeCall::CatchUp(current, previous));
+        Ok(())
+    }
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+        let status = self.context.write_status().await?;
+        self.observed
+            .lock()
+            .unwrap()
+            .push(NativeCall::Wait(mode, status));
+        if self.provider.probe_fenced_admission.load(Ordering::Acquire)
+            && status != AccessStatus::Granted
+        {
+            let progress = self.inner.current_progress().await?;
+            let error = match self.state.begin_replicate(Bytes::new()) {
+                Err(error) => error,
+                Ok(admitted) => {
+                    return Err(failure(format!(
+                        "post-Revoke raw admission consumed LSN {}",
+                        admitted.lsn
+                    )));
+                }
+            };
+            self.observed
+                .lock()
+                .unwrap()
+                .push(NativeCall::FencedBegin(status, error.to_string()));
+            if self.inner.current_progress().await? != progress {
+                return Err(failure("rejected raw admission changed native progress"));
+            }
+        }
+        self.inner.wait_for_catch_up_quorum(mode).await
+    }
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        self.observed
+            .lock()
+            .unwrap()
+            .push(NativeCall::Build(replica.clone()));
+        self.inner.build_replica(replica).await
+    }
+    async fn remove_replica(&self, replica: ReplicaId) -> Result<()> {
+        self.observed.lock().unwrap().push(NativeCall::RemoveBegin(
+            replica,
+            self.provider.copy_active.load(Ordering::Acquire),
+        ));
+        self.inner.remove_replica(replica).await?;
+        self.observed.lock().unwrap().push(NativeCall::RemoveEnd(
+            replica,
+            self.provider.copy_active.load(Ordering::Acquire),
+        ));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ReplicatorFactory for CountingFactory {
     async fn create_replicator(
         &self,
         context: ReplicatorFactoryContext,
-        state_provider: Option<Arc<dyn StateProvider>>,
+        provider: Option<Arc<dyn StateProvider>>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.storage.default_factory.load(Ordering::Acquire) {
-            return kuberic_runtime::replicator::DefaultReplicatorFactory::new(
-                self.storage.clone(),
-            )
-            .create_replicator(context, state_provider, settings)
-            .await;
-        }
-        StatelessReplicatorFactory::new(self.storage.clone())
-            .create_replicator(context, state_provider, settings)
-            .await
-    }
-}
-
-struct RejectingFactory {
-    calls: Arc<AtomicU64>,
-}
-
-#[async_trait]
-impl ReplicatorFactory for RejectingFactory {
-    async fn create_replicator(
-        &self,
-        _context: ReplicatorFactoryContext,
-        _state_provider: Option<Arc<dyn StateProvider>>,
-        _settings: ReplicatorSettings,
-    ) -> Result<ReplicatorInterfaces> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Err(RuntimeError::Application(
-            "injected creation failure".into(),
+        let native = DefaultReplicatorFactory::new()
+            .create_replicator(context.clone(), provider, settings)
+            .await?;
+        let native = if self.provider.conservative_quorum.load(Ordering::Acquire) {
+            kuberic_runtime::testing::without_catch_up_specific_quorum(native)?
+        } else {
+            native
+        };
+        let state = native.state_replicator();
+        let primary = native.primary_replicator().unwrap();
+        Ok(native.wrap_primary(
+            Arc::new(ObservedPrimary {
+                inner: primary,
+                state: state.clone().unwrap(),
+                context,
+                observed: self.observed.clone(),
+                provider: self.provider.clone(),
+            }),
+            state,
         ))
     }
 }
 
-struct PreviewApplication {
-    storage: Arc<MemoryState>,
-    replication_address: String,
-    control: RwLock<Option<Arc<dyn Replicator>>>,
-    state_replicator: RwLock<Option<Arc<dyn StateReplicator>>>,
-    #[allow(clippy::disallowed_types)]
-    primary: RwLock<Option<Arc<dyn kuberic_runtime::replicator::PrimaryReplicator>>>,
-    partition: RwLock<Option<StatefulServicePartition>>,
-    fail_first_creation: AtomicBool,
-    opens: AtomicU64,
-    factory_calls: Arc<AtomicU64>,
-    failed_factory_calls: Arc<AtomicU64>,
-    metadata_database: Option<PathBuf>,
-    instruction_seen_before_open: AtomicBool,
-    fail_close: AtomicBool,
-    none_behavior: AtomicU64,
-    none_calls: AtomicU64,
-    abort_entered: Notify,
-    abort_calls: AtomicU64,
-    replicator_released_before_application_close: AtomicBool,
-    lifecycle_events: Mutex<Vec<&'static str>>,
-    stream_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    controlled_operations: Arc<
-        Mutex<
-            Option<
-                tokio::sync::mpsc::UnboundedSender<
-                    kuberic_runtime::replicator::stream::StreamOperation,
-                >,
-            >,
-        >,
-    >,
+struct PendingWrite {
+    lsn: i64,
+    outcome: oneshot::Receiver<Result<i64>>,
 }
 
-impl PreviewApplication {
-    fn new(storage: Arc<MemoryState>, replication_address: String) -> Self {
-        Self {
-            storage,
-            replication_address,
-            control: RwLock::new(None),
-            state_replicator: RwLock::new(None),
-            primary: RwLock::new(None),
+impl PendingWrite {
+    async fn wait(self) -> Result<i64> {
+        self.outcome.await.map_err(failure)?
+    }
+}
+
+struct Application {
+    owner: Mutex<std::sync::Weak<Self>>,
+    provider: Arc<Provider>,
+    address: String,
+    partition: RwLock<Option<StatefulServicePartition>>,
+    control: RwLock<Option<Arc<dyn Replicator>>>,
+    state: RwLock<Option<Arc<dyn StateReplicator>>>,
+    #[allow(clippy::disallowed_types)]
+    primary: RwLock<Option<Arc<dyn kuberic_runtime::replicator::PrimaryReplicator>>>,
+    role: Mutex<ReplicaRole>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    write_gate: Arc<AsyncMutex<()>>,
+    stop: watch::Sender<bool>,
+    failed: AtomicBool,
+    close_failure: AtomicBool,
+    opens: AtomicU64,
+    factories: Arc<AtomicU64>,
+    observed: Arc<Mutex<Vec<NativeCall>>>,
+    none_calls: AtomicU64,
+    controlled: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ReceivedOperation>>>,
+}
+
+impl Application {
+    fn new(root: PathBuf, address: String) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            owner: Mutex::new(std::sync::Weak::new()),
+            provider: Arc::new(Provider::new(root)?),
+            address,
             partition: RwLock::new(None),
-            fail_first_creation: AtomicBool::new(false),
+            control: RwLock::new(None),
+            state: RwLock::new(None),
+            primary: RwLock::new(None),
+            role: Mutex::new(ReplicaRole::None),
+            tasks: Mutex::new(Vec::new()),
+            write_gate: Arc::new(AsyncMutex::new(())),
+            stop: watch::channel(false).0,
+            failed: AtomicBool::new(false),
+            close_failure: AtomicBool::new(false),
             opens: AtomicU64::new(0),
-            factory_calls: Arc::new(AtomicU64::new(0)),
-            failed_factory_calls: Arc::new(AtomicU64::new(0)),
-            metadata_database: None,
-            instruction_seen_before_open: AtomicBool::new(false),
-            fail_close: AtomicBool::new(false),
-            none_behavior: AtomicU64::new(0),
+            factories: Arc::new(AtomicU64::new(0)),
+            observed: Arc::new(Mutex::new(Vec::new())),
             none_calls: AtomicU64::new(0),
-            abort_entered: Notify::new(),
-            abort_calls: AtomicU64::new(0),
-            replicator_released_before_application_close: AtomicBool::new(false),
-            lifecycle_events: Mutex::new(Vec::new()),
-            stream_tasks: Mutex::new(Vec::new()),
-            controlled_operations: Arc::new(Mutex::new(None)),
-        }
+            controlled: Mutex::new(None),
+        }))
     }
 
-    fn with_open_probe(mut self, metadata_database: PathBuf) -> Self {
-        self.metadata_database = Some(metadata_database);
-        self
-    }
-
-    fn with_failed_creation(mut self) -> Self {
-        self.fail_first_creation = AtomicBool::new(true);
-        self
-    }
-
-    fn fail_next_close(&self) {
-        self.fail_close.store(true, Ordering::Release);
-    }
-
-    fn control_operations(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<kuberic_runtime::replicator::stream::StreamOperation>
-    {
+    fn control_operations(&self) -> tokio::sync::mpsc::UnboundedReceiver<ReceivedOperation> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        *self.controlled_operations.lock().unwrap() = Some(sender);
+        *self.controlled.lock().unwrap() = Some(sender);
         receiver
     }
 
-    async fn duplicate_creation(&self) -> Result<()> {
+    async fn begin_write(self: &Arc<Self>, data: Bytes) -> Result<PendingWrite> {
+        let permit = self.write_gate.clone().lock_owned().await;
+        if *self.stop.borrow() || self.failed.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
         let partition = self
             .partition
             .read()
             .await
             .clone()
             .ok_or(RuntimeError::NotOpen)?;
-        partition
-            .with_factory(Arc::new(CountingStatelessFactory {
-                storage: self.storage.clone(),
-                calls: self.factory_calls.clone(),
-            }))
-            .create_replicator(
-                Some(self.storage.clone()),
-                Some(ReplicatorSettings {
-                    replication_address: self.replication_address.clone(),
-                }),
-            )
-            .await
-            .map(|_| ())
-    }
-
-    async fn replicate(&self, data: Bytes) -> Result<i64> {
-        self.state_replicator
+        let status = partition.get_write_status().await?;
+        if status != AccessStatus::Granted {
+            return Err(RuntimeError::WriteClosed(status));
+        }
+        let replicator = self
+            .state
             .read()
             .await
-            .as_ref()
-            .ok_or(RuntimeError::NotOpen)?
-            .replicate(data)
-            .await
+            .clone()
+            .ok_or(RuntimeError::NotOpen)?;
+        let mut stop = self.stop.subscribe();
+        let epoch = self.provider.state.lock().unwrap().epoch;
+        let (reply, outcome) = oneshot::channel();
+        let assigned = replicator.begin_replicate(data.clone())?;
+        let lsn = assigned.lsn;
+        let service = self.clone();
+        self.tasks.lock().unwrap().push(tokio::spawn(async move {
+            let _permit = permit;
+            let work = async {
+                assigned.completion.await?;
+                service.provider.commit.wait().await;
+                if service.provider.state.lock().unwrap().epoch != epoch {
+                    return Err(failure("service epoch changed before local commitment"));
+                }
+                service.provider.commit(lsn, data)?;
+                Ok(lsn)
+            };
+            let result = tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => Err(RuntimeError::OperationCancelled),
+                result = work => result,
+            };
+            if result.is_err() && !*stop.borrow() {
+                service.failed.store(true, Ordering::Release);
+                let _ = partition.report_fault(FaultType::Transient).await;
+            }
+            let _ = reply.send(result);
+        }));
+        Ok(PendingWrite { lsn, outcome })
     }
 
-    async fn on_data_loss(&self) -> Result<bool> {
-        self.primary
-            .read()
-            .await
-            .as_ref()
-            .ok_or(RuntimeError::NotPrimary)?
-            .on_data_loss()
-            .await
+    async fn write(self: &Arc<Self>, data: impl Into<Bytes>) -> Result<i64> {
+        self.begin_write(data.into()).await?.wait().await
     }
 
-    async fn wait_for_write_quorum(&self) -> Result<()> {
-        self.primary
+    async fn values(&self) -> Result<Vec<Bytes>> {
+        if *self.stop.borrow() || self.failed.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        let partition = self
+            .partition
             .read()
             .await
-            .as_ref()
-            .ok_or(RuntimeError::NotPrimary)?
-            .wait_for_catch_up_quorum(
-                kuberic_runtime::replicator::ReplicaSetQuorumMode::WriteQuorum,
-            )
-            .await
+            .clone()
+            .ok_or(RuntimeError::NotOpen)?;
+        let access = partition.get_read_status().await?;
+        if access != AccessStatus::Granted {
+            return Err(RuntimeError::ReadClosed(access));
+        }
+        Ok(self.provider.values())
+    }
+
+    fn spawn_consumer(
+        self: &Arc<Self>,
+        mut stream: OperationStream,
+        mut copied: watch::Receiver<bool>,
+        copy_done: Option<watch::Sender<bool>>,
+        partition: StatefulServicePartition,
+    ) {
+        let service = self.clone();
+        let mut stop = self.stop.subscribe();
+        self.tasks.lock().unwrap().push(tokio::spawn(async move {
+            let consume = async {
+                let wait_for_copy = copy_done.is_none() && !*copied.borrow();
+                if wait_for_copy && copied.wait_for(|copied| *copied).await.is_err() {
+                    return Ok(());
+                }
+                let mut installed = false;
+                let mut ended = false;
+                loop {
+                    let operation = match stream.get_operation().await {
+                        Ok(Some(operation)) => operation,
+                        Ok(None) => break,
+                        Err(RuntimeError::Closed) => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
+                    ended |= operation.end_of_stream;
+                    installed |= !operation.end_of_stream;
+                    let controlled = service.controlled.lock().unwrap().clone();
+                    if let Some(controlled) = controlled {
+                        controlled.send(operation).map_err(failure)?;
+                    } else {
+                        service.provider.persist_received(&operation).await?;
+                        operation.acknowledge()?;
+                    }
+                }
+                if ended && let Some(copy_done) = copy_done {
+                    if !installed {
+                        return Err(failure("native copy ended without a service snapshot"));
+                    }
+                    copy_done.send_replace(true);
+                }
+                Ok::<_, RuntimeError>(())
+            };
+            tokio::select! {
+                biased;
+                _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => {}
+                result = consume => {
+                    if let Err(error) = result {
+                        if matches!(error, RuntimeError::Closed) {
+                            return;
+                        }
+                        service.failed.store(true, Ordering::Release);
+                        let _ = stream.report_fault(error.to_string());
+                        let _ = partition.report_fault(FaultType::Transient).await;
+                    }
+                }
+            }
+        }));
+    }
+
+    async fn drain(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            if let Err(error) = task.await {
+                assert!(error.is_cancelled(), "service task panicked: {error}");
+            }
+        }
     }
 }
 
 #[async_trait]
-impl StatefulServiceReplica for PreviewApplication {
+impl StatefulServiceReplica for Application {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        if let Some(database) = &self.metadata_database {
-            let connection = rusqlite::Connection::open(database).unwrap();
-            let json: String = connection
-                .query_row(
-                    "SELECT state_json FROM agent_state WHERE singleton = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            self.instruction_seen_before_open.store(
-                json.contains("ApplicationOpen") && json.contains("\"open-once\""),
-                Ordering::Release,
-            );
-        }
         if let Some(control) = self.control.read().await.clone() {
             return Ok(control);
         }
+        *self.provider.identity.lock().unwrap() = Some(context.identity);
+        self.provider
+            .persist(&self.provider.state.lock().unwrap())?;
         *self.partition.write().await = Some(context.partition.clone());
-        if self.fail_first_creation.swap(false, Ordering::AcqRel) {
-            let failed = context
-                .partition
-                .with_factory(Arc::new(RejectingFactory {
-                    calls: self.failed_factory_calls.clone(),
-                }))
-                .create_replicator(
-                    Some(self.storage.clone()),
-                    Some(ReplicatorSettings {
-                        replication_address: self.replication_address.clone(),
-                    }),
-                )
-                .await;
-            if failed.is_ok() {
-                return Err(RuntimeError::Application(
-                    "injected creation unexpectedly succeeded".into(),
-                ));
-            }
-        }
-        let factory: Arc<dyn ReplicatorFactory> = Arc::new(CountingStatelessFactory {
-            storage: self.storage.clone(),
-            calls: self.factory_calls.clone(),
-        });
         let interfaces = context
             .partition
-            .with_factory(factory)
+            .with_factory(Arc::new(CountingFactory {
+                calls: self.factories.clone(),
+                observed: self.observed.clone(),
+                provider: self.provider.clone(),
+            }))
             .create_replicator(
-                Some(self.storage.clone()),
+                Some(self.provider.clone()),
                 Some(ReplicatorSettings {
-                    replication_address: self.replication_address.clone(),
+                    replication_address: self.address.clone(),
                 }),
             )
             .await?;
         let control = interfaces.replicator();
-        let state = interfaces
-            .state_replicator()
-            .expect("built-in state replicator");
-        if self.storage.stream_mode.load(Ordering::Acquire) != 1 {
-            for mut stream in [
-                state.get_copy_stream().await?,
-                state.get_replication_stream().await?,
-            ] {
-                if self.storage.stream_mode.load(Ordering::Acquire) == 2 {
-                    continue;
-                }
-                let storage = self.storage.clone();
-                let controlled = self.controlled_operations.clone();
-                self.stream_tasks
-                    .lock()
-                    .unwrap()
-                    .push(tokio::spawn(async move {
-                        while let Ok(Some(operation)) = stream.get_operation().await {
-                            let control = controlled.lock().unwrap().clone();
-                            if let Some(control) = control {
-                                let _ = control.send(operation);
-                                continue;
-                            }
-                            match operation.apply_to(storage.as_ref()).await {
-                                Ok(progress) => {
-                                    let _ = operation.acknowledge(progress);
-                                }
-                                Err(error) => {
-                                    let _ = operation.reject(error);
-                                }
-                            }
-                        }
-                    }));
-            }
-        }
+        *self.state.write().await = interfaces.state_replicator();
         *self.primary.write().await = interfaces.primary_replicator();
-        *self.state_replicator.write().await = interfaces.state_replicator();
         *self.control.write().await = Some(control.clone());
         Ok(control)
     }
@@ -849,2223 +830,389 @@ impl StatefulServiceReplica for PreviewApplication {
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
         if role == ReplicaRole::None {
             self.none_calls.fetch_add(1, Ordering::SeqCst);
-            match self.none_behavior.load(Ordering::Acquire) {
-                1 => return Err(RuntimeError::Application("synthetic None injected".into())),
-                2 => std::future::pending::<()>().await,
-                _ => {}
-            }
         }
+        let previous = *self.role.lock().unwrap();
+        if role == ReplicaRole::Primary || previous == ReplicaRole::Primary {
+            let _drain = self.write_gate.lock().await;
+        }
+        if matches!(
+            role,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) && !matches!(
+            previous,
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary
+        ) {
+            let state = self
+                .state
+                .read()
+                .await
+                .clone()
+                .ok_or(RuntimeError::NotOpen)?;
+            let partition = self
+                .partition
+                .read()
+                .await
+                .clone()
+                .ok_or(RuntimeError::NotOpen)?;
+            let copy = role == ReplicaRole::IdleSecondary || previous != ReplicaRole::Primary;
+            let (copied, completion) = watch::channel(!copy);
+            // The task owner is retained by the service, including after a request
+            // or stream handle is dropped. No runtime receipt owns service work.
+            let owner = self.controlled_service_owner()?;
+            if copy {
+                owner.spawn_consumer(
+                    state.copy_operations()?,
+                    completion.clone(),
+                    Some(copied),
+                    partition.clone(),
+                );
+            }
+            owner.spawn_consumer(state.replication_operations()?, completion, None, partition);
+        }
+        *self.role.lock().unwrap() = role;
         Ok(RoleChange {
-            service_address: (role == ReplicaRole::Primary)
-                .then(|| "http://127.0.0.1:8080".to_string()),
+            service_address: (role == ReplicaRole::Primary).then(|| "service/native-memory".into()),
         })
     }
 
     async fn close(&self) -> Result<()> {
-        self.lifecycle_events
-            .lock()
-            .unwrap()
-            .push("application.close.begin");
-        let address: std::net::SocketAddr = self
-            .replication_address
-            .strip_prefix("http://")
-            .expect("preview replication address")
-            .parse()
-            .expect("preview socket address");
-        if std::net::TcpListener::bind(address).is_ok() {
-            self.replicator_released_before_application_close
-                .store(true, Ordering::Release);
-        }
-        self.state_replicator.write().await.take();
+        self.stop.send_replace(true);
+        self.drain().await;
+        self.state.write().await.take();
         self.primary.write().await.take();
         self.control.write().await.take();
-        let tasks = std::mem::take(&mut *self.stream_tasks.lock().unwrap());
-        for task in &tasks {
-            task.abort();
-        }
-        for task in tasks {
-            let _ = task.await;
-        }
-        self.lifecycle_events
-            .lock()
-            .unwrap()
-            .push("application.close.end");
-        if self.fail_close.swap(false, Ordering::AcqRel) {
-            return Err(RuntimeError::Application(
-                "injected application close failure".into(),
-            ));
+        if self.close_failure.swap(false, Ordering::AcqRel) {
+            return Err(failure("injected application close failure"));
         }
         Ok(())
     }
 
     fn abort(&self) {
-        self.abort_calls.fetch_add(1, Ordering::SeqCst);
-        self.abort_entered.notify_one();
-        for task in self.stream_tasks.lock().unwrap().iter() {
+        self.stop.send_replace(true);
+        for task in self.tasks.lock().unwrap().iter() {
             task.abort();
         }
-        self.lifecycle_events
+    }
+}
+
+// change_role has the protected &self signature; a weak owner avoids an Arc cycle.
+impl Application {
+    fn controlled_service_owner(&self) -> Result<Arc<Self>> {
+        self.owner
             .lock()
             .unwrap()
-            .push("application.abort");
+            .upgrade()
+            .ok_or(RuntimeError::Closed)
     }
 }
 
 struct Resolver;
 
 impl kuberic_runtime::host::ReplicaEndpointResolver for Resolver {
-    fn control_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+    fn control_endpoint(&self, _: &ReplicaIdentity) -> String {
         "http://127.0.0.1:1".into()
     }
-
-    fn replication_endpoint(&self, _identity: &ReplicaIdentity) -> String {
+    fn replication_endpoint(&self, _: &ReplicaIdentity) -> String {
         "http://127.0.0.1:1".into()
     }
 }
 
-fn intent(
-    preview: &PublicV1Identity,
-    session: kuberic_runtime::protocol::types::ProcessSessionId,
-    revision: u64,
-    name: &str,
-    program: PublicOperationProgram,
-) -> PublicOperationIntent {
-    let class = match &program {
-        PublicOperationProgram::Swap { .. } => PublicOperationClass::PlannedSwap,
-        PublicOperationProgram::Build(build) => PublicOperationClass::Build {
-            target: build.replica.replica_id,
-        },
-        PublicOperationProgram::Remove(build) => PublicOperationClass::Remove {
-            target: build.replica.replica_id,
-        },
-        PublicOperationProgram::Close => PublicOperationClass::Close,
-        PublicOperationProgram::Abort => PublicOperationClass::Abort,
-        _ => PublicOperationClass::Authority,
-    };
-    PublicOperationIntent {
-        identity: preview.clone(),
-        operation_id: OperationId::new(name),
-        revision,
-        process_session_id: session,
-        class,
-        input_digest: program.digest(),
-        replay_disposition: program.replay_disposition(),
-        lifecycle: None,
-        program: Some(program),
-    }
-}
-
-async fn install_static_authority(
-    handle: &kuberic_runtime::host::ReplicaHandle,
-    preview: &PublicV1Identity,
-    local: ReplicaIdentity,
-    role: ReplicaRole,
-    epoch: Epoch,
-    configuration: PublicConfiguration,
-) {
-    let session = handle.process_session_id();
-    handle
-        .execute_public_v1(intent(
-            preview,
-            session.clone(),
-            1,
-            &format!("open-{}", local.replica_id.value()),
-            PublicOperationProgram::Open {
-                replica: local,
-                existing: true,
-            },
-        ))
-        .await
-        .unwrap();
-    handle
-        .execute_public_v1(intent(
-            preview,
-            session.clone(),
-            2,
-            &format!("role-{}", role as u8),
-            PublicOperationProgram::Role { epoch, role },
-        ))
-        .await
-        .unwrap();
-    handle
-        .execute_public_v1(intent(
-            preview,
-            session.clone(),
-            3,
-            "epoch-static",
-            PublicOperationProgram::Epoch { epoch },
-        ))
-        .await
-        .unwrap();
-    handle
-        .execute_public_v1(intent(
-            preview,
-            session,
-            4,
-            "configuration-static",
-            PublicOperationProgram::Configuration(configuration),
-        ))
-        .await
-        .unwrap();
-}
-
-struct HostedMemoryReplica {
+struct Node {
+    running: RunningReplica,
+    control_address: String,
+    service: Arc<Application>,
     identity: ReplicaIdentity,
     storage: ReplicaStorageIncarnationContext,
+    history: HistoryContext,
+    preview: PublicV1Identity,
     root: PathBuf,
-    address: std::net::SocketAddr,
-    state: Arc<MemoryState>,
-    application: Arc<PreviewApplication>,
-    running: RunningReplica,
 }
 
-impl HostedMemoryReplica {
-    async fn start(
-        name: &str,
-        resource_uid: &ResourceUid,
-        preview: &PublicV1Identity,
-        replica_id: i64,
-    ) -> Self {
-        let pod_uid = format!("{name}-pod");
-        let pvc_uid = format!("{name}-pvc");
-        let identity = replica_named(replica_id, &pod_uid, &format!("{name}-agent"));
-        let storage = storage_named(identity.clone(), &pod_uid, &pvc_uid);
-        let root = test_root(name);
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&root),
-                preview.clone(),
-                store_identity_named(resource_uid.clone(), identity.clone(), &pod_uid, &pvc_uid),
-            )
-            .unwrap(),
-        );
-        let address = free_address();
-        let state = Arc::new(MemoryState::default());
-        let application = Arc::new(PreviewApplication::new(
-            state.clone(),
-            format!("http://{address}"),
-        ));
+impl Node {
+    async fn start(root: &Path, resource: &ResourceUid, id: i64) -> Self {
+        std::fs::create_dir_all(root).unwrap();
+        let preview = PublicV1Identity::new(1);
+        let pod = PodUid::new(format!("native-pod-{id}"));
+        let pvc = PvcUid::new(format!("native-pvc-{id}"));
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(pod.as_str()),
+            agent_generation: AgentGeneration::new(format!("native-agent-{id}")),
+        };
+        let storage = ReplicaStorageIncarnationContext {
+            replica: identity.clone(),
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: pod.clone(),
+                pvc_uid: pvc.clone(),
+            },
+            storage_generation: StorageGeneration::new(format!("native-storage-{id}")),
+        };
+        let database = SqliteStore::metadata_database_path(root);
+        if !database.exists() {
+            drop(
+                SqliteStore::create_public_v1(
+                    &database,
+                    preview.clone(),
+                    StorageIdentity {
+                        schema_version: SCHEMA_VERSION,
+                        resource_uid: resource.clone(),
+                        pod_uid: pod.clone(),
+                        pvc_uid: pvc.clone(),
+                        initialization_id: InitializationId::new(format!(
+                            "native-initialization-{id}"
+                        )),
+                        local_identity: identity.clone(),
+                        effective_policy: EffectivePolicy::fixed(1, 1).unwrap(),
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let fresh = !root.join("application/service.json").exists();
+        let service =
+            Application::new(root.join("application"), "http://127.0.0.1:0".into()).unwrap();
+        *service.owner.lock().unwrap() = Arc::downgrade(&service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = format!("http://{}", listener.local_addr().unwrap());
         let running = ReplicaHost::new(
             ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(replica_id),
-                pod_uid: PodUid::new(&pod_uid),
-                pvc_uid: PvcUid::new(&pvc_uid),
-                data_root: root.clone(),
-                replication_address: address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
+                resource_uid: resource.clone(),
+                replica_id: identity.replica_id,
+                pod_uid: pod,
+                pvc_uid: pvc,
+                data_root: root.to_path_buf(),
+                replication_address: "127.0.0.1:0".parse().unwrap(),
+                bearer_token: TOKEN.into(),
+                rpc_deadline: Duration::from_secs(5),
+                transport_window_capacity: 16,
             },
-            application.clone(),
-            ApplicationStorageState::FreshEmpty,
+            service.clone(),
+            if fresh {
+                ApplicationStorageState::FreshEmpty
+            } else {
+                ApplicationStorageState::Established
+            },
             Arc::new(Resolver),
         )
         .with_public_v1_binding(PublicV1LifecycleBinding {
             identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
+            resource_uid: resource.clone(),
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
         })
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+        .start(listener)
         .await
         .unwrap();
+        let initialization =
+            derive_history_initialization_id(resource, PublicProtocolGeneration::new(1));
+        let history =
+            derive_bootstrap_history(resource, PublicProtocolGeneration::new(1), &initialization);
+        running
+            .handle()
+            .initialize_public_v1_history(&initialization, &history, &storage)
+            .await
+            .unwrap();
         Self {
+            running,
+            control_address,
+            service,
             identity,
             storage,
-            root,
-            address,
-            state,
-            application,
-            running,
+            history,
+            preview,
+            root: root.to_path_buf(),
         }
     }
 
-    fn handle(&self) -> kuberic_runtime::host::ReplicaHandle {
+    fn handle(&self) -> ReplicaHandle {
         self.running.handle()
     }
 
-    async fn initialize_history(
-        &self,
-        initialization: &kuberic_runtime::protocol::types::HistoryInitializationId,
-        history: &kuberic_runtime::protocol::types::HistoryContext,
-    ) {
-        self.handle()
-            .initialize_public_v1_history(initialization, history, &self.storage)
-            .await
-            .unwrap();
+    async fn report(&self) -> PublicV1AgentReport {
+        self.handle().public_v1_report().await.unwrap()
     }
 
-    async fn stop(&mut self) {
-        self.running.shutdown();
-        self.running.wait().await.unwrap();
-    }
-
-    fn cleanup(self) {
-        std::fs::remove_dir_all(self.root).unwrap();
-    }
-}
-
-struct AuthorizedHostedPair {
-    identity: PublicV1Identity,
-    epoch: Epoch,
-    primary: HostedMemoryReplica,
-    secondary: HostedMemoryReplica,
-}
-
-impl AuthorizedHostedPair {
-    async fn start(name: &str, generation: u64) -> Self {
-        Self::start_mode(name, generation, 0).await
-    }
-
-    async fn start_mode(name: &str, generation: u64, stream_mode: u64) -> Self {
-        let resource_uid = ResourceUid::new(format!("{name}-resource"));
-        let preview = PublicV1Identity::new(generation);
-        let primary =
-            HostedMemoryReplica::start(&format!("{name}-primary"), &resource_uid, &preview, 1)
-                .await;
-        let secondary =
-            HostedMemoryReplica::start(&format!("{name}-secondary"), &resource_uid, &preview, 2)
-                .await;
-        secondary
-            .state
-            .stream_mode
-            .store(stream_mode, Ordering::Release);
-        let protocol_generation = PublicProtocolGeneration::new(generation);
-        let initialization = derive_history_initialization_id(&resource_uid, protocol_generation);
-        let history = derive_bootstrap_history(&resource_uid, protocol_generation, &initialization);
-        primary.initialize_history(&initialization, &history).await;
-        secondary
-            .initialize_history(&initialization, &history)
-            .await;
-        let epoch = Epoch::new(0, 1);
-        let configuration = ConfigurationDescriptor::new(
-            epoch,
-            primary.identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: primary.identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: secondary.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        install_static_authority(
-            &primary.handle(),
-            &preview,
-            primary.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: configuration.clone(),
-                previous: None,
-                replicas: vec![PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
-                    identity: secondary.identity.clone(),
-                    replication_address: format!("http://{}", secondary.address),
-                    process_session_id: secondary.handle().process_session_id(),
-                    storage_incarnation: Some(secondary.storage.clone()),
-                    role: ReplicaRole::ActiveSecondary,
-                    current_progress: 0,
-                    catch_up_capability: 0,
-                    must_catchup: false,
-                }],
-            },
-        )
-        .await;
-        install_static_authority(
-            &secondary.handle(),
-            &preview,
-            secondary.identity.clone(),
-            ReplicaRole::ActiveSecondary,
-            epoch,
-            PublicConfiguration {
-                current: configuration,
-                previous: None,
-                replicas: vec![PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
-                    identity: primary.identity.clone(),
-                    replication_address: format!("http://{}", primary.address),
-                    process_session_id: primary.handle().process_session_id(),
-                    storage_incarnation: Some(primary.storage.clone()),
-                    role: ReplicaRole::Primary,
-                    current_progress: 0,
-                    catch_up_capability: 0,
-                    must_catchup: false,
-                }],
-            },
-        )
-        .await;
-        Self {
-            identity: preview,
-            epoch,
-            primary,
-            secondary,
-        }
-    }
-
-    async fn cleanup(mut self) {
-        self.primary.stop().await;
-        self.secondary.stop().await;
-        self.primary.cleanup();
-        self.secondary.cleanup();
-    }
-
-    fn replication_frame(&self, lsn: i64, committed_lsn: i64) -> proto::ReplicationItem {
-        let configuration = ConfigurationDescriptor::new(
-            self.epoch,
-            self.primary.identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: self.primary.identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: self.secondary.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        proto::ReplicationItem {
-            completed_build: None,
-            protocol_version: 11,
-            sender: Some(self.primary.identity.clone().into()),
-            receiver: Some(self.secondary.identity.clone().into()),
-            epoch: Some(self.epoch.into()),
-            previous_configuration_id: String::new(),
-            current_configuration_id: configuration.configuration_id.to_string(),
-            lsn,
-            committed_lsn,
-            data: b"stream-value".to_vec(),
-            sender_session_id: self.primary.handle().process_session_id().to_string(),
-            receiver_session_id: self.secondary.handle().process_session_id().to_string(),
-        }
-    }
-
-    async fn send_frame(
-        &self,
-        frame: proto::ReplicationItem,
-    ) -> tonic::Streaming<proto::ReplicationAck> {
-        proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{}",
-            self.secondary.address
-        ))
-        .await
-        .unwrap()
-        .replicate(Request::new(stream::iter([frame])))
-        .await
-        .unwrap()
-        .into_inner()
-    }
-}
-
-use kuberic_runtime::replicator::stream::{OperationMetadata, StreamOperation};
-
-async fn delivered(
-    operations: &mut tokio::sync::mpsc::UnboundedReceiver<StreamOperation>,
-) -> StreamOperation {
-    tokio::time::timeout(Duration::from_secs(5), operations.recv())
-        .await
-        .expect("built-in delivery timed out")
-        .expect("service consumer stopped")
-}
-
-fn stored_public_operation(
-    replica: &HostedMemoryReplica,
-    operation: &OperationId,
-) -> serde_json::Value {
-    let connection =
-        rusqlite::Connection::open(SqliteStore::metadata_database_path(&replica.root)).unwrap();
-    let json: String = connection
-        .query_row(
-            "SELECT state_json FROM agent_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let state: serde_json::Value = serde_json::from_str(&json).unwrap();
-    state["publicV1OperationState"]["operations"][operation.as_str()].clone()
-}
-
-async fn pending_ack<T: prost::Message + Default + 'static>(response: &mut tonic::Streaming<T>) {
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), response.message())
-            .await
-            .is_err(),
-        "transport completed before durable service ACK"
-    );
-}
-
-async fn assert_receiver_pending(replica: &HostedMemoryReplica, prior_lsn: i64) {
-    let report = replica.handle().public_v1_report().await.unwrap();
-    assert_ne!(report.read_status, AccessStatus::Granted);
-    assert_ne!(report.write_status, AccessStatus::Granted);
-    assert_eq!(
-        report.progress.last, prior_lsn,
-        "unacknowledged service progress was published"
-    );
-    let partition = replica.application.partition.read().await.clone().unwrap();
-    assert_ne!(
-        partition.get_read_status().await.unwrap(),
-        AccessStatus::Granted
-    );
-}
-
-struct StreamBuildFixture {
-    source: HostedMemoryReplica,
-    target: HostedMemoryReplica,
-    authority: PublicInboundBuildAuthority,
-}
-
-impl StreamBuildFixture {
-    async fn build_from_source(&mut self, concurrent_suffix: bool) {
-        self.authority.operation_revision = 4;
-        self.target
-            .handle()
-            .install_public_v1_inbound_build_authority(&self.authority)
-            .await
-            .unwrap();
-        let preview = PublicV1Identity::new(401);
-        let authority = &self.authority;
-        if self.source.state.progress.lock().unwrap().committed_lsn > 0 {
-            self.source
-                .state
-                .copy_chunks
-                .lock()
-                .unwrap()
-                .push(Bytes::from_static(b"snapshot-bytes"));
-        }
-        let program = PublicOperationProgram::Build(PublicBuildInput {
-            attempt: authority.attempt.build_id.clone(),
-            epoch: authority.attempt.epoch,
-            current_configuration_id: Some(authority.current_configuration_id.clone()),
-            replica: authority.attempt.target.clone(),
-            target_storage: authority.attempt.target_storage.clone(),
-            process_session_id: authority.attempt.target_session.clone(),
-            replication_address: authority.target_address.clone(),
-            history: Some(authority.history.clone()),
-        });
-        let build_intent = intent(
-            &preview,
-            self.source.handle().process_session_id(),
-            authority.operation_revision,
-            authority.operation_id.as_str(),
+    async fn intent(&self, program: PublicOperationProgram) -> PublicOperationIntent {
+        let handle = self.handle();
+        let next = handle.public_v1_next_operation_revision().await.unwrap();
+        let revision = if matches!(
             program,
-        );
-        if concurrent_suffix {
-            self.source.state.block_copy();
-            let entered = self.source.state.copy_entered.notified();
-            let mut build = tokio::spawn({
-                let handle = self.source.handle();
-                async move { handle.execute_public_v1(build_intent).await }
-            });
-            tokio::select! {
-                _ = entered => {}
-                result = &mut build => panic!("build did not wait for copy: {result:?}"),
-            }
-            assert_eq!(
-                self.source
-                    .application
-                    .replicate(Bytes::from_static(b"suffix"))
-                    .await
-                    .unwrap(),
-                2
-            );
-            self.source.state.release_copy.notify_one();
-            build.await.unwrap().unwrap();
+            PublicOperationProgram::Build(_) | PublicOperationProgram::Remove(_)
+        ) {
+            next - 1
         } else {
-            self.source
-                .handle()
-                .execute_public_v1(build_intent)
-                .await
-                .unwrap();
+            next
+        };
+        let operation_id = match &program {
+            PublicOperationProgram::Build(build) => build.attempt.clone(),
+            _ => OperationId::new(format!(
+                "native-operation-{}",
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            )),
+        };
+        let class = match &program {
+            PublicOperationProgram::Swap { .. } => PublicOperationClass::PlannedSwap,
+            PublicOperationProgram::Build(build) => PublicOperationClass::Build {
+                target: build.replica.replica_id,
+            },
+            PublicOperationProgram::Remove(build) => PublicOperationClass::Remove {
+                target: build.replica.replica_id,
+            },
+            PublicOperationProgram::Close => PublicOperationClass::Close,
+            PublicOperationProgram::Abort => PublicOperationClass::Abort,
+            _ => PublicOperationClass::Authority,
+        };
+        PublicOperationIntent {
+            identity: self.preview.clone(),
+            operation_id,
+            revision,
+            process_session_id: handle.process_session_id(),
+            class,
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
         }
-        assert!(self.terminal_receipt().is_some());
     }
 
-    async fn activate(&self, progress: i64) {
-        let preview = PublicV1Identity::new(401);
-        let epoch = self.authority.attempt.epoch;
-        let configuration = ConfigurationDescriptor::new(
-            epoch,
-            self.source.identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: self.source.identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: self.target.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        self.target
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                self.target.handle().process_session_id(),
-                5,
-                "sf10-activate",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ))
+    async fn command(&self, program: PublicOperationProgram) -> kuberic_runtime::host::Result<()> {
+        self.handle()
+            .execute_public_v1(self.intent(program).await)
+            .await
+    }
+
+    async fn open(&self, role: ReplicaRole, epoch: Epoch) {
+        self.command(PublicOperationProgram::Open {
+            replica: self.identity.clone(),
+            existing: self.report().await.open_mode == OpenMode::Existing,
+        })
+        .await
+        .unwrap();
+        self.command(PublicOperationProgram::Role { epoch, role })
             .await
             .unwrap();
-        for (local, remote, role) in [
-            (&self.target, &self.source, ReplicaRole::Primary),
-            (&self.source, &self.target, ReplicaRole::ActiveSecondary),
-        ] {
-            local
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    local.handle().process_session_id(),
-                    6,
-                    "sf10-configuration",
-                    PublicOperationProgram::Configuration(PublicConfiguration {
-                        current: configuration.clone(),
-                        previous: None,
-                        replicas: vec![PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: remote.identity.clone(),
-                            replication_address: format!("http://{}", remote.address),
-                            process_session_id: remote.handle().process_session_id(),
-                            storage_incarnation: Some(remote.storage.clone()),
-                            role,
-                            current_progress: progress,
-                            catch_up_capability: 0,
-                            must_catchup: false,
-                        }],
-                    }),
-                ))
+        if role == ReplicaRole::Primary {
+            self.command(PublicOperationProgram::Epoch { epoch })
                 .await
                 .unwrap();
         }
     }
 
-    async fn catch_up_both(&self) {
-        let primary = self
-            .source
-            .application
-            .primary
-            .read()
-            .await
-            .clone()
-            .unwrap();
-        for mode in [
-            kuberic_runtime::replicator::ReplicaSetQuorumMode::WriteQuorum,
-            kuberic_runtime::replicator::ReplicaSetQuorumMode::All,
-        ] {
-            primary.wait_for_catch_up_quorum(mode).await.unwrap();
-        }
-    }
-
-    fn prefix_proof(&self) -> proto::ReplicationItem {
-        let receipt: kuberic_runtime::protocol::public_operations::PublicInboundBuildReceipt =
-            serde_json::from_value(self.terminal_receipt().unwrap()).unwrap();
-        let terminal = self.frame(
-            receipt.final_sequence,
-            false,
-            true,
-            receipt.replication_boundary_lsn,
-            receipt.catch_up_boundary_lsn,
-        );
-        let configuration = ConfigurationDescriptor::new(
-            self.authority.attempt.epoch,
-            self.source.identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: self.source.identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: self.target.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        proto::ReplicationItem {
-            protocol_version: 11,
-            sender: Some(self.source.identity.clone().into()),
-            receiver: Some(self.target.identity.clone().into()),
-            epoch: Some(self.authority.attempt.epoch.into()),
-            previous_configuration_id: String::new(),
-            current_configuration_id: configuration.configuration_id.to_string(),
-            lsn: receipt.catch_up_boundary_lsn,
-            committed_lsn: receipt.catch_up_boundary_lsn,
-            data: vec![],
-            sender_session_id: self.source.handle().process_session_id().to_string(),
-            receiver_session_id: self.target.handle().process_session_id().to_string(),
-            completed_build: Some(terminal),
-        }
-    }
-
-    async fn send_proof(
-        &self,
-        proof: proto::ReplicationItem,
-    ) -> std::result::Result<proto::ReplicationAck, tonic::Status> {
-        proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{}",
-            self.target.address
-        ))
-        .await
-        .unwrap()
-        .replicate(Request::new(stream::iter([proof])))
-        .await
-        .unwrap()
-        .into_inner()
-        .next()
-        .await
-        .unwrap()
-    }
-
-    async fn start(name: &str, default_factory: bool, boundary: i64) -> Self {
-        let resource = ResourceUid::new(name);
-        let preview = PublicV1Identity::new(401);
-        let source =
-            HostedMemoryReplica::start(&format!("{name}-source"), &resource, &preview, 1).await;
-        let target =
-            HostedMemoryReplica::start(&format!("{name}-target"), &resource, &preview, 2).await;
-        target
-            .state
-            .default_factory
-            .store(default_factory, Ordering::Release);
-        let initialization =
-            derive_history_initialization_id(&resource, PublicProtocolGeneration::new(401));
-        let history = derive_bootstrap_history(
-            &resource,
-            PublicProtocolGeneration::new(401),
-            &initialization,
-        );
-        source.initialize_history(&initialization, &history).await;
-        target.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let configuration = ConfigurationDescriptor::new(
+    async fn single(&self, epoch: Epoch) -> ConfigurationDescriptor {
+        let current = ConfigurationDescriptor::new(
             epoch,
-            source.identity.replica_id,
+            self.identity.replica_id,
             vec![ConfigurationMember {
-                identity: source.identity.clone(),
+                identity: self.identity.clone(),
                 role: ReplicaRole::Primary,
             }],
             1,
         );
-        install_static_authority(
-            &source.handle(),
-            &preview,
-            source.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: configuration.clone(),
-                previous: None,
-                replicas: vec![],
-            },
-        )
-        .await;
-        if boundary > 0 {
-            assert_eq!(
-                source
-                    .application
-                    .replicate(Bytes::from_static(b"snapshot"))
-                    .await
-                    .unwrap(),
-                1
-            );
+        self.command(PublicOperationProgram::Configuration(PublicConfiguration {
+            current: current.clone(),
+            previous: None,
+            replicas: Vec::new(),
+        }))
+        .await
+        .unwrap();
+        current
+    }
+
+    async fn descriptor(&self, role: ReplicaRole) -> PublicReplicaDescriptor {
+        let report = self.report().await;
+        PublicReplicaDescriptor {
+            build_id: OperationId::default(),
+            identity: self.identity.clone(),
+            replication_address: report.replication_address.unwrap(),
+            process_session_id: report.process_session_id,
+            storage_incarnation: Some(self.storage.clone()),
+            role,
+            current_progress: report.progress.current().expect("native progress is ready"),
+            catch_up_capability: report
+                .progress
+                .capability()
+                .expect("native capability is ready"),
+            must_catchup: false,
         }
-        for (revision, program) in [
-            (
-                1,
-                PublicOperationProgram::Open {
-                    replica: target.identity.clone(),
-                    existing: true,
-                },
-            ),
-            (
-                2,
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ),
-            (3, PublicOperationProgram::Epoch { epoch }),
-        ] {
-            target
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    target.handle().process_session_id(),
-                    revision,
-                    &format!("stream-target-{revision}"),
-                    program,
-                ))
-                .await
-                .unwrap();
-        }
+    }
+
+    async fn build_intent(
+        &self,
+        target: &Self,
+        current: &ConfigurationDescriptor,
+    ) -> (PublicOperationIntent, PublicInboundBuildAuthority) {
+        let report = target.report().await;
+        let source_address = self.report().await.replication_address.unwrap();
+        let attempt = OperationId::new(format!(
+            "native-build-{}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let intent = self
+            .intent(PublicOperationProgram::Build(PublicBuildInput {
+                attempt: attempt.clone(),
+                epoch: current.epoch,
+                current_configuration_id: Some(current.configuration_id.clone()),
+                replica: target.identity.clone(),
+                target_storage: target.storage.clone(),
+                process_session_id: report.process_session_id.clone(),
+                replication_address: report.replication_address.clone().unwrap(),
+                history: Some(self.history.clone()),
+                source_address: source_address.clone(),
+            }))
+            .await;
         let authority = PublicInboundBuildAuthority {
-            operation_id: OperationId::new("stream-build"),
-            operation_revision: 1,
+            operation_id: intent.operation_id.clone(),
+            operation_revision: intent.revision,
             attempt: PublicBuildAttemptReference {
-                resource_uid: resource,
-                epoch,
-                build_id: OperationId::new("stream-build"),
-                source: source.identity.clone(),
-                source_storage: source.storage.clone(),
-                source_session: source.handle().process_session_id(),
+                resource_uid: self.history.resource_uid.clone(),
+                epoch: current.epoch,
+                build_id: attempt,
+                source: self.identity.clone(),
+                source_storage: self.storage.clone(),
+                source_session: self.handle().process_session_id(),
                 target: target.identity.clone(),
                 target_storage: target.storage.clone(),
-                target_session: target.handle().process_session_id(),
+                target_session: report.process_session_id,
             },
-            history,
-            current_configuration_id: configuration.configuration_id,
-            target_address: format!("http://{}", target.address),
+            history: self.history.clone(),
+            current_configuration_id: current.configuration_id.clone(),
+            target_address: report.replication_address.unwrap(),
+            source_address,
         };
         target
             .handle()
             .install_public_v1_inbound_build_authority(&authority)
             .await
             .unwrap();
-        Self {
-            source,
-            target,
-            authority,
-        }
+        (intent, authority)
     }
-}
 
-#[tokio::test]
-async fn sf10_quiet_snapshot_only_build_activates_and_catches_up_without_writes() {
-    sf10_quiet_snapshot_journey(false).await;
-}
-
-#[tokio::test]
-async fn sf10_quiet_snapshot_only_known_peer_invalid_lsn_catches_up() {
-    sf10_quiet_snapshot_journey(true).await;
-}
-
-async fn sf10_quiet_snapshot_journey(omitted: bool) {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        for boundary in [0, 1] {
-            let mut fixture = StreamBuildFixture::start("sf10-quiet", false, boundary).await;
-            fixture.build_from_source(false).await;
-            assert!(fixture.target.state.operations.lock().unwrap().is_empty());
-            fixture.activate(if omitted { -1 } else { boundary }).await;
-            fixture.catch_up_both().await;
-            // Neither side needs the operation-shaped snapshot boundary.
-            fixture.source.state.operations.lock().unwrap().clear();
-            fixture.catch_up_both().await;
-            assert_eq!(
-                fixture.source.state.progress.lock().unwrap().committed_lsn,
-                boundary
-            );
-            assert_eq!(
-                fixture.target.state.progress.lock().unwrap().committed_lsn,
-                boundary
-            );
-            assert!(fixture.target.state.operations.lock().unwrap().is_empty());
-            fixture.cleanup().await;
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn sf10_snapshot_prefix_preserves_concurrent_and_later_exact_suffix() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        for concurrent in [false, true] {
-            let mut fixture = StreamBuildFixture::start("sf10-suffix", false, 1).await;
-            fixture.build_from_source(concurrent).await;
-            fixture.activate(-1).await;
-            if !concurrent {
-                assert_eq!(
-                    fixture
-                        .source
-                        .application
-                        .replicate(Bytes::from_static(b"later-suffix"))
-                        .await
-                        .unwrap(),
-                    2
-                );
-            }
-            fixture.catch_up_both().await;
-            let retained = fixture.target.state.operations.lock().unwrap().clone();
-            assert_eq!(retained.len(), 1);
-            assert_eq!(retained[0].lsn, 2);
-            assert_eq!(
-                retained[0].data.as_ref(),
-                if concurrent {
-                    b"suffix".as_slice()
-                } else {
-                    b"later-suffix".as_slice()
-                }
-            );
-            assert_eq!(
-                fixture.target.state.progress.lock().unwrap().committed_lsn,
-                2
-            );
-            if !concurrent {
-                fixture.target.state.operations.lock().unwrap()[0].data =
-                    Bytes::from_static(b"wrong-suffix");
-                assert!(
-                    fixture
-                        .source
-                        .application
-                        .wait_for_write_quorum()
-                        .await
-                        .is_err(),
-                    "snapshot prefix proof hid a mismatching later operation"
-                );
-            }
-            fixture.cleanup().await;
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn sf10_live_prefix_proof_is_exact_read_only_and_rejects_stale_identity() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let mut fixture = StreamBuildFixture::start("sf10-proof", false, 1).await;
-        fixture.build_from_source(false).await;
-        fixture.activate(1).await;
-        let proof = fixture.prefix_proof();
-        let before = (
-            fixture.target.state.apply_calls.load(Ordering::Acquire),
-            fixture.target.state.commit_calls.load(Ordering::Acquire),
-            fixture.target.state.copy_chunks.lock().unwrap().clone(),
-        );
-        for _ in 0..2 {
-            let ack = fixture.send_proof(proof.clone()).await.unwrap();
-            assert_eq!(ack.completed_build, proof.completed_build);
-            assert_eq!(
-                (ack.received_lsn, ack.applied_lsn, ack.committed_lsn),
-                (1, 1, 1)
-            );
-        }
-        let mut invalid = vec![];
-        let mut changed = proof.clone();
-        changed.data = b"not-a-proof".to_vec();
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed.receiver_session_id = "stale-process".into();
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed.current_configuration_id = "stale-configuration".into();
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed
-            .completed_build
-            .as_mut()
-            .unwrap()
-            .history
-            .as_mut()
-            .unwrap()
-            .history_id = "wrong-history".into();
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed.completed_build.as_mut().unwrap().source_storage =
-            Some(storage_proto(&fixture.target.storage));
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed.completed_build.as_mut().unwrap().target_storage =
-            Some(storage_proto(&fixture.source.storage));
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed.completed_build.as_mut().unwrap().build_id = "unknown-copy".into();
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed.completed_build.as_mut().unwrap().sender_session_id = "stale-source".into();
-        invalid.push(changed);
-        let mut changed = proof.clone();
-        changed.completed_build.as_mut().unwrap().lsn = 2;
-        changed.lsn = 2;
-        changed.committed_lsn = 2;
-        invalid.push(changed);
-        for changed in invalid {
-            assert_eq!(
-                fixture.send_proof(changed).await.unwrap_err().code(),
-                tonic::Code::FailedPrecondition
-            );
-        }
-        // A receipt is insufficient if live durable provider progress disappeared.
-        *fixture.target.state.progress.lock().unwrap() = DurableApplicationProgress::default();
-        assert!(fixture.send_proof(proof.clone()).await.is_err());
-        *fixture.target.state.progress.lock().unwrap() = DurableApplicationProgress {
-            applied_lsn: 1,
-            committed_lsn: 1,
-        };
-        // A historical receipt cannot certify a different live history/storage.
-        let connection =
-            rusqlite::Connection::open(SqliteStore::metadata_database_path(&fixture.target.root))
-                .unwrap();
-        let original: String = connection
-            .query_row(
-                "SELECT state_json FROM agent_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        for field in ["history", "storageIncarnation"] {
-            let mut state: serde_json::Value = serde_json::from_str(&original).unwrap();
-            let preview = &mut state["publicV1OperationState"];
-            if field == "history" {
-                preview[field]["historyId"] = serde_json::json!("different-live-history");
-            } else {
-                preview[field]["storageGeneration"] = serde_json::json!("different-live-storage");
-            }
-            connection
-                .execute(
-                    "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
-                    [serde_json::to_string(&state).unwrap()],
-                )
-                .unwrap();
-            assert!(fixture.send_proof(proof.clone()).await.is_err());
-            connection
-                .execute(
-                    "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
-                    [&original],
-                )
-                .unwrap();
-        }
-        drop(connection);
-        fixture.catch_up_both().await;
-        assert_eq!(
-            before,
-            (
-                fixture.target.state.apply_calls.load(Ordering::Acquire),
-                fixture.target.state.commit_calls.load(Ordering::Acquire),
-                fixture.target.state.copy_chunks.lock().unwrap().clone(),
-            )
-        );
-        assert!(fixture.target.state.operations.lock().unwrap().is_empty());
-        fixture.cleanup().await;
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn sf10_delayed_prefix_proof_cannot_succeed_after_source_abort() {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        let mut fixture = StreamBuildFixture::start("sf10-source-fence", false, 1).await;
-        fixture.build_from_source(false).await;
-        fixture.activate(-1).await;
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let route = kuberic_runtime::replicator::stateless::TestingTcpRoute::register(
-            fixture.source.identity.instance_id.to_string(),
-            {
-                let entered = entered.clone();
-                let release = release.clone();
-                move |_, endpoint| {
-                    let entered = entered.clone();
-                    let release = release.clone();
-                    Box::pin(async move {
-                        entered.notify_one();
-                        release.notified().await;
-                        Ok(endpoint)
-                    })
-                }
-            },
-        )
-        .unwrap();
-        let primary = fixture
-            .source
-            .application
-            .primary
-            .read()
-            .await
-            .clone()
-            .unwrap();
-        let pending = tokio::spawn(async move {
-            primary
-                .wait_for_catch_up_quorum(kuberic_runtime::replicator::ReplicaSetQuorumMode::All)
-                .await
-        });
-        entered.notified().await;
-        fixture
-            .source
-            .application
-            .control
-            .read()
-            .await
-            .as_ref()
-            .unwrap()
-            .abort();
-        release.notify_one();
-        assert!(
-            pending.await.unwrap().is_err(),
-            "delayed genuine proof credited revoked source authority"
-        );
-        drop(route);
-        fixture.cleanup().await;
-    })
-    .await
-    .unwrap();
-}
-
-impl StreamBuildFixture {
-    fn frame(
+    async fn build(
         &self,
-        sequence: u64,
-        snapshot: bool,
-        final_item: bool,
-        boundary: i64,
-        lsn: i64,
-    ) -> proto::CopyItem {
-        let attempt = &self.authority.attempt;
-        proto::CopyItem {
-            protocol_version: 11,
-            build_id: attempt.build_id.to_string(),
-            sender: Some(attempt.source.clone().into()),
-            receiver: Some(attempt.target.clone().into()),
-            epoch: Some(attempt.epoch.into()),
-            current_configuration_id: self.authority.current_configuration_id.to_string(),
-            sequence,
-            lsn,
-            committed_lsn: lsn,
-            replication_boundary_lsn: boundary,
-            final_item,
-            data: if snapshot {
-                b"snapshot-bytes".to_vec()
-            } else if lsn > boundary && !final_item {
-                b"retained-value".to_vec()
-            } else {
-                vec![]
-            },
-            snapshot_chunk: snapshot,
-            sender_session_id: attempt.source_session.to_string(),
-            receiver_session_id: attempt.target_session.to_string(),
-            catch_up_boundary_lsn: final_item.then_some(lsn),
-            source_storage: Some(storage_proto(&attempt.source_storage)),
-            target_storage: Some(storage_proto(&attempt.target_storage)),
-            history: Some(history_proto(&self.authority.history)),
-            target_address: self.authority.target_address.clone(),
-        }
-    }
-
-    async fn send(&self, frame: proto::CopyItem) -> tonic::Streaming<proto::CopyAck> {
-        proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{}",
-            self.target.address
-        ))
-        .await
-        .unwrap()
-        .build(Request::new(stream::iter([frame])))
-        .await
-        .unwrap()
-        .into_inner()
-    }
-
-    fn terminal_receipt(&self) -> Option<serde_json::Value> {
-        let connection =
-            rusqlite::Connection::open(SqliteStore::metadata_database_path(&self.target.root))
-                .unwrap();
-        let json: String = connection
-            .query_row(
-                "SELECT state_json FROM agent_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let state: serde_json::Value = serde_json::from_str(&json).unwrap();
-        state["publicV1OperationState"]["terminalInboundBuildReceipts"]
-            .get(self.authority.attempt.build_id.as_str())
-            .cloned()
-    }
-
-    async fn cleanup(mut self) {
-        self.source.stop().await;
-        self.target.stop().await;
-        self.source.cleanup();
-        self.target.cleanup();
-    }
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_copy_and_completion_wait_for_durable_ack() {
-    for (default_factory, boundary) in [(false, 1), (true, 0)] {
-        let fixture = StreamBuildFixture::start("stream-copy", default_factory, boundary).await;
-        let mut operations = fixture.target.application.control_operations();
-        let mut sequence = 0;
-        if boundary != 0 {
-            let mut response = fixture
-                .send(fixture.frame(sequence, true, false, boundary, boundary))
-                .await;
-            let operation = delivered(&mut operations).await;
-            assert_eq!(
-                operation.metadata,
-                OperationMetadata::Copy {
-                    build_id: fixture.authority.attempt.build_id.clone(),
-                    sequence
-                }
-            );
-            assert_eq!(operation.data.as_ref(), b"snapshot-bytes");
-            assert!(fixture.target.state.copy_chunks.lock().unwrap().is_empty());
-            pending_ack(&mut response).await;
-            let progress = operation
-                .apply_to(fixture.target.state.as_ref())
+        target: &Self,
+        current: &ConfigurationDescriptor,
+    ) -> PublicInboundBuildAuthority {
+        let (intent, authority) = self.build_intent(target, current).await;
+        self.handle().execute_public_v1(intent).await.unwrap();
+        assert!(
+            self.report()
                 .await
-                .unwrap();
-            pending_ack(&mut response).await;
-            operation.acknowledge(progress).unwrap();
-            assert!(response.message().await.unwrap().is_some());
-            sequence += 1;
-        }
-        let mut response = fixture
-            .send(fixture.frame(sequence, false, false, boundary, boundary))
-            .await;
-        let operation = delivered(&mut operations).await;
-        assert_eq!(
-            operation.metadata,
-            OperationMetadata::CopyComplete {
-                build_id: fixture.authority.attempt.build_id.clone(),
-                up_to_lsn: boundary,
-                committed_lsn: boundary,
-            }
-        );
-        pending_ack(&mut response).await;
-        let progress = operation
-            .apply_to(fixture.target.state.as_ref())
-            .await
-            .unwrap();
-        pending_ack(&mut response).await;
-        operation.acknowledge(progress).unwrap();
-        assert!(response.message().await.unwrap().is_some());
-        let mut final_response = fixture
-            .send(fixture.frame(sequence + 1, false, true, boundary, boundary))
-            .await;
-        assert!(final_response.message().await.unwrap().unwrap().final_item);
-        assert!(
-            operations.try_recv().is_err(),
-            "terminal frame must not redeliver CopyComplete"
-        );
-        let mut replay = fixture
-            .send(fixture.frame(sequence + 1, false, true, boundary, boundary))
-            .await;
-        assert!(replay.message().await.unwrap().unwrap().final_item);
-        assert!(
-            operations.try_recv().is_err(),
-            "exact terminal receipt must be replayable"
-        );
-        fixture.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_live_final_requires_exact_sequence_and_copy_complete_ack() {
-    for malformed_kind in 0..4 {
-        let fixture = StreamBuildFixture::start("stream-final-admission", false, 0).await;
-        let mut operations = fixture.target.application.control_operations();
-        let mut snapshot = fixture.send(fixture.frame(0, true, false, 0, 0)).await;
-        let operation = delivered(&mut operations).await;
-        let progress = operation
-            .apply_to(fixture.target.state.as_ref())
-            .await
-            .unwrap();
-        operation.acknowledge(progress).unwrap();
-        snapshot.message().await.unwrap().unwrap();
-
-        let mut malformed = fixture.frame(
-            if malformed_kind == 0 { 0 } else { 1 },
-            malformed_kind == 1,
-            true,
-            0,
-            0,
-        );
-        if malformed_kind == 2 {
-            malformed.data = b"nonempty-final".to_vec();
-        } else if malformed_kind == 3 {
-            malformed.committed_lsn = 1;
-        }
-        for _ in 0..2 {
-            let mut response = fixture.send(malformed.clone()).await;
-            if malformed_kind == 1 {
-                // Also exercise an actual Copy ACK if this malformed frame is delivered.
-                tokio::select! {
-                    result = response.message() => assert!(result.is_err()),
-                    operation = delivered(&mut operations) => {
-                        let progress = operation.apply_to(fixture.target.state.as_ref()).await.unwrap();
-                        operation.acknowledge(progress).unwrap();
-                        assert!(response.message().await.is_err(), "snapshot/final frame completed the build");
-                    }
-                }
-            } else {
-                assert!(
-                    response.message().await.is_err(),
-                    "malformed live final frame bypassed CopyComplete"
-                );
-            }
-            assert!(fixture.terminal_receipt().is_none());
-            assert!(operations.try_recv().is_err());
-        }
-        let final_frame = fixture.frame(1, false, true, 0, 0);
-        let mut response = fixture.send(final_frame.clone()).await;
-        let complete = delivered(&mut operations).await;
-        assert!(matches!(
-            complete.metadata,
-            OperationMetadata::CopyComplete { .. }
-        ));
-        pending_ack(&mut response).await;
-        let progress = complete
-            .apply_to(fixture.target.state.as_ref())
-            .await
-            .unwrap();
-        pending_ack(&mut response).await;
-        assert!(fixture.terminal_receipt().is_none());
-        complete.acknowledge(progress).unwrap();
-        assert!(response.message().await.unwrap().unwrap().final_item);
-        assert_eq!(fixture.terminal_receipt().unwrap()["finalSequence"], 1);
-        let mut replay = fixture.send(final_frame).await;
-        assert!(replay.message().await.unwrap().unwrap().final_item);
-        assert!(operations.try_recv().is_err());
-        fixture.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_copy_complete_requires_verified_existing_suffix() {
-    for malformed_kind in 0..5 {
-        let fixture = StreamBuildFixture::start("stream-complete-suffix", false, 1).await;
-        let mut operations = fixture.target.application.control_operations();
-        let applied_lsn = if malformed_kind == 4 { 2 } else { 3 };
-        *fixture.target.state.progress.lock().unwrap() = DurableApplicationProgress {
-            applied_lsn,
-            committed_lsn: 1,
-        };
-        let retained = match malformed_kind {
-            0 => vec![],
-            1 => vec![Operation {
-                lsn: 3,
-                committed_lsn: 1,
-                data: Bytes::from_static(b"missing-lsn-two"),
-            }],
-            2 => vec![Operation {
-                lsn: 2,
-                committed_lsn: 1,
-                data: Bytes::from_static(b"missing-lsn-three"),
-            }],
-            3 => vec![
-                Operation {
-                    lsn: 2,
-                    committed_lsn: -1,
-                    data: Bytes::from_static(b"invalid-retained-metadata"),
-                },
-                Operation {
-                    lsn: 3,
-                    committed_lsn: 1,
-                    data: Bytes::from_static(b"last-operation"),
-                },
-            ],
-            _ => vec![Operation {
-                lsn: 2,
-                committed_lsn: 1,
-                data: Bytes::from_static(b"existing-suffix"),
-            }],
-        };
-        *fixture.target.state.operations.lock().unwrap() = retained;
-        let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
-        let operation = delivered(&mut operations).await;
-        assert!(matches!(
-            operation.metadata,
-            OperationMetadata::CopyComplete { .. }
-        ));
-        // Deliberately malformed ACKs must fail even when they match storage.
-        if malformed_kind == 4 {
-            fixture
-                .target
-                .state
-                .apply(Operation {
-                    lsn: 3,
-                    committed_lsn: 1,
-                    data: Bytes::from_static(b"invented-during-copy-complete"),
+                .completed_operations
+                .iter()
+                .any(|completion| {
+                    completion.operation_id == authority.operation_id
+                        && completion.result == PublicV1OperationResult::Succeeded
                 })
-                .await
-                .unwrap();
-        }
-        operation
-            .acknowledge(fixture.target.state.durable_progress().await.unwrap())
-            .unwrap();
-        assert!(response.message().await.is_err());
-        assert!(fixture.terminal_receipt().is_none());
-        let mut final_response = fixture.send(fixture.frame(1, false, true, 1, 1)).await;
-        assert!(final_response.message().await.is_err());
-        assert!(fixture.terminal_receipt().is_none());
-        fixture.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_replication_waits_for_durable_ack() {
-    let pair = AuthorizedHostedPair::start("stream-replication", 402).await;
-    let mut operations = pair.secondary.application.control_operations();
-    let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    assert_eq!(
-        operation.metadata,
-        OperationMetadata::Replication {
-            lsn: 1,
-            committed_lsn: 1
-        }
-    );
-    assert_eq!(operation.data.as_ref(), b"stream-value");
-    assert_eq!(
-        pair.secondary.state.durable_progress().await.unwrap(),
-        DurableApplicationProgress::default()
-    );
-    pending_ack(&mut response).await;
-    let progress = operation
-        .apply_to(pair.secondary.state.as_ref())
-        .await
-        .unwrap();
-    assert_receiver_pending(&pair.secondary, 0).await;
-    pending_ack(&mut response).await;
-    operation.acknowledge(progress).unwrap();
-    let ack = response.message().await.unwrap().unwrap();
-    assert_eq!((ack.applied_lsn, ack.committed_lsn), (1, 1));
-    pair.cleanup().await;
-
-    let fixture = StreamBuildFixture::start("stream-retained", false, 1).await;
-    let mut operations = fixture.target.application.control_operations();
-    let mut copy = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
-    let complete = delivered(&mut operations).await;
-    assert!(matches!(
-        complete.metadata,
-        OperationMetadata::CopyComplete { .. }
-    ));
-    pending_ack(&mut copy).await;
-    let progress = complete
-        .apply_to(fixture.target.state.as_ref())
-        .await
-        .unwrap();
-    complete.acknowledge(progress).unwrap();
-    copy.message().await.unwrap().unwrap();
-    let mut retained = fixture.send(fixture.frame(1, false, false, 1, 2)).await;
-    let operation = delivered(&mut operations).await;
-    assert_eq!(
-        operation.metadata,
-        OperationMetadata::Replication {
-            lsn: 2,
-            committed_lsn: 2
-        }
-    );
-    assert_eq!(operation.data.as_ref(), b"retained-value");
-    pending_ack(&mut retained).await;
-    let progress = operation
-        .apply_to(fixture.target.state.as_ref())
-        .await
-        .unwrap();
-    pending_ack(&mut retained).await;
-    operation.acknowledge(progress).unwrap();
-    assert_eq!(retained.message().await.unwrap().unwrap().durable_lsn, 2);
-    let mut final_response = fixture.send(fixture.frame(2, false, true, 1, 2)).await;
-    assert!(final_response.message().await.unwrap().unwrap().final_item);
-    fixture.cleanup().await;
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_duplicate_commit_advancement_reaches_service() {
-    let pair = AuthorizedHostedPair::start("stream-duplicate", 403).await;
-    let mut operations = pair.secondary.application.control_operations();
-    for committed in [0, 1, 1] {
-        let mut response = pair.send_frame(pair.replication_frame(1, committed)).await;
-        let operation = delivered(&mut operations).await;
-        pending_ack(&mut response).await;
-        let progress = operation
-            .apply_to(pair.secondary.state.as_ref())
-            .await
-            .unwrap();
-        assert_eq!(pair.secondary.state.operations.lock().unwrap().len(), 1);
-        assert_eq!(pair.secondary.state.apply_calls.load(Ordering::Acquire), 1);
-        assert_eq!(
-            pair.secondary.state.operations.lock().unwrap()[0].committed_lsn,
-            0
         );
-        pending_ack(&mut response).await;
-        operation.acknowledge(progress).unwrap();
-        assert_eq!(
-            response.message().await.unwrap().unwrap().committed_lsn,
-            committed
-        );
-    }
-    let mut corrupt = pair.replication_frame(1, 1);
-    corrupt.data = b"changed".to_vec();
-    let mut response = pair.send_frame(corrupt).await;
-    assert!(response.message().await.is_err());
-    assert!(operations.try_recv().is_err());
-    pair.cleanup().await;
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_reject_drop_and_invalid_ack_do_not_complete() {
-    for outcome in 0..7 {
-        let pair = AuthorizedHostedPair::start("stream-negative", 410 + outcome).await;
-        let mut operations = pair.secondary.application.control_operations();
-        let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
-        let operation = delivered(&mut operations).await;
-        match outcome {
-            0 => {
-                operation
-                    .reject(RuntimeError::Application("service rejected".into()))
-                    .unwrap();
-            }
-            1 => drop(operation),
-            _ => {
-                let progress = match outcome {
-                    2 => DurableApplicationProgress {
-                        applied_lsn: -1,
-                        committed_lsn: -1,
-                    },
-                    3 => DurableApplicationProgress::default(),
-                    4 => DurableApplicationProgress {
-                        applied_lsn: 1,
-                        committed_lsn: 2,
-                    },
-                    5 => DurableApplicationProgress {
-                        applied_lsn: 99,
-                        committed_lsn: 99,
-                    },
-                    _ => DurableApplicationProgress {
-                        applied_lsn: 1,
-                        committed_lsn: 1,
-                    },
-                };
-                operation.acknowledge(progress).unwrap();
-            }
-        }
-        assert!(response.message().await.is_err());
-        assert_eq!(
-            pair.secondary.state.durable_progress().await.unwrap(),
-            DurableApplicationProgress::default()
-        );
-        assert_receiver_pending(&pair.secondary, 0).await;
-        let mut retry = pair.send_frame(pair.replication_frame(1, 1)).await;
-        let operation = delivered(&mut operations).await;
-        let progress = operation
-            .apply_to(pair.secondary.state.as_ref())
-            .await
-            .unwrap();
-        operation.acknowledge(progress).unwrap();
-        assert_eq!(retry.message().await.unwrap().unwrap().applied_lsn, 1);
-        assert_eq!(pair.secondary.state.apply_calls.load(Ordering::Acquire), 1);
-        assert_eq!(
-            pair.secondary
-                .handle()
-                .public_v1_report()
-                .await
-                .unwrap()
-                .read_status,
-            AccessStatus::Granted
-        );
-        pair.cleanup().await;
-    }
-    for copy_complete in [false, true] {
-        for reject in [false, true] {
-            let fixture = StreamBuildFixture::start("stream-copy-failure", false, 1).await;
-            let mut operations = fixture.target.application.control_operations();
-            let mut response = fixture
-                .send(fixture.frame(0, !copy_complete, false, 1, 1))
-                .await;
-            let operation = delivered(&mut operations).await;
-            if reject {
-                operation
-                    .reject(RuntimeError::Application("copy rejected".into()))
-                    .unwrap();
-            } else {
-                drop(operation);
-            }
-            assert!(response.message().await.is_err());
-            assert_eq!(
-                fixture.target.state.durable_progress().await.unwrap(),
-                DurableApplicationProgress::default()
-            );
-            fixture.cleanup().await;
-        }
-    }
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_invalid_history_and_copy_complete_acks_are_fenced() {
-    let fixture = StreamBuildFixture::start("stream-retained-gap", false, 0).await;
-    let mut operations = fixture.target.application.control_operations();
-    let mut copy = fixture.send(fixture.frame(0, false, false, 0, 0)).await;
-    let operation = delivered(&mut operations).await;
-    let progress = operation
-        .apply_to(fixture.target.state.as_ref())
-        .await
-        .unwrap();
-    operation.acknowledge(progress).unwrap();
-    copy.message().await.unwrap().unwrap();
-    let mut gap = fixture.send(fixture.frame(1, false, false, 0, 2)).await;
-    assert!(
-        gap.message().await.is_err(),
-        "build sequence continuity is not retained LSN continuity"
-    );
-    assert!(
-        operations.try_recv().is_err(),
-        "a skipped LSN must be rejected before service effects or ACK"
-    );
-    for sequence in [1, 2, 1] {
-        let mut final_response = fixture
-            .send(fixture.frame(sequence, false, true, 0, 2))
-            .await;
-        assert!(
-            final_response.message().await.is_err(),
-            "a retained gap produced cursor/terminal replay proof"
-        );
-    }
-    assert_eq!(fixture.target.state.apply_calls.load(Ordering::Acquire), 0);
-    fixture.cleanup().await;
-
-    let fixture = StreamBuildFixture::start("stream-retained-mismatch", false, 1).await;
-    let mut operations = fixture.target.application.control_operations();
-    let mut copy = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    let progress = operation
-        .apply_to(fixture.target.state.as_ref())
-        .await
-        .unwrap();
-    operation.acknowledge(progress).unwrap();
-    copy.message().await.unwrap().unwrap();
-    let mut retained = fixture.send(fixture.frame(1, false, false, 1, 2)).await;
-    let operation = delivered(&mut operations).await;
-    // Deliberately malformed service ACK: real durable watermarks, wrong bytes.
-    let progress = operation
-        .execute(async {
-            fixture
-                .target
-                .state
-                .apply(Operation {
-                    lsn: 2,
-                    committed_lsn: 1,
-                    data: Bytes::from_static(b"wrong-history"),
-                })
-                .await?;
-            fixture.target.state.commit(2).await
-        })
-        .await
-        .unwrap();
-    operation.acknowledge(progress).unwrap();
-    assert!(retained.message().await.is_err());
-    let mut final_response = fixture.send(fixture.frame(2, false, true, 1, 2)).await;
-    assert!(
-        final_response.message().await.is_err(),
-        "rejected retained ACK advanced the cursor"
-    );
-    let mut replay = fixture.send(fixture.frame(1, false, false, 1, 2)).await;
-    let operation = delivered(&mut operations).await;
-    assert!(
-        operation
-            .apply_to(fixture.target.state.as_ref())
-            .await
-            .is_err()
-    );
-    operation
-        .reject(RuntimeError::InvalidReplication(
-            "wrong retained bytes".into(),
-        ))
-        .unwrap();
-    assert!(replay.message().await.is_err());
-    fixture.cleanup().await;
-
-    for progress in [
-        DurableApplicationProgress::default(),
-        DurableApplicationProgress {
-            applied_lsn: -1,
-            committed_lsn: -1,
-        },
-        DurableApplicationProgress {
-            applied_lsn: 1,
-            committed_lsn: 2,
-        },
-        DurableApplicationProgress {
-            applied_lsn: 2,
-            committed_lsn: 2,
-        },
-    ] {
-        let fixture = StreamBuildFixture::start("stream-complete-invalid", false, 1).await;
-        let mut operations = fixture.target.application.control_operations();
-        let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
-        let operation = delivered(&mut operations).await;
-        operation.acknowledge(progress).unwrap();
-        assert!(response.message().await.is_err());
-        let mut final_response = fixture.send(fixture.frame(1, false, true, 1, 1)).await;
-        assert!(final_response.message().await.is_err());
-        fixture.cleanup().await;
+        authority
     }
 
-    let pair = AuthorizedHostedPair::start("stream-regressing-ack", 426).await;
-    let mut first = pair.send_frame(pair.replication_frame(1, 1)).await;
-    first.message().await.unwrap().unwrap();
-    let mut operations = pair.secondary.application.control_operations();
-    let mut response = pair.send_frame(pair.replication_frame(2, 2)).await;
-    let operation = delivered(&mut operations).await;
-    operation
-        .acknowledge(DurableApplicationProgress {
-            applied_lsn: 1,
-            committed_lsn: 0,
-        })
-        .unwrap();
-    assert!(response.message().await.is_err());
-    assert_ne!(
-        pair.secondary
-            .handle()
-            .public_v1_report()
-            .await
-            .unwrap()
-            .read_status,
-        AccessStatus::Granted
-    );
-    pair.cleanup().await;
-
-    let pair = AuthorizedHostedPair::start("stream-post-ack-history", 427).await;
-    let mut operations = pair.secondary.application.control_operations();
-    let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    let progress = operation
-        .apply_to(pair.secondary.state.as_ref())
-        .await
-        .unwrap();
-    pair.secondary.state.operations.lock().unwrap()[0].data =
-        Bytes::from_static(b"corrupted-after-apply");
-    operation.acknowledge(progress).unwrap();
-    assert!(response.message().await.is_err());
-    assert_receiver_pending(&pair.secondary, 0).await;
-    pair.cleanup().await;
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_caller_cancellation_fences_queued_and_delivered_operations() {
-    let pair = AuthorizedHostedPair::start("stream-caller-cancel", 421).await;
-    let mut operations = pair.secondary.application.control_operations();
-    let response = pair.send_frame(pair.replication_frame(1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    drop(response);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if pair
-                .secondary
-                .handle()
-                .public_v1_raw_retained_task_cardinality()
-                .unwrap()
-                .1
-                == 0
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(
-        operation
-            .apply_to(pair.secondary.state.as_ref())
-            .await
-            .is_err()
-    );
-    assert!(
-        operation
-            .acknowledge(DurableApplicationProgress::default())
-            .is_err()
-    );
-    assert!(pair.secondary.state.operations.lock().unwrap().is_empty());
-    let response = pair.send_frame(pair.replication_frame(1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    pair.secondary.state.block_commit();
-    let state = pair.secondary.state.clone();
-    let effect = tokio::spawn(async move {
-        let result = operation.apply_to(state.as_ref()).await;
-        assert!(result.is_err());
-        assert!(
-            operation
-                .acknowledge(DurableApplicationProgress {
-                    applied_lsn: 1,
-                    committed_lsn: 1
-                })
-                .is_err()
-        );
-    });
-    pair.secondary.state.commit_entered.notified().await;
-    assert_receiver_pending(&pair.secondary, 0).await;
-    drop(response);
-    tokio::time::timeout(Duration::from_secs(5), effect)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_receiver_pending(&pair.secondary, 0).await;
-    assert_eq!(
-        pair.secondary
-            .state
-            .durable_progress()
-            .await
-            .unwrap()
-            .committed_lsn,
-        0
-    );
-    // A current exact replay can safely finish the already-applied payload,
-    // but access stays closed until the service's fresh durable ACK.
-    pair.secondary
-        .state
-        .block_commit
-        .store(false, Ordering::Release);
-    let mut replay = pair.send_frame(pair.replication_frame(1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    let progress = operation
-        .apply_to(pair.secondary.state.as_ref())
-        .await
-        .unwrap();
-    assert_receiver_pending(&pair.secondary, 0).await;
-    operation.acknowledge(progress).unwrap();
-    replay.message().await.unwrap().unwrap();
-    assert_eq!(
-        pair.secondary
-            .handle()
-            .public_v1_report()
-            .await
-            .unwrap()
-            .read_status,
-        AccessStatus::Granted
-    );
-    pair.cleanup().await;
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_authority_changes_cancel_effects_and_fence_late_ack() {
-    let fixture = StreamBuildFixture::start("stream-authority", false, 1).await;
-    let mut operations = fixture.target.application.control_operations();
-    let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    fixture.target.state.block_finish_copy();
-    let state = fixture.target.state.clone();
-    let effect = tokio::spawn(async move { operation.apply_to(state.as_ref()).await });
-    fixture.target.state.finish_copy_entered.notified().await;
-    fixture
-        .target
-        .handle()
-        .install_public_v1_inbound_build_authority(&fixture.authority)
-        .await
-        .unwrap();
-    let mut stale = fixture.authority.clone();
-    stale.operation_revision = 0;
-    assert!(
-        fixture
-            .target
-            .handle()
-            .install_public_v1_inbound_build_authority(&stale)
-            .await
-            .is_err()
-    );
-    assert!(
-        !effect.is_finished(),
-        "exact reinstall/stale request interrupted current effect"
-    );
-    fixture
-        .target
-        .handle()
-        .revoke_public_v1_inbound_build_authority(&fixture.authority)
-        .await
-        .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), effect)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_err()
-    );
-    assert!(response.message().await.unwrap_or(None).is_none());
-    fixture.target.state.release_finish_copy.notify_one();
-    assert_eq!(
-        fixture.target.state.durable_progress().await.unwrap(),
-        DurableApplicationProgress::default()
-    );
-    fixture.cleanup().await;
-
-    let pair = AuthorizedHostedPair::start("stream-role-fence", 422).await;
-    let mut operations = pair.secondary.application.control_operations();
-    let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
-    let operation = delivered(&mut operations).await;
-    let control = pair
-        .secondary
-        .application
-        .control
-        .read()
-        .await
-        .clone()
-        .unwrap();
-    control
-        .change_role(pair.epoch, ReplicaRole::None)
-        .await
-        .unwrap();
-    assert!(
-        operation
-            .apply_to(pair.secondary.state.as_ref())
-            .await
-            .is_err()
-    );
-    assert!(
-        operation
-            .acknowledge(DurableApplicationProgress::default())
-            .is_err()
-    );
-    assert!(response.message().await.unwrap_or(None).is_none());
-    pair.cleanup().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hosted_operation_stream_successor_and_close_wait_for_synchronous_effects() {
-    for close in [false, true] {
-        let fixture = StreamBuildFixture::start("stream-sync-drain", false, 1).await;
-        let mut operations = fixture.target.application.control_operations();
-        let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
-        let operation = delivered(&mut operations).await;
-        let state = fixture.target.state.clone();
-        let build_id = fixture.authority.attempt.build_id.clone();
-        let entered = Arc::new(Notify::new());
-        let entered_effect = entered.clone();
-        let (release, blocked) = std::sync::mpsc::channel();
-        let effect = tokio::spawn(async move {
-            let result = operation
-                .execute(async move {
-                    entered_effect.notify_one();
-                    // Deliberately synchronous provider section: cancellation is
-                    // not proof of quiescence until this section actually exits.
-                    blocked.recv_timeout(Duration::from_secs(5)).unwrap();
-                    state.finish_copy(&build_id, 1, 1).await
-                })
-                .await;
-            assert!(operation.acknowledge(result.unwrap_or_default()).is_err());
-        });
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
-        let handle = fixture.target.handle();
-        let control = fixture
-            .target
-            .application
-            .control
-            .read()
-            .await
-            .clone()
-            .unwrap();
-        let mut successor = fixture.authority.clone();
-        successor.operation_id = OperationId::new("stream-sync-successor");
-        successor.operation_revision = 2;
-        successor.attempt.build_id = OperationId::new("stream-sync-successor");
-        let transition = tokio::spawn(async move {
-            if close {
-                control.close().await.map_err(|error| error.to_string())
-            } else {
-                handle
-                    .install_public_v1_inbound_build_authority(&successor)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-        });
-        // EOF proves invalidation has reached the real ingress owner.
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), response.message())
-                .await
-                .unwrap()
-                .unwrap_or(None)
-                .is_none()
-        );
-        tokio::pin!(transition);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(40), &mut transition)
-                .await
-                .is_err(),
-            "successor/close returned while synchronous persistence was still running"
-        );
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), transition)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        effect.await.unwrap();
-        assert_eq!(
-            fixture
-                .target
-                .state
-                .durable_progress()
-                .await
-                .unwrap()
-                .committed_lsn,
-            1,
-            "cancellation does not roll back a synchronous durable effect"
-        );
-        fixture.cleanup().await;
-    }
-}
-
-#[tokio::test]
-async fn hosted_operation_stream_epoch_and_configuration_cancel_active_persistence() {
-    for epoch_change in [false, true] {
-        let pair = AuthorizedHostedPair::start("stream-authority-effect", 428).await;
-        let mut operations = pair.secondary.application.control_operations();
-        let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
-        let operation = delivered(&mut operations).await;
-        pair.secondary.state.block_commit();
-        let state = pair.secondary.state.clone();
-        let effect = tokio::spawn(async move { operation.apply_to(state.as_ref()).await });
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            pair.secondary.state.commit_entered.notified(),
-        )
-        .await
-        .unwrap();
-        if epoch_change {
-            pair.secondary
-                .application
-                .control
-                .read()
-                .await
-                .clone()
-                .unwrap()
-                .update_epoch(Epoch::new(0, 2))
-                .await
-                .unwrap();
-        } else {
-            let configuration = ConfigurationDescriptor::new(
-                pair.epoch,
-                pair.primary.identity.replica_id,
-                vec![
-                    ConfigurationMember {
-                        identity: pair.primary.identity.clone(),
-                        role: ReplicaRole::Primary,
-                    },
-                    ConfigurationMember {
-                        identity: pair.secondary.identity.clone(),
-                        role: ReplicaRole::ActiveSecondary,
-                    },
-                ],
-                1,
-            );
-            pair.secondary
-                .handle()
-                .execute_public_v1(intent(
-                    &pair.identity,
-                    pair.secondary.handle().process_session_id(),
-                    5,
-                    "stream-config-replacement",
-                    PublicOperationProgram::Configuration(PublicConfiguration {
-                        current: configuration,
-                        previous: None,
-                        replicas: vec![PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: pair.primary.identity.clone(),
-                            replication_address: format!("http://{}", pair.primary.address),
-                            process_session_id: pair.primary.handle().process_session_id(),
-                            storage_incarnation: Some(pair.primary.storage.clone()),
-                            role: ReplicaRole::Primary,
-                            current_progress: 0,
-                            catch_up_capability: 0,
-                            must_catchup: false,
-                        }],
-                    }),
-                ))
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), effect)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
-        assert!(response.message().await.unwrap_or(None).is_none());
-        pair.secondary.state.release_commit.notify_one();
-        assert_eq!(
-            pair.secondary
-                .state
-                .durable_progress()
-                .await
-                .unwrap()
-                .committed_lsn,
-            0
-        );
-        assert_ne!(
-            pair.secondary
-                .handle()
-                .public_v1_report()
-                .await
-                .unwrap()
-                .read_status,
-            AccessStatus::Granted
-        );
-        pair.cleanup().await;
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hosted_sf06_public_abort_waits_for_owned_synchronous_effect_after_waiter_drop() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        for drop_waiter in [false, true] {
-            let fixture = StreamBuildFixture::start("sf06-abort-sync-drain", false, 1).await;
-            fixture
-                .target
-                .application
-                .none_behavior
-                .store(2, Ordering::Release);
-            let mut operations = fixture.target.application.control_operations();
-            let mut response = fixture.send(fixture.frame(0, false, false, 1, 1)).await;
-            let operation = delivered(&mut operations).await;
-            let state = fixture.target.state.clone();
-            let build_id = fixture.authority.attempt.build_id.clone();
-            let entered = Arc::new(Notify::new());
-            let entered_effect = entered.clone();
-            let (release, blocked) = std::sync::mpsc::channel();
-            let effect = tokio::spawn(async move {
-                let result = operation
-                    .execute(async move {
-                        entered_effect.notify_one();
-                        blocked.recv_timeout(Duration::from_secs(10)).unwrap();
-                        state.finish_copy(&build_id, 1, 1).await
-                    })
-                    .await;
-                assert!(operation.acknowledge(result.unwrap_or_default()).is_err());
-            });
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
-            let handle = fixture.target.handle();
-            let operation_id = OperationId::new("sf06-abort-sync");
-            let terminal = intent(
-                &handle.public_v1_report().await.unwrap().identity,
-                handle.process_session_id(),
-                handle.public_v1_next_operation_revision().await.unwrap(),
-                operation_id.as_str(),
-                PublicOperationProgram::Abort,
-            );
-            let waiter_handle = handle.clone();
-            let mut waiter =
-                tokio::spawn(async move { waiter_handle.execute_public_v1(terminal).await });
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                fixture.target.application.abort_entered.notified(),
-            )
-            .await
-            .unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_secs(5), response.message())
-                    .await
-                    .unwrap()
-                    .unwrap_or(None)
-                    .is_none()
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(40), &mut waiter)
-                    .await
-                    .is_err()
-            );
-            let diagnostics = handle.diagnostics().await.unwrap();
-            assert_eq!(diagnostics.read_status, "NotPrimary");
-            assert_eq!(diagnostics.write_status, "NotPrimary");
-            assert_ne!(
-                stored_public_operation(&fixture.target, &operation_id)["stage"],
-                "completed"
-            );
-            assert_eq!(
-                fixture.target.application.none_calls.load(Ordering::SeqCst),
-                0
-            );
-            if drop_waiter {
-                waiter.abort();
-                assert!(waiter.await.unwrap_err().is_cancelled());
-            } else {
-                // The waiter is retained below; dropping a request is not root cancellation.
-                release.send(()).unwrap();
-                tokio::time::timeout(Duration::from_secs(5), waiter)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                effect.await.unwrap();
-                assert_eq!(
-                    handle.public_v1_raw_retained_task_cardinality().unwrap(),
-                    (0, 0)
-                );
-                assert!(std::net::TcpListener::bind(fixture.target.address).is_ok());
-                fixture.cleanup().await;
-                continue;
-            }
-            release.send(()).unwrap();
-            effect.await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if stored_public_operation(&fixture.target, &operation_id)["stage"]
-                        == "completed"
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(
-                handle.public_v1_raw_retained_task_cardinality().unwrap(),
-                (0, 0)
-            );
-            assert!(std::net::TcpListener::bind(fixture.target.address).is_ok());
-            fixture.cleanup().await;
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn hosted_sf06_terminal_access_denial_never_calls_synthetic_none() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        for behavior in [1, 2] {
-            for abort in [false, true] {
-                let pair = AuthorizedHostedPair::start("sf06-terminal-none", 6).await;
-                let handle = pair.primary.handle();
-                pair.primary
-                    .application
-                    .none_behavior
-                    .store(behavior, Ordering::Release);
-                let program = if abort {
-                    PublicOperationProgram::Abort
-                } else {
-                    PublicOperationProgram::Close
-                };
-                handle
-                    .execute_public_v1(intent(
-                        &pair.identity,
-                        handle.process_session_id(),
-                        handle.public_v1_next_operation_revision().await.unwrap(),
-                        "sf06-terminal-none",
-                        program,
-                    ))
-                    .await
-                    .unwrap();
-                let diagnostics = handle.diagnostics().await.unwrap();
-                assert_eq!(diagnostics.read_status, "NotPrimary");
-                assert_eq!(diagnostics.write_status, "NotPrimary");
-                let partition = pair
-                    .primary
-                    .application
-                    .partition
-                    .read()
-                    .await
-                    .clone()
-                    .unwrap();
+    async fn stop(&mut self) {
+        self.running.shutdown();
+        match self.running.wait().await {
+            Ok(()) => {}
+            Err(kuberic_runtime::host::HostError::Runtime(RuntimeError::OperationCancelled)) => {
+                let partition = self.service.partition.read().await.clone().unwrap();
                 assert_ne!(
                     partition.get_read_status().await.unwrap(),
                     AccessStatus::Granted
@@ -3074,7353 +1221,3976 @@ async fn hosted_sf06_terminal_access_denial_never_calls_synthetic_none() {
                     partition.get_write_status().await.unwrap(),
                     AccessStatus::Granted
                 );
-                assert_eq!(
-                    pair.primary.application.none_calls.load(Ordering::SeqCst),
-                    0
-                );
-                assert_eq!(
-                    handle.public_v1_raw_retained_task_cardinality().unwrap(),
-                    (0, 0)
-                );
-                assert!(std::net::TcpListener::bind(pair.primary.address).is_ok());
-                pair.cleanup().await;
+                assert!(self.service.values().await.is_err());
             }
+            Err(error) => panic!("unexpected host drainage failure: {error}"),
         }
-    })
-    .await
-    .unwrap();
-}
-#[tokio::test]
-async fn hosted_operation_stream_close_and_abort_drain_without_a_consumer() {
-    for stream_mode in [1, 2] {
-        for abort in [false, true] {
-            let pair =
-                AuthorizedHostedPair::start_mode("stream-no-consumer", 425, stream_mode).await;
-            let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
-            if stream_mode == 1 {
-                pending_ack(&mut response).await;
-            }
-            let control = pair
-                .secondary
-                .application
-                .control
-                .read()
-                .await
-                .clone()
-                .unwrap();
-            if abort {
-                control.abort();
-            } else {
-                control.close().await.unwrap();
-            }
-            assert!(response.message().await.unwrap_or(None).is_none());
-            assert!(pair.secondary.state.operations.lock().unwrap().is_empty());
-            pair.cleanup().await;
-        }
-    }
-    for abort in [false, true] {
-        let pair = AuthorizedHostedPair::start("stream-shutdown", 423).await;
-        let mut operations = pair.secondary.application.control_operations();
-        let mut response = pair.send_frame(pair.replication_frame(1, 1)).await;
-        let operation = delivered(&mut operations).await;
-        let control = pair
-            .secondary
-            .application
-            .control
-            .read()
-            .await
-            .clone()
-            .unwrap();
-        if abort {
-            control.abort();
-        } else {
-            control.close().await.unwrap();
-        }
-        assert!(
-            operation
-                .apply_to(pair.secondary.state.as_ref())
-                .await
-                .is_err()
-        );
-        assert!(
-            operation
-                .acknowledge(DurableApplicationProgress::default())
-                .is_err()
-        );
-        assert!(response.message().await.unwrap_or(None).is_none());
-        pair.cleanup().await;
+        self.service.drain().await;
     }
 }
 
-#[tokio::test]
-async fn hosted_operation_stream_primary_local_apply_is_not_redelivered() {
-    let pair = AuthorizedHostedPair::start("stream-primary-local", 424).await;
-    let mut primary_operations = pair.primary.application.control_operations();
-    assert_eq!(
-        pair.primary
-            .application
-            .replicate(Bytes::from_static(b"primary-once"))
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(primary_operations.try_recv().is_err());
-    assert_eq!(pair.primary.state.operations.lock().unwrap().len(), 1);
-    assert_eq!(pair.primary.state.apply_calls.load(Ordering::Acquire), 1);
-    assert_eq!(pair.primary.state.commit_calls.load(Ordering::Acquire), 1);
-    assert_eq!(
-        pair.primary
-            .state
-            .durable_progress()
-            .await
-            .unwrap()
-            .committed_lsn,
-        1
-    );
-    assert_eq!(pair.secondary.state.operations.lock().unwrap().len(), 1);
-    assert_eq!(pair.secondary.state.apply_calls.load(Ordering::Acquire), 1);
-    assert_eq!(
-        pair.secondary.state.operations.lock().unwrap()[0]
-            .data
-            .as_ref(),
-        b"primary-once"
-    );
-    pair.cleanup().await;
+struct Pair {
+    source: Node,
+    target: Node,
+    configuration: ConfigurationDescriptor,
+    authority: PublicInboundBuildAuthority,
 }
 
-#[tokio::test]
-async fn empty_history_catch_up_requires_exact_live_peer_proof() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let mut pair = AuthorizedHostedPair::start("zero-progress-proof", 752).await;
-        pair.primary
-            .application
-            .wait_for_write_quorum()
-            .await
-            .unwrap();
-        assert_eq!(
-            *pair.primary.state.progress.lock().unwrap(),
-            DurableApplicationProgress::default()
-        );
-        pair.secondary.stop().await;
-        assert!(matches!(
-            pair.primary.application.wait_for_write_quorum().await,
-            Err(RuntimeError::ReconfigurationPending)
+impl Pair {
+    async fn start(root: &Path, values: usize) -> Self {
+        let resource = ResourceUid::new(format!(
+            "native-resource-{}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        pair.primary.stop().await;
-        pair.primary.cleanup();
-        pair.secondary.cleanup();
-    })
-    .await
-    .unwrap();
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-enum StoredCloseDiagnostic {
-    CloseFailure {
-        child: StoredCloseChild,
-        error: String,
-    },
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-enum StoredCloseChild {
-    Replicator,
-    Application,
-}
-
-#[tokio::test]
-async fn public_v1_dynamic_open_endpoint_is_current_session_owned_and_cleared_on_close() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let root = test_root("dynamic-open-endpoint");
-        let resource_uid = ResourceUid::new("dynamic-open-endpoint");
-        let preview = PublicV1Identity::new(7);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&root),
-                preview.clone(),
-                store_identity(resource_uid.clone()),
-            )
-            .unwrap(),
-        );
-        let config = ReplicaProcessConfig {
-            resource_uid: resource_uid.clone(),
-            replica_id: ReplicaId::new(1),
-            pod_uid: PodUid::new("preview-pod-uid"),
-            pvc_uid: PvcUid::new("preview-pvc-uid"),
-            data_root: root.clone(),
-            replication_address: "127.0.0.1:0".parse().unwrap(),
-            bearer_token: "preview-token".into(),
-            rpc_deadline: Duration::from_secs(2),
-            transport_window_capacity: 8,
-        };
-        let storage = Arc::new(MemoryState::default());
-        let application = Arc::new(PreviewApplication::new(
-            storage.clone(),
-            "http://127.0.0.1:0".into(),
-        ));
-        let mut running = ReplicaHost::new(
-            config.clone(),
-            application.clone(),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding.clone())
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let handle = running.handle();
-        let generation = PublicProtocolGeneration::new(7);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_incarnation(replica()),
-            )
-            .await
-            .unwrap();
-        assert!(handle.public_v1_report().await.unwrap().replication_address.is_none());
-        let open = intent(
-            &preview,
-            handle.process_session_id(),
-            1,
-            "dynamic-open",
-            PublicOperationProgram::Open {
-                replica: replica(),
-                existing: true,
-            },
-        );
-        handle.execute_public_v1(open.clone()).await.unwrap();
-        let opened = handle.public_v1_report().await.unwrap();
-        let endpoint: tonic::codegen::http::Uri = opened
-            .replication_address
-            .as_ref()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let address: std::net::SocketAddr = endpoint.authority().unwrap().as_str().parse().unwrap();
-        assert_ne!(address.port(), 0);
-        let control = application.control.read().await.clone().unwrap();
-        assert_eq!(
-            Some(control.open().await.unwrap()),
-            opened.replication_address,
-        );
-        assert!(tokio::net::TcpStream::connect(address).await.is_ok());
-        assert!(std::net::TcpListener::bind(address).is_err());
-        handle.execute_public_v1(open).await.unwrap();
-        assert_eq!(
-            handle.public_v1_report().await.unwrap().replication_address,
-            opened.replication_address,
-        );
-        running.shutdown();
-        running.wait().await.unwrap();
-        let reserved_old_endpoint = std::net::TcpListener::bind(address).unwrap();
-        let application = Arc::new(PreviewApplication::new(
-            storage,
-            "http://127.0.0.1:0".into(),
-        ));
-        let mut restarted = ReplicaHost::new(
-            config,
-            application,
-            ApplicationStorageState::Established,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let handle = restarted.handle();
-        let unopened = handle.public_v1_report().await.unwrap();
-        assert_ne!(unopened.process_session_id, opened.process_session_id);
-        assert!(unopened.replication_address.is_none());
-        assert!(unopened.completed_operations.is_empty());
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                handle.process_session_id(),
-                2,
-                "dynamic-reopen",
-                PublicOperationProgram::Open {
-                    replica: replica(),
-                    existing: true,
-                },
-            ))
-            .await
-            .unwrap();
-        let reopened = handle.public_v1_report().await.unwrap();
-        assert!(reopened.replication_address.is_some());
-        assert_ne!(reopened.replication_address, opened.replication_address);
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                handle.process_session_id(),
-                3,
-                "dynamic-close",
-                PublicOperationProgram::Close,
-            ))
-            .await
-            .unwrap();
-        let store = SqliteStore::open_public_v1(
-            SqliteStore::metadata_database_path(&root), &preview,
-        ).unwrap();
-        let closed = store.public_v1_agent_report(
-            &preview,
-            kuberic_runtime::testing::sqlite_store::PublicV1ReportProjection {
-                process_session_id: handle.process_session_id(),
-                report_sequence: 1,
-                role: ReplicaRole::None,
-                read_status: AccessStatus::NotPrimary,
-                write_status: AccessStatus::NotPrimary,
-                progress: kuberic_runtime::protocol::public_operations::PublicProgress {
-                    role: kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery,
-                    first: 0,
-                    last: 0,
-                },
-            },
-        ).await.unwrap();
-        assert!(closed.replication_address.is_none());
-        drop(store);
-        restarted.shutdown();
-        restarted.wait().await.unwrap();
-        drop(reserved_old_endpoint);
-        std::fs::remove_dir_all(root).unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn public_v1_open_owns_registration_listener_and_writer_exactly_once() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let root = test_root("open-once");
-        let resource_uid = ResourceUid::new("preview-open-once");
-        let preview = PublicV1Identity::new(7);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let database = SqliteStore::metadata_database_path(&root);
-        drop(
-            SqliteStore::create_public_v1(
-                &database,
-                preview.clone(),
-                store_identity(resource_uid.clone()),
-            )
-            .unwrap(),
-        );
-        let advertised_replication_address = free_address();
-        let replication_address =
-            std::net::SocketAddr::from(([0, 0, 0, 0], advertised_replication_address.port()));
-        let storage = Arc::new(MemoryState::default());
-        let application = Arc::new(
-            PreviewApplication::new(
-                storage.clone(),
-                format!("http://{advertised_replication_address}"),
-            )
-            .with_open_probe(database)
-            .with_failed_creation(),
-        );
-        let mut running = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("preview-pod-uid"),
-                pvc_uid: PvcUid::new("preview-pvc-uid"),
-                data_root: root.clone(),
-                replication_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            application.clone(),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let handle = running.handle();
-        assert_eq!(application.opens.load(Ordering::SeqCst), 0);
-        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(application.failed_factory_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(handle.public_v1_provider_writer_count(), 0);
-        drop(std::net::TcpListener::bind(advertised_replication_address).unwrap());
-
-        let generation = PublicProtocolGeneration::new(7);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_incarnation(replica()),
-            )
-            .await
-            .unwrap();
-        let open = intent(
-            &preview,
-            handle.process_session_id(),
-            1,
-            "open-once",
-            PublicOperationProgram::Open {
-                replica: replica(),
-                existing: true,
-            },
-        );
-        handle.execute_public_v1(open.clone()).await.unwrap();
-        assert_eq!(application.opens.load(Ordering::SeqCst), 1);
-        assert_eq!(application.failed_factory_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
-        assert!(
-            application
-                .instruction_seen_before_open
-                .load(Ordering::Acquire),
-            "ApplicationOpen instruction was not durable before its effect"
-        );
-        assert_eq!(handle.public_v1_provider_writer_count(), 1);
-        assert!(std::net::TcpListener::bind(advertised_replication_address).is_err());
-
-        assert!(application.duplicate_creation().await.is_err());
-        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handle.public_v1_provider_writer_count(), 1);
-
-        handle.execute_public_v1(open).await.unwrap();
-        assert_eq!(application.opens.load(Ordering::SeqCst), 1);
-        assert_eq!(application.factory_calls.load(Ordering::SeqCst), 1);
-        assert!(std::net::TcpListener::bind(advertised_replication_address).is_err());
-
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                handle.process_session_id(),
-                2,
-                "close-open-once",
-                PublicOperationProgram::Close,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(handle.public_v1_provider_writer_count(), 0);
-        drop(std::net::TcpListener::bind(advertised_replication_address).unwrap());
-        running.shutdown();
-        running.wait().await.unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn hosted_public_v1_contained_close_restarts_without_replaying_interrupted_children() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let resource_uid = ResourceUid::new("preview-contained-close");
-        let preview = PublicV1Identity::new(12);
-        let mut replica =
-            HostedMemoryReplica::start("contained-close", &resource_uid, &preview, 1).await;
-        let generation = PublicProtocolGeneration::new(12);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        replica.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        install_static_authority(
-            &replica.handle(),
-            &preview,
-            replica.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: ConfigurationDescriptor::new(
-                    epoch,
-                    replica.identity.replica_id,
-                    vec![ConfigurationMember {
-                        identity: replica.identity.clone(),
-                        role: ReplicaRole::Primary,
-                    }],
-                    1,
-                ),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-
-        replica.application.fail_next_close();
-        let close_id = OperationId::new("preview-contained-close");
-        let error = replica
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                replica.handle().process_session_id(),
-                5,
-                close_id.as_str(),
-                PublicOperationProgram::Close,
-            ))
-            .await
-            .expect_err("child close failure must remain visible after containment");
-        assert!(
-            error
-                .to_string()
-                .contains("injected application close failure")
-        );
-
-        assert!(
-            replica
-                .application
-                .replicator_released_before_application_close
-                .load(Ordering::Acquire),
-            "Replicator teardown did not precede application close"
-        );
-        assert_eq!(
-            *replica.application.lifecycle_events.lock().unwrap(),
-            [
-                "application.close.begin",
-                "application.close.end",
-                "application.abort",
-            ],
-            "child failure did not trigger ordered abort containment"
-        );
-        assert_eq!(
-            replica.application.abort_calls.load(Ordering::SeqCst),
-            1,
-            "close failure must abort each child bundle exactly once"
-        );
-
-        let database = SqliteStore::metadata_database_path(&replica.root);
-        let connection = rusqlite::Connection::open(database).unwrap();
-        let json: String = connection
-            .query_row(
-                "SELECT state_json FROM agent_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let state: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let close = &state["publicV1OperationState"]["operations"][close_id.as_str()];
-        assert_eq!(
-            close["disposition"]["kind"],
-            serde_json::Value::String("failed".into()),
-            "contained close failure was not retained as failure"
-        );
-        let outcomes = close["lifecycle"]["outcomes"]
-            .as_array()
-            .expect("close lifecycle outcomes");
-        let diagnostic = outcomes
-            .iter()
-            .find(|outcome| outcome.get("CloseFailure").is_some())
-            .cloned()
-            .expect("typed close failure was not retained");
-        assert_eq!(
-            serde_json::from_value::<StoredCloseDiagnostic>(diagnostic).unwrap(),
-            StoredCloseDiagnostic::CloseFailure {
-                child: StoredCloseChild::Application,
-                error: "application error: injected application close failure".into(),
-            }
-        );
-
-        let root = replica.root.clone();
-        let identity = replica.identity.clone();
-        let storage = replica.state.clone();
-        let address = replica.address;
-        replica.stop().await;
-        let replay_application = Arc::new(PreviewApplication::new(
-            storage,
-            format!("http://{address}"),
-        ));
-        let mut restarted = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: identity.replica_id,
-                pod_uid: PodUid::new("contained-close-pod"),
-                pvc_uid: PvcUid::new("contained-close-pvc"),
-                data_root: root.clone(),
-                replication_address: address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            replay_application.clone(),
-            ApplicationStorageState::Established,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(PublicV1LifecycleBinding {
-            identity: preview,
-            resource_uid,
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        })
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        assert_eq!(replay_application.opens.load(Ordering::SeqCst), 0);
-        assert!(
-            replay_application
-                .lifecycle_events
-                .lock()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(replay_application.abort_calls.load(Ordering::SeqCst), 0);
-        restarted.shutdown();
-        restarted.wait().await.unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn hosted_public_v1_role_address_publishes_replaces_and_clears() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let resource_uid = ResourceUid::new("preview-role-address");
-        let preview = PublicV1Identity::new(71);
-        let mut replica =
-            HostedMemoryReplica::start("role-address", &resource_uid, &preview, 1).await;
-        let initialization =
-            derive_history_initialization_id(&resource_uid, PublicProtocolGeneration::new(71));
-        let history = derive_bootstrap_history(
-            &resource_uid,
-            PublicProtocolGeneration::new(71),
-            &initialization,
-        );
-        replica.initialize_history(&initialization, &history).await;
-        let first_epoch = Epoch::new(0, 1);
-        let first_configuration = ConfigurationDescriptor::new(
-            first_epoch,
-            replica.identity.replica_id,
-            vec![ConfigurationMember {
-                identity: replica.identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        install_static_authority(
-            &replica.handle(),
-            &preview,
-            replica.identity.clone(),
-            ReplicaRole::Primary,
-            first_epoch,
-            PublicConfiguration {
-                current: first_configuration,
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        let published = replica.handle().public_v1_report().await.unwrap();
-        let first_location = published
-            .service_location
-            .expect("primary address published");
-        assert_eq!(first_location.address, "http://127.0.0.1:8080");
-
-        let second_epoch = Epoch::new(0, 2);
-        replica
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                replica.handle().process_session_id(),
-                5,
-                "role-address-epoch",
-                PublicOperationProgram::Epoch {
-                    epoch: second_epoch,
-                },
-            ))
-            .await
-            .unwrap();
-        replica
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                replica.handle().process_session_id(),
-                6,
-                "role-address-replace",
-                PublicOperationProgram::Role {
-                    epoch: second_epoch,
-                    role: ReplicaRole::Primary,
-                },
-            ))
-            .await
-            .unwrap();
-        replica
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                replica.handle().process_session_id(),
-                8,
-                "role-address-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: ConfigurationDescriptor::new(
-                        second_epoch,
-                        replica.identity.replica_id,
-                        vec![ConfigurationMember {
-                            identity: replica.identity.clone(),
-                            role: ReplicaRole::Primary,
-                        }],
-                        1,
-                    ),
-                    previous: None,
-                    replicas: Vec::new(),
-                }),
-            ))
-            .await
-            .unwrap();
-        let replaced = replica.handle().public_v1_report().await.unwrap();
-        let second_location = replaced
-            .service_location
-            .expect("replacement address published");
-        assert_ne!(first_location.operation_id, second_location.operation_id);
-        assert_eq!(second_location.address, first_location.address);
-
-        replica
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                replica.handle().process_session_id(),
-                9,
-                "role-address-clear",
-                PublicOperationProgram::Role {
-                    epoch: second_epoch,
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ))
-            .await
-            .unwrap();
-        assert!(
-            replica
-                .handle()
-                .public_v1_report()
-                .await
-                .unwrap()
-                .service_location
-                .is_none()
-        );
-        replica.stop().await;
-        replica.cleanup();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn primary_write_revocation_fences_provider_apply_and_peer_ack_interleavings() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let apply_pair = AuthorizedHostedPair::start("write-apply-cut", 72).await;
-        apply_pair.primary.state.block_apply();
-        let write = tokio::spawn({
-            let application = apply_pair.primary.application.clone();
-            async move {
-                application
-                    .replicate(Bytes::from_static(b"apply-cut"))
+        let source = Node::start(&root.join("source"), &resource, 1).await;
+        let target = Node::start(&root.join("target"), &resource, 2).await;
+        source.open(ReplicaRole::Primary, EPOCH).await;
+        let single = source.single(EPOCH).await;
+        for lsn in 1..=values {
+            assert_eq!(
+                source
+                    .service
+                    .write(Bytes::from(format!("value-{lsn}")))
                     .await
-            }
-        });
-        apply_pair.primary.state.apply_entered.notified().await;
-        let demotion = tokio::spawn({
-            let handle = apply_pair.primary.handle();
-            let preview = apply_pair.identity.clone();
-            let epoch = apply_pair.epoch;
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        5,
-                        "demote-during-apply",
-                        PublicOperationProgram::Role {
-                            epoch,
-                            role: ReplicaRole::ActiveSecondary,
-                        },
-                    ))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        apply_pair.primary.state.release_apply.notify_waiters();
-        assert!(write.await.unwrap().is_err());
-        demotion.await.unwrap().unwrap();
-        assert_eq!(
-            apply_pair
-                .primary
-                .state
-                .progress
-                .lock()
-                .unwrap()
-                .committed_lsn,
-            0
-        );
-        assert_eq!(
-            apply_pair
-                .primary
-                .handle()
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            AccessStatus::NotPrimary
-        );
-        apply_pair.cleanup().await;
-
-        let ack_pair = AuthorizedHostedPair::start("write-ack-cut", 73).await;
-        ack_pair.secondary.state.block_apply();
-        let write = tokio::spawn({
-            let application = ack_pair.primary.application.clone();
-            async move { application.replicate(Bytes::from_static(b"ack-cut")).await }
-        });
-        ack_pair.secondary.state.apply_entered.notified().await;
-        let demotion = tokio::spawn({
-            let handle = ack_pair.primary.handle();
-            let preview = ack_pair.identity.clone();
-            let epoch = ack_pair.epoch;
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        5,
-                        "demote-during-ack",
-                        PublicOperationProgram::Role {
-                            epoch,
-                            role: ReplicaRole::ActiveSecondary,
-                        },
-                    ))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        ack_pair.secondary.state.release_apply.notify_waiters();
-        assert!(write.await.unwrap().is_err());
-        demotion.await.unwrap().unwrap();
-        assert_eq!(
-            ack_pair
-                .primary
-                .state
-                .progress
-                .lock()
-                .unwrap()
-                .committed_lsn,
-            0
-        );
-        ack_pair.cleanup().await;
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn primary_write_close_and_dropped_future_leave_conservative_fences() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let close_pair = AuthorizedHostedPair::start("write-close-cut", 74).await;
-        close_pair.primary.state.block_commit();
-        let write = tokio::spawn({
-            let application = close_pair.primary.application.clone();
-            async move {
-                application
-                    .replicate(Bytes::from_static(b"close-cut"))
-                    .await
-            }
-        });
-        close_pair.primary.state.commit_entered.notified().await;
-        let closed_control = close_pair
-            .primary
-            .application
-            .control
-            .read()
-            .await
-            .clone()
-            .unwrap();
-        assert_eq!(closed_control.current_progress().await.unwrap(), 0);
-        let close = tokio::spawn({
-            let handle = close_pair.primary.handle();
-            let preview = close_pair.identity.clone();
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        5,
-                        "close-during-commit",
-                        PublicOperationProgram::Close,
-                    ))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        close_pair.primary.state.release_commit.notify_waiters();
-        assert!(write.await.unwrap().is_err());
-        close.await.unwrap().unwrap();
-        assert!(matches!(
-            closed_control.current_progress().await,
-            Err(RuntimeError::Closed)
-        ));
-        assert!(
-            close_pair
-                .primary
-                .application
-                .replicate(Bytes::from_static(b"after-close-cut"))
-                .await
-                .is_err()
-        );
-        close_pair.cleanup().await;
-
-        let epoch_pair = AuthorizedHostedPair::start("write-epoch-tail-cut", 751).await;
-        epoch_pair.primary.state.block_commit();
-        let write = tokio::spawn({
-            let application = epoch_pair.primary.application.clone();
-            async move {
-                application
-                    .replicate(Bytes::from_static(b"epoch-tail-cut"))
-                    .await
-            }
-        });
-        epoch_pair.primary.state.commit_entered.notified().await;
-        assert_eq!(read_fencing::scalar_progress(&epoch_pair.primary).await, 0);
-        let next_epoch = Epoch::new(0, 2);
-        let epoch_update = tokio::spawn({
-            let handle = epoch_pair.primary.handle();
-            let preview = epoch_pair.identity.clone();
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        5,
-                        "epoch-during-commit",
-                        PublicOperationProgram::Epoch { epoch: next_epoch },
-                    ))
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        epoch_pair.primary.state.release_commit.notify_waiters();
-        assert!(write.await.unwrap().is_err());
-        epoch_update.await.unwrap().unwrap();
-        assert_eq!(read_fencing::scalar_progress(&epoch_pair.primary).await, 1);
-        assert_eq!(
-            epoch_pair
-                .primary
-                .state
-                .epoch_tails
-                .lock()
-                .unwrap()
-                .last()
-                .copied(),
-            Some(1),
-            "epoch callback did not receive the drained provider committed tail"
-        );
-        epoch_pair.cleanup().await;
-
-        let dropped_pair = AuthorizedHostedPair::start("write-drop-cut", 75).await;
-        dropped_pair.primary.state.block_apply();
-        let write = tokio::spawn({
-            let application = dropped_pair.primary.application.clone();
-            async move { application.replicate(Bytes::from_static(b"drop-cut")).await }
-        });
-        dropped_pair.primary.state.apply_entered.notified().await;
-        write.abort();
-        let _ = write.await;
-        dropped_pair.primary.state.release_apply.notify_waiters();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if dropped_pair
-                    .primary
-                    .handle()
-                    .public_v1_report()
-                    .await
-                    .is_ok_and(|report| report.write_status == AccessStatus::NotPrimary)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("dropped post-apply write did not fence access");
-        assert!(
-            dropped_pair
-                .primary
-                .application
-                .replicate(Bytes::from_static(b"after-drop-cut"))
-                .await
-                .is_err()
-        );
-        dropped_pair.cleanup().await;
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn replication_ingress_accepts_only_exact_current_primary_in_three_replica_set() {
-    tokio::time::timeout(Duration::from_secs(270), async {
-        let resource_uid = ResourceUid::new("three-replica-ingress");
-        let preview = PublicV1Identity::new(76);
-        let primary =
-            HostedMemoryReplica::start("ingress-primary", &resource_uid, &preview, 1).await;
-        let receiver =
-            HostedMemoryReplica::start("ingress-receiver", &resource_uid, &preview, 2).await;
-        let other = HostedMemoryReplica::start("ingress-other", &resource_uid, &preview, 3).await;
-        let initialization =
-            derive_history_initialization_id(&resource_uid, PublicProtocolGeneration::new(76));
-        let history = derive_bootstrap_history(
-            &resource_uid,
-            PublicProtocolGeneration::new(76),
-            &initialization,
-        );
-        primary.initialize_history(&initialization, &history).await;
-        receiver.initialize_history(&initialization, &history).await;
-        other.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
+                    .unwrap(),
+                lsn as i64
+            );
+        }
+        target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+        let authority = source.build(&target, &single).await;
         let configuration = ConfigurationDescriptor::new(
-            epoch,
-            primary.identity.replica_id,
+            EPOCH,
+            source.identity.replica_id,
             vec![
                 ConfigurationMember {
-                    identity: primary.identity.clone(),
+                    identity: source.identity.clone(),
                     role: ReplicaRole::Primary,
                 },
                 ConfigurationMember {
-                    identity: receiver.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-                ConfigurationMember {
-                    identity: other.identity.clone(),
+                    identity: target.identity.clone(),
                     role: ReplicaRole::ActiveSecondary,
                 },
             ],
             2,
         );
-        install_static_authority(
-            &receiver.handle(),
-            &preview,
-            receiver.identity.clone(),
-            ReplicaRole::ActiveSecondary,
-            epoch,
-            PublicConfiguration {
-                current: configuration.clone(),
-                previous: None,
-                replicas: vec![
-                    PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: primary.identity.clone(),
-                        replication_address: format!("http://{}", primary.address),
-                        process_session_id: primary.handle().process_session_id(),
-                        storage_incarnation: Some(primary.storage.clone()),
-                        role: ReplicaRole::Primary,
-                        current_progress: 0,
-                        catch_up_capability: 0,
-                        must_catchup: false,
-                    },
-                    PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: other.identity.clone(),
-                        replication_address: format!("http://{}", other.address),
-                        process_session_id: other.handle().process_session_id(),
-                        storage_incarnation: Some(other.storage.clone()),
-                        role: ReplicaRole::ActiveSecondary,
-                        current_progress: 0,
-                        catch_up_capability: 0,
-                        must_catchup: false,
-                    },
-                ],
-            },
-        )
-        .await;
-        let send = |sender: &HostedMemoryReplica, data: &'static [u8]| proto::ReplicationItem {
-            completed_build: None,
-            protocol_version: 11,
-            sender: Some(sender.identity.clone().into()),
-            receiver: Some(receiver.identity.clone().into()),
-            epoch: Some(epoch.into()),
-            previous_configuration_id: String::new(),
-            current_configuration_id: configuration.configuration_id.to_string(),
-            lsn: 1,
-            committed_lsn: 0,
-            data: data.to_vec(),
-            sender_session_id: sender.handle().process_session_id().to_string(),
-            receiver_session_id: receiver.handle().process_session_id().to_string(),
+        target
+            .command(PublicOperationProgram::Role {
+                epoch: EPOCH,
+                role: ReplicaRole::ActiveSecondary,
+            })
+            .await
+            .unwrap();
+        target
+            .command(PublicOperationProgram::Epoch { epoch: EPOCH })
+            .await
+            .unwrap();
+        for (local, remote, role) in [
+            (&target, &source, ReplicaRole::Primary),
+            (&source, &target, ReplicaRole::ActiveSecondary),
+        ] {
+            local
+                .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: configuration.clone(),
+                    previous: None,
+                    replicas: vec![remote.descriptor(role).await],
+                }))
+                .await
+                .unwrap();
+        }
+        Self {
+            source,
+            target,
+            configuration,
+            authority,
+        }
+    }
+
+    async fn stop(mut self) {
+        self.source.stop().await;
+        self.target.stop().await;
+    }
+}
+
+async fn delivered(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ReceivedOperation>,
+) -> ReceivedOperation {
+    tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn wire_report(node: &Node) -> PublicV1AgentReport {
+    use kuberic_runtime::control::proto;
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(node.control_address.clone())
+            .await
+            .unwrap();
+    let mut request = Request::new(proto::GetAgentStatusRequest {
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+        resource_uid: node.history.resource_uid.to_string(),
+        replica_id: node.identity.replica_id.value(),
+        expected_instance_id: node.identity.instance_id.to_string(),
+    });
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    kuberic_runtime::control::normalize_public_v1_agent_status_report(
+        client.get_status(request).await.unwrap().into_inner(),
+    )
+    .unwrap()
+}
+
+struct RenewalController {
+    status: Mutex<Option<PublicV1SessionRenewalStatus>>,
+    replacement: ReplicaHandle,
+    endpoints: Vec<(ProcessSessionEndpoint, String)>,
+}
+
+#[async_trait]
+impl PublicV1SessionRenewalApi for RenewalController {
+    async fn observe_public_v1_session_renewal(
+        &self,
+        _: &PublicV1Scope,
+    ) -> std::result::Result<Option<PublicV1SessionRenewalStatus>, String> {
+        Ok(self.status.lock().unwrap().clone())
+    }
+    async fn persist_public_v1_session_renewal(
+        &self,
+        _: &PublicV1Scope,
+        expected: Option<&PublicV1SessionRenewalStatus>,
+        next: &PublicV1SessionRenewalStatus,
+    ) -> std::result::Result<(), String> {
+        if self.status.lock().unwrap().as_ref() != expected {
+            return Err("stale controller renewal".into());
+        }
+        self.replacement
+            .persist_public_v1_session_renewal(expected, next)
+            .await
+            .map_err(|error| error.to_string())?;
+        *self.status.lock().unwrap() = Some(next.clone());
+        Ok(())
+    }
+    async fn dispatch_public_v1_session_renewal(
+        &self,
+        scope: &PublicV1Scope,
+        expected: &PublicV1SessionRenewalStatus,
+        command: &ProtocolCommand,
+    ) -> std::result::Result<(), String> {
+        use kuberic_runtime::control::{convert, proto};
+        if self.status.lock().unwrap().as_ref() != Some(expected) {
+            return Err("stale controller dispatch".into());
+        }
+        let ProtocolCommand::PublicV1History(history) = command else {
+            return Err("wrong command".into());
         };
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{}",
-            receiver.address
-        ))
+        let PublicV1HistoryCommand::SessionRenewal { command: renewal } = history.as_ref() else {
+            return Err("wrong history command".into());
+        };
+        let endpoint = renewal.expected_endpoint();
+        let address = &self
+            .endpoints
+            .iter()
+            .find(|(current, _)| {
+                current.identity == endpoint.identity
+                    && current.process_session_id == endpoint.process_session_id
+                    && current.replicator_creation_id == endpoint.replicator_creation_id
+                    && current.storage_incarnation == endpoint.storage_incarnation
+            })
+            .ok_or("captured survivor unreachable")?
+            .1;
+        let mut client = proto::replica_peer_client::ReplicaPeerClient::connect(address.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut request = Request::new(proto::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: scope.resource_uid.to_string(),
+            target: Some(endpoint.identity.clone().into()),
+            expected_process_session_id: endpoint.process_session_id.to_string(),
+            command: Some(proto::execute_command_request::Command::PublicV1History(
+                convert::public_v1_history_command_to_proto(history)
+                    .map_err(|error| error.to_string())?,
+            )),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        client
+            .execute(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let next = match renewal.as_ref() {
+            PublicV1SessionRenewalCommand::CloseAccessAndIngress { accepted } => {
+                accepted.close_access()
+            }
+            PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+                accepted,
+                survivor,
+                epoch,
+            } => accepted.record_epoch_updated(survivor, *epoch),
+            PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                accepted,
+                process_session_id,
+                epoch,
+                role,
+            } => accepted.replay_replacement_role(process_session_id, *epoch, *role),
+            PublicV1SessionRenewalCommand::InstallFreshConfiguration {
+                accepted,
+                configuration,
+            } => accepted.install_fresh_configuration(configuration),
+        }
+        .map_err(str::to_owned)?;
+        if matches!(
+            renewal.as_ref(),
+            PublicV1SessionRenewalCommand::UpdateEpochBarrier { .. }
+        ) {
+            self.replacement
+                .persist_public_v1_session_renewal(Some(expected), &next)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        *self.status.lock().unwrap() = Some(next);
+        Ok(())
+    }
+}
+
+async fn eventually(mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !predicate() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeEndpoint {
+    identity: ReplicaIdentity,
+    process_session_id: ProcessSessionId,
+    storage: ReplicaStorageIncarnationContext,
+    address: String,
+}
+
+impl NativeEndpoint {
+    fn from_report(report: &PublicV1AgentReport) -> Self {
+        Self {
+            identity: report.replica.clone(),
+            process_session_id: report.process_session_id.clone(),
+            storage: report.storage_incarnation.clone(),
+            address: report.replication_address.clone().unwrap(),
+        }
+    }
+}
+
+fn guid(domain: &[u8], bytes: &[u8]) -> Bytes {
+    let mut digest = Sha256::new();
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain);
+    digest.update(bytes);
+    Bytes::copy_from_slice(&digest.finalize()[..16])
+}
+
+fn wire_endpoint(resource: &ResourceUid, endpoint: &NativeEndpoint) -> native_wire::Endpoint {
+    native_wire::Endpoint {
+        partition: guid(
+            b"kuberic-classic-v1-partition",
+            resource.as_str().as_bytes(),
+        ),
+        replica: endpoint.identity.replica_id.value(),
+        incarnation: guid(
+            b"kuberic-classic-v1-endpoint",
+            &serde_json::to_vec(endpoint).unwrap(),
+        ),
+    }
+}
+
+async fn binding(pair: &Pair) -> serde_json::Value {
+    serde_json::json!({
+        "history": pair.source.history,
+        "epoch": pair.configuration.epoch,
+        "currentConfigurationId": pair.configuration.configuration_id,
+        "previousConfigurationId": null,
+        "primary": NativeEndpoint::from_report(&pair.source.report().await),
+        "secondary": NativeEndpoint::from_report(&pair.target.report().await),
+        "build": null,
+    })
+}
+
+async fn replication_frame(pair: &Pair, lsn: i64, data: Bytes) -> native_wire::Envelope {
+    let primary = NativeEndpoint::from_report(&pair.source.report().await);
+    let secondary = NativeEndpoint::from_report(&pair.target.report().await);
+    let epoch = native_wire::Epoch {
+        data_loss: pair.configuration.epoch.data_loss_number,
+        configuration: pair.configuration.epoch.configuration_number,
+    };
+    native_wire::Envelope {
+        version: 1,
+        source: Some(wire_endpoint(&pair.source.history.resource_uid, &primary)),
+        destination: Some(wire_endpoint(&pair.source.history.resource_uid, &secondary)),
+        sender_address: primary.address,
+        message_id: uuid::Uuid::new_v4().to_string(),
+        body: Some(native_wire::envelope::Body::ReplicationOperation(
+            native_wire::ReplicationOperation {
+                metadata: Some(native_wire::Metadata {
+                    sequence: lsn,
+                    operation_type: 1,
+                    atomic_group: -1,
+                }),
+                original_epoch: Some(epoch),
+                sending_epoch: Some(epoch),
+                buffers: Some(native_wire::Buffers {
+                    segments: vec![data],
+                }),
+                first_sequence: lsn,
+                last_sequence: lsn,
+                last_in_batch: lsn,
+                buffer_counts: vec![1],
+                completed_hint: 0,
+            },
+        )),
+    }
+}
+
+async fn build_binding(
+    source: &Node,
+    target: &Node,
+    authority: &PublicInboundBuildAuthority,
+) -> serde_json::Value {
+    serde_json::json!({
+        "history": authority.history, "epoch": authority.attempt.epoch,
+        "currentConfigurationId": authority.current_configuration_id,
+        "previousConfigurationId": null,
+        "primary": NativeEndpoint::from_report(&source.report().await),
+        "secondary": NativeEndpoint::from_report(&target.report().await),
+        "build": authority,
+    })
+}
+
+async fn native_frame(
+    source: &Node,
+    target: &Node,
+    body: native_wire::envelope::Body,
+) -> native_wire::Envelope {
+    let primary = NativeEndpoint::from_report(&source.report().await);
+    let secondary = NativeEndpoint::from_report(&target.report().await);
+    native_wire::Envelope {
+        version: 1,
+        source: Some(wire_endpoint(&source.history.resource_uid, &primary)),
+        destination: Some(wire_endpoint(&source.history.resource_uid, &secondary)),
+        sender_address: primary.address,
+        message_id: uuid::Uuid::new_v4().to_string(),
+        body: Some(body),
+    }
+}
+
+async fn exchange(
+    address: String,
+    binding: &serde_json::Value,
+    credential: &str,
+    frames: Vec<native_wire::Envelope>,
+) -> std::result::Result<tonic::Streaming<native_wire::Envelope>, tonic::Status> {
+    let mut client = native_wire::carrier_client::CarrierClient::connect(address)
         .await
         .unwrap();
-        let mut rejected = client
-            .replicate(Request::new(stream::iter([send(
-                &other,
-                b"secondary-origin",
-            )])))
+    let mut request = Request::new(stream::iter(frames).chain(stream::pending()));
+    request
+        .metadata_mut()
+        .insert("authorization", credential.parse().unwrap());
+    request.metadata_mut().insert_bin(
+        "kuberic-native-binding-bin",
+        tonic::metadata::MetadataValue::from_bytes(&serde_json::to_vec(binding).unwrap()),
+    );
+    client
+        .exchange(request)
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+async fn no_applied_ack(
+    stream: &mut tonic::Streaming<native_wire::Envelope>,
+    kind: OperationKind,
+    through: i64,
+) {
+    let result = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match stream.message().await {
+                Ok(Some(envelope)) => {
+                    if let Some(native_wire::envelope::Body::ReplicationAck(ack)) = envelope.body {
+                        let applied = if kind == OperationKind::Replication {
+                            ack.replication_applied
+                        } else {
+                            ack.copy_applied
+                        };
+                        assert!(
+                            applied < through,
+                            "unauthorized frame produced successful applied ACK: {ack:?}"
+                        );
+                    }
+                }
+                Ok(None) | Err(_) => return,
+            }
+        }
+    })
+    .await;
+    let _ = result;
+}
+
+async fn applied(stream: &mut tonic::Streaming<native_wire::Envelope>, through: i64) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let envelope = stream
+                .message()
+                .await
+                .unwrap()
+                .expect("native peer closed before ACK");
+            if let Some(native_wire::envelope::Body::ReplicationAck(ack)) = envelope.body {
+                assert_eq!(ack.error, 0, "native peer rejected the valid operation");
+                if ack.replication_applied >= through {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sf10_quiet_snapshot_build_activates_without_writes_or_fabricated_progress() {
+    let root = root();
+    for count in [0, 1] {
+        let pair = Pair::start(&root.path().join(format!("boundary-{count}")), count).await;
+        assert_eq!(
+            pair.target.service.provider.values(),
+            pair.source.service.provider.values()
+        );
+        assert_eq!(
+            pair.target.service.provider.installs.load(Ordering::SeqCst),
+            1
+        );
+        let report = pair.target.report().await;
+        assert_eq!(report.progress.current(), Some(count as i64));
+        assert_eq!(report.progress.capability(), Some(0));
+        for mode in [
+            kuberic_runtime::replicator::ReplicaSetQuorumMode::WriteQuorum,
+            kuberic_runtime::replicator::ReplicaSetQuorumMode::All,
+        ] {
+            pair.source
+                .service
+                .primary
+                .read()
+                .await
+                .clone()
+                .unwrap()
+                .wait_for_catch_up_quorum(mode)
+                .await
+                .unwrap();
+        }
+        pair.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_replication_waits_for_service_persistence_and_ack() {
+    let root = root();
+    let pair = Pair::start(root.path(), 0).await;
+    let mut operations = pair.target.service.control_operations();
+    let mut write = pair
+        .source
+        .service
+        .begin_write(Bytes::from_static(b"native-value"))
+        .await
+        .unwrap();
+    let operation = delivered(&mut operations).await;
+    assert_eq!(
+        (operation.kind, operation.lsn, operation.end_of_stream),
+        (OperationKind::Replication, write.lsn, false)
+    );
+    assert!(pair.target.service.provider.values().is_empty());
+    pair.target
+        .service
+        .provider
+        .persist_received(&operation)
+        .await
+        .unwrap();
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"native-value")]
+    );
+    assert_eq!(pair.target.report().await.progress.current(), Some(1));
+    assert!(
+        matches!(
+            write.outcome.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "native receive progress completed a service-ACK-dependent write"
+    );
+    operation.acknowledge().unwrap();
+    assert_eq!(write.wait().await.unwrap(), 1);
+    assert_eq!(
+        pair.source.service.values().await.unwrap(),
+        [Bytes::from_static(b"native-value")]
+    );
+    assert!(
+        operations.try_recv().is_err(),
+        "native quorum must not redeliver a synthetic commit watermark"
+    );
+    pair.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_copy_and_eof_wait_for_service_owned_snapshot_ack() {
+    let root = root();
+    let resource = ResourceUid::new("copy-service-ack");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    source
+        .service
+        .write(Bytes::from_static(b"snapshot-value"))
+        .await
+        .unwrap();
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    let mut operations = target.service.control_operations();
+    let (intent, _) = source.build_intent(&target, &single).await;
+    let handle = source.handle();
+    let mut build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    let snapshot = delivered(&mut operations).await;
+    assert_eq!(snapshot.kind, OperationKind::Copy);
+    assert!(!snapshot.end_of_stream);
+    assert!(target.service.provider.values().is_empty());
+    target
+        .service
+        .provider
+        .persist_received(&snapshot)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut build)
+            .await
+            .is_err()
+    );
+    snapshot.acknowledge().unwrap();
+    let eof = delivered(&mut operations).await;
+    assert_eq!(eof.kind, OperationKind::Copy);
+    assert!(eof.end_of_stream);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut build)
+            .await
+            .is_err()
+    );
+    eof.acknowledge().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), build)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        target.service.provider.values(),
+        [Bytes::from_static(b"snapshot-value")]
+    );
+    source.stop().await;
+    target.stop().await;
+}
+
+#[tokio::test]
+async fn sf10_snapshot_prefix_preserves_concurrent_and_later_exact_suffix() {
+    let root = root();
+    let resource = ResourceUid::new("copy-concurrent-suffix");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    source
+        .service
+        .write(Bytes::from_static(b"snapshot"))
+        .await
+        .unwrap();
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    source.service.provider.copy.hold();
+    let (intent, _) = source.build_intent(&target, &single).await;
+    let handle = source.handle();
+    let build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    source.service.provider.copy.entered.notified().await;
+    assert_eq!(
+        source
+            .service
+            .write(Bytes::from_static(b"concurrent"))
+            .await
+            .unwrap(),
+        2
+    );
+    source.service.provider.copy.release();
+    tokio::time::timeout(Duration::from_secs(15), build)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    source
+        .service
+        .write(Bytes::from_static(b"later"))
+        .await
+        .unwrap();
+    eventually(|| target.service.provider.values().len() == 3).await;
+    assert_eq!(
+        target.service.provider.values(),
+        source.service.provider.values()
+    );
+    source.stop().await;
+    target.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_drop_and_persistence_failure_are_not_successful_acks() {
+    let root = root();
+    for fail in [false, true] {
+        let pair = Pair::start(&root.path().join(format!("fail-{fail}")), 0).await;
+        let mut operations = pair.target.service.control_operations();
+        let write = pair
+            .source
+            .service
+            .begin_write(Bytes::from_static(b"held"))
+            .await
+            .unwrap();
+        let operation = delivered(&mut operations).await;
+        let mut observer = tokio::spawn(write.wait());
+        if fail {
+            pair.target
+                .service
+                .provider
+                .fail_commit
+                .store(true, Ordering::Release);
+            assert!(
+                pair.target
+                    .service
+                    .provider
+                    .persist_received(&operation)
+                    .await
+                    .is_err()
+            );
+            pair.target
+                .service
+                .state
+                .read()
+                .await
+                .clone()
+                .unwrap()
+                .replication_operations()
+                .unwrap()
+                .report_fault("service persistence failed".into())
+                .unwrap();
+        } else {
+            drop(operation);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), &mut observer)
+                .await
+                .is_err()
+        );
+        assert!(pair.target.service.provider.values().is_empty());
+        assert!(pair.source.service.provider.values().is_empty());
+        pair.stop().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), observer)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn primary_commit_failure_contains_the_ambiguous_native_quorum_success() {
+    let root = root();
+    let pair = Pair::start(root.path(), 0).await;
+    pair.source
+        .service
+        .provider
+        .fail_commit
+        .store(true, Ordering::Release);
+    assert!(
+        pair.source
+            .service
+            .write(Bytes::from_static(b"ambiguous"))
+            .await
+            .is_err()
+    );
+    assert!(pair.source.service.provider.values().is_empty());
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"ambiguous")]
+    );
+    assert!(pair.source.service.values().await.is_err());
+    assert!(
+        pair.source
+            .service
+            .write(Bytes::from_static(b"must-not-follow"))
+            .await
+            .is_err()
+    );
+    let report = pair.source.report().await;
+    assert_ne!(report.read_status, AccessStatus::Granted);
+    assert_ne!(report.write_status, AccessStatus::Granted);
+    pair.stop().await;
+}
+
+#[tokio::test]
+async fn native_transient_fault_restarts_same_storage_under_exact_session_renewal() {
+    let root = root();
+    let resource = ResourceUid::new("native-transient-fault-restart");
+    let mut predecessor = Node::start(root.path(), &resource, 1).await;
+    predecessor.open(ReplicaRole::Primary, EPOCH).await;
+    predecessor.single(EPOCH).await;
+    for value in [b"fault-prefix-1", b"fault-prefix-2", b"fault-prefix-3"] {
+        predecessor
+            .service
+            .write(Bytes::copy_from_slice(value))
+            .await
+            .unwrap();
+    }
+    let acknowledged = predecessor.service.provider.values();
+    let before = predecessor.report().await;
+    assert_eq!(before.write_status, AccessStatus::Granted);
+    let old_endpoint = predecessor
+        .handle()
+        .public_v1_process_endpoint(ReplicaRole::Primary)
+        .await
+        .unwrap();
+    let old_handle = predecessor.handle();
+    let old_partition = predecessor.service.partition.read().await.clone().unwrap();
+    let old_intent = predecessor
+        .intent(PublicOperationProgram::Progress { capability: false })
+        .await;
+
+    old_partition
+        .report_fault(FaultType::Transient)
+        .await
+        .unwrap();
+    assert_ne!(
+        old_partition.get_read_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+    assert_ne!(
+        old_partition.get_write_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+    assert!(predecessor.service.values().await.is_err());
+    assert!(
+        predecessor
+            .service
+            .write(Bytes::from_static(b"cannot-follow-transient-fault"))
+            .await
+            .is_err()
+    );
+    assert_eq!(predecessor.service.provider.values(), acknowledged);
+    let connection =
+        rusqlite::Connection::open(SqliteStore::metadata_database_path(root.path())).unwrap();
+    let json: String = connection
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let durable: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        durable["reportedFault"],
+        serde_json::to_value(FaultType::Transient).unwrap()
+    );
+    let faults = durable["publicV1OperationState"]["operations"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter(|record| {
+            record["intent"]["class"]
+                == serde_json::to_value(PublicOperationClass::TransientFault).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        faults.len(),
+        1,
+        "actual fault did not request exact durable containment"
+    );
+    assert_eq!(
+        faults[0]["intent"]["processSessionId"],
+        serde_json::to_value(&before.process_session_id).unwrap()
+    );
+    assert_eq!(
+        faults[0]["acceptedStorage"],
+        serde_json::to_value(&before.storage_incarnation).unwrap()
+    );
+    assert_eq!(
+        faults[0]["acceptedHistory"],
+        serde_json::to_value(&before.history).unwrap()
+    );
+    drop(connection);
+
+    // Reap the process only after its actual fault request and serving fence.
+    predecessor.stop().await;
+    assert_eq!(
+        old_handle
+            .public_v1_raw_retained_task_cardinality()
+            .unwrap(),
+        (0, 0)
+    );
+    assert_ne!(
+        old_partition.get_write_status().await.unwrap(),
+        AccessStatus::Granted
+    );
+    let mut replacement = Node::start(root.path(), &resource, 1).await;
+    let fresh = replacement.report().await;
+    assert_eq!(fresh.replica, before.replica);
+    assert_eq!(fresh.storage_incarnation, before.storage_incarnation);
+    assert_eq!(fresh.history, before.history);
+    assert_eq!(fresh.open_mode, OpenMode::Existing);
+    assert_ne!(fresh.process_session_id, before.process_session_id);
+    assert_ne!(fresh.replicator_creation_id, before.replicator_creation_id);
+    assert_eq!(replacement.service.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement.service.provider.values(), acknowledged);
+    assert_ne!(fresh.read_status, AccessStatus::Granted);
+    assert_ne!(fresh.write_status, AccessStatus::Granted);
+    let endpoint = replacement
+        .handle()
+        .public_v1_process_endpoint(ReplicaRole::None)
+        .await
+        .unwrap();
+    let epoch = Epoch::new(0, 2);
+    let configuration = ConfigurationDescriptor::new(
+        epoch,
+        replacement.identity.replica_id,
+        vec![ConfigurationMember {
+            identity: replacement.identity.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+        operation_id: OperationId::new("fault-requested-exact-session-renewal"),
+        reason: ProcessSessionRenewalReason::PrimaryReplacement,
+        resource_uid: resource.clone(),
+        history: before.history.clone(),
+        previous_epoch: EPOCH,
+        renewal_epoch: epoch,
+        predecessor: old_endpoint,
+        replacement: Some(endpoint.clone()),
+        surviving_sessions: Vec::new(),
+        fresh_configuration: configuration,
+        predecessor_contained: true,
+        data_loss: None,
+    })
+    .unwrap();
+    required
+        .required
+        .validate_replacement_report(&fresh)
+        .unwrap();
+    let controller = RenewalController {
+        status: Mutex::new(None),
+        replacement: replacement.handle(),
+        endpoints: vec![(endpoint, replacement.control_address.clone())],
+    };
+    let scope = PublicV1Scope {
+        namespace: "testing".into(),
+        name: "transient-fault-restart".into(),
+        resource_uid: resource,
+    };
+    controller
+        .persist_public_v1_session_renewal(&scope, None, &required)
+        .await
+        .unwrap();
+    let mut authorized = false;
+    for _ in 0..24 {
+        let current = controller
+            .observe_public_v1_session_renewal(&scope)
             .await
             .unwrap()
-            .into_inner();
-        assert!(rejected.next().await.unwrap().is_err());
-        assert_eq!(
-            *receiver.state.progress.lock().unwrap(),
-            DurableApplicationProgress::default()
-        );
-        assert!(receiver.state.operations.lock().unwrap().is_empty());
+            .unwrap();
+        let plan = plan_public_v1_session_renewal(&current, &[]).unwrap();
+        if matches!(plan, PublicV1SessionRenewalPlan::Stable) {
+            assert_eq!(current.stage, PublicSessionRenewalStage::Authorized);
+            authorized = true;
+            break;
+        }
+        let mut replaying_role = false;
+        if let PublicV1SessionRenewalPlan::Dispatch {
+            command: ProtocolCommand::PublicV1History(history),
+            ..
+        } = &plan
+            && let PublicV1HistoryCommand::SessionRenewal { command } = history.as_ref()
+        {
+            match command.as_ref() {
+                PublicV1SessionRenewalCommand::ReplayReplacementRole { .. } => {
+                    replaying_role = true;
+                    assert_eq!(replacement.service.opens.load(Ordering::SeqCst), 0);
+                    assert_ne!(
+                        replacement.report().await.write_status,
+                        AccessStatus::Granted
+                    );
+                }
+                PublicV1SessionRenewalCommand::InstallFreshConfiguration {
+                    configuration, ..
+                } => {
+                    replacement
+                        .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                            current: configuration.clone(),
+                            previous: None,
+                            replicas: Vec::new(),
+                        }))
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+        execute_public_v1_session_renewal(&controller, &scope, plan)
+            .await
+            .unwrap();
+        if replaying_role {
+            let opened = replacement.report().await;
+            assert_eq!(replacement.service.opens.load(Ordering::SeqCst), 1);
+            assert_eq!(opened.process_session_id, fresh.process_session_id);
+            assert_eq!(opened.storage_incarnation, fresh.storage_incarnation);
+            assert_ne!(opened.write_status, AccessStatus::Granted);
+            assert_eq!(
+                opened.replicator_creation_id, fresh.replicator_creation_id,
+                "automatic Open changed the already-captured renewal endpoint creation"
+            );
+        }
+    }
+    assert!(
+        authorized,
+        "actual transient fault never reached authorized restart"
+    );
+    let recovered = wire_report(&replacement).await;
+    assert_eq!(recovered.process_session_id, fresh.process_session_id);
+    assert_eq!(
+        recovered.replicator_creation_id,
+        fresh.replicator_creation_id
+    );
+    assert_eq!(recovered.storage_incarnation, before.storage_incarnation);
+    assert_eq!(recovered.history, before.history);
+    assert_eq!(recovered.role, ReplicaRole::Primary);
+    assert_eq!(replacement.service.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.service.values().await.unwrap(), acknowledged);
+    let calls = replacement.service.observed.lock().unwrap().len();
+    assert!(
+        replacement
+            .handle()
+            .execute_public_v1(old_intent)
+            .await
+            .is_err()
+    );
+    assert!(
+        old_partition
+            .report_fault(FaultType::Transient)
+            .await
+            .is_err()
+    );
+    assert_eq!(replacement.service.observed.lock().unwrap().len(), calls);
+    assert_eq!(
+        replacement.report().await.write_status,
+        AccessStatus::Granted
+    );
+    assert_eq!(
+        replacement
+            .service
+            .write(Bytes::from_static(b"after-transient-restart"))
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        &replacement.service.provider.values()[..3],
+        acknowledged.as_slice()
+    );
+    replacement.stop().await;
+}
 
-        let mut accepted = client
-            .replicate(Request::new(stream::iter([send(
-                &primary,
-                b"primary-origin",
-            )])))
+#[tokio::test]
+async fn native_shared_stream_handles_do_not_rewind_or_reapply_acknowledged_operations() {
+    let root = root();
+    let pair = Pair::start(root.path(), 0).await;
+    let mut operations = pair.target.service.control_operations();
+    let write = pair
+        .source
+        .service
+        .begin_write(Bytes::from_static(b"once"))
+        .await
+        .unwrap();
+    let operation = delivered(&mut operations).await;
+    let state = pair.target.service.state.read().await.clone().unwrap();
+    let mut another = state.replication_operations().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), another.get_operation())
+            .await
+            .is_err()
+    );
+    pair.target
+        .service
+        .provider
+        .persist_received(&operation)
+        .await
+        .unwrap();
+    operation.acknowledge().unwrap();
+    write.wait().await.unwrap();
+    assert_eq!(pair.target.service.provider.values().len(), 1);
+    assert!(operations.try_recv().is_err());
+    pair.stop().await;
+}
+
+#[tokio::test]
+async fn production_carrier_rejects_crossed_process_storage_history_epoch_and_endpoint() {
+    let root = root();
+    let pair = Pair::start(root.path(), 1).await;
+    let valid = binding(&pair).await;
+    let address = pair.target.report().await.replication_address.unwrap();
+    let mut rejected = Vec::new();
+    for (side, field) in [
+        ("primary", "processSessionId"),
+        ("secondary", "processSessionId"),
+        ("primary", "address"),
+        ("secondary", "address"),
+    ] {
+        let mut crossed = valid.clone();
+        crossed[side][field] = "stale".into();
+        rejected.push(crossed);
+    }
+    let mut crossed = valid.clone();
+    crossed["primary"]["storage"]["storageGeneration"] = "retired".into();
+    rejected.push(crossed);
+    let mut crossed = valid.clone();
+    crossed["history"]["historyId"] = "predecessor".into();
+    rejected.push(crossed);
+    let mut crossed = valid.clone();
+    crossed["epoch"]["configurationNumber"] = 99.into();
+    rejected.push(crossed);
+    let mut crossed = valid.clone();
+    crossed["currentConfigurationId"] = "stale-configuration".into();
+    rejected.push(crossed);
+    for crossed in rejected {
+        let error = exchange(
+            address.clone(),
+            &crossed,
+            &format!("Bearer {TOKEN}"),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+    let error = exchange(address, &valid, "Bearer wrong", Vec::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"value-1")]
+    );
+    pair.source
+        .service
+        .write(Bytes::from_static(b"unaffected"))
+        .await
+        .unwrap();
+    assert_eq!(pair.target.service.provider.values().len(), 2);
+    pair.stop().await;
+}
+
+#[tokio::test]
+async fn three_replica_native_quorum_ignores_hung_minority_and_rejects_secondary_origin() {
+    let root = root();
+    let mut pair = Pair::start(root.path(), 1).await;
+    let mut third = Node::start(
+        &root.path().join("third"),
+        &pair.source.history.resource_uid,
+        3,
+    )
+    .await;
+    third.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    pair.source.build(&third, &pair.configuration).await;
+    third
+        .command(PublicOperationProgram::Role {
+            epoch: EPOCH,
+            role: ReplicaRole::ActiveSecondary,
+        })
+        .await
+        .unwrap();
+    third
+        .command(PublicOperationProgram::Epoch { epoch: EPOCH })
+        .await
+        .unwrap();
+    let current = ConfigurationDescriptor::new(
+        EPOCH,
+        pair.source.identity.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: pair.source.identity.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: pair.target.identity.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: third.identity.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        2,
+    );
+    let entered = Arc::new(Notify::new());
+    let observed = entered.clone();
+    let isolated = third.identity.instance_id.to_string();
+    let route = TestingTcpRoute::register_with_kind(
+        pair.source.identity.instance_id.to_string(),
+        move |kind, destination, endpoint| {
+            let hung = kind == TestingTcpRouteKind::Replication && destination == isolated;
+            let entered = observed.clone();
+            Box::pin(async move {
+                if hung {
+                    entered.notify_one();
+                    std::future::pending::<std::io::Result<String>>().await
+                } else {
+                    Ok(endpoint)
+                }
+            })
+        },
+    )
+    .unwrap();
+    for local in [&pair.target, &third, &pair.source] {
+        let mut replicas = Vec::new();
+        for peer in [&pair.source, &pair.target, &third] {
+            if peer.identity != local.identity {
+                replicas.push(
+                    peer.descriptor(if peer.identity == pair.source.identity {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    })
+                    .await,
+                );
+            }
+        }
+        local
+            .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                current: current.clone(),
+                previous: None,
+                replicas,
+            }))
+            .await
+            .unwrap();
+    }
+    pair.configuration = current;
+    let mut rogue = binding(&pair).await;
+    rogue["primary"] =
+        serde_json::to_value(NativeEndpoint::from_report(&third.report().await)).unwrap();
+    let error = exchange(
+        pair.target.report().await.replication_address.unwrap(),
+        &rogue,
+        &format!("Bearer {TOKEN}"),
+        Vec::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    let write = pair
+        .source
+        .service
+        .begin_write(Bytes::from_static(b"live-majority"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), write.wait())
             .await
             .unwrap()
-            .into_inner();
-        assert!(accepted.next().await.unwrap().is_ok());
-        assert_eq!(receiver.state.progress.lock().unwrap().applied_lsn, 1);
-        assert_eq!(
-            receiver.state.operations.lock().unwrap()[0].data.as_ref(),
-            b"primary-origin"
-        );
-
-        let baseline = receiver
+            .unwrap(),
+        2
+    );
+    assert_eq!(pair.target.service.provider.values().len(), 2);
+    assert_eq!(third.service.provider.values().len(), 1);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        pair.source.command(PublicOperationProgram::Close),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        pair.source
             .handle()
             .public_v1_raw_retained_task_cardinality()
+            .unwrap(),
+        (0, 0)
+    );
+    drop(route);
+    pair.source.stop().await;
+    pair.target.stop().await;
+    third.stop().await;
+}
+
+#[tokio::test]
+async fn native_reconnect_does_not_transfer_dequeued_service_work_to_an_rpc_waiter() {
+    let root = root();
+    let pair = Pair::start(root.path(), 0).await;
+    let mut operations = pair.target.service.control_operations();
+    let frame = replication_frame(&pair, 1, Bytes::from_static(b"reconnect")).await;
+    let binding = binding(&pair).await;
+    let address = pair.target.report().await.replication_address.unwrap();
+    let first = exchange(
+        address.clone(),
+        &binding,
+        &format!("Bearer {TOKEN}"),
+        vec![frame.clone()],
+    )
+    .await
+    .unwrap();
+    let operation = delivered(&mut operations).await;
+    drop(first);
+    let mut second = exchange(address, &binding, &format!("Bearer {TOKEN}"), vec![frame])
+        .await
+        .unwrap();
+    pair.target
+        .service
+        .provider
+        .persist_received(&operation)
+        .await
+        .unwrap();
+    operation.acknowledge().unwrap();
+    applied(&mut second, 1).await;
+    assert!(
+        operations.try_recv().is_err(),
+        "reconnect redelivered already dequeued service work"
+    );
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"reconnect")]
+    );
+    drop(second);
+    pair.stop().await;
+}
+
+#[tokio::test]
+async fn native_carrier_bad_payload_and_wrong_sender_cannot_publish_service_progress() {
+    let root = root();
+    for wrong_sender in [false, true] {
+        let pair = Pair::start(&root.path().join(format!("sender-{wrong_sender}")), 0).await;
+        let mut frame = replication_frame(&pair, 1, Bytes::from_static(b"bad")).await;
+        if wrong_sender {
+            frame.source.as_mut().unwrap().replica = 3;
+        } else if let Some(native_wire::envelope::Body::ReplicationOperation(body)) =
+            &mut frame.body
+        {
+            body.buffer_counts = vec![2];
+        }
+        let result = exchange(
+            pair.target.report().await.replication_address.unwrap(),
+            &binding(&pair).await,
+            &format!("Bearer {TOKEN}"),
+            vec![frame],
+        )
+        .await;
+        if let Ok(mut stream) = result {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while stream.message().await.unwrap_or(None).is_some() {}
+            })
+            .await
             .unwrap();
-        for _ in 0..2 {
-            stream::iter(0..1_000)
-                .map(|_| {
-                    let mut client = client.clone();
-                    async move {
-                        let mut response = client
-                            .replicate(Request::new(stream::empty::<proto::ReplicationItem>()))
-                            .await
-                            .unwrap()
-                            .into_inner();
-                        assert!(response.next().await.is_none());
-                    }
+        }
+        assert!(pair.target.service.provider.values().is_empty());
+        assert_eq!(pair.target.report().await.progress.current(), Some(0));
+        pair.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn successor_inbound_build_retires_native_receiver_instead_of_resetting_metadata() {
+    let root = root();
+    let pair = Pair::start(root.path(), 1).await;
+    pair.target
+        .handle()
+        .install_public_v1_inbound_build_authority(&pair.authority)
+        .await
+        .unwrap();
+    let mut stale = pair.authority.clone();
+    stale.operation_revision = 0;
+    assert!(
+        pair.target
+            .handle()
+            .install_public_v1_inbound_build_authority(&stale)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"value-1")]
+    );
+    let mut successor = pair.authority.clone();
+    successor.operation_revision += 100;
+    successor.operation_id = OperationId::new("successor-copy");
+    successor.attempt.build_id = successor.operation_id.clone();
+    let error = pair
+        .target
+        .handle()
+        .install_public_v1_inbound_build_authority(&successor)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("requires process replacement"));
+    let report = pair.target.report().await;
+    assert_ne!(report.read_status, AccessStatus::Granted);
+    assert_ne!(report.write_status, AccessStatus::Granted);
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"value-1")]
+    );
+    pair.stop().await;
+}
+
+#[tokio::test]
+async fn successor_copy_requires_replacement_without_exposing_held_service_install() {
+    let root = root();
+    let resource = ResourceUid::new("successor-held-install");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    source
+        .service
+        .write(Bytes::from_static(b"held-snapshot"))
+        .await
+        .unwrap();
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    target.service.provider.install.hold();
+    let (intent, mut authority) = source.build_intent(&target, &single).await;
+    let handle = source.handle();
+    let build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        target.service.provider.install.entered.notified(),
+    )
+    .await
+    .unwrap();
+    authority.operation_id = OperationId::new("held-install-successor");
+    authority.operation_revision += 100;
+    authority.attempt.build_id = authority.operation_id.clone();
+    assert!(
+        target
+            .handle()
+            .install_public_v1_inbound_build_authority(&authority)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires process replacement")
+    );
+    assert_ne!(target.report().await.read_status, AccessStatus::Granted);
+    assert_ne!(target.report().await.write_status, AccessStatus::Granted);
+    assert!(target.service.values().await.is_err());
+    assert!(
+        target
+            .command(PublicOperationProgram::Open {
+                replica: target.identity.clone(),
+                existing: true,
+            })
+            .await
+            .is_err()
+    );
+    target.service.provider.install.release();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_ne!(target.report().await.read_status, AccessStatus::Granted);
+    tokio::time::timeout(Duration::from_secs(10), source.stop())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), target.stop())
+        .await
+        .unwrap();
+    let retained = target.service.provider.values();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(target.service.provider.values(), retained);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), build)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn service_rejects_corrupt_copy_and_conflicting_retained_history_before_ack() {
+    let root = root();
+    for corrupt in [false, true] {
+        let directory = root.path().join(format!("corrupt-{corrupt}"));
+        let resource = ResourceUid::new(format!("retained-conflict-{corrupt}"));
+        let mut source = Node::start(&directory.join("source"), &resource, 1).await;
+        let mut target = Node::start(&directory.join("target"), &resource, 2).await;
+        let epoch = Epoch::new(0, 2);
+        source.open(ReplicaRole::Primary, epoch).await;
+        let single = source.single(epoch).await;
+        source
+            .service
+            .write(Bytes::from_static(b"source-history"))
+            .await
+            .unwrap();
+        if !corrupt {
+            target.open(ReplicaRole::Primary, EPOCH).await;
+            target.single(EPOCH).await;
+            target
+                .service
+                .write(Bytes::from_static(b"acknowledged-conflicting-history"))
+                .await
+                .unwrap();
+            target.stop().await;
+            target = Node::start(&directory.join("target"), &resource, 2).await;
+        }
+        target.open(ReplicaRole::IdleSecondary, epoch).await;
+        source
+            .service
+            .provider
+            .corrupt_copy
+            .store(corrupt, Ordering::Release);
+        let before = target.service.provider.values();
+        let bytes = std::fs::read(target.service.provider.root.join("service.json")).unwrap();
+        let (intent, _) = source.build_intent(&target, &single).await;
+        let operation_id = intent.operation_id.clone();
+        let handle = source.handle();
+        let build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+        eventually(|| target.service.failed.load(Ordering::Acquire)).await;
+        assert_eq!(target.service.provider.values(), before);
+        assert_eq!(
+            std::fs::read(target.service.provider.root.join("service.json")).unwrap(),
+            bytes
+        );
+        assert!(
+            !source
+                .report()
+                .await
+                .completed_operations
+                .iter()
+                .any(|completion| {
+                    completion.operation_id == operation_id
+                        && completion.result == PublicV1OperationResult::Succeeded
                 })
-                .buffer_unordered(32)
-                .collect::<Vec<_>>()
-                .await;
+        );
+        assert_ne!(target.report().await.write_status, AccessStatus::Granted);
+        tokio::time::timeout(Duration::from_secs(10), source.stop())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), target.stop())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), build)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn hosted_operation_stream_close_and_abort_drain_with_dequeued_or_unconsumed_work() {
+    let root = root();
+    for abort in [false, true] {
+        let pair = Pair::start(&root.path().join(format!("abort-{abort}")), 0).await;
+        let mut operations = pair.target.service.control_operations();
+        let write = pair
+            .source
+            .service
+            .begin_write(Bytes::from_static(b"pending"))
+            .await
+            .unwrap();
+        let operation = delivered(&mut operations).await;
+        let program = if abort {
+            PublicOperationProgram::Abort
+        } else {
+            PublicOperationProgram::Close
+        };
+        let intent = pair.target.intent(program).await;
+        let handle = pair.target.handle();
+        let mut terminal = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+        if abort {
+            tokio::time::timeout(Duration::from_secs(10), terminal)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let _ = operation.acknowledge();
+            assert!(pair.target.service.provider.values().is_empty());
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(pair.source.service.provider.values().is_empty());
+            assert_ne!(
+                pair.target.report().await.write_status,
+                AccessStatus::Granted
+            );
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), &mut terminal)
+                    .await
+                    .is_err()
+            );
+            pair.target
+                .service
+                .provider
+                .persist_received(&operation)
+                .await
+                .unwrap();
+            operation.acknowledge().unwrap();
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    if receiver
-                        .handle()
-                        .public_v1_raw_retained_task_cardinality()
-                        .unwrap()
-                        == baseline
-                    {
-                        break;
+                    tokio::select! {
+                        result = &mut terminal => { result.unwrap().unwrap(); break; }
+                        operation = operations.recv() => {
+                            let operation = operation.unwrap();
+                            assert!(operation.end_of_stream);
+                            operation.acknowledge().unwrap();
+                        }
                     }
-                    tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("completed inbound RPC tasks were retained");
+            .unwrap();
         }
+        assert_eq!(pair.target.service.none_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            pair.target
+                .handle()
+                .public_v1_raw_retained_task_cardinality()
+                .unwrap(),
+            (0, 0)
+        );
+        drop(write);
+        pair.stop().await;
+    }
+}
 
-        let mut primary = primary;
-        let mut receiver = receiver;
-        let mut other = other;
-        primary.stop().await;
-        receiver.stop().await;
-        other.stop().await;
-        primary.cleanup();
-        receiver.cleanup();
-        other.cleanup();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_sf06_close_waits_for_synchronous_service_effect_even_if_observer_is_dropped() {
+    let root = root();
+    let resource = ResourceUid::new("synchronous-copy");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    source
+        .service
+        .write(Bytes::from_static(b"copied"))
+        .await
+        .unwrap();
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    let (release, blocked) = std::sync::mpsc::channel();
+    *target.service.provider.synchronous_install.lock().unwrap() = Some(blocked);
+    let (intent, _) = source.build_intent(&target, &single).await;
+    let handle = source.handle();
+    let build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    target.service.provider.synchronous_entered.notified().await;
+    let close = target.intent(PublicOperationProgram::Close).await;
+    let handle = target.handle();
+    let mut observer = tokio::spawn(async move { handle.execute_public_v1(close).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut observer)
+            .await
+            .is_err()
+    );
+    observer.abort();
+    let _ = observer.await;
+    release.send(()).unwrap();
+    eventually(|| target.service.provider.installs.load(Ordering::SeqCst) == 1).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if target
+                .handle()
+                .public_v1_raw_retained_task_cardinality()
+                .unwrap()
+                == (0, 0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     })
     .await
     .unwrap();
+    let after = target.service.provider.values();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(target.service.provider.values(), after);
+    build.abort();
+    let _ = build.await;
+    source.stop().await;
+    target.stop().await;
+}
+
+type HungCarrierStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<native_wire::Envelope, tonic::Status>> + Send>>;
+
+struct HungCarrier {
+    entered: Arc<Notify>,
+}
+
+#[tonic::async_trait]
+impl native_wire::carrier_server::Carrier for HungCarrier {
+    type ExchangeStream = HungCarrierStream;
+    async fn exchange(
+        &self,
+        request: Request<tonic::Streaming<native_wire::Envelope>>,
+    ) -> std::result::Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+        assert!(
+            request
+                .metadata()
+                .get_bin("kuberic-native-binding-bin")
+                .is_some()
+        );
+        let mut incoming = request.into_inner();
+        let first = incoming.message().await?.unwrap();
+        assert!(matches!(
+            first.body,
+            Some(native_wire::envelope::Body::StartCopy(_))
+        ));
+        self.entered.notify_one();
+        Ok(tonic::Response::new(Box::pin(stream::unfold(
+            incoming,
+            |incoming| async move {
+                std::future::pending::<()>().await;
+                Some((Ok(native_wire::Envelope::default()), incoming))
+            },
+        ))))
+    }
 }
 
 #[tokio::test]
-async fn bounded_concurrent_peer_work_ignores_hung_minority_and_drains_on_close() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let pair = AuthorizedHostedPair::start("hung-minority", 77).await;
-        let hung_identity = replica_named(3, "hung-peer-pod", "hung-peer-agent");
-        let hung_storage = storage_named(hung_identity.clone(), "hung-peer-pod", "hung-peer-pvc");
-        let hung_session = ProcessSessionId::new("hung-peer-session");
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let hung_address = listener.local_addr().unwrap();
-        let hung_task = tokio::spawn(async move {
-            let (_connection, _) = listener.accept().await.unwrap();
-            futures::future::pending::<()>().await;
-        });
-        let three = ConfigurationDescriptor::new(
-            pair.epoch,
-            pair.primary.identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: pair.primary.identity.clone(),
-                    role: ReplicaRole::Primary,
+async fn hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline() {
+    let root = root();
+    let resource = ResourceUid::new("hung-native-carrier");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let destination = format!("http://{}", listener.local_addr().unwrap());
+    let entered = Arc::new(Notify::new());
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(native_wire::carrier_server::CarrierServer::new(
+                HungCarrier {
+                    entered: entered.clone(),
                 },
-                ConfigurationMember {
-                    identity: pair.secondary.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-                ConfigurationMember {
-                    identity: hung_identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        pair.primary
-            .handle()
-            .execute_public_v1(intent(
-                &pair.identity,
-                pair.primary.handle().process_session_id(),
-                5,
-                "hung-minority-primary-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: three.clone(),
-                    previous: None,
-                    replicas: vec![
-                        PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: pair.secondary.identity.clone(),
-                            replication_address: format!("http://{}", pair.secondary.address),
-                            process_session_id: pair.secondary.handle().process_session_id(),
-                            storage_incarnation: Some(pair.secondary.storage.clone()),
-                            role: ReplicaRole::ActiveSecondary,
-                            current_progress: 0,
-                            catch_up_capability: 0,
-                            must_catchup: false,
-                        },
-                        PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: hung_identity.clone(),
-                            replication_address: format!("http://{hung_address}"),
-                            process_session_id: hung_session.clone(),
-                            storage_incarnation: Some(hung_storage.clone()),
-                            role: ReplicaRole::ActiveSecondary,
-                            current_progress: 0,
-                            catch_up_capability: 0,
-                            must_catchup: false,
-                        },
-                    ],
-                }),
             ))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let record = observed.clone();
+    let route = TestingTcpRoute::register_with_kind(
+        source.identity.instance_id.to_string(),
+        move |kind, peer, canonical| {
+            record.lock().unwrap().push((kind, peer, canonical));
+            let destination = destination.clone();
+            Box::pin(async move { Ok(destination) })
+        },
+    )
+    .unwrap();
+    let (intent, _) = source.build_intent(&target, &single).await;
+    let handle = source.handle();
+    let mut build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), &mut build)
             .await
-            .unwrap();
-        pair.secondary
-            .handle()
-            .execute_public_v1(intent(
-                &pair.identity,
-                pair.secondary.handle().process_session_id(),
-                5,
-                "hung-minority-secondary-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: three,
-                    previous: None,
-                    replicas: vec![
-                        PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: pair.primary.identity.clone(),
-                            replication_address: format!("http://{}", pair.primary.address),
-                            process_session_id: pair.primary.handle().process_session_id(),
-                            storage_incarnation: Some(pair.primary.storage.clone()),
-                            role: ReplicaRole::Primary,
-                            current_progress: 0,
-                            catch_up_capability: 0,
-                            must_catchup: false,
-                        },
-                        PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: hung_identity.clone(),
-                            replication_address: format!("http://{hung_address}"),
-                            process_session_id: hung_session.clone(),
-                            storage_incarnation: Some(hung_storage.clone()),
-                            role: ReplicaRole::ActiveSecondary,
-                            current_progress: 0,
-                            catch_up_capability: 0,
-                            must_catchup: false,
-                        },
-                    ],
-                }),
-            ))
+            .is_err()
+    );
+    assert_eq!(observed.lock().unwrap()[0].0, TestingTcpRouteKind::Build);
+    let close = source.intent(PublicOperationProgram::Close).await;
+    let close_id = close.operation_id.clone();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        source.handle().execute_public_v1(close),
+    )
+    .await
+    .expect("terminal containment did not drain a hung native Build")
+    .unwrap_err();
+    assert!(!error.to_string().is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), build)
             .await
-            .unwrap();
-        let started = std::time::Instant::now();
-        assert_eq!(
-            pair.primary
-                .application
-                .replicate(Bytes::from_static(b"healthy-quorum"))
-                .await
-                .unwrap(),
-            1
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
-        hung_task.abort();
-        let _ = hung_task.await;
-        pair.cleanup().await;
-
-        let resource_uid = ResourceUid::new("required-hung-peer");
-        let preview = PublicV1Identity::new(78);
-        let mut primary =
-            HostedMemoryReplica::start("required-hung-primary", &resource_uid, &preview, 1).await;
-        let initialization =
-            derive_history_initialization_id(&resource_uid, PublicProtocolGeneration::new(78));
-        let history = derive_bootstrap_history(
-            &resource_uid,
-            PublicProtocolGeneration::new(78),
-            &initialization,
-        );
-        primary.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let hung_identity = replica_named(2, "required-hung-pod", "required-hung-agent");
-        let hung_storage = storage_named(
-            hung_identity.clone(),
-            "required-hung-pod",
-            "required-hung-pvc",
-        );
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let hung_address = listener.local_addr().unwrap();
-        let hung_task = tokio::spawn(async move {
-            let (_connection, _) = listener.accept().await.unwrap();
-            futures::future::pending::<()>().await;
-        });
-        install_static_authority(
-            &primary.handle(),
-            &preview,
-            primary.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: ConfigurationDescriptor::new(
-                    epoch,
-                    primary.identity.replica_id,
-                    vec![
-                        ConfigurationMember {
-                            identity: primary.identity.clone(),
-                            role: ReplicaRole::Primary,
-                        },
-                        ConfigurationMember {
-                            identity: hung_identity.clone(),
-                            role: ReplicaRole::ActiveSecondary,
-                        },
-                    ],
-                    2,
-                ),
-                previous: None,
-                replicas: vec![PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
-                    identity: hung_identity,
-                    replication_address: format!("http://{hung_address}"),
-                    process_session_id: ProcessSessionId::new("required-hung-session"),
-                    storage_incarnation: Some(hung_storage),
-                    role: ReplicaRole::ActiveSecondary,
-                    current_progress: 0,
-                    catch_up_capability: 0,
-                    must_catchup: false,
-                }],
-            },
-        )
-        .await;
-        let started = std::time::Instant::now();
-        assert!(
-            primary
-                .application
-                .replicate(Bytes::from_static(b"required-hung"))
-                .await
-                .is_err()
-        );
-        assert!(started.elapsed() < Duration::from_secs(7));
-        hung_task.abort();
-        let _ = hung_task.await;
-        primary.stop().await;
-        primary.cleanup();
-
-        let close_pair = AuthorizedHostedPair::start("hung-close", 79).await;
-        close_pair.secondary.state.block_apply();
-        let write = tokio::spawn({
-            let application = close_pair.primary.application.clone();
-            async move {
-                application
-                    .replicate(Bytes::from_static(b"close-drain"))
-                    .await
-            }
-        });
-        close_pair.secondary.state.apply_entered.notified().await;
-        let close = tokio::spawn({
-            let handle = close_pair.primary.handle();
-            let preview = close_pair.identity.clone();
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        5,
-                        "close-drains-peer-work",
-                        PublicOperationProgram::Close,
-                    ))
-                    .await
-            }
-        });
-        close_pair.secondary.state.release_apply.notify_waiters();
-        assert!(write.await.unwrap().is_err());
-        tokio::time::timeout(Duration::from_secs(7), close)
-            .await
-            .expect("Close did not drain bounded peer work")
             .unwrap()
-            .unwrap();
-        close_pair.cleanup().await;
-    })
-    .await
-    .unwrap();
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        source
+            .handle()
+            .public_v1_raw_retained_task_cardinality()
+            .unwrap(),
+        (0, 0)
+    );
+    let connection =
+        rusqlite::Connection::open(SqliteStore::metadata_database_path(&source.root)).unwrap();
+    let json: String = connection
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let close = &state["publicV1OperationState"]["operations"][close_id.as_str()];
+    assert_eq!(close["stage"], "completed");
+    assert!(
+        close["lifecycle"]["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outcome| {
+                outcome["CloseFailure"]["child"] == "Replicator"
+                    && outcome["CloseFailure"]["error"]
+                        .as_str()
+                        .is_some_and(|error| !error.is_empty())
+            }),
+        "native child Close failure was not retained after outer containment"
+    );
+    assert_ne!(source.report().await.write_status, AccessStatus::Granted);
+    drop(route);
+    server.abort();
+    let _ = server.await;
+    source.stop().await;
+    target.stop().await;
 }
 
 #[tokio::test]
-async fn replacement_is_store_free_access_gated_and_durable_before_ack() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let root = test_root("static");
-        let resource_uid = ResourceUid::new("preview-resource");
-        let preview = PublicV1Identity::new(1);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let database = SqliteStore::metadata_database_path(&root);
-        drop(
-            SqliteStore::create_public_v1(
-                &database,
-                preview.clone(),
-                store_identity(resource_uid.clone()),
+async fn public_v1_open_owns_one_registration_listener_and_writer_and_close_failure_is_retained() {
+    let root = root();
+    let resource = ResourceUid::new("native-open-once");
+    let mut node = Node::start(root.path(), &resource, 1).await;
+    assert_eq!(node.service.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
+    let open = node
+        .intent(PublicOperationProgram::Open {
+            replica: node.identity.clone(),
+            existing: node.report().await.open_mode == OpenMode::Existing,
+        })
+        .await;
+    node.handle().execute_public_v1(open.clone()).await.unwrap();
+    node.handle().execute_public_v1(open).await.unwrap();
+    assert_eq!(node.service.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(node.service.factories.load(Ordering::SeqCst), 1);
+    assert_eq!(node.handle().public_v1_provider_writer_count(), 1);
+    let partition = node.service.partition.read().await.clone().unwrap();
+    assert!(
+        partition
+            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
+            .create_replicator(
+                Some(node.service.provider.clone()),
+                Some(ReplicatorSettings {
+                    replication_address: node.service.address.clone()
+                })
             )
-            .unwrap(),
-        );
-        let control_address = free_address();
-        let replication_address = free_address();
-        let storage = Arc::new(MemoryState::default());
-        let application = Arc::new(PreviewApplication::new(
-            storage.clone(),
-            format!("http://{replication_address}"),
-        ));
-        let mut running = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("preview-pod-uid"),
-                pvc_uid: PvcUid::new("preview-pvc-uid"),
-                data_root: root.clone(),
-                replication_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            application.clone(),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding)
-        .start(
-            tokio::net::TcpListener::bind(control_address)
-                .await
-                .unwrap(),
-        )
+            .await
+            .is_err()
+    );
+    assert_eq!(node.service.factories.load(Ordering::SeqCst), 1);
+    let address: tonic::codegen::http::Uri = node
+        .report()
+        .await
+        .replication_address
+        .unwrap()
+        .parse()
+        .unwrap();
+    let socket = address.authority().unwrap().as_str().to_owned();
+    assert!(std::net::TcpListener::bind(&socket).is_err());
+    node.service.close_failure.store(true, Ordering::Release);
+    let intent = node.intent(PublicOperationProgram::Close).await;
+    let operation = intent.operation_id.clone();
+    assert!(
+        node.handle()
+            .execute_public_v1(intent)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected application close failure")
+    );
+    assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
+    assert!(std::net::TcpListener::bind(socket).is_ok());
+    let store = SqliteStore::open_public_v1(
+        SqliteStore::metadata_database_path(&node.root),
+        &node.preview,
+    )
+    .unwrap();
+    let record = store
+        .public_v1_operation_snapshot(&operation)
         .await
         .unwrap();
-        let handle = running.handle();
-        assert_eq!(handle.public_v1_provider_writer_count(), 0);
-        let generation = PublicProtocolGeneration::new(1);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_incarnation(replica()),
-            )
+    assert!(format!("{:?}", record.disposition).contains("Failed"));
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn retained_service_state_reopens_without_replaying_interrupted_application_children() {
+    let root = root();
+    let resource = ResourceUid::new("native-restart");
+    let mut node = Node::start(root.path(), &resource, 1).await;
+    node.open(ReplicaRole::Primary, EPOCH).await;
+    node.single(EPOCH).await;
+    node.service
+        .write(Bytes::from_static(b"retained"))
+        .await
+        .unwrap();
+    let prior = node.report().await;
+    node.stop().await;
+    let mut restarted = Node::start(root.path(), &resource, 1).await;
+    assert_ne!(
+        restarted.handle().process_session_id(),
+        prior.process_session_id
+    );
+    assert_eq!(restarted.service.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        restarted.service.provider.values(),
+        [Bytes::from_static(b"retained")]
+    );
+    restarted.open(ReplicaRole::Primary, Epoch::new(0, 2)).await;
+    restarted.single(Epoch::new(0, 2)).await;
+    assert_eq!(
+        restarted.service.values().await.unwrap(),
+        [Bytes::from_static(b"retained")]
+    );
+    assert_eq!(
+        restarted
+            .service
+            .write(Bytes::from_static(b"after-restart"))
             .await
-            .unwrap();
-        let session = handle.process_session_id();
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                session.clone(),
-                1,
-                "open",
-                PublicOperationProgram::Open {
-                    replica: replica(),
-                    existing: true,
-                },
-            ))
-            .await
-            .unwrap();
-        assert_eq!(handle.public_v1_provider_writer_count(), 1);
-        let epoch = Epoch::new(0, 1);
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                session.clone(),
-                2,
-                "role",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::Primary,
-                },
-            ))
-            .await
-            .unwrap();
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                session.clone(),
-                3,
-                "epoch",
-                PublicOperationProgram::Epoch { epoch },
-            ))
-            .await
-            .unwrap();
-        let before = handle.public_v1_report().await.unwrap();
-        assert_eq!(
-            before.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        let configuration = ConfigurationDescriptor::new(
+            .unwrap(),
+        2
+    );
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn incompatible_or_corrupt_provider_and_agent_formats_reject_before_mutation() {
+    let root = root();
+    let application = root.path().join("application");
+    std::fs::create_dir_all(&application).unwrap();
+    let bad = application.join("service.json");
+    std::fs::write(&bad, br#"{"format":"old-engine","epoch":{},"values":[]}"#).unwrap();
+    assert!(Provider::new(application.clone()).is_err());
+    assert_eq!(
+        std::fs::read(&bad).unwrap(),
+        br#"{"format":"old-engine","epoch":{},"values":[]}"#
+    );
+    let resource = ResourceUid::new("old-agent-schema");
+    let mut node = Node::start(&root.path().join("agent"), &resource, 1).await;
+    node.stop().await;
+    let database = SqliteStore::metadata_database_path(&node.root);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.pragma_update(None, "user_version", 6).unwrap();
+    drop(connection);
+    let before = std::fs::read(&database).unwrap();
+    assert!(SqliteStore::open_public_v1(&database, &node.preview).is_err());
+    assert_eq!(std::fs::read(database).unwrap(), before);
+}
+
+#[tokio::test]
+async fn retained_secondary_promotion_preserves_acknowledged_bytes_and_replaces_service_location() {
+    let root = root();
+    let pair = Pair::start(root.path(), 1).await;
+    pair.source
+        .service
+        .write(Bytes::from_static(b"before-promotion"))
+        .await
+        .unwrap();
+    assert!(pair.source.report().await.service_location.is_some());
+    let epoch = Epoch::new(0, 2);
+    pair.source
+        .command(PublicOperationProgram::Role {
             epoch,
-            ReplicaId::new(1),
-            vec![ConfigurationMember {
-                identity: replica(),
+            role: ReplicaRole::ActiveSecondary,
+        })
+        .await
+        .unwrap();
+    pair.source
+        .command(PublicOperationProgram::Epoch { epoch })
+        .await
+        .unwrap();
+    pair.target
+        .command(PublicOperationProgram::Role {
+            epoch,
+            role: ReplicaRole::Primary,
+        })
+        .await
+        .unwrap();
+    pair.target
+        .command(PublicOperationProgram::Epoch { epoch })
+        .await
+        .unwrap();
+    let promoted = ConfigurationDescriptor::new(
+        epoch,
+        pair.target.identity.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: pair.target.identity.clone(),
                 role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                session,
-                4,
-                "configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: configuration,
-                    previous: None,
-                    replicas: Vec::new(),
-                }),
-            ))
-            .await
-            .unwrap();
-        let ready = handle.public_v1_report().await.unwrap();
-        assert_eq!(
-            ready.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::Granted
-        );
-
-        storage.block_commit();
-        let write = tokio::spawn({
-            let application = application.clone();
-            async move { application.replicate(Bytes::from_static(b"durable")).await }
-        });
-        storage.commit_entered.notified().await;
-        assert!(
-            !write.is_finished(),
-            "ACK preceded provider commit durability"
-        );
-        storage.release_commit.notify_waiters();
-        assert_eq!(write.await.unwrap().unwrap(), 1);
-        assert_eq!(storage.progress.lock().unwrap().committed_lsn, 1);
-        assert!(!application.on_data_loss().await.unwrap());
-        storage.change_on_data_loss();
-        assert!(application.on_data_loss().await.unwrap());
-        storage.fail_next_data_loss();
-        assert!(application.on_data_loss().await.is_err());
-        assert!(
-            application
-                .replicate(Bytes::from_static(b"requires-history-readmission"))
-                .await
-                .is_err()
-        );
-
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                handle.process_session_id(),
-                5,
-                "close",
-                PublicOperationProgram::Close,
-            ))
-            .await
-            .unwrap();
-        std::net::TcpListener::bind(replication_address).unwrap();
-        running.shutdown();
-        running.wait().await.unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-
-        let root = test_root("open-failure");
-        let resource_uid = ResourceUid::new("preview-open-failure");
-        let preview = PublicV1Identity::new(5);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&root),
-                preview.clone(),
-                store_identity(resource_uid.clone()),
-            )
-            .unwrap(),
-        );
-        let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let replication_address = blocker.local_addr().unwrap();
-        let mut running = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("preview-pod-uid"),
-                pvc_uid: PvcUid::new("preview-pvc-uid"),
-                data_root: root.clone(),
-                replication_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
             },
-            Arc::new(PreviewApplication::new(
-                Arc::new(MemoryState::default()),
-                format!("http://{replication_address}"),
-            )),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let handle = running.handle();
-        let generation = PublicProtocolGeneration::new(5);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_incarnation(replica()),
-            )
-            .await
-            .unwrap();
-        assert!(
-            handle
-                .execute_public_v1(intent(
-                    &preview,
-                    handle.process_session_id(),
-                    1,
-                    "open-failure",
-                    PublicOperationProgram::Open {
-                        replica: replica(),
-                        existing: true,
-                    },
-                ))
-                .await
-                .is_err(),
-            "preview Open failure must fail the durable Open"
-        );
-        assert!(handle.public_v1_report().await.is_err());
-        drop(blocker);
-        std::net::TcpListener::bind(replication_address).unwrap();
-        running.shutdown();
-        running.wait().await.unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn commit_failure_permanently_contains_the_ambiguous_suffix() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let root = test_root("commit-ambiguity");
-        let resource_uid = ResourceUid::new("preview-commit-ambiguity");
-        let preview = PublicV1Identity::new(8);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&root),
-                preview.clone(),
-                store_identity(resource_uid.clone()),
-            )
-            .unwrap(),
-        );
-        let replication_address = free_address();
-        let storage = Arc::new(MemoryState::default());
-        let application = Arc::new(PreviewApplication::new(
-            storage.clone(),
-            format!("http://{replication_address}"),
-        ));
-        let mut running = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("preview-pod-uid"),
-                pvc_uid: PvcUid::new("preview-pvc-uid"),
-                data_root: root.clone(),
-                replication_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
+            ConfigurationMember {
+                identity: pair.source.identity.clone(),
+                role: ReplicaRole::ActiveSecondary,
             },
-            application.clone(),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let handle = running.handle();
-        let generation = PublicProtocolGeneration::new(8);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_incarnation(replica()),
-            )
-            .await
-            .unwrap();
-        let epoch = Epoch::new(0, 1);
-        install_static_authority(
-            &handle,
-            &preview,
-            replica(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: ConfigurationDescriptor::new(
-                    epoch,
-                    ReplicaId::new(1),
-                    vec![ConfigurationMember {
-                        identity: replica(),
-                        role: ReplicaRole::Primary,
-                    }],
-                    1,
-                ),
+        ],
+        2,
+    );
+    for (local, remote, role) in [
+        (&pair.source, &pair.target, ReplicaRole::Primary),
+        (&pair.target, &pair.source, ReplicaRole::ActiveSecondary),
+    ] {
+        local
+            .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                current: promoted.clone(),
                 previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        let ready = handle.public_v1_report().await.unwrap();
-        assert_eq!(
-            ready.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::Granted
-        );
-
-        storage.fail_next_commit();
-        let error = application
-            .replicate(Bytes::from_static(b"ambiguous"))
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("injected provider commit failure")
-        );
-        assert_eq!(
-            *storage.progress.lock().unwrap(),
-            DurableApplicationProgress {
-                applied_lsn: 1,
-                committed_lsn: 0,
-            }
-        );
-        assert_eq!(
-            application
-                .control
-                .read()
-                .await
-                .clone()
-                .unwrap()
-                .current_progress()
-                .await
-                .unwrap(),
-            0
-        );
-        let fenced = handle.public_v1_report().await.unwrap();
-        assert_eq!(
-            fenced.read_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        assert_eq!(
-            fenced.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        assert!(
-            application
-                .replicate(Bytes::from_static(b"later"))
-                .await
-                .is_err()
-        );
-        assert_eq!(storage.operations.lock().unwrap().len(), 1);
-
-        DurableState::commit(storage.as_ref(), 1).await.unwrap();
-        handle
-            .execute_public_v1(intent(
-                &preview,
-                handle.process_session_id(),
-                5,
-                "progress-after-ambiguity",
-                PublicOperationProgram::Progress { capability: false },
-            ))
+                replicas: vec![remote.descriptor(role).await],
+            }))
             .await
             .unwrap();
-        let still_fenced = handle.public_v1_report().await.unwrap();
-        assert_eq!(
-            application
-                .control
-                .read()
-                .await
-                .clone()
-                .unwrap()
-                .current_progress()
-                .await
-                .unwrap(),
-            0,
-            "raw provider commitment does not bypass acknowledged engine progress"
-        );
-        assert_eq!(still_fenced.progress.first, 1);
-        assert_eq!(still_fenced.progress.last, 1);
-        assert_eq!(
-            still_fenced.read_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        assert_eq!(
-            still_fenced.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-
-        running.shutdown();
-        running.wait().await.unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    })
-    .await
-    .unwrap();
+    }
+    assert!(pair.source.report().await.service_location.is_none());
+    assert!(pair.target.report().await.service_location.is_some());
+    assert!(
+        pair.source
+            .service
+            .write(Bytes::from_static(b"revoked-primary"))
+            .await
+            .is_err()
+    );
+    assert_eq!(pair.target.service.values().await.unwrap().len(), 2);
+    assert_eq!(
+        pair.target
+            .service
+            .write(Bytes::from_static(b"after-promotion"))
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        pair.source.service.provider.values(),
+        pair.target.service.provider.values()
+    );
+    pair.stop().await;
 }
 
 #[tokio::test]
-async fn preview_rejects_schema6_and_crossed_factory_without_fallback() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let root = test_root("crossed");
-        let resource_uid = ResourceUid::new("preview-crossed");
-        let database = SqliteStore::metadata_database_path(&root);
-        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
-        let connection = rusqlite::Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE agent_state (
-                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                    state_json TEXT NOT NULL
-                 );",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO agent_state(singleton, state_json) VALUES(1, ?1)",
-                [
-                    serde_json::to_string(&AgentState::new(store_identity(resource_uid.clone())))
-                        .unwrap(),
-                ],
-            )
-            .unwrap();
-        connection.pragma_update(None, "user_version", 6).unwrap();
-        drop(connection);
-        let replication_address = free_address();
-        let preview = PublicV1Identity::new(2);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview,
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let storage = Arc::new(MemoryState::default());
-        let application = Arc::new(PreviewApplication::new(
-            storage,
-            format!("http://{replication_address}"),
-        ));
-        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let control_address = control_listener.local_addr().unwrap();
-        let result = ReplicaHost::new(
+async fn exact_idle_removal_does_not_reauthorize_retired_service_work() {
+    let root = root();
+    let resource = ResourceUid::new("native-idle-removal");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    source
+        .service
+        .write(Bytes::from_static(b"before-removal"))
+        .await
+        .unwrap();
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    let build = source.build(&target, &single).await;
+    target.command(PublicOperationProgram::Abort).await.unwrap();
+    let removal = source
+        .intent(PublicOperationProgram::Remove(PublicBuildInput {
+            attempt: build.attempt.build_id.clone(),
+            epoch: build.attempt.epoch,
+            current_configuration_id: Some(build.current_configuration_id.clone()),
+            replica: build.attempt.target.clone(),
+            target_storage: build.attempt.target_storage.clone(),
+            process_session_id: build.attempt.target_session.clone(),
+            replication_address: build.target_address.clone(),
+            history: Some(build.history.clone()),
+            source_address: build.source_address.clone(),
+        }))
+        .await;
+    source
+        .handle()
+        .execute_public_v1(removal.clone())
+        .await
+        .unwrap();
+    source
+        .handle()
+        .execute_public_v1(removal.clone())
+        .await
+        .unwrap();
+    let report = source.report().await;
+    assert!(report.completed_operations.iter().any(|completion| {
+        completion.operation_id == removal.operation_id
+            && completion.call_kind == PublicV1CallKind::Remove
+            && completion.result == PublicV1OperationResult::Succeeded
+    }));
+    assert_eq!(
+        source
+            .service
+            .write(Bytes::from_static(b"after-removal"))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(target.service.provider.values().len(), 1);
+    assert!(
+        target
+            .service
+            .write(Bytes::from_static(b"retired"))
+            .await
+            .is_err()
+    );
+    source.stop().await;
+    target.stop().await;
+}
+
+#[tokio::test]
+async fn terminal_close_restarts_fenced_without_replaying_application_open() {
+    let root = root();
+    let resource = ResourceUid::new("terminal-restart");
+    let mut node = Node::start(root.path(), &resource, 1).await;
+    node.open(ReplicaRole::Primary, EPOCH).await;
+    node.single(EPOCH).await;
+    node.service
+        .write(Bytes::from_static(b"durable-before-terminal"))
+        .await
+        .unwrap();
+    node.command(PublicOperationProgram::Close).await.unwrap();
+    node.stop().await;
+    let mut restarted = Node::start(root.path(), &resource, 1).await;
+    assert_eq!(restarted.service.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        restarted.service.provider.values(),
+        [Bytes::from_static(b"durable-before-terminal")]
+    );
+    assert_ne!(restarted.report().await.write_status, AccessStatus::Granted);
+    assert!(
+        restarted
+            .command(PublicOperationProgram::Open {
+                replica: restarted.identity.clone(),
+                existing: true,
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(restarted.service.opens.load(Ordering::SeqCst), 0);
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn caller_owned_control_listener_is_released_when_startup_is_cancelled() {
+    let root = root();
+    for drop_sender in [false, true] {
+        let resource = ResourceUid::new(format!("cancel-startup-{drop_sender}"));
+        let service = Application::new(
+            root.path().join(format!("service-{drop_sender}")),
+            "http://127.0.0.1:0".into(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let data_root = root.path().join(format!("host-{drop_sender}"));
+        let host = ReplicaHost::new(
             ReplicaProcessConfig {
-                resource_uid,
+                resource_uid: resource.clone(),
                 replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("preview-pod-uid"),
-                pvc_uid: PvcUid::new("preview-pvc-uid"),
-                data_root: root.clone(),
-                replication_address,
-                bearer_token: "preview-token".into(),
+                pod_uid: PodUid::new("cancel-pod"),
+                pvc_uid: PvcUid::new("cancel-pvc"),
+                data_root: data_root.clone(),
+                replication_address: "127.0.0.1:0".parse().unwrap(),
+                bearer_token: TOKEN.into(),
                 rpc_deadline: Duration::from_secs(2),
                 transport_window_capacity: 8,
             },
-            application,
+            service.clone(),
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .with_public_v1_binding(binding)
-        .start(control_listener)
-        .await;
-        assert!(result.is_err(), "schema 6 must not fall back to legacy");
-        tokio::net::TcpListener::bind(control_address)
-            .await
-            .unwrap();
-        std::net::TcpListener::bind(replication_address).unwrap();
-        std::fs::remove_dir_all(root).unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn caller_bound_control_listener_is_released_on_startup_cancellation() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        for (cancel_before_start, drop_sender) in
-            [(true, false), (false, false), (true, true), (false, true)]
-        {
-            let root = test_root("cancel-caller-bound-control");
-            let resource_uid = ResourceUid::new("cancel-caller-bound-control");
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let application = Arc::new(PreviewApplication::new(
-                Arc::new(MemoryState::default()),
-                "http://127.0.0.1:0".into(),
-            ));
-            let host = ReplicaHost::new(
-                ReplicaProcessConfig {
-                    resource_uid: resource_uid.clone(),
-                    replica_id: ReplicaId::new(1),
-                    pod_uid: PodUid::new("cancel-pod"),
-                    pvc_uid: PvcUid::new("cancel-pvc"),
-                    data_root: root.clone(),
-                    replication_address: "127.0.0.1:0".parse().unwrap(),
-                    bearer_token: "preview-token".into(),
-                    rpc_deadline: Duration::from_secs(2),
-                    transport_window_capacity: 8,
-                },
-                application.clone(),
-                ApplicationStorageState::FreshEmpty,
-                Arc::new(Resolver),
-            );
-            assert!(tokio::net::TcpListener::bind(address).await.is_err());
-            let (shutdown, receiver) =
-                tokio::sync::watch::channel(cancel_before_start && !drop_sender);
-            let mut shutdown = Some(shutdown);
-            if cancel_before_start && drop_sender {
-                drop(shutdown.take());
-            }
-            let startup = tokio::spawn(host.start_with_shutdown(listener, receiver));
-            if !cancel_before_start {
-                let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
-                    "http://{address}"
-                ))
-                .await
-                .unwrap();
-                let report = client
-                    .get_status(authorized(proto::GetAgentStatusRequest {
-                        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                        resource_uid: resource_uid.to_string(),
-                        replica_id: 1,
-                        expected_instance_id: "cancel-pod".into(),
-                    }))
-                    .await
-                    .unwrap()
-                    .into_inner();
-                assert_eq!(
-                    report.storage_state,
-                    proto::AgentStorageState::Uninitialized as i32
-                );
-                drop(client);
-                if drop_sender {
-                    drop(shutdown.take());
-                } else {
-                    shutdown.as_ref().unwrap().send_replace(true);
-                }
-            }
-            assert!(startup.await.unwrap().unwrap().is_none());
-            tokio::net::TcpListener::bind(address).await.unwrap();
-            assert!(!SqliteStore::metadata_database_path(&root).exists());
-            assert_eq!(application.opens.load(Ordering::SeqCst), 0);
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn replacement_initialization_creates_exact_bound_schema12_before_open() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let root = test_root("fresh-replacement_schema");
-        let resource_uid = ResourceUid::new("preview-fresh-replacement_schema");
-        let preview = PublicV1Identity::new(6);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
+        .with_public_v1_binding(PublicV1LifecycleBinding {
+            identity: PublicV1Identity::new(1),
+            resource_uid: resource,
             spec_generation: 1,
             state_persistence: StatePersistence::Persisted,
-        };
-        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let control_address = control_listener.local_addr().unwrap();
-        let replication_address = free_address();
-        let application = Arc::new(PreviewApplication::new(
-            Arc::new(MemoryState::default()),
-            format!("http://{replication_address}"),
-        ));
-        let host = tokio::spawn(
-            ReplicaHost::new(
-                ReplicaProcessConfig {
-                    resource_uid: resource_uid.clone(),
-                    replica_id: ReplicaId::new(1),
-                    pod_uid: PodUid::new("fresh-pod"),
-                    pvc_uid: PvcUid::new("fresh-pvc"),
-                    data_root: root.clone(),
-                    replication_address,
-                    bearer_token: "preview-token".into(),
-                    rpc_deadline: Duration::from_secs(2),
-                    transport_window_capacity: 8,
-                },
-                application,
-                ApplicationStorageState::FreshEmpty,
-                Arc::new(Resolver),
-            )
-            .with_public_v1_binding(binding)
-            .start(control_listener),
+        });
+        let (shutdown, receiver) = watch::channel(false);
+        let startup = tokio::spawn(host.start_with_shutdown(listener, receiver));
+        if drop_sender {
+            drop(shutdown);
+        } else {
+            shutdown.send_replace(true);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), startup)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .is_none()
         );
-        let mut client = loop {
+        tokio::net::TcpListener::bind(address).await.unwrap();
+        assert!(!SqliteStore::metadata_database_path(&data_root).exists());
+        assert_eq!(service.opens.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn replacement_initialization_persists_exact_identity_before_application_open() {
+    use kuberic_runtime::control::proto;
+    let root = root();
+    let resource = ResourceUid::new("native-public-initialization");
+    let service =
+        Application::new(root.path().join("application"), "http://127.0.0.1:0".into()).unwrap();
+    *service.owner.lock().unwrap() = Arc::downgrade(&service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let preview = PublicV1Identity::new(1);
+    let host = ReplicaHost::new(
+        ReplicaProcessConfig {
+            resource_uid: resource.clone(),
+            replica_id: ReplicaId::new(1),
+            pod_uid: PodUid::new("fresh-pod"),
+            pvc_uid: PvcUid::new("fresh-pvc"),
+            data_root: root.path().to_path_buf(),
+            replication_address: "127.0.0.1:0".parse().unwrap(),
+            bearer_token: TOKEN.into(),
+            rpc_deadline: Duration::from_secs(5),
+            transport_window_capacity: 8,
+        },
+        service.clone(),
+        ApplicationStorageState::FreshEmpty,
+        Arc::new(Resolver),
+    )
+    .with_public_v1_binding(PublicV1LifecycleBinding {
+        identity: preview.clone(),
+        resource_uid: resource.clone(),
+        spec_generation: 1,
+        state_persistence: StatePersistence::Persisted,
+    })
+    .with_application_storage_paths(std::collections::BTreeMap::from([(
+        "application".into(),
+        root.path().join("application"),
+    )]));
+    let startup = tokio::spawn(host.start(listener));
+    let mut client = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
             match proto::agent_control_client::AgentControlClient::connect(format!(
-                "http://{control_address}"
+                "http://{address}"
             ))
             .await
             {
                 Ok(client) => break client,
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
-        };
-        let status = client
-            .get_status(authorized(proto::GetAgentStatusRequest {
-                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                resource_uid: resource_uid.to_string(),
-                replica_id: 1,
-                expected_instance_id: "fresh-pod".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        let initialization = derive_initialization_id(
-            &resource_uid,
-            ReplicaId::new(1),
-            &PodUid::new("fresh-pod"),
-            &PvcUid::new("fresh-pvc"),
-        );
-        let identity = ReplicaIdentity {
-            replica_id: ReplicaId::new(1),
-            instance_id: ReplicaInstanceId::new("fresh-pod"),
-            agent_generation: derive_agent_generation(&initialization),
-        };
-        let configuration = ConfigurationDescriptor::new(
-            Epoch::new(0, 1),
-            ReplicaId::new(1),
-            vec![ConfigurationMember {
-                identity: identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        let initialization_response = client
-            .execute(authorized(proto::ExecuteCommandRequest {
-                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                resource_uid: resource_uid.to_string(),
-                target: Some(identity.clone().into()),
-                expected_process_session_id: status.process_session_id,
-                command: Some(
-                    proto::execute_command_request::Command::InitializeAgentStore(
-                        proto::InitializeAgentStoreCommand {
-                            initialization_id: initialization.to_string(),
-                            resource_uid: resource_uid.to_string(),
-                            local_replica_id: 1,
-                            expected_instance_id: "fresh-pod".into(),
-                            expected_pod_uid: "fresh-pod".into(),
-                            expected_pvc_uid: "fresh-pvc".into(),
-                            assigned_agent_generation: identity.agent_generation.to_string(),
-                            effective_policy: Some(proto::EffectivePolicy {
-                                replica_set_size: 1,
-                                write_quorum: 1,
-                                read_quorum: 1,
-                                failover_delay_seconds: 30,
-                            }),
-                            bootstrap_configuration: Some(configuration.into()),
-                            provisioning: None,
-                        },
-                    ),
-                ),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        kuberic_runtime::control::normalize_uninitialized_agent_status_report(
-            initialization_response
-                .observation
-                .expect("initialization response observation"),
-        )
-        .unwrap();
-        drop(client);
-        let mut running = host.await.unwrap().unwrap();
-        let mut established = proto::agent_control_client::AgentControlClient::connect(format!(
-            "http://{control_address}"
-        ))
-        .await
-        .unwrap();
-        let report = established
-            .get_status(authorized(proto::GetAgentStatusRequest {
-                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                resource_uid: resource_uid.to_string(),
-                replica_id: 1,
-                expected_instance_id: "fresh-pod".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        let report =
-            kuberic_runtime::control::normalize_public_v1_agent_status_report(report).unwrap();
-        assert_eq!(report.replica, identity);
-        assert_eq!(report.role, ReplicaRole::None);
-        assert!(
-            tokio::net::TcpListener::bind(control_address)
-                .await
-                .is_err()
-        );
-        let database = SqliteStore::metadata_database_path(&root);
-        let connection = rusqlite::Connection::open(&database).unwrap();
-        let schema: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(schema, 12);
-        drop(connection);
-        drop(SqliteStore::open_public_v1(&database, &preview).unwrap());
-        running.shutdown();
-        running.wait().await.unwrap();
-        tokio::net::TcpListener::bind(control_address)
-            .await
-            .unwrap();
-        std::fs::remove_dir_all(root).unwrap();
+        }
     })
     .await
     .unwrap();
+    let authorized = |message| {
+        let mut request = Request::new(message);
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        request
+    };
+    let mut request = Request::new(proto::GetAgentStatusRequest {
+        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+        resource_uid: resource.to_string(),
+        replica_id: 1,
+        expected_instance_id: "fresh-pod".into(),
+    });
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    let status = client.get_status(request).await.unwrap().into_inner();
+    assert_eq!(
+        status.storage_state,
+        proto::AgentStorageState::Uninitialized as i32
+    );
+    assert_eq!(service.opens.load(Ordering::SeqCst), 0);
+    let initialization = derive_initialization_id(
+        &resource,
+        ReplicaId::new(1),
+        &PodUid::new("fresh-pod"),
+        &PvcUid::new("fresh-pvc"),
+    );
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("fresh-pod"),
+        agent_generation: derive_agent_generation(&initialization),
+    };
+    let configuration = ConfigurationDescriptor::new(
+        EPOCH,
+        identity.replica_id,
+        vec![ConfigurationMember {
+            identity: identity.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    client
+        .execute(authorized(proto::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: resource.to_string(),
+            target: Some(identity.clone().into()),
+            expected_process_session_id: status.process_session_id,
+            command: Some(
+                proto::execute_command_request::Command::InitializeAgentStore(
+                    proto::InitializeAgentStoreCommand {
+                        initialization_id: initialization.to_string(),
+                        resource_uid: resource.to_string(),
+                        local_replica_id: 1,
+                        expected_instance_id: "fresh-pod".into(),
+                        expected_pod_uid: "fresh-pod".into(),
+                        expected_pvc_uid: "fresh-pvc".into(),
+                        assigned_agent_generation: identity.agent_generation.to_string(),
+                        effective_policy: Some(EffectivePolicy::fixed(1, 1).unwrap().into()),
+                        bootstrap_configuration: Some(configuration.into()),
+                        provisioning: None,
+                    },
+                ),
+            ),
+        }))
+        .await
+        .unwrap();
+    let mut running = tokio::time::timeout(Duration::from_secs(10), startup)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let report = running.handle().public_v1_report().await.unwrap();
+    assert_eq!(report.replica, identity);
+    assert_eq!(report.open_mode, OpenMode::New);
+    assert_eq!(service.opens.load(Ordering::SeqCst), 0);
+    let database = SqliteStore::metadata_database_path(root.path());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version,
+        kuberic_runtime::testing::sqlite_store::PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION
+    );
+    drop(connection);
+    let program = PublicOperationProgram::Open {
+        replica: identity,
+        existing: false,
+    };
+    running
+        .handle()
+        .execute_public_v1(PublicOperationIntent {
+            identity: preview,
+            operation_id: OperationId::new("public-initialization-open"),
+            revision: 1,
+            process_session_id: report.process_session_id,
+            class: PublicOperationClass::Authority,
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
+        })
+        .await
+        .unwrap();
+    assert_eq!(service.opens.load(Ordering::SeqCst), 1);
+    running.shutdown();
+    running.wait().await.unwrap();
+    service.drain().await;
+    drop(client);
+    tokio::net::TcpListener::bind(address).await.unwrap();
 }
 
 #[tokio::test]
-async fn hosted_public_v1_authorized_data_loss_maps_only_the_effective_outcome() {
-    #[derive(Clone, Copy)]
-    enum Outcome {
-        Unchanged,
-        Changed,
-        Error,
-        AmbiguousReplacement,
+async fn production_config_has_no_protocol_selector_or_application_commit_oracle() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let process = std::fs::read_to_string(manifest.join("src/host/process.rs")).unwrap();
+    let config = process
+        .split("pub struct ReplicaProcessConfig")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(!config.contains("preview"));
+    assert!(!manifest.join("src/replicator/stateless/mod.rs").exists());
+    let replicator = std::fs::read_to_string(manifest.join("src/replicator/mod.rs")).unwrap();
+    assert!(!replicator.contains("mod stateless;"));
+    let production =
+        std::fs::read_to_string(manifest.join("src/replicator/v1/service_adapter/production.rs"))
+            .unwrap();
+    for forbidden in [
+        "ManagedReplicaStore",
+        "DurableState",
+        "LocalWriteJournal",
+        "ReplicationProgressStore",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "native owner depends on service persistence: {forbidden}"
+        );
     }
-
-    tokio::time::timeout(Duration::from_secs(120), async {
-        for (index, outcome) in [
-            Outcome::Unchanged,
-            Outcome::Changed,
-            Outcome::Error,
-            Outcome::AmbiguousReplacement,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let resource_uid = ResourceUid::new(format!("preview-data-loss-{index}"));
-            let generation_number = 30 + u64::try_from(index).unwrap();
-            let preview = PublicV1Identity::new(generation_number);
-            let mut replica = HostedMemoryReplica::start(
-                &format!("data-loss-{index}"),
-                &resource_uid,
-                &preview,
-                1,
-            )
-            .await;
-            let generation = PublicProtocolGeneration::new(generation_number);
-            let initialization = derive_history_initialization_id(&resource_uid, generation);
-            let predecessor = derive_bootstrap_history(&resource_uid, generation, &initialization);
-            replica
-                .initialize_history(&initialization, &predecessor)
-                .await;
-            if matches!(outcome, Outcome::Unchanged) {
-                for lsn in 1..=11 {
-                    replica.state.apply(Operation {
-                        lsn,
-                        committed_lsn: lsn - 1,
-                        data: Bytes::from(format!("sf-d02-recovery-{lsn}")),
-                    }).await.unwrap();
-                }
-                replica.state.commit(10).await.unwrap();
-            }
-            replica
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    replica.handle().process_session_id(),
-                    1,
-                    &format!("recovery-open-{index}"),
-                    PublicOperationProgram::Open {
-                        replica: replica.identity.clone(),
-                        existing: true,
-                    },
-                ))
-                .await
-                .unwrap();
-            let before = replica.handle().public_v1_report().await.unwrap();
-            assert_eq!(before.write_status, AccessStatus::NotPrimary);
-
-            let authorization_id = OperationId::new(format!("authorize-data-loss-{index}"));
-            let proposed = derive_data_loss_history(
-                &authorization_id,
-                &predecessor,
-                predecessor.data_loss_number + 1,
-                &replica.storage,
-            )
-            .unwrap();
-            let authorization = DataLossAuthorization {
-                authorization_id: authorization_id.clone(),
-                predecessor: predecessor.clone(),
-                proposed: proposed.clone(),
-                provisional_primary: replica.storage.clone(),
-                reset_scope: match outcome {
-                    Outcome::Changed | Outcome::AmbiguousReplacement => {
-                        ProviderProgressReset::ResetToEmpty
-                    }
-                    Outcome::Unchanged | Outcome::Error => ProviderProgressReset::Preserve,
-                },
-                replay_disposition: DataLossReplay::ReplaceOnAmbiguity,
-            };
-            let endpoint = replica
-                .handle()
-                .public_v1_process_endpoint(ReplicaRole::None)
-                .await
-                .unwrap();
-            let recovery_epoch = Epoch::new(proposed.data_loss_number, 1);
-            let attempt = DataLossAttempt {
-                authorization_id,
-                attempt_id: OperationId::new(format!("data-loss-attempt-{index}")),
-                process: ProcessAttemptContext {
-                    process_session_id: endpoint.process_session_id.clone(),
-                    replicator_creation_id: endpoint.replicator_creation_id,
-                    catch_up_specific_quorum: true,
-                    data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
-                    epoch: recovery_epoch,
-                    attempt_revision: 2,
-                },
-            };
-            let members = vec![ConfigurationMember {
-                identity: replica.identity.clone(),
-                role: ReplicaRole::Primary,
-            }];
-            let lifecycle = PublicLifecycleInput {
-                recipe: PublicLifecycleRecipe::InitialPrimary,
-                replica: replica.identity.clone(),
-                epoch: recovery_epoch,
-                possible_data_loss: PossibleDataLossIntent::Possible,
-                current: ConfigurationDescriptor::new(
-                    recovery_epoch,
-                    replica.identity.replica_id,
-                    members.clone(),
-                    1,
-                ),
-                previous: Some(ConfigurationDescriptor::new(
-                    Epoch::new(proposed.data_loss_number, 0),
-                    replica.identity.replica_id,
-                    members,
-                    1,
-                )),
-                replicas: Vec::new(),
-                data_loss_recovery: Some(PublicDataLossRecoveryInput {
-                    authorization: authorization.clone(),
-                    attempt: attempt.clone(),
-                }),
-            };
-            let recovery_intent = PublicOperationIntent {
-                identity: preview.clone(),
-                operation_id: attempt.attempt_id.clone(),
-                revision: attempt.process.attempt_revision,
-                process_session_id: attempt.process.process_session_id.clone(),
-                class: PublicOperationClass::Authority,
-                input_digest: lifecycle.digest(),
-                replay_disposition: PublicOperationReplayDisposition::DataLoss(
-                    DataLossReplay::ReplaceOnAmbiguity,
-                ),
-                lifecycle: Some(lifecycle),
-                program: None,
-            };
-            let accepted = PublicV1AcceptedStatus {
-                identity: preview.clone(),
-                history_initialization_id: initialization,
-                history: predecessor.clone(),
-                data_loss_recovery: None,
-                completed_operations: Vec::new(),
-                extensions: Default::default(),
-            };
-            let transition = PublicV1AcceptedTransitionStatus {
-                resource_version: format!("data-loss-status-rv-{index}"),
-                evidence: accepted.clone(),
-                intent: PublicV1AcceptedTransitionIntent {
-                    consumer: PublicV1EvidenceConsumer::DataLoss,
-                    operation_id: recovery_intent.operation_id.clone(),
-                    revision: recovery_intent.revision,
-                    call_kind: PublicV1CallKind::InitialPrimary,
-                    history: predecessor.clone(),
-                    source: PublicV1ResourceAuthority {
-                        storage_incarnation: replica.storage.clone(),
-                        resource_version: format!("data-loss-resource-rv-{index}"),
-                    },
-                    target: None,
-                    process_session_id: recovery_intent.process_session_id.clone(),
-                    input_digest: recovery_intent.input_digest.clone(),
-                    replay_disposition: recovery_intent.replay_disposition,
-                    previous_configuration_id: None,
-                    current_configuration_id: None,
-                    catch_up_mode: None,
-                    catch_up_specific_quorum: None,
-                },
-            };
-            let evidence = Arc::new(
-                PublicV1EvidenceState::new(
-                    transition,
-                    vec![PublicV1EvidenceResource {
-                        storage_incarnation: replica.storage.clone(),
-                        resource_version: format!("data-loss-resource-rv-{index}"),
-                        proof: Some(PublicV1ResourceProof {
-                            history: predecessor.clone(),
-                            storage_incarnation: replica.storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    }],
-                )
-                .unwrap(),
-            );
-            let adapter = HostedPublicV1Harness::new(
-                vec![HostedPublicV1Replica {
-                    identity: replica.identity.clone(),
-                    replication_address: format!("http://{}", replica.address),
-                    handle: replica.handle(),
-                }],
-                Some(accepted.clone()),
-                None,
-                evidence,
-            )
-            .unwrap();
-
-            let mut wrong_authorization = authorization.clone();
-            wrong_authorization.authorization_id =
-                OperationId::new(format!("wrong-data-loss-{index}"));
-            assert!(
-                plan_public_v1_data_loss_recovery(
-                    &accepted,
-                    &before,
-                    &wrong_authorization,
-                    &attempt,
-                    &recovery_intent,
-                    false,
-                )
-                .is_err()
-            );
-            let mut missing = recovery_intent.clone();
-            missing.lifecycle.as_mut().unwrap().data_loss_recovery = None;
-            missing.input_digest = missing.lifecycle.as_ref().unwrap().digest();
-            assert!(missing.validate().is_err());
-            let unchanged = replica.handle().public_v1_report().await.unwrap();
-            assert_eq!(unchanged.history, before.history);
-            assert_eq!(unchanged.process_session_id, before.process_session_id);
-            assert_eq!(unchanged.read_status, before.read_status);
-            assert_eq!(unchanged.write_status, before.write_status);
-            assert_eq!(unchanged.progress, before.progress);
-            assert_eq!(unchanged.data_loss_recovery, None);
-            assert!(adapter.dispatched().is_empty());
-
-            execute_public_v1_history(
-                &adapter,
-                &test_scope(&resource_uid),
-                plan_public_v1_data_loss_recovery(
-                    &accepted,
-                    &before,
-                    &authorization,
-                    &attempt,
-                    &recovery_intent,
-                    false,
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-            let invalidated = adapter
-                .observe_public_v1_status(&test_scope(&resource_uid))
-                .await
-                .unwrap()
-                .unwrap();
-            match outcome {
-                Outcome::Unchanged => {}
-                Outcome::Changed => replica.state.change_on_data_loss(),
-                Outcome::Error => replica.state.fail_next_data_loss(),
-                Outcome::AmbiguousReplacement => {
-                    replica.state.rebuild_on_data_loss(replica.identity.clone());
-                }
-            }
-            if matches!(outcome, Outcome::Unchanged) {
-                replica.state.block_commit();
-            }
-            let scope = test_scope(&resource_uid);
-            let dispatch = execute_public_v1_history(
-                &adapter,
-                &scope,
-                plan_public_v1_data_loss_recovery(
-                    &invalidated,
-                    &before,
-                    &authorization,
-                    &attempt,
-                    &recovery_intent,
-                    false,
-                )
-                .unwrap(),
-            );
-            tokio::pin!(dispatch);
-            if matches!(outcome, Outcome::Unchanged) {
-                tokio::select! {
-                    _ = replica.state.commit_entered.notified() => {}
-                    result = &mut dispatch => panic!("recovery did not reach held suffix commitment: {result:?}"),
-                }
-                assert_eq!(read_fencing::scalar_progress(&replica).await, 10);
-                let pending = replica.handle().public_v1_report().await.unwrap();
-                assert_eq!((pending.progress.first, pending.progress.last), (10, 11));
-                assert_ne!(pending.read_status, AccessStatus::Granted);
-                assert_ne!(pending.write_status, AccessStatus::Granted);
-                let observation = pending.data_loss_recovery.unwrap().observed_progress.unwrap();
-                assert_eq!((observation.first, observation.last), (10, 10));
-                assert_eq!(observation.role, kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery);
-                replica.state.release_commit.notify_one();
-            }
-            let dispatched = dispatch.await;
-            assert_eq!(adapter.dispatched().len(), 1);
-            assert_eq!(
-                replica.state.data_loss_calls.load(Ordering::SeqCst),
-                1,
-                "recovery dispatch did not invoke the callback: {dispatched:?}"
-            );
-            if matches!(outcome, Outcome::Unchanged | Outcome::Changed) {
-                dispatched
-                    .as_ref()
-                    .unwrap_or_else(|error| panic!("data-loss outcome {index} failed: {error}"));
-            }
-            let report = adapter
-                .report(&replica.identity)
-                .await
-                .unwrap_or_else(|error| panic!("data-loss outcome {index} report: {error}"));
-            match outcome {
-                Outcome::Unchanged | Outcome::Changed => {
-                    assert_eq!(report.history, proposed);
-                    assert_eq!(report.write_status, AccessStatus::Granted);
-                    assert_eq!(
-                        report.data_loss_recovery.as_ref().unwrap().stage,
-                        kuberic_runtime::protocol::public_operations::
-                            PublicDataLossRecoveryStage::Admitted
-                    );
-                    if matches!(outcome, Outcome::Unchanged) {
-                        assert_eq!(read_fencing::scalar_progress(&replica).await, 11);
-                        assert_eq!((report.progress.first, report.progress.last), (11, 11));
-                        assert_eq!(replica.state.operations.lock().unwrap().last().unwrap().data,
-                            Bytes::from_static(b"sf-d02-recovery-11"));
-                    }
-                }
-                Outcome::Error => {
-                    assert!(dispatched.is_err());
-                    assert_eq!(report.history, predecessor);
-                    assert_eq!(report.write_status, AccessStatus::NotPrimary);
-                    assert_eq!(
-                        report.data_loss_recovery.as_ref().unwrap().stage,
-                        kuberic_runtime::protocol::public_operations::
-                            PublicDataLossRecoveryStage::Failed
-                    );
-                }
-                Outcome::AmbiguousReplacement => {
-                    assert!(dispatched.is_err());
-                    assert_eq!(report.history, predecessor);
-                    assert_eq!(report.write_status, AccessStatus::NotPrimary);
-                    assert_eq!(
-                        report.data_loss_recovery.as_ref().unwrap().stage,
-                        kuberic_runtime::protocol::public_operations::
-                            PublicDataLossRecoveryStage::ReplacementRequired
-                    );
-                }
-            }
-            if !matches!(outcome, Outcome::Unchanged | Outcome::Changed) {
-                execute_public_v1_history(
-                    &adapter,
-                    &test_scope(&resource_uid),
-                    plan_public_v1_recovery_report(&invalidated, &report).unwrap(),
-                )
-                .await
-                .unwrap();
-            }
-            replica.stop().await;
-            replica.cleanup();
-        }
-    })
-    .await
-    .unwrap();
 }
 
 #[tokio::test]
-async fn hosted_public_v1_unreachable_survivor_blocks_access_until_return_or_retirement() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let resource_uid = ResourceUid::new("preview-unreachable-survivor");
-        let preview = PublicV1Identity::new(40);
-        let mut primary =
-            HostedMemoryReplica::start("fault-primary", &resource_uid, &preview, 1).await;
-        let mut survivor =
-            HostedMemoryReplica::start("fault-survivor", &resource_uid, &preview, 2).await;
-        let generation = PublicProtocolGeneration::new(40);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        primary.initialize_history(&initialization, &history).await;
-        survivor.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let configuration = ConfigurationDescriptor::new(
-            epoch,
-            primary.identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: primary.identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: survivor.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        install_static_authority(
-            &primary.handle(),
-            &preview,
-            primary.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: configuration.clone(),
-                previous: None,
-                replicas: vec![PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
-                    identity: survivor.identity.clone(),
-                    replication_address: format!("http://{}", survivor.address),
-                    process_session_id: survivor.handle().process_session_id(),
-                    storage_incarnation: Some(survivor.storage.clone()),
-                    role: ReplicaRole::ActiveSecondary,
-                    current_progress: 0,
-                    catch_up_capability: 0,
-                    must_catchup: false,
-                }],
-            },
-        )
-        .await;
-        install_static_authority(
-            &survivor.handle(),
-            &preview,
-            survivor.identity.clone(),
-            ReplicaRole::ActiveSecondary,
-            epoch,
-            PublicConfiguration {
-                current: configuration.clone(),
-                previous: None,
-                replicas: vec![PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
-                    identity: primary.identity.clone(),
-                    replication_address: format!("http://{}", primary.address),
-                    process_session_id: primary.handle().process_session_id(),
-                    storage_incarnation: Some(primary.storage.clone()),
-                    role: ReplicaRole::Primary,
-                    current_progress: 0,
-                    catch_up_capability: 0,
-                    must_catchup: false,
-                }],
-            },
-        )
-        .await;
-        assert_eq!(
-            primary
-                .application
-                .replicate(Bytes::from_static(b"before-survivor-loss"))
-                .await
-                .unwrap(),
-            1
-        );
-        let exact_survivor_session = survivor.handle().process_session_id();
-        primary.handle().fence_public_v1_access().await;
-        assert_eq!(
-            primary
-                .handle()
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            AccessStatus::NotPrimary
-        );
-        primary
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                primary.handle().process_session_id(),
-                5,
-                "exact-survivor-return",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: configuration.clone(),
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: survivor.identity.clone(),
-                        replication_address: format!("http://{}", survivor.address),
-                        process_session_id: exact_survivor_session.clone(),
-                        storage_incarnation: Some(survivor.storage.clone()),
-                        role: ReplicaRole::ActiveSecondary,
-                        current_progress: 1,
-                        catch_up_capability: 1,
-                        must_catchup: false,
-                    }],
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            primary
-                .application
-                .replicate(Bytes::from_static(b"after-exact-session-return"))
-                .await
-                .unwrap(),
-            2
-        );
-
-        primary.handle().fence_public_v1_access().await;
-        let removal_program = PublicOperationProgram::Remove(PublicBuildInput {
-            attempt: OperationId::new("retire-unreachable-survivor"),
-            epoch,
-            current_configuration_id: None,
-            replica: survivor.identity.clone(),
-            target_storage: survivor.storage.clone(),
-            process_session_id: exact_survivor_session.clone(),
-            replication_address: format!("http://{}", survivor.address),
-            history: Some(history.clone()),
-        });
-        let removal_intent = intent(
-            &preview,
-            primary.handle().process_session_id(),
-            6,
-            "retire-unreachable-survivor",
-            removal_program,
-        );
-        let accepted = PublicV1AcceptedStatus {
-            identity: preview.clone(),
-            history_initialization_id: initialization.clone(),
-            history: history.clone(),
-            data_loss_recovery: None,
-            completed_operations: Vec::new(),
-            extensions: Default::default(),
-        };
-        let transition = PublicV1AcceptedTransitionStatus {
-            resource_version: "fault-retirement-status-rv-1".into(),
-            evidence: accepted,
-            intent: PublicV1AcceptedTransitionIntent {
-                consumer: PublicV1EvidenceConsumer::Removal,
-                operation_id: removal_intent.operation_id.clone(),
-                revision: removal_intent.revision,
-                call_kind: PublicV1CallKind::Remove,
-                history: history.clone(),
-                source: PublicV1ResourceAuthority {
-                    storage_incarnation: primary.storage.clone(),
-                    resource_version: "fault-primary-rv-1".into(),
-                },
-                target: Some(PublicV1ResourceAuthority {
-                    storage_incarnation: survivor.storage.clone(),
-                    resource_version: "fault-survivor-rv-1".into(),
-                }),
-                process_session_id: removal_intent.process_session_id.clone(),
-                input_digest: removal_intent.input_digest.clone(),
-                replay_disposition: removal_intent.replay_disposition,
-                previous_configuration_id: None,
-                current_configuration_id: None,
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
-            },
-        };
-        let evidence = PublicV1EvidenceState::new(
-            transition.clone(),
-            vec![
-                PublicV1EvidenceResource {
-                    storage_incarnation: primary.storage.clone(),
-                    resource_version: "fault-primary-rv-1".into(),
-                    proof: Some(PublicV1ResourceProof {
-                        history: history.clone(),
-                        storage_incarnation: primary.storage.clone(),
-                    }),
-                    disposition: PublicV1ResourceDisposition::Active,
-                },
-                PublicV1EvidenceResource {
-                    storage_incarnation: survivor.storage.clone(),
-                    resource_version: "fault-survivor-rv-1".into(),
-                    proof: Some(PublicV1ResourceProof {
-                        history: history.clone(),
-                        storage_incarnation: survivor.storage.clone(),
-                    }),
-                    disposition: PublicV1ResourceDisposition::Active,
-                },
-            ],
-        )
-        .unwrap();
-        let completion = PublicV1OperationCompletion {
-            operation_id: removal_intent.operation_id.clone(),
-            revision: removal_intent.revision,
-            call_kind: PublicV1CallKind::Remove,
-            process_session_id: removal_intent.process_session_id.clone(),
-            input_digest: removal_intent.input_digest.clone(),
-            replay_disposition: removal_intent.replay_disposition,
-            history: history.clone(),
-            storage_incarnation: primary.storage.clone(),
-            previous_configuration_id: None,
-            current_configuration_id: None,
-            catch_up_mode: None,
-            catch_up_specific_quorum: None,
-            result: PublicV1OperationResult::Ambiguous(
-                "survivor did not return in its exact process session".into(),
-            ),
-        };
-        let mut persisted_evidence = transition.evidence.clone();
-        persisted_evidence.completed_operations.push(
-            kuberic_runtime::protocol::public_operations::
-                PublicV1AcceptedOperationCompletion::from_completion(&completion),
-        );
-        PublicV1EvidenceApi::persist_public_v1_evidence_status(
-            &evidence,
-            &test_scope(&resource_uid),
-            &transition,
-            &persisted_evidence,
-        )
+async fn native_same_role_secondary_epoch_fences_predecessor_binding_and_sending_epoch() {
+    let root = root();
+    let mut pair = Pair::start(root.path(), 1).await;
+    let before = pair.target.report().await;
+    let predecessor = binding(&pair).await;
+    let predecessor_frame = replication_frame(&pair, 2, Bytes::from_static(b"predecessor")).await;
+    pair.target.service.observed.lock().unwrap().clear();
+    let mut operations = pair.target.service.control_operations();
+    let epoch = Epoch::new(0, 2);
+    pair.target
+        .command(PublicOperationProgram::Epoch { epoch })
         .await
         .unwrap();
-        let persisted_transition = evidence.transition();
-        PublicV1EvidenceApi::retire_public_v1_incarnation(
-            &evidence,
-            &test_scope(&resource_uid),
-            &persisted_transition,
-            &completion,
-            persisted_transition.intent.target.as_ref().unwrap(),
-        )
+    pair.source
+        .command(PublicOperationProgram::Epoch { epoch })
         .await
         .unwrap();
-        let retired = evidence
-            .resources()
-            .into_iter()
-            .find(|resource| resource.storage_incarnation == survivor.storage)
-            .unwrap();
-        assert_eq!(retired.resource_version, "fault-survivor-rv-1-next");
-        assert_eq!(retired.disposition, PublicV1ResourceDisposition::Retired);
-
-        let single = ConfigurationDescriptor::new(
-            Epoch::new(0, 2),
-            primary.identity.replica_id,
-            vec![ConfigurationMember {
-                identity: primary.identity.clone(),
+    let current = ConfigurationDescriptor::new(
+        epoch,
+        pair.source.identity.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: pair.source.identity.clone(),
                 role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        primary
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                primary.handle().process_session_id(),
-                6,
-                "epoch-after-survivor-retirement",
-                PublicOperationProgram::Epoch {
-                    epoch: Epoch::new(0, 2),
-                },
-            ))
-            .await
-            .unwrap();
-        primary
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                primary.handle().process_session_id(),
-                7,
-                "role-after-survivor-retirement",
-                PublicOperationProgram::Role {
-                    epoch: Epoch::new(0, 2),
-                    role: ReplicaRole::Primary,
-                },
-            ))
-            .await
-            .unwrap();
-        primary
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                primary.handle().process_session_id(),
-                8,
-                "configuration-after-survivor-retirement",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: single,
-                    previous: None,
-                    replicas: Vec::new(),
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            primary
-                .application
-                .replicate(Bytes::from_static(b"after-survivor-retirement"))
-                .await
-                .unwrap(),
-            3
-        );
-
-        let retired_identity = survivor.identity.clone();
-        let retired_progress = *survivor.state.progress.lock().unwrap();
-        survivor.stop().await;
-        let mut replacement =
-            HostedMemoryReplica::start("fault-replacement", &resource_uid, &preview, 2).await;
-        replacement
-            .initialize_history(&initialization, &history)
-            .await;
-        replacement
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                replacement.handle().process_session_id(),
-                1,
-                "open-fault-replacement",
-                PublicOperationProgram::Open {
-                    replica: replacement.identity.clone(),
-                    existing: true,
-                },
-            ))
-            .await
-            .unwrap();
-        let replacement_before = *replacement.state.progress.lock().unwrap();
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{}",
-            replacement.address
-        ))
-        .await
-        .unwrap();
-        let stale = proto::ReplicationItem {
-            completed_build: None,
-            protocol_version: 11,
-            sender: Some(primary.identity.clone().into()),
-            receiver: Some(retired_identity.into()),
-            epoch: Some(epoch.into()),
-            previous_configuration_id: String::new(),
-            current_configuration_id: configuration.configuration_id.to_string(),
-            lsn: retired_progress.applied_lsn + 1,
-            committed_lsn: retired_progress.committed_lsn,
-            data: b"retired-session-payload".to_vec(),
-            sender_session_id: primary.handle().process_session_id().to_string(),
-            receiver_session_id: exact_survivor_session.to_string(),
-        };
-        let mut response = client
-            .replicate(tonic::Request::new(stream::iter([stale])))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(response.next().await.unwrap().is_err());
-        assert_eq!(
-            *replacement.state.progress.lock().unwrap(),
-            replacement_before
-        );
-        assert_eq!(
-            primary
-                .handle()
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            AccessStatus::Granted
-        );
-
-        primary.stop().await;
-        replacement.stop().await;
-        primary.cleanup();
-        survivor.cleanup();
-        replacement.cleanup();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn hosted_public_v1_switchover_dispatches_exact_intent_and_accepts_matching_completion() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let resource_uid = ResourceUid::new("preview-two-replica");
-        let preview = PublicV1Identity::new(4);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let primary_identity = replica_named(1, "primary-pod", "primary-agent");
-        let secondary_identity = replica_named(2, "secondary-pod", "secondary-agent");
-        let primary_root = test_root("primary");
-        let secondary_root = test_root("secondary");
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&primary_root),
-                preview.clone(),
-                store_identity_named(
-                    resource_uid.clone(),
-                    primary_identity.clone(),
-                    "primary-pod",
-                    "primary-pvc",
-                ),
-            )
-            .unwrap(),
-        );
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&secondary_root),
-                preview.clone(),
-                store_identity_named(
-                    resource_uid.clone(),
-                    secondary_identity.clone(),
-                    "secondary-pod",
-                    "secondary-pvc",
-                ),
-            )
-            .unwrap(),
-        );
-        let primary_address = free_address();
-        let secondary_address = free_address();
-        let primary_state = Arc::new(MemoryState::default());
-        let secondary_state = Arc::new(MemoryState::default());
-        let primary_app = Arc::new(PreviewApplication::new(
-            primary_state.clone(),
-            format!("http://{primary_address}"),
-        ));
-        let secondary_app = Arc::new(PreviewApplication::new(
-            secondary_state.clone(),
-            format!("http://{secondary_address}"),
-        ));
-        let mut primary = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("primary-pod"),
-                pvc_uid: PvcUid::new("primary-pvc"),
-                data_root: primary_root.clone(),
-                replication_address: primary_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
             },
-            primary_app.clone(),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding.clone())
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let mut secondary = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(2),
-                pod_uid: PodUid::new("secondary-pod"),
-                pvc_uid: PvcUid::new("secondary-pvc"),
-                data_root: secondary_root.clone(),
-                replication_address: secondary_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            secondary_app.clone(),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let primary_handle = primary.handle();
-        let secondary_handle = secondary.handle();
-        let generation = PublicProtocolGeneration::new(4);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        primary_handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_named(
-                    primary_identity.clone(),
-                    "primary-pod",
-                    "primary-pvc",
-                ),
-            )
-            .await
-            .unwrap();
-        secondary_handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_named(
-                    secondary_identity.clone(),
-                    "secondary-pod",
-                    "secondary-pvc",
-                ),
-            )
-            .await
-            .unwrap();
-        let epoch = Epoch::new(0, 1);
-        let descriptor = ConfigurationDescriptor::new(
-            epoch,
-            ReplicaId::new(1),
-            vec![
-                ConfigurationMember {
-                    identity: primary_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: secondary_identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        install_static_authority(
-            &primary_handle,
-            &preview,
-            primary_identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: descriptor.clone(),
-                previous: None,
-                replicas: vec![PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
-                    identity: secondary_identity.clone(),
-                    replication_address: format!("http://{secondary_address}"),
-                    process_session_id: secondary_handle.process_session_id(),
-                    storage_incarnation: Some(storage_named(
-                        secondary_identity.clone(),
-                        "secondary-pod",
-                        "secondary-pvc",
-                    )),
-                    role: ReplicaRole::ActiveSecondary,
-                    current_progress: 0,
-                    catch_up_capability: 0,
-                    must_catchup: false,
-                }],
-            },
-        )
-        .await;
-        install_static_authority(
-            &secondary_handle,
-            &preview,
-            secondary_identity.clone(),
-            ReplicaRole::ActiveSecondary,
-            epoch,
-            PublicConfiguration {
-                current: descriptor.clone(),
-                previous: None,
-                replicas: vec![PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
-                    identity: primary_identity.clone(),
-                    replication_address: format!("http://{primary_address}"),
-                    process_session_id: primary_handle.process_session_id(),
-                    storage_incarnation: Some(storage_named(
-                        primary_identity.clone(),
-                        "primary-pod",
-                        "primary-pvc",
-                    )),
-                    role: ReplicaRole::Primary,
-                    current_progress: 0,
-                    catch_up_capability: 0,
-                    must_catchup: false,
-                }],
-            },
-        )
-        .await;
-        secondary_state.block_commit();
-        let write = tokio::spawn({
-            let primary_app = primary_app.clone();
-            async move {
-                primary_app
-                    .replicate(Bytes::from_static(b"replicated"))
-                    .await
-            }
-        });
-        secondary_state.commit_entered.notified().await;
-        assert_eq!(secondary_state.progress.lock().unwrap().applied_lsn, 1);
-        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 0);
-        let applied_only = secondary_handle.public_v1_report().await.unwrap();
-        assert_eq!(
-            applied_only.progress.role,
-            kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery
-        );
-        assert_eq!(applied_only.history, history);
-        assert_eq!(applied_only.progress.first, 0);
-        assert_eq!(applied_only.progress.last, 1);
-        assert_eq!(
-            applied_only.read_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        secondary_state.release_commit.notify_waiters();
-        assert_eq!(write.await.unwrap().unwrap(), 1);
-        assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while secondary_state.progress.lock().unwrap().committed_lsn < 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("secondary did not receive committed watermark");
-        let committed = secondary_handle.public_v1_report().await.unwrap();
-        assert_eq!(
-            committed.progress.role,
-            kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary
-        );
-        assert_eq!(committed.history, history);
-        assert_eq!(committed.progress.first, 1);
-        assert_eq!(committed.progress.last, 1);
-        assert_eq!(
-            committed.read_status,
-            kuberic_runtime::protocol::types::AccessStatus::Granted
-        );
-
-        let mut client = kuberic_runtime::control::proto::replication_data_client::ReplicationDataClient::connect(
-            format!("http://{secondary_address}"),
-        )
-        .await
-        .unwrap();
-        let stale = kuberic_runtime::control::proto::ReplicationItem {
-            completed_build: None,
-            protocol_version: 11,
-            sender: Some(primary_identity.clone().into()),
-            receiver: Some(secondary_identity.clone().into()),
-            epoch: Some(epoch.into()),
-            previous_configuration_id: String::new(),
-            current_configuration_id: descriptor.configuration_id.to_string(),
-            lsn: 2,
-            committed_lsn: 1,
-            data: b"stale".to_vec(),
-            sender_session_id: "predecessor-session".into(),
-            receiver_session_id: secondary_handle.process_session_id().to_string(),
-        };
-        let mut response = client
-            .replicate(tonic::Request::new(stream::iter([stale])))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(response.next().await.unwrap().is_err());
-        assert_eq!(secondary_state.progress.lock().unwrap().applied_lsn, 1);
-
-        secondary_state.fail_next_commit();
-        assert_eq!(
-            primary_app
-                .replicate(Bytes::from_static(b"lost-watermark"))
-                .await
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            *primary_state.progress.lock().unwrap(),
-            DurableApplicationProgress {
-                applied_lsn: 2,
-                committed_lsn: 2,
-            }
-        );
-        assert_eq!(
-            *secondary_state.progress.lock().unwrap(),
-            DurableApplicationProgress {
-                applied_lsn: 2,
-                committed_lsn: 1,
-            }
-        );
-        let lost = secondary_handle.public_v1_report().await.unwrap();
-        assert_eq!(lost.progress.first, 1);
-        assert_eq!(lost.progress.last, 2);
-        assert_eq!(
-            lost.read_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-
-        let refreshed = ConfigurationDescriptor::new(
-            Epoch::new(0, 2),
-            primary_identity.replica_id,
-            descriptor.members.clone(),
-            2,
-        );
-        primary_handle
-            .execute_public_v1(intent(
-                &preview,
-                primary_handle.process_session_id(),
-                5,
-                "switchover-pre-catchup",
-                PublicOperationProgram::CatchUp {
-                    configuration: PublicConfiguration {
-                        current: descriptor.clone(),
-                        previous: None,
-                        replicas: vec![PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: secondary_identity.clone(),
-                            replication_address: format!("http://{secondary_address}"),
-                            process_session_id: secondary_handle.process_session_id(),
-                            storage_incarnation: Some(storage_named(
-                                secondary_identity.clone(),
-                                "secondary-pod",
-                                "secondary-pvc",
-                            )),
-                            role: ReplicaRole::ActiveSecondary,
-                            current_progress: 1,
-                            catch_up_capability: 1,
-                            must_catchup: true,
-                        }],
-                    },
-                    mode: kuberic_runtime::protocol::public_operations::PublicCatchUpMode::
-                        WriteQuorum,
-                },
-            ))
-            .await
-            .unwrap();
-        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 2);
-            secondary_state.fail_next_commit();
-            assert_eq!(
-                primary_app
-                    .replicate(Bytes::from_static(b"intervening-before-composed-swap"))
-                    .await
-                    .unwrap(),
-                3
-            );
-            assert_eq!(
-                *secondary_state.progress.lock().unwrap(),
-                DurableApplicationProgress {
-                    applied_lsn: 3,
-                    committed_lsn: 2,
-                },
-                "designated successor was not lagging at composed swap admission"
-            );
-            let starting_secondary_descriptor = || PublicReplicaDescriptor {
-            build_id: OperationId::default(),
-            identity: secondary_identity.clone(),
-            replication_address: format!("http://{secondary_address}"),
-            process_session_id: secondary_handle.process_session_id(),
-            storage_incarnation: Some(storage_named(
-                secondary_identity.clone(),
-                "secondary-pod",
-                "secondary-pvc",
-            )),
-            role: ReplicaRole::ActiveSecondary,
-            current_progress: 2,
-            catch_up_capability: 2,
-            must_catchup: true,
-        };
-        let refreshed_configuration_id = refreshed.configuration_id.clone();
-        let switchover = intent(
-            &preview,
-            primary_handle.process_session_id(),
-            7,
-            "planned-switchover",
-            PublicOperationProgram::Swap {
-                starting: PublicConfiguration {
-                    current: descriptor.clone(),
-                    previous: None,
-                    replicas: vec![starting_secondary_descriptor()],
-                },
-                refreshed: PublicConfiguration {
-                    current: refreshed,
-                    previous: None,
-                    replicas: vec![starting_secondary_descriptor()],
-                },
-                epoch: Epoch::new(0, 2),
-                handoff: ReplicaRole::ActiveSecondary,
-                catch_up_specific_quorum: true,
-                mode: kuberic_runtime::protocol::public_operations::PublicCatchUpMode::WriteQuorum,
-                controller_composed: true,
-            },
-        );
-        let accepted = PublicV1AcceptedStatus {
-            identity: preview.clone(),
-            history_initialization_id: initialization.clone(),
-            history: history.clone(),
-            data_loss_recovery: None,
-            completed_operations: Vec::new(),
-            extensions: Default::default(),
-        };
-        let source_storage = storage_named(
-            primary_identity.clone(),
-            "primary-pod",
-            "primary-pvc",
-        );
-        let transition = PublicV1AcceptedTransitionStatus {
-            resource_version: "switchover-status-1".into(),
-            evidence: accepted.clone(),
-            intent: PublicV1AcceptedTransitionIntent {
-                consumer: PublicV1EvidenceConsumer::Switchover,
-                operation_id: switchover.operation_id.clone(),
-                revision: switchover.revision,
-                call_kind: PublicV1CallKind::Swap,
-                history: history.clone(),
-                source: PublicV1ResourceAuthority {
-                    storage_incarnation: source_storage.clone(),
-                    resource_version: "primary-rv-1".into(),
-                },
-                target: Some(PublicV1ResourceAuthority {
-                    storage_incarnation: storage_named(
-                        secondary_identity.clone(),
-                        "secondary-pod",
-                        "secondary-pvc",
-                    ),
-                    resource_version: "secondary-rv-1".into(),
-                }),
-                process_session_id: switchover.process_session_id.clone(),
-                input_digest: switchover.input_digest.clone(),
-                replay_disposition: switchover.replay_disposition,
-                previous_configuration_id: None,
-                current_configuration_id: Some(refreshed_configuration_id),
-                catch_up_mode: Some(
-                    kuberic_runtime::protocol::public_operations::PublicCatchUpMode::WriteQuorum,
-                ),
-                catch_up_specific_quorum: Some(true),
-            },
-        };
-        let evidence = Arc::new(
-            PublicV1EvidenceState::new(
-                transition.clone(),
-                vec![
-                    PublicV1EvidenceResource {
-                        storage_incarnation: source_storage.clone(),
-                        resource_version: "primary-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: source_storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                    PublicV1EvidenceResource {
-                        storage_incarnation: storage_named(
-                            secondary_identity.clone(),
-                            "secondary-pod",
-                            "secondary-pvc",
-                        ),
-                        resource_version: "secondary-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: storage_named(
-                                secondary_identity.clone(),
-                                "secondary-pod",
-                                "secondary-pvc",
-                            ),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                ],
-            )
-            .unwrap(),
-        );
-        let hosted_replicas = || {
-            vec![
-                HostedPublicV1Replica {
-                    identity: primary_identity.clone(),
-                    replication_address: format!("http://{primary_address}"),
-                    handle: primary_handle.clone(),
-                },
-                HostedPublicV1Replica {
-                    identity: secondary_identity.clone(),
-                    replication_address: format!("http://{secondary_address}"),
-                    handle: secondary_handle.clone(),
-                },
-            ]
-        };
-        let adapter = HostedPublicV1Harness::new(
-            hosted_replicas(),
-            Some(accepted.clone()),
-            None,
-            evidence.clone(),
-        )
-        .unwrap();
-        let command = ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
-            target: primary_identity.clone(),
-            intent: switchover.clone(),
-        }));
-        let wrong_target =
-            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
-                target: secondary_identity.clone(),
-                intent: switchover,
-            }));
-        let error = PublicV1OperationApi::dispatch_public_v1_operation(
-            &adapter,
-            &test_scope(&resource_uid),
-            &transition,
-            &wrong_target,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error.contains("target differs from accepted source incarnation"),
-            "{error}"
-        );
-        assert!(adapter.dispatched().is_empty());
-        assert!(evidence.effects().is_empty());
-        assert!(
-            adapter
-                .report(&primary_identity)
-                .await
-                .unwrap()
-                .completed_operations
-                .iter()
-                .all(|completion| completion.operation_id != transition.intent.operation_id)
-        );
-        adapter.cut_after_hosted_suboperations(3);
-        assert!(
-            execute_public_v1_operation(&adapter, &test_scope(&resource_uid), &transition, command.clone())
-                .await
-                .unwrap_err()
-                .contains("injected cut after hosted suboperation completion")
-        );
-        assert_eq!(
-            primary_handle
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            kuberic_runtime::protocol::types::AccessStatus::Granted
-        );
-        assert_eq!(
-            secondary_handle
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        let partial_configuration_id =
-            OperationId::new("planned-switchover-target-configuration-2");
-        let partial_configuration = secondary_handle
-            .public_v1_operation_intent(&partial_configuration_id)
-            .await
-            .unwrap()
-            .expect("partial switchover configuration was not durable");
-        drop(adapter);
-        let adapter = HostedPublicV1Harness::new(
-            hosted_replicas(),
-            Some(accepted.clone()),
-            None,
-            evidence.clone(),
-        )
-        .unwrap();
-        execute_public_v1_operation(&adapter, &test_scope(&resource_uid), &transition, command)
-            .await
-            .unwrap();
-        assert_eq!(
-            secondary_handle
-                .public_v1_operation_intent(&partial_configuration_id)
-                .await
-                .unwrap(),
-            Some(partial_configuration),
-            "adapter recreation changed the durable switchover configuration intent"
-        );
-        let switchover_report = adapter.report(&primary_identity).await.unwrap();
-        assert_eq!(
-            reconcile_public_v1_consumer(&adapter, &test_scope(&resource_uid), &switchover_report)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EvidencePersisted
-        );
-        assert_eq!(
-            reconcile_public_v1_consumer(&adapter, &test_scope(&resource_uid), &switchover_report)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EffectApplied
-        );
-        assert_eq!(evidence.effects().len(), 1);
-        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 3);
-        assert_eq!(
-            primary_handle
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        assert_eq!(
-            secondary_handle
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            kuberic_runtime::protocol::types::AccessStatus::Granted
-        );
-        let next_revision = secondary_handle
-            .public_v1_next_operation_revision()
-            .await
-            .unwrap();
-        secondary_handle
-            .execute_public_v1(intent(
-                &preview,
-                secondary_handle.process_session_id(),
-                next_revision,
-                "same-session-after-composed-swap",
-                PublicOperationProgram::Progress { capability: true },
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            secondary_app
-                .replicate(Bytes::from_static(b"after-switchover"))
-                .await
-                .unwrap(),
-            4
-        );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while primary_state.progress.lock().unwrap().committed_lsn < 4 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("new primary write did not reach old primary");
-        let primary_predecessor = primary_handle
-            .public_v1_process_endpoint(ReplicaRole::Primary)
-            .await
-            .unwrap();
-        let secondary_predecessor = secondary_handle
-            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
-            .await
-            .unwrap();
-
-        secondary.shutdown();
-        secondary.wait().await.unwrap();
-        assert!(
-            primary_app
-                .replicate(Bytes::from_static(b"after-close"))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            *primary_state.progress.lock().unwrap(),
-            DurableApplicationProgress {
-                applied_lsn: 4,
-                committed_lsn: 4,
-            }
-        );
-        std::net::TcpListener::bind(secondary_address).unwrap();
-        primary.shutdown();
-        primary.wait().await.unwrap();
-        let primary_restart_app = Arc::new(PreviewApplication::new(
-            primary_state.clone(),
-            format!("http://{primary_address}"),
-        ));
-        let secondary_restart_app = Arc::new(PreviewApplication::new(
-            secondary_state.clone(),
-            format!("http://{secondary_address}"),
-        ));
-        let restart_binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let mut restarted_primary = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("primary-pod"),
-                pvc_uid: PvcUid::new("primary-pvc"),
-                data_root: primary_root.clone(),
-                replication_address: primary_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            primary_restart_app.clone(),
-            ApplicationStorageState::Established,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(restart_binding.clone())
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let mut restarted_secondary = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(2),
-                pod_uid: PodUid::new("secondary-pod"),
-                pvc_uid: PvcUid::new("secondary-pvc"),
-                data_root: secondary_root.clone(),
-                replication_address: secondary_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            secondary_restart_app.clone(),
-            ApplicationStorageState::Established,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(restart_binding)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let restarted_primary_handle = restarted_primary.handle();
-        let restarted_secondary_handle = restarted_secondary.handle();
-        assert_eq!(
-            restarted_primary_handle.public_v1_provider_writer_count(),
-            0
-        );
-        assert_eq!(
-            restarted_secondary_handle.public_v1_provider_writer_count(),
-            0
-        );
-        assert_eq!(primary_restart_app.opens.load(Ordering::SeqCst), 0);
-        assert_eq!(secondary_restart_app.opens.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            restarted_primary_handle
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            AccessStatus::NotPrimary
-        );
-        assert_eq!(
-            restarted_secondary_handle
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            AccessStatus::NotPrimary
-        );
-        std::net::TcpListener::bind(primary_address).unwrap();
-        std::net::TcpListener::bind(secondary_address).unwrap();
-
-        let failover_epoch = Epoch::new(0, 3);
-        let renewal_configuration = ConfigurationDescriptor::new(
-            failover_epoch,
-            ReplicaId::new(1),
-            vec![
-                ConfigurationMember {
-                    identity: primary_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: secondary_identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        let promotion_epoch = Epoch::new(0, 4);
-        let failover_configuration = ConfigurationDescriptor::new(
-            promotion_epoch,
-            ReplicaId::new(2),
-            vec![
-                ConfigurationMember {
-                    identity: primary_identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-                ConfigurationMember {
-                    identity: secondary_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-            ],
-            2,
-        );
-        let hosted_replicas = || {
-            vec![
-                HostedPublicV1Replica {
-                    identity: primary_identity.clone(),
-                    replication_address: format!("http://{primary_address}"),
-                    handle: restarted_primary_handle.clone(),
-                },
-                HostedPublicV1Replica {
-                    identity: secondary_identity.clone(),
-                    replication_address: format!("http://{secondary_address}"),
-                    handle: restarted_secondary_handle.clone(),
-                },
-            ]
-        };
-        let single_primary_configuration = ConfigurationDescriptor::new(
-            failover_epoch,
-            ReplicaId::new(1),
-            vec![ConfigurationMember {
-                identity: primary_identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        let primary_report = restarted_primary_handle
-            .public_v1_report()
-            .await
-            .unwrap();
-        let primary_replacement = ProcessSessionEndpoint {
-            identity: primary_predecessor.identity.clone(),
-            storage_incarnation: primary_predecessor.storage_incarnation.clone(),
-            process_session_id: restarted_primary_handle.process_session_id(),
-            replicator_creation_id: primary_report.replicator_creation_id.clone(),
-            role: ReplicaRole::None,
-        };
-        let primary_renewal = HostedPublicV1Harness::new(
-            hosted_replicas(),
-            Some(transition.evidence.clone()),
-            None,
-            evidence.clone(),
-        )
-        .unwrap();
-        execute_public_v1_session_renewal(
-            &primary_renewal,
-            &test_scope(&resource_uid),
-            accept_public_v1_session_renewal(
-                None,
-                ProcessSessionRenewalRequired {
-                    operation_id: OperationId::new("renew-primary-process"),
-                    reason: ProcessSessionRenewalReason::PrimaryReplacement,
-                    resource_uid: resource_uid.clone(),
-                    history: history.clone(),
-                    previous_epoch: Epoch::new(0, 2),
-                    renewal_epoch: failover_epoch,
-                    predecessor: primary_predecessor,
-                    replacement: Some(primary_replacement),
-                    surviving_sessions: vec![secondary_predecessor.clone()],
-                    fresh_configuration: single_primary_configuration.clone(),
-                    predecessor_contained: true,
-                    data_loss: None,
-                },
-                Some(&primary_report),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        drive_session_renewal(
-            &primary_renewal,
-            &resource_uid,
-            std::slice::from_ref(&secondary_predecessor.process_session_id),
-            true,
-        )
-        .await;
-        primary_renewal
-            .reconstruct_hosted_configuration(
-                &OperationId::new("reconstruct-primary-after-renewal"),
-                preview.generation,
-                &single_primary_configuration,
-            )
-            .await
-            .unwrap();
-        let renewed_primary = restarted_primary_handle
-            .public_v1_process_endpoint(ReplicaRole::Primary)
-            .await
-            .unwrap();
-
-        let secondary_report = restarted_secondary_handle
-            .public_v1_report()
-            .await
-            .unwrap();
-        let secondary_replacement = ProcessSessionEndpoint {
-            identity: secondary_predecessor.identity.clone(),
-            storage_incarnation: secondary_predecessor.storage_incarnation.clone(),
-            process_session_id: restarted_secondary_handle.process_session_id(),
-            replicator_creation_id: secondary_report.replicator_creation_id.clone(),
-            role: ReplicaRole::None,
-        };
-        let secondary_renewal = HostedPublicV1Harness::new(
-            hosted_replicas(),
-            Some(transition.evidence.clone()),
-            None,
-            evidence.clone(),
-        )
-        .unwrap();
-        execute_public_v1_session_renewal(
-            &secondary_renewal,
-            &test_scope(&resource_uid),
-            accept_public_v1_session_renewal(
-                None,
-                ProcessSessionRenewalRequired {
-                    operation_id: OperationId::new("renew-secondary-process"),
-                    reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
-                    resource_uid: resource_uid.clone(),
-                    history: history.clone(),
-                    previous_epoch: Epoch::new(0, 2),
-                    renewal_epoch: failover_epoch,
-                    predecessor: secondary_predecessor,
-                    replacement: Some(secondary_replacement),
-                    surviving_sessions: vec![renewed_primary],
-                    fresh_configuration: renewal_configuration.clone(),
-                    predecessor_contained: true,
-                    data_loss: None,
-                },
-                Some(&secondary_report),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-        loop {
-            let accepted = secondary_renewal
-                .observe_public_v1_session_renewal(&test_scope(&resource_uid))
-                .await
-                .unwrap()
-                .unwrap();
-            let plan = plan_public_v1_session_renewal(&accepted, &[]).unwrap();
-            let is_epoch_dispatch = matches!(
-                &plan,
-                PublicV1SessionRenewalPlan::Dispatch { command, .. }
-                    if matches!(
-                        command,
-                        ProtocolCommand::PublicV1History(public)
-                            if matches!(
-                                public.as_ref(),
-                                kuberic_runtime::protocol::command::PublicV1HistoryCommand::
-                                    SessionRenewal { command: renewal }
-                                    if matches!(
-                                        renewal.as_ref(),
-                                        kuberic_runtime::protocol::command::
-                                            PublicV1SessionRenewalCommand::UpdateEpochBarrier { .. }
-                                    )
-                            )
-                    )
-            );
-            if is_epoch_dispatch {
-                secondary_renewal.cut_after_hosted_suboperations(1);
-                assert!(
-                    execute_public_v1_session_renewal(&secondary_renewal, &test_scope(&resource_uid), plan.clone())
-                        .await
-                        .unwrap_err()
-                        .contains("injected cut after hosted suboperation completion")
-                );
-                assert_eq!(
-                    secondary_renewal
-                        .observe_public_v1_session_renewal(&test_scope(&resource_uid))
-                        .await
-                        .unwrap(),
-                    Some(accepted.clone())
-                );
-                let barrier_id = OperationId::new("renew-secondary-process-barrier-1");
-                let durable_barrier = restarted_primary_handle
-                    .public_v1_operation_intent(&barrier_id)
-                    .await
-                    .unwrap()
-                    .expect("renewal barrier was not durable at the injected cut");
-                drop(secondary_renewal);
-                let secondary_renewal = HostedPublicV1Harness::new(
-                    hosted_replicas(),
-                    Some(transition.evidence.clone()),
-                    Some(accepted),
-                    evidence.clone(),
-                )
-                .unwrap();
-                execute_public_v1_session_renewal(&secondary_renewal, &test_scope(&resource_uid), plan)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    restarted_primary_handle
-                        .public_v1_operation_intent(&barrier_id)
-                        .await
-                        .unwrap(),
-                    Some(durable_barrier),
-                    "adapter recreation changed the durable renewal barrier intent"
-                );
-                drive_session_renewal(&secondary_renewal, &resource_uid, &[], false).await;
-                break;
-            }
-            execute_public_v1_session_renewal(&secondary_renewal, &test_scope(&resource_uid), plan)
-                .await
-                .unwrap();
-        }
-        let primary_restart_progress = primary_state.progress.lock().unwrap().committed_lsn;
-        let failover_lifecycle = PublicLifecycleInput {
-            recipe: PublicLifecycleRecipe::FailoverPromotion,
-            replica: secondary_identity.clone(),
-            epoch: promotion_epoch,
-            possible_data_loss: PossibleDataLossIntent::NotPossible,
-            current: failover_configuration.clone(),
-            previous: Some(renewal_configuration.clone()),
-            replicas: vec![PublicReplicaDescriptor {
-                build_id: OperationId::default(),
-                identity: primary_identity.clone(),
-                replication_address: format!("http://{primary_address}"),
-                process_session_id: restarted_primary_handle.process_session_id(),
-                storage_incarnation: Some(storage_named(
-                    primary_identity.clone(),
-                    "primary-pod",
-                    "primary-pvc",
-                )),
+            ConfigurationMember {
+                identity: pair.target.identity.clone(),
                 role: ReplicaRole::ActiveSecondary,
-                current_progress: primary_restart_progress,
-                catch_up_capability: primary_restart_progress,
-                must_catchup: true,
-            }],
-            data_loss_recovery: None,
-        };
-        let failover_revision = restarted_secondary_handle
-            .public_v1_next_operation_revision()
-            .await
-            .unwrap();
-        let failover_intent = plan_public_v1_lifecycle(
-            &PublicV1EvaluationConfig::new(
-                preview.clone(),
-                Default::default(),
-            ),
-            OperationId::new("controller-restart-failover"),
-            failover_revision,
-            restarted_secondary_handle.process_session_id(),
-            failover_lifecycle,
-            PublicV1LifecycleTransition::Ordinary,
-        )
-        .unwrap();
-        let failover_accepted = PublicV1AcceptedStatus {
-            identity: preview.clone(),
-            history_initialization_id: initialization.clone(),
-            history: history.clone(),
-            data_loss_recovery: None,
-            completed_operations: Vec::new(),
-            extensions: Default::default(),
-        };
-        let failover_source_storage = storage_named(
-            secondary_identity.clone(),
-            "secondary-pod",
-            "secondary-pvc",
-        );
-        let failover_transition = PublicV1AcceptedTransitionStatus {
-            resource_version: "restart-failover-status-1".into(),
-            evidence: failover_accepted.clone(),
-            intent: PublicV1AcceptedTransitionIntent {
-                consumer: PublicV1EvidenceConsumer::Failover,
-                operation_id: failover_intent.operation_id.clone(),
-                revision: failover_intent.revision,
-                call_kind: PublicV1CallKind::FailoverPromotion,
-                history: history.clone(),
-                source: PublicV1ResourceAuthority {
-                    storage_incarnation: failover_source_storage.clone(),
-                    resource_version: "restart-secondary-rv-1".into(),
-                },
-                target: None,
-                process_session_id: failover_intent.process_session_id.clone(),
-                input_digest: failover_intent.input_digest.clone(),
-                replay_disposition: failover_intent.replay_disposition,
-                previous_configuration_id: Some(
-                    renewal_configuration.configuration_id.clone(),
-                ),
-                current_configuration_id: Some(
-                    failover_configuration.configuration_id.clone(),
-                ),
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
             },
-        };
-        let failover_evidence = Arc::new(
-            PublicV1EvidenceState::new(
-                failover_transition.clone(),
-                vec![PublicV1EvidenceResource {
-                    storage_incarnation: failover_source_storage.clone(),
-                    resource_version: "restart-secondary-rv-1".into(),
-                    proof: Some(PublicV1ResourceProof {
-                        history: history.clone(),
-                        storage_incarnation: failover_source_storage,
-                    }),
-                    disposition: PublicV1ResourceDisposition::Active,
-                }],
-            )
-            .unwrap(),
-        );
-        let restart_adapter = HostedPublicV1Harness::new(
-            vec![
-                HostedPublicV1Replica {
-                    identity: primary_identity.clone(),
-                    replication_address: format!("http://{primary_address}"),
-                    handle: restarted_primary_handle.clone(),
-                },
-                HostedPublicV1Replica {
-                    identity: secondary_identity.clone(),
-                    replication_address: format!("http://{secondary_address}"),
-                    handle: restarted_secondary_handle.clone(),
-                },
-            ],
-            Some(failover_accepted),
-            None,
-            failover_evidence.clone(),
-        )
-        .unwrap();
-        let failover_command =
-            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
-                target: secondary_identity.clone(),
-                intent: failover_intent,
-            }));
-        assert_eq!(
-            reconcile_public_v1_operation(&restart_adapter, &test_scope(&resource_uid), failover_command.clone())
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EvidencePersisted
-        );
-        assert_eq!(
-            reconcile_public_v1_operation(&restart_adapter, &test_scope(&resource_uid), failover_command)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EffectApplied
-        );
-        assert_eq!(failover_evidence.effects().len(), 1);
-        let old_primary_report = restarted_primary_handle
-            .public_v1_report()
+        ],
+        2,
+    );
+    for (local, remote, role) in [
+        (&pair.target, &pair.source, ReplicaRole::Primary),
+        (&pair.source, &pair.target, ReplicaRole::ActiveSecondary),
+    ] {
+        local
+            .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                current: current.clone(),
+                previous: None,
+                replicas: vec![remote.descriptor(role).await],
+            }))
             .await
             .unwrap();
-        let new_primary_report = restarted_secondary_handle
-            .public_v1_report()
-            .await
-            .unwrap();
-        assert_eq!(
-            old_primary_report.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-        );
-        assert_eq!(
-            new_primary_report.write_status,
-            kuberic_runtime::protocol::types::AccessStatus::Granted
-        );
-        assert!(
-            primary_restart_app
-                .replicate(Bytes::from_static(b"fenced-restart-predecessor"))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            secondary_restart_app
-                .replicate(Bytes::from_static(b"after-all-process-restart"))
-                .await
-                .unwrap(),
-            5
-        );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while primary_state.progress.lock().unwrap().committed_lsn < 5 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("restart failover write did not reach secondary");
-        assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 5);
-
-        restarted_primary.shutdown();
-        restarted_secondary.shutdown();
-        restarted_primary.wait().await.unwrap();
-        restarted_secondary.wait().await.unwrap();
-        std::fs::remove_dir_all(primary_root).unwrap();
-        std::fs::remove_dir_all(secondary_root).unwrap();
-    })
+    }
+    pair.configuration = current;
+    let observed = pair.target.service.observed.lock().unwrap().clone();
+    assert!(
+        observed
+            .iter()
+            .any(|call| matches!(call, NativeCall::Epoch(selected) if *selected == epoch))
+    );
+    assert!(
+        !observed
+            .iter()
+            .any(|call| matches!(call, NativeCall::Role(..))),
+        "same-role epoch advance recreated the native role/receiver"
+    );
+    let after = pair.target.report().await;
+    assert_eq!(after.role, ReplicaRole::ActiveSecondary);
+    assert_eq!(after.replicator_creation_id, before.replicator_creation_id);
+    assert_eq!(after.replication_address, before.replication_address);
+    assert_eq!(after.storage_incarnation, before.storage_incarnation);
+    let address = after.replication_address.unwrap();
+    let error = exchange(
+        address.clone(),
+        &predecessor,
+        &format!("Bearer {TOKEN}"),
+        vec![predecessor_frame],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    let mut stale = replication_frame(&pair, 2, Bytes::from_static(b"old-sending-epoch")).await;
+    let Some(native_wire::envelope::Body::ReplicationOperation(body)) = &mut stale.body else {
+        unreachable!()
+    };
+    body.sending_epoch = Some(native_wire::Epoch {
+        data_loss: 0,
+        configuration: 1,
+    });
+    let stale_stream = exchange(
+        address,
+        &binding(&pair).await,
+        &format!("Bearer {TOKEN}"),
+        vec![stale],
+    )
     .await
     .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), operations.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"value-1")]
+    );
+    assert_eq!(pair.target.report().await.progress.current(), Some(1));
+    drop(stale_stream);
+    let mut historical = replication_frame(&pair, 1, Bytes::from_static(b"value-1")).await;
+    let Some(native_wire::envelope::Body::ReplicationOperation(body)) = &mut historical.body else {
+        unreachable!()
+    };
+    body.original_epoch = Some(native_wire::Epoch {
+        data_loss: 0,
+        configuration: 1,
+    });
+    let mut historical_stream = exchange(
+        pair.target.report().await.replication_address.unwrap(),
+        &binding(&pair).await,
+        &format!("Bearer {TOKEN}"),
+        vec![historical],
+    )
+    .await
+    .unwrap();
+    applied(&mut historical_stream, 1).await;
+    assert!(
+        operations.try_recv().is_err(),
+        "legitimate historical-original retry was redelivered"
+    );
+    assert_eq!(
+        pair.target.service.provider.values(),
+        [Bytes::from_static(b"value-1")]
+    );
+    drop(historical_stream);
+    let write = pair
+        .source
+        .service
+        .begin_write(Bytes::from_static(b"current-epoch"))
+        .await
+        .unwrap();
+    let operation = delivered(&mut operations).await;
+    assert_eq!((operation.lsn, operation.epoch), (2, epoch));
+    pair.target
+        .service
+        .provider
+        .persist_received(&operation)
+        .await
+        .unwrap();
+    operation.acknowledge().unwrap();
+    assert_eq!(write.wait().await.unwrap(), 2);
+    pair.stop().await;
 }
 
 #[tokio::test]
-async fn hosted_public_v1_build_dispatches_exact_attempt_and_waits_for_matching_completion() {
-    tokio::time::timeout(Duration::from_secs(150), async {
-        let resource_uid = ResourceUid::new("preview-build");
-        let preview = PublicV1Identity::new(8);
-        let binding = PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let source_identity = replica_named(1, "build-source-pod", "build-source-agent");
-        let target_identity = replica_named(2, "build-target-pod", "build-target-agent");
-        let source_root = test_root("build-source");
-        let target_root = test_root("build-target");
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&source_root),
-                preview.clone(),
-                store_identity_named(
-                    resource_uid.clone(),
-                    source_identity.clone(),
-                    "build-source-pod",
-                    "build-source-pvc",
-                ),
-            )
-            .unwrap(),
-        );
-        drop(
-            SqliteStore::create_public_v1(
-                SqliteStore::metadata_database_path(&target_root),
-                preview.clone(),
-                store_identity_named(
-                    resource_uid.clone(),
-                    target_identity.clone(),
-                    "build-target-pod",
-                    "build-target-pvc",
-                ),
-            )
-            .unwrap(),
-        );
-        let source_address = free_address();
-        let target_address = free_address();
-        let source_state = Arc::new(MemoryState::default());
-        let target_state = Arc::new(MemoryState::default());
-        let source_app = Arc::new(PreviewApplication::new(
-            source_state.clone(),
-            format!("http://{source_address}"),
-        ));
-        let target_app = Arc::new(PreviewApplication::new(
-            target_state.clone(),
-            format!("http://{target_address}"),
-        ));
-        let mut source = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(1),
-                pod_uid: PodUid::new("build-source-pod"),
-                pvc_uid: PvcUid::new("build-source-pvc"),
-                data_root: source_root.clone(),
-                replication_address: source_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            source_app.clone(),
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding.clone())
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let mut target = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(2),
-                pod_uid: PodUid::new("build-target-pod"),
-                pvc_uid: PvcUid::new("build-target-pvc"),
-                data_root: target_root.clone(),
-                replication_address: target_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            target_app,
-            ApplicationStorageState::FreshEmpty,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(binding)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let source_handle = source.handle();
-        let target_handle = target.handle();
-        let generation = PublicProtocolGeneration::new(8);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        source_handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_named(
-                    source_identity.clone(),
-                    "build-source-pod",
-                    "build-source-pvc",
-                ),
-            )
-            .await
-            .unwrap();
-        target_handle
-            .initialize_public_v1_history(
-                &initialization,
-                &history,
-                &storage_named(
-                    target_identity.clone(),
-                    "build-target-pod",
-                    "build-target-pvc",
-                ),
-            )
-            .await
-            .unwrap();
-        let epoch = Epoch::new(0, 1);
-        let source_configuration = ConfigurationDescriptor::new(
-            epoch,
-            ReplicaId::new(1),
-            vec![ConfigurationMember {
-                identity: source_identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        install_static_authority(
-            &source_handle,
-            &preview,
-            source_identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: source_configuration.clone(),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        let target_session = target_handle.process_session_id();
-        for (revision, name, program) in [
-            (
-                1,
-                "open-build-target",
-                PublicOperationProgram::Open {
-                    replica: target_identity.clone(),
-                    existing: true,
-                },
-            ),
-            (
-                2,
-                "role-build-target",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ),
-            (
-                3,
-                "epoch-build-target",
-                PublicOperationProgram::Epoch { epoch },
-            ),
-        ] {
-            target_handle
-                .execute_public_v1(intent(
-                    &preview,
-                    target_session.clone(),
-                    revision,
-                    name,
-                    program,
-                ))
-                .await
-                .unwrap();
-        }
-        assert_eq!(
-            source_app
-                .replicate(Bytes::from_static(b"snapshot-value"))
-                .await
-                .unwrap(),
-            1
-        );
-        source_state
-            .copy_chunks
-            .lock()
-            .unwrap()
-            .push(Bytes::from_static(b"snapshot-bytes"));
-        let build_input = PublicBuildInput {
-            attempt: OperationId::new("preview-build-attempt"),
-            epoch,
-            current_configuration_id: Some(source_configuration.configuration_id.clone()),
-            replica: target_identity.clone(),
-            target_storage: storage_named(
-                target_identity.clone(),
-                "build-target-pod",
-                "build-target-pvc",
-            ),
-            process_session_id: target_session.clone(),
-            replication_address: format!("http://{target_address}"),
-            history: Some(history.clone()),
-        };
-        let source_storage = storage_named(
-            source_identity.clone(),
-            "build-source-pod",
-            "build-source-pvc",
-        );
-        let target_storage = build_input.target_storage.clone();
-        let build_authority =
-            |operation_id: &str, operation_revision, build_id: &str| PublicInboundBuildAuthority {
-                operation_id: OperationId::new(operation_id),
-                operation_revision,
-                attempt: PublicBuildAttemptReference {
-                    resource_uid: resource_uid.clone(),
-                    epoch,
-                    build_id: OperationId::new(build_id),
-                    source: source_identity.clone(),
-                    source_storage: source_storage.clone(),
-                    source_session: source_handle.process_session_id(),
-                    target: target_identity.clone(),
-                    target_storage: target_storage.clone(),
-                    target_session: target_session.clone(),
-                },
-                history: history.clone(),
-                current_configuration_id: source_configuration.configuration_id.clone(),
-                target_address: format!("http://{target_address}"),
-            };
-        let authority_classified = build_authority(
-            "classified-configuration-successor",
-            1,
-            "classified-successor",
-        );
-        let authority_a = build_authority("superseded-build-a", 2, "superseded-build-a");
-        let authority_b = build_authority("held-build-b", 3, "held-build-b");
-        let copy_frame = |authority: &PublicInboundBuildAuthority,
-                          sequence,
-                          snapshot_chunk,
-                          final_item| proto::CopyItem {
-            protocol_version: 11,
-            build_id: authority.attempt.build_id.to_string(),
-            sender: Some(source_identity.clone().into()),
-            receiver: Some(target_identity.clone().into()),
-            epoch: Some(epoch.into()),
-            current_configuration_id: source_configuration.configuration_id.to_string(),
-            sequence,
-            lsn: 1,
-            committed_lsn: 1,
-            replication_boundary_lsn: 1,
-            final_item,
-            data: if snapshot_chunk {
-                b"snapshot-bytes".to_vec()
-            } else {
-                Vec::new()
-            },
-            snapshot_chunk,
-            sender_session_id: source_handle.process_session_id().to_string(),
-            receiver_session_id: target_session.to_string(),
-            catch_up_boundary_lsn: final_item.then_some(1),
-            source_storage: Some(storage_proto(&source_storage)),
-            target_storage: Some(storage_proto(&target_storage)),
-            history: Some(history_proto(&history)),
-            target_address: format!("http://{target_address}"),
-        };
-        let classification_pause = testing_pause_inbound_build_after_classification(
-            authority_classified.operation_id.clone(),
-        );
-        let classified_install = tokio::spawn({
-            let target_handle = target_handle.clone();
-            let authority = authority_classified.clone();
-            async move {
-                target_handle
-                    .install_public_v1_inbound_build_authority(&authority)
-                    .await
-            }
-        });
-        classification_pause.wait_until_classified().await;
-        let target_configuration = ConfigurationDescriptor::new(
-            epoch,
-            source_identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: source_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: target_identity.clone(),
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ],
-            1,
-        );
-        let boundary_source_identity = source_identity.clone();
-        let boundary_source_session = source_handle.process_session_id();
-        let boundary_source_storage = source_storage.clone();
-        let configuration_boundary = tokio::spawn({
-            let target_handle = target_handle.clone();
-            let preview = preview.clone();
-            let target_session = target_session.clone();
-            async move {
-                target_handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        target_session,
-                        4,
-                        "classified-successor-configuration-boundary",
-                        PublicOperationProgram::Configuration(PublicConfiguration {
-                            current: target_configuration,
-                            previous: None,
-                            replicas: vec![PublicReplicaDescriptor {
-                                build_id: OperationId::default(),
-                                identity: boundary_source_identity,
-                                replication_address: format!("http://{source_address}"),
-                                process_session_id: boundary_source_session,
-                                storage_incarnation: Some(boundary_source_storage),
-                                role: ReplicaRole::Primary,
-                                current_progress: 1,
-                                catch_up_capability: 1,
-                                must_catchup: false,
-                            }],
-                        }),
-                    ))
-                    .await
-            }
-        });
-        classification_pause.wait_until_boundary_waiting().await;
-        classification_pause.release();
-        classified_install.await.unwrap().unwrap();
-        configuration_boundary.await.unwrap().unwrap();
-
-        let connection =
-            rusqlite::Connection::open(SqliteStore::metadata_database_path(&target_root)).unwrap();
-        let json: String = connection
-            .query_row(
-                "SELECT state_json FROM agent_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let durable: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let preview_state = &durable["publicV1OperationState"];
-        assert!(
-            preview_state["currentInboundBuildAuthority"].is_null(),
-            "classified successor survived completed configuration revocation"
-        );
-        assert_eq!(preview_state["inboundBuildGeneration"], 1);
-        drop(connection);
-
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{target_address}"
-        ))
-        .await
-        .unwrap();
-        let mut stale_classified = client
-            .build(Request::new(stream::iter([copy_frame(
-                &authority_classified,
-                0,
-                true,
-                false,
-            )])))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(
-            stale_classified.next().await.unwrap().is_err(),
-            "revoked classified successor retained an inbound task or cursor"
-        );
-        assert_eq!(
-            *target_state.progress.lock().unwrap(),
-            DurableApplicationProgress::default()
-        );
-        assert!(target_state.copy_chunks.lock().unwrap().is_empty());
-        assert!(target_state.operations.lock().unwrap().is_empty());
-
-        target_handle
-            .install_public_v1_inbound_build_authority(&authority_a)
-            .await
-            .unwrap();
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{target_address}"
-        ))
-        .await
-        .unwrap();
-        let mut first_a = client
-            .build(Request::new(stream::iter([copy_frame(
-                &authority_a,
-                0,
-                true,
-                false,
-            )])))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(
-            !first_a.next().await.unwrap().unwrap().final_item,
-            "fresh post-boundary authority did not start from an empty cursor"
-        );
-
-        target_state.block_finish_copy();
-        let held_finish = tokio::spawn({
-            let frame = copy_frame(&authority_a, 1, false, false);
-            async move {
-                let mut client = proto::replication_data_client::ReplicationDataClient::connect(
-                    format!("http://{target_address}"),
-                )
-                .await
-                .unwrap();
-                client
-                    .build(Request::new(stream::iter([frame])))
-                    .await
-                    .unwrap()
-                    .into_inner()
-                    .next()
-                    .await
-            }
-        });
-        target_state.finish_copy_entered.notified().await;
-        target_handle
-            .install_public_v1_inbound_build_authority(&authority_b)
-            .await
-            .unwrap();
-        assert!(
-            held_finish
-                .await
-                .unwrap()
-                .is_none_or(|result| result.is_err()),
-            "revoked target finish_copy returned a successful acknowledgement"
-        );
-        assert_eq!(
-            *target_state.progress.lock().unwrap(),
-            DurableApplicationProgress::default(),
-            "superseded finish_copy changed target durable progress"
-        );
-        target_state
-            .block_finish_copy
-            .store(false, Ordering::Release);
-        let mut first_b_frame = copy_frame(&authority_b, 0, true, false);
-        first_b_frame.lsn = 0;
-        first_b_frame.committed_lsn = 0;
-        first_b_frame.replication_boundary_lsn = 0;
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{target_address}"
-        ))
-        .await
-        .unwrap();
-        let mut first_b = client
-            .build(Request::new(stream::iter([first_b_frame])))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!first_b.next().await.unwrap().unwrap().final_item);
-        target_state.block_finish_copy();
-        let mut held_b = tokio::spawn({
-            let mut frame = copy_frame(&authority_b, 1, false, false);
-            frame.lsn = 0;
-            frame.committed_lsn = 0;
-            frame.replication_boundary_lsn = 0;
-            async move {
-                let mut client = proto::replication_data_client::ReplicationDataClient::connect(
-                    format!("http://{target_address}"),
-                )
-                .await
-                .unwrap();
-                client
-                    .build(Request::new(stream::iter([frame])))
-                    .await
-                    .unwrap()
-                    .into_inner()
-                    .next()
-                    .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::select! {
-                _ = target_state.finish_copy_entered.notified() => {}
-                result = &mut held_b => panic!("B completed before entering provider: {result:?}"),
-            }
+async fn native_build_callback_receives_invalid_progress_and_exact_frozen_idle_target() {
+    let root = root();
+    let resource = ResourceUid::new("observed-native-build");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    target.service.provider.install.hold();
+    let (intent, authority) = source.build_intent(&target, &single).await;
+    let expected = intent.clone();
+    let handle = source.handle();
+    let mut build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        target.service.provider.install.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let observed = source.service.observed.lock().unwrap().clone();
+    let info = observed
+        .iter()
+        .find_map(|call| match call {
+            NativeCall::Build(info) => Some(info),
+            _ => None,
         })
-        .await
-        .expect("B did not enter the target provider");
-        assert!(
-            target_handle
-                .install_public_v1_inbound_build_authority(&authority_a)
-                .await
-                .is_err(),
-            "stale authority A unexpectedly replaced in-flight authority B"
-        );
-        target_handle
-            .install_public_v1_inbound_build_authority(&authority_b)
-            .await
-            .unwrap();
-        target_state.release_finish_copy.notify_one();
-        let continued_b = tokio::time::timeout(Duration::from_secs(5), held_b)
-            .await
-            .expect("in-flight B did not continue after stale/exact admission")
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(continued_b.sequence, 1);
-        assert!(!continued_b.final_item);
-        assert_eq!(
-            *target_state.progress.lock().unwrap(),
-            DurableApplicationProgress::default(),
-            "stale or exact admission reset B into a provider progress mutation"
-        );
-        source_state.block_copy();
-        let terminal_authority =
-            build_authority("preview-build-attempt", 4, "preview-build-attempt");
-        let build_program = PublicOperationProgram::Build(build_input.clone());
-        let build_intent = intent(
-            &preview,
-            source_handle.process_session_id(),
-            4,
-            "preview-build-attempt",
-            build_program,
-        );
-        let build_accepted = PublicV1AcceptedStatus {
-            identity: preview.clone(),
-            history_initialization_id: initialization.clone(),
-            history: history.clone(),
-            data_loss_recovery: None,
-            completed_operations: Vec::new(),
-            extensions: Default::default(),
-        };
-        let build_transition = PublicV1AcceptedTransitionStatus {
-            resource_version: "build-status-1".into(),
-            evidence: build_accepted.clone(),
-            intent: PublicV1AcceptedTransitionIntent {
-                consumer: PublicV1EvidenceConsumer::RepairReplacement,
-                operation_id: build_intent.operation_id.clone(),
-                revision: build_intent.revision,
-                call_kind: PublicV1CallKind::Build,
-                history: history.clone(),
-                source: PublicV1ResourceAuthority {
-                    storage_incarnation: source_storage.clone(),
-                    resource_version: "build-source-rv-1".into(),
-                },
-                target: Some(PublicV1ResourceAuthority {
-                    storage_incarnation: target_storage.clone(),
-                    resource_version: "build-target-rv-1".into(),
-                }),
-                process_session_id: build_intent.process_session_id.clone(),
-                input_digest: build_intent.input_digest.clone(),
-                replay_disposition: build_intent.replay_disposition,
-                previous_configuration_id: None,
-                current_configuration_id: Some(source_configuration.configuration_id.clone()),
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
-            },
-        };
-        let build_evidence = Arc::new(
-            PublicV1EvidenceState::new(
-                build_transition.clone(),
-                vec![
-                    PublicV1EvidenceResource {
-                        storage_incarnation: source_storage.clone(),
-                        resource_version: "build-source-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: source_storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                    PublicV1EvidenceResource {
-                        storage_incarnation: target_storage.clone(),
-                        resource_version: "build-target-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: target_storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                ],
-            )
-            .unwrap(),
-        );
-        let build_adapter = Arc::new(
-            HostedPublicV1Harness::new(
-                vec![
-                    HostedPublicV1Replica {
-                        identity: source_identity.clone(),
-                        replication_address: format!("http://{source_address}"),
-                        handle: source_handle.clone(),
-                    },
-                    HostedPublicV1Replica {
-                        identity: target_identity.clone(),
-                        replication_address: format!("http://{target_address}"),
-                        handle: target_handle.clone(),
-                    },
-                ],
-                Some(build_accepted),
-                None,
-                build_evidence.clone(),
-            )
-            .unwrap(),
-        );
-        let build_command =
-            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
-                target: source_identity.clone(),
-                intent: build_intent,
-            }));
-        let copy_entered = source_state.copy_entered.notified();
-        let build_scope = test_scope(&resource_uid);
-        let mut build = tokio::spawn({
-            let build_adapter = build_adapter.clone();
-            let build_transition = build_transition.clone();
-            async move {
-                execute_public_v1_operation(
-                    build_adapter.as_ref(),
-                    &build_scope,
-                    &build_transition,
-                    build_command,
-                )
-                .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                _ = copy_entered => {}
-                result = &mut build => panic!("build completed before copy: {result:?}"),
-            }
-        })
-        .await
-        .expect("build did not request its frozen copy");
-        let exact_frame = proto::CopyItem {
-            protocol_version: 11,
-            build_id: build_input.attempt.to_string(),
-            sender: Some(source_identity.clone().into()),
-            receiver: Some(target_identity.clone().into()),
-            epoch: Some(epoch.into()),
-            current_configuration_id: source_configuration.configuration_id.to_string(),
-            sequence: 0,
-            lsn: 1,
-            committed_lsn: 1,
-            replication_boundary_lsn: 1,
-            final_item: false,
-            data: b"unauthorized-copy".to_vec(),
-            snapshot_chunk: true,
-            sender_session_id: source_handle.process_session_id().to_string(),
-            receiver_session_id: target_session.to_string(),
-            catch_up_boundary_lsn: None,
-            source_storage: Some(storage_proto(&source_storage)),
-            target_storage: Some(storage_proto(&target_storage)),
-            history: Some(history_proto(&history)),
-            target_address: format!("http://{target_address}"),
-        };
-        let mut wrong_frames = Vec::new();
-        let mut wrong = exact_frame.clone();
-        wrong.sender = Some(replica_named(9, "wrong-source", "wrong-source-agent").into());
-        wrong_frames.push(wrong);
-        let mut wrong = exact_frame.clone();
-        wrong.build_id = "wrong-build".into();
-        wrong_frames.push(wrong);
-        let mut wrong = exact_frame.clone();
-        let mut wrong_storage = target_storage.clone();
-        wrong_storage.storage_generation = StorageGeneration::new("wrong-target-storage");
-        wrong.target_storage = Some(storage_proto(&wrong_storage));
-        wrong_frames.push(wrong);
-        let mut wrong = exact_frame.clone();
-        wrong.history.as_mut().unwrap().history_id = "wrong-history".into();
-        wrong_frames.push(wrong);
-        let mut wrong = exact_frame.clone();
-        wrong.sender_session_id = "wrong-source-session".into();
-        wrong_frames.push(wrong);
-        let mut wrong = exact_frame;
-        wrong.epoch = Some(Epoch::new(0, 2).into());
-        wrong_frames.push(wrong);
-        for wrong in wrong_frames {
-            let mut client = proto::replication_data_client::ReplicationDataClient::connect(
-                format!("http://{target_address}"),
-            )
-            .await
-            .unwrap();
-            let mut response = client
-                .build(Request::new(stream::iter([wrong])))
-                .await
-                .unwrap()
-                .into_inner();
-            assert!(response.next().await.unwrap().is_err());
-            assert_eq!(
-                *target_state.progress.lock().unwrap(),
-                DurableApplicationProgress::default()
+        .unwrap();
+    assert_eq!(
+        info.current_progress,
+        kuberic_runtime::application::INVALID_LSN
+    );
+    assert_eq!(
+        info.catch_up_capability,
+        kuberic_runtime::application::INVALID_LSN
+    );
+    assert_eq!(info.role, ReplicaRole::IdleSecondary);
+    assert!(!info.must_catchup);
+    assert_eq!(info.build_id, authority.attempt.build_id);
+    assert_eq!(info.identity, target.identity);
+    assert_eq!(info.storage_incarnation.as_ref(), Some(&target.storage));
+    assert_eq!(
+        info.process_session_id,
+        target.handle().process_session_id()
+    );
+    assert_eq!(info.replication_address, authority.target_address);
+    let role_index = observed
+        .iter()
+        .position(
+            |call| matches!(call, NativeCall::Role(epoch, ReplicaRole::Primary) if *epoch == EPOCH),
+        )
+        .unwrap();
+    let configuration_index = observed
+        .iter()
+        .position(|call| matches!(call, NativeCall::Current(_)))
+        .unwrap();
+    assert!(
+        role_index < configuration_index,
+        "native primary configuration preceded completed Primary role"
+    );
+    for call in &observed {
+        if let NativeCall::Current(configuration) = call {
+            assert!(
+                !configuration
+                    .configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == target.identity)
             );
-            assert_eq!(
-                target_state.copy_chunks.lock().unwrap().as_slice(),
-                &[Bytes::from_static(b"snapshot-bytes")],
-                "rejected frame changed the superseded target copy"
-            );
+            assert!(configuration.replicas.iter().all(|peer| {
+                peer.identity != source.identity && peer.role == ReplicaRole::ActiveSecondary
+            }));
         }
-        assert_eq!(
-            source_app
-                .replicate(Bytes::from_static(b"retained-after-snapshot"))
-                .await
-                .unwrap(),
-            2
-        );
-        source_state.release_copy.notify_waiters();
-        build.await.unwrap().unwrap();
-        target_handle
-            .revoke_public_v1_inbound_build_authority(&terminal_authority)
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut build)
             .await
-            .unwrap();
-        target_handle
-            .revoke_public_v1_inbound_build_authority(&terminal_authority)
+            .is_err()
+    );
+    assert!(
+        !source
+            .report()
             .await
-            .unwrap();
-        let build_report = build_adapter.report(&source_identity).await.unwrap();
-        assert_eq!(
-            reconcile_public_v1_consumer(build_adapter.as_ref(), &test_scope(&resource_uid), &build_report)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EvidencePersisted
-        );
-        assert_eq!(
-            reconcile_public_v1_consumer(build_adapter.as_ref(), &test_scope(&resource_uid), &build_report)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EffectApplied
-        );
-        assert_eq!(build_evidence.effects().len(), 1);
-        assert_eq!(
-            *target_state.progress.lock().unwrap(),
-            DurableApplicationProgress {
-                applied_lsn: 2,
-                committed_lsn: 2,
-            }
-        );
-        assert_eq!(
-            target_state.copy_chunks.lock().unwrap().as_slice(),
-            &[Bytes::from_static(b"snapshot-bytes")]
-        );
-        assert!(
-            target_state
-                .operations
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|operation| {
-                    operation.lsn == 2 && operation.data.as_ref() == b"retained-after-snapshot"
-                })
-        );
-        let terminal_counts = (
-            target_state.copy_chunks.lock().unwrap().len(),
-            target_state.operations.lock().unwrap().len(),
-        );
-        let terminal_frame = proto::CopyItem {
-            protocol_version: 11,
-            build_id: build_input.attempt.to_string(),
-            sender: Some(source_identity.clone().into()),
-            receiver: Some(target_identity.clone().into()),
-            epoch: Some(epoch.into()),
-            current_configuration_id: source_configuration.configuration_id.to_string(),
-            sequence: 3,
-            lsn: 2,
-            committed_lsn: 2,
-            replication_boundary_lsn: 1,
-            final_item: true,
-            data: Vec::new(),
-            snapshot_chunk: false,
-            sender_session_id: source_handle.process_session_id().to_string(),
-            receiver_session_id: target_session.to_string(),
-            catch_up_boundary_lsn: Some(2),
-            source_storage: Some(storage_proto(&source_storage)),
-            target_storage: Some(storage_proto(&target_storage)),
-            history: Some(history_proto(&history)),
-            target_address: format!("http://{target_address}"),
-        };
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{target_address}"
-        ))
-        .await
-        .unwrap();
-        let replayed_ack = client
-            .build(Request::new(stream::iter([terminal_frame.clone()])))
-            .await
-            .unwrap()
-            .into_inner()
-            .next()
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(replayed_ack.final_item);
-        assert_eq!(replayed_ack.durable_lsn, 2);
-        assert_eq!(
-            terminal_counts,
-            (
-                target_state.copy_chunks.lock().unwrap().len(),
-                target_state.operations.lock().unwrap().len(),
-            ),
-            "terminal ACK replay repeated provider mutation"
-        );
-        let mut changed_terminal = terminal_frame;
-        changed_terminal.current_configuration_id = "changed-terminal-authority".into();
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{target_address}"
-        ))
-        .await
-        .unwrap();
-        assert!(
-            client
-                .build(Request::new(stream::iter([changed_terminal])))
-                .await
-                .unwrap()
-                .into_inner()
-                .next()
-                .await
-                .unwrap()
-                .is_err()
-        );
-        let admitted = ConfigurationDescriptor::new(
-            epoch,
-            ReplicaId::new(1),
-            vec![
-                ConfigurationMember {
-                    identity: source_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: target_identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        target_handle
-            .execute_public_v1(intent(
-                &preview,
-                target_session.clone(),
-                7,
-                "admit-build-target-role",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ))
-            .await
-            .unwrap();
-        target_handle
-            .execute_public_v1(intent(
-                &preview,
-                target_session.clone(),
-                8,
-                "admit-build-target-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: admitted.clone(),
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: source_identity.clone(),
-                        replication_address: format!("http://{source_address}"),
-                        process_session_id: source_handle.process_session_id(),
-                        storage_incarnation: Some(source_storage.clone()),
-                        role: ReplicaRole::Primary,
-                        current_progress: 2,
-                        catch_up_capability: 1,
-                        must_catchup: false,
-                    }],
-                }),
-            ))
-            .await
-            .unwrap();
-        source_handle
-            .execute_public_v1(intent(
-                &preview,
-                source_handle.process_session_id(),
-                6,
-                "admit-build-source-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: admitted,
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: target_identity.clone(),
-                        replication_address: format!("http://{target_address}"),
-                        process_session_id: target_session,
-                        storage_incarnation: Some(target_storage.clone()),
-                        role: ReplicaRole::ActiveSecondary,
-                        current_progress: 2,
-                        catch_up_capability: 2,
-                        must_catchup: false,
-                    }],
-                }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            source_app
-                .replicate(Bytes::from_static(b"after-admission"))
-                .await
-                .unwrap(),
-            3
-        );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while target_state.progress.lock().unwrap().committed_lsn < 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("admitted build target did not observe committed write");
-        source_handle
-            .execute_public_v1(intent(
-                &preview,
-                source_handle.process_session_id(),
-                6,
-                "preview-remove-target",
-                PublicOperationProgram::Remove(build_input),
-            ))
-            .await
-            .unwrap();
-        let single = ConfigurationDescriptor::new(
-            epoch,
-            ReplicaId::new(1),
-            vec![ConfigurationMember {
-                identity: source_identity,
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        source_handle
-            .execute_public_v1(intent(
-                &preview,
-                source_handle.process_session_id(),
-                8,
-                "post-removal-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: single,
-                    previous: None,
-                    replicas: Vec::new(),
-                }),
-            ))
-            .await
-            .unwrap();
-        target.shutdown();
-        target.wait().await.unwrap();
-        assert_eq!(
-            source_app
-                .replicate(Bytes::from_static(b"after-removal"))
-                .await
-                .unwrap(),
-            4
-        );
-
-        source.shutdown();
-        source.wait().await.unwrap();
-        std::fs::remove_dir_all(source_root).unwrap();
-        std::fs::remove_dir_all(target_root).unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn hosted_public_v1_supersession_cancels_build_root_and_drains_descendant_before_close() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let resource_uid = ResourceUid::new("preview-close-cancels-build");
-        let preview = PublicV1Identity::new(13);
-        let mut source =
-            HostedMemoryReplica::start("close-build-source", &resource_uid, &preview, 1).await;
-        let generation = PublicProtocolGeneration::new(13);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        source.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let source_configuration = ConfigurationDescriptor::new(
-            epoch,
-            source.identity.replica_id,
-            vec![ConfigurationMember {
-                identity: source.identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        install_static_authority(
-            &source.handle(),
-            &preview,
-            source.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: source_configuration.clone(),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"snapshot-before-close"))
-                .await
-                .unwrap(),
-            1
-        );
-        source
-            .state
-            .copy_chunks
-            .lock()
-            .unwrap()
-            .push(Bytes::from_static(b"close-build-snapshot"));
-        source.state.block_copy_with_descendant();
-        let target_identity =
-            replica_named(2, "close-build-target-pod", "close-build-target-agent");
-        let build_input = PublicBuildInput {
-            attempt: OperationId::new("build-superseded-by-close"),
-            epoch,
-            current_configuration_id: Some(source_configuration.configuration_id.clone()),
-            replica: target_identity.clone(),
-            target_storage: storage_named(
-                target_identity,
-                "close-build-target-pod",
-                "close-build-target-pvc",
-            ),
-            process_session_id: kuberic_runtime::protocol::types::ProcessSessionId::new(
-                "close-build-target-session",
-            ),
-            replication_address: "http://127.0.0.1:1".into(),
-            history: Some(history),
-        };
-        let build_intent = intent(
-            &preview,
-            source.handle().process_session_id(),
-            4,
-            "build-superseded-by-close",
-            PublicOperationProgram::Build(build_input),
-        );
-        let copy_entered = source.state.copy_entered.notified();
-        let mut build = tokio::spawn({
-            let handle = source.handle();
-            async move { handle.execute_public_v1(build_intent).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                _ = copy_entered => {}
-                result = &mut build => panic!("build root completed before held callback: {result:?}"),
-            }
-        })
-        .await
-        .expect("build root did not enter the provider copy callback");
-        assert!(!build.is_finished(), "build root was not held");
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            source.state.copy_descendant_entered.notified(),
-        )
-            .await
-            .expect("provider callback descendant did not start");
-
-        let successor = tokio::spawn({
-            let handle = source.handle();
-            let preview = preview.clone();
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        5,
-                        "progress-supersedes-build",
-                        PublicOperationProgram::Progress { capability: true },
-                    ))
-                    .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if source
-                    .state
-                    .cancelled_copy_descendants
-                    .load(Ordering::SeqCst)
-                    == 1
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successor did not cancel and drain the callback descendant");
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), build)
-                .await
-                .expect("superseded build root did not terminate")
-                .unwrap()
-                .is_err(),
-            "superseded build root completed successfully"
-        );
-        tokio::time::timeout(Duration::from_secs(10), successor)
-            .await
-            .expect("successor did not complete after descendant drain")
-            .unwrap()
-            .unwrap();
-        source
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                source.handle().process_session_id(),
-                6,
-                "close-after-build-supersession",
-                PublicOperationProgram::Close,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            source
-                .state
-                .copy_descendant_mutations
-                .load(Ordering::SeqCst),
-            0,
-            "cancelled callback descendant mutated state"
-        );
-        source.state.release_copy_descendant.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            source
-                .state
-                .copy_descendant_mutations
-                .load(Ordering::SeqCst),
-            0,
-            "cancelled callback descendant performed a delayed mutation after close"
-        );
-        assert!(std::net::TcpListener::bind(source.address).is_ok());
-
-        source.stop().await;
-        source.cleanup();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn hung_build_peer_is_bounded_and_drained_before_successor_close() {
-    tokio::time::timeout(Duration::from_secs(90), async {
-        let resource_uid = ResourceUid::new("hung-build-peer");
-        let preview = PublicV1Identity::new(753);
-        let mut source =
-            HostedMemoryReplica::start("hung-build-source", &resource_uid, &preview, 1).await;
-        let generation = PublicProtocolGeneration::new(753);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        source.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let configuration = ConfigurationDescriptor::new(
-            epoch,
-            source.identity.replica_id,
-            vec![ConfigurationMember {
-                identity: source.identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        install_static_authority(
-            &source.handle(),
-            &preview,
-            source.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: configuration.clone(),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"hung-build-snapshot"))
-                .await
-                .unwrap(),
-            1
-        );
-        let listener = TcpListener::bind(free_address()).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let accepted = Arc::new(Notify::new());
-        let hang = tokio::spawn({
-            let accepted = accepted.clone();
-            async move {
-                tonic::transport::Server::builder()
-                    .add_service(proto::replication_data_server::ReplicationDataServer::new(
-                        HungBuildService { entered: accepted },
-                    ))
-                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                    .await
-            }
-        });
-        let target = replica_named(2, "hung-build-target-pod", "hung-build-target-agent");
-        let build = tokio::spawn({
-            let handle = source.handle();
-            let preview = preview.clone();
-            let history = history.clone();
-            let configuration_id = configuration.configuration_id.clone();
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        4,
-                        "hung-build-attempt",
-                        PublicOperationProgram::Build(PublicBuildInput {
-                            attempt: OperationId::new("hung-build-attempt"),
-                            epoch,
-                            current_configuration_id: Some(configuration_id),
-                            replica: target.clone(),
-                            target_storage: storage_named(
-                                target,
-                                "hung-build-target-pod",
-                                "hung-build-target-pvc",
-                            ),
-                            process_session_id: ProcessSessionId::new("hung-build-target-session"),
-                            replication_address: format!("http://{address}"),
-                            history: Some(history),
-                        }),
-                    ))
-                    .await
-            }
-        });
-        accepted.notified().await;
-        let deadline_started = tokio::time::Instant::now();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), build)
-                .await
-                .expect("hung build exceeded its peer deadline")
-                .unwrap()
-                .is_err()
-        );
-        assert!(
-            deadline_started.elapsed() >= Duration::from_secs(4),
-            "hung build did not exercise the peer ACK deadline"
-        );
-        let successor = tokio::spawn({
-            let handle = source.handle();
-            let preview = preview.clone();
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        5,
-                        "progress-after-hung-build",
-                        PublicOperationProgram::Progress { capability: true },
-                    ))
-                    .await
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(10), successor)
-            .await
-            .expect("successor did not drain the timed-out build")
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            source.handle().execute_public_v1(intent(
-                &preview,
-                source.handle().process_session_id(),
-                6,
-                "close-after-hung-build",
-                PublicOperationProgram::Close,
-            )),
-        )
-        .await
-        .expect("Close was not bounded after a hung build")
-        .unwrap();
-        hang.abort();
-        let _ = hang.await;
-        source.stop().await;
-        source.cleanup();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn build_retained_gap_corruption_replaces_source_without_contacting_target() {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let resource_uid = ResourceUid::new("build-source-gap-corruption");
-        let preview = PublicV1Identity::new(754);
-        let mut source =
-            HostedMemoryReplica::start("build-gap-source", &resource_uid, &preview, 1).await;
-        let generation = PublicProtocolGeneration::new(754);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        source.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let configuration = ConfigurationDescriptor::new(
-            epoch,
-            source.identity.replica_id,
-            vec![ConfigurationMember {
-                identity: source.identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        install_static_authority(
-            &source.handle(),
-            &preview,
-            source.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: configuration.clone(),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"source-snapshot"))
-                .await
-                .unwrap(),
-            1
-        );
-        source.state.block_copy();
-        let target_listener = TcpListener::bind(free_address()).await.unwrap();
-        let target_address = target_listener.local_addr().unwrap();
-        let target = replica_named(2, "healthy-target-pod", "healthy-target-agent");
-        let operation_id = OperationId::new("build-with-corrupt-source-gap");
-        let copy_entered = source.state.copy_entered.notified();
-        let build = tokio::spawn({
-            let handle = source.handle();
-            let preview = preview.clone();
-            let history = history.clone();
-            let configuration_id = configuration.configuration_id.clone();
-            let target = target.clone();
-            async move {
-                handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        handle.process_session_id(),
-                        4,
-                        "build-with-corrupt-source-gap",
-                        PublicOperationProgram::Build(PublicBuildInput {
-                            attempt: operation_id,
-                            epoch,
-                            current_configuration_id: Some(configuration_id),
-                            replica: target.clone(),
-                            target_storage: storage_named(
-                                target,
-                                "healthy-target-pod",
-                                "healthy-target-pvc",
-                            ),
-                            process_session_id: ProcessSessionId::new("healthy-target-session"),
-                            replication_address: format!("http://{target_address}"),
-                            history: Some(history),
-                        }),
-                    ))
-                    .await
-            }
-        });
-        copy_entered.await;
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"missing-retained-gap"))
-                .await
-                .unwrap(),
-            2
-        );
-        source
-            .state
-            .operations
-            .lock()
-            .unwrap()
-            .retain(|operation| operation.lsn != 2);
-        source.state.release_copy.notify_waiters();
-        assert!(
-            build
-                .await
-                .unwrap()
-                .unwrap_err()
-                .to_string()
-                .contains("local build source requires replacement")
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), target_listener.accept())
-                .await
-                .is_err(),
-            "source corruption contacted or mutated the healthy target"
-        );
-        let partition = source.application.partition.read().await.clone().unwrap();
-        assert_eq!(
-            partition.get_read_status().await.unwrap(),
-            AccessStatus::NotPrimary
-        );
-        assert_eq!(
-            partition.get_write_status().await.unwrap(),
-            AccessStatus::NotPrimary
-        );
-        assert!(
-            source
-                .application
-                .replicate(Bytes::from_static(
-                    b"must-not-write-after-source-corruption"
-                ))
-                .await
-                .is_err(),
-            "local rebuild-required returned before write authority was revoked"
-        );
-        source
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                source.handle().process_session_id(),
-                5,
-                "progress-after-source-corruption",
-                PublicOperationProgram::Progress { capability: true },
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            partition.get_read_status().await.unwrap(),
-            AccessStatus::NotPrimary
-        );
-        assert_eq!(
-            partition.get_write_status().await.unwrap(),
-            AccessStatus::NotPrimary
-        );
-        let report = source.handle().public_v1_report().await.unwrap();
-        let completion = report
             .completed_operations
             .iter()
-            .find(|completion| completion.operation_id.as_str() == "build-with-corrupt-source-gap")
-            .unwrap();
-        assert!(matches!(
-            completion.result,
-            PublicV1OperationResult::RebuildRequired(ref rebuild)
-                if matches!(
-                    rebuild.as_ref(),
-                    kuberic_runtime::protocol::public_operations::
-                        CanonicalReplicaRebuildRequired::LocalProvider {
-                            local_replica,
-                            ..
-                        } if local_replica == &source.identity
-                )
-        ));
-        source.stop().await;
-        source.cleanup();
-    })
-    .await
-    .unwrap();
+            .any(|completion| completion.operation_id == expected.operation_id)
+    );
+    target.service.provider.install.release();
+    tokio::time::timeout(Duration::from_secs(10), build)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let report = source.report().await;
+    let completion = report
+        .completed_operations
+        .iter()
+        .find(|completion| completion.operation_id == expected.operation_id)
+        .unwrap();
+    assert_eq!(completion.revision, expected.revision);
+    assert_eq!(completion.process_session_id, expected.process_session_id);
+    assert_eq!(completion.input_digest, expected.input_digest);
+    assert_eq!(completion.replay_disposition, expected.replay_disposition);
+    assert_eq!(completion.history, authority.history);
+    assert_eq!(completion.storage_incarnation, source.storage);
+    assert_eq!(
+        completion.current_configuration_id.as_ref(),
+        Some(&authority.current_configuration_id)
+    );
+    assert_eq!(completion.call_kind, PublicV1CallKind::Build);
+    assert_eq!(completion.result, PublicV1OperationResult::Succeeded);
+    source.stop().await;
+    target.stop().await;
 }
 
 #[tokio::test]
-async fn hosted_public_v1_removal_drains_build_excludes_peer_and_rejects_stale_session() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let resource_uid = ResourceUid::new("preview-removal-drain");
-        let preview = PublicV1Identity::new(9);
-        let mut source =
-            HostedMemoryReplica::start("removal-source", &resource_uid, &preview, 1).await;
-        let mut target =
-            HostedMemoryReplica::start("removal-target", &resource_uid, &preview, 2).await;
-        let generation = PublicProtocolGeneration::new(9);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        source.initialize_history(&initialization, &history).await;
-        target.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let source_configuration = ConfigurationDescriptor::new(
-            epoch,
-            source.identity.replica_id,
-            vec![ConfigurationMember {
-                identity: source.identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        install_static_authority(
-            &source.handle(),
-            &preview,
-            source.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: source_configuration.clone(),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        let target_session = target.handle().process_session_id();
-        for (revision, name, program) in [
-            (
-                1,
-                "open-removal-target",
-                PublicOperationProgram::Open {
-                    replica: target.identity.clone(),
-                    existing: true,
-                },
-            ),
-            (
-                2,
-                "role-removal-target",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ),
-            (
-                3,
-                "epoch-removal-target",
-                PublicOperationProgram::Epoch { epoch },
-            ),
-        ] {
-            target
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    target_session.clone(),
-                    revision,
-                    name,
-                    program,
-                ))
-                .await
-                .unwrap();
+async fn native_configuration_dispatch_rejects_self_idle_and_nonmember_descriptors() {
+    let root = root();
+    let pair = Pair::start(root.path(), 0).await;
+    let valid = PublicConfiguration {
+        current: pair.configuration.clone(),
+        previous: None,
+        replicas: vec![pair.target.descriptor(ReplicaRole::ActiveSecondary).await],
+    };
+    for invalid in 0..3 {
+        let mut input = valid.clone();
+        match invalid {
+            0 => input
+                .replicas
+                .push(pair.source.descriptor(ReplicaRole::Primary).await),
+            1 => input.replicas[0].role = ReplicaRole::IdleSecondary,
+            _ => input.replicas[0].identity.replica_id = ReplicaId::new(99),
         }
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"snapshot-before-removal"))
+        let count = pair.source.service.observed.lock().unwrap().len();
+        assert!(
+            pair.source
+                .command(PublicOperationProgram::Configuration(input))
                 .await
-                .unwrap(),
-            1
+                .is_err()
         );
-        source
-            .state
-            .copy_chunks
-            .lock()
-            .unwrap()
-            .push(Bytes::from_static(b"frozen-build-snapshot"));
-        source.state.block_copy();
-        target.state.block_commit();
-        let build_input = PublicBuildInput {
-            attempt: OperationId::new("active-build-to-remove"),
-            epoch,
-            current_configuration_id: Some(source_configuration.configuration_id.clone()),
+        assert_eq!(pair.source.service.observed.lock().unwrap().len(), count);
+    }
+    pair.source
+        .command(PublicOperationProgram::Configuration(valid))
+        .await
+        .unwrap();
+    for call in pair.source.service.observed.lock().unwrap().iter() {
+        if let NativeCall::Current(configuration) = call {
+            assert!(
+                configuration
+                    .replicas
+                    .iter()
+                    .all(|peer| peer.identity != pair.source.identity
+                        && peer.role == ReplicaRole::ActiveSecondary)
+            );
+        }
+    }
+    pair.stop().await;
+}
+
+#[tokio::test]
+async fn native_remove_cancels_session_without_late_install_and_close_drains_retained_provider() {
+    let root = root();
+    let resource = ResourceUid::new("remove-running-native-build");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    source
+        .service
+        .write(Bytes::from_static(b"committed-before-build"))
+        .await
+        .unwrap();
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    source.service.provider.copy.hold();
+    let (intent, authority) = source.build_intent(&target, &single).await;
+    let cancelled_intent = intent.clone();
+    let build_id = intent.operation_id.clone();
+    let handle = source.handle();
+    let build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        source.service.provider.copy.entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        source.service.provider.copy_active.load(Ordering::Acquire),
+        1
+    );
+    let removal = source
+        .intent(PublicOperationProgram::Remove(PublicBuildInput {
+            attempt: authority.attempt.build_id.clone(),
+            epoch: authority.attempt.epoch,
+            current_configuration_id: Some(authority.current_configuration_id.clone()),
             replica: target.identity.clone(),
             target_storage: target.storage.clone(),
-            process_session_id: target_session.clone(),
-            replication_address: format!("http://{}", target.address),
-            history: Some(history.clone()),
-        };
-        let build_intent = intent(
-            &preview,
-            source.handle().process_session_id(),
-            4,
-            "active-build-to-remove",
-            PublicOperationProgram::Build(build_input.clone()),
-        );
-        target
-            .handle()
-            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
-                operation_id: OperationId::new("active-build-to-remove"),
-                operation_revision: 4,
-                attempt: PublicBuildAttemptReference {
-                    resource_uid: resource_uid.clone(),
-                    epoch,
-                    build_id: build_input.attempt.clone(),
-                    source: source.identity.clone(),
-                    source_storage: source.storage.clone(),
-                    source_session: source.handle().process_session_id(),
-                    target: target.identity.clone(),
-                    target_storage: target.storage.clone(),
-                    target_session: target_session.clone(),
-                },
-                history: history.clone(),
-                current_configuration_id: source_configuration.configuration_id.clone(),
-                target_address: format!("http://{}", target.address),
-            })
-            .await
-            .unwrap();
-        let copy_entered = source.state.copy_entered.notified();
-        let mut build = tokio::spawn({
-            let handle = source.handle();
-            async move { handle.execute_public_v1(build_intent).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                _ = copy_entered => {}
-                result = &mut build => panic!("build completed before frozen copy: {result:?}"),
-            }
-        })
-        .await
-        .expect("build root did not reach the frozen copy");
-        assert!(!build.is_finished(), "build root was not active");
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"retained-before-removal"))
-                .await
-                .unwrap(),
-            2
-        );
-        let descendant_entered = target.state.commit_entered.notified();
-        source.state.release_copy.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), descendant_entered)
-            .await
-            .expect("remote build descendant did not reach durable commit");
-        assert!(!build.is_finished(), "build descendant was not active");
-
-        let removal_intent = intent(
-            &preview,
-            source.handle().process_session_id(),
-            4,
-            "remove-active-build",
-            PublicOperationProgram::Remove(build_input),
-        );
-        let accepted = PublicV1AcceptedStatus {
-            identity: preview.clone(),
-            history_initialization_id: initialization,
-            history: history.clone(),
-            data_loss_recovery: None,
-            completed_operations: Vec::new(),
-            extensions: Default::default(),
-        };
-        let transition = PublicV1AcceptedTransitionStatus {
-            resource_version: "removal-status-rv-1".into(),
-            evidence: accepted.clone(),
-            intent: PublicV1AcceptedTransitionIntent {
-                consumer: PublicV1EvidenceConsumer::Removal,
-                operation_id: removal_intent.operation_id.clone(),
-                revision: removal_intent.revision,
-                call_kind: PublicV1CallKind::Remove,
-                history: history.clone(),
-                source: PublicV1ResourceAuthority {
-                    storage_incarnation: source.storage.clone(),
-                    resource_version: "removal-source-rv-1".into(),
-                },
-                target: Some(PublicV1ResourceAuthority {
-                    storage_incarnation: target.storage.clone(),
-                    resource_version: "removal-target-rv-1".into(),
-                }),
-                process_session_id: removal_intent.process_session_id.clone(),
-                input_digest: removal_intent.input_digest.clone(),
-                replay_disposition: removal_intent.replay_disposition,
-                previous_configuration_id: None,
-                current_configuration_id: None,
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
-            },
-        };
-        let evidence = Arc::new(
-            PublicV1EvidenceState::new(
-                transition.clone(),
-                vec![
-                    PublicV1EvidenceResource {
-                        storage_incarnation: source.storage.clone(),
-                        resource_version: "removal-source-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: source.storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                    PublicV1EvidenceResource {
-                        storage_incarnation: target.storage.clone(),
-                        resource_version: "removal-target-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: target.storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                ],
-            )
-            .unwrap(),
-        );
-        let adapter = Arc::new(
-            HostedPublicV1Harness::new(
-                vec![
-                    HostedPublicV1Replica {
-                        identity: source.identity.clone(),
-                        replication_address: format!("http://{}", source.address),
-                        handle: source.handle(),
-                    },
-                    HostedPublicV1Replica {
-                        identity: target.identity.clone(),
-                        replication_address: format!("http://{}", target.address),
-                        handle: target.handle(),
-                    },
-                ],
-                Some(accepted.clone()),
-                None,
-                evidence.clone(),
-            )
-            .unwrap(),
-        );
-        let removal_scope = test_scope(&resource_uid);
-        let removal = tokio::spawn({
-            let adapter = adapter.clone();
-            let transition = transition.clone();
-            async move {
-                execute_public_v1_operation(
-                    adapter.as_ref(),
-                    &removal_scope,
-                    &transition,
-                    ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
-                        target: transition.intent.source.storage_incarnation.replica.clone(),
-                        intent: removal_intent,
-                    })),
-                )
-                .await
-            }
-        });
-        assert!(evidence.effects().is_empty());
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), build)
-                .await
-                .expect("cancelled build root did not drain")
-                .unwrap()
-                .is_err()
-        );
-        tokio::time::timeout(Duration::from_secs(10), removal)
-            .await
-            .expect("removal did not cancel and drain the build")
-            .unwrap()
-            .unwrap();
-        let committed_before_release = target.state.progress.lock().unwrap().committed_lsn;
-        target.state.release_commit.notify_one();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            target.state.progress.lock().unwrap().committed_lsn,
-            committed_before_release,
-            "cancelled target build committed after removal completed"
-        );
-        let report = adapter.report(&source.identity).await.unwrap();
-        assert_eq!(
-            reconcile_public_v1_consumer(adapter.as_ref(), &test_scope(&resource_uid), &report)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EvidencePersisted
-        );
-        assert_eq!(
-            reconcile_public_v1_consumer(adapter.as_ref(), &test_scope(&resource_uid), &report)
-                .await
-                .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::EffectApplied
-        );
-        assert!(matches!(
-            evidence.effects().as_slice(),
-            [kuberic_controller::evaluator::testing::PublicV1EvidenceEffect::Retired {
-                consumer: PublicV1EvidenceConsumer::Removal,
-                operation_id,
-                revision: 4,
-                storage,
-            }] if operation_id == &OperationId::new("remove-active-build")
-                && storage.as_ref() == &target.storage
-        ));
-        let target_resource = evidence
-            .resources()
-            .into_iter()
-            .find(|resource| resource.storage_incarnation == target.storage)
-            .unwrap();
-        assert_eq!(target_resource.resource_version, "removal-target-rv-1-next");
-        assert_eq!(
-            target_resource.disposition,
-            PublicV1ResourceDisposition::Retired
-        );
-
-        let before = *target.state.progress.lock().unwrap();
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{}",
-            target.address
-        ))
-        .await
-        .unwrap();
-        let stale = proto::ReplicationItem {
-            completed_build: None,
-            protocol_version: 11,
-            sender: Some(source.identity.clone().into()),
-            receiver: Some(target.identity.clone().into()),
-            epoch: Some(epoch.into()),
-            previous_configuration_id: String::new(),
-            current_configuration_id: source_configuration.configuration_id.to_string(),
-            lsn: before.applied_lsn + 1,
-            committed_lsn: before.committed_lsn,
-            data: b"stale-after-retirement".to_vec(),
-            sender_session_id: source.handle().process_session_id().to_string(),
-            receiver_session_id: target_session.to_string(),
-        };
-        let mut response = client
-            .replicate(tonic::Request::new(stream::iter([stale])))
+            process_session_id: target.handle().process_session_id(),
+            replication_address: authority.target_address.clone(),
+            history: Some(authority.history.clone()),
+            source_address: authority.source_address.clone(),
+        }))
+        .await;
+    let removal_id = removal.operation_id.clone();
+    let handle = source.handle();
+    let mut remove = tokio::spawn(async move { handle.execute_public_v1(removal).await });
+    let result = tokio::time::timeout(Duration::from_secs(10), &mut remove).await;
+    if result.is_err() {
+        source.service.provider.copy.release();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            source.command(PublicOperationProgram::Abort),
+        )
+        .await;
+        let _ = remove.await;
+        let _ = build.await;
+        panic!("public Remove did not cancel its active native Build");
+    }
+    result.unwrap().unwrap().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), build)
             .await
             .unwrap()
-            .into_inner();
-        assert!(response.next().await.unwrap().is_err());
-        assert_eq!(*target.state.progress.lock().unwrap(), before);
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"after-exact-removal"))
-                .await
-                .unwrap(),
-            3
-        );
-
-        source.stop().await;
-        target.stop().await;
-        source.cleanup();
-        target.cleanup();
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        source.service.provider.copy_active.load(Ordering::SeqCst),
+        1,
+        "native Remove must retain the in-flight provider call for separate drainage",
+    );
+    assert_eq!(
+        source
+            .service
+            .provider
+            .copy_interrupted
+            .load(Ordering::SeqCst),
+        0
+    );
+    let calls = source.service.observed.lock().unwrap().clone();
+    let removed = calls.iter().position(|call| matches!(call,
+        NativeCall::RemoveBegin(id, active) if *id == target.identity.replica_id && *active == 1,
+    )).expect("protected native Remove did not overlap the held Build callback");
+    assert!(
+        calls[removed + 1..].iter().any(|call| matches!(call,
+            NativeCall::RemoveEnd(id, active) if *id == target.identity.replica_id && *active == 1,
+        )),
+        "protected Remove did not preserve the actual provider callback owner"
+    );
+    let report = source.report().await;
+    assert!(
+        report
+            .completed_operations
+            .iter()
+            .any(|completion| completion.operation_id == build_id
+                && completion.result == PublicV1OperationResult::Cancelled)
+    );
+    assert!(
+        report
+            .completed_operations
+            .iter()
+            .any(|completion| completion.operation_id == removal_id
+                && completion.result == PublicV1OperationResult::Succeeded)
+    );
+    let installed = report.configuration.as_ref().unwrap();
+    assert_eq!(installed.voting.current, single);
+    assert!(
+        !installed
+            .idle_replicas
+            .contains(&target.identity.replica_id)
+    );
+    assert_eq!(
+        source.service.provider.copy_active.load(Ordering::SeqCst),
+        1
+    );
+    assert!(target.service.provider.values().is_empty());
+    source.service.provider.copy.release();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while source.service.provider.copy_active.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     })
     .await
+    .expect("retained provider callback did not drain after release");
+    assert_eq!(
+        source
+            .service
+            .provider
+            .copy_interrupted
+            .load(Ordering::SeqCst),
+        0,
+        "Remove abandoned the provider future instead of retaining its actual return"
+    );
+    assert!(
+        source
+            .handle()
+            .execute_public_v1(cancelled_intent)
+            .await
+            .is_err(),
+        "replaying the cancelled Build resurrected the removed session"
+    );
+    assert_eq!(
+        source
+            .service
+            .observed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| matches!(call, NativeCall::Build(_)))
+            .count(),
+        1
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(target.service.provider.values().is_empty());
+    assert_eq!(target.service.provider.installs.load(Ordering::SeqCst), 0);
+    assert!(
+        !single
+            .members
+            .iter()
+            .any(|member| member.identity == target.identity)
+    );
+    let report = source.report().await;
+    assert!(report.completed_operations.iter().any(|completion| {
+        completion.operation_id == build_id
+            && completion.result == PublicV1OperationResult::Cancelled
+    }));
+    assert!(
+        !report
+            .configuration
+            .as_ref()
+            .unwrap()
+            .idle_replicas
+            .contains(&target.identity.replica_id)
+    );
+    assert_eq!(report.role, ReplicaRole::Primary);
+    assert_eq!(
+        source.service.provider.values(),
+        [Bytes::from_static(b"committed-before-build")]
+    );
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        source.command(PublicOperationProgram::Close),
+    )
+    .await
+    .unwrap()
     .unwrap();
+    assert_eq!(
+        source
+            .handle()
+            .public_v1_raw_retained_task_cardinality()
+            .unwrap(),
+        (0, 0)
+    );
+    assert_eq!(
+        source.service.provider.copy_active.load(Ordering::SeqCst),
+        0
+    );
+    assert!(target.service.provider.values().is_empty());
+    assert_eq!(target.service.provider.installs.load(Ordering::SeqCst), 0);
+    source.stop().await;
+    target.stop().await;
 }
 
 #[tokio::test]
-async fn hosted_public_v1_rebuild_retires_and_restarts_fresh_replacement() {
-    tokio::time::timeout(Duration::from_secs(180), async {
-        let resource_uid = ResourceUid::new("preview-controller-replacement");
-        let preview = PublicV1Identity::new(60);
-        let mut source =
-            HostedMemoryReplica::start("controller-source", &resource_uid, &preview, 1).await;
-        let mut stale =
-            HostedMemoryReplica::start("controller-stale", &resource_uid, &preview, 2).await;
-        let generation = PublicProtocolGeneration::new(60);
-        let initialization = derive_history_initialization_id(&resource_uid, generation);
-        let history = derive_bootstrap_history(&resource_uid, generation, &initialization);
-        source.initialize_history(&initialization, &history).await;
-        stale.initialize_history(&initialization, &history).await;
-        let epoch = Epoch::new(0, 1);
-        let source_configuration = ConfigurationDescriptor::new(
-            epoch,
-            source.identity.replica_id,
-            vec![ConfigurationMember {
-                identity: source.identity.clone(),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        install_static_authority(
-            &source.handle(),
-            &preview,
-            source.identity.clone(),
-            ReplicaRole::Primary,
-            epoch,
-            PublicConfiguration {
-                current: source_configuration.clone(),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
-        .await;
-        let stale_session = stale.handle().process_session_id();
-        for (revision, name, program) in [
-            (
-                1,
-                "controller-stale-open",
-                PublicOperationProgram::Open {
-                    replica: stale.identity.clone(),
-                    existing: true,
-                },
-            ),
-            (
-                2,
-                "controller-stale-role",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ),
-            (
-                3,
-                "controller-stale-epoch",
-                PublicOperationProgram::Epoch { epoch },
-            ),
-        ] {
-            stale
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    stale_session.clone(),
-                    revision,
-                    name,
-                    program,
-                ))
-                .await
-                .unwrap();
+async fn native_replication_body_epochs_cannot_escape_a_valid_admitted_binding() {
+    let root = root();
+    for crossed in 0..4 {
+        let pair = Pair::start(&root.path().join(crossed.to_string()), 0).await;
+        let mut operations = pair.target.service.control_operations();
+        let before = pair.target.report().await;
+        let callbacks = pair.target.service.provider.callback_counts();
+        let state = std::fs::read(pair.target.service.provider.root.join("service.json")).unwrap();
+        let mut frame = replication_frame(&pair, 1, Bytes::from_static(b"unauthorized-body")).await;
+        let Some(native_wire::envelope::Body::ReplicationOperation(body)) = &mut frame.body else {
+            unreachable!()
+        };
+        match crossed {
+            0 => body.sending_epoch.as_mut().unwrap().configuration = 2,
+            1 => body.sending_epoch.as_mut().unwrap().data_loss = 1,
+            2 => body.original_epoch.as_mut().unwrap().data_loss = 1,
+            _ => body.original_epoch.as_mut().unwrap().configuration = 2,
         }
-        assert_eq!(
-            source
-                .application
-                .replicate(Bytes::from_static(b"controller-payload"))
-                .await
-                .unwrap(),
-            1
-        );
-        source
-            .state
-            .copy_chunks
-            .lock()
-            .unwrap()
-            .push(Bytes::from_static(b"controller-snapshot"));
-        stale
-            .state
-            .copy_chunks
-            .lock()
-            .unwrap()
-            .push(Bytes::from_static(b"stale-higher-progress"));
-        stale.state.operations.lock().unwrap().push(Operation {
-            lsn: 9,
-            committed_lsn: 8,
-            data: Bytes::from_static(b"stale-higher-progress"),
-        });
-        *stale.state.progress.lock().unwrap() = DurableApplicationProgress {
-            applied_lsn: 9,
-            committed_lsn: 9,
-        };
-        let stale_before = *stale.state.progress.lock().unwrap();
-        let stale_build = PublicBuildInput {
-            attempt: OperationId::new("controller-rebuild-required"),
-            epoch,
-            current_configuration_id: Some(source_configuration.configuration_id.clone()),
-            replica: stale.identity.clone(),
-            target_storage: stale.storage.clone(),
-            process_session_id: stale_session.clone(),
-            replication_address: format!("http://{}", stale.address),
-            history: Some(history.clone()),
-        };
-        let stale_build_intent = intent(
-            &preview,
-            source.handle().process_session_id(),
-            4,
-            "controller-rebuild-required",
-            PublicOperationProgram::Build(stale_build.clone()),
-        );
-        let accepted = PublicV1AcceptedStatus {
-            identity: preview.clone(),
-            history_initialization_id: initialization.clone(),
-            history: history.clone(),
-            data_loss_recovery: None,
-            completed_operations: Vec::new(),
-            extensions: Default::default(),
-        };
-        let build_transition = PublicV1AcceptedTransitionStatus {
-            resource_version: "controller-build-status-rv-1".into(),
-            evidence: accepted.clone(),
-            intent: PublicV1AcceptedTransitionIntent {
-                consumer: PublicV1EvidenceConsumer::RepairReplacement,
-                operation_id: stale_build_intent.operation_id.clone(),
-                revision: stale_build_intent.revision,
-                call_kind: PublicV1CallKind::Build,
-                history: history.clone(),
-                source: PublicV1ResourceAuthority {
-                    storage_incarnation: source.storage.clone(),
-                    resource_version: "controller-source-rv-1".into(),
-                },
-                target: Some(PublicV1ResourceAuthority {
-                    storage_incarnation: stale.storage.clone(),
-                    resource_version: "controller-stale-rv-1".into(),
-                }),
-                process_session_id: stale_build_intent.process_session_id.clone(),
-                input_digest: stale_build_intent.input_digest.clone(),
-                replay_disposition: stale_build_intent.replay_disposition,
-                previous_configuration_id: None,
-                current_configuration_id: Some(source_configuration.configuration_id.clone()),
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
-            },
-        };
-        let build_evidence = Arc::new(
-            PublicV1EvidenceState::new(
-                build_transition.clone(),
-                vec![
-                    PublicV1EvidenceResource {
-                        storage_incarnation: source.storage.clone(),
-                        resource_version: "controller-source-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: source.storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                    PublicV1EvidenceResource {
-                        storage_incarnation: stale.storage.clone(),
-                        resource_version: "controller-stale-rv-1".into(),
-                        proof: Some(PublicV1ResourceProof {
-                            history: history.clone(),
-                            storage_incarnation: stale.storage.clone(),
-                        }),
-                        disposition: PublicV1ResourceDisposition::Active,
-                    },
-                ],
-            )
-            .unwrap(),
-        );
-        let build_adapter = HostedPublicV1Harness::new(
-            vec![
-                HostedPublicV1Replica {
-                    identity: source.identity.clone(),
-                    replication_address: format!("http://{}", source.address),
-                    handle: source.handle(),
-                },
-                HostedPublicV1Replica {
-                    identity: stale.identity.clone(),
-                    replication_address: format!("http://{}", stale.address),
-                    handle: stale.handle(),
-                },
-            ],
-            Some(accepted.clone()),
-            None,
-            build_evidence.clone(),
-        )
-        .unwrap();
-        let build_error = execute_public_v1_operation(
-            &build_adapter,
-            &test_scope(&resource_uid),
-            &build_transition,
-            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
-                target: source.identity.clone(),
-                intent: stale_build_intent,
-            })),
-        )
-        .await
-        .unwrap_err();
-        let rebuild_report = build_adapter.report(&source.identity).await.unwrap();
-        let rebuild_outcome = reconcile_public_v1_consumer(
-            &build_adapter,
-            &test_scope(&resource_uid),
-            &rebuild_report,
+        let mut response = exchange(
+            before.replication_address.clone().unwrap(),
+            &binding(&pair).await,
+            &format!("Bearer {TOKEN}"),
+            vec![frame],
         )
         .await
         .unwrap();
+        no_applied_ack(&mut response, OperationKind::Replication, 1).await;
+        assert!(operations.try_recv().is_err());
+        let after = pair.target.report().await;
+        assert_eq!(after.progress, before.progress);
+        assert_eq!(after.completed_operations, before.completed_operations);
+        assert_eq!(pair.target.service.provider.callback_counts(), callbacks);
         assert_eq!(
-            rebuild_outcome,
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::
-                EvidencePersisted,
-            "build error: {build_error}; unexpected rebuild report: {rebuild_report:#?}"
+            std::fs::read(pair.target.service.provider.root.join("service.json")).unwrap(),
+            state
         );
-        assert_eq!(
-            reconcile_public_v1_consumer(
-                &build_adapter,
-                &test_scope(&resource_uid),
-                &rebuild_report
-            )
-            .await
-            .unwrap(),
-            kuberic_controller::evaluator::testing::PublicV1ReconciliationOutcome::EffectApplied
-        );
-        assert!(matches!(
-            build_evidence.effects().as_slice(),
-            [kuberic_controller::evaluator::testing::PublicV1EvidenceEffect::Replacement {
-                storage,
-                ..
-            }] if storage.as_ref() == &stale.storage
-        ));
-        let replacement_requested = build_evidence
-            .resources()
-            .into_iter()
-            .find(|resource| resource.storage_incarnation == stale.storage)
-            .unwrap();
-        assert_eq!(
-            replacement_requested.resource_version,
-            "controller-stale-rv-1-next"
-        );
-        assert_eq!(
-            replacement_requested.disposition,
-            PublicV1ResourceDisposition::ReplacementRequested
-        );
+        assert!(pair.source.service.provider.values().is_empty());
+        drop(response);
+        pair.stop().await;
+    }
+}
 
-        let removal_intent = intent(
-            &preview,
-            source.handle().process_session_id(),
-            4,
-            "controller-retire-stale",
-            PublicOperationProgram::Remove(stale_build),
-        );
-        let removal_transition = PublicV1AcceptedTransitionStatus {
-            resource_version: "controller-removal-status-rv-1".into(),
-            evidence: build_evidence.transition().evidence,
-            intent: PublicV1AcceptedTransitionIntent {
-                consumer: PublicV1EvidenceConsumer::Removal,
-                operation_id: removal_intent.operation_id.clone(),
-                revision: removal_intent.revision,
-                call_kind: PublicV1CallKind::Remove,
-                history: history.clone(),
-                source: PublicV1ResourceAuthority {
-                    storage_incarnation: source.storage.clone(),
-                    resource_version: "controller-source-rv-1".into(),
-                },
-                target: Some(PublicV1ResourceAuthority {
-                    storage_incarnation: stale.storage.clone(),
-                    resource_version: "controller-stale-rv-1-next".into(),
-                }),
-                process_session_id: removal_intent.process_session_id.clone(),
-                input_digest: removal_intent.input_digest.clone(),
-                replay_disposition: removal_intent.replay_disposition,
-                previous_configuration_id: None,
-                current_configuration_id: None,
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
-            },
-        };
-        let removal_evidence = Arc::new(
-            PublicV1EvidenceState::new(removal_transition.clone(), build_evidence.resources())
-                .unwrap(),
-        );
-        let removal_adapter = HostedPublicV1Harness::new(
-            vec![
-                HostedPublicV1Replica {
-                    identity: source.identity.clone(),
-                    replication_address: format!("http://{}", source.address),
-                    handle: source.handle(),
-                },
-                HostedPublicV1Replica {
-                    identity: stale.identity.clone(),
-                    replication_address: format!("http://{}", stale.address),
-                    handle: stale.handle(),
-                },
-            ],
-            None,
-            None,
-            removal_evidence.clone(),
-        )
-        .unwrap();
-        execute_public_v1_operation(
-            &removal_adapter,
-            &test_scope(&resource_uid),
-            &removal_transition,
-            ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
-                target: source.identity.clone(),
-                intent: removal_intent,
-            })),
-        )
-        .await
-        .unwrap();
-        let removal_report = removal_adapter.report(&source.identity).await.unwrap();
-        reconcile_public_v1_consumer(
-            &removal_adapter,
-            &test_scope(&resource_uid),
-            &removal_report,
-        )
-        .await
-        .unwrap();
-        reconcile_public_v1_consumer(
-            &removal_adapter,
-            &test_scope(&resource_uid),
-            &removal_report,
-        )
-        .await
-        .unwrap();
-        let retired = removal_evidence
-            .resources()
-            .into_iter()
-            .find(|resource| resource.storage_incarnation == stale.storage)
-            .unwrap();
-        assert_eq!(retired.resource_version, "controller-stale-rv-1-next-next");
-        assert_eq!(retired.disposition, PublicV1ResourceDisposition::Retired);
-        assert_eq!(*stale.state.progress.lock().unwrap(), stale_before);
-        let readmit_before_restart = ConfigurationDescriptor::new(
-            epoch,
-            source.identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: source.identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: stale.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            1,
-        );
-        assert!(
-            source
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    source.handle().process_session_id(),
-                    5,
-                    "readmit-retired-configuration-before-restart",
-                    PublicOperationProgram::Configuration(PublicConfiguration {
-                        current: readmit_before_restart.clone(),
-                        previous: None,
-                        replicas: vec![PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: stale.identity.clone(),
-                            replication_address: format!("http://{}", stale.address),
-                            process_session_id: stale_session.clone(),
-                            storage_incarnation: Some(stale.storage.clone()),
-                            role: ReplicaRole::ActiveSecondary,
-                            current_progress: 99,
-                            catch_up_capability: 99,
-                            must_catchup: false,
-                        }],
+#[tokio::test]
+async fn native_build_start_and_copy_body_epochs_are_checked_before_receiver_mutation() {
+    let root = root();
+    for (copy, future_loss) in [(false, false), (false, true), (true, false), (true, true)] {
+        let directory = root.path().join(format!("copy-{copy}-loss-{future_loss}"));
+        let resource = ResourceUid::new(format!("body-epoch-{copy}-{future_loss}"));
+        let mut source = Node::start(&directory.join("source"), &resource, 1).await;
+        let mut target = Node::start(&directory.join("target"), &resource, 2).await;
+        source.open(ReplicaRole::Primary, EPOCH).await;
+        let single = source.single(EPOCH).await;
+        target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+        let (_intent, authority) = source.build_intent(&target, &single).await;
+        let binding = build_binding(&source, &target, &authority).await;
+        let address = target.report().await.replication_address.unwrap();
+        let mut existing = None;
+        if copy {
+            let start = native_frame(
+                &source,
+                &target,
+                native_wire::envelope::Body::StartCopy(native_wire::StartCopy {
+                    epoch: Some(native_wire::Epoch {
+                        data_loss: 0,
+                        configuration: 1,
                     }),
-                ))
-                .await
-                .is_err()
-        );
-        let retired_build = PublicBuildInput {
-            attempt: OperationId::new("readmit-retired-build-before-restart"),
-            epoch,
-            current_configuration_id: Some(source_configuration.configuration_id.clone()),
-            replica: stale.identity.clone(),
-            target_storage: stale.storage.clone(),
-            process_session_id: stale_session.clone(),
-            replication_address: format!("http://{}", stale.address),
-            history: Some(history.clone()),
-        };
-        assert!(
-            source
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    source.handle().process_session_id(),
-                    5,
-                    "readmit-retired-build-before-restart",
-                    PublicOperationProgram::Build(retired_build),
-                ))
-                .await
-                .is_err()
-        );
-        assert_eq!(*stale.state.progress.lock().unwrap(), stale_before);
-
-        stale.stop().await;
-        let retired_identity = stale.identity.clone();
-        let mut fresh =
-            HostedMemoryReplica::start("controller-fresh", &resource_uid, &preview, 2).await;
-        fresh.initialize_history(&initialization, &history).await;
-        let fresh_session = fresh.handle().process_session_id();
-        for (revision, name, program) in [
-            (
-                1,
-                "controller-fresh-open",
-                PublicOperationProgram::Open {
-                    replica: fresh.identity.clone(),
-                    existing: true,
-                },
-            ),
-            (
-                2,
-                "controller-fresh-role",
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::IdleSecondary,
-                },
-            ),
-            (
-                3,
-                "controller-fresh-epoch",
-                PublicOperationProgram::Epoch { epoch },
-            ),
-        ] {
-            fresh
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    fresh_session.clone(),
-                    revision,
-                    name,
-                    program,
-                ))
-                .await
-                .unwrap();
-        }
-        source
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                source.handle().process_session_id(),
-                7,
-                "controller-authority-after-retirement",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: source_configuration.clone(),
-                    previous: None,
-                    replicas: Vec::new(),
+                    replica: target.identity.replica_id.value(),
+                    replication_start: 1,
                 }),
-            ))
+            )
+            .await;
+            let mut response = exchange(
+                address.clone(),
+                &binding,
+                &format!("Bearer {TOKEN}"),
+                vec![start],
+            )
             .await
             .unwrap();
-        let fresh_build = PublicBuildInput {
-            attempt: OperationId::new("controller-fresh-build"),
-            epoch,
-            current_configuration_id: Some(source_configuration.configuration_id.clone()),
-            replica: fresh.identity.clone(),
-            target_storage: fresh.storage.clone(),
-            process_session_id: fresh_session.clone(),
-            replication_address: format!("http://{}", fresh.address),
-            history: Some(history.clone()),
-        };
-        fresh
-            .handle()
-            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
-                operation_id: OperationId::new("controller-fresh-build"),
-                operation_revision: 7,
-                attempt: PublicBuildAttemptReference {
-                    resource_uid: resource_uid.clone(),
-                    epoch,
-                    build_id: fresh_build.attempt.clone(),
-                    source: source.identity.clone(),
-                    source_storage: source.storage.clone(),
-                    source_session: source.handle().process_session_id(),
-                    target: fresh.identity.clone(),
-                    target_storage: fresh.storage.clone(),
-                    target_session: fresh_session.clone(),
-                },
-                history: history.clone(),
-                current_configuration_id: source_configuration.configuration_id.clone(),
-                target_address: format!("http://{}", fresh.address),
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let envelope = response.message().await.unwrap().unwrap();
+                    if matches!(
+                        envelope.body,
+                        Some(native_wire::envelope::Body::CopyContextOperation(_))
+                    ) {
+                        break;
+                    }
+                }
             })
             .await
             .unwrap();
-        source
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                source.handle().process_session_id(),
-                7,
-                "controller-fresh-build",
-                PublicOperationProgram::Build(fresh_build),
-            ))
+            existing = Some(response);
+        }
+        let mut operations = target.service.control_operations();
+        let before = target.report().await;
+        let callbacks = target.service.provider.callback_counts();
+        let state = std::fs::read(target.service.provider.root.join("service.json")).unwrap();
+        let epoch = native_wire::Epoch {
+            data_loss: if future_loss { 1 } else { 0 },
+            configuration: if future_loss { 1 } else { 2 },
+        };
+        let body = if copy {
+            native_wire::envelope::Body::CopyOperation(native_wire::CopyOperation {
+                metadata: Some(native_wire::Metadata {
+                    sequence: 0,
+                    operation_type: 1,
+                    atomic_group: -1,
+                }),
+                epoch: Some(epoch),
+                buffers: Some(native_wire::Buffers {
+                    segments: vec![Bytes::from(
+                        serde_json::to_vec(&ServiceState::default()).unwrap(),
+                    )],
+                }),
+                replica: target.identity.replica_id.value(),
+                is_last: true,
+            })
+        } else {
+            native_wire::envelope::Body::StartCopy(native_wire::StartCopy {
+                epoch: Some(epoch),
+                replica: target.identity.replica_id.value(),
+                replication_start: 1,
+            })
+        };
+        let frame = native_frame(&source, &target, body).await;
+        let mut response = exchange(address, &binding, &format!("Bearer {TOKEN}"), vec![frame])
             .await
             .unwrap();
+        no_applied_ack(&mut response, OperationKind::Copy, 0).await;
+        assert!(operations.try_recv().is_err());
+        let after = target.report().await;
+        assert_eq!(after.progress, before.progress);
+        assert_eq!(after.completed_operations, before.completed_operations);
+        assert_eq!(target.service.provider.callback_counts(), callbacks);
         assert_eq!(
-            *fresh.state.progress.lock().unwrap(),
-            DurableApplicationProgress {
-                applied_lsn: 1,
-                committed_lsn: 1,
-            }
+            std::fs::read(target.service.provider.root.join("service.json")).unwrap(),
+            state
         );
-        assert_eq!(
-            fresh.state.copy_chunks.lock().unwrap().as_slice(),
-            &[Bytes::from_static(b"controller-snapshot")]
-        );
+        drop(existing);
+        drop(response);
+        source.stop().await;
+        target.stop().await;
+    }
+}
 
-        let promoted_epoch = Epoch::new(0, 2);
-        let promoted = ConfigurationDescriptor::new(
-            promoted_epoch,
-            fresh.identity.replica_id,
+#[tokio::test]
+async fn native_build_binding_pins_frozen_source_address_even_when_source_is_unreachable() {
+    let root = root();
+    let resource = ResourceUid::new("frozen-source-build-address");
+    let mut source = Node::start(&root.path().join("source"), &resource, 1).await;
+    let mut target = Node::start(&root.path().join("target"), &resource, 2).await;
+    source.open(ReplicaRole::Primary, EPOCH).await;
+    let single = source.single(EPOCH).await;
+    target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    let (intent, authority) = source.build_intent(&target, &single).await;
+    let valid = build_binding(&source, &target, &authority).await;
+    assert_eq!(valid["primary"]["address"], authority.source_address);
+    let encoded = serde_json::to_vec(&authority).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<PublicInboundBuildAuthority>(&encoded).unwrap(),
+        authority
+    );
+    let mut changed_intent = intent.clone();
+    if let Some(PublicOperationProgram::Build(input)) = &mut changed_intent.program {
+        input.source_address = "http://127.0.0.1:9/".into();
+    }
+    assert_ne!(
+        changed_intent.program.as_ref().unwrap().digest(),
+        intent.input_digest
+    );
+    assert!(changed_intent.validate().is_err());
+    let callbacks = target.service.provider.callback_counts();
+    let before = target.report().await;
+    let bytes = std::fs::read(target.service.provider.root.join("service.json")).unwrap();
+    source.stop().await;
+    let mut changed = valid.clone();
+    changed["primary"]["address"] = "http://127.0.0.1:9/".into();
+    let address = before.replication_address.clone().unwrap();
+    let error = exchange(
+        address.clone(),
+        &changed,
+        &format!("Bearer {TOKEN}"),
+        Vec::new(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    assert_eq!(target.service.provider.callback_counts(), callbacks);
+    assert_eq!(target.report().await.progress, before.progress);
+    assert_eq!(
+        std::fs::read(target.service.provider.root.join("service.json")).unwrap(),
+        bytes
+    );
+    let accepted = exchange(address, &valid, &format!("Bearer {TOKEN}"), Vec::new())
+        .await
+        .unwrap();
+    drop(accepted);
+    target.stop().await;
+}
+
+#[tokio::test]
+async fn native_swap_freezes_specific_quorum_and_conservative_all_fallback_inputs() {
+    let root = root();
+    for specific in [false, true] {
+        let directory = root.path().join(specific.to_string());
+        let resource = ResourceUid::new(format!("captured-native-swap-{specific}"));
+        let mut source = Node::start(&directory.join("source"), &resource, 1).await;
+        let mut target = Node::start(&directory.join("target"), &resource, 2).await;
+        source
+            .service
+            .provider
+            .conservative_quorum
+            .store(!specific, Ordering::Release);
+        source.open(ReplicaRole::Primary, EPOCH).await;
+        let single = source.single(EPOCH).await;
+        source
+            .service
+            .write(Bytes::from_static(b"before-swap"))
+            .await
+            .unwrap();
+        target.open(ReplicaRole::IdleSecondary, EPOCH).await;
+        source.build(&target, &single).await;
+        target
+            .command(PublicOperationProgram::Role {
+                epoch: EPOCH,
+                role: ReplicaRole::ActiveSecondary,
+            })
+            .await
+            .unwrap();
+        target
+            .command(PublicOperationProgram::Epoch { epoch: EPOCH })
+            .await
+            .unwrap();
+        let current = ConfigurationDescriptor::new(
+            EPOCH,
+            source.identity.replica_id,
             vec![
                 ConfigurationMember {
                     identity: source.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
+                    role: ReplicaRole::Primary,
                 },
                 ConfigurationMember {
-                    identity: fresh.identity.clone(),
-                    role: ReplicaRole::Primary,
+                    identity: target.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
                 },
             ],
             2,
         );
-        for (handle, revision, name, program) in [
-            (
-                source.handle(),
-                9,
-                "controller-source-promoted-epoch",
-                PublicOperationProgram::Epoch {
-                    epoch: promoted_epoch,
-                },
-            ),
-            (
-                source.handle(),
-                10,
-                "controller-source-secondary-role",
-                PublicOperationProgram::Role {
-                    epoch: promoted_epoch,
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ),
-            (
-                fresh.handle(),
-                4,
-                "controller-fresh-promoted-epoch",
-                PublicOperationProgram::Epoch {
-                    epoch: promoted_epoch,
-                },
-            ),
-            (
-                fresh.handle(),
-                5,
-                "controller-fresh-primary-role",
-                PublicOperationProgram::Role {
-                    epoch: promoted_epoch,
-                    role: ReplicaRole::Primary,
-                },
-            ),
+        for (local, remote, role) in [
+            (&target, &source, ReplicaRole::Primary),
+            (&source, &target, ReplicaRole::ActiveSecondary),
         ] {
-            handle
-                .execute_public_v1(intent(
-                    &preview,
-                    handle.process_session_id(),
-                    revision,
-                    name,
-                    program,
-                ))
+            local
+                .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: current.clone(),
+                    previous: None,
+                    replicas: vec![remote.descriptor(role).await],
+                }))
                 .await
                 .unwrap();
         }
+        let report = source.report().await;
+        assert_eq!(report.extensions.catch_up_specific_quorum, Some(specific));
+        source
+            .service
+            .provider
+            .probe_fenced_admission
+            .store(true, Ordering::Release);
+        let mut candidate = target.descriptor(ReplicaRole::ActiveSecondary).await;
+        candidate.must_catchup = true;
+        let starting = PublicConfiguration {
+            current: current.clone(),
+            previous: None,
+            replicas: vec![candidate.clone()],
+        };
+        let epoch = Epoch::new(0, 2);
+        let refreshed = PublicConfiguration {
+            current: ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                current.members.clone(),
+                2,
+            ),
+            previous: None,
+            replicas: vec![candidate],
+        };
+        target
+            .command(PublicOperationProgram::Epoch { epoch })
+            .await
+            .unwrap();
+        target
+            .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                current: refreshed.current.clone(),
+                previous: None,
+                replicas: vec![source.descriptor(ReplicaRole::Primary).await],
+            }))
+            .await
+            .unwrap();
+        source.service.observed.lock().unwrap().clear();
+        let mode = if specific {
+            PublicCatchUpMode::WriteQuorum
+        } else {
+            PublicCatchUpMode::All
+        };
+        let program = PublicOperationProgram::Swap {
+            starting,
+            refreshed: refreshed.clone(),
+            epoch,
+            handoff: ReplicaRole::ActiveSecondary,
+            catch_up_specific_quorum: specific,
+            mode,
+            controller_composed: false,
+        };
+        let frozen = source.intent(program).await;
+        let mut crossed = frozen.clone();
+        crossed.operation_id = OperationId::new(format!("crossed-swap-{specific}"));
+        if let Some(PublicOperationProgram::Swap {
+            catch_up_specific_quorum,
+            mode,
+            ..
+        }) = &mut crossed.program
+        {
+            *catch_up_specific_quorum = !specific;
+            *mode = if specific {
+                PublicCatchUpMode::All
+            } else {
+                PublicCatchUpMode::WriteQuorum
+            };
+        }
+        crossed.input_digest = crossed.program.as_ref().unwrap().digest();
+        assert!(source.handle().execute_public_v1(crossed).await.is_err());
+        assert!(
+            source.service.observed.lock().unwrap().is_empty(),
+            "substituted capability dispatched native work"
+        );
+        if let Err(error) = source.handle().execute_public_v1(frozen.clone()).await {
+            let connection =
+                rusqlite::Connection::open(SqliteStore::metadata_database_path(&source.root))
+                    .unwrap();
+            let json: String = connection
+                .query_row(
+                    "SELECT state_json FROM agent_state WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+            panic!(
+                "native Swap failed (specific={specific}): {error}; record={}; calls={:?}",
+                state["publicV1OperationState"]["operations"][frozen.operation_id.as_str()],
+                source.service.observed.lock().unwrap()
+            );
+        }
+        let observed = source.service.observed.lock().unwrap().clone();
+        let waits = observed
+            .iter()
+            .filter_map(|call| match call {
+                NativeCall::Wait(mode, status) => Some((*mode, *status)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let native_mode = if specific {
+            ReplicaSetQuorumMode::WriteQuorum
+        } else {
+            ReplicaSetQuorumMode::All
+        };
+        assert_eq!(waits.len(), 2);
+        assert_eq!(waits[0], (native_mode, AccessStatus::Granted));
+        assert_eq!(waits[1].0, native_mode);
+        assert_ne!(waits[1].1, AccessStatus::Granted);
+        let raw_rejections = observed
+            .iter()
+            .filter_map(|call| match call {
+                NativeCall::FencedBegin(status, error) => Some((*status, error)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(raw_rejections.len(), 1);
+        assert_ne!(raw_rejections[0].0, AccessStatus::Granted);
+        assert!(!raw_rejections[0].1.is_empty());
+        let configurations = observed
+            .iter()
+            .filter_map(|call| match call {
+                NativeCall::CatchUp(current, previous) => Some((current, previous)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            configurations.len(),
+            2,
+            "both Swap installs must use native catch-up configuration, not final current config"
+        );
+        assert_eq!(configurations[0].0.configuration.epoch, EPOCH);
+        assert_eq!(configurations[1].0.configuration.epoch, epoch);
+        for (current, previous) in configurations {
+            assert!(
+                current
+                    .replicas
+                    .iter()
+                    .all(|peer| peer.identity != source.identity
+                        && peer.role == ReplicaRole::ActiveSecondary
+                        && peer.must_catchup)
+            );
+            assert!(
+                previous
+                    .replicas
+                    .iter()
+                    .all(|peer| peer.identity != source.identity)
+            );
+        }
+        let completed = source.report().await;
+        let receipt = completed
+            .completed_operations
+            .iter()
+            .find(|receipt| receipt.operation_id == frozen.operation_id)
+            .unwrap();
+        assert_eq!(receipt.input_digest, frozen.input_digest);
+        assert_eq!(receipt.process_session_id, frozen.process_session_id);
+        assert_eq!(receipt.revision, frozen.revision);
+        assert_eq!(receipt.catch_up_specific_quorum, Some(specific));
+        assert_eq!(receipt.catch_up_mode, Some(mode));
+        assert_eq!(
+            receipt.current_configuration_id.as_ref(),
+            Some(&refreshed.current.configuration_id)
+        );
+        assert_eq!(receipt.result, PublicV1OperationResult::Succeeded);
+        let store = SqliteStore::open_public_v1(
+            SqliteStore::metadata_database_path(&source.root),
+            &source.preview,
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .public_v1_operation_snapshot(&frozen.operation_id)
+                .await
+                .unwrap()
+                .intent,
+            frozen
+        );
         source
             .handle()
-            .execute_public_v1(intent(
-                &preview,
-                source.handle().process_session_id(),
-                11,
-                "controller-source-secondary-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: promoted.clone(),
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: fresh.identity.clone(),
-                        replication_address: format!("http://{}", fresh.address),
-                        process_session_id: fresh.handle().process_session_id(),
-                        storage_incarnation: Some(fresh.storage.clone()),
-                        role: ReplicaRole::Primary,
-                        current_progress: 1,
-                        catch_up_capability: 1,
-                        must_catchup: false,
-                    }],
-                }),
-            ))
-            .await
-            .unwrap();
-        fresh
-            .handle()
-            .execute_public_v1(intent(
-                &preview,
-                fresh.handle().process_session_id(),
-                6,
-                "controller-fresh-primary-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: promoted,
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: source.identity.clone(),
-                        replication_address: format!("http://{}", source.address),
-                        process_session_id: source.handle().process_session_id(),
-                        storage_incarnation: Some(source.storage.clone()),
-                        role: ReplicaRole::ActiveSecondary,
-                        current_progress: 1,
-                        catch_up_capability: 1,
-                        must_catchup: false,
-                    }],
-                }),
-            ))
+            .execute_public_v1(frozen.clone())
             .await
             .unwrap();
         assert_eq!(
+            source.service.observed.lock().unwrap().len(),
+            observed.len(),
+            "exact Swap replay reselected its mode"
+        );
+        assert!(
             source
-                .handle()
-                .public_v1_report()
+                .service
+                .write(Bytes::from_static(b"old-primary"))
                 .await
-                .unwrap()
-                .write_status,
-            AccessStatus::NotPrimary
+                .is_err()
         );
         assert_eq!(
-            fresh
-                .handle()
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            AccessStatus::Granted
+            target.service.provider.values(),
+            [Bytes::from_static(b"before-swap")]
         );
-        assert_eq!(
-            fresh
-                .application
-                .replicate(Bytes::from_static(b"replacement-writable-payload"))
-                .await
-                .unwrap(),
-            2
-        );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while source.state.progress.lock().unwrap().committed_lsn < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("replacement primary write did not reach source secondary");
+        source.stop().await;
+        target.stop().await;
+    }
+}
 
-        let predecessor = fresh
+#[tokio::test]
+async fn native_controller_unreachable_survivor_fences_until_exact_return_or_explicit_retirement() {
+    use kuberic_runtime::control::proto;
+    let root = root();
+    for retire in [false, true] {
+        let directory = root.path().join(retire.to_string());
+        let mut pair = Pair::start(&directory, 1).await;
+        let predecessor = pair
+            .source
             .handle()
             .public_v1_process_endpoint(ReplicaRole::Primary)
             .await
             .unwrap();
-        let predecessor_session = predecessor.process_session_id.clone();
-        let fresh_root = fresh.root.clone();
-        let fresh_identity = fresh.identity.clone();
-        let fresh_storage = fresh.storage.clone();
-        let fresh_state = fresh.state.clone();
-        fresh.stop().await;
-        let restarted_address = free_address();
-        let restarted_application = Arc::new(PreviewApplication::new(
-            fresh_state.clone(),
-            format!("http://{restarted_address}"),
-        ));
-        let mut restarted = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: ReplicaId::new(2),
-                pod_uid: PodUid::new("controller-fresh-pod"),
-                pvc_uid: PvcUid::new("controller-fresh-pvc"),
-                data_root: fresh_root.clone(),
-                replication_address: restarted_address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            restarted_application.clone(),
-            ApplicationStorageState::Established,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        })
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let restarted_handle = restarted.handle();
-        let renewal_epoch = Epoch::new(0, 3);
-        let source_endpoint = source
+        let survivor = pair
+            .target
             .handle()
             .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
             .await
             .unwrap();
-        let renewal_configuration = ConfigurationDescriptor::new(
-            renewal_epoch,
-            fresh_identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: source.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-                ConfigurationMember {
-                    identity: fresh_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-            ],
-            2,
-        );
-        restarted_handle
-            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
-                operation_id: OperationId::new("controller-fresh-restart"),
-                reason: ProcessSessionRenewalReason::PrimaryReplacement,
-                resource_uid: resource_uid.clone(),
-                history: history.clone(),
-                previous_epoch: promoted_epoch,
-                renewal_epoch,
-                predecessor,
-                replacement: Some(ProcessSessionEndpoint {
-                    identity: fresh_identity.clone(),
-                    storage_incarnation: fresh_storage.clone(),
-                    process_session_id: restarted_handle.process_session_id(),
-                    replicator_creation_id: ReplicatorCreationId::new(
-                        "controller-fresh-restart-creation",
-                    ),
-                    role: ReplicaRole::None,
-                }),
-                surviving_sessions: vec![source_endpoint],
-                fresh_configuration: renewal_configuration.clone(),
-                predecessor_contained: true,
-                data_loss: None,
+        let resource = pair.source.history.resource_uid.clone();
+        pair.source.stop().await;
+        let mut replacement = Node::start(&directory.join("source"), &resource, 1).await;
+        replacement
+            .command(PublicOperationProgram::Open {
+                replica: replacement.identity.clone(),
+                existing: true,
             })
             .await
             .unwrap();
-        source
+        let endpoint = replacement
             .handle()
-            .execute_public_v1(intent(
-                &preview,
-                source.handle().process_session_id(),
-                12,
-                "controller-source-renewal-epoch",
-                PublicOperationProgram::Epoch {
-                    epoch: renewal_epoch,
-                },
-            ))
+            .public_v1_process_endpoint(ReplicaRole::None)
             .await
             .unwrap();
-        for (revision, name, program) in [
-            (
-                7,
-                "controller-restart-open",
-                PublicOperationProgram::Open {
-                    replica: fresh_identity.clone(),
-                    existing: true,
+        let epoch = Epoch::new(0, 2);
+        let required = ProcessSessionRenewalRequired {
+            operation_id: OperationId::new(format!("unreachable-native-survivor-{retire}")),
+            reason: ProcessSessionRenewalReason::PrimaryReplacement,
+            resource_uid: resource.clone(),
+            history: replacement.history.clone(),
+            previous_epoch: EPOCH,
+            renewal_epoch: epoch,
+            predecessor,
+            replacement: Some(endpoint.clone()),
+            surviving_sessions: vec![survivor.clone()],
+            fresh_configuration: ConfigurationDescriptor::new(
+                epoch,
+                replacement.identity.replica_id,
+                if retire {
+                    vec![ConfigurationMember {
+                        identity: replacement.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    }]
+                } else {
+                    vec![
+                        ConfigurationMember {
+                            identity: replacement.identity.clone(),
+                            role: ReplicaRole::Primary,
+                        },
+                        ConfigurationMember {
+                            identity: pair.target.identity.clone(),
+                            role: ReplicaRole::ActiveSecondary,
+                        },
+                    ]
                 },
+                if retire { 1 } else { 2 },
             ),
-            (
-                8,
-                "controller-restart-role",
-                PublicOperationProgram::Role {
-                    epoch: renewal_epoch,
-                    role: ReplicaRole::Primary,
-                },
-            ),
-            (
-                9,
-                "controller-restart-epoch",
-                PublicOperationProgram::Epoch {
-                    epoch: renewal_epoch,
-                },
-            ),
-            (
-                10,
-                "controller-restart-configuration",
-                PublicOperationProgram::Configuration(PublicConfiguration {
-                    current: renewal_configuration,
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: source.identity.clone(),
-                        replication_address: format!("http://{}", source.address),
-                        process_session_id: source.handle().process_session_id(),
-                        storage_incarnation: Some(source.storage.clone()),
-                        role: ReplicaRole::ActiveSecondary,
-                        current_progress: 2,
-                        catch_up_capability: 2,
-                        must_catchup: false,
-                    }],
-                }),
-            ),
-        ] {
-            restarted_handle
-                .execute_public_v1(intent(
-                    &preview,
-                    restarted_handle.process_session_id(),
-                    revision,
-                    name,
-                    program,
-                ))
+            predecessor_contained: true,
+            data_loss: None,
+        };
+        required.validate().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = format!("http://{}", listener.local_addr().unwrap());
+        let blackhole = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(socket);
+            }
+        });
+        let mut unavailable =
+            proto::agent_control_client::AgentControlClient::connect(unavailable_address.clone())
                 .await
                 .unwrap();
-        }
-        assert_eq!(
-            restarted_handle
-                .public_v1_report()
-                .await
-                .unwrap()
-                .write_status,
-            AccessStatus::Granted
-        );
+        let mut probe = Request::new(proto::GetAgentStatusRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: resource.to_string(),
+            replica_id: survivor.identity.replica_id.value(),
+            expected_instance_id: survivor.identity.instance_id.to_string(),
+        });
+        probe
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        probe.set_timeout(Duration::from_secs(1));
         assert!(
-            fresh_state
-                .operations
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|operation| {
-                    operation.lsn == 2 && operation.data.as_ref() == b"replacement-writable-payload"
-                })
+            unavailable.get_status(probe).await.is_err(),
+            "blackholed actual control RPC succeeded"
         );
-        let before = *fresh_state.progress.lock().unwrap();
-        assert!(
-            restarted_handle
-                .execute_public_v1(intent(
-                    &preview,
-                    predecessor_session,
-                    11,
-                    "controller-predecessor-session",
-                    PublicOperationProgram::Progress { capability: false },
-                ))
-                .await
-                .is_err()
-        );
-        let mut client = proto::replication_data_client::ReplicationDataClient::connect(format!(
-            "http://{restarted_address}"
-        ))
-        .await
-        .unwrap();
-        let stale_item = proto::ReplicationItem {
-            completed_build: None,
-            protocol_version: 11,
-            sender: Some(source.identity.clone().into()),
-            receiver: Some(retired_identity.into()),
-            epoch: Some(epoch.into()),
-            previous_configuration_id: String::new(),
-            current_configuration_id: "retired-controller-configuration".into(),
-            lsn: 99,
-            committed_lsn: 98,
-            data: b"retired-controller-payload".to_vec(),
-            sender_session_id: source.handle().process_session_id().to_string(),
-            receiver_session_id: stale_session.to_string(),
+        let mut controller = RenewalController {
+            status: Mutex::new(None),
+            replacement: replacement.handle(),
+            endpoints: vec![
+                (endpoint, replacement.control_address.clone()),
+                (survivor.clone(), unavailable_address),
+            ],
         };
-        let mut response = client
-            .replicate(tonic::Request::new(stream::iter([stale_item])))
+        let scope = PublicV1Scope {
+            namespace: "testing".into(),
+            name: "survivor-policy".into(),
+            resource_uid: resource,
+        };
+        let initial = PublicV1SessionRenewalStatus::required(required).unwrap();
+        controller
+            .persist_public_v1_session_renewal(&scope, None, &initial)
             .await
+            .unwrap();
+        let blocked = loop {
+            let current = controller
+                .observe_public_v1_session_renewal(&scope)
+                .await
+                .unwrap()
+                .unwrap();
+            match plan_public_v1_session_renewal(
+                &current,
+                std::slice::from_ref(&survivor.process_session_id),
+            )
             .unwrap()
-            .into_inner();
-        assert!(response.next().await.unwrap().is_err());
-        assert_eq!(*fresh_state.progress.lock().unwrap(), before);
-
-        let source_predecessor = source
-            .handle()
-            .public_v1_process_endpoint(ReplicaRole::ActiveSecondary)
-            .await
-            .unwrap();
-        let source_root = source.root.clone();
-        let source_state = source.state.clone();
-        source.stop().await;
-        let source_restart_application = Arc::new(PreviewApplication::new(
-            source_state,
-            format!("http://{}", source.address),
-        ));
-        source.application = source_restart_application;
-        source.running = ReplicaHost::new(
-            ReplicaProcessConfig {
-                resource_uid: resource_uid.clone(),
-                replica_id: source.identity.replica_id,
-                pod_uid: PodUid::new("controller-source-pod"),
-                pvc_uid: PvcUid::new("controller-source-pvc"),
-                data_root: source_root,
-                replication_address: source.address,
-                bearer_token: "preview-token".into(),
-                rpc_deadline: Duration::from_secs(2),
-                transport_window_capacity: 8,
-            },
-            source.application.clone(),
-            ApplicationStorageState::Established,
-            Arc::new(Resolver),
-        )
-        .with_public_v1_binding(PublicV1LifecycleBinding {
-            identity: preview.clone(),
-            resource_uid: resource_uid.clone(),
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        })
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let post_restart_epoch = Epoch::new(0, 4);
-        let post_restart_configuration = ConfigurationDescriptor::new(
-            post_restart_epoch,
-            fresh_identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: source.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-                ConfigurationMember {
-                    identity: fresh_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-            ],
-            2,
-        );
-        source
-            .handle()
-            .authorize_public_v1_session_renewal(ProcessSessionRenewalRequired {
-                operation_id: OperationId::new("controller-source-restart"),
-                reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
-                resource_uid: resource_uid.clone(),
-                history: history.clone(),
-                previous_epoch: renewal_epoch,
-                renewal_epoch: post_restart_epoch,
-                predecessor: source_predecessor,
-                replacement: Some(ProcessSessionEndpoint {
-                    identity: source.identity.clone(),
-                    storage_incarnation: source.storage.clone(),
-                    process_session_id: source.handle().process_session_id(),
-                    replicator_creation_id: ReplicatorCreationId::new(
-                        "controller-source-restart-creation",
-                    ),
-                    role: ReplicaRole::None,
-                }),
-                surviving_sessions: vec![
-                    restarted_handle
-                        .public_v1_process_endpoint(ReplicaRole::Primary)
-                        .await
-                        .unwrap(),
-                ],
-                fresh_configuration: post_restart_configuration.clone(),
-                predecessor_contained: true,
-                data_loss: None,
-            })
-            .await
-            .unwrap();
-        let post_restart_adapter = HostedPublicV1Harness::new(
-            vec![
-                HostedPublicV1Replica {
-                    identity: source.identity.clone(),
-                    replication_address: format!("http://{}", source.address),
-                    handle: source.handle(),
-                },
-                HostedPublicV1Replica {
-                    identity: fresh_identity.clone(),
-                    replication_address: format!("http://{restarted_address}"),
-                    handle: restarted_handle.clone(),
-                },
-            ],
-            Some(accepted.clone()),
-            None,
-            build_evidence.clone(),
-        )
-        .unwrap();
-        post_restart_adapter
-            .reconstruct_hosted_configuration(
-                &OperationId::new("controller-source-restart-authority"),
-                preview.generation,
-                &post_restart_configuration,
-            )
-            .await
-            .unwrap();
-        let readmit_after_restart = ConfigurationDescriptor::new(
-            post_restart_epoch,
-            fresh_identity.replica_id,
-            vec![
-                ConfigurationMember {
-                    identity: source.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-                ConfigurationMember {
-                    identity: fresh_identity.clone(),
-                    role: ReplicaRole::Primary,
-                },
-                ConfigurationMember {
-                    identity: stale.identity.clone(),
-                    role: ReplicaRole::ActiveSecondary,
-                },
-            ],
-            2,
-        );
-        assert!(
-            source
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    source.handle().process_session_id(),
-                    u64::MAX - 2,
-                    "readmit-retired-configuration-after-restart",
-                    PublicOperationProgram::Configuration(PublicConfiguration {
-                        current: readmit_after_restart,
-                        previous: None,
-                        replicas: vec![
-                            PublicReplicaDescriptor {
-                                build_id: OperationId::default(),
-                                identity: fresh_identity.clone(),
-                                replication_address: format!("http://{restarted_address}"),
-                                process_session_id: restarted_handle.process_session_id(),
-                                storage_incarnation: Some(fresh_storage.clone()),
-                                role: ReplicaRole::Primary,
-                                current_progress: 2,
-                                catch_up_capability: 2,
-                                must_catchup: false,
-                            },
-                            PublicReplicaDescriptor {
-                                build_id: OperationId::default(),
-                                identity: stale.identity.clone(),
-                                replication_address: format!("http://{}", stale.address),
-                                process_session_id: stale_session.clone(),
-                                storage_incarnation: Some(stale.storage.clone()),
-                                role: ReplicaRole::ActiveSecondary,
-                                current_progress: 99,
-                                catch_up_capability: 99,
-                                must_catchup: false,
-                            },
-                        ],
-                    }),
-                ))
-                .await
-                .is_err()
-        );
-        let retired_build = PublicBuildInput {
-            attempt: OperationId::new("readmit-retired-build-after-restart"),
-            epoch: post_restart_epoch,
-            current_configuration_id: Some(post_restart_configuration.configuration_id.clone()),
-            replica: stale.identity.clone(),
-            target_storage: stale.storage.clone(),
-            process_session_id: stale_session.clone(),
-            replication_address: format!("http://{}", stale.address),
-            history: Some(history.clone()),
+            {
+                PublicV1SessionRenewalPlan::WaitForSurvivor {
+                    survivor: captured, ..
+                } => {
+                    assert_eq!(*captured, survivor);
+                    break current;
+                }
+                plan => execute_public_v1_session_renewal(&controller, &scope, plan)
+                    .await
+                    .unwrap(),
+            }
         };
-        assert!(
-            source
-                .handle()
-                .execute_public_v1(intent(
-                    &preview,
-                    source.handle().process_session_id(),
-                    u64::MAX - 2,
-                    "readmit-retired-build-after-restart",
-                    PublicOperationProgram::Build(retired_build),
-                ))
-                .await
-                .is_err()
-        );
-
-        source.stop().await;
-        restarted.shutdown();
-        restarted.wait().await.unwrap();
-        source.cleanup();
-        stale.cleanup();
-        std::fs::remove_dir_all(fresh_root).unwrap();
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn ambiguous_suffix_exactly_replays_quorum_peers_despite_higher_advertised_progress() {
-    tokio::time::timeout(Duration::from_secs(180), async {
-        for (case, divergent, unavailable, unverifiable) in [
-            ("identical", false, false, false),
-            ("divergent", true, false, false),
-            ("unavailable", false, true, false),
-            ("unverifiable", false, false, true),
-        ] {
-            let resource_uid = ResourceUid::new(format!("suffix-{case}"));
-            let preview = PublicV1Identity::new(12);
-            let binding = PublicV1LifecycleBinding {
-                identity: preview.clone(),
-                resource_uid: resource_uid.clone(),
-                spec_generation: 1,
-                state_persistence: StatePersistence::Persisted,
-            };
-            let primary_identity = replica_named(
-                1,
-                &format!("{case}-primary-pod"),
-                &format!("{case}-primary-agent"),
-            );
-            let secondary_identity = replica_named(
-                2,
-                &format!("{case}-secondary-pod"),
-                &format!("{case}-secondary-agent"),
-            );
-            let primary_root = test_root(&format!("{case}-suffix-primary"));
-            let secondary_root = test_root(&format!("{case}-suffix-secondary"));
-            for (root, identity, pod, pvc) in [
-                (
-                    &primary_root,
-                    primary_identity.clone(),
-                    format!("{case}-primary-pod"),
-                    format!("{case}-primary-pvc"),
-                ),
-                (
-                    &secondary_root,
-                    secondary_identity.clone(),
-                    format!("{case}-secondary-pod"),
-                    format!("{case}-secondary-pvc"),
-                ),
-            ] {
-                drop(
-                    SqliteStore::create_public_v1(
-                        SqliteStore::metadata_database_path(root),
-                        preview.clone(),
-                        store_identity_named(
-                            resource_uid.clone(),
-                            identity,
-                            pod.as_str(),
-                            pvc.as_str(),
-                        ),
-                    )
-                    .unwrap(),
-                );
-            }
-            let primary_address = free_address();
-            let secondary_address = free_address();
-            let primary_state = Arc::new(MemoryState::default());
-            let secondary_state = Arc::new(MemoryState::default());
-            let primary_app = Arc::new(PreviewApplication::new(
-                primary_state.clone(),
-                format!("http://{primary_address}"),
+        for _ in 0..3 {
+            assert!(matches!(
+                plan_public_v1_session_renewal(
+                    &blocked,
+                    std::slice::from_ref(&survivor.process_session_id),
+                )
+                .unwrap(),
+                PublicV1SessionRenewalPlan::WaitForSurvivor { .. }
             ));
-            let mut primary = ReplicaHost::new(
-                ReplicaProcessConfig {
-                    resource_uid: resource_uid.clone(),
-                    replica_id: ReplicaId::new(1),
-                    pod_uid: PodUid::new(format!("{case}-primary-pod")),
-                    pvc_uid: PvcUid::new(format!("{case}-primary-pvc")),
-                    data_root: primary_root.clone(),
-                    replication_address: primary_address,
-                    bearer_token: "preview-token".into(),
-                    rpc_deadline: Duration::from_secs(2),
-                    transport_window_capacity: 8,
-                },
-                primary_app.clone(),
-                ApplicationStorageState::FreshEmpty,
-                Arc::new(Resolver),
-            )
-            .with_public_v1_binding(binding.clone())
-            .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-            .await
-            .unwrap();
-            let mut secondary = ReplicaHost::new(
-                ReplicaProcessConfig {
-                    resource_uid: resource_uid.clone(),
-                    replica_id: ReplicaId::new(2),
-                    pod_uid: PodUid::new(format!("{case}-secondary-pod")),
-                    pvc_uid: PvcUid::new(format!("{case}-secondary-pvc")),
-                    data_root: secondary_root.clone(),
-                    replication_address: secondary_address,
-                    bearer_token: "preview-token".into(),
-                    rpc_deadline: Duration::from_secs(2),
-                    transport_window_capacity: 8,
-                },
-                Arc::new(PreviewApplication::new(
-                    secondary_state.clone(),
-                    format!("http://{secondary_address}"),
-                )),
-                ApplicationStorageState::FreshEmpty,
-                Arc::new(Resolver),
-            )
-            .with_public_v1_binding(binding)
-            .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-            .await
-            .unwrap();
-            let primary_handle = primary.handle();
-            let secondary_handle = secondary.handle();
-            let initialization =
-                derive_history_initialization_id(&resource_uid, PublicProtocolGeneration::new(12));
-            let history = derive_bootstrap_history(
-                &resource_uid,
-                PublicProtocolGeneration::new(12),
-                &initialization,
-            );
-            for (handle, identity, pod, pvc) in [
-                (
-                    &primary_handle,
-                    primary_identity.clone(),
-                    format!("{case}-primary-pod"),
-                    format!("{case}-primary-pvc"),
-                ),
-                (
-                    &secondary_handle,
-                    secondary_identity.clone(),
-                    format!("{case}-secondary-pod"),
-                    format!("{case}-secondary-pvc"),
-                ),
-            ] {
-                handle
-                    .initialize_public_v1_history(
-                        &initialization,
-                        &history,
-                        &storage_named(identity, pod.as_str(), pvc.as_str()),
-                    )
-                    .await
-                    .unwrap();
-            }
-
-            let epoch = Epoch::new(0, 1);
-            let descriptor = ConfigurationDescriptor::new(
-                epoch,
-                ReplicaId::new(1),
-                vec![
-                    ConfigurationMember {
-                        identity: primary_identity.clone(),
-                        role: ReplicaRole::Primary,
-                    },
-                    ConfigurationMember {
-                        identity: secondary_identity.clone(),
-                        role: ReplicaRole::ActiveSecondary,
-                    },
-                ],
-                2,
-            );
-            install_static_authority(
-                &primary_handle,
-                &preview,
-                primary_identity.clone(),
-                ReplicaRole::Primary,
-                epoch,
-                PublicConfiguration {
-                    current: descriptor.clone(),
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: secondary_identity.clone(),
-                        replication_address: format!("http://{secondary_address}"),
-                        process_session_id: secondary_handle.process_session_id(),
-                        storage_incarnation: Some(storage_named(
-                            secondary_identity.clone(),
-                            "secondary-pod",
-                            "secondary-pvc",
-                        )),
-                        role: ReplicaRole::ActiveSecondary,
-                        current_progress: 0,
-                        catch_up_capability: 0,
-                        must_catchup: true,
-                    }],
-                },
-            )
-            .await;
-            install_static_authority(
-                &secondary_handle,
-                &preview,
-                secondary_identity.clone(),
-                ReplicaRole::ActiveSecondary,
-                epoch,
-                PublicConfiguration {
-                    current: descriptor.clone(),
-                    previous: None,
-                    replicas: vec![PublicReplicaDescriptor {
-                        build_id: OperationId::default(),
-                        identity: primary_identity.clone(),
-                        replication_address: format!("http://{primary_address}"),
-                        process_session_id: primary_handle.process_session_id(),
-                        storage_incarnation: Some(storage_named(
-                            primary_identity.clone(),
-                            "primary-pod",
-                            "primary-pvc",
-                        )),
-                        role: ReplicaRole::Primary,
-                        current_progress: 0,
-                        catch_up_capability: 0,
-                        must_catchup: false,
-                    }],
-                },
-            )
-            .await;
-            assert_eq!(
-                primary_app
-                    .replicate(Bytes::from_static(b"committed"))
-                    .await
-                    .unwrap(),
-                1
-            );
-            primary_state.fail_next_commit();
+            let report = wire_report(&replacement).await;
+            assert_ne!(report.read_status, AccessStatus::Granted);
+            assert_ne!(report.write_status, AccessStatus::Granted);
             assert!(
-                primary_app
-                    .replicate(Bytes::from_static(b"ambiguous"))
+                replacement
+                    .service
+                    .write(Bytes::from_static(b"cannot-skip-survivor"))
                     .await
                     .is_err()
             );
-            assert_eq!(
-                *primary_state.progress.lock().unwrap(),
-                DurableApplicationProgress {
-                    applied_lsn: 2,
-                    committed_lsn: 1,
+        }
+        assert!(blocked.finish_epoch_barriers().is_err());
+        assert!(
+            !replacement
+                .service
+                .observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, NativeCall::Role(..)))
+        );
+        if retire {
+            pair.target.stop().await;
+            let next = accept_public_v1_survivor_retired(
+                &blocked,
+                &survivor,
+                OperationId::new("explicit-exact-survivor-retirement"),
+            )
+            .unwrap();
+            controller
+                .persist_public_v1_session_renewal(&scope, Some(&blocked), &next)
+                .await
+                .unwrap();
+        } else {
+            controller.endpoints[1].1 = pair.target.control_address.clone();
+        }
+        blackhole.abort();
+        let _ = blackhole.await;
+        let mut stable = false;
+        for _ in 0..24 {
+            let current = controller
+                .observe_public_v1_session_renewal(&scope)
+                .await
+                .unwrap()
+                .unwrap();
+            let plan = plan_public_v1_session_renewal(&current, &[]).unwrap();
+            if matches!(plan, PublicV1SessionRenewalPlan::Stable) {
+                assert_eq!(current.stage, PublicSessionRenewalStage::Authorized);
+                stable = true;
+                break;
+            }
+            if let PublicV1SessionRenewalPlan::Dispatch {
+                command: ProtocolCommand::PublicV1History(history),
+                ..
+            } = &plan
+                && let PublicV1HistoryCommand::SessionRenewal { command } = history.as_ref()
+                && let PublicV1SessionRenewalCommand::InstallFreshConfiguration {
+                    configuration,
+                    ..
+                } = command.as_ref()
+            {
+                if !retire {
+                    pair.target
+                        .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                            current: configuration.clone(),
+                            previous: None,
+                            replicas: vec![replacement.descriptor(ReplicaRole::Primary).await],
+                        }))
+                        .await
+                        .unwrap();
                 }
-            );
-            secondary_state
-                .apply(Operation {
-                    lsn: 3,
-                    committed_lsn: 2,
-                    data: Bytes::from_static(b"peer-higher-progress"),
-                })
-                .await
-                .unwrap();
-            secondary_state.commit(3).await.unwrap();
-            if divergent {
-                secondary_state
-                    .operations
-                    .lock()
-                    .unwrap()
-                    .iter_mut()
-                    .find(|operation| operation.lsn == 2)
-                    .unwrap()
-                    .data = Bytes::from_static(b"divergent");
-            }
-            if unverifiable {
-                primary_state
-                    .operations
-                    .lock()
-                    .unwrap()
-                    .retain(|operation| operation.lsn != 2);
-            }
-            if unavailable {
-                secondary.shutdown();
-                secondary.wait().await.unwrap();
-            }
-            primary_handle
-                .execute_public_v1(intent(
-                    &preview,
-                    primary_handle.process_session_id(),
-                    5,
-                    &format!("advertise-higher-{case}"),
-                    PublicOperationProgram::Configuration(PublicConfiguration {
-                        current: descriptor,
+                replacement
+                    .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                        current: configuration.clone(),
                         previous: None,
-                        replicas: vec![PublicReplicaDescriptor {
-                            build_id: OperationId::default(),
-                            identity: secondary_identity.clone(),
-                            replication_address: format!("http://{secondary_address}"),
-                            process_session_id: secondary_handle.process_session_id(),
-                            storage_incarnation: Some(storage_named(
-                                secondary_identity.clone(),
-                                "secondary-pod",
-                                "secondary-pvc",
-                            )),
-                            role: ReplicaRole::ActiveSecondary,
-                            current_progress: 99,
-                            catch_up_capability: 99,
-                            must_catchup: true,
-                        }],
-                    }),
-                ))
-                .await
-                .unwrap();
-            let settlement = primary_app.wait_for_write_quorum().await;
-            let report = primary_handle.public_v1_report().await.unwrap();
-            if divergent {
-                assert!(matches!(
-                    settlement,
-                    Err(RuntimeError::ReplicaRebuildRequired(rebuild))
-                        if matches!(
-                            rebuild.as_ref(),
-                            kuberic_runtime::protocol::public_operations::
-                                ReplicaRebuildRequired::RemoteBuildTarget(target)
-                                if target.target == secondary_identity
-                                    && target.reason
-                                        == kuberic_runtime::protocol::public_operations::
-                                            ReplicaRebuildReason::IncompatibleRetainedHistory
-                        )
-                ));
-                assert_eq!(
-                    report.write_status,
-                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-                );
-                assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
-            } else if unverifiable {
-                assert!(matches!(
-                    settlement,
-                    Err(RuntimeError::ReplicaRebuildRequired(rebuild))
-                        if matches!(
-                            rebuild.as_ref(),
-                            kuberic_runtime::protocol::public_operations::
-                                ReplicaRebuildRequired::LocalProvider(local)
-                                if local.provider.replica == primary_identity
-                                    && local.reason
-                                        == kuberic_runtime::protocol::public_operations::
-                                            ReplicaRebuildReason::IncompatibleRetainedHistory
-                        )
-                ));
-                assert_eq!(
-                    report.write_status,
-                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-                );
-                assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
-            } else if unavailable {
-                assert!(matches!(
-                    settlement,
-                    Err(RuntimeError::ReconfigurationPending)
-                ));
-                assert_eq!(
-                    report.write_status,
-                    kuberic_runtime::protocol::types::AccessStatus::NotPrimary
-                );
-                assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 1);
-            } else {
-                settlement.unwrap();
-                assert_eq!(primary_state.progress.lock().unwrap().committed_lsn, 2);
-                assert_eq!(secondary_state.progress.lock().unwrap().committed_lsn, 3);
-                primary_handle
-                    .execute_public_v1(intent(
-                        &preview,
-                        primary_handle.process_session_id(),
-                        6,
-                        "refresh-settled-progress",
-                        PublicOperationProgram::Progress { capability: false },
-                    ))
+                        replicas: if retire {
+                            Vec::new()
+                        } else {
+                            vec![pair.target.descriptor(ReplicaRole::ActiveSecondary).await]
+                        },
+                    }))
                     .await
                     .unwrap();
-                let report = primary_handle.public_v1_report().await.unwrap();
-                assert_eq!(
-                    report.write_status,
-                    kuberic_runtime::protocol::types::AccessStatus::Granted
-                );
             }
-
-            primary.shutdown();
-            primary.wait().await.unwrap();
-            if !unavailable {
-                secondary.shutdown();
-                secondary.wait().await.unwrap();
-            }
-            std::fs::remove_dir_all(primary_root).unwrap();
-            std::fs::remove_dir_all(secondary_root).unwrap();
+            execute_public_v1_session_renewal(&controller, &scope, plan)
+                .await
+                .unwrap();
         }
-    })
-    .await
-    .unwrap();
+        assert!(
+            stable,
+            "controller renewal did not resolve a returned/retired exact survivor"
+        );
+        assert_eq!(
+            replacement
+                .service
+                .write(Bytes::from_static(b"after-renewal"))
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(replacement.service.provider.values().len(), 2);
+        if !retire {
+            assert_eq!(
+                pair.target.service.provider.values(),
+                replacement.service.provider.values()
+            );
+        }
+        replacement.stop().await;
+        if !retire {
+            pair.target.stop().await;
+        }
+    }
 }
 
 #[tokio::test]
-async fn production_config_has_no_protocol_selector_and_stateless_source_has_no_legacy_store_or_auth()
- {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let process = std::fs::read_to_string(manifest.join("src/host/process.rs")).unwrap();
-        let config = process
-            .split("pub struct ReplicaProcessConfig")
-            .nth(1)
-            .unwrap()
-            .split('}')
-            .next()
-            .unwrap();
-        assert!(!config.contains("preview"));
-        let stateless =
-            std::fs::read_to_string(manifest.join("src/replicator/stateless/mod.rs")).unwrap();
-        for forbidden in [
-            "ManagedReplicaStore",
-            "ReplicationProgressStore",
-            "LocalWriteJournal",
-            "BuildAuthorityStore",
-            "BuildProgressStore",
-            "bearer_token",
-            "authorize_request",
-        ] {
-            assert!(
-                !stateless.contains(forbidden),
-                "stateless preview contains forbidden dependency: {forbidden}"
-            );
-        }
+async fn native_query_outcomes_remain_independent_through_host_wire_and_controller_eligibility() {
+    use kuberic_controller::evaluator::public_v1_topology::{
+        PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
+    };
+    let root = root();
+    let resource = ResourceUid::new("connected-native-query-outcomes");
+    let mut first = Node::start(root.path(), &resource, 1).await;
+    first.open(ReplicaRole::Primary, EPOCH).await;
+    first.single(EPOCH).await;
+    first
+        .service
+        .write(Bytes::from_static(b"genuinely-committed"))
+        .await
+        .unwrap();
+    first.stop().await;
+    let mut node = Node::start(root.path(), &resource, 1).await;
+    node.command(PublicOperationProgram::Open {
+        replica: node.identity.clone(),
+        existing: true,
     })
     .await
     .unwrap();
+    let baseline = wire_report(&node).await;
+    assert_eq!(baseline.progress.current(), Some(1));
+    assert_eq!(baseline.progress.capability(), Some(0));
+    let accepted = PublicV1AcceptedStatus {
+        identity: node.preview.clone(),
+        history_initialization_id: derive_history_initialization_id(
+            &resource,
+            PublicProtocolGeneration::new(1),
+        ),
+        history: node.history.clone(),
+        data_loss_recovery: None,
+        completed_operations: Vec::new(),
+        extensions: Default::default(),
+    };
+    for (current, capability) in [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2), (1, 2), (2, 1)] {
+        node.service
+            .provider
+            .query_current
+            .store(current, Ordering::Release);
+        node.service
+            .provider
+            .query_capability
+            .store(capability, Ordering::Release);
+        let host = node.report().await;
+        let report = wire_report(&node).await;
+        assert_eq!(report.progress, host.progress);
+        assert_eq!(report.history, baseline.history);
+        assert_eq!(report.storage_incarnation, baseline.storage_incarnation);
+        assert_eq!(report.read_status, AccessStatus::NotPrimary);
+        assert_eq!(report.write_status, AccessStatus::NotPrimary);
+        match current {
+            0 => assert_eq!(
+                report.progress.current_progress,
+                ProgressQueryResult::Value(1)
+            ),
+            1 => assert_eq!(
+                report.progress.current_progress,
+                ProgressQueryResult::NotReady
+            ),
+            _ => assert!(
+                matches!(&report.progress.current_progress, ProgressQueryResult::Failed(error)
+                if error.contains("current-progress query failure"))
+            ),
+        }
+        match capability {
+            0 => assert_eq!(
+                report.progress.catch_up_capability,
+                ProgressQueryResult::Value(0)
+            ),
+            1 => assert_eq!(
+                report.progress.catch_up_capability,
+                ProgressQueryResult::NotReady
+            ),
+            _ => assert!(
+                matches!(&report.progress.catch_up_capability, ProgressQueryResult::Failed(error)
+                if error.contains("catch-up-capability query failure"))
+            ),
+        }
+        let plan = plan_public_v1_topology(
+            &accepted,
+            None,
+            &[PublicV1TopologyReplica {
+                replication_address: report.replication_address.clone().unwrap(),
+                report,
+            }],
+            1,
+            None,
+            None,
+            "query-matrix",
+        )
+        .unwrap();
+        if current != 0 {
+            assert!(
+                matches!(plan, PublicV1TopologyPlan::Wait),
+                "unknown/failed current progress became an eligible primary: {plan:?}"
+            );
+        } else {
+            assert!(
+                !matches!(plan, PublicV1TopologyPlan::Wait),
+                "independent capability outcome erased known current progress"
+            );
+        }
+    }
+    node.service
+        .provider
+        .query_current
+        .store(0, Ordering::Release);
+    node.service
+        .provider
+        .query_capability
+        .store(0, Ordering::Release);
+    assert_eq!(
+        node.service.provider.values(),
+        [Bytes::from_static(b"genuinely-committed")]
+    );
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn hosted_public_v1_authorized_data_loss_preserves_effective_outcomes_and_history_scope() {
+    let root = root();
+    for outcome in 0..4 {
+        let resource = ResourceUid::new(format!("native-data-loss-{outcome}"));
+        let mut node = Node::start(&root.path().join(outcome.to_string()), &resource, 1).await;
+        node.command(PublicOperationProgram::Open {
+            replica: node.identity.clone(),
+            existing: node.report().await.open_mode == OpenMode::Existing,
+        })
+        .await
+        .unwrap();
+        let before = node.report().await;
+        let authorization_id = OperationId::new(format!("native-data-loss-{outcome}"));
+        let proposed =
+            derive_data_loss_history(&authorization_id, &node.history, 1, &node.storage).unwrap();
+        let authorization = DataLossAuthorization {
+            authorization_id: authorization_id.clone(),
+            predecessor: node.history.clone(),
+            proposed: proposed.clone(),
+            provisional_primary: node.storage.clone(),
+            reset_scope: if matches!(outcome, 1 | 3) {
+                ProviderProgressReset::ResetToEmpty
+            } else {
+                ProviderProgressReset::Preserve
+            },
+            replay_disposition: DataLossReplay::ReplaceOnAmbiguity,
+        };
+        let endpoint = node
+            .handle()
+            .public_v1_process_endpoint(ReplicaRole::None)
+            .await
+            .unwrap();
+        let epoch = Epoch::new(1, 1);
+        let attempt = DataLossAttempt {
+            authorization_id,
+            attempt_id: OperationId::new(format!("native-recovery-{outcome}")),
+            process: ProcessAttemptContext {
+                process_session_id: endpoint.process_session_id,
+                replicator_creation_id: endpoint.replicator_creation_id,
+                catch_up_specific_quorum: true,
+                data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
+                epoch,
+                attempt_revision: 2,
+            },
+        };
+        let members = vec![ConfigurationMember {
+            identity: node.identity.clone(),
+            role: ReplicaRole::Primary,
+        }];
+        let lifecycle = PublicLifecycleInput {
+            recipe: PublicLifecycleRecipe::InitialPrimary,
+            replica: node.identity.clone(),
+            epoch,
+            possible_data_loss: PossibleDataLossIntent::Possible,
+            current: ConfigurationDescriptor::new(
+                epoch,
+                node.identity.replica_id,
+                members.clone(),
+                1,
+            ),
+            previous: Some(ConfigurationDescriptor::new(
+                Epoch::new(1, 0),
+                node.identity.replica_id,
+                members,
+                1,
+            )),
+            replicas: Vec::new(),
+            data_loss_recovery: Some(PublicDataLossRecoveryInput {
+                authorization: authorization.clone(),
+                attempt: attempt.clone(),
+            }),
+        };
+        let intent = PublicOperationIntent {
+            identity: node.preview.clone(),
+            operation_id: attempt.attempt_id.clone(),
+            revision: 2,
+            process_session_id: attempt.process.process_session_id.clone(),
+            class: PublicOperationClass::Authority,
+            input_digest: lifecycle.digest(),
+            replay_disposition: PublicOperationReplayDisposition::DataLoss(
+                DataLossReplay::ReplaceOnAmbiguity,
+            ),
+            lifecycle: Some(lifecycle),
+            program: None,
+        };
+        let accepted = PublicV1AcceptedStatus {
+            identity: node.preview.clone(),
+            history_initialization_id: derive_history_initialization_id(
+                &resource,
+                PublicProtocolGeneration::new(1),
+            ),
+            history: node.history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: Default::default(),
+        };
+        let transition = PublicV1AcceptedTransitionStatus {
+            resource_version: "status-1".into(),
+            evidence: accepted.clone(),
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: PublicV1EvidenceConsumer::DataLoss,
+                operation_id: intent.operation_id.clone(),
+                revision: intent.revision,
+                call_kind: PublicV1CallKind::InitialPrimary,
+                history: node.history.clone(),
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: node.storage.clone(),
+                    resource_version: "storage-1".into(),
+                },
+                target: None,
+                process_session_id: intent.process_session_id.clone(),
+                input_digest: intent.input_digest.clone(),
+                replay_disposition: intent.replay_disposition,
+                previous_configuration_id: None,
+                current_configuration_id: None,
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+            },
+        };
+        let evidence = Arc::new(
+            PublicV1EvidenceState::new(
+                transition,
+                vec![PublicV1EvidenceResource {
+                    storage_incarnation: node.storage.clone(),
+                    resource_version: "storage-1".into(),
+                    proof: Some(PublicV1ResourceProof {
+                        history: node.history.clone(),
+                        storage_incarnation: node.storage.clone(),
+                    }),
+                    disposition: PublicV1ResourceDisposition::Active,
+                }],
+            )
+            .unwrap(),
+        );
+        let adapter = HostedPublicV1Harness::new(
+            vec![HostedPublicV1Replica {
+                identity: node.identity.clone(),
+                replication_address: before.replication_address.clone().unwrap(),
+                handle: node.handle(),
+            }],
+            Some(accepted.clone()),
+            None,
+            evidence,
+        )
+        .unwrap();
+        let scope = PublicV1Scope {
+            namespace: "testing".into(),
+            name: "recovery".into(),
+            resource_uid: resource,
+        };
+        let mut crossed = authorization.clone();
+        crossed.authorization_id = OperationId::new("crossed-authorization");
+        assert!(
+            plan_public_v1_data_loss_recovery(
+                &accepted, &before, &crossed, &attempt, &intent, false,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            node.service.provider.recovery_calls.load(Ordering::SeqCst),
+            0
+        );
+        execute_public_v1_history(
+            &adapter,
+            &scope,
+            plan_public_v1_data_loss_recovery(
+                &accepted,
+                &before,
+                &authorization,
+                &attempt,
+                &intent,
+                false,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let invalidated = adapter
+            .observe_public_v1_status(&scope)
+            .await
+            .unwrap()
+            .unwrap();
+        node.service
+            .provider
+            .recovery_outcome
+            .store(outcome, Ordering::Release);
+        node.service.provider.recovery.hold();
+        let dispatch = execute_public_v1_history(
+            &adapter,
+            &scope,
+            plan_public_v1_data_loss_recovery(
+                &invalidated,
+                &before,
+                &authorization,
+                &attempt,
+                &intent,
+                false,
+            )
+            .unwrap(),
+        );
+        tokio::pin!(dispatch);
+        tokio::select! {
+            _ = node.service.provider.recovery.entered.notified() => {}
+            result = &mut dispatch => panic!("recovery did not reach its provider callback: {result:?}"),
+        }
+        let pending = node.report().await;
+        assert_eq!(pending.history, node.history);
+        assert_ne!(pending.read_status, AccessStatus::Granted);
+        assert_ne!(pending.write_status, AccessStatus::Granted);
+        assert!(matches!(
+            pending.progress.current_progress,
+            ProgressQueryResult::NotQueried(_)
+        ));
+        assert!(matches!(
+            pending.progress.catch_up_capability,
+            ProgressQueryResult::NotQueried(_)
+        ));
+        node.service.provider.recovery.release();
+        let result = dispatch.await;
+        let report = node.report().await;
+        let store = SqliteStore::open_public_v1(
+            SqliteStore::metadata_database_path(&node.root),
+            &node.preview,
+        )
+        .unwrap();
+        let persisted = store.public_v1_history_snapshot().await.unwrap().recovery;
+        assert_eq!(persisted, report.data_loss_recovery);
+        drop(store);
+        let reopened = SqliteStore::open_public_v1(
+            SqliteStore::metadata_database_path(&node.root),
+            &node.preview,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .public_v1_history_snapshot()
+                .await
+                .unwrap()
+                .recovery,
+            persisted
+        );
+        let wire = wire_report(&node).await;
+        assert_eq!(wire.data_loss_recovery, persisted);
+        assert_eq!(wire.progress, report.progress);
+        assert_eq!(
+            node.service.provider.recovery_calls.load(Ordering::SeqCst),
+            1
+        );
+        if outcome < 2 {
+            result.unwrap();
+            let observation = persisted
+                .as_ref()
+                .unwrap()
+                .observed_progress
+                .as_ref()
+                .unwrap();
+            assert!(matches!(
+                observation.current_progress,
+                ProgressQueryResult::Value(_)
+            ));
+            assert_eq!(
+                observation.catch_up_capability,
+                ProgressQueryResult::NotReady
+            );
+            execute_public_v1_history(
+                &adapter,
+                &scope,
+                plan_public_v1_recovery_report(&invalidated, &wire).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                adapter
+                    .observe_public_v1_status(&scope)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .data_loss_recovery
+                    .as_ref()
+                    .unwrap()
+                    .observed_progress,
+                Some(observation.clone())
+            );
+            assert_eq!(report.history, proposed);
+            assert_eq!(
+                report.data_loss_recovery.unwrap().stage,
+                PublicDataLossRecoveryStage::Admitted
+            );
+            assert_eq!(report.write_status, AccessStatus::Granted);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(report.history, node.history);
+            assert_ne!(report.write_status, AccessStatus::Granted);
+            assert_eq!(
+                report.data_loss_recovery.unwrap().stage,
+                if outcome == 2 {
+                    PublicDataLossRecoveryStage::Failed
+                } else {
+                    PublicDataLossRecoveryStage::ReplacementRequired
+                },
+                "typed provider recovery result was lost: {result:?}",
+            );
+        }
+        node.stop().await;
+    }
 }

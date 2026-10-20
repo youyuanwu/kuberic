@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,10 +20,44 @@ fn application_replication_api_has_no_parallel_driver_or_admission_surface() {
             "ReplicaRegistration",
             "ReplicaAdmission",
             "AdmissionGuard",
+            "StatelessReplicator",
+            "StatelessRuntimeControl",
+            "OperationMetadata",
+            "StreamOperation",
+            "ServiceStreams",
         ] {
             assert!(
                 !entry.contains(forbidden),
                 "non-SF application API: {entry}"
+            );
+        }
+    }
+}
+
+#[test]
+fn retired_replication_data_protocol_is_not_source_public() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let mut inventory = Vec::new();
+    inventory_file("crate", &source, true, false, &mut inventory);
+    for entry in inventory {
+        for forbidden in [
+            "ReplicationData",
+            "ReplicationEnvelope",
+            "ReplicationAcknowledgement",
+            "CopyEnvelope",
+            "CopyAcknowledgement",
+            "normalize_replication_item",
+            "normalize_replication_ack",
+            "validate_replication_item",
+            "validate_replication_ack",
+            "normalize_copy_item",
+            "normalize_copy_ack",
+            "validate_copy_item",
+            "validate_copy_ack",
+        ] {
+            assert!(
+                !entry.contains(forbidden),
+                "retired replication-data protocol API: {entry}"
             );
         }
     }
@@ -79,12 +114,25 @@ fn source_public_api_matches_reviewed_inventory() {
     expected.dedup();
     let expected = format!("{}\n", expected.join("\n"));
 
-    assert_eq!(
-        actual, expected,
+    let actual_entries = actual.lines().collect::<BTreeSet<_>>();
+    let expected_entries = expected.lines().collect::<BTreeSet<_>>();
+    assert!(
+        actual == expected,
         "kuberic-runtime source-public API changed; review the diff and, if intentional, run \
          UPDATE_RUNTIME_SOURCE_API=1 cargo test -p kuberic-runtime \
          --test public_api_inventory (or UPDATE_RUNTIME_CONTROL_SOURCE_API=1 for \
-         the protocol and control modules)"
+         the protocol and control modules)\n\
+         unexpected entries:\n{}\nmissing entries:\n{}",
+        actual_entries
+            .difference(&expected_entries)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+        expected_entries
+            .difference(&actual_entries)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 }
 
@@ -130,6 +178,7 @@ fn host_capabilities_are_not_source_public_even_when_doc_hidden() {
             "crate::host::state",
             "crate::host::store",
             "crate::host::testing",
+            "crate::host::native_transport",
             "crate::replicator::copy",
             "crate::replicator::quorum",
             "crate::replicator::sender",
@@ -143,6 +192,7 @@ fn host_capabilities_are_not_source_public_even_when_doc_hidden() {
             "ManagedFenceGuard",
             "PartitionAccessView",
             "ReplicatorRegistration",
+            "NativeRuntimeControl",
             "crate::replicator::ReplicatorFactoryContext::fn new",
             "crate::replicator::StatefulServicePartition::fn new",
             "crate::replicator::ReplicatorInterfaces::fn testing_",

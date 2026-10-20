@@ -215,11 +215,14 @@ where
                 return Ok(outcome);
             }
         }
-        api.contain_public_v1_operation(scope, &expected, &command)
-            .await
-            .map_err(|containment_error| {
-                format!("{dispatch_error}; containment failed: {containment_error}")
-            })?;
+        // A failed RPC observer does not retract an admitted native operation.
+        // Supersession/retirement requires its own exact authority; preserve
+        // the receiver while an idempotent retry observes the selected work.
+        tracing::warn!(
+            operation = %expected.intent.operation_id,
+            error = %dispatch_error,
+            "public operation dispatch failed; retained work is not cancelled"
+        );
         return Err(dispatch_error);
     }
     let report = api

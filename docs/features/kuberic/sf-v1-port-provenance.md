@@ -24,6 +24,25 @@ Kuberic's root license and existing API-documentation notices are unchanged.
 
 ## Concrete material register
 
+### Connected production composition
+
+The [runtime guide](classic-v1-runtime.md) describes selection through
+`replicator/v1/service_adapter/{production,production_transport}.rs` and the
+host's `native_transport.rs`. These Kuberic-specific adapters compose the
+already-recorded translations below; they do not import additional native
+COM, transport, hosting or placement implementation.
+
+Public assignment and shared streams expose the native owners without adding
+provider commit hooks. KV and SQLite now select their previously recorded local
+commit/publication companions. The controller supplies exact frozen authority,
+PC/CC staging and copy-before-vote policy; those are host/controller adaptations,
+not a claim to have ported RA/FM.
+
+The Microsoft MIT notices and selected native pin remain unchanged. Subsequent
+private/unselected labels describe the historical scope of individual slices.
+Production selection establishes neither native binary execution nor differential
+or power-loss qualification.
+
 ### OperationQueue implementation slice (P2, not all of P2)
 
 Rust destinations:

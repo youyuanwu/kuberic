@@ -19,7 +19,6 @@ pub(in crate::replicator::v1) struct QueuePolicyConfig {
     pub(in crate::replicator::v1) extra_active: usize,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 policy settings"))]
 impl QueuePolicyConfig {
     pub(in crate::replicator::v1) fn for_persisted(persisted: bool) -> Self {
         Self {

@@ -135,8 +135,7 @@ message PublicV1AgentStatus {
   AccessStatus read_status = 8;
   AccessStatus write_status = 9;
   PublicV1ProgressRole progress_role = 10;
-  int64 first_progress = 11;
-  int64 last_progress = 12;
+  reserved 11, 12;
   repeated PublicV1OperationCompletion completed_operations = 13;
   optional uint32 history_recovery_extension_version = 14;
   reserved 15;
@@ -149,6 +148,10 @@ message PublicV1AgentStatus {
   optional bool catch_up_specific_quorum = 23;
   optional string replication_address = 22;
   PublicV1OpenMode open_mode = 24;
+  PublicV1ProgressQuery current_progress = 25;
+  PublicV1ProgressQuery catch_up_capability = 26;
+  optional string configuration_json = 27;
+  repeated string active_operations_json = 28;
 }
 
 enum PublicV1OpenMode {
@@ -217,8 +220,18 @@ enum PublicV1DataLossRecoveryStage {
 
 message PublicV1RecoveryProgress {
   PublicV1ProgressRole role = 1;
-  int64 first = 2;
-  int64 last = 3;
+  reserved 2, 3;
+  PublicV1ProgressQuery current_progress = 4;
+  PublicV1ProgressQuery catch_up_capability = 5;
+}
+
+message PublicV1ProgressQuery {
+  oneof result {
+    sint64 value = 1;
+    bool not_ready = 2;
+    string failure = 3;
+    string not_queried = 4;
+  }
 }
 
 message PublicV1DataLossRecoveryStatus {

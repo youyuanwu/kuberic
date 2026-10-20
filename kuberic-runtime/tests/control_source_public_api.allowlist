@@ -43,50 +43,10 @@ public-path documented enum crate::protocol::types::ScaleUpStage
 public-path documented enum crate::protocol::types::SecondaryRemovalStage
 public-path documented enum crate::protocol::types::TransitionKind
 public-path documented enum crate::protocol::validation::ValidationError
-public-path documented field crate::control::convert::CopyAcknowledgement::build_id: OperationId
-public-path documented field crate::control::convert::CopyAcknowledgement::catch_up_boundary_lsn: Option < i64 >
-public-path documented field crate::control::convert::CopyAcknowledgement::current_configuration_id: ConfigurationId
-public-path documented field crate::control::convert::CopyAcknowledgement::durable_lsn: i64
-public-path documented field crate::control::convert::CopyAcknowledgement::epoch: Epoch
-public-path documented field crate::control::convert::CopyAcknowledgement::final_item: bool
-public-path documented field crate::control::convert::CopyAcknowledgement::receiver: ReplicaIdentity
-public-path documented field crate::control::convert::CopyAcknowledgement::replication_boundary_lsn: i64
-public-path documented field crate::control::convert::CopyAcknowledgement::sender: ReplicaIdentity
-public-path documented field crate::control::convert::CopyAcknowledgement::sequence: u64
-public-path documented field crate::control::convert::CopyAcknowledgement::snapshot_chunk: bool
-public-path documented field crate::control::convert::CopyEnvelope::build_id: OperationId
-public-path documented field crate::control::convert::CopyEnvelope::catch_up_boundary_lsn: Option < i64 >
-public-path documented field crate::control::convert::CopyEnvelope::committed_lsn: i64
-public-path documented field crate::control::convert::CopyEnvelope::current_configuration_id: ConfigurationId
-public-path documented field crate::control::convert::CopyEnvelope::data: Vec < u8 >
-public-path documented field crate::control::convert::CopyEnvelope::epoch: Epoch
-public-path documented field crate::control::convert::CopyEnvelope::final_item: bool
-public-path documented field crate::control::convert::CopyEnvelope::lsn: i64
-public-path documented field crate::control::convert::CopyEnvelope::receiver: ReplicaIdentity
-public-path documented field crate::control::convert::CopyEnvelope::replication_boundary_lsn: i64
-public-path documented field crate::control::convert::CopyEnvelope::sender: ReplicaIdentity
-public-path documented field crate::control::convert::CopyEnvelope::sequence: u64
-public-path documented field crate::control::convert::CopyEnvelope::snapshot_chunk: bool
 public-path documented field crate::control::convert::ExecuteEnvelope::command: ProtocolCommand
 public-path documented field crate::control::convert::ExecuteEnvelope::expected_process_session_id: ProcessSessionId
 public-path documented field crate::control::convert::ExecuteEnvelope::resource_uid: ResourceUid
 public-path documented field crate::control::convert::ExecuteEnvelope::target: ReplicaIdentity
-public-path documented field crate::control::convert::ReplicationAcknowledgement::applied_lsn: i64
-public-path documented field crate::control::convert::ReplicationAcknowledgement::committed_lsn: i64
-public-path documented field crate::control::convert::ReplicationAcknowledgement::current_configuration_id: ConfigurationId
-public-path documented field crate::control::convert::ReplicationAcknowledgement::epoch: Epoch
-public-path documented field crate::control::convert::ReplicationAcknowledgement::previous_configuration_id: Option < ConfigurationId >
-public-path documented field crate::control::convert::ReplicationAcknowledgement::received_lsn: i64
-public-path documented field crate::control::convert::ReplicationAcknowledgement::receiver: ReplicaIdentity
-public-path documented field crate::control::convert::ReplicationAcknowledgement::sender: ReplicaIdentity
-public-path documented field crate::control::convert::ReplicationEnvelope::committed_lsn: i64
-public-path documented field crate::control::convert::ReplicationEnvelope::current_configuration_id: ConfigurationId
-public-path documented field crate::control::convert::ReplicationEnvelope::data: Vec < u8 >
-public-path documented field crate::control::convert::ReplicationEnvelope::epoch: Epoch
-public-path documented field crate::control::convert::ReplicationEnvelope::lsn: i64
-public-path documented field crate::control::convert::ReplicationEnvelope::previous_configuration_id: Option < ConfigurationId >
-public-path documented field crate::control::convert::ReplicationEnvelope::receiver: ReplicaIdentity
-public-path documented field crate::control::convert::ReplicationEnvelope::sender: ReplicaIdentity
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::committed: crate :: protocol :: types :: SecondaryScaleDownCleanup
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::local_recovery: bool
 public-path documented field crate::protocol::command::AcceptSecondaryRemovalCommit::operation_id: OperationId
@@ -490,21 +450,13 @@ public-path documented field crate::protocol::types::TransitionIntent::spec_gene
 public-path documented field crate::protocol::types::TransitionIntent::switchover: Option < PlannedSwitchoverIntent >
 public-path documented field crate::protocol::types::TransitionIntent::transition_id: TransitionId
 public-path documented fn crate::control::convert::fn ensure_supported_version (observed : u32) -> Result < () , WireError >
-public-path documented fn crate::control::convert::fn normalize_copy_ack (ack : proto :: CopyAck) -> Result < CopyAcknowledgement , WireError >
-public-path documented fn crate::control::convert::fn normalize_copy_item (item : proto :: CopyItem) -> Result < CopyEnvelope , WireError >
 public-path documented fn crate::control::convert::fn normalize_execute_request (request : proto :: ExecuteCommandRequest ,) -> Result < ExecuteEnvelope , WireError >
 public-path documented fn crate::control::convert::fn normalize_public_v1_agent_status_report (report : proto :: AgentStatusReport ,) -> Result < PublicV1AgentReport , WireError >
-public-path documented fn crate::control::convert::fn normalize_replication_ack (ack : proto :: ReplicationAck ,) -> Result < ReplicationAcknowledgement , WireError >
-public-path documented fn crate::control::convert::fn normalize_replication_item (item : proto :: ReplicationItem ,) -> Result < ReplicationEnvelope , WireError >
 public-path documented fn crate::control::convert::fn normalize_uninitialized_agent_status_report (report : proto :: AgentStatusReport ,) -> Result < crate :: protocol :: observation :: UninitializedAgentObservation , WireError >
 public-path documented fn crate::control::convert::fn public_v1_agent_status_to_proto (report : & PublicV1AgentReport) -> proto :: AgentStatusReport
 public-path documented fn crate::control::convert::fn public_v1_history_command_to_proto (command : & PublicV1HistoryCommand ,) -> Result < proto :: PublicV1HistoryCommand , WireError >
 public-path documented fn crate::control::convert::fn public_v1_operation_command_to_proto (command : & PublicV1OperationCommand ,) -> Result < proto :: PublicV1OperationCommand , WireError >
-public-path documented fn crate::control::convert::fn validate_copy_ack (ack : & proto :: CopyAck) -> Result < () , WireError >
-public-path documented fn crate::control::convert::fn validate_copy_item (item : & proto :: CopyItem) -> Result < () , WireError >
 public-path documented fn crate::control::convert::fn validate_execute_request (request : & proto :: ExecuteCommandRequest) -> Result < () , WireError >
-public-path documented fn crate::control::convert::fn validate_replication_ack (ack : & proto :: ReplicationAck) -> Result < () , WireError >
-public-path documented fn crate::control::convert::fn validate_replication_item (item : & proto :: ReplicationItem) -> Result < () , WireError >
 public-path documented fn crate::protocol::types::fn derive_agent_generation (initialization_id : & InitializationId) -> AgentGeneration
 public-path documented fn crate::protocol::types::fn derive_bootstrap_history (resource_uid : & ResourceUid , protocol_generation : PublicProtocolGeneration , initialization_id : & HistoryInitializationId ,) -> HistoryContext
 public-path documented fn crate::protocol::types::fn derive_data_loss_history (authorization_id : & OperationId , predecessor : & HistoryContext , next_data_loss_number : i64 , provisional_primary : & ReplicaStorageIncarnationContext ,) -> Result < HistoryContext , & 'static str >
@@ -601,11 +553,7 @@ public-path documented module crate::protocol::command
 public-path documented module crate::protocol::observation
 public-path documented module crate::protocol::types
 public-path documented module crate::protocol::validation
-public-path documented struct crate::control::convert::CopyAcknowledgement
-public-path documented struct crate::control::convert::CopyEnvelope
 public-path documented struct crate::control::convert::ExecuteEnvelope
-public-path documented struct crate::control::convert::ReplicationAcknowledgement
-public-path documented struct crate::control::convert::ReplicationEnvelope
 public-path documented struct crate::protocol::command::AcceptSecondaryRemovalCommit
 public-path documented struct crate::protocol::command::EnsureConfiguration
 public-path documented struct crate::protocol::command::EnsureReplicaBuild
@@ -672,7 +620,7 @@ public-path documented struct crate::protocol::types::StatusCondition
 public-path documented struct crate::protocol::types::SwitchoverHandoff
 public-path documented struct crate::protocol::types::SwitchoverPreparationId
 public-path documented struct crate::protocol::types::TransitionIntent
-public-path documented use crate::control::convert :: { CopyAcknowledgement , CopyEnvelope , ExecuteEnvelope , ReplicationAcknowledgement , ReplicationEnvelope , WireError , ensure_supported_version , normalize_copy_ack , normalize_copy_item , normalize_execute_request , normalize_public_v1_agent_status_report , normalize_replication_ack , normalize_replication_item , normalize_uninitialized_agent_status_report , public_v1_agent_status_to_proto , public_v1_history_command_to_proto , public_v1_operation_command_to_proto , validate_copy_ack , validate_copy_item , validate_execute_request , validate_replication_ack , validate_replication_item , }
+public-path documented use crate::control::convert :: { ExecuteEnvelope , WireError , ensure_supported_version , normalize_execute_request , normalize_public_v1_agent_status_report , normalize_uninitialized_agent_status_report , public_v1_agent_status_to_proto , public_v1_history_command_to_proto , public_v1_operation_command_to_proto , validate_execute_request , }
 public-path documented use crate::protocol::validation::scale_down :: *
 public-path documented use crate::protocol::validation::scale_up :: *
 public-path documented variant crate::control::convert::WireError::InvalidAuthority((String))
@@ -852,6 +800,7 @@ public-path hidden enum crate::protocol::public_operations::CanonicalReplicaRebu
 public-path hidden enum crate::protocol::public_operations::DataLossRenewalDecision
 public-path hidden enum crate::protocol::public_operations::DataLossReplay
 public-path hidden enum crate::protocol::public_operations::PossibleDataLossIntent
+public-path hidden enum crate::protocol::public_operations::ProgressQueryResult
 public-path hidden enum crate::protocol::public_operations::ProviderProgressReset
 public-path hidden enum crate::protocol::public_operations::PublicCatchUpMode
 public-path hidden enum crate::protocol::public_operations::PublicDataLossRecoveryStage
@@ -933,6 +882,7 @@ public-path hidden field crate::protocol::public_operations::PublicBuildInput::h
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::replication_address: String
+public-path hidden field crate::protocol::public_operations::PublicBuildInput::source_address: String
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::target_storage: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicConfiguration::current: ConfigurationDescriptor
 public-path hidden field crate::protocol::public_operations::PublicConfiguration::previous: Option < ConfigurationDescriptor >
@@ -966,6 +916,7 @@ public-path hidden field crate::protocol::public_operations::PublicInboundBuildA
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::history: HistoryContext
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_revision: u64
+public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::source_address: String
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::target_address: String
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::authority: PublicInboundBuildAuthority
 public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::catch_up_boundary_lsn: i64
@@ -1000,8 +951,8 @@ public-path hidden field crate::protocol::public_operations::PublicOperationInte
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::program: Option < PublicOperationProgram >
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::replay_disposition: PublicOperationReplayDisposition
 public-path hidden field crate::protocol::public_operations::PublicOperationIntent::revision: u64
-public-path hidden field crate::protocol::public_operations::PublicProgress::first: i64
-public-path hidden field crate::protocol::public_operations::PublicProgress::last: i64
+public-path hidden field crate::protocol::public_operations::PublicProgress::catch_up_capability: ProgressQueryResult
+public-path hidden field crate::protocol::public_operations::PublicProgress::current_progress: ProgressQueryResult
 public-path hidden field crate::protocol::public_operations::PublicProgress::role: PublicProgressRole
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::build_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::catch_up_capability: i64
@@ -1049,7 +1000,9 @@ public-path hidden field crate::protocol::public_operations::PublicV1AcceptedSta
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedStatus::history: HistoryContext
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedStatus::history_initialization_id: crate :: protocol :: types :: HistoryInitializationId
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedStatus::identity: PublicV1Identity
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::active_operations: Vec < PublicOperationIntent >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::completed_operations: Vec < PublicV1OperationCompletion >
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::configuration: Option < PublicV1InstalledConfiguration >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::data_loss_recovery: Option < PublicDataLossRecoveryStatus >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::extensions: PublicV1Extensions
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::history: HistoryContext
@@ -1073,6 +1026,8 @@ public-path hidden field crate::protocol::public_operations::PublicV1Extensions:
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::public_build_evidence: Option < PublicV1ExtensionSlot >
 public-path hidden field crate::protocol::public_operations::PublicV1Identity::generation: u64
 public-path hidden field crate::protocol::public_operations::PublicV1Identity::protocol_version: u32
+public-path hidden field crate::protocol::public_operations::PublicV1InstalledConfiguration::idle_replicas: Vec < ReplicaId >
+public-path hidden field crate::protocol::public_operations::PublicV1InstalledConfiguration::voting: PublicConfiguration
 public-path hidden field crate::protocol::public_operations::PublicV1LifecycleBinding::identity: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::PublicV1LifecycleBinding::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::PublicV1LifecycleBinding::spec_generation: u64
@@ -1123,6 +1078,8 @@ public-path hidden impl crate::protocol::public_operations::DataLossAuthorizatio
 public-path hidden impl crate::protocol::public_operations::ProcessSessionRenewalRequired::fn data_loss_decision (& self) -> Option < DataLossRenewalDecision >
 public-path hidden impl crate::protocol::public_operations::ProcessSessionRenewalRequired::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::ProcessSessionRenewalRequired::fn validate_replacement_report (& self , report : & PublicV1AgentReport ,) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::ProgressQueryResult::fn validate (& self) -> Result < () , & 'static str >
+public-path hidden impl crate::protocol::public_operations::ProgressQueryResult::fn value (& self) -> Option < i64 >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn successor (& self) -> Option < & ReplicaIdentity >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicConfiguration::fn validate_for_local (& self , local_replica_id : ReplicaId) -> Result < () , & 'static str >
@@ -1139,6 +1096,8 @@ public-path hidden impl crate::protocol::public_operations::PublicOperationClass
 public-path hidden impl crate::protocol::public_operations::PublicOperationIntent::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicOperationProgram::const fn replay_disposition (& self) -> PublicOperationReplayDisposition
 public-path hidden impl crate::protocol::public_operations::PublicOperationProgram::fn digest (& self) -> CanonicalOperationInputDigest
+public-path hidden impl crate::protocol::public_operations::PublicProgress::fn capability (& self) -> Option < i64 >
+public-path hidden impl crate::protocol::public_operations::PublicProgress::fn current (& self) -> Option < i64 >
 public-path hidden impl crate::protocol::public_operations::PublicProgress::fn validate (& self , replica_role : ReplicaRole , read : AccessStatus , write : AccessStatus ,) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicReplicaDescriptor::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::fn from_completion (completion : & PublicV1OperationCompletion) -> Self
@@ -1195,6 +1154,7 @@ public-path hidden struct crate::protocol::public_operations::PublicV1AgentRepor
 public-path hidden struct crate::protocol::public_operations::PublicV1ExtensionSlot
 public-path hidden struct crate::protocol::public_operations::PublicV1Extensions
 public-path hidden struct crate::protocol::public_operations::PublicV1Identity
+public-path hidden struct crate::protocol::public_operations::PublicV1InstalledConfiguration
 public-path hidden struct crate::protocol::public_operations::PublicV1LifecycleBinding
 public-path hidden struct crate::protocol::public_operations::PublicV1OperationCompletion
 public-path hidden struct crate::protocol::public_operations::PublicV1SessionRenewalStatus
@@ -1211,6 +1171,10 @@ public-path hidden variant crate::protocol::public_operations::DataLossReplay::C
 public-path hidden variant crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity
 public-path hidden variant crate::protocol::public_operations::PossibleDataLossIntent::NotPossible
 public-path hidden variant crate::protocol::public_operations::PossibleDataLossIntent::Possible
+public-path hidden variant crate::protocol::public_operations::ProgressQueryResult::Failed((String))
+public-path hidden variant crate::protocol::public_operations::ProgressQueryResult::NotQueried((String))
+public-path hidden variant crate::protocol::public_operations::ProgressQueryResult::NotReady
+public-path hidden variant crate::protocol::public_operations::ProgressQueryResult::Value((i64))
 public-path hidden variant crate::protocol::public_operations::ProviderProgressReset::Preserve
 public-path hidden variant crate::protocol::public_operations::ProviderProgressReset::ReplaceIncarnation { { retired : ReplicaStorageIncarnationContext , } }
 public-path hidden variant crate::protocol::public_operations::ProviderProgressReset::ResetToEmpty
@@ -1249,6 +1213,7 @@ public-path hidden variant crate::protocol::public_operations::PublicOperationPr
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Open { { replica : ReplicaIdentity , existing : bool , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Progress { { capability : bool , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Remove((PublicBuildInput))
+public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::RetireIdleReplica { { replica_id : ReplicaId , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Role { { epoch : Epoch , role : ReplicaRole , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationProgram::Swap { { starting : PublicConfiguration , refreshed : PublicConfiguration , epoch : Epoch , handoff : ReplicaRole , catch_up_specific_quorum : bool , mode : PublicCatchUpMode , controller_composed : bool , } }
 public-path hidden variant crate::protocol::public_operations::PublicOperationReplayDisposition::Containment

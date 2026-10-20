@@ -1,5 +1,10 @@
 # Service Fabric Contract Audit Tracker
 
+> Historical baseline and finding register. The connected classic V1 cutover
+> removes the audited bespoke engine; [Classic V1 Runtime](classic-v1-runtime.md)
+> describes current ownership and APIs. Original traces and source references
+> remain historical evidence, not current paths or automatic audit closure.
+
 ## Status and Scope
 
 Audit date: 2026-10-16.
@@ -178,13 +183,13 @@ describe that revision, not the historical audit:
 - Primary `replicate` publishes ambiguity with existing counters **before**
   provider entry, keeps its abandonment guard armed, and rechecks exact
   authority after the new await
-  ([stateless/mod.rs:3076-3092](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L3076-L3092)).
+  ([stateless/mod.rs:3076-3092](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L3076-L3092)).
   The guard credits only the already-applied floor until provider entry.
   Publication failure/drop/revocation therefore cannot manufacture an applied
   LSN just to close admission.
 - Secondary ingress already publishes ambiguity **before service delivery**,
   then requires durable, verified, current-authority service ACK
-  ([stateless/mod.rs:1186-1205,1255-1278](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1186-L1278)).
+  ([stateless/mod.rs:1186-1205,1255-1278](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L1186-L1278)).
   Its older post-apply description is not a second current defect.
 - Real KV provider barriers persist/install the visible mutation, release the
   map mutex, then pause before apply returns
@@ -217,7 +222,7 @@ After Abort the service removes its partition, so the normal read is `NotOpen`;
 before Abort it is exact `ReadClosed(NotPrimary)`. Three private
 `sf01_*preapply_publication*` tests prove failure/drop/revocation during
 publication never enters the provider or advances counters
-([read_fence_tests.rs:167-282](../../../kuberic-runtime/src/replicator/stateless/read_fence_tests.rs#L167-L282)).
+([read_fence_tests.rs:167-282](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/read_fence_tests.rs#L167-L282)).
 See the [verification record](#sf-01-and-sf-11-revalidation) for commands and
 the negative control that returned the uncommitted value with the old ordering.
 
@@ -584,9 +589,9 @@ verification to replay the missing committed prefix first. That implementation
 was already present at `9c0dcf0`; SF-01's runtime patch does not change it.
 `434cd18` adds the exact positive/rejection evidence:
 
-- [`verify_peer_applied_suffix`:1472-1490](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1472-L1490)
+- [`verify_peer_applied_suffix`:1472-1490](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L1472-L1490)
   caps peer progress by primary commitment, then
-  [`catch_up_peer`:1522-1559](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L1522-L1559)
+  [`catch_up_peer`:1522-1559](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L1522-L1559)
   replays through the applied tail.
 - `read_fencing::sf11_committed_prefix_6_through_10_precedes_ambiguous_11_and_rejects_bad_history`
   seeds actual primary `(11,10)`, compatible peer `(5,5)` and retained 6-11
@@ -988,7 +993,7 @@ cache, including access-closed writes and recovery. Opened role None returns the
 validated retained applied tail for election only; secondary retains contiguous
 durably acknowledged acceptance. A closed access gate never changes a Primary
 query into an applied-tail query
-([query:2765-2775](../../../kuberic-runtime/src/replicator/stateless/mod.rs#L2765-L2775);
+([query:2765-2775](https://github.com/youyuanwu/kuberic/blob/66ad81d139453047f4df2e9282d7b34c79ff7cd9/kuberic-runtime/src/replicator/stateless/mod.rs#L2765-L2775);
 [contract:45-58](../../../kuberic-runtime/src/replicator/traits.rs#L45-L58)).
 The independent host report still carries accepted/applied and committed
 boundaries; suffix recovery and committed-watermark propagation remain separate

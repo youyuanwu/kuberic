@@ -2,7 +2,14 @@
 
 ## Status and Compatibility Target
 
-**Roadmap, updated 2026-10-20. No selected replication behavior changes.**
+**Roadmap and historical slice boundaries, updated 2026-10-20.**
+The connected cutover now selects the delivered classic V1 owners through the
+sole default factory and removes the old engine/data-plane contract. See
+[Classic V1 Runtime](classic-v1-runtime.md) for current ownership and breaking
+formats. Earlier delivery notes below describe what each slice established at
+its original boundary; their private/unselected labels are historical.
+Selection alone does not establish hosted native differential parity, complete
+audit closure, kernel power-loss qualification, or production readiness.
 The separately delivered [P1 foundation ledger](sf-v1-port-ledger.md) and
 [provenance/notices](sf-v1-port-provenance.md) record source-derived scenarios
 and protected-type guards, not ported engine behavior or complete alignment.

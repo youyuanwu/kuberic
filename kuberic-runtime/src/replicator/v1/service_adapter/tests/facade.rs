@@ -15,6 +15,27 @@ use crate::replicator::{
 };
 use std::future::Future;
 
+#[test]
+fn selected_completion_cancellation_and_sender_failure_remain_distinct() {
+    use super::super::super::replica_manager::CompletionError;
+    assert!(matches!(
+        RuntimeError::from(FacadeError::Adapter(AdapterError::Completion(
+            CompletionError::OperationCanceled,
+        ))),
+        RuntimeError::OperationCancelled,
+    ));
+    assert!(matches!(
+        RuntimeError::from(FacadeError::Adapter(AdapterError::Completion(
+            CompletionError::ObjectClosed,
+        ))),
+        RuntimeError::Closed,
+    ));
+    assert!(matches!(
+        RuntimeError::from(FacadeError::Adapter(AdapterError::CompletionDropped)),
+        RuntimeError::ControlPlane(_),
+    ));
+}
+
 fn identity(id: i64) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(id),
@@ -85,6 +106,7 @@ pub(super) fn facade_config<P: StateProvider + 'static>(
     FacadeConfig {
         local: identity(node.id),
         peers: bindings,
+        resolve_peer: None,
         close_quorum_wait: Duration::from_secs(5),
     }
 }

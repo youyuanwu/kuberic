@@ -8,6 +8,7 @@ members = [
   "kuberic-controller",
   "kuberic-level-tests",
 ]
+exclude = ["scripts/fixtures/classic-v1-provider"]
 
 [workspace.package]
 version = "0.0.1"

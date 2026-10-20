@@ -10,7 +10,7 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 11;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 12;
 pub(crate) const PUBLIC_V1_PROTOCOL_REGISTRATIONS: &[&str] = &["PUBLIC_V1_PROTOCOL_VERSION"];
 pub const INVALID_LSN: i64 = -1;
 
@@ -668,6 +668,7 @@ pub struct PublicInboundBuildAuthority {
     pub attempt: PublicBuildAttemptReference,
     pub history: HistoryContext,
     pub current_configuration_id: ConfigurationId,
+    pub source_address: String,
     pub target_address: String,
 }
 
@@ -678,9 +679,10 @@ impl PublicInboundBuildAuthority {
         if self.operation_id.is_empty()
             || self.operation_revision == 0
             || self.current_configuration_id.is_empty()
+            || self.source_address.trim().is_empty()
             || self.target_address.is_empty()
         {
-            return Err("inbound build authority lacks configuration or target address");
+            return Err("inbound build authority lacks configuration or endpoint address");
         }
         Ok(())
     }
@@ -718,6 +720,7 @@ pub struct PublicBuildInput {
     pub replica: ReplicaIdentity,
     pub target_storage: ReplicaStorageIncarnationContext,
     pub process_session_id: ProcessSessionId,
+    pub source_address: String,
     pub replication_address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryContext>,
@@ -732,6 +735,7 @@ impl PublicBuildInput {
             && self.replica == other.replica
             && self.target_storage == other.target_storage
             && self.process_session_id == other.process_session_id
+            && self.source_address == other.source_address
             && self.replication_address == other.replication_address
             && self.history == other.history
     }
@@ -769,6 +773,9 @@ pub enum PublicOperationProgram {
     },
     Build(PublicBuildInput),
     Remove(PublicBuildInput),
+    RetireIdleReplica {
+        replica_id: ReplicaId,
+    },
     Close,
     Abort,
 }
@@ -787,7 +794,9 @@ impl PublicOperationProgram {
             Self::Progress { .. } => PublicOperationReplayDisposition::RepeatableRead,
             Self::CatchUp { .. } => PublicOperationReplayDisposition::ReevaluateCatchUp,
             Self::Build(_) => PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity,
-            Self::Remove(_) => PublicOperationReplayDisposition::ExactRemoval,
+            Self::Remove(_) | Self::RetireIdleReplica { .. } => {
+                PublicOperationReplayDisposition::ExactRemoval
+            }
             Self::Close | Self::Abort => PublicOperationReplayDisposition::Containment,
             Self::Open { .. }
             | Self::Role { .. }
@@ -829,7 +838,11 @@ impl PublicOperationProgram {
             Self::Build(build) | Self::Remove(build) => {
                 build.history.as_ref() == Some(expected_history)
             }
-            Self::Open { .. } | Self::Progress { .. } | Self::Close | Self::Abort => true,
+            Self::Open { .. }
+            | Self::Progress { .. }
+            | Self::RetireIdleReplica { .. }
+            | Self::Close
+            | Self::Abort => true,
         };
         if valid {
             Ok(())
@@ -840,6 +853,12 @@ impl PublicOperationProgram {
 
     fn validate(&self, class: &PublicOperationClass, id: &OperationId) -> Result<(), &'static str> {
         let expected = match self {
+            Self::RetireIdleReplica { replica_id } => {
+                if replica_id.value() <= 0 {
+                    return Err("idle replica identity must be positive");
+                }
+                PublicOperationClass::Authority
+            }
             Self::Swap {
                 starting,
                 refreshed,
@@ -879,6 +898,7 @@ impl PublicOperationProgram {
                     || build.epoch.data_loss_number < 0
                     || build.epoch.configuration_number < 0
                     || build.process_session_id.is_empty()
+                    || build.source_address.trim().is_empty()
                     || build.replication_address.is_empty()
                 {
                     return Err("incomplete exact build identity");
@@ -985,6 +1005,10 @@ impl PublicOperationProgram {
             }
             Self::Close => encoder.u8(10),
             Self::Abort => encoder.u8(11),
+            Self::RetireIdleReplica { replica_id } => {
+                encoder.u8(12);
+                encoder.i64(replica_id.value());
+            }
         }
     }
 }
@@ -1943,7 +1967,14 @@ impl PublicLifecycleInput {
             previous: self.previous.clone(),
             replicas: self.replicas.clone(),
         };
-        configuration.validate_for_local(self.replica.replica_id)?;
+        configuration.validate()?;
+        if configuration
+            .replicas
+            .iter()
+            .any(|peer| peer.identity == self.replica)
+        {
+            return Err("lifecycle configuration describes its local replica as a peer");
+        }
         let role = if self.recipe == PublicLifecycleRecipe::SecondaryEpochAdvance {
             if self.possible_data_loss != PossibleDataLossIntent::NotPossible {
                 return Err("secondary epoch update cannot request data loss");
@@ -2159,31 +2190,66 @@ pub enum PublicProgressRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub enum ProgressQueryResult {
+    Value(i64),
+    NotQueried(String),
+    NotReady,
+    Failed(String),
+}
+
+impl ProgressQueryResult {
+    pub fn value(&self) -> Option<i64> {
+        match self {
+            Self::Value(value) => Some(*value),
+            Self::NotQueried(_) | Self::NotReady | Self::Failed(_) => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Value(value) => validate_progress_value(*value),
+            Self::Failed(reason) | Self::NotQueried(reason) if reason.is_empty() => {
+                Err("progress outcome lacks a diagnostic")
+            }
+            Self::NotQueried(_) | Self::NotReady | Self::Failed(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicProgress {
     pub role: PublicProgressRole,
-    pub first: i64,
-    pub last: i64,
+    pub current_progress: ProgressQueryResult,
+    pub catch_up_capability: ProgressQueryResult,
 }
 
 impl PublicProgress {
+    pub fn current(&self) -> Option<i64> {
+        self.current_progress.value()
+    }
+    pub fn capability(&self) -> Option<i64> {
+        self.catch_up_capability.value()
+    }
+
     pub fn validate(
         &self,
         replica_role: ReplicaRole,
         read: AccessStatus,
         write: AccessStatus,
     ) -> Result<(), &'static str> {
-        validate_progress_value(self.first)?;
-        validate_progress_value(self.last)?;
-        if self.first == -1 || self.last == -1 || self.first > self.last {
-            return Err("completed public progress must be a valid ordered range");
-        }
+        self.current_progress.validate()?;
+        self.catch_up_capability.validate()?;
         if matches!(self.role, PublicProgressRole::Primary) && replica_role != ReplicaRole::Primary
         {
             return Err("primary progress requires the primary replica role");
         }
         if matches!(self.role, PublicProgressRole::Secondary)
-            && replica_role != ReplicaRole::ActiveSecondary
+            && !matches!(
+                replica_role,
+                ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary
+            )
         {
             return Err("secondary progress requires the active-secondary replica role");
         }
@@ -2365,6 +2431,13 @@ pub struct PublicV1AgentReport {
     pub history: HistoryContext,
     pub storage_incarnation: ReplicaStorageIncarnationContext,
     pub progress: PublicProgress,
+    /// Last successfully installed host configuration for this process/history.
+    /// This is control authority, not application durability or a serving grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<PublicV1InstalledConfiguration>,
+    /// Running host control observers. Native work can outlive a cancelled observer.
+    #[serde(default)]
+    pub active_operations: Vec<PublicOperationIntent>,
     /// Host-authoritative mode for a new Open against the current application storage.
     pub open_mode: OpenMode,
     /// The current process's successful Replicator Open result, absent before Open.
@@ -2380,6 +2453,13 @@ pub struct PublicV1AgentReport {
     pub extensions: PublicV1Extensions,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicV1InstalledConfiguration {
+    pub voting: PublicConfiguration,
+    pub idle_replicas: Vec<ReplicaId>,
+}
+
 impl PublicV1AgentReport {
     /// An endpoint backed by a successful Open for this exact storage and process.
     pub fn has_current_open_endpoint(&self) -> bool {
@@ -2389,7 +2469,19 @@ impl PublicV1AgentReport {
             && self.completed_operations.iter().any(|completion| {
                 completion.call_kind == PublicV1CallKind::Open
                     && completion.process_session_id == self.process_session_id
-                    && completion.history == self.history
+                    && (completion.history == self.history
+                        || self.data_loss_recovery.as_ref().is_some_and(|recovery| {
+                            recovery.stage == PublicDataLossRecoveryStage::Admitted
+                                && recovery.attempt.process.process_session_id
+                                    == self.process_session_id
+                                && recovery.attempt.process.replicator_creation_id
+                                    == self.replicator_creation_id
+                                && completion.history.resource_uid == self.history.resource_uid
+                                && completion.history.protocol_generation
+                                    == self.history.protocol_generation
+                                && completion.history.data_loss_number
+                                    <= recovery.predecessor_history.data_loss_number
+                        }))
                     && completion.storage_incarnation == self.storage_incarnation
                     && completion.result == PublicV1OperationResult::Succeeded
                     && [false, true].into_iter().any(|existing| {
@@ -2407,7 +2499,6 @@ impl PublicV1AgentReport {
         self.role == ReplicaRole::None
             && self.read_status != AccessStatus::Granted
             && self.write_status != AccessStatus::Granted
-            && self.data_loss_recovery.is_none()
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -2430,6 +2521,65 @@ impl PublicV1AgentReport {
         }
         self.progress
             .validate(self.role, self.read_status, self.write_status)?;
+        let mut active = std::collections::BTreeSet::new();
+        for intent in &self.active_operations {
+            intent.validate()?;
+            if intent.identity != self.identity
+                || intent.process_session_id != self.process_session_id
+                || !active.insert(&intent.operation_id)
+                || intent
+                    .lifecycle
+                    .as_ref()
+                    .is_some_and(|input| input.replica != self.replica)
+                || self
+                    .completed_operations
+                    .iter()
+                    .any(|completion| completion.operation_id == intent.operation_id)
+            {
+                return Err("active control observation differs from report identity");
+            }
+        }
+        if let Some(observation) = &self.configuration {
+            let configuration = &observation.voting;
+            configuration.validate()?;
+            if configuration.current.epoch.data_loss_number != self.history.data_loss_number
+                || !configuration
+                    .current
+                    .members
+                    .iter()
+                    .chain(
+                        configuration
+                            .previous
+                            .iter()
+                            .flat_map(|previous| &previous.members),
+                    )
+                    .any(|member| member.identity == self.replica)
+                || configuration
+                    .replicas
+                    .iter()
+                    .any(|peer| peer.identity == self.replica)
+            {
+                return Err("installed configuration differs from report history or identity");
+            }
+            let mut idle = std::collections::BTreeSet::new();
+            if observation.idle_replicas.iter().any(|id| {
+                id.value() <= 0
+                    || !idle.insert(*id)
+                    || configuration
+                        .current
+                        .members
+                        .iter()
+                        .chain(
+                            configuration
+                                .previous
+                                .iter()
+                                .flat_map(|previous| &previous.members),
+                        )
+                        .any(|member| member.identity.replica_id == *id)
+            }) {
+                return Err("idle replica observation overlaps voting membership");
+            }
+        }
         if self
             .replication_address
             .as_ref()
@@ -2741,7 +2891,7 @@ pub struct PublicV1AcceptedStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_loss_recovery: Option<PublicDataLossRecoveryStatus>,
     #[serde(default)]
-    #[schemars(length(max = 64))]
+    #[schemars(length(max = 256))]
     pub completed_operations: Vec<PublicV1AcceptedOperationCompletion>,
     #[serde(default)]
     pub extensions: PublicV1Extensions,
@@ -2750,7 +2900,7 @@ pub struct PublicV1AcceptedStatus {
 impl PublicV1AcceptedStatus {
     pub fn validate_evidence(&self) -> Result<(), &'static str> {
         if !self.identity.is_public_v1()
-            || self.completed_operations.len() > 64
+            || self.completed_operations.len() > 256
             || self.history.protocol_generation.value() != self.identity.generation
         {
             return Err("public-v1 accepted evidence identity or bound is invalid");
@@ -3002,6 +3152,7 @@ impl CanonicalEncoder {
         self.replica_identity(&build.replica);
         self.storage_incarnation(&build.target_storage);
         self.string(build.process_session_id.as_str());
+        self.string(&build.source_address);
         self.string(&build.replication_address);
         self.option(build.history.as_ref(), |encoder, history| {
             encoder.history(history);

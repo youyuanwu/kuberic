@@ -2249,23 +2249,33 @@ fn renewal_public_configuration(
     let peers = replicas
         .iter()
         .filter(|replica| replica.report.replica != *local)
-        .map(|replica| PublicReplicaDescriptor {
-            build_id: OperationId::default(),
-            identity: replica.report.replica.clone(),
-            replication_address: replica.replication_address.clone(),
-            process_session_id: replica.report.process_session_id.clone(),
-            storage_incarnation: Some(replica.report.storage_incarnation.clone()),
-            role: configuration
-                .members
-                .iter()
-                .find(|member| member.identity == replica.report.replica)
-                .map(|member| member.role)
-                .expect("renewal replica is configured"),
-            current_progress: replica.report.progress.last,
-            catch_up_capability: replica.report.progress.first,
-            must_catchup: false,
+        .map(|replica| {
+            Ok(PublicReplicaDescriptor {
+                build_id: OperationId::default(),
+                identity: replica.report.replica.clone(),
+                replication_address: replica.replication_address.clone(),
+                process_session_id: replica.report.process_session_id.clone(),
+                storage_incarnation: Some(replica.report.storage_incarnation.clone()),
+                role: configuration
+                    .members
+                    .iter()
+                    .find(|member| member.identity == replica.report.replica)
+                    .map(|member| member.role)
+                    .expect("renewal replica is configured"),
+                current_progress: replica
+                    .report
+                    .progress
+                    .current()
+                    .ok_or("native current progress unavailable")?,
+                catch_up_capability: replica
+                    .report
+                    .progress
+                    .capability()
+                    .ok_or("native catch-up capability unavailable")?,
+                must_catchup: false,
+            })
         })
-        .collect();
+        .collect::<std::result::Result<Vec<_>, String>>()?;
     let configuration = PublicConfiguration {
         current: configuration.clone(),
         previous: None,
@@ -2353,7 +2363,158 @@ fn renewal_configuration_commands(
         command.validate().map_err(str::to_owned)?;
         commands.push(ProtocolCommand::PublicV1Operation(Box::new(command)));
     }
+
     Ok(commands)
+}
+
+fn renewal_native_command(
+    authority: &PublicV1AcceptedStatus,
+    renewal: &PublicV1SessionRenewalStatus,
+    replicas: &[PublicV1TopologyReplica],
+) -> std::result::Result<Option<ProtocolCommand>, String> {
+    use crate::evaluator::public_v1_topology::{native_cold_copy_step, native_configuration_step};
+    use kuberic_runtime::protocol::public_operations::{ProgressQueryResult, PublicV1CallKind};
+    let Some(replacement) = renewal
+        .required
+        .replacement
+        .as_ref()
+        .filter(|_| renewal.required.predecessor.role == ReplicaRole::ActiveSecondary)
+    else {
+        return Ok(None);
+    };
+    let target = replicas
+        .iter()
+        .find(|replica| replica.report.replica == replacement.identity)
+        .ok_or("native renewal lacks its replacement report")?;
+    let source = replicas
+        .iter()
+        .find(|replica| {
+            replica.report.replica.replica_id == renewal.required.fresh_configuration.primary_id
+        })
+        .ok_or("native renewal lacks its primary report")?;
+    let copy_id = OperationId::new(format!(
+        "{}-native-copy-{}",
+        renewal.required.operation_id, replacement.process_session_id,
+    ));
+    if let Some(intent) = source.report.active_operations.iter().find(|intent| {
+        intent.operation_id == copy_id
+            && matches!(intent.program, Some(PublicOperationProgram::Build(_)))
+    }) {
+        return Ok(Some(ProtocolCommand::PublicV1Operation(Box::new(
+            PublicV1OperationCommand {
+                target: source.report.replica.clone(),
+                intent: intent.clone(),
+            },
+        ))));
+    }
+    let copied = source.report.completed_operations.iter().any(|completion| {
+        completion.operation_id == copy_id
+            && completion.process_session_id == source.report.process_session_id
+            && completion.storage_incarnation == source.report.storage_incarnation
+            && completion.history == renewal.required.history
+            && completion.call_kind == PublicV1CallKind::Build
+            && completion.result == PublicV1OperationResult::Succeeded
+    });
+    let cold = matches!(
+        target.report.progress.current_progress,
+        ProgressQueryResult::NotQueried(_)
+    );
+    let next = if copied {
+        native_configuration_step(replicas, &renewal.required.fresh_configuration)?
+    } else if cold {
+        native_cold_copy_step(replicas, source, target, renewal.required.renewal_epoch)?
+    } else {
+        return Ok(None);
+    };
+    let (replica, program, id) = if let Some((identity, program)) = next {
+        let replica = replicas
+            .iter()
+            .find(|replica| replica.report.replica == identity)
+            .ok_or("native renewal lost its exact participant")?;
+        let id = crate::evaluator::public_v1_topology::content_addressed_operation_id(
+            format!(
+                "{}-native-{}",
+                renewal.required.operation_id, identity.replica_id
+            ),
+            &program,
+        );
+        (replica, program, id)
+    } else if cold && !copied {
+        let base = source
+            .report
+            .configuration
+            .as_ref()
+            .ok_or("native copy requires an installed primary configuration")?;
+        (
+            source,
+            PublicOperationProgram::Build(
+                kuberic_runtime::protocol::public_operations::PublicBuildInput {
+                    attempt: copy_id.clone(),
+                    source_address: source.replication_address.clone(),
+                    epoch: base.voting.current.epoch,
+                    current_configuration_id: Some(base.voting.current.configuration_id.clone()),
+                    replica: target.report.replica.clone(),
+                    target_storage: target.report.storage_incarnation.clone(),
+                    process_session_id: target.report.process_session_id.clone(),
+                    replication_address: target.replication_address.clone(),
+                    history: Some(renewal.required.history.clone()),
+                },
+            ),
+            copy_id,
+        )
+    } else {
+        return Ok(None);
+    };
+    let retained = replica
+        .report
+        .completed_operations
+        .iter()
+        .filter(|completion| completion.process_session_id == replica.report.process_session_id)
+        .map(|completion| completion.revision)
+        .chain(
+            authority
+                .completed_operations
+                .iter()
+                .filter(|completion| {
+                    completion.process_session_id == replica.report.process_session_id
+                })
+                .map(|completion| completion.revision),
+        )
+        .max()
+        .unwrap_or(0);
+    let (class, revision) = if let PublicOperationProgram::Build(build) = &program {
+        (
+            kuberic_runtime::protocol::public_operations::PublicOperationClass::Build {
+                target: build.replica.replica_id,
+            },
+            retained,
+        )
+    } else {
+        (
+            kuberic_runtime::protocol::public_operations::PublicOperationClass::Authority,
+            retained
+                .checked_add(1)
+                .ok_or("native renewal revision exhausted")?,
+        )
+    };
+    let intent = kuberic_runtime::protocol::public_operations::PublicOperationIntent {
+        identity: authority.identity.clone(),
+        operation_id: id,
+        revision,
+        process_session_id: replica.report.process_session_id.clone(),
+        class,
+        input_digest: program.digest(),
+        replay_disposition: program.replay_disposition(),
+        lifecycle: None,
+        program: Some(program),
+    };
+    intent.validate().map_err(str::to_owned)?;
+    Ok(Some(ProtocolCommand::PublicV1Operation(Box::new(
+        PublicV1OperationCommand {
+            target: replica.report.replica.clone(),
+            intent,
+        },
+    ))))
 }
 
 fn accepted_public_v1_status(
@@ -2406,6 +2567,7 @@ fn inbound_build_authority(
             target_session: build.process_session_id.clone(),
         },
         history: expected.intent.history.clone(),
+        source_address: build.source_address.clone(),
         current_configuration_id: expected
             .intent
             .current_configuration_id
@@ -2549,8 +2711,9 @@ where
                 .any(|member| {
                     member.identity == replica.report.replica
                         && (replica.report.role != member.role
-                            || replica.report.progress.first != replica.report.progress.last
-                            || replica.report.progress.last != primary.report.progress.last)
+                            || replica.report.progress.current().is_none()
+                            || replica.report.progress.current()
+                                != primary.report.progress.current())
                 })
         }) {
             let authority = accepted_public_v1_status(Some(&status))?
@@ -2625,7 +2788,7 @@ where
         expected: &PublicV1SessionRenewalStatus,
         command: &ProtocolCommand,
     ) -> std::result::Result<(), String> {
-        let observation = self.observe_public_v1_scope(scope).await?;
+        let mut observation = self.observe_public_v1_scope(scope).await?;
         if accepted_public_v1_renewal(observation.set.status.as_ref())?.as_ref() != Some(expected) {
             return Err("stale public-v1 session-renewal dispatch".into());
         }
@@ -2646,6 +2809,61 @@ where
         if installs_configuration {
             let authority = accepted_public_v1_status(observation.set.status.as_ref())?
                 .ok_or_else(|| "session renewal lacks accepted public-v1 authority".to_string())?;
+            loop {
+                let replicas = renewal_topology_replicas(&observation, expected)?;
+                let Some(preparation) = renewal_native_command(&authority, expected, &replicas)?
+                else {
+                    break;
+                };
+                if let ProtocolCommand::PublicV1Operation(operation) = &preparation
+                    && let Some(PublicOperationProgram::Build(build)) =
+                        operation.intent.program.as_ref()
+                {
+                    let source = replicas
+                        .iter()
+                        .find(|replica| replica.report.replica == operation.target)
+                        .ok_or("native renewal copy lost its source")?;
+                    let authority = PublicInboundBuildAuthority {
+                        operation_id: operation.intent.operation_id.clone(),
+                        operation_revision: operation.intent.revision,
+                        attempt: PublicBuildAttemptReference {
+                            resource_uid: scope.resource_uid.clone(),
+                            epoch: build.epoch,
+                            build_id: build.attempt.clone(),
+                            source: operation.target.clone(),
+                            source_storage: source.report.storage_incarnation.clone(),
+                            source_session: operation.intent.process_session_id.clone(),
+                            target: build.replica.clone(),
+                            target_storage: build.target_storage.clone(),
+                            target_session: build.process_session_id.clone(),
+                        },
+                        history: expected.required.history.clone(),
+                        source_address: build.source_address.clone(),
+                        current_configuration_id: build
+                            .current_configuration_id
+                            .clone()
+                            .ok_or("native renewal copy lacks installed configuration")?,
+                        target_address: build.replication_address.clone(),
+                    };
+                    self.execute_command(
+                        &observation,
+                        &ProtocolCommand::PublicV1History(Box::new(
+                            kuberic_runtime::protocol::command::PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                                authority: Box::new(authority),
+                            },
+                        )),
+                    ).await.map_err(|error| error.to_string())?;
+                }
+                self.execute_command(&observation, &preparation)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                observation = self.observe_public_v1_scope(scope).await?;
+                if accepted_public_v1_renewal(observation.set.status.as_ref())?.as_ref()
+                    != Some(expected)
+                {
+                    return Err("native renewal preparation lost its captured authority".into());
+                }
+            }
             let replicas = renewal_topology_replicas(&observation, expected)?;
             for configuration_command in
                 renewal_configuration_commands(&authority, expected, &replicas)?
@@ -4078,6 +4296,8 @@ impl ClusterApi for InMemoryClusterApi {
                     observation.agents.insert(
                         key,
                         RawAgentObservation::PublicV1Report(Box::new(PublicV1AgentReport {
+            active_operations: Vec::new(),
+            configuration: None,
                             identity:
                                 kuberic_runtime::protocol::public_operations::PublicV1Identity::new(1),
                             resource_uid: initialization.resource_uid.clone(),
@@ -4110,8 +4330,8 @@ impl ClusterApi for InMemoryClusterApi {
                             progress: kuberic_runtime::protocol::public_operations::PublicProgress {
                                 role:
                                     kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery,
-                                first: 0,
-                                last: 0,
+                                current_progress: kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady,
+                                catch_up_capability: kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady,
                             },
                             replication_address: None,
                             service_location: None,
@@ -4170,6 +4390,10 @@ impl ClusterApi for InMemoryClusterApi {
                         match program {
                             kuberic_runtime::protocol::public_operations::PublicOperationProgram::Open { .. } => {
                                 report.open_mode = kuberic_runtime::protocol::types::OpenMode::Existing;
+                                report.progress.current_progress =
+                                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0);
+                                report.progress.catch_up_capability =
+                                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0);
                                 report.extensions.catch_up_specific_quorum = Some(false);
                                 report.replication_address = Some(format!(
                                     "http://10.0.0.{}:50052",
@@ -4180,16 +4404,18 @@ impl ClusterApi for InMemoryClusterApi {
                                 epoch,
                                 role,
                             } => {
-                                report.role = if *role == ReplicaRole::IdleSecondary {
-                                    ReplicaRole::None
-                                } else {
-                                    *role
-                                };
+                                report.role = *role;
                                 report.progress.role = match report.role {
                                     ReplicaRole::Primary => kuberic_runtime::protocol::public_operations::PublicProgressRole::Primary,
-                                    ReplicaRole::ActiveSecondary => kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary,
-                                    ReplicaRole::IdleSecondary | ReplicaRole::None => kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery,
+                                    ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary => kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary,
+                                    ReplicaRole::None => kuberic_runtime::protocol::public_operations::PublicProgressRole::Recovery,
                                 };
+                                if *role == ReplicaRole::IdleSecondary {
+                                    report.progress.current_progress =
+                                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady;
+                                    report.progress.catch_up_capability =
+                                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady;
+                                }
                                 report.read_status =
                                     kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
                                 report.write_status =
@@ -4202,6 +4428,7 @@ impl ClusterApi for InMemoryClusterApi {
                                 configuration,
                                 ..
                             } => {
+                                report.configuration = Some(kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration { voting: configuration.clone(), idle_replicas: Vec::new() });
                                 if report.role == ReplicaRole::Primary {
                                     report.read_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
                                     report.write_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
@@ -4233,14 +4460,16 @@ impl ClusterApi for InMemoryClusterApi {
                                         },
                                     );
                                 } else {
-                                    report.read_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
+                                    report.read_status = kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
                                     report.write_status = kuberic_runtime::protocol::types::AccessStatus::NotPrimary;
                                 }
                             }
                             kuberic_runtime::protocol::public_operations::PublicOperationProgram::Swap {
                                 handoff,
+                                refreshed,
                                 ..
                             } => {
+                                report.configuration = Some(kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration { voting: refreshed.clone(), idle_replicas: Vec::new() });
                                 report.role = *handoff;
                                 report.progress.role =
                                     kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary;
@@ -4257,6 +4486,27 @@ impl ClusterApi for InMemoryClusterApi {
                     report
                         .validate()
                         .map_err(|message| ControllerError::InvalidAgentEvidence(message.into()))?;
+                    if let Some(
+                        kuberic_runtime::protocol::public_operations::PublicOperationProgram::Build(
+                            build,
+                        ),
+                    ) = operation.intent.program.as_ref()
+                    {
+                        let target = ReplicaObservationKey::new(
+                            build.replica.replica_id,
+                            build.replica.instance_id.clone(),
+                        );
+                        let Some(RawAgentObservation::PublicV1Report(report)) =
+                            observation.agents.get_mut(&target)
+                        else {
+                            return Err(ControllerError::ObservationStale);
+                        };
+                        report.progress.current_progress =
+                            kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0);
+                        report.progress.catch_up_capability =
+                            kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0);
+                        report.report_sequence += 1;
+                    }
                 }
                 ProtocolCommand::PublicV1History(_) => {}
             }
@@ -4334,9 +4584,10 @@ impl ClusterApi for InMemoryClusterApi {
                     None,
                     None,
                 )),
-                Some(PublicOperationProgram::Remove(_)) => {
-                    Ok((PublicV1CallKind::Remove, None, None, None, None))
-                }
+                Some(
+                    PublicOperationProgram::Remove(_)
+                    | PublicOperationProgram::RetireIdleReplica { .. },
+                ) => Ok((PublicV1CallKind::Remove, None, None, None, None)),
                 Some(PublicOperationProgram::Close) => {
                     Ok((PublicV1CallKind::Close, None, None, None, None))
                 }
@@ -4639,6 +4890,38 @@ impl PublicV1SessionRenewalApi for InMemoryClusterApi {
             } => accepted.install_fresh_configuration(configuration),
         }
         .map_err(str::to_owned)?;
+        if matches!(renewal_command.as_ref(),
+            kuberic_runtime::protocol::command::PublicV1SessionRenewalCommand::ReplayReplacementRole { .. })
+            && let Some(report) = exact_report.filter(|report| !report.has_current_open_endpoint())
+        {
+            let program = PublicOperationProgram::Open {
+                replica: report.replica.clone(), existing: true,
+            };
+            let revision = accepted_public_v1_status(observation.set.status.as_ref())?
+                .into_iter().flat_map(|authority| authority.completed_operations)
+                .filter(|completion| completion.storage_incarnation.replica == report.replica)
+                .map(|completion| completion.revision)
+                .chain(report.completed_operations.iter().map(|completion| completion.revision))
+                .max().unwrap_or(0).checked_add(1).ok_or("replacement Open revision exhausted")?;
+            self.execute_command(&observation, &ProtocolCommand::PublicV1Operation(Box::new(
+                PublicV1OperationCommand {
+                    target: report.replica.clone(),
+                    intent: PublicOperationIntent {
+                        identity: report.identity.clone(),
+                        operation_id: OperationId::new(format!(
+                            "{}:replacement-open", expected.required.operation_id,
+                        )),
+                        revision,
+                        process_session_id: report.process_session_id.clone(),
+                        class: kuberic_runtime::protocol::public_operations::PublicOperationClass::Authority,
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
+                    },
+                },
+            ))).await.map_err(|error| error.to_string())?;
+        }
         let mut state = self.state.lock().await;
         let target = renewal_command.target();
         let report = state
@@ -5304,6 +5587,7 @@ mod corrective_replacement_tests {
     ) -> PublicOperationProgram {
         PublicOperationProgram::Build(PublicBuildInput {
             attempt: operation_id.clone(),
+            source_address: "http://127.0.0.1:50052".into(),
             epoch: Epoch::new(accepted.history.data_loss_number, 1),
             current_configuration_id: Some(configuration_id.clone()),
             replica: target.replica.clone(),
@@ -5549,6 +5833,8 @@ mod corrective_replacement_tests {
         target: &ReplicaStorageIncarnationContext,
     ) -> PublicV1AgentReport {
         PublicV1AgentReport {
+            active_operations: Vec::new(),
+            configuration: None,
             identity: expected.evidence.identity.clone(),
             resource_uid: expected.evidence.history.resource_uid.clone(),
             replica: target.replica.clone(),
@@ -5563,8 +5849,10 @@ mod corrective_replacement_tests {
             storage_incarnation: target.clone(),
             progress: kuberic_runtime::protocol::public_operations::PublicProgress {
                 role: kuberic_runtime::protocol::public_operations::PublicProgressRole::Primary,
-                first: 0,
-                last: 0,
+                current_progress:
+                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                catch_up_capability:
+                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
             },
             replication_address: Some("http://10.0.0.1:50052".into()),
             service_location: None,
@@ -6267,6 +6555,8 @@ mod tests {
     ) -> PublicV1TopologyReplica {
         PublicV1TopologyReplica {
             report: PublicV1AgentReport {
+                active_operations: Vec::new(),
+                configuration: None,
                 identity,
                 resource_uid: history.resource_uid.clone(),
                 replica: endpoint.identity.clone(),
@@ -6280,9 +6570,17 @@ mod tests {
                 history: history.clone(),
                 storage_incarnation: endpoint.storage_incarnation.clone(),
                 progress: PublicProgress {
-                    role: PublicProgressRole::Recovery,
-                    first: 0,
-                    last: 0,
+                    role: match report_role {
+                        ReplicaRole::Primary => PublicProgressRole::Primary,
+                        ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary => {
+                            PublicProgressRole::Secondary
+                        }
+                        ReplicaRole::None => PublicProgressRole::Recovery,
+                    },
+                    current_progress:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
+                    catch_up_capability:
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0),
                 },
                 replication_address: Some(format!(
                     "http://10.0.0.{}:50052",
@@ -6438,6 +6736,94 @@ mod tests {
         ];
 
         (authority, renewal, replicas)
+    }
+
+    #[test]
+    fn renewal_retry_reattaches_frozen_build_before_retiring_its_idle_slot() {
+        use kuberic_runtime::protocol::public_operations::{
+            ProgressQueryResult, PublicBuildInput, PublicOperationClass, PublicOperationIntent,
+            PublicV1InstalledConfiguration,
+        };
+        let (authority, renewal, mut replicas) = renewal_configuration_fixture();
+        let replacement = renewal.required.replacement.as_ref().unwrap();
+        let retained = ConfigurationDescriptor::new(
+            renewal.required.renewal_epoch,
+            renewal.required.fresh_configuration.primary_id,
+            renewal
+                .required
+                .fresh_configuration
+                .members
+                .iter()
+                .filter(|member| member.identity != replacement.identity)
+                .cloned()
+                .collect(),
+            2,
+        );
+        let voting = crate::evaluator::public_v1_topology::native_public_configuration(
+            &replicas[0].report.replica,
+            &replicas,
+            &retained,
+            None,
+            None,
+        )
+        .unwrap();
+        replicas[0].report.configuration = Some(PublicV1InstalledConfiguration {
+            voting,
+            idle_replicas: vec![replacement.identity.replica_id],
+        });
+        let pending = ProgressQueryResult::NotQueried("native copy is incomplete".into());
+        replicas[1].report.progress.current_progress = pending.clone();
+        replicas[1].report.progress.catch_up_capability = pending;
+        let copy_id = OperationId::new(format!(
+            "{}-native-copy-{}",
+            renewal.required.operation_id, replacement.process_session_id,
+        ));
+        let program = PublicOperationProgram::Build(PublicBuildInput {
+            attempt: copy_id.clone(),
+            source_address: replicas[0].replication_address.clone(),
+            epoch: retained.epoch,
+            current_configuration_id: Some(retained.configuration_id.clone()),
+            replica: replacement.identity.clone(),
+            target_storage: replacement.storage_incarnation.clone(),
+            process_session_id: replacement.process_session_id.clone(),
+            replication_address: replicas[1].replication_address.clone(),
+            history: Some(renewal.required.history.clone()),
+        });
+        let frozen = PublicOperationIntent {
+            identity: authority.identity.clone(),
+            operation_id: copy_id,
+            revision: 7,
+            process_session_id: replicas[0].report.process_session_id.clone(),
+            class: PublicOperationClass::Build {
+                target: replacement.identity.replica_id,
+            },
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
+        };
+        frozen.validate().unwrap();
+        replicas[0].report.active_operations.push(frozen.clone());
+        replicas[0].report.validate().unwrap();
+        let Some(ProtocolCommand::PublicV1Operation(retry)) =
+            renewal_native_command(&authority, &renewal, &replicas).unwrap()
+        else {
+            panic!("running copy must retain its exact operation");
+        };
+        assert_eq!(retry.target, replicas[0].report.replica);
+        assert_eq!(retry.intent, frozen);
+        replicas[0].report.active_operations.clear();
+        let Some(ProtocolCommand::PublicV1Operation(retirement)) =
+            renewal_native_command(&authority, &renewal, &replicas).unwrap()
+        else {
+            panic!("unowned predecessor idle slot must be retired before new copy");
+        };
+        assert_eq!(
+            retirement.intent.program,
+            Some(PublicOperationProgram::RetireIdleReplica {
+                replica_id: replacement.identity.replica_id,
+            })
+        );
     }
 
     #[test]

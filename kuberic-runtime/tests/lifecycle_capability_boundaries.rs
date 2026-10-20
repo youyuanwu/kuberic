@@ -64,9 +64,10 @@ fn protected_public_trait_method_sets_are_unchanged() {
     assert_eq!(
         trait_methods("src/replicator/traits.rs", "StateReplicator"),
         [
-            "get_copy_stream",
-            "get_replication_stream",
+            "begin_replicate",
+            "copy_operations",
             "replicate",
+            "replication_operations",
             "update_replicator_settings",
         ]
         .into_iter()
@@ -121,6 +122,7 @@ fn protected_public_trait_method_sets_are_unchanged() {
 #[test]
 fn replacement_runtime_has_no_managed_default_or_agent_replication_owner() {
     assert!(!Path::new(&manifest().join("src/runtime.rs")).exists());
+    assert!(!manifest().join("src/replicator/stateless/mod.rs").exists());
     let replicator = format!(
         "{}\n{}",
         source("src/replicator/mod.rs"),
@@ -132,6 +134,8 @@ fn replacement_runtime_has_no_managed_default_or_agent_replication_owner() {
         "ManagedReplicaStore",
         "DefaultReplicatorInner",
         "LegacyManaged",
+        "StatelessReplicator",
+        "StatelessRuntimeControl",
     ] {
         assert!(!replicator.contains(forbidden), "{forbidden} survived");
     }
@@ -140,6 +144,42 @@ fn replacement_runtime_has_no_managed_default_or_agent_replication_owner() {
     let transport = source("src/host/transport.rs");
     assert!(!transport.contains("GrpcOutboundDispatcher"));
     assert!(!transport.contains("ReliableTransport"));
+}
+
+#[test]
+fn native_production_owners_remain_private() {
+    let replicator = syn::parse_file(&source("src/replicator/mod.rs")).unwrap();
+    let native = replicator
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Mod(item) if item.ident == "v1" => Some(item),
+            _ => None,
+        })
+        .expect("native owner module");
+    assert!(!matches!(native.vis, syn::Visibility::Public(_)));
+    let control = replicator
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Trait(item) if item.ident == "NativeRuntimeControl" => Some(item),
+            _ => None,
+        })
+        .expect("native runtime capability");
+    assert!(!matches!(control.vis, syn::Visibility::Public(_)));
+
+    let adapter = syn::parse_file(&source("src/replicator/v1/service_adapter.rs")).unwrap();
+    for owner in ["production", "production_transport"] {
+        let module = adapter
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Mod(item) if item.ident == owner => Some(item),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing native owner {owner}"));
+        assert!(!matches!(module.vis, syn::Visibility::Public(_)));
+    }
 }
 
 #[test]

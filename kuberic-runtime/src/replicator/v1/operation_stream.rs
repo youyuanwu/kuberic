@@ -33,20 +33,17 @@ pub(super) struct EpochBarrier {
     pub(super) previous_epoch_last_lsn: Lsn,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 dispatch input"))]
 pub(super) enum DispatchEntry {
     Operation(ReceivedOperation),
     UpdateEpoch(EpochBarrier),
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 stream output"))]
 pub(super) enum StreamEvent {
     Operation(ReceivedOperation),
     UpdateEpoch(EpochBarrier),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 stream errors"))]
 pub(super) enum StreamError {
     #[error("epoch completion does not match the blocked stream marker")]
     InvalidEpochCompletion,
@@ -59,14 +56,12 @@ pub(super) enum StreamError {
 /// Must be dispatched after releasing the caller's serialization guard.
 /// Aborted entries are also released here, outside queue/owner guards.
 #[must_use = "dispatch staged stream wakeups outside the caller's guard"]
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 stream wakeups"))]
 pub(super) struct DispatchWake {
     wakers: Vec<Waker>,
     retired: VecDeque<DispatchEntry>,
     changed: Option<Arc<Notify>>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "unselected V1 stream wakeups"))]
 impl DispatchWake {
     pub(super) fn dispatch(self) {
         drop(self.retired);
@@ -119,10 +114,6 @@ impl DispatchState {
 /// EOF. Graceful EOF is permanent, including for subsequently acquired readers;
 /// abort can override a draining close, but cannot reopen a drained queue.
 #[derive(Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 shared dispatch owner")
-)]
 pub(super) struct SharedDispatchQueue {
     state: Arc<Mutex<DispatchState>>,
     changed: Arc<Notify>,
@@ -135,10 +126,6 @@ pub(super) struct DispatchSnapshot {
     pub(super) aborted: Option<StreamError>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 shared dispatch API")
-)]
 impl SharedDispatchQueue {
     pub(super) fn new() -> Self {
         Self {
@@ -261,10 +248,6 @@ impl SharedDispatchQueue {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "unselected V1 shared operation stream")
-)]
 pub(super) struct OperationStream {
     state: Arc<Mutex<DispatchState>>,
     reader: u64,

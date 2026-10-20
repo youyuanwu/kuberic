@@ -283,8 +283,14 @@ impl HostedPublicV1Harness {
                     process_session_id: report.process_session_id,
                     storage_incarnation: Some(report.storage_incarnation),
                     role: member.role,
-                    current_progress: report.progress.last,
-                    catch_up_capability: report.progress.first,
+                    current_progress: report
+                        .progress
+                        .current()
+                        .ok_or("native current progress unavailable")?,
+                    catch_up_capability: report
+                        .progress
+                        .capability()
+                        .ok_or("native catch-up capability unavailable")?,
                     must_catchup: false,
                 },
             );
@@ -717,6 +723,9 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
             if target_replica.replication_address != build.replication_address {
                 return Err("hosted build changed target address".into());
             }
+            if self.replica(&operation.target)?.replication_address != build.source_address {
+                return Err("hosted build changed source address".into());
+            }
             target_replica
                 .handle
                 .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
@@ -734,6 +743,7 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
                         target_session: build.process_session_id.clone(),
                     },
                     history: expected.intent.history.clone(),
+                    source_address: build.source_address.clone(),
                     current_configuration_id: expected
                         .intent
                         .current_configuration_id
@@ -1191,7 +1201,9 @@ pub(crate) fn operation_matches_transition(
             None,
             None,
         ),
-        PublicOperationProgram::Remove(_) => (PublicV1CallKind::Remove, None, None, None, None),
+        PublicOperationProgram::Remove(_) | PublicOperationProgram::RetireIdleReplica { .. } => {
+            (PublicV1CallKind::Remove, None, None, None, None)
+        }
         PublicOperationProgram::Close => (PublicV1CallKind::Close, None, None, None, None),
         PublicOperationProgram::Abort => (PublicV1CallKind::Abort, None, None, None, None),
     };
@@ -1242,6 +1254,7 @@ fn intent_history_matches(intent: &PublicOperationIntent, data_loss_number: i64)
         Some(
             PublicOperationProgram::Open { .. }
             | PublicOperationProgram::Progress { .. }
+            | PublicOperationProgram::RetireIdleReplica { .. }
             | PublicOperationProgram::Close
             | PublicOperationProgram::Abort,
         )
