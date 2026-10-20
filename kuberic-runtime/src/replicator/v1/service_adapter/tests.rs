@@ -31,6 +31,7 @@ use super::super::transport::{Route, wire};
 
 mod facade;
 mod host;
+mod kv;
 
 struct Provider {
     progress: AtomicI64,
@@ -318,10 +319,10 @@ fn copy_config() -> CopyConfig {
     }
 }
 
-struct Node {
+struct Node<P = Provider> {
     adapter: ServiceReplicator,
     service: ServiceHandle,
-    provider: Arc<Provider>,
+    provider: Arc<P>,
     access: Arc<AtomicU8>,
     faults: Arc<Mutex<Vec<SecondaryError>>>,
     bus: Bus,
@@ -333,14 +334,16 @@ impl Node {
     fn new(id: i64, persisted: bool, eos: bool, bus: Bus, registry: MessageRegistry) -> Self {
         Self::with_provider(id, persisted, eos, bus, registry, Arc::new(Provider::new()))
     }
+}
 
+impl<P: StateProvider + 'static> Node<P> {
     fn with_provider(
         id: i64,
         persisted: bool,
         eos: bool,
         bus: Bus,
         registry: MessageRegistry,
-        provider: Arc<Provider>,
+        provider: Arc<P>,
     ) -> Self {
         let send = bus.clone();
         let acks = bus.clone();

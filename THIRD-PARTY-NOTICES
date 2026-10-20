@@ -321,6 +321,23 @@ Host/proxy state and policy are owned outside the replication engine. Opaque
 crate-private facade setup/probes and neutral observation/access callbacks
 replace concrete engine-to-host coupling without exposing core types.
 
+The private examples/kvstore2/src/v1.rs service companion and its real-storage,
+actual-V1-owner regressions use selected service-owned ordering from
+Store/ReplicatedStore.TransactionReplicator.cpp:606-796,848-900 at the same
+immutable pin, together with the existing classic V1 assignment/completion,
+receiver/ACK, stream/copy and role/recovery sources recorded above. A retained
+Rust FIFO commit worker and existing KV file/fsync/rename persistence replace
+KVS transaction/COM lifetime plumbing. Preparation, local commit, read
+visibility and client completion belong to the service, not the engine.
+KVS batching/implicit completion, tombstones, local-store implementation and
+native harness/utility/dependency source are not ported. The existing testing
+feature and a repository-only dev dependency bridge real KV storage to private
+runtime fixtures without exporting engine types or creating a public factory.
+Actual file IO/restart tests are not native execution, power-loss qualification,
+hosted/differential parity or production service migration. Protected interfaces,
+selected services/factory/host/status/wire/reports/controller remain unchanged;
+SQLite adaptation and atomic cutover remain pending.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

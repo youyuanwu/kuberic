@@ -2,7 +2,7 @@
 
 ## Status and Compatibility Target
 
-**Roadmap, updated 2026-10-19. No selected runtime behavior changes.**
+**Roadmap, updated 2026-10-20. No selected replication behavior changes.**
 The separately delivered [P1 foundation ledger](sf-v1-port-ledger.md) and
 [provenance/notices](sf-v1-port-provenance.md) record source-derived scenarios
 and protected-type guards, not ported engine behavior or complete alignment.
@@ -100,11 +100,19 @@ membership availability/quorum, actual replicator/application role and catch-up
 outcomes, and distinct outer Close diagnostics/retained drainage. Host intent,
 availability and activation remain explicit private inputs; cancelled host
 continuations require caller resumption. This is not an RA/FM port or production
-serving-policy change. Real services, authenticated host/report integration and
+serving-policy change. Production services, authenticated host/report integration and
 atomic activation remain pending.
 Host/proxy policy and outer lifecycle reside in `host/v1_lifecycle.rs`, outside
 the engine. The private facade supplies neutral observations and opaque setup/
 liveness/Abort seams; the host supplies access policy, not the reverse.
+The [private real-KV commit slice](sf-v1-port-ledger.md#private-real-kv-commit-slice-p4-bounded-f02f04f05f07f09f11)
+now adds service-owned durable preparation, FIFO local commit/client completion,
+committed read isolation while native access remains Granted, persisted-secondary
+ACK discipline, copy waiting/installation, real-file restart and actual queue
+promotion. A repository-only bridge composes real KV storage with actual private
+V1 owners; no public factory or engine selector is introduced. Production service
+API migration/serving qualification, SQLite adaptation and atomic activation
+remain pending.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -494,9 +502,12 @@ evidence. A private protected-trait execution bridge now retains active and
 retired work independently of callers, without changing public selection.
 A private caller-driven host adapter now adds native access selection and
 host-availability quorum, actual role/application/catch-up outcomes and outer
-Close diagnostics, without enabling production grants. Published
-facade/assignment/ACK integration, real services and production host/status/
-reporting integration remain pending. This roadmap is not
+Close diagnostics, without enabling production grants. A private real-KV
+committer now composes durable prepares, ordered local commit/client success,
+committed read isolation and copy/restart/promotion evidence with actual V1
+owners. Published facade/assignment/ACK integration, production service migration,
+SQLite adaptation and production host/status/reporting integration remain
+pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
 Existing production factory wiring, protected types, required
