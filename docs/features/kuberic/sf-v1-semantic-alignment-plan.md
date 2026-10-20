@@ -102,6 +102,9 @@ availability and activation remain explicit private inputs; cancelled host
 continuations require caller resumption. This is not an RA/FM port or production
 serving-policy change. Real services, authenticated host/report integration and
 atomic activation remain pending.
+Host/proxy policy and outer lifecycle reside in `host/v1_lifecycle.rs`, outside
+the engine. The private facade supplies neutral observations and opaque setup/
+liveness/Abort seams; the host supplies access policy, not the reverse.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,

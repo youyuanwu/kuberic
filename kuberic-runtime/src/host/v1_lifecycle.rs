@@ -14,27 +14,32 @@
 //! actual child roles and catch-up come from retained callbacks. Cancelled host
 //! calls require `resume`; the facade independently retains engine execution.
 
+#![cfg_attr(not(test), expect(dead_code, reason = "unselected V1 host adapter"))]
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use futures::future::BoxFuture;
 
 use crate::error::RuntimeError;
-use crate::protocol::types::{AccessStatus, ReplicaRole};
+use crate::protocol::types::{AccessStatus, Epoch, ReplicaRole};
+use crate::replicator::v1::{
+    Facade, FacadeSetup, FacadeState, LifecycleObservation, matches_binding,
+};
 use crate::replicator::{PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator};
 use crate::traits::StatefulServiceReplica;
 
-use super::facade::{Facade, FacadeConfig, FacadeError, matches_binding};
-use super::*;
-
 #[derive(Clone)]
-pub(super) struct RemoteReplica {
-    pub(super) information: ReplicaInformation,
-    pub(super) previous: ReplicaRole,
-    pub(super) current: ReplicaRole,
-    pub(super) is_up: bool,
-    pub(super) ready: bool,
+pub(crate) struct RemoteReplica {
+    pub(crate) information: ReplicaInformation,
+    pub(crate) previous: ReplicaRole,
+    pub(crate) current: ReplicaRole,
+    pub(crate) is_up: bool,
+    pub(crate) ready: bool,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
-pub(super) enum HostError {
+pub(crate) enum HostError {
     #[error("invalid private host input/state: {0}")]
     Input(&'static str),
     #[error("a host callback is outstanding; resume it")]
@@ -46,7 +51,7 @@ pub(super) enum HostError {
     #[error("host child callback: {0}")]
     Callback(Arc<RuntimeError>),
     #[error(transparent)]
-    Facade(#[from] FacadeError),
+    Facade(Arc<RuntimeError>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,14 +64,14 @@ enum Lifecycle {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ConfigurationStage {
+pub(crate) enum ConfigurationStage {
     PreWriteStatusRevoke,
     Catchup,
     Activated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Fence {
+pub(crate) enum Fence {
     Authority,
     Fault,
     Retired,
@@ -91,10 +96,9 @@ struct Projection {
 }
 
 #[derive(Clone)]
-pub(super) struct PartitionAccess {
+pub(crate) struct PartitionAccess {
     state: Arc<Mutex<Projection>>,
-    aborted: Arc<AtomicBool>,
-    owner: Weak<Mutex<Target>>,
+    replicator: FacadeState,
 }
 
 impl Projection {
@@ -196,8 +200,8 @@ impl Projection {
 }
 
 impl PartitionAccess {
-    pub(super) fn status(&self) -> Result<(AccessStatus, AccessStatus), HostError> {
-        if self.aborted.load(Ordering::Acquire) {
+    pub(crate) fn status(&self) -> Result<(AccessStatus, AccessStatus), HostError> {
+        if self.replicator.aborted() {
             return Ok((AccessStatus::NotPrimary, AccessStatus::NotPrimary));
         }
         let state = self.state.lock().unwrap();
@@ -207,27 +211,24 @@ impl PartitionAccess {
         ) && !state.authority_fenced
             && !state.faulted
             && !state.retired
-            && self.owner.upgrade().is_none()
+            && !self.replicator.is_alive()
         {
             return Err(HostError::Input("replicator owner stopped"));
         }
         state.status()
     }
 
-    fn write_access(&self) -> WriteAccess {
+    fn write_access(&self) -> AccessStatus {
         match self.status() {
-            Ok((_, AccessStatus::Granted)) => WriteAccess::Granted,
-            Ok((_, AccessStatus::ReconfigurationPending)) => WriteAccess::ReconfigurationPending,
-            Ok((_, AccessStatus::NoWriteQuorum)) => WriteAccess::NoWriteQuorum,
-            Ok((_, AccessStatus::NotPrimary)) => WriteAccess::NotPrimary,
+            Ok((_, access)) => access,
             Err(error) => {
                 tracing::warn!(%error, "private host access projection failed");
-                WriteAccess::NotPrimary
+                AccessStatus::NotPrimary
             }
         }
     }
 
-    pub(super) fn fence(&self, fence: Fence) {
+    pub(crate) fn fence(&self, fence: Fence) {
         let mut state = self.state.lock().unwrap();
         match fence {
             Fence::Authority => state.authority_fenced = true,
@@ -236,28 +237,26 @@ impl PartitionAccess {
         }
     }
 
-    pub(super) fn observe_owner(&self, status: RoleStatus) {
+    fn observe(&self, observation: LifecycleObservation) {
         let mut state = self.state.lock().unwrap();
-        match status {
-            RoleStatus::Ready(role) => {
+        match observation {
+            LifecycleObservation::Ready(role) => {
                 state.replicator_open = true;
-                let role = public_role(role);
                 if state.replicator_role != role && role != ReplicaRole::Primary {
                     state.remotes.clear();
                 }
                 state.replicator_role = role;
             }
-            RoleStatus::Opened => state.replicator_open = true,
-            RoleStatus::Closed | RoleStatus::Aborted => state.replicator_open = false,
-            RoleStatus::Faulted => {
+            LifecycleObservation::Opened => state.replicator_open = true,
+            LifecycleObservation::Closed => state.replicator_open = false,
+            LifecycleObservation::Faulted => {
                 state.faulted = true;
             }
-            _ => {}
         }
     }
 
     fn check_live(&self) -> Result<(), HostError> {
-        if self.aborted.load(Ordering::Acquire) || self.state.lock().unwrap().retired {
+        if self.replicator.aborted() || self.state.lock().unwrap().retired {
             Err(HostError::Aborted)
         } else {
             Ok(())
@@ -265,17 +264,8 @@ impl PartitionAccess {
     }
 }
 
-fn public_role(role: Role) -> ReplicaRole {
-    match role {
-        Role::None => ReplicaRole::None,
-        Role::Primary => ReplicaRole::Primary,
-        Role::IdleSecondary => ReplicaRole::IdleSecondary,
-        Role::ActiveSecondary => ReplicaRole::ActiveSecondary,
-    }
-}
-
 #[derive(Clone, Debug)]
-pub(super) enum ChildClose {
+pub(crate) enum ChildClose {
     Pending,
     Closed,
     Failed(Arc<RuntimeError>),
@@ -283,14 +273,14 @@ pub(super) enum ChildClose {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct CloseOutcome {
-    pub(super) role_mismatch: bool,
-    pub(super) replicator: ChildClose,
-    pub(super) application: ChildClose,
+pub(crate) struct CloseOutcome {
+    pub(crate) role_mismatch: bool,
+    pub(crate) replicator: ChildClose,
+    pub(crate) application: ChildClose,
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum HostOutcome {
+pub(crate) enum HostOutcome {
     Opened {
         replication_address: String,
         service: crate::application::RoleChange,
@@ -313,7 +303,7 @@ impl Application {
     }
 }
 
-pub(super) struct HostLifecycle {
+pub(crate) struct HostLifecycle {
     facade: Arc<Facade>,
     application: Arc<Application>,
     access: PartitionAccess,
@@ -324,14 +314,13 @@ pub(super) struct HostLifecycle {
 
 impl HostLifecycle {
     /// The caller has opened the application; no factory/partition is installed.
-    pub(super) fn start(
-        mut adapter: ServiceReplicator,
-        config: FacadeConfig,
+    pub(crate) fn start(
+        setup: FacadeSetup,
         application: Arc<dyn StatefulServiceReplica>,
         minimum: usize,
     ) -> Result<Self, HostError> {
-        if minimum == 0 || adapter.status() != RoleStatus::Created {
-            return Err(HostError::Input("minimum or initial owner state"));
+        if minimum == 0 {
+            return Err(HostError::Input("minimum replica set size"));
         }
         let access = PartitionAccess {
             state: Arc::new(Mutex::new(Projection {
@@ -351,19 +340,19 @@ impl HostLifecycle {
                 retired: false,
                 close_outcome: None,
             })),
-            aborted: adapter.service.aborted.clone(),
-            owner: adapter.service.target.clone(),
+            replicator: setup.state(),
         };
-        let projection = access.clone();
-        *adapter.service.write_access.lock().unwrap() = Arc::new(move || projection.write_access());
-        adapter.host = Some(access.clone());
-        let bindings = config
-            .peers
-            .iter()
-            .map(|peer| peer.information.clone())
-            .collect();
+        let policy = access.clone();
+        let observation = access.clone();
+        let bindings = setup.bindings();
+        let facade = setup
+            .start(
+                Arc::new(move || policy.write_access()),
+                Arc::new(move |event| observation.observe(event)),
+            )
+            .map_err(|error| HostError::Facade(Arc::new(error)))?;
         Ok(Self {
-            facade: Facade::start(adapter, config)?,
+            facade,
             application: Arc::new(Application {
                 replica: application,
                 aborted: AtomicBool::new(false),
@@ -375,11 +364,11 @@ impl HostLifecycle {
         })
     }
 
-    pub(super) fn access(&self) -> PartitionAccess {
+    pub(crate) fn access(&self) -> PartitionAccess {
         self.access.clone()
     }
 
-    pub(super) fn facade(&self) -> Arc<Facade> {
+    pub(crate) fn facade(&self) -> Arc<Facade> {
         self.facade.clone()
     }
 
@@ -394,7 +383,7 @@ impl HostLifecycle {
         }
     }
 
-    pub(super) fn begin_open(&mut self, epoch: Epoch, role: ReplicaRole) -> Result<(), HostError> {
+    pub(crate) fn begin_open(&mut self, epoch: Epoch, role: ReplicaRole) -> Result<(), HostError> {
         self.idle()?;
         {
             let mut state = self.access.state.lock().unwrap();
@@ -432,7 +421,7 @@ impl HostLifecycle {
         Ok(())
     }
 
-    pub(super) fn prepare_reconfiguration(
+    pub(crate) fn prepare_reconfiguration(
         &mut self,
         target: ReplicaRole,
         primary_change: bool,
@@ -489,7 +478,7 @@ impl HostLifecycle {
         Ok(())
     }
 
-    pub(super) fn update_availability(
+    pub(crate) fn update_availability(
         &self,
         information: &ReplicaInformation,
         is_up: bool,
@@ -507,7 +496,7 @@ impl HostLifecycle {
         Ok(())
     }
 
-    pub(super) fn begin_change_role(&mut self, epoch: Epoch) -> Result<(), HostError> {
+    pub(crate) fn begin_change_role(&mut self, epoch: Epoch) -> Result<(), HostError> {
         self.idle()?;
         if epoch.data_loss_number < 0 || epoch.configuration_number < 0 {
             return Err(HostError::Input("role-change epoch"));
@@ -542,7 +531,7 @@ impl HostLifecycle {
         Ok(())
     }
 
-    pub(super) fn begin_catchup(&mut self, mode: ReplicaSetQuorumMode) -> Result<(), HostError> {
+    pub(crate) fn begin_catchup(&mut self, mode: ReplicaSetQuorumMode) -> Result<(), HostError> {
         self.idle()?;
         {
             let mut state = self.access.state.lock().unwrap();
@@ -570,7 +559,7 @@ impl HostLifecycle {
     }
 
     /// Host acknowledgement of activation, not an engine ACK/configuration call.
-    pub(super) fn complete_reconfiguration(&mut self) -> Result<(), HostError> {
+    pub(crate) fn complete_reconfiguration(&mut self) -> Result<(), HostError> {
         self.idle()?;
         let mut state = self.access.state.lock().unwrap();
         let idle_activation =
@@ -586,7 +575,7 @@ impl HostLifecycle {
         Ok(())
     }
 
-    pub(super) fn begin_close(&mut self) -> Result<(), HostError> {
+    pub(crate) fn begin_close(&mut self) -> Result<(), HostError> {
         if self.pending.is_some() {
             return Err(HostError::Busy);
         }
@@ -621,7 +610,7 @@ impl HostLifecycle {
                 application.abort();
                 (ChildClose::Aborted, ChildClose::Aborted)
             } else {
-                let replicator = if access.aborted.load(Ordering::Acquire)
+                let replicator = if access.replicator.aborted()
                     || !access.state.lock().unwrap().replicator_open
                 {
                     facade.abort();
@@ -668,7 +657,7 @@ impl HostLifecycle {
         Ok(())
     }
 
-    pub(super) async fn resume(&mut self) -> Result<HostOutcome, HostError> {
+    pub(crate) async fn resume(&mut self) -> Result<HostOutcome, HostError> {
         let result = self.pending.as_mut().ok_or(HostError::NoOperation)?.await;
         self.pending = None;
         let result = result.and_then(|outcome| {
@@ -685,25 +674,29 @@ impl HostLifecycle {
         result
     }
 
-    pub(super) fn close_outcome(&self) -> Option<CloseOutcome> {
+    pub(crate) fn close_outcome(&self) -> Option<CloseOutcome> {
         self.access.state.lock().unwrap().close_outcome.clone()
     }
 
-    pub(super) fn abort(&self) {
+    pub(crate) fn abort(&self) {
         self.access.fence(Fence::Retired);
         self.facade.abort();
         self.application.abort();
     }
 
     /// Independent of ordinary outer Close; reports actual retained task drain.
-    pub(super) async fn join(&self) -> Result<(), HostError> {
+    pub(crate) async fn join(&self) -> Result<(), HostError> {
         if self.pending.is_some() {
             return Err(HostError::Busy);
         }
-        if self.closed.is_none() && !self.access.aborted.load(Ordering::Acquire) {
+        if self.closed.is_none() && !self.access.replicator.aborted() {
             return Err(HostError::Input("join before host Close/Abort"));
         }
-        let result = self.facade.join().await.map_err(HostError::from);
+        let result = self
+            .facade
+            .drain()
+            .await
+            .map_err(|error| HostError::Facade(Arc::new(error)));
         if result.is_err() {
             self.access.fence(Fence::Fault);
         }

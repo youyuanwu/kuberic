@@ -820,9 +820,17 @@ and [selector](testing.md#sf-v1-private-protected-facade-execution-slice).
 ### Private Host Access and Lifecycle Slice (P4, Bounded F01/F09/F11)
 
 Rust destination:
-[`service_adapter/host.rs`](../../../kuberic-runtime/src/replicator/v1/service_adapter/host.rs),
+[`host/v1_lifecycle.rs`](../../../kuberic-runtime/src/host/v1_lifecycle.rs),
 with [actual-owner regressions](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/host.rs).
 `RA/` below is `src/prod/src/Reliability/Failover/ra/` at the same immutable pin.
+
+This is host/proxy ownership, separate from the replication engine. The engine
+offers only crate-private opaque facade setup/liveness/Abort probes and neutral
+lifecycle observations; the host supplies the access callback and owns all
+native access policy/application/outer-Close state. No concrete host type is
+referenced by production `v1` implementation code. Core queue/role/configuration/
+error types stay hidden. Cross-layer tests retain existing private core fixtures;
+hook-only actual-owner cases also verify callbacks outside projection guards.
 
 | Selected native production material | Translation / representation changes |
 |---|---|

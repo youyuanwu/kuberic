@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See LICENSES/service-fabric-MIT.txt.
 //
-// Actual-owner vectors from the pinned native host sources in host.rs.
+// Cross-layer vectors beside private core fixtures; policy belongs to host.
 
-use super::super::host::{
-    ChildClose, ConfigurationStage, Fence, HostError, HostLifecycle, HostOutcome, RemoteReplica,
-};
 use super::facade::{config, deliver, facade_config, information, until};
 use super::*;
 use crate::application::{OpenContext, RoleChange};
+use crate::host::v1_lifecycle::{
+    ChildClose, ConfigurationStage, Fence, HostError, HostLifecycle, HostOutcome, RemoteReplica,
+};
 use crate::protocol::types::{AccessStatus, ReplicaRole};
 use crate::replicator::{PrimaryReplicator, ReplicaSetQuorumMode, Replicator};
 use crate::traits::StatefulServiceReplica;
@@ -72,7 +72,7 @@ impl StatefulServiceReplica for Application {
 
 fn host(node: Node, peers: &[(i64, bool)], app: Arc<Application>, minimum: usize) -> HostLifecycle {
     let config = facade_config(&node, peers);
-    HostLifecycle::start(node.adapter, config, app, minimum).unwrap()
+    HostLifecycle::start(FacadeSetup::new(node.adapter, config), app, minimum).unwrap()
 }
 
 fn remote(id: i64, previous: ReplicaRole, current: ReplicaRole, available: bool) -> RemoteReplica {
@@ -716,4 +716,85 @@ async fn invalid_host_membership_and_phase_inputs_fail_before_mutation() {
     assert!(host.complete_reconfiguration().is_err());
     assert_eq!(host.access().status().unwrap(), before);
     close(&mut host).await;
+}
+
+#[tokio::test]
+async fn neutral_facade_hooks_use_actual_owners_without_host_policy_or_projection_locks() {
+    for abort in [false, true] {
+        let node = lone();
+        let configuration = facade_config(&node, &[]);
+        let old_service = node.service.clone();
+        let setup = FacadeSetup::new(node.adapter, configuration);
+        let state = setup.state();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observations = events.clone();
+        let access = Arc::new(AtomicBool::new(false));
+        let granted = access.clone();
+        let slot = Arc::downgrade(&old_service.write_access);
+        let policy_target = old_service.target.clone();
+        let observer_target = old_service.target.clone();
+        let facade = setup
+            .start(
+                Arc::new(move || {
+                    assert!(slot.upgrade().unwrap().try_lock().is_ok());
+                    assert!(policy_target.upgrade().unwrap().try_lock().is_ok());
+                    if granted.load(Ordering::Acquire) {
+                        AccessStatus::Granted
+                    } else {
+                        AccessStatus::NoWriteQuorum
+                    }
+                }),
+                Arc::new(move |event| {
+                    assert!(observer_target.upgrade().unwrap().try_lock().is_ok());
+                    observations.lock().unwrap().push(event);
+                }),
+            )
+            .unwrap();
+        assert!(state.is_alive());
+        assert!(!state.aborted());
+        facade.open().await.unwrap();
+        facade
+            .change_role(epoch(1), ReplicaRole::Primary)
+            .await
+            .unwrap();
+        facade
+            .update_current_replica_set_configuration(config(1, 1, &[]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            old_service.begin_replicate(Bytes::new()),
+            Err(AdapterError::WriteAccess(WriteAccess::NoWriteQuorum))
+        ));
+        access.store(true, Ordering::Release);
+        let mut write = old_service
+            .begin_replicate(Bytes::from_static(b"one"))
+            .unwrap();
+        write.completion.wait().await.unwrap();
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&LifecycleObservation::Opened)
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&LifecycleObservation::Ready(ReplicaRole::Primary))
+        );
+        if abort {
+            facade.abort();
+            assert!(state.aborted());
+        } else {
+            facade.close().await.unwrap();
+        }
+        facade.drain().await.unwrap();
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&LifecycleObservation::Closed)
+        );
+        assert!(!state.is_alive());
+    }
 }

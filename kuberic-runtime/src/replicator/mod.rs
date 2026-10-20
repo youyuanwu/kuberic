@@ -1,6 +1,6 @@
 pub mod stateless;
 mod traits;
-mod v1;
+pub(crate) mod v1;
 
 pub use traits::{PrimaryReplicator, Replicator, ReplicatorFactory, StateReplicator};
 

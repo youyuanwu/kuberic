@@ -40,7 +40,16 @@ use super::role::{DataLossEnd, Role, RoleConfig, RoleError, RoleReplicator, Role
 use super::secondary::{SecondaryError, SecondaryHandle};
 
 mod facade;
-mod host;
+
+pub(crate) use facade::{Facade, FacadeSetup, FacadeState, matches_binding};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleObservation {
+    Opened,
+    Ready(crate::protocol::types::ReplicaRole),
+    Closed,
+    Faulted,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WriteAccess {
@@ -92,7 +101,7 @@ pub(super) struct ServiceReplicator {
     provider: Arc<dyn StateProvider>,
     registry: MessageRegistry,
     control: Option<Control>,
-    host: Option<host::PartitionAccess>,
+    observe: Option<Arc<dyn Fn(LifecycleObservation) + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -135,7 +144,7 @@ impl ServiceReplicator {
             provider,
             registry,
             control: None,
-            host: None,
+            observe: None,
         })
     }
 
@@ -148,8 +157,23 @@ impl ServiceReplicator {
     }
 
     fn refresh(&self) {
-        if let Some(host) = &self.host {
-            host.observe_owner(self.owner.status());
+        if let Some(observe) = &self.observe {
+            use crate::protocol::types::ReplicaRole;
+            let observation = match self.owner.status() {
+                RoleStatus::Opened => Some(LifecycleObservation::Opened),
+                RoleStatus::Ready(role) => Some(LifecycleObservation::Ready(match role {
+                    Role::None => ReplicaRole::None,
+                    Role::Primary => ReplicaRole::Primary,
+                    Role::IdleSecondary => ReplicaRole::IdleSecondary,
+                    Role::ActiveSecondary => ReplicaRole::ActiveSecondary,
+                })),
+                RoleStatus::Closed | RoleStatus::Aborted => Some(LifecycleObservation::Closed),
+                RoleStatus::Faulted => Some(LifecycleObservation::Faulted),
+                _ => None,
+            };
+            if let Some(observation) = observation {
+                observe(observation);
+            }
         }
         let target = if self.service.aborted.load(Ordering::Acquire) {
             Target::Unavailable(RoleStatus::Aborting)

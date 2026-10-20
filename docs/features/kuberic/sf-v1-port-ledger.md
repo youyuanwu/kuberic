@@ -1103,7 +1103,7 @@ is claimed.
 
 ### Private Host Access and Lifecycle Slice (P4, Bounded F01/F09/F11)
 
-The private [`host adapter`](../../../kuberic-runtime/src/replicator/v1/service_adapter/host.rs)
+The private [`host adapter`](../../../kuberic-runtime/src/host/v1_lifecycle.rs)
 composes the existing facade, actual role/primary/secondary owners and an
 already-opened `StatefulServiceReplica`. It ports reachable native FUP
 lifecycle/reconfiguration access decisions and their selector, not an
@@ -1125,6 +1125,14 @@ matching reuses the facade binding helper. Authority, fault and retirement
 fences remain independent. All service-handle clones, including ones obtained
 before host attachment, use the same rebound access seam; callback invocation
 remains outside its short guard.
+
+Host/proxy policy and application/outer-teardown orchestration belong to
+`host/v1_lifecycle.rs`, not replication-engine internals. The replicator supplies
+an opaque unopened-facade setup, liveness/Abort observation and neutral lifecycle
+callbacks; the host supplies access policy. No concrete host type is stored or
+imported by the engine. Private queue/role/configuration/error types remain
+hidden behind this crate-private seam. Cross-layer regression journeys stay
+beside existing private core fixtures rather than widening core visibility.
 
 Host controls are caller-driven, retain their actual continuation on waiter
 cancellation, and require `resume` to finish host bookkeeping. The existing
@@ -1158,7 +1166,7 @@ or provider-fsync qualification is claimed.
 
 | ID / native family and source | Transitions/responsibility | Rust destination (only explicit slices implemented) | Allowed representation substitution | Scenarios |
 |---|---|---|---|---|
-| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`, private `service_adapter.rs`, `service_adapter/facade.rs` and `service_adapter/host.rs`; public selection/factory and production host integration pending | COM/refcounts → owned Rust; actual role/recovery, retained protected-trait driver and caller-driven outer lifecycle with explicit diagnostics, not public activation | A1, C1, L1, L3 |
+| F01 facade/factory/ReplicatorState ([state:39–126][state], [QI:12–35][qi]) | initial/transitional/primary/secondary/faulted/closed; role admission | bounded `v1/role.rs`, private `service_adapter.rs`/`service_adapter/facade.rs`, and separate `host/v1_lifecycle.rs`; public selection/factory and production host integration pending | COM/refcounts → owned Rust; actual role/recovery, retained protected-trait driver and host-owned caller-driven outer lifecycle with explicit diagnostics, not public activation | A1, C1, L1, L3 |
 | F02 PrimaryReplicator/ReplicaManager/ReplicationQueueManager ([manager:349–421][manager], [queue-manager:261–408][qm]) | CC/PC/idle sessions; enqueue/assignment/completion; quorum/config capture | bounded `v1/replication_queue_manager.rs`, `replica_manager.rs`, `build_idle.rs`, `primary.rs`, `role.rs` | owned futures replace Begin/End, not primary ACK, configured W or B/Q/M arithmetic; classic idle lifecycle, lasting primary/session ownership, descriptor configuration and role/epoch queue handoff delivered | A1, M1–M5, E1 |
 | F03 OperationQueue ([queue:677–737,990–1047][queue], [heads:62–87][qh]) | gap/order, retention, count/byte admission, commit/complete/trim/reset/transfer | `v1/operation_queue.rs` | owned storage instead of ring layout, not a plain channel or merged cursors | Q1–Q4, L2 |
 | F04 SecondaryReplicator/receivers ([secondary:165–193,951–1003][secondary], [receiver:632–740][receiver]) | reorder/dispatch/completion, fixed copy/minimum replication epoch, drains | bounded `v1/secondary_receiver.rs`, `secondary_copy_receiver.rs`, `copy_establishment.rs`, `secondary.rs`, `role.rs` | async queues/executor; required/optimistic ACK, shared StartCopy receiver, provider callbacks, ordinary Close/Abort, promotion drainage, direct epochs and actual queue handoff delivered; host demux pending | S1–S3, E2 |
@@ -1166,7 +1174,7 @@ or provider-fsync qualification is claimed.
 | F06 ReplicationSession/RemoteSession/ReliableOperationSender/AckSender ([sender:548–755][sender], [ACK order:585–627][remote], [batch:64–112,174–208][ack]) | incarnation, separate receive/apply, retry/window/RequestAck, final ACK | `v1/session.rs`, `sender.rs`, `ack.rs`, bounded `primary.rs`, `replica_manager/policy.rs` | injected clocks, lasting session timers/ordered ACKs and slow-fault notification/reclamation policy; quorum/all/MustCatchup remain separate | R1–R3, T2 |
 | F07 CopySender/CopyAsyncOperation/context/establishment ([copy:171–254][copy], [build:111–166][build], [retarget:524–579][copy-sender]) | target context, serial polls, one parked item, EOF target and pending retarget | bounded `v1/copy_context_receiver.rs`, `copy_async_operation.rs`, `copy_sender.rs`, `copy_establishment.rs`, `build_idle.rs`; full role composition pending | context acquisition/receipt, reliable StartCopy, serial enumeration/sending, EOF-issued target, copy/replication gates/pending retarget and idle lifecycle delivered; no fixed snapshot-only build substitute | C2–C5 |
 | F08 transport/demux/headers ([send:880–937][transport], [session lookup:632–683][primary], [header:25–42][header]) | logical messages, full identity, two epochs, sequence spaces, expiry | `v1/transport.rs`, `ingress.rs`, bounded role/primary/secondary owners, private `sf_v1.proto` | typed role demux, native secondary per-message admission, current reply routing and targeted fault reporting; accepted send is not service ACK; production host integration and native wire compatibility are not claimed | T1–T2, D1 |
-| F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | bounded `v1/role.rs`, `primary.rs`, `replica_manager.rs`, `replication_queue_manager.rs`, private `service_adapter/host.rs`; production host/controller integration pending | provider recovery/queue handoff plus private native access selector/host-availability quorum and distinct outer Close diagnostics; no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
+| F09 provider epoch/recovery/RA boundary ([epoch:31–90][epoch], [reset:82–126][loss], [status:34–145][status]) | issued epoch boundary, queue recovery/transfer, lifecycle access/direct vs outer Close | bounded `v1/role.rs`, `primary.rs`, `replica_manager.rs`, `replication_queue_manager.rs`, separate `host/v1_lifecycle.rs`; production host/controller integration pending | provider recovery/queue handoff plus host-owned private native access selector/availability quorum and distinct outer Close diagnostics; no RA/FM/placement port; optional provider durability is not native queue progress | E1–E2, L2–L3, H1–H2 |
 | F10 settings/actual extensions/partition reports ([settings:490–532,762–808][com], [public defaults:140–177][defaults], [partition:208–350][partition]) | effective settings/update validation, persisted declaration, faults/load/move/health | existing facade/settings/partition adapters, P4/P7 | Rust types; preserve public defaults, unsupported results and credential enforcement | C1, C6, H3 |
 | F11 async lifetime/diagnostics ([drain:56–102][drain], [health:62–125][health]) | retain owners through cancel/drain, outside-lock dispatch, batched/cleared warnings | Rust async ownership/clock + host reporting | no Common/Transport/KTL/Boost copy; preserve algorithm-affecting policy, not platform plumbing | R3, C3, H3 |
 

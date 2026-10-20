@@ -850,6 +850,13 @@ minimum and PC/CC majority checks remain independent of engine W, queue/ACK
 progress and provider commitment; remote CC primary and PC secondary roles have
 different counting rules.
 
+The implementation belongs to `host/v1_lifecycle.rs`; the selector above names
+cross-layer integration tests kept beside private core fixtures. Neutral
+hook-only cases drive actual owners without constructing host policy, observe
+real lifecycle/Abort/liveness outcomes, and verify callback invocation outside
+the service binding and target projection guards. The replication engine has
+no concrete host dependency, and its core types are not widened for these tests.
+
 Held/cancelled provider and application callbacks retain their host continuation;
 call `resume` to finish host bookkeeping while the facade independently retains
 engine work. Preexisting service-handle clones cannot bypass attached access

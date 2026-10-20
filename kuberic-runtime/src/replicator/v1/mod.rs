@@ -23,5 +23,9 @@ mod service_adapter;
 mod session;
 mod transport;
 
+pub(crate) use service_adapter::{
+    Facade, FacadeSetup, FacadeState, LifecycleObservation, matches_binding,
+};
+
 #[cfg(test)]
 mod copy_receiver_integration;
