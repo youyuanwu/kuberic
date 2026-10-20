@@ -40,6 +40,7 @@ use super::role::{DataLossEnd, Role, RoleConfig, RoleError, RoleReplicator, Role
 use super::secondary::{SecondaryError, SecondaryHandle};
 
 mod facade;
+mod host;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WriteAccess {
@@ -91,6 +92,7 @@ pub(super) struct ServiceReplicator {
     provider: Arc<dyn StateProvider>,
     registry: MessageRegistry,
     control: Option<Control>,
+    host: Option<host::PartitionAccess>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +126,7 @@ impl ServiceReplicator {
             aborted: Arc::new(AtomicBool::new(false)),
             policy: config.secondary.context.buffer_policy,
             limits: config.secondary.context.buffer_limits,
-            write_access,
+            write_access: Arc::new(Mutex::new(write_access)),
         };
         Ok(Self {
             owner: RoleReplicator::new(config, provider.clone(), clock)?,
@@ -133,6 +135,7 @@ impl ServiceReplicator {
             provider,
             registry,
             control: None,
+            host: None,
         })
     }
 
@@ -145,6 +148,9 @@ impl ServiceReplicator {
     }
 
     fn refresh(&self) {
+        if let Some(host) = &self.host {
+            host.observe_owner(self.owner.status());
+        }
         let target = if self.service.aborted.load(Ordering::Acquire) {
             Target::Unavailable(RoleStatus::Aborting)
         } else if let Ok(primary) = self.owner.primary() {
@@ -354,7 +360,7 @@ pub(super) struct ServiceHandle {
     aborted: Arc<AtomicBool>,
     policy: BufferPolicy,
     limits: BufferLimits,
-    write_access: Arc<dyn Fn() -> WriteAccess + Send + Sync>,
+    write_access: Arc<Mutex<Arc<dyn Fn() -> WriteAccess + Send + Sync>>>,
 }
 
 impl ServiceHandle {
@@ -368,7 +374,8 @@ impl ServiceHandle {
 
     pub(super) fn begin_replicate(&self, data: OperationData) -> Result<Replication, AdapterError> {
         buffers::decode(data.clone(), self.policy, self.limits)?;
-        match (self.write_access)() {
+        let access = self.write_access.lock().unwrap().clone();
+        match access() {
             WriteAccess::Granted => {}
             denied => return Err(AdapterError::WriteAccess(denied)),
         }

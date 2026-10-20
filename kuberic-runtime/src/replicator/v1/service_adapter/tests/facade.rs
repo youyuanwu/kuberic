@@ -23,7 +23,7 @@ fn identity(id: i64) -> ReplicaIdentity {
     }
 }
 
-fn information(id: i64) -> ReplicaInformation {
+pub(super) fn information(id: i64) -> ReplicaInformation {
     let mut info = ReplicaInformation::idle_build(
         OperationId::new(format!("build-{id}")),
         identity(id),
@@ -33,7 +33,11 @@ fn information(id: i64) -> ReplicaInformation {
     info
 }
 
-fn config(from: i64, quorum: u32, peers: &[(i64, Lsn, bool)]) -> ReplicaSetConfiguration {
+pub(super) fn config(
+    from: i64,
+    quorum: u32,
+    peers: &[(i64, Lsn, bool)],
+) -> ReplicaSetConfiguration {
     let members = std::iter::once(ConfigurationMember {
         identity: identity(from),
         role: ReplicaRole::Primary,
@@ -63,7 +67,7 @@ fn config(from: i64, quorum: u32, peers: &[(i64, Lsn, bool)]) -> ReplicaSetConfi
     }
 }
 
-fn start(node: Node, peers: &[(i64, bool)]) -> Arc<Facade> {
+pub(super) fn facade_config(node: &Node, peers: &[(i64, bool)]) -> FacadeConfig {
     let bindings = peers
         .iter()
         .map(|&(id, persisted)| {
@@ -75,18 +79,19 @@ fn start(node: Node, peers: &[(i64, bool)]) -> Arc<Facade> {
             }
         })
         .collect();
-    Facade::start(
-        node.adapter,
-        FacadeConfig {
-            local: identity(node.id),
-            peers: bindings,
-            close_quorum_wait: Duration::from_secs(5),
-        },
-    )
-    .unwrap()
+    FacadeConfig {
+        local: identity(node.id),
+        peers: bindings,
+        close_quorum_wait: Duration::from_secs(5),
+    }
 }
 
-async fn until(mut ready: impl FnMut() -> bool) {
+fn start(node: Node, peers: &[(i64, bool)]) -> Arc<Facade> {
+    let config = facade_config(&node, peers);
+    Facade::start(node.adapter, config).unwrap()
+}
+
+pub(super) async fn until(mut ready: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !ready() {
             tokio::task::yield_now().await;
@@ -96,7 +101,11 @@ async fn until(mut ready: impl FnMut() -> bool) {
     .expect("actual owner reached the requested boundary");
 }
 
-async fn deliver<T>(bus: &Bus, registry: &MessageRegistry, future: impl Future<Output = T>) -> T {
+pub(super) async fn deliver<T>(
+    bus: &Bus,
+    registry: &MessageRegistry,
+    future: impl Future<Output = T>,
+) -> T {
     tokio::pin!(future);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

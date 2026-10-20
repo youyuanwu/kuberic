@@ -834,6 +834,48 @@ real-service migration and P5 activation are not claimed.
 See the [ledger](sf-v1-port-ledger.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11)
 and [provenance](sf-v1-port-provenance.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11).
 
+### SF V1 Private Host Access and Lifecycle Slice
+
+```bash
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(replicator::v1::service_adapter::tests::host::)' -j 2
+```
+
+Actual-owner journeys compose the private retained facade, real source/target
+copy/build, service ACK, configuration/quorum/catch-up and demotion/promotion
+with StatefulServiceReplica callbacks. They observe stable-secondary denial,
+promotion's staged grants, same-primary reads and demotion's production-selector
+behavior. Native TryAgain maps to ReconfigurationPending. Host Up/Ready,
+minimum and PC/CC majority checks remain independent of engine W, queue/ACK
+progress and provider commitment; remote CC primary and PC secondary roles have
+different counting rules.
+
+Held/cancelled provider and application callbacks retain their host continuation;
+call `resume` to finish host bookkeeping while the facade independently retains
+engine work. Preexisting service-handle clones cannot bypass attached access
+policy. An in-memory service keeps uncommitted bytes invisible while native
+reads remain Granted; this is not real KV/SQLite or fsync evidence. Invalid
+binding/stage inputs fail before mutation, and authority/fault/retirement fences
+remain independent.
+
+Outer Close revokes access first, aborts role mismatch, retains each real child
+failure and allows native outer completion. Repeated Close observes cached
+diagnostics without replaying callbacks. Cancelled application Close and
+external Abort do not lose callback errors or publish late host success.
+Join rejects an unfinished host continuation; after Close/Abort it separately
+observes held legacy context drainage, provider errors and actual worker panic.
+Successful Abort drainage does not mean a failed child Close was graceful.
+
+Use the live nextest inventory, not a fixed test total. The application is
+already opened; host availability, intent and activation acknowledgement are
+private inputs, not a complete RA/FM/placement program. Production
+factory/status/services/listener/registry/wire/reports/schema/controller,
+protected interfaces and tier policy remain unchanged. Full P4 closure, native
+execution/hosted parity, real-service serving qualification and P5 activation
+are not claimed. See the
+[ledger](sf-v1-port-ledger.md#private-host-access-and-lifecycle-slice-p4-bounded-f01f09f11)
+and [source register](sf-v1-port-provenance.md#private-host-access-and-lifecycle-slice-p4-bounded-f01f09f11).
+
 ### Built-In Service Operation Delivery
 
 ```bash

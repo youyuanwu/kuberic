@@ -273,10 +273,7 @@ impl FacadeConfig {
             .iter()
             .find(|peer| {
                 let bound = &peer.information;
-                bound.identity == info.identity
-                    && bound.process_session_id == info.process_session_id
-                    && bound.storage_incarnation == info.storage_incarnation
-                    && bound.replication_address == info.replication_address
+                matches_binding(bound, info)
             })
             .ok_or_else(|| FacadeError::Input("no exact admitted peer binding".into()))
     }
@@ -353,6 +350,13 @@ impl FacadeConfig {
             replicas,
         })
     }
+}
+
+pub(super) fn matches_binding(bound: &ReplicaInformation, input: &ReplicaInformation) -> bool {
+    bound.identity == input.identity
+        && bound.process_session_id == input.process_session_id
+        && bound.storage_incarnation == input.storage_incarnation
+        && bound.replication_address == input.replication_address
 }
 
 fn reply(reply: Reply, result: Result<Value, FacadeError>) {

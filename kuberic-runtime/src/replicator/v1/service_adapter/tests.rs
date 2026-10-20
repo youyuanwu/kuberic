@@ -30,6 +30,7 @@ use super::super::session::{SendIntent, SendKind};
 use super::super::transport::{Route, wire};
 
 mod facade;
+mod host;
 
 struct Provider {
     progress: AtomicI64,
