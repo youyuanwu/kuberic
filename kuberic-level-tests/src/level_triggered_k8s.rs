@@ -107,6 +107,75 @@ fn topology_session_matches(value: &Value, replica_id: i64, process_session: &Va
         })
 }
 
+fn secondary_reconstructed_authority(
+    value: &Value,
+    before: &Value,
+    after: &Value,
+    replica_id: i64,
+) -> Result<bool> {
+    use kuberic_controller::crd::{PublicV1AuthorityStatus, PublicV1TopologyState};
+    use kuberic_runtime::protocol::public_operations::{PublicV1AcceptedResult, PublicV1CallKind};
+    use kuberic_runtime::protocol::types::ReplicaRole;
+
+    let before_session = before["processSession"]
+        .as_str()
+        .filter(|session| !session.is_empty())
+        .context("pre-restart process session is missing")?;
+    let Some(after_session) = after["processSession"]
+        .as_str()
+        .filter(|session| !session.is_empty() && *session != before_session)
+    else {
+        return Ok(false);
+    };
+    if after["replicaId"] != replica_id
+        || after["role"] != "ActiveSecondary"
+        || after["readStatus"] != "NotPrimary"
+        || after["writeStatus"] != "NotPrimary"
+        || after["retired"] != false
+        || !public_v1_topology_idle(value)
+        || !public_v1_authority_present(value)
+    {
+        return Ok(false);
+    }
+    for field in ["instanceId", "agentGeneration"] {
+        let expected = before[field]
+            .as_str()
+            .filter(|identity| !identity.is_empty())
+            .with_context(|| format!("pre-restart {field} is missing"))?;
+        if after[field].as_str() != Some(expected) {
+            return Ok(false);
+        }
+    }
+    let topology: PublicV1TopologyState =
+        serde_json::from_value(value["status"]["publicV1Topology"].clone())?;
+    let configuration = topology.configuration().map_err(anyhow::Error::msg)?;
+    let Some(endpoint) = topology.sessions.iter().find(|endpoint| {
+        endpoint.identity.replica_id.value() == replica_id
+            && Some(endpoint.identity.instance_id.as_str()) == after["instanceId"].as_str()
+            && Some(endpoint.identity.agent_generation.as_str())
+                == after["agentGeneration"].as_str()
+            && endpoint.process_session_id.as_str() == after_session
+            && endpoint.role == ReplicaRole::ActiveSecondary
+    }) else {
+        return Ok(false);
+    };
+    let authority: PublicV1AuthorityStatus =
+        serde_json::from_value(value["status"]["publicV1Authority"].clone())?;
+    let authority = authority.authority().map_err(anyhow::Error::msg)?;
+    Ok(
+        authority.history.data_loss_number == configuration.epoch.data_loss_number
+            && authority.completed_operations.iter().any(|completion| {
+                completion.process_session_id == endpoint.process_session_id
+                    && completion.storage_incarnation == endpoint.storage_incarnation
+                    && completion.call_kind == PublicV1CallKind::Configuration
+                    && completion.result == PublicV1AcceptedResult::Succeeded
+                    && completion.previous_configuration_id.is_none()
+                    && completion.current_configuration_id.as_ref()
+                        == Some(&configuration.configuration_id)
+            }),
+    )
+}
+
 fn public_v1_primary(kubeconfig: &str, context: &str) -> Result<Option<i64>> {
     let mut granted = Vec::new();
     for replica_id in 1..=3 {
@@ -376,6 +445,167 @@ fn owned_cluster_contract_rejects_ambient_or_mismatched_contexts() {
 }
 
 #[test]
+fn secondary_restart_requires_current_accepted_configuration_not_legacy_diagnostics() -> Result<()>
+{
+    use kuberic_controller::crd::{PublicV1AuthorityStatus, PublicV1TopologyState};
+    use kuberic_runtime::protocol::public_operations::*;
+    use kuberic_runtime::protocol::types::*;
+
+    let epoch = Epoch::new(0, 2);
+    let members = (1..=2)
+        .map(|id| ConfigurationMember {
+            identity: ReplicaIdentity {
+                replica_id: ReplicaId::new(id),
+                instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+                agent_generation: AgentGeneration::new(format!("agent-{id}")),
+            },
+            role: if id == 1 {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            },
+        })
+        .collect::<Vec<_>>();
+    let configuration = ConfigurationDescriptor::new(epoch, ReplicaId::new(1), members.clone(), 2);
+    let sessions = members
+        .iter()
+        .map(|member| ProcessSessionEndpoint {
+            identity: member.identity.clone(),
+            storage_incarnation: ReplicaStorageIncarnationContext {
+                replica: member.identity.clone(),
+                storage: ReplicaStorageIdentity::Persistent {
+                    pod_uid: PodUid::new(member.identity.instance_id.as_str()),
+                    pvc_uid: PvcUid::new(format!("pvc-{}", member.identity.replica_id)),
+                },
+                storage_generation: StorageGeneration::new("storage"),
+            },
+            process_session_id: ProcessSessionId::new("current"),
+            replicator_creation_id: ReplicatorCreationId::new("creation"),
+            role: member.role,
+        })
+        .collect::<Vec<_>>();
+    let topology = PublicV1TopologyState::from_configuration(&configuration, &sessions)
+        .map_err(anyhow::Error::msg)?;
+    let history = HistoryContext {
+        resource_uid: ResourceUid::new("resource"),
+        protocol_generation: PublicProtocolGeneration::new(1),
+        history_id: HistoryId::new("history"),
+        data_loss_number: 0,
+    };
+    let mut accepted = PublicV1AcceptedStatus {
+        identity: PublicV1Identity::new(1),
+        history_initialization_id: HistoryInitializationId::new("initialization"),
+        history: history.clone(),
+        data_loss_recovery: None,
+        completed_operations: vec![PublicV1AcceptedOperationCompletion {
+            operation_id: OperationId::new("configuration"),
+            revision: 1,
+            call_kind: PublicV1CallKind::Configuration,
+            process_session_id: sessions[1].process_session_id.clone(),
+            input_digest_version: 1,
+            input_digest_sha256: "a".repeat(64),
+            replay_disposition: PublicV1AcceptedReplayDisposition::Convergent,
+            history,
+            storage_incarnation: sessions[1].storage_incarnation.clone(),
+            previous_configuration_id: None,
+            current_configuration_id: Some(configuration.configuration_id.clone()),
+            catch_up_mode: None,
+            catch_up_specific_quorum: None,
+            result: PublicV1AcceptedResult::Succeeded,
+            failure_detail: None,
+            rebuild_required: None,
+        }],
+        extensions: PublicV1Extensions::default(),
+    };
+    let authority =
+        PublicV1AuthorityStatus::from_authority(&accepted).map_err(anyhow::Error::msg)?;
+    let mut status = serde_json::json!({"status": {
+        "publicV1Authority": authority,
+        "publicV1Topology": topology,
+    }});
+    let before = serde_json::json!({
+        "replicaId": 2, "instanceId": "pod-2", "agentGeneration": "agent-2",
+        "processSession": "previous", "currentConfiguration": null,
+    });
+    let after = serde_json::json!({
+        "replicaId": 2, "instanceId": "pod-2", "agentGeneration": "agent-2",
+        "processSession": "current", "role": "ActiveSecondary", "epoch": "0.1",
+        "readStatus": "NotPrimary", "writeStatus": "NotPrimary", "retired": false,
+        "currentConfiguration": null,
+    });
+    assert!(secondary_reconstructed_authority(
+        &status, &before, &after, 2
+    )?);
+    for (field, value) in [
+        ("processSession", serde_json::json!("previous")),
+        ("instanceId", serde_json::json!("other-pod")),
+        ("agentGeneration", serde_json::json!("other-agent")),
+        ("role", serde_json::json!("Primary")),
+        ("readStatus", serde_json::json!("Granted")),
+        ("writeStatus", serde_json::json!("Granted")),
+        ("retired", serde_json::json!(true)),
+    ] {
+        let mut pending = after.clone();
+        pending[field] = value;
+        assert!(
+            !secondary_reconstructed_authority(&status, &before, &pending, 2)?,
+            "{field}"
+        );
+    }
+    let mut pending = status.clone();
+    pending["status"]["publicV1SessionRenewal"] = serde_json::json!({});
+    assert!(!secondary_reconstructed_authority(
+        &pending, &before, &after, 2
+    )?);
+    pending = status.clone();
+    pending["status"]["publicV1Topology"]["sessions"][1]["processSessionId"] =
+        serde_json::json!("previous");
+    assert!(!secondary_reconstructed_authority(
+        &pending, &before, &after, 2
+    )?);
+    for completion in [
+        {
+            let mut completion = accepted.completed_operations[0].clone();
+            completion.process_session_id = ProcessSessionId::new("previous");
+            completion
+        },
+        {
+            let mut completion = accepted.completed_operations[0].clone();
+            completion.current_configuration_id = Some(ConfigurationId::new("other"));
+            completion
+        },
+        {
+            let mut completion = accepted.completed_operations[0].clone();
+            completion.storage_incarnation.storage_generation = StorageGeneration::new("other");
+            completion
+        },
+        {
+            let mut completion = accepted.completed_operations[0].clone();
+            completion.result = PublicV1AcceptedResult::Cancelled;
+            completion
+        },
+    ] {
+        accepted.completed_operations = vec![completion];
+        status["status"]["publicV1Authority"] = serde_json::to_value(
+            PublicV1AuthorityStatus::from_authority(&accepted).map_err(anyhow::Error::msg)?,
+        )?;
+        assert!(!secondary_reconstructed_authority(
+            &status, &before, &after, 2
+        )?);
+    }
+    accepted.completed_operations.clear();
+    status["status"]["publicV1Authority"] = serde_json::to_value(
+        PublicV1AuthorityStatus::from_authority(&accepted).map_err(anyhow::Error::msg)?,
+    )?;
+    assert!(!secondary_reconstructed_authority(
+        &status, &before, &after, 2
+    )?);
+    status["status"]["publicV1Topology"]["canonicalConfigurationJson"] = serde_json::json!("{}");
+    assert!(secondary_reconstructed_authority(&status, &before, &after, 2).is_err());
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires an explicitly owned isolated KinD cluster"]
 fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
     let (kubeconfig, context, _) = cluster_args()?;
@@ -503,16 +733,21 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         ],
     )?;
 
-    let secondary = 2;
+    let secondary = (1..=3)
+        .find(|replica_id| *replica_id != primary)
+        .context("bootstrap omitted a secondary")?;
     let before = replica_diagnostics(&kubeconfig, &context, secondary)?;
     stop_replica_process(&kubeconfig, &context, secondary)?;
     let restart_deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        if replica_diagnostics(&kubeconfig, &context, secondary).is_ok_and(|after| {
-            after["processSession"] != before["processSession"]
-                && after["currentConfiguration"] == before["currentConfiguration"]
-                && after["readStatus"] == "Granted"
-        }) {
+        if let Ok(after) = replica_diagnostics(&kubeconfig, &context, secondary)
+            && secondary_reconstructed_authority(
+                &set_status(&kubeconfig, &context)?,
+                &before,
+                &after,
+                secondary,
+            )?
+        {
             break;
         }
         if Instant::now() >= restart_deadline {
@@ -642,15 +877,14 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
     let restart_deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(restarted) = replica_diagnostics(&kubeconfig, &context, 2)
-            && restarted["processSession"] != before_restart["processSession"]
-            && restarted["currentConfiguration"] == before_restart["currentConfiguration"]
+            && secondary_reconstructed_authority(
+                &set_status(&kubeconfig, &context)?,
+                &before_restart,
+                &restarted,
+                2,
+            )?
         {
-            let status = set_status(&kubeconfig, &context)?;
-            if public_v1_topology_idle(&status)
-                && topology_session_matches(&status, 2, &restarted["processSession"])
-            {
-                break;
-            }
+            break;
         }
         if Instant::now() >= restart_deadline {
             bail!("replacement process did not reconstruct and publish accepted authority");
