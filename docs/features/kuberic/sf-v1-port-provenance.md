@@ -817,6 +817,46 @@ No native utility, monitoring, dependency or harness implementation is imported.
 See the [ledger](sf-v1-port-ledger.md#private-protected-facade-execution-slice-p4-bounded-f01f02f09f11)
 and [selector](testing.md#sf-v1-private-protected-facade-execution-slice).
 
+### Private Host Access and Lifecycle Slice (P4, Bounded F01/F09/F11)
+
+Rust destination:
+[`host/v1_lifecycle.rs`](../../../kuberic-runtime/src/host/v1_lifecycle.rs),
+with [actual-owner regressions](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/host.rs).
+`RA/` below is `src/prod/src/Reliability/Failover/ra/` at the same immutable pin.
+
+This is host/proxy ownership, separate from the replication engine. The engine
+offers only crate-private opaque facade setup/liveness/Abort probes and neutral
+lifecycle observations; the host supplies the access callback and owns all
+native access policy/application/outer-Close state. No concrete host type is
+referenced by production `v1` implementation code. Core queue/role/configuration/
+error types stay hidden. Cross-layer tests retain existing private core fixtures;
+hook-only actual-owner cases also verify callbacks outside projection guards.
+
+| Selected native production material | Translation / representation changes |
+|---|---|
+| [`RA/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:34-381`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L34-L381) | Reachable access table/selector, lifecycle precedence, promotion/demotion, idle activation and same-primary stages. Typed private host intent plus actual callback results replace FUP fields; native TryAgain maps to existing ReconfigurationPending. The demotion selector does not choose its table's CatchupCompleted row; after catch-up it selects TransitioningRole/Completed. Invalid inputs return explicit errors, not invented success. |
+| [`RA/FailoverUnitProxy.cpp:1399-1455`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.cpp#L1399-L1455) | Local-plus-remote host Up/Ready counts, CC minimum, CC majority and optional PC majority; CC includes remote primary/secondary, PC includes secondary only. Exact admitted binding snapshots replace native configuration-map identity. Host availability is not ACK-derived liveness, configured engine W, queue progress or provider durability. |
+| [`RA/FailoverUnitProxy.ChangeReplicatorRoleAsyncOperation.cpp:99-140`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ChangeReplicatorRoleAsyncOperation.cpp#L99-L140); [`RA/FailoverUnitProxy.ChangeReplicaRoleAsyncOperation.cpp:93-150`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ChangeReplicaRoleAsyncOperation.cpp#L93-L150) | Actual replicator/service callback success advances separate role observations and returns the real service address. Successful non-primary replicator role clears host membership. Retained caller-owned futures replace Begin/End rooting; cancelled callers must resume host bookkeeping. The existing facade task still owns autonomous engine work. Host activation acknowledgement is an explicit seam, not a complete RA reconfiguration program or engine configuration call. |
+| [`RA/FailoverUnitProxy.CloseAsyncOperation.cpp:30-110,164-276`](https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.CloseAsyncOperation.cpp#L30-L276) | Stateful outer Close revokes access, aborts role mismatch, otherwise closes replicator then application and aborts a failed child. Structured pending/closed/failed/aborted child observations preserve diagnostics despite native outer completion; repeated Close does not repeat callbacks. Application cancellation retains its real future. Explicit join rejects unfinished host continuations and observes actual facade provider/build/context drainage and task failure, not a fabricated graceful child result. External Abort suppresses late host success. |
+
+The application is already opened by the private caller. Host intent, membership
+availability and activation are explicit inputs, not a production registry,
+failure detector or RA/FM/placement port. Shared access rebinding reaches
+preexisting service-handle clones and invokes callbacks outside guards.
+Authority/fault/retirement fences remain distinct; no applied==committed or
+optional provider-evidence gate changes a normal native access decision.
+Synthetic journeys execute actual compiled Rust queue/role/copy/ACK/provider
+owners and StatefulServiceReplica callbacks, not native fixtures or binaries.
+Separate service-local commit/visibility is demonstrated only in memory; real
+KV/SQLite migration and service-qualified native serving grants remain pending.
+No public factory, selected host/status/wire, report/schema/controller/election/
+rejoin contract, protected signature, dependency or tier policy changes.
+No native utility, monitoring or harness implementation is imported. Full P4
+closure, P5 activation, hosted/differential parity and provider-fsync qualification
+are not claimed. See the
+[ledger](sf-v1-port-ledger.md#private-host-access-and-lifecycle-slice-p4-bounded-f01f09f11)
+and [selector](testing.md#sf-v1-private-host-access-and-lifecycle-slice).
+
 ### P1 documented expectations (historical foundation)
 
 `R/` is `src/prod/src/Reliability/Replication/`. The

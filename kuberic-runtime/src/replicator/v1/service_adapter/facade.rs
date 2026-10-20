@@ -22,7 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::RuntimeError;
-use crate::protocol::types::{ReplicaId, ReplicaIdentity, ReplicaRole};
+use crate::protocol::types::{AccessStatus, ReplicaId, ReplicaIdentity, ReplicaRole};
 use crate::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
     Replicator,
@@ -44,6 +44,67 @@ pub(super) struct FacadeConfig {
     pub(super) local: ReplicaIdentity,
     pub(super) peers: Vec<PeerBinding>,
     pub(super) close_quorum_wait: Duration,
+}
+
+/// Opaque unselected setup; core configuration and owners stay private.
+pub(crate) struct FacadeSetup {
+    adapter: ServiceReplicator,
+    config: FacadeConfig,
+}
+
+#[derive(Clone)]
+pub(crate) struct FacadeState {
+    aborted: Arc<AtomicBool>,
+    owner: Weak<Mutex<Target>>,
+}
+
+impl FacadeState {
+    pub(crate) fn aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.owner.upgrade().is_some()
+    }
+}
+
+impl FacadeSetup {
+    pub(super) fn new(adapter: ServiceReplicator, config: FacadeConfig) -> Self {
+        Self { adapter, config }
+    }
+
+    pub(crate) fn state(&self) -> FacadeState {
+        FacadeState {
+            aborted: self.adapter.service.aborted.clone(),
+            owner: self.adapter.service.target.clone(),
+        }
+    }
+
+    pub(crate) fn bindings(&self) -> Vec<ReplicaInformation> {
+        self.config
+            .peers
+            .iter()
+            .map(|peer| peer.information.clone())
+            .collect()
+    }
+
+    pub(crate) fn start(
+        mut self,
+        access: Arc<dyn Fn() -> AccessStatus + Send + Sync>,
+        observe: Arc<dyn Fn(LifecycleObservation) + Send + Sync>,
+    ) -> crate::Result<Arc<Facade>> {
+        if self.adapter.status() != RoleStatus::Created {
+            return Err(FacadeError::Input("setup requires a Created owner".into()).into());
+        }
+        *self.adapter.service.write_access.lock().unwrap() = Arc::new(move || match access() {
+            AccessStatus::Granted => WriteAccess::Granted,
+            AccessStatus::ReconfigurationPending => WriteAccess::ReconfigurationPending,
+            AccessStatus::NoWriteQuorum => WriteAccess::NoWriteQuorum,
+            AccessStatus::NotPrimary => WriteAccess::NotPrimary,
+        });
+        self.adapter.observe = Some(observe);
+        Facade::start(self.adapter, self.config).map_err(RuntimeError::from)
+    }
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -144,7 +205,7 @@ struct Join {
     result: Option<Result<(), FacadeError>>,
 }
 
-pub(super) struct Facade {
+pub(crate) struct Facade {
     requests: mpsc::Sender<Request>,
     abort: Arc<Abort>,
     join: AsyncMutex<Join>,
@@ -198,6 +259,10 @@ impl Facade {
             );
         }
         join.result.as_ref().unwrap().clone()
+    }
+
+    pub(crate) async fn drain(&self) -> crate::Result<()> {
+        self.join().await.map_err(RuntimeError::from)
     }
 
     async fn call(&self, command: Command) -> crate::Result<Value> {
@@ -273,10 +338,7 @@ impl FacadeConfig {
             .iter()
             .find(|peer| {
                 let bound = &peer.information;
-                bound.identity == info.identity
-                    && bound.process_session_id == info.process_session_id
-                    && bound.storage_incarnation == info.storage_incarnation
-                    && bound.replication_address == info.replication_address
+                matches_binding(bound, info)
             })
             .ok_or_else(|| FacadeError::Input("no exact admitted peer binding".into()))
     }
@@ -353,6 +415,13 @@ impl FacadeConfig {
             replicas,
         })
     }
+}
+
+pub(crate) fn matches_binding(bound: &ReplicaInformation, input: &ReplicaInformation) -> bool {
+    bound.identity == input.identity
+        && bound.process_session_id == input.process_session_id
+        && bound.storage_incarnation == input.storage_incarnation
+        && bound.replication_address == input.replication_address
 }
 
 fn reply(reply: Reply, result: Result<Value, FacadeError>) {

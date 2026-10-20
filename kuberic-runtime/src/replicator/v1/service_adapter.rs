@@ -41,6 +41,16 @@ use super::secondary::{SecondaryError, SecondaryHandle};
 
 mod facade;
 
+pub(crate) use facade::{Facade, FacadeSetup, FacadeState, matches_binding};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleObservation {
+    Opened,
+    Ready(crate::protocol::types::ReplicaRole),
+    Closed,
+    Faulted,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WriteAccess {
     Granted,
@@ -91,6 +101,7 @@ pub(super) struct ServiceReplicator {
     provider: Arc<dyn StateProvider>,
     registry: MessageRegistry,
     control: Option<Control>,
+    observe: Option<Arc<dyn Fn(LifecycleObservation) + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +135,7 @@ impl ServiceReplicator {
             aborted: Arc::new(AtomicBool::new(false)),
             policy: config.secondary.context.buffer_policy,
             limits: config.secondary.context.buffer_limits,
-            write_access,
+            write_access: Arc::new(Mutex::new(write_access)),
         };
         Ok(Self {
             owner: RoleReplicator::new(config, provider.clone(), clock)?,
@@ -133,6 +144,7 @@ impl ServiceReplicator {
             provider,
             registry,
             control: None,
+            observe: None,
         })
     }
 
@@ -145,6 +157,24 @@ impl ServiceReplicator {
     }
 
     fn refresh(&self) {
+        if let Some(observe) = &self.observe {
+            use crate::protocol::types::ReplicaRole;
+            let observation = match self.owner.status() {
+                RoleStatus::Opened => Some(LifecycleObservation::Opened),
+                RoleStatus::Ready(role) => Some(LifecycleObservation::Ready(match role {
+                    Role::None => ReplicaRole::None,
+                    Role::Primary => ReplicaRole::Primary,
+                    Role::IdleSecondary => ReplicaRole::IdleSecondary,
+                    Role::ActiveSecondary => ReplicaRole::ActiveSecondary,
+                })),
+                RoleStatus::Closed | RoleStatus::Aborted => Some(LifecycleObservation::Closed),
+                RoleStatus::Faulted => Some(LifecycleObservation::Faulted),
+                _ => None,
+            };
+            if let Some(observation) = observation {
+                observe(observation);
+            }
+        }
         let target = if self.service.aborted.load(Ordering::Acquire) {
             Target::Unavailable(RoleStatus::Aborting)
         } else if let Ok(primary) = self.owner.primary() {
@@ -354,7 +384,7 @@ pub(super) struct ServiceHandle {
     aborted: Arc<AtomicBool>,
     policy: BufferPolicy,
     limits: BufferLimits,
-    write_access: Arc<dyn Fn() -> WriteAccess + Send + Sync>,
+    write_access: Arc<Mutex<Arc<dyn Fn() -> WriteAccess + Send + Sync>>>,
 }
 
 impl ServiceHandle {
@@ -368,7 +398,8 @@ impl ServiceHandle {
 
     pub(super) fn begin_replicate(&self, data: OperationData) -> Result<Replication, AdapterError> {
         buffers::decode(data.clone(), self.policy, self.limits)?;
-        match (self.write_access)() {
+        let access = self.write_access.lock().unwrap().clone();
+        match access() {
             WriteAccess::Granted => {}
             denied => return Err(AdapterError::WriteAccess(denied)),
         }

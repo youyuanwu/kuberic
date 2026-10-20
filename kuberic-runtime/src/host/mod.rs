@@ -21,6 +21,8 @@ pub(crate) mod sqlite_store;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod transport;
+#[allow(clippy::disallowed_types)]
+pub(crate) mod v1_lifecycle;
 
 pub use error::{HostError, Result};
 

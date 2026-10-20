@@ -299,6 +299,28 @@ peer snapshots are not a production registry or invented identity conversion.
 No native utility, dependency or harness implementation is imported; production
 factory/public data APIs/services/wire/reports remain unchanged and unselected.
 
+The private host/v1_lifecycle.rs and its actual-owner integration tests translate
+selected Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:
+34-381, FailoverUnitProxy.cpp:1399-1455,
+FailoverUnitProxy.ChangeReplicatorRoleAsyncOperation.cpp:99-140,
+FailoverUnitProxy.ChangeReplicaRoleAsyncOperation.cpp:93-150 and
+FailoverUnitProxy.CloseAsyncOperation.cpp:30-110,164-276 at the same pin.
+Typed host intent/availability and actual child role/catch-up callbacks replace
+FUP fields; caller-owned retained futures replace Begin/End rooting. Native
+TryAgain maps to existing ReconfigurationPending. Host Up/Ready minimum/majority
+is distinct from engine W, ACK progress and provider durability. Structured
+child diagnostics, explicit Abort and separate join preserve outer teardown
+versus graceful child Close/provider drainage. The already-opened application,
+private binding snapshots and activation acknowledgement are explicit host
+seams, not an RA/FM/placement port, public Open/factory, production registry or
+failure detector. Shared service-handle access rebinding and actual owner
+observations do not change production serving policy. No native utility,
+monitoring, dependency or harness implementation is imported; selected
+factory/services/wire/reports/controller and protected signatures are unchanged.
+Host/proxy state and policy are owned outside the replication engine. Opaque
+crate-private facade setup/probes and neutral observation/access callbacks
+replace concrete engine-to-host coupling without exposing core types.
+
 Copyright (c) Microsoft Corporation. All rights reserved.
 
 The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.

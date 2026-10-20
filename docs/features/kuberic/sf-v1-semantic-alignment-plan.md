@@ -94,6 +94,17 @@ now implements unchanged protected traits over those owners with a retained
 active/retired driver, independent build/catch-up waits, synchronous Abort
 gating and separate Close/join lifetimes. Published selection, assignment/ACK
 APIs and their current durability contract remain unchanged until P5.
+The [private host access/lifecycle slice](sf-v1-port-ledger.md#private-host-access-and-lifecycle-slice-p4-bounded-f01f09f11)
+now composes native lifecycle/reconfiguration access selection, independent host
+membership availability/quorum, actual replicator/application role and catch-up
+outcomes, and distinct outer Close diagnostics/retained drainage. Host intent,
+availability and activation remain explicit private inputs; cancelled host
+continuations require caller resumption. This is not an RA/FM port or production
+serving-policy change. Real services, authenticated host/report integration and
+atomic activation remain pending.
+Host/proxy policy and outer lifecycle reside in `host/v1_lifecycle.rs`, outside
+the engine. The private facade supplies neutral observations and opaque setup/
+liveness/Abort seams; the host supplies access policy, not the reverse.
 This roadmap replaces isolated audit-item prioritization with a **faithful
 source-guided port of Service Fabric classic V1**, implemented using Rust async
 and tonic transport. This is the user's refined implementation direction,
@@ -481,7 +492,10 @@ resumable caller-driven lifecycle, early assignment/separate quorum completion,
 shared receiver/ACK/provider-barrier adaptation and helper-free service ownership
 evidence. A private protected-trait execution bridge now retains active and
 retired work independently of callers, without changing public selection.
-Published facade/assignment/ACK integration, real services and host/status/
+A private caller-driven host adapter now adds native access selection and
+host-availability quorum, actual role/application/catch-up outcomes and outer
+Close diagnostics, without enabling production grants. Published
+facade/assignment/ACK integration, real services and production host/status/
 reporting integration remain pending. This roadmap is not
 authorization to implement remaining work. P2-P4 port and test source-mapped components before
 production activation; they do not activate a partially migrated public contract.
