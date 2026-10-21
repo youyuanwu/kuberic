@@ -842,6 +842,10 @@ impl ReplicatorFactoryContext {
         self.access.native_write_status()
     }
 
+    pub(crate) fn native_write_admission(&self) -> Result<Arc<std::sync::Mutex<()>>> {
+        self.access.native_write_admission()
+    }
+
     pub(crate) fn observe_native_lifecycle(&self, observation: v1::LifecycleObservation) {
         if let Some(reservation) = self.reservation {
             self.access
@@ -860,6 +864,10 @@ impl ReplicatorFactoryContext {
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
+    fn native_write_admission(&self) -> Result<Arc<std::sync::Mutex<()>>> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+
     fn partition_information(&self) -> PartitionInformation;
     async fn read_status(&self) -> Result<AccessStatus>;
 

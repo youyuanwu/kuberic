@@ -407,6 +407,7 @@ mod tests {
         struct Fixture {
             fail_registration: std::sync::atomic::AtomicBool,
             binding: Mutex<Option<(ReplicaIdentity, ProcessSessionId)>>,
+            write_admission: Arc<Mutex<()>>,
         }
 
         #[async_trait]
@@ -434,6 +435,10 @@ mod tests {
 
         #[async_trait]
         impl PartitionAccessView for Fixture {
+            fn native_write_admission(&self) -> Result<Arc<Mutex<()>>> {
+                Ok(self.write_admission.clone())
+            }
+
             fn validate_native_creation(&self, _: ReplicatorCreationReservation) -> Result<()> {
                 Ok(())
             }

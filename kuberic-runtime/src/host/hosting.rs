@@ -168,6 +168,7 @@ struct RuntimeHost {
     closed: AtomicBool,
     replacement_fault_fenced: AtomicBool,
     replacement_authority_fenced: AtomicBool,
+    write_admission: Arc<StdMutex<()>>,
     replacement_fault_bridge: Mutex<Option<Arc<ReplacementFaultBridge>>>,
 }
 
@@ -303,6 +304,7 @@ impl PodRuntime {
                 closed: AtomicBool::new(false),
                 replacement_fault_fenced: AtomicBool::new(false),
                 replacement_authority_fenced: AtomicBool::new(false),
+                write_admission: Arc::new(StdMutex::new(())),
                 replacement_fault_bridge: Mutex::new(None),
                 replica_session: OnceLock::new(),
                 native_credentials: OnceLock::new(),
@@ -372,6 +374,7 @@ impl PodRuntime {
         let revoke_host = Arc::downgrade(&self.host);
         let revoke_access: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
             let host = revoke_host.upgrade().ok_or(RuntimeError::Closed)?;
+            let _admission = host.write_admission.lock().unwrap();
             host.replacement_authority_fenced
                 .store(true, Ordering::Release);
             Ok(())
@@ -771,9 +774,12 @@ impl PodRuntime {
     }
 
     pub(crate) async fn fence_replacement_access(&self) {
-        self.host
-            .replacement_authority_fenced
-            .store(true, Ordering::Release);
+        {
+            let _admission = self.host.write_admission.lock().unwrap();
+            self.host
+                .replacement_authority_fenced
+                .store(true, Ordering::Release);
+        }
         let mut state = self.host.state.write().await;
         state.projection.read_status = AccessStatus::NotPrimary;
         state.projection.write_status = AccessStatus::NotPrimary;
@@ -1157,6 +1163,15 @@ impl ReplacementFaultBridge {
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
+    fn native_write_admission(&self) -> Result<Arc<StdMutex<()>>> {
+        Ok(self
+            .host
+            .upgrade()
+            .ok_or(RuntimeError::Closed)?
+            .write_admission
+            .clone())
+    }
+
     fn partition_information(&self) -> PartitionInformation {
         self.partition_information.clone()
     }

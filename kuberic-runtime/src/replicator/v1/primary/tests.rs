@@ -23,6 +23,7 @@ use crate::replicator::v1::replication_queue_manager::QueueNormalizationError;
 use crate::replicator::v1::sender::SenderConfig;
 use crate::replicator::v1::session::{SendIntent, SendKind, SessionIdentity};
 
+mod admission;
 mod configuration;
 mod policy;
 

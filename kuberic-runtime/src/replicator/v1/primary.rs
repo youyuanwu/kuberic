@@ -616,6 +616,16 @@ impl PrimaryHandle {
         policy: BufferPolicy,
         limits: BufferLimits,
     ) -> Result<PrimaryAdmission, PrimaryError> {
+        self.enqueue_with_lease(data, policy, limits, ())
+    }
+
+    pub(super) fn enqueue_with_lease(
+        &self,
+        data: OperationData,
+        policy: BufferPolicy,
+        limits: BufferLimits,
+        lease: impl Sized,
+    ) -> Result<PrimaryAdmission, PrimaryError> {
         let root = self.root()?;
         let (admission, _activity) = {
             let mut state = root.state.lock().unwrap();
@@ -623,6 +633,9 @@ impl PrimaryHandle {
             let admission = root.manager.lock().unwrap().enqueue(data, policy, limits);
             (admission, root.activity(&mut state))
         };
+        // The host admission cut covers only assignment, never foreign effects
+        // or policy callbacks. Early rejection also drops the lease.
+        drop(lease);
         let admission = match admission {
             Ok(admission) => {
                 admission.effects.dispatch(root.clock.now())?;

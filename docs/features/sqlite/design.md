@@ -19,6 +19,12 @@ watermark and old protocol details are historical, not the selected data-plane
 contract. Current real-file publication/copy/restart evidence lives in the
 service's `v1` tests and runtime `classic_v1_production` target.
 
+The production host constructor binds the actual `data_root/application` path.
+Authenticated initialization can then authorize the first application Open as
+New; FreshEmpty alone is not that authorization. Established Open is Existing
+and rejects missing, corrupt or incompatible metadata without resetting it.
+The binary's production-constructor regression exercises this lifecycle.
+
 ## Original design baseline
 
 The `examples/sqlite` application (`sqlite-replicated`) uses the level-triggered
