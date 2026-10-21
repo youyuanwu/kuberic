@@ -158,9 +158,9 @@ Catch-up is not a fresh union-membership or independent PC+CC proof. With
 These are the actual selected predicates
 ([manager:975–1024][catchup], [queue-manager:394–404][capture]),
 with [native:43–105][native-catchup] ancestry and
-[actual tests:641–719][catchup-test]. Do not infer them from the broader stale
-protected catch-up Rustdoc; comment reconciliation is
-[pending](sf-v1-semantic-alignment-plan.md#p2--source-contract-wording).
+[actual tests:641–719][catchup-test]. The
+[protected catch-up contract][catchup-doc] describes these selected V1
+conditions separately from ordinary PC/CC completion and provider commitment.
 
 ### Rejection and fault scope
 
@@ -219,7 +219,9 @@ eligibility, not every native fault or the agent recovery journal
 
 Primary epoch provider callbacks use issued tail, including duplicate epochs.
 Secondary direct epoch updates and stream/provider barriers are different paths
-([manager:292–302][epoch], [role:399–435][secondary-epoch]).
+([manager:292–302][epoch], [role:399–435][secondary-epoch]). The
+[provider epoch contract][epoch-doc] preserves the supplied boundary without
+certifying quorum commitment or provider durability.
 Changed data-loss recovery can reset higher/lower/equal/empty progress and next
 assignment; it is not globally monotone across history/session reset
 ([data-loss test:233–252][data-loss]).
@@ -432,6 +434,8 @@ production-readiness support from the selected Rust journeys.
 [query-matrix]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/classic_v1_production.rs#L991-L1085
 [query-snapshots]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/classic_v1_production.rs#L1131-L1168
 [epoch]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/replica_manager.rs#L292-L302
+[catchup-doc]: ../../../kuberic-runtime/src/replicator/traits.rs#L107
+[epoch-doc]: ../../../kuberic-runtime/src/traits.rs#L53
 [secondary-epoch]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/role.rs#L399-L435
 [data-loss]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/role/tests/data_loss.rs#L233-L252
 [sentinel]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/mod.rs#L153-L163
