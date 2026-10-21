@@ -17,7 +17,8 @@ Kuberic's root license and adapted API-documentation notices are unchanged.
 
 This register records **ancestry and transformations**, not delivery progress.
 Kuberic selected-host Close/access evidence is assessed at
-`aad23335c219a576d69133cee883bbd63e40b68a`; unchanged component ancestry
+`69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; Close references retain their
+explicit earlier anchors. Unchanged component ancestry
 retains its original explicit anchors. See
 [current semantics](classic-v1-runtime.md) and the
 [evidence ledger](sf-v1-port-ledger.md). No native binary or native test was
@@ -345,7 +346,7 @@ Private destination: [`kuberic-runtime/src/host/v1_lifecycle.rs`](../../../kuber
 and [host adapter tests](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/host.rs).
 This native-shaped private host is distinct from selected
 `host/hosting.rs`/`selected_access.rs`/`public_lifecycle_program.rs`.
-Selected [policy:99–184][selected-policy], [activation:590–629][selected-activation],
+Selected [policy:209–300][selected-policy], [activation:721–766][selected-activation],
 [Close:550–638][selected-close] and [recovery:79–115][selected-recovery] port the
 bounded reachable behavior below using the production journal and ownership
 mechanisms; ancestry alone is not the production evidence.
@@ -364,7 +365,7 @@ detector/RA/FM/placement. Shared handle access rebinding runs outside guards;
 optional provider evidence does not redefine native access. Private host
 in-memory visibility evidence and selected real-file service evidence differ.
 
-Selected deterministic [stage tests:133–1025][selected-stage-tests] use actual
+Selected deterministic [stage tests:144–2159][selected-stage-tests] use actual
 public hosts, committed service reads and raw write assignment. They include
 split/recipe promotion, joint/current-only configuration, missing C/P,
 pre/post-Revoke demotion, final-wait-before-receipt denial, cancellation/exact
@@ -376,6 +377,13 @@ Local abort-both/skip-later-graceful containment intentionally differs from
 native's per-child Abort/continued service Close. Required protocol-13
 availability facts are controller observations, not a new failure detector;
 old descriptor-bearing state is rejected rather than defaulted available.
+Same-live-host promotion after demotion uses actual native role/epoch
+reconciliation with compatible context/generation evidence, not an unconditional
+same-role bypass. Superseded/uninvoked reservations and nonactivating
+configuration preserve that evidence without preserving serving grants;
+successful native nonprimary role or genuine stable-primary activation
+discharges it. The selected tests distinguish these cuts from fault/terminal/
+history denials and unknown-progress controller observations.
 
 ### Service-owned KV and SQLite commitment — F02/F04/F05/F07/F09/F11
 
@@ -466,11 +474,11 @@ These were source/context selections, not whole-test translations or executions:
   | `RemoteSession.cpp:492–670`; `RemoteSession.h:202–259`; `ComFromBytesOperation.cpp:167–262`; `SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31–156` | ACK/callback/provider-boundary context from the public contract comparison; distinct from a native test or whole-owner translation. |
   | `src/prod/src/managed/Api/src/System/Fabric/IStateReplicator.cs:19–81,102–127`; `src/prod/src/managed/Api/src/System/Fabric/IStatefulServicePartition.cs:16–45` | Managed API contract context, not imported managed implementation or a substitute for actual native facade exposure. |
 
-[selected-policy]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L99-L184
-[selected-activation]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L590-L629
+[selected-policy]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L209-L300
+[selected-activation]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L721-L766
 [selected-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
 [selected-recovery]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L79-L115
-[selected-stage-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/support/staged_access.rs#L133-L1025
+[selected-stage-tests]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L144-L2159
 [selected-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505
 
 - `ReplicationSecondary.Test.cpp:529–579,1450–1507,1550–1587` — progress/drain modes.

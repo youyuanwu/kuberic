@@ -1,7 +1,8 @@
 # SF V1: Current Source and Evidence Ledger
 
 This ledger assesses selected-host alignment at Kuberic
-`aad23335c219a576d69133cee883bbd63e40b68a`; unchanged component references
+`69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; Close references retain explicit
+`aad23335c219a576d69133cee883bbd63e40b68a` anchors. Unchanged component references
 retain their explicit `e2a47b6c631c974aa0135e81c3a7e3a439980ded` anchors.
 Native SF is
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`. It is not a delivery log.
@@ -31,7 +32,7 @@ scenario oracle.
 | **SF-02** — KV bypasses write denial | Supported selected write admission; historical Open label stale | [adapter:421–448][admission], [Revoke:374–380][revoke], [host-gate test:11–145][gate-test], [public raw-fence assertion:4413–4422][raw-fence]. Access sample/assignment share Revoke gate. No separately rerun exact HTTP-only legacy trace. |
 | **SF-03** — PG ignores partition denial | Supported periodic live-status policy | [PG:626–731][pg-access], [tests:3–158][pg-access-test]. Not instantaneous/per-statement revocation; isolated secondary status is not a stable-secondary public-host grant. |
 | **SF-04** — swap capability mismatch | Supported capability/mode binding | [controller:445–470][fallback], [public wait assertions:4396–4412][capability], [swap:4360–4468][swap]. True/WriteQuorum and false/All are distinct real-bundle cases; crossed metadata rejects. |
-| **SF-05** — demotion precedes final catch-up | Supported source configuration/role order and selected staged access | [program:20–39][program], [public:4423–4451][swap], [selected stage barriers:896–1025][aligned-swap]. Final wait returns before paired role transition; read denial is immediate before the outcome receipt. |
+| **SF-05** — demotion precedes final catch-up | Supported source configuration/role order and selected staged access | [program:20–39][program], [public:4423–4451][swap], [selected stage barriers:2030–2159][aligned-swap]. Final wait returns before paired role transition; read denial is immediate before the outcome receipt. |
 | **SF-06** — Revoke invokes obstructing synthetic role callback | Supported access-only Revoke, contained outer success and retained diagnostics | [selected program:550–638][aligned-close], [actual child/interruption/join witnesses:3114–3505][aligned-close-tests]. Ambiguous/cancelled callbacks are not retried; actual terminal joins remain separate from Abort/receipts. |
 | **SF-07** — PG idle Remove globally drains | Supported completed-idle retirement | [PG:1919–1952][pg-remove], [test:607–656][pg-remove-test]. Same process/healthy SQL survives idle Remove; voters must first leave configuration. |
 | **SF-08** — retired PG grants leak slots | Supported selected managed-slot reclamation | [slots:212–258][slots], [dirty cleanup:784–789][dirty], [cancel-without-retry test:660–688][pg-remove-test]. Slot absence releases that WAL pin, not a disk-growth SLA. |
@@ -60,7 +61,7 @@ progress, not empty history or cross-identity reusable state
 | Category | Selected-source evidence | Disposition |
 |---|---|---|
 | Core — outer Close | [selected program:550–638][aligned-close], [public failures/joins:3114–3505][aligned-close-tests] vs [native:94–105,206–275][native-close] | Supported bounded outer-success-after-containment alignment with retained child diagnostics. Local abort-both/skip-later-graceful action difference remains intentional; no generic app-task join claim. |
-| Core — staged access | [selected policy:99–184][aligned-access], [public barriers:133–1025][aligned-access-tests] vs [native selector:288–381][aligned-native-selector] | Supported bounded same-primary/promotion/demotion stage policy, shared admission gate, cancellation/replay and compatible final release. Explicit descriptor availability is not remote liveness; broader stage/interleaving qualification remains unverified. |
+| Core — staged access | [selected policy:209–300][aligned-access], [public barriers:144–2159][aligned-access-tests] vs [native selector:288–381][aligned-native-selector] | Supported bounded same-primary/promotion/demotion stage policy, primary-context validation, same-host repromotion/reconciliation, cancellation/replay and compatible final release. Missing progress yields explicit unavailable facts; descriptor availability is not remote liveness. Broader stage/interleaving qualification remains unverified. |
 | Source-contract wording | [catch-up Rustdoc:107–119][catchup-doc], [epoch Rustdoc:53–55][epoch-doc] vs [manager:975–1024][manager], [292–302][epoch] | Stale comments; separately reconcile without changing protected signatures. No source edit in this rewrite. |
 | Security | [HTTP:177–227][http], [bearer:728–766][auth] | Authenticated but no TLS; ordinary deployment constraints remain. Missing native credential API is not accepted-but-unenforced settings. |
 | Qualification | [public external provider:1861–1939][external], [real SQLite:1731–1801][sqlite], component/native ancestry | Actual Rust/application evidence is not native binary differential, kernel power-loss or production readiness. |
@@ -82,7 +83,7 @@ native ranges/test cases and substitutions are in the corresponding
 | F06 sender/session/ACK | `v1/sender.rs`, `session.rs`, `ack.rs`, `async_runtime.rs` | Ordered effects/retries and separate receive/apply; fixed production policies ([composition:127–227][composition]). |
 | F07 copy/build | `v1/build_idle.rs`, establishment/enumerator/sender/context receiver | Target context and actual EOF target/gates, not fixed snapshot-only success ([copy:218–293][copy], [context-source:738–757][context-source]). |
 | F08 carrier/demux | `v1/transport.rs`, `ingress.rs`, `service_adapter/production_transport.rs`; `host/native_transport.rs` | Tonic/bearer/exact host authority, not native platform transport/wire ([dispatch:365–400][dispatch]). |
-| F09 recovery/access/lifecycle | `v1/role.rs`; `host/hosting.rs`, `selected_access.rs`, `public_lifecycle_program.rs` | Selected operation-owned stage policy and retained Close cleanup are actual production paths; private `v1_lifecycle.rs` ancestry alone is not the evidence ([selected:99–184][aligned-access], [Close:550–638][aligned-close]). |
+| F09 recovery/access/lifecycle | `v1/role.rs`; `host/hosting.rs`, `selected_access.rs`, `public_lifecycle_program.rs` | Selected operation-owned stage policy and retained Close cleanup are actual production paths; private `v1_lifecycle.rs` ancestry alone is not the evidence ([selected:209–300][aligned-access], [Close:550–638][aligned-close]). |
 | F10 settings/reporting | `mod.rs`, fixed production policies, public partition methods | Partial/deferred full native public exposure ([settings:275–283][settings], [partition:1036–1064][partition]). |
 | F11 async/error/drain | Retained facade/transport/provider tasks and service committers | Rust future/task/waker substitutions; direct Close, Remove and separate join are not interchangeable ([facade test:351–387][join]). |
 
@@ -147,9 +148,9 @@ maintained. Former filenames here are plain text, not live navigation targets.
 
 [aligned-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
 [aligned-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505
-[aligned-access]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L99-L184
-[aligned-access-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/support/staged_access.rs#L133-L1025
-[aligned-swap]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/support/staged_access.rs#L896-L1025
+[aligned-access]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L209-L300
+[aligned-access-tests]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L144-L2159
+[aligned-swap]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L2030-L2159
 [aligned-native-selector]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L288-L381
 [kv]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/kvstore2/src/v1.rs#L195-L376
 [kv-read]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/kvstore2/tests/read_fencing.rs#L554-L611

@@ -2,7 +2,8 @@
 
 This is the authoritative behavioral reference for the selected classic V1
 runtime. Selected-host Close/access evidence is pinned to Kuberic
-`aad23335c219a576d69133cee883bbd63e40b68a`; unchanged component references
+`69b1cfe3c85d296463da0def3e80eaca0ddcd0a7` (Close references retain their
+explicit `aad23335c219a576d69133cee883bbd63e40b68a` anchors); unchanged component references
 retain their explicit `e2a47b6c631c974aa0135e81c3a7e3a439980ded` anchors.
 Native comparisons use Service Fabric
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
@@ -194,8 +195,8 @@ Revoke is access-only, not synthetic `change_role(None)`
 
 Selected production now publishes live operation-owned stages, not the private
 host's full selector. Paired-role/configuration/catch-up evidence and matching
-completion determine access ([selected policy:99–184][selected-policy],
-[activation:590–629][selected-activation]):
+completion determine access ([selected policy:209–300][selected-policy],
+[activation:721–766][selected-activation]):
 
 | Reachable stage | Read | Write |
 |---|---|---|
@@ -224,8 +225,20 @@ immediately after final wait, before a fallible outcome receipt. These are the
 reachable native branches ([selector:288–381][native-stage-selector]), not its
 unreachable demotion CatchupCompleted table row. Deterministic real-public-host
 barriers attempt service committed reads and raw assignment across these cuts
-([stage witnesses:133–1025][selected-tests]); private selector tests alone are
+([stage witnesses:144–2159][selected-tests]); private selector tests alone are
 not the evidence.
+
+Same-primary grants require matching previous/current primary context, not just
+old paired-role receipts. A demoted host can later promote again: compatible
+final-demotion evidence survives interrupted/superseded reservations without
+carrying serving grants. Actual native role/epoch observation, fresh application
+role, configuration, catch-up and activation remain required. Nonactivating
+configuration or uninvoked role reservations cannot consume that evidence
+([same-host/lineage witnesses:919–1545][reconciliation-tests]).
+Controller unavailable current/capability observations produce explicit
+not-ready descriptors rather than leave old availability installed
+([producer/selected witness:484–599][producer-tests]); restored admission is
+distinct from a completed transported write.
 
 **Outer Close** records the child identity/error, aborts both children and skips
 later graceful callbacks after a child failure. Successful actual terminal
@@ -423,9 +436,11 @@ production-readiness support from the selected Rust journeys.
 [authority]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/native_transport.rs#L148-L226
 [ingress-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/tests/production_ingress.rs#L226-L370
 [protocol]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/protocol/public_operations.rs#L13
-[selected-policy]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L99-L184
-[selected-activation]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L590-L629
-[selected-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/support/staged_access.rs#L133-L1025
+[selected-policy]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L209-L300
+[selected-activation]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L721-L766
+[selected-tests]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L144-L2159
+[reconciliation-tests]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L919-L1545
+[producer-tests]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L484-L599
 [selected-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
 [selected-recovery]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L79-L115
 [selected-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505

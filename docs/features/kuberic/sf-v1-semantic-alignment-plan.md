@@ -1,7 +1,7 @@
 # SF V1: Pending Alignment and Qualification
 
 This is a current work queue, not a delivery-phase checklist. Host-alignment
-baseline: Kuberic `aad23335c219a576d69133cee883bbd63e40b68a`; native SF
+baseline: Kuberic `69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; native SF
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 Read [current semantics](classic-v1-runtime.md) first and use the
 [disposition ledger](sf-v1-port-ledger.md) to interpret historical SF IDs.
@@ -28,14 +28,16 @@ callback sequence or generic application-task join.
 
 The selected runtime now publishes same-primary, split/recipe promotion and
 standalone/composed demotion stages from operation-owned live evidence
-([policy:99–184][aligned-access], [public barriers:133–1025][aligned-access-tests]).
+([policy:209–300][aligned-access], [public barriers:144–2159][aligned-access-tests]).
 The [current matrix and protocol-13 boundary](classic-v1-runtime.md#host-access-lifecycle-and-retirement)
 replace the former blanket pending/fence availability difference. Public tests
 attempt committed service reads and raw writes, including independent missing
 C/P, pre/post-Revoke, final-wait-before-receipt, cancellation, exact replay,
 late owner and final release. Descriptor availability is not live health
 certification; service isolation and the actual shared admission gate remain
-independent. This is bounded source-guided alignment, not exhaustive native
+independent. Previous/current primary context and same-live-host repromotion
+after interrupted/superseded demotion have selected witnesses; nonactivating
+operations do not erase outstanding reconciliation. This is bounded source-guided alignment, not exhaustive native
 stage/interleaving qualification.
 
 ## P2 — Focused qualification, not presumed defects
@@ -120,8 +122,8 @@ do not satisfy the entire original P8 qualification claim.
 
 [aligned-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
 [aligned-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505
-[aligned-access]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L99-L184
-[aligned-access-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/support/staged_access.rs#L133-L1025
+[aligned-access]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L209-L300
+[aligned-access-tests]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L144-L2159
 
 [minority]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/public_v1_recovery.rs#L2302-L2433
 [marked]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/replica_manager/tests.rs#L690-L719

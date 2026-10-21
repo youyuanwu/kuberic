@@ -135,12 +135,17 @@ certification. Actual wire old-version rejection is not native wire compatibilit
 
 Targeted runs for the host-alignment revision exercise the real selected
 `ReplicaHost` and default public factory. The
-[stage witnesses](../../../kuberic-runtime/tests/support/staged_access.rs#L133-L1025)
+[stage witnesses](../../../kuberic-runtime/tests/support/staged_access.rs#L144-L2159)
 hold actual executor/callback boundaries and attempt committed service reads
 and raw sequence assignment, not only a private selector. They cover joint/
 current-only same-primary, missing C/P, split/recipe promotion, current-only/
 joint standalone/composed demotion, immediate post-final-wait denial,
 cancellation/replay, late reservation/completion and final publication.
+They also cover previous-primary-context negatives and same-live-host
+repromotion after completed/interrupted demotion, including superseded
+promotion/secondary-role/Swap reservations and nonactivating configuration.
+Native role/epoch is reconciled only for compatible lineage; fresh role/
+configuration/catch-up/activation still controls serving access.
 The split-promotion observer-drop witness crosses authenticated control RPC;
 other testing-handle entries are selected-host evidence, not all RPC-ingress
 qualification.
@@ -151,6 +156,9 @@ native/provider joins separately. Explicitly seeded recovery records and unit
 callback/receipt cuts are not process-crash, power-loss or generic application
 task-join proof. Protocol-13 tests cover required availability encoding,
 changed-input rejection and deliberate old descriptor-bearing state rejection.
+Full-planner unavailable current/capability observations reach actual selected
+C/P denial/restoration through public commands. Restored raw admission in that
+producer test is not a claim of completed transport/quorum publication.
 
 Inventory the exact filter first, then run it. For checkout-owned temporary
 files, set an absolute ignored scratch directory:
