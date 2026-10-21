@@ -10,7 +10,7 @@
 - Reason: Phase 7 removed the legacy engine, selectors, private attachments, continuation stores, old protocol/controller branches, and fallback. Public V1 is now the sole built-in path.
 - MVP alternative: None; the direct replacement is complete.
 - Revisit when: Never for compatibility. Production activation remains a separate fresh-state operational decision.
-- Evidence: `docs/features/kuberic/stateless-default-replicator.md` and `docs/features/kuberic/service-fabric-alignment.md` describe the as-built one-path replacement.
+- Evidence: [current selection](../features/kuberic/classic-v1-runtime.md#selection-and-ownership) and [ownership](../features/kuberic/stateless-default-replicator.md).
 
 ### P6D-02: Pre-cutover state migration and rolling compatibility
 - Status: REJECTED
@@ -27,18 +27,22 @@
 - Evidence: `docs/features/kuberic/stateless-default-replicator.md` excludes transparent crash continuation and requires conservative ambiguous-write handling.
 
 ### P6D-04: Public V1 transport authentication or peer authorization
-- Status: DEFERRED
-- Reason: Public V1 intentionally has no transport credential contract. Replica identity, session, epoch, history and build values are correctness fences rather than credentials.
-- MVP alternative: Preserve exact lifecycle fencing without an authentication or authorization activation gate.
-- Revisit when: A separate security requirement authorizes TLS identity, workload identity, tokens or another transport-credential design.
-- Evidence: `docs/features/kuberic/replicator-boundary.md` and `docs/features/kuberic/stateless-default-replicator.md` document the unauthenticated design boundary.
+- Status: SUPERSEDED BY CURRENT BEARER AUTHENTICATION
+- Decision context: This replacement-era deferral concerned a then-credential-free
+  transport; it is not the current security boundary.
+- Current disposition: Production checks the host agent bearer token over HTTP.
+  Identity/history/build fences remain separate from credentials; TLS is absent.
+  Native credential-settings/update capability is still not exposed.
+- Revisit when: Deployment-security qualification or broader credential APIs are
+  separately authorized; do not treat ordinary network/token protection as rare.
+- Evidence: [current security and direct source citations](../features/kuberic/classic-v1-runtime.md#production-policies-and-security).
 
 ### P6D-05: Optional V2 transactional durability
 - Status: DEFERRED
 - Reason: Phase 6 proves the SF V1-shaped public replacement using provider-owned application durability; a Replicator-owned transactional layer is not required for that outcome.
 - MVP alternative: Keep state providers authoritative for application bytes, progress and retained history.
 - Revisit when: A separately selected consumer requires the V2 transactional contract after the public-only V1 replacement is stable.
-- Evidence: `docs/features/kuberic/service-fabric-alignment.md` places optional V2 after the public-only V1 replacement.
+- Evidence: [separate V2 design](../features/kuberic/v2-transactional-replicator-design.md) and [current V1 pending work](../features/kuberic/sf-v1-semantic-alignment-plan.md).
 
 ### P6D-06: Eagerly reap completed transport task handles
 - Status: IMPLEMENTED

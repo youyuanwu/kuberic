@@ -1,377 +1,78 @@
 Third-Party Notices
 ===================
 
-Service Fabric classic V1 component translations and source ledger
------------------------------------------------------------------
+Service Fabric classic V1 translations and source-derived documentation
+----------------------------------------------------------------------
 
-The connected default-factory composition now selects the translated owners.
-Private/unselected labels below record the original delivery boundaries.
-The Kuberic production host/carrier and service adapters compose that material;
-they do not incorporate additional native COM, hosting or transport utilities.
-See docs/features/kuberic/classic-v1-runtime.md for current selection and
-docs/features/kuberic/sf-v1-port-provenance.md for representation changes.
-
-The source-derived acceptance scenarios and selected native test expectations
-documented in docs/features/kuberic/sf-v1-port-ledger.md derive from Microsoft
-Service Fabric at commit 3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
-
-The internal Rust OperationQueue and its component tests in
-kuberic-runtime/src/replicator/v1/operation_queue.rs and
-kuberic-runtime/src/replicator/v1/operation_queue/tests.rs translate selected
-Microsoft OperationQueue.h/.cpp algorithms and OperationQueue.Test.cpp
-assertions at that same pin, with Rust ownership/storage adaptations and
-additional production-source-derived cases. They are not factory-selected.
-
-The internal sender.rs, ack.rs, session.rs and their component tests under
-kuberic-runtime/src/replicator/v1/ translate selected ReliableOperationSender,
-AckSender, RemoteSession and ReplicationSession production algorithms and
-ReliableOperationSender.Test.cpp/DecayAverage.Test.cpp assertions. The sender
-also translates DecayAverage and the REPerformanceCounters tick-mean helper.
-This is a bounded session responsibility port, not copy/build/primary/receiver
-integration or a carrier. Rust ownership, staged effects and injected time
-replace native pointer/timer execution; components remain production-unselected.
-
-The private transport.rs, buffers.rs, async_runtime.rs, sf_v1.proto and their
-component tests adapt selected ReplicationTransport message contracts,
-ReplicationEndpointId routing, RemoteSession send outcomes, and
-ReliableOperationSender/AckSender timer-lifetime obligations at the same pin.
-Tokio/tonic, bounded Rust queues and explicit versioned buffer framing replace
-native execution/transport representations. No native wire serialization,
-Common/Transport timer library, test harness or activated listener is imported.
-See the provenance register for exact selected ranges and remaining owners.
-
-The private replication_queue_manager.rs, replica_manager.rs and their component
-tests under kuberic-runtime/src/replicator/v1/ translate selected
-ReplicationQueueManager/ReplicaManager primary queue, configured quorum,
-assignment/completion and catch-up algorithms, plus selected
-ReplicaManager.Test.cpp expectations at the same pin. Rust-owned queue entries,
-caller-established sessions, staged effects and separate completion receivers
-replace COM operations/job queues; they do not import native utilities or
-implement the complete primary, copy/build, slow-fault or role state machines.
-The components remain production-unselected.
-
-The private received_operation.rs, operation_stream.rs, secondary_receiver.rs
-and their component tests under kuberic-runtime/src/replicator/v1/ translate
-selected ComFromBytesOperation/ComOperation callback-lifetime,
-OperationStream/GetOperationAsyncOperation and SecondaryReplicationReceiver
-algorithms, selected SecondaryReplicator ACK/admission orchestration, and
-ReplicationSecondary.Test.cpp expectations at the same pin. Rust-owned ACK
-work, shared consuming streams, staged wakeups and explicit provider epoch
-handoffs replace COM callbacks and ReaderQueue/Begin-End plumbing. Native
-copy/build, provider invocation, fault reporting, graceful drains and full role
-integration remain separate owners; failure containment is not their successful
-execution. No Common ReaderQueue implementation or native test harness is
-imported. The components remain private and production-unselected.
-
-The private secondary_copy_receiver.rs, copy_context_receiver.rs and their
-component tests under kuberic-runtime/src/replicator/v1/ translate selected
-SecondaryCopyReceiver and CopyContextReceiver algorithms at the same pin.
-The shared received-operation constructor and copy_receiver_integration.rs
-also adapt selected ReplicationTransport terminal metadata and
-SecondaryReplicator/RemoteSession ACK-boundary responsibilities.
-Existing Rust queue, received-operation, shared-stream and ACK-scheduler
-components replace native COM/ReaderQueue/Begin-End ownership plumbing.
-Copy-context receipt is target-to-source; it does not implement provider
-invocation, copy enumeration/sending, StartCopy establishment or build
-completion. Receiver-local cleanup is not full cross-receiver fault/drain or
-role orchestration. The components remain private and production-unselected;
-the provenance register records exact sources and representation adaptations.
-
-The private copy_async_operation.rs and its component tests under
-kuberic-runtime/src/replicator/v1/ translate selected CopyAsyncOperation.h/.cpp
-and ComProxyAsyncEnumOperation.cpp enumeration contracts, plus selected
-CopyAsyncOperation.Test.cpp expectations at the same pin. The actual Rust queue
-and reliable sender retain their algorithms; a caller-driven Tokio future,
-weak handles and rooted stream lease replace native Threadpool/Begin-End/COM
-execution. The sender's read-only pending-operation view stages lifetime
-release outside copy-owner guards, without adding another ordering queue.
-No native utility or harness is imported. CopySender replication build gates,
-provider acquisition, StartCopy and full role/drain integration remain separate.
-This enumeration/sending owner remains private and production-unselected.
-
-The private copy_sender.rs and its component tests under
-kuberic-runtime/src/replicator/v1/ translate selected CopySender.h/.cpp
-completion/state/ACK/retarget algorithms, the EOF latest-issued-target callback
-from PrimaryReplicator.BuildIdleAsyncOperation.cpp, and ordered RemoteSession
-handoff obligations at the same pin. The existing CopyAsyncOperation gains
-explicit external-error completion for native FinishOperation. Short Rust
-transitions, weak handles and a callback-rooted owner replace COM/Begin-End
-plumbing; explicit errors replace malformed-input assertions. Tests use the
-actual queue, reliable sender, sessions and copy/context receivers, without
-the native harness. This is not provider acquisition, complete BuildIdle,
-StartCopy, periodic/slow-fault policy or role/drain/host integration.
-All components remain private and production-unselected.
-
-The private copy_establishment.rs and its component tests translate selected
-RemoteSession.EstablishCopyAsyncOperation.cpp, RemoteSession.cpp,
-ReplicationSession.cpp, PrimaryReplicator.cpp,
-PrimaryReplicator.BuildIdleAsyncOperation.cpp, SecondaryReplicator.cpp and
-ComProxyStateProvider.cpp establishment/acquisition responsibilities at the
-same pin. Existing session/reliable sender and logical tonic adapter implement
-StartCopy delivery. Protected StateProvider callbacks and retained Rust futures
-replace COM stream acquisition/Begin-End; bound full logical routes replace
-native demux lookup only after caller-owned idle-role admission. Explicit private
-errors replace malformed-input assertions, and -1 is a private error token, not
-native HRESULT interoperability. Tests use actual receivers/senders, provider
-trait implementations and a real tonic connection, not a native harness.
-At that slice boundary, full BuildIdle/session/role/drain and provider-monitoring
-owners remained pending;
-all components remain private and production-unselected.
-
-The private build_idle.rs and its component tests translate selected
-PrimaryReplicator.BuildIdleAsyncOperation.cpp lifecycle responsibilities,
-ReplicaManager.cpp admission/removal/close and ReplicationQueueManager.cpp
-classic pending-build selection at the same pin. The existing manager, queue,
-establishment, session and CopySender remain the actual owners; no second
-algorithm or sender is introduced. Rust futures, weak driver/manager references,
-rooted lifecycle metadata and outside-guard effects replace COM/Threadpool/
-Begin-End lifetime plumbing. StartCopy is published during admission before
-callbacks can remove the replica. Already-selected sends may survive removal,
-but retries and pending build success do not. Explicit malformed-ACK checks
-reuse CopySender normalization before session coalescing; timer wakeups resample
-deadlines after ingress or enqueue. Tests execute these actual Rust components
-and protected provider implementations, not native binaries or the native
-harness. At that slice boundary, full role/cross-receiver drain composition,
-slow-peer/promotion policy, host health reporting and provider monitoring
-remained pending. All components
-remain private and production-unselected.
-
-The private secondary.rs and its component tests translate selected ordinary
-Close/EndClose/Abort and provider/receiver lifetime responsibilities from
-SecondaryReplicator.cpp, SecondaryReplicator.CloseAsyncOperation.cpp,
-SecondaryReplicator.CloseAsyncOperation2.cpp,
-SecondaryReplicator.DrainQueueAsyncOperation.cpp and
-OperationStream.GetOperationAsyncOperation.cpp at the same pin. Actual existing
-receiver, establishment, context-sender and ACK components remain the owners.
-Retained Rust provider futures, shared dispatch initialization/drain snapshots,
-weak ingress and outside-guard Notify wakes replace COM/job/manual-reset-event
-plumbing. Cleanup callback tokens retain the actual provider without a
-receiver/root cycle. Legacy containment, EOS initialized-stream drain, distinct
-provider/stream fault aftermath and independent Abort are not conflated. Tests
-execute actual Rust components and protected provider implementations, not a
-native harness. At that slice boundary, primary/session/role orchestration,
-external epoch reconfiguration, promotion, monitoring/health and production
-activation remained pending; arbitrary provider GetNext drainage is not
-asserted. Components remain private and production-unselected.
-
-The private primary.rs and its component tests translate selected
-PrimaryReplicator.cpp ordinary lifetime and bound ACK/context lookup,
-PrimaryReplicator.CloseAsyncOperation.cpp quorum prewait/Close,
-ReplicaManager.cpp cancellation/callback-drain and RemoteSession.cpp rooted
-ordered ACK processing responsibilities at the same pin. Existing actual
-queue/quorum, session, BuildIdle, CopySender and provider owners are composed,
-not replaced. Split guarded build preparation publishes routes before
-reentrant sends; shared handoff delivery preserves ACK ordering and continues
-after failures. Retained Rust build futures, weak ingress, outside-guard effects,
-Tokio deadlines/Notify and rooted activity accounting replace COM/job/callback
-queue plumbing. Oneshot delivery drainage does not assert client waiter
-execution or arbitrary pending provider-call drain. At that slice boundary,
-configuration was a caller-established seam, not native session creation or
-promotion. At that slice boundary, full role/external-epoch/queue-transfer, slow-peer/
-MustCatchup policy, monitoring/health and production activation remained pending.
-Tests execute actual Rust components,
-not native binaries or a native harness. Components remain private/unselected.
-
-The descriptor-based primary configuration extension in primary.rs, narrow
-replica_manager.rs/session.rs/sender.rs seams and
-primary/tests/configuration.rs translate selected PrimaryReplicator.cpp
-catch-up/current update entry points, ReplicaManager.cpp:306-335,1205-1779
-session creation/reuse, membership/replay/retirement and
-ReplicationSession.cpp:279-283 idle-to-active session marking/average reset at
-the same pin. Typed Rust descriptors use optional progress for the native
-unknown sentinel and contain active remote members only. Configuration matches
-existing sessions by replica ID; retained endpoint/incarnation and ACK state are
-not silently replaced by new descriptor metadata. Bound ACK ingress still
-checks full identity. Shared existing quorum/replay/catchup algorithms and
-outside-guard effects are reused. Actual pending copy/provider work is neither
-declared successful nor implicitly drained by session promotion. This is not
-secondary-to-primary role promotion, external epoch/queue transfer, slow-peer
-policy, host integration or production activation. Tests execute actual Rust
-components, not native binaries or the native harness.
-
-The private role.rs, its component tests and narrow primary/secondary/receiver/
-queue-manager extensions translate selected ReplicatorState.cpp role edges,
-Replicator.ChangeRoleAsyncOperation.cpp close/create/handoff ordering,
-ReplicationQueueManager.cpp and SecondaryReplicationReceiver.cpp queue transfer,
-promotion-specific branches of both SecondaryReplicator Close operations,
-idle-to-active dispatch drainage and primary/secondary UpdateEpoch operations
-at the same immutable pin. Retained caller-driven Rust steps/provider futures
-replace native COM async roots. Actual queue/operation identity and original
-epochs survive; demotion enforces count/logical-byte bounds and correct service
-ACK mode without reconstructing history or replaying already-applied state.
-Distinct ordinary/promotion Close, required/optimistic ACK and direct/stream
-epochs remain separate. Old primary builds retain their actual provider calls
-for explicit later drainage, not an invented role-completion promise.
-At that slice boundary data-loss/recovery/reset, periodic/slow-peer policy,
-host demux/health, public adapters and activation remain pending. No native binary, native test
-harness or utility dependency is incorporated.
-
-The private data-loss extension of role.rs, actual recovery tests and narrow
-primary/manager reset/admission seams translate selected
-Replicator.OnDatalossAsyncOperation.cpp:30-157,
-ReplicatorState.cpp:129-139,177-186, Replicator.cpp:659-708,799-838,
-PrimaryReplicator.cpp:501-505, ReplicaManager.cpp:1015-1023 and
-ReplicationQueueManager.cpp:148-160 at the same immutable pin.
-Changed/unchanged recovery and progress expectations derive from
-PublicApi.Test.cpp:1349-1383 plus the production paths above. Retained Rust
-provider futures and explicit End results preserve changed flags, original
-errors and primary-state restoration. Actual reset reuses the existing queue;
-native no-pending-work assumptions become explicit errors. Abort retains
-provider obligations but cannot publish successful reset/recovery. Broader
-host recovery/rebuild policy, public adapters and activation remain pending.
-No native binary, fixture, harness or utility dependency is incorporated.
-
-The private queue-policy extension in replica_manager/policy.rs and narrow
-primary/session/build/establishment/queue/carrier extensions translate selected
-ReplicaManager.cpp:173-284,350-432,530-545,716-778,1748-1750,1832-2076,2443-2450;
-ReplicationSession.cpp:87-283; RemoteSession.cpp:448-490;
-standarddeviation.h:17-22 and standarddeviation.cpp:32-76;
-Replicator.cpp:946-980; OperationQueue.cpp:135-138,205-212;
-ComOperation.cpp:18-28; REInternalSettings.cpp:451-607; and
-src/prod/src/ServiceModel/reliability/replication/REConfigMacros.h:166-177,
-at the same immutable pin. Actual component tests derive from these production
-paths; DecayAverage.Test.cpp:65-108 and ReplicatorSettings.Test.cpp:738-788
-are reviewed context, not whole-test translations. Injected Tokio time and
-outside-guard Rust effects replace native timers/locks, preserving sender
-closure before reclamation, separate quorum/all/MustCatchup observations,
-actual copy completion-disable races and deferred/retrying fault notification.
-Existing typed tonic InduceFault carries real bound target identity; no native
-wire compatibility or remote host fault handling is claimed. No native
-binary, fixture, test harness or utility/dependency implementation is imported.
-
-The private ingress.rs, secondary/ingress.rs and role/secondary/establishment/
-receiver/carrier extensions translate selected Replicator.cpp:618-759,
-ReplicatorState.cpp:39-186,
-Replicator.ChangeRoleAsyncOperation.cpp:131-275,405-489,
-Replicator.CloseAsyncOperation.cpp:31-180,
-SecondaryReplicator.cpp:915-1035,1125-1263,1306-1396,1438-1621,2282-2344
-and existing ReplicationTransport.cpp:684-832 contracts at the same immutable
-pin. Shared Rust selection, actual receiver/session ownership, retained reply
-routes and required outside-guard fault callbacks replace native job queues,
-locking and partition COM handoffs. Tests derive from these production paths
-and execute actual owners and a real tonic connection, not native tests,
-fixtures, binaries or a harness. Production host wiring remains unselected;
-no native wire compatibility or complete hosted/native parity is asserted.
-
-The private Open/recovery extension of role.rs, logical endpoint registration
-in ingress.rs, shared endpoint validation in transport.rs and actual-owner
-regressions translate selected Replicator.OpenAsyncOperation.cpp:29-81,
-ReplicatorState.cpp:16-37,177-242, Replicator.cpp:178-253,296-367,
-ReplicationTransport.h:253-267,301-308,
-ReplicationTransport.cpp:872-878, ComProxyStateProvider.cpp:63-79,
-Replicator.ChangeRoleAsyncOperation.cpp:131-208 and
-Replicator.CloseAsyncOperation.cpp:31-100,131-180 at the same immutable pin.
-Rust RAII registration and typed endpoints replace native demux roots/string
-formatting; retained explicitly driven futures replace synchronous COM progress
-reads. Successful negative provider progress normalizes to zero; errors are not
-erased. Restart exercises the existing empty recovered queue, missing-replay
-error and caller-directed copy/build/receiver/session owners rather than
-recovering invented bytes or importing placement policy. No native transport,
-monitoring, utility, fixture or test-harness implementation is incorporated.
-All components remain private and production-unselected.
-
-The private service_adapter.rs, its actual-owner tests, primary.rs/secondary.rs
-query seams and build_idle.rs End notification compose selected
-ComReplicator.cpp:219-313, ComReplicator.ReplicateOperation.cpp:23-74,
-Replicator.ReplicateAsyncOperation.cpp:31-98,
-PrimaryReplicator.ReplicateAsyncOperation.cpp:31-66,
-Replicator.cpp:296-562,889-907, PrimaryReplicator.cpp:319-336,
-SecondaryReplicator.cpp:553-619,
-ComOperationStream.GetOperationOperation.cpp:23-72,
-ComFromBytesOperation.cpp:139-257 and EnumOperators.cpp:85-129 at the same pin.
-Weak Rust service handles, explicitly driven resumable controls, retained
-completion receivers and outside-guard notifications replace COM Begin/End
-execution plumbing. Existing queues, ACK callbacks, provider barriers and build
-owners remain authoritative; no second engine, service-local commit hook,
-mandatory DurableState or success oracle is added. Tests use actual compiled
-owners and a helper-free in-memory service, not native binaries/fixtures.
-Public facade/factory, real services and host/report integration remain
-unselected. No native utility, harness or third-party dependency source is
-imported; full concurrent native facade interleavings are not asserted.
-
-The private service_adapter/facade.rs and its actual-owner protected-trait tests
-compose selected Replicator.cpp:178-253,296-562,
-ReplicatorState.cpp:39-126,177-248,
-Replicator.CatchupReplicaSetAsyncOperation.cpp:29-94 and
-Replicator.CloseAsyncOperation.cpp:31-154 at the same pin. A bounded Rust request
-channel and one retained Tokio driver replace COM operation rooting; actual
-primary/secondary/role/build owners supply intact retired-owner transfer,
-pollable build drainage and explicit retained legacy-secondary context drainage.
-Protected signatures remain unchanged. Synchronous Abort admission/
-projected-child revocation and task-owned coordination, exclusive control
-admission and explicit cancellation-safe join are documented Rust execution
-substitutions, not full native concurrent interleaving parity. Ordinary Close,
-arbitrary provider drainage and abnormal Drop remain distinct. Exact private
-peer snapshots are not a production registry or invented identity conversion.
-No native utility, dependency or harness implementation is imported; production
-factory/public data APIs/services/wire/reports remain unchanged and unselected.
-
-The private host/v1_lifecycle.rs and its actual-owner integration tests translate
-selected Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:
-34-381, FailoverUnitProxy.cpp:1399-1455,
-FailoverUnitProxy.ChangeReplicatorRoleAsyncOperation.cpp:99-140,
-FailoverUnitProxy.ChangeReplicaRoleAsyncOperation.cpp:93-150 and
-FailoverUnitProxy.CloseAsyncOperation.cpp:30-110,164-276 at the same pin.
-Typed host intent/availability and actual child role/catch-up callbacks replace
-FUP fields; caller-owned retained futures replace Begin/End rooting. Native
-TryAgain maps to existing ReconfigurationPending. Host Up/Ready minimum/majority
-is distinct from engine W, ACK progress and provider durability. Structured
-child diagnostics, explicit Abort and separate join preserve outer teardown
-versus graceful child Close/provider drainage. The already-opened application,
-private binding snapshots and activation acknowledgement are explicit host
-seams, not an RA/FM/placement port, public Open/factory, production registry or
-failure detector. Shared service-handle access rebinding and actual owner
-observations do not change production serving policy. No native utility,
-monitoring, dependency or harness implementation is imported; selected
-factory/services/wire/reports/controller and protected signatures are unchanged.
-Host/proxy state and policy are owned outside the replication engine. Opaque
-crate-private facade setup/probes and neutral observation/access callbacks
-replace concrete engine-to-host coupling without exposing core types.
-
-The private examples/kvstore2/src/v1.rs service companion and its real-storage,
-actual-V1-owner regressions use selected service-owned ordering from
-Store/ReplicatedStore.TransactionReplicator.cpp:606-796,848-900 at the same
-immutable pin, together with the existing classic V1 assignment/completion,
-receiver/ACK, stream/copy and role/recovery sources recorded above. A retained
-Rust FIFO commit worker and existing KV file/fsync/rename persistence replace
-KVS transaction/COM lifetime plumbing. Preparation, local commit, read
-visibility and client completion belong to the service, not the engine.
-KVS batching/implicit completion, tombstones, local-store implementation and
-native harness/utility/dependency source are not ported. The existing testing
-feature and a repository-only dev dependency bridge real KV storage to private
-runtime fixtures without exporting engine types or creating a public factory.
-Actual file IO/restart tests are not native execution, power-loss qualification,
-hosted/differential parity or production service migration. Protected interfaces,
-selected services/factory/host/status/wire/reports/controller remain unchanged;
-Private SQLite preparation follows below; production migration and atomic
-cutover remain pending.
-
-The private examples/sqlite/src/v1.rs companion, native-only frame-log helpers
-and actual-V1-owner regressions use the same selected service-owned ordering
-from Store/ReplicatedStore.TransactionReplicator.cpp:606-796,848-900, together
-with the existing classic V1 assignment/completion, receiver/ACK, stream/copy
-and role/recovery sources. This is application adaptation over the existing
-real SQLite WAL staging VFS, connection and fsynced frame log, not an SF SQLite
-implementation. Retained FIFO SQL work replaces KVS transaction/COM rooting;
-local frame commitment, WAL publication and client success remain separate
-service responsibilities. No native engine algorithm is replaced. KVS
-batching/implicit completion, tombstones, local-store utilities and native
-harness/dependency source are not ported. An existing-feature testing bridge
-and repository-only dev dependency expose neutral callbacks, not engine types.
-Protected interfaces and production selection/services/host/status/wire/reports/
-controller remain unchanged. File IO/restart tests do not claim native
-execution, power-loss or old-store migration qualification, hosted/differential
-parity, production service migration, full P4 closure or atomic P5 activation.
+Selected production algorithms, message contracts and test expectations derive
+from Microsoft Service Fabric at immutable commit
+3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d.
 
 Copyright (c) Microsoft Corporation. All rights reserved.
 
-The complete upstream MIT notice is preserved in LICENSES/service-fabric-MIT.txt.
-The selected production/test material, exact source references, adaptation
-changes and third-party boundaries are recorded in
-docs/features/kuberic/sf-v1-port-provenance.md. No native implementation binary,
-Boost test harness or Common/Transport/KTL dependency source is incorporated.
+The complete upstream MIT permission, inclusion requirement and disclaimer are
+preserved verbatim in LICENSES/service-fabric-MIT.txt. Exact native source/test
+paths, ranges, named cases, Rust destinations, transformations and exclusions
+are recorded in docs/features/kuberic/sf-v1-port-provenance.md.
+docs/features/kuberic/sf-v1-port-ledger.md records current evidence/dispositions;
+docs/features/kuberic/classic-v1-runtime.md describes selected current behavior.
+
+The selected private components under kuberic-runtime/src/replicator/v1/ include:
+
+- operation_queue.rs: OperationQueue admission/cursors/retention/transfer and
+  selected OperationQueue.Test.cpp assertions.
+- sender.rs, session.rs, ack.rs: ReliableOperationSender, RemoteSession,
+  ReplicationSession, AckSender, DecayAverage/REPerformanceCounters algorithms
+  and selected sender/DecayAverage test assertions.
+- transport.rs, buffers.rs, async_runtime.rs and proto/sf_v1.proto: selected
+  ReplicationTransport/endpoint/header/message and timer-lifetime contracts,
+  adapted to bounded Rust queues, explicit buffer framing and Tokio/tonic.
+- replication_queue_manager.rs, replica_manager.rs, primary.rs and policy:
+  primary queue/quorum/configuration/catch-up/pressure/slow-peer/Close ownership
+  and selected ReplicaManager assertions.
+- received_operation.rs, operation_stream.rs, secondary_receiver.rs,
+  secondary_copy_receiver.rs, copy_context_receiver.rs and secondary.rs:
+  ComFromBytesOperation/OperationStream/secondary receiver and lifecycle
+  responsibilities and selected ReplicationSecondary/ReplicateCopyOperations
+  expectations.
+- copy_async_operation.rs, copy_sender.rs, copy_establishment.rs and
+  build_idle.rs: selected enumeration, target-context acquisition, StartCopy,
+  build/retarget/cancellation and provider-lifetime contracts, including
+  selected CopyAsyncOperation test expectations.
+- role.rs, ingress.rs and secondary/ingress.rs: ReplicatorState, role/epoch,
+  data-loss, Open/restart, routing and direct lifecycle responsibilities,
+  including selected PublicApi data-loss expectations.
+- service_adapter.rs and service_adapter/facade.rs: protected trait/service
+  assignment/quorum/shared-stream/ACK and retained async control ownership.
+
+These components and their adjacent tests retain selected Microsoft
+copyright/MIT attribution. The default production adapter composes them; they
+are private API internals, not production-unselected delivery slices.
+The production host/carrier uses Kuberic-authored exact authority and bearer
+adapters, not imported native COM, transport or hosting utilities.
+
+kuberic-runtime/src/host/v1_lifecycle.rs and its integration tests derive
+selected native FailoverUnitProxy access/availability/role/outer-Close behavior.
+The production journal executor does not select all of this private host's
+staged access and outer-Close policy; provenance is not equivalence evidence.
+
+examples/kvstore2/src/v1.rs and examples/sqlite/src/v1.rs use selected
+service-owned ordering from
+Store/ReplicatedStore.TransactionReplicator.cpp:606-796,848-900 at the same pin.
+Retained FIFO workers and existing KV file/fsync/rename or SQLite WAL/VFS/frame
+log primitives replace KVS transaction/COM lifetime plumbing. Local preparation,
+commit, visibility/publication and client success belong to the services.
+This is not a whole KVS or SF SQLite port; batching/implicit completion,
+tombstones and native local-store internals are not incorporated.
+
+Rust ownership/futures/tasks/wakers, injected time and logical tonic/protobuf
+replace platform execution representations. Selected native assertions are
+transformed expectations, not whole native fixtures or executed native tests.
+No native implementation binary, Boost test harness, Common/Transport/KTL
+utility, third-party asset or native dependency build graph is incorporated.
 Service Fabric's heterogeneous ThirdPartyNotices.txt is not an all-MIT license.
-Kuberic's existing license and adapted API-documentation notice below remain.
+Future selections require their own exact-origin/license/notice review.
+Kuberic's existing license and the adapted API-documentation notice below remain.
 
 Service Fabric API documentation
 -------------------------------

@@ -5,8 +5,9 @@ Service Fabric-shaped public interfaces.
 
 The sole built-in factory composes the source-guided native classic V1 owners.
 See the [runtime guide](classic-v1-runtime.md) for assignment, stream, controller,
-transport and restart behavior. The [port plan](sf-v1-semantic-alignment-plan.md)
-retains the source baseline and intentionally separate parity/qualification gates.
+transport and restart behavior, with direct selected source/test evidence.
+The [pending-items plan](sf-v1-semantic-alignment-plan.md) separates verified
+core differences, unverified qualification and deferred capability work.
 
 ## Public Interfaces
 
@@ -54,8 +55,9 @@ ACK. Primary preparation, ordered commitment, publication and client success
 are service-owned and separate from native quorum completion.
 
 Streams share the native receiver lifetime; an explicit end-of-stream operation
-has its own ACK rules. Retirement is typed `RuntimeError::Closed`, not successful
-EOF. Missing consumers do not manufacture required service ACKs. Cancelled
+has its own ACK rules. An aborted reader sees typed `RuntimeError::Closed`
+once before termination, distinct from graceful EOF. Missing consumers do not
+manufacture required service ACKs. Cancelled
 observers do not cancel accepted native or application work.
 
 ## Public Completion Evidence
@@ -67,9 +69,14 @@ transport state into controller evidence.
 - configuration completion means the exact PC/CC description is installed;
 - catch-up completion means the requested predicate holds;
 - build completion means copy plus retained catch-up completed;
-- remove completion means the exact idle target is released;
+- remove completion releases the exact idle membership/retention target, not
+  arbitrary provider callbacks or remote storage;
 - data-loss completion is validated against exact history/provider evidence;
-- Close/Abort drain or contain descendants.
+- direct Close, Abort containment requests and separate task/provider joins
+  have distinct postconditions; a cancelled observer proves none of those joins.
+
+The [lifecycle evidence](classic-v1-runtime.md#host-access-lifecycle-and-retirement)
+documents these limits and the selected outer-Close/native outcome difference.
 
 Incomparable histories return no ordering. Numeric progress cannot substitute
 for history identity.

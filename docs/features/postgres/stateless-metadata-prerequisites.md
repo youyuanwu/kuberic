@@ -2,11 +2,13 @@
 
 ## Status
 
-Required prerequisite architecture. PostgreSQL restart-stateless metadata work
-is blocked until every prerequisite in this document and every applicable
-public/custom conformance requirement in
-[Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md)
-is implemented and verified.
+Proposed prerequisite architecture for PostgreSQL restart-stateless metadata,
+not a current runtime contract. Before resuming that separate design, reassess
+its proposed obligations against [current semantics](../kuberic/classic-v1-runtime.md),
+[finding dispositions](../kuberic/sf-v1-port-ledger.md) and
+[pending work](../kuberic/sf-v1-semantic-alignment-plan.md).
+The catch-up/progress proposals below must not override current native
+queue/captured-boundary semantics or establish new defects by assertion.
 
 These changes belong to Kuberic's generic Service Fabric-shaped
 reconfiguration behavior. They must not introduce PostgreSQL-specific runtime
@@ -69,11 +71,9 @@ are issued, retried, and considered complete.
 ## Upstream Service Fabric Conformance Gate
 
 This document supplements rather than replaces the generic conformance
-inventory in
-[Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md).
-The current public/custom path is materially misaligned with SF semantics, so
-the three PostgreSQL-discovered changes below are not the complete generic
-runtime prerequisite set.
+inventory in the [current evidence ledger](../kuberic/sf-v1-port-ledger.md).
+The proposed PostgreSQL-discovered changes below are not a verified current
+generic runtime gap inventory; use the current pending-items plan for that.
 
 Before PostgreSQL metadata-removal implementation begins, the conformance
 catalog must classify every `KSF-*` finding as applicable or inapplicable to a
@@ -618,9 +618,9 @@ prerequisite fails and PostgreSQL metadata removal remains blocked.
 - [PostgreSQL Restart-Stateless Metadata](stateless-metadata.md) is blocked and
   must be rewritten around these completed prerequisites before
   implementation.
-- [Service Fabric Alignment and Runtime Simplification](../kuberic/service-fabric-alignment.md)
+- [Pending SF V1 alignment and qualification](../kuberic/sf-v1-semantic-alignment-plan.md)
   defines the broader generic ownership direction.
-- [Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md)
+- [Current SF V1 semantics](../kuberic/classic-v1-runtime.md)
   is the authoritative public/custom conformance inventory that must be
   completed or explicitly classified before this work proceeds.
 - [Stateless Default Replicator](../kuberic/stateless-default-replicator.md)
