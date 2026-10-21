@@ -194,19 +194,17 @@ of SF V2's lower interface.
 
 | Existing boundary | Baseline evidence | Required adaptation |
 |---|---|---|
-| Coherent factory registration | `kuberic-runtime/src/replicator/mod.rs:280-318,981-1029` | One outer lifecycle bundle, one creation identity and one listener |
-| Public replication completion | `kuberic-runtime/src/replicator/traits.rs:139-162` | Keep public completion unchanged; supply early-LSN/private completion separately |
-| Primary durable apply before quorum | `kuberic-runtime/src/replicator/stateless/mod.rs:2828-2991` | Factor private transport/log-acceptance phases instead of making this whole method V2's scheduler |
-| Direct secondary durability delivery | `kuberic-runtime/src/replicator/stateless/mod.rs:1024-1125` | Provide actual V2 operation streams with durability/apply ACK dependencies |
-| Provider persistence hooks | `kuberic-runtime/src/engine.rs:19-50` | Retain existing V1 `DurableState`; do not redefine its commit callback as V2 provider Apply |
-| Provider epoch/copy/progress | `kuberic-runtime/src/traits.rs:44-117` | Separate protected public adapter semantics from SF's private logging-provider callbacks |
-| Host readiness | `kuberic-runtime/src/host/hosting.rs:499-555,917-969` | Add private V2 readiness/progress evidence; equality of two old watermarks is insufficient |
-| Existing retained catch-up | `kuberic-runtime/src/replicator/stateless/mod.rs:1346-1547` | Preserve V1 behavior while admitting V2 history-aware readers and copy proofs |
+| Selected classic factory | [factory:1138–1156](../../../kuberic-runtime/src/replicator/mod.rs#L1138-L1156) | Preserve coherent public bundle/identity/listener ownership |
+| Early assignment / separate quorum completion | [production:473–491](../../../kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L473-L491) | Already present in V1; do not invent another completion/LSN path |
+| Shared received-operation streams and parameterless ACK | [production:341–378](../../../kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L341-L378) | V2 logging/provider Apply dependencies are a separate design, not automatic V1 apply |
+| Service-owned commit/publication | [KV:195–240](../../../examples/kvstore2/src/v1.rs#L195-L240), [SQLite:272–345](../../../examples/sqlite/src/v1.rs#L272-L345) | Do not redefine optional V1 helpers as V2 provider Apply or engine prerequisites |
+| Protected provider epoch/copy/progress | [provider contract:47–104](../../../kuberic-runtime/src/traits.rs#L47-L104) | Preserve protected signatures; distinguish issued/receive/quorum from service durability |
+| Host access / lifecycle and catch-up | [current reference](classic-v1-runtime.md) | Use actual selected policy and captured-boundary predicates, not old watermark/removed-engine assumptions |
 
-Audit findings in the [SF contract tracker](service-fabric-contract-audit.md)
-remain open unless fixed independently with evidence. Access admission, swap
-capability/staging, containment, retained-boundary proofs and catch-up behavior
-must be qualified before V2 activation.
+The [current evidence/disposition ledger](sf-v1-port-ledger.md) replaces inherited
+Open labels. Verified selected-host differences and claim-specific qualification
+remain in the [pending-items plan](sf-v1-semantic-alignment-plan.md). V2 is still
+a separate deferred design, not a reason to label broad P7 capabilities complete.
 
 ### Private V1 transport bridge
 
@@ -215,7 +213,8 @@ Port the seam represented by SF
 Its Rust equivalent supplies:
 
 - start replication and return an assigned LSN plus owned completion handle;
-- secondary replication and copy streams with explicit ACK/reject;
+- secondary replication and copy streams with explicit ACK and separately
+  specified stream-fault behavior (V1 has no item-level negative ACK);
 - target-to-source copy-context exchange;
 - maximum message size and bounded admission;
 - exact epoch, session, configuration, storage and build fencing.

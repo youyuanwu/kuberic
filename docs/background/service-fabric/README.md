@@ -23,8 +23,9 @@ document; older studies used `build/service-fabric/` (depth-1 clone).
 
 ## Related Kuberic Documents
 
-- [Stateful API Semantics and Kuberic Conformance](../../features/kuberic/service-fabric-api-semantics.md)
-- [Service Fabric Alignment and Runtime Simplification](../../features/kuberic/service-fabric-alignment.md)
+- [Kuberic classic V1 current semantics](../../features/kuberic/classic-v1-runtime.md)
+- [Current evidence and finding dispositions](../../features/kuberic/sf-v1-port-ledger.md)
+- [Pending alignment and qualification](../../features/kuberic/sf-v1-semantic-alignment-plan.md)
 - [Stateless Default Replicator](../../features/kuberic/stateless-default-replicator.md)
 - [Kuberic V2 Transactional Replicator Design](../../features/kuberic/v2-transactional-replicator-design.md)
 - [SQLite on a V2 Transactional Replicator](../../features/sqlite/v2-transactional-replicator.md)

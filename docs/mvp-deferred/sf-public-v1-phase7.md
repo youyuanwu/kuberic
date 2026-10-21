@@ -3,6 +3,11 @@
 - Work ID: sf-public-v1-phase7
 - Core outcome: Replace the legacy built-in stack with the sole fresh-state Public V1 path and validate it through existing repository workflows.
 
+This record's replacement-era “Phase 7” is not the native-alignment program's
+deferred broad P7 capability expansion. Use the [current pending-items plan](../features/kuberic/sf-v1-semantic-alignment-plan.md)
+for that scope and [current evidence](../features/kuberic/sf-v1-port-ledger.md)
+instead of inherited historical finding labels.
+
 ## Decisions
 
 ### P7D-01: Image publication and production cutover
@@ -17,14 +22,19 @@
 - Reason: The replacement-only release is validated from fresh state and intentionally rejects old controller and agent state plus every supported in-repository provider format rather than interpreting or enrolling it. Independent custom Replicators own classification and rejection of their provider storage because the protected public interfaces expose no generic storage-format introspection.
 - MVP alternative: Initialize only the replacement schema, fail closed on old controller/agent and supported-provider state, and require each independent custom Replicator to reject its own prior provider storage before participation.
 - Revisit when: Only through a separately approved product decision that changes the no-compatibility design.
-- Evidence: `docs/features/kuberic/stateless-default-replicator.md` defines fresh-storage activation, provider-owned application durability and no generic migration contract; `docs/features/kuberic/service-fabric-alignment.md` excludes preservation and mixed-version operation.
+- Evidence: [current ownership and recovery constraints](../features/kuberic/stateless-default-replicator.md) and [selected semantics](../features/kuberic/classic-v1-runtime.md).
 
 ### P7D-03: Public V1 transport authentication or peer authorization
-- Status: REJECTED
-- Reason: Public V1 intentionally has no transport credential contract. Replica identity, session, epoch, history, storage, build and operation values are correctness fences rather than credentials.
-- MVP alternative: Preserve exact lifecycle fencing and use the controller command credential, resource identity and Kubernetes RBAC only as separate control-plane fences.
-- Revisit when: Only if the credential-free transport design is explicitly replaced.
-- Evidence: `docs/features/kuberic/replicator-boundary.md` and `docs/features/kuberic/stateless-default-replicator.md` document the unauthenticated Public V1 boundary.
+- Status: SUPERSEDED BY CURRENT BEARER AUTHENTICATION
+- Decision context: The replacement-era credential-free decision no longer
+  describes the selected transport.
+- Current disposition: Host agent bearer credentials authenticate peer/control
+  requests over HTTP; exact correctness fences independently authorize delivery.
+  TLS and native public credential-settings/update parity are not provided.
+- Revisit when: Separately scoped deployment-security qualification or credential
+  capability work is approved. Network/token/resource protection is already a
+  deployment constraint, not merely an optional rare extension.
+- Evidence: [current security and direct source citations](../features/kuberic/classic-v1-runtime.md#production-policies-and-security).
 
 ### P7D-04: Transparent completion of crash-interrupted client requests
 - Status: DEFERRED
@@ -38,7 +48,7 @@
 - Reason: Provider-owned Public V1 application durability is sufficient for the replacement-only release and its fresh-state acceptance boundary.
 - MVP alternative: Keep state providers authoritative for application bytes, progress, retained history and copy state.
 - Revisit when: A selected consumer requires the V2 transactional contract after the public-only V1 replacement is stable.
-- Evidence: `docs/features/kuberic/service-fabric-alignment.md` places optional V2 after the Phase 7 public-only V1 replacement.
+- Evidence: [separate V2 design](../features/kuberic/v2-transactional-replicator-design.md) and [current V1 obligations](../features/kuberic/sf-v1-semantic-alignment-plan.md).
 
 ### P7D-06: Dedicated reproducible-build or attestation infrastructure
 - Status: DEFERRED
@@ -66,7 +76,7 @@
 - Reason: KSF-16 needs proof that its concrete eligibility oracle detects semantic reintroduction, not an exhaustive mutation-testing campaign or new harness.
 - MVP alternative: Maintain exact source, artifact and runtime-registration allowlists and one differently named extra-owner or endpoint mutation fixture that must fail eligibility.
 - Revisit when: A regression escapes the allowlist model or the replacement capability surface expands enough that one representative mutation no longer validates the oracle.
-- Evidence: `docs/features/kuberic/service-fabric-alignment.md` defines KSF-16 as the legacy-continuation guard; the existing project test strategy favors bounded, risk-specific checks over a new general framework.
+- Evidence: [current testing tiers](../features/kuberic/testing.md) and the `KSF-16` ownership/eligibility mapping in `kuberic-runtime/tests/public_v1_conformance.rs`; the decision remains a bounded-risk choice, not a native compatibility claim.
 
 ### P7D-10: Kubernetes cutover Lease
 - Status: REJECTED

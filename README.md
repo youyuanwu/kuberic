@@ -151,12 +151,11 @@ the isolated development/CI assets above.
 ## Documentation
 
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
-- [Classic V1 default Replicator](docs/features/kuberic/classic-v1-runtime.md)
-- [Service Fabric alignment](docs/features/kuberic/service-fabric-alignment.md)
-- [Faithful SF V1 replicator port design and plan](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
-- [SF V1 P1 source/scenario ledger](docs/features/kuberic/sf-v1-port-ledger.md) and [provenance/notices](docs/features/kuberic/sf-v1-port-provenance.md)
+- [Classic V1 current semantics](docs/features/kuberic/classic-v1-runtime.md)
+- [SF V1 pending alignment and qualification](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
+- [SF V1 current evidence/dispositions](docs/features/kuberic/sf-v1-port-ledger.md) and [source provenance/notices](docs/features/kuberic/sf-v1-port-provenance.md)
 - [V2 transactional Replicator design](docs/features/kuberic/v2-transactional-replicator-design.md)
-- [Replicator boundary and native proof](docs/features/kuberic/replicator-boundary.md)
+- [Replicator ownership boundary](docs/features/kuberic/replicator-boundary.md)
 - [Testing strategy](docs/features/kuberic/testing.md)
 - [Downstream in-process application testing](docs/features/kuberic/in-process-testing.md)
 - [Downstream in-process testing harness design](docs/proposal/downstream-in-process-testing.md)

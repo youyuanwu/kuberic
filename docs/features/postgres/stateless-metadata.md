@@ -12,11 +12,13 @@ the existing Service Fabric-shaped lifecycle callbacks as the complete
 application boundary, with PostgreSQL facts reconstructed from PGDATA and
 callback completion serving as the native acceptance boundary.
 
-The applicable public/custom requirements in
-[Service Fabric Stateful API Semantics and Kuberic Conformance](../kuberic/service-fabric-api-semantics.md)
-must be completed before this design can be rewritten or implemented. The
-PostgreSQL audit additionally identified three application-neutral
-reconfiguration blockers:
+Use [current semantics](../kuberic/classic-v1-runtime.md),
+[current finding dispositions](../kuberic/sf-v1-port-ledger.md) and
+[pending alignment/qualification](../kuberic/sf-v1-semantic-alignment-plan.md)
+to reassess prerequisites before rewriting or implementing this draft.
+Its old blocker labels are not evidence of current selected-path defects.
+The earlier PostgreSQL audit identified these application-neutral
+reconfiguration concerns:
 
 1. deferred cold role restoration after listeners and fresh peer sessions are
    available;
@@ -1487,5 +1489,6 @@ insufficient quorum evidence.
 - [PostgreSQL: Native Replication on Kuberic V2](design.md)
 - [CloudNativePG Architecture](../../background/cloudnative-pg-architecture.md)
 - [Stateless Default Replicator](../kuberic/stateless-default-replicator.md)
-- [Service Fabric Alignment and Simplification](../kuberic/service-fabric-alignment.md)
+- [Current SF V1 semantics](../kuberic/classic-v1-runtime.md)
+- [Pending SF V1 alignment and qualification](../kuberic/sf-v1-semantic-alignment-plan.md)
 - [Service Fabric State Management and Persistence](../../background/service-fabric/state-management.md)
