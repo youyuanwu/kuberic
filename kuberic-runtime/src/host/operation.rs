@@ -106,12 +106,34 @@ impl PartitionOperation {
         Ok(())
     }
 
+    pub(crate) async fn track_recovery_containment(&self, witness: watch::Receiver<bool>) -> bool {
+        let _lifecycle = self.lifecycle.lock().await;
+        let mut descendants = self.descendants.lock().await;
+        if self.snapshot().stage != PublicOperationStage::ContainmentPending
+            || descendants.is_some()
+        {
+            return false;
+        }
+        *descendants = Some(witness);
+        self.wait_for_descendants
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
+    }
+
+    pub(crate) fn record_containment_failure(&self, error: &HostError) {
+        tracing::warn!(%error, operation_id = %self.intent().operation_id, "terminal recovery remains uncontained");
+        self.failure.send_replace(Some(error.to_string()));
+        self.bump_revision();
+    }
+
     async fn descendants_contained(&self) -> bool {
-        self.descendants
-            .lock()
-            .await
-            .as_ref()
-            .is_none_or(|witness| *witness.borrow())
+        self.descendants.lock().await.as_ref().map_or(
+            !matches!(
+                self.intent().program,
+                Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
+            ),
+            |witness| *witness.borrow(),
+        )
     }
 
     async fn settle_witness(&self) -> Result<()> {
@@ -657,6 +679,11 @@ impl PartitionOperation {
         self.bump_revision();
     }
 
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn retained_failure(&self) -> Option<String> {
+        self.failure.borrow().clone()
+    }
+
     fn needs_recovery(&self) -> bool {
         self.needs_recovery
             .load(std::sync::atomic::Ordering::Acquire)
@@ -929,6 +956,13 @@ pub(crate) struct PartitionOperationRegistry {
     control_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     terminal_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     abort_guard: Arc<std::sync::Mutex<bool>>,
+    terminal_recovery: std::sync::OnceLock<
+        Arc<
+            dyn Fn() -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl PartitionOperationRegistry {
@@ -961,7 +995,20 @@ impl PartitionOperationRegistry {
             control_tasks: std::sync::Mutex::new(Vec::new()),
             terminal_tasks: std::sync::Mutex::new(Vec::new()),
             abort_guard: Arc::new(std::sync::Mutex::new(false)),
+            terminal_recovery: std::sync::OnceLock::new(),
         }))
+    }
+
+    pub(crate) fn bind_terminal_recovery(
+        &self,
+        callbacks: impl Fn() -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        self.terminal_recovery
+            .set(Arc::new(callbacks))
+            .map_err(|_| HostError::CommandRejected("terminal recovery is already bound".into()))
     }
 
     pub(crate) fn revision_receiver(&self) -> watch::Receiver<u64> {
@@ -1508,6 +1555,15 @@ impl PartitionOperationRegistry {
             {
                 recovered.push(record);
             }
+            if matches!(
+                operation.intent().program,
+                Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
+            ) && operation.snapshot().stage == PublicOperationStage::ContainmentPending
+                && let Some(callbacks) = self.terminal_recovery.get()
+            {
+                crate::host::public_lifecycle::recover_terminal(self, &operation, callbacks()?)
+                    .await?;
+            }
         }
         if !recovered.is_empty() {
             self.bump_revision();
@@ -1565,6 +1621,23 @@ impl PartitionOperationRegistry {
         drop(admission);
         if let Err(error) = self.recover_unowned().await {
             first_error.get_or_insert(error);
+        }
+        // Recovery can discover a terminal record whose cleanup owner did not
+        // exist at the first join boundary. Join those owners too; shutdown is
+        // not complete merely because durable discovery has finished.
+        loop {
+            let terminals =
+                std::mem::take(&mut *self.terminal_tasks.lock().expect("terminal task lock"));
+            if terminals.is_empty() {
+                break;
+            }
+            for task in terminals {
+                if let Err(error) = task.await {
+                    first_error.get_or_insert_with(|| {
+                        HostError::CommandRejected(format!("terminal cleanup join failed: {error}"))
+                    });
+                }
+            }
         }
         match first_error {
             Some(error) => Err(error),

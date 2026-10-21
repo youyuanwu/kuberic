@@ -75,3 +75,42 @@ pub(super) fn bind(
     };
     (cleanup, task)
 }
+
+pub(crate) async fn recover(
+    registry: &PartitionOperationRegistry,
+    operation: &Arc<PartitionOperation>,
+    mut callbacks: PublicLifecycleCallbacks,
+) -> Result<()> {
+    let (contained, witness) = watch::channel(false);
+    if !operation.track_recovery_containment(witness).await {
+        return Ok(());
+    }
+    registry.fence();
+    callbacks.aborted = registry.abort_guard();
+    // Recovery cannot execute the uncertain instruction program. It still
+    // owns Abort and actual drain, independently of any replay observer.
+    let revoked = (callbacks.revoke_access)();
+    callbacks.abort_once();
+    let (cleanup, owner) = bind(callbacks);
+    let operation = operation.clone();
+    registry.own_terminal_task(async move {
+        let join = async {
+            let result = cleanup.wait().await.and(revoked.map_err(HostError::from));
+            match result {
+                Ok(()) => {
+                    contained.send_replace(true);
+                    if let Err(error) = operation.complete_containment().await {
+                        operation.record_containment_failure(&error);
+                    }
+                }
+                Err(error) => {
+                    // Keep the original Ambiguous/Cancelled disposition and a
+                    // separate retained cleanup diagnostic. Do not settle on error.
+                    operation.record_containment_failure(&error);
+                }
+            }
+        };
+        tokio::join!(owner, join);
+    });
+    Ok(())
+}

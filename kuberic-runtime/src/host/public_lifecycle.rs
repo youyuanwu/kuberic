@@ -30,6 +30,7 @@ mod program;
 #[path = "public_lifecycle_terminal.rs"]
 mod terminal;
 pub(crate) use program::{operation_instructions, repeatable, replayable};
+pub(crate) use terminal::recover as recover_terminal;
 
 pub(crate) fn instruction_selected(
     record: &super::state::PublicOperationRecord,
@@ -118,6 +119,7 @@ pub(crate) fn is_replacement_role_replay(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PublicCutPosition {
     BeforeInstruction,
+    InstructionSelected,
     CallbackSuccess,
     InstructionApplied,
     CallbackApplied,
@@ -244,6 +246,10 @@ pub(crate) async fn launch(
     let operation = registry.admit(intent.clone()).await?;
     if intent.class.is_terminal() {
         registry.fence();
+        if operation.snapshot().stage == PublicOperationStage::ContainmentPending {
+            terminal::recover(registry, &operation, callbacks).await?;
+            return Ok(operation);
+        }
         if callbacks.preempt_retained_owner
             && registry.has_uncontained_predecessors(&operation).await
         {
@@ -264,8 +270,17 @@ pub(crate) async fn launch(
             }
             let terminal_guard = if intent.class.is_terminal() {
                 let (cleanup, owner) = terminal::bind(callbacks.clone());
-                callbacks.terminal_cleanup = Some(cleanup);
-                terminal_registry.own_terminal_task(owner);
+                callbacks.terminal_cleanup = Some(cleanup.clone());
+                let terminal_operation = operation.clone();
+                terminal_registry.own_terminal_task(async move {
+                    owner.await;
+                    if let Err(error) = cleanup.wait().await {
+                        // A cancelled root no longer observes Cleanup's result.
+                        // Keep that failure independently of its disposition.
+                        let _ = terminal_operation.wait_for_terminal().await;
+                        terminal_operation.record_containment_failure(&error);
+                    }
+                });
                 Some(terminal::TerminalRootGuard(callbacks.clone()))
             } else {
                 None

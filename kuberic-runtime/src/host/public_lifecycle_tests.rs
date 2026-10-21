@@ -810,20 +810,18 @@ async fn sf06_close_child_failures_abort_skip_graceful_work_and_preserve_errors(
         let operation = fixture.launch(PublicOperationProgram::Close, 1).await;
         let record = completed(&operation).await;
         assert_eq!(record.stage, PublicOperationStage::Completed);
-        let Some(PublicOperationDisposition::Failed(error)) = record.disposition else {
-            panic!("not failed");
-        };
-        assert!(error.contains(if replication {
-            "replicator close injected"
-        } else {
-            "application close injected"
-        }));
+        assert_eq!(
+            record.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
         assert!(
             record
                 .lifecycle
                 .outcomes
                 .iter()
-                .any(|outcome| matches!(outcome, PublicInstructionOutcome::CloseFailure { .. }))
+                .any(|outcome| matches!(outcome, PublicInstructionOutcome::CloseFailure { child, error }
+                    if *child == if replication { crate::host::state::PublicCloseChild::Replicator } else { crate::host::state::PublicCloseChild::Application }
+                        && error.contains(if replication { "replicator close injected" } else { "application close injected" })))
         );
         let events = fixture.probe.events.lock().unwrap().clone();
         if replication {
@@ -1122,9 +1120,14 @@ async fn sf06_failed_close_and_cancelled_abort_cannot_outrun_owned_cleanup() {
         if failed_close {
             let record = completed(&operation).await;
             assert_eq!(record.stage, PublicOperationStage::Completed);
-            assert!(
-                matches!(record.disposition, Some(PublicOperationDisposition::Failed(ref error)) if error.contains("replicator close injected"))
+            assert_eq!(
+                record.disposition,
+                Some(PublicOperationDisposition::Succeeded)
             );
+            assert!(record.lifecycle.outcomes.iter().any(|outcome| {
+                matches!(outcome, PublicInstructionOutcome::CloseFailure { error, .. }
+                    if error.contains("replicator close injected"))
+            }));
         }
         fixture.registry.shutdown().await.unwrap();
         assert_eq!(operation.snapshot().stage, PublicOperationStage::Completed);
@@ -1383,6 +1386,7 @@ async fn sf06_replayed_terminal_cuts_reestablish_containment_and_preserve_first_
                             .public_instruction(&intent, index, instruction, Some(outcome))
                             .await?;
                     }
+
                     if cut == 3 {
                         store
                             .public_instruction(
@@ -1418,22 +1422,23 @@ async fn sf06_replayed_terminal_cuts_reestablish_containment_and_preserve_first_
                 Some(PublicOperationDisposition::Succeeded)
             );
         } else {
-            assert!(
-                matches!(record.disposition, Some(PublicOperationDisposition::Failed(ref error)) if error.contains("retained first close failure"))
-            );
             if cut == 3 {
                 assert!(
-                    matches!(record.disposition, Some(PublicOperationDisposition::Failed(ref error)) if error.contains("drain injected"))
+                    matches!(record.disposition, Some(PublicOperationDisposition::Failed(ref error))
+                        if error.contains("drain injected") && error.contains("retained first close failure"))
+                );
+            } else {
+                assert_eq!(
+                    record.disposition,
+                    Some(PublicOperationDisposition::Succeeded)
                 );
             }
-            let events = fixture.probe.events.lock().unwrap().clone();
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| event == "replicator.close" || event == "application.close")
-            );
+            assert!(record.lifecycle.outcomes.iter().any(|outcome| {
+                matches!(outcome, PublicInstructionOutcome::CloseFailure { error, .. }
+                    if error == "retained first close failure")
+            }));
             assert_eq!(
-                events,
+                *fixture.probe.events.lock().unwrap(),
                 [
                     "replicator.abort",
                     "application.abort",
@@ -1445,4 +1450,413 @@ async fn sf06_replayed_terminal_cuts_reestablish_containment_and_preserve_first_
         assert_eq!(fixture.probe.none_calls.load(Ordering::SeqCst), 0);
         fixture.registry.shutdown().await.unwrap();
     }
+}
+
+impl Fixture {
+    async fn interrupt_close_at(
+        &self,
+        position: PublicCutPosition,
+        index: usize,
+    ) -> PublicOperationIntent {
+        self.interrupt_terminal_at(PublicOperationProgram::Close, position, index)
+            .await
+    }
+
+    async fn interrupt_terminal_at(
+        &self,
+        program: PublicOperationProgram,
+        position: PublicCutPosition,
+        index: usize,
+    ) -> PublicOperationIntent {
+        let intent = self.intent(program, 1);
+        self.registry.admit(intent.clone()).await.unwrap();
+        self.store
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                PublicOperationStage::Ready,
+                PublicOperationStage::Running,
+                None,
+            )
+            .await
+            .unwrap();
+        let cut = Arc::new(PublicOperationCut {
+            position,
+            index,
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let mut callbacks = self.callbacks.clone();
+        callbacks.aborted = self.registry.abort_guard();
+        callbacks.cut = Some(cut.clone());
+        let (cleanup, owner) = terminal::bind(callbacks.clone());
+        callbacks.terminal_cleanup = Some(cleanup);
+        let owner = tokio::spawn(owner);
+        let store = self.store.clone();
+        let captured = intent.clone();
+        // Lose process-local owners without publishing cancellation, at the
+        // actual instruction/receipt boundary exercised by the executor.
+        let task = tokio::spawn(async move { program::execute(store, captured, callbacks).await });
+        tokio::time::timeout(Duration::from_secs(5), cut.entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        owner.abort();
+        let _ = owner.await;
+        intent
+    }
+
+    fn replace_registry(&mut self, predecessor: bool, bind_callbacks: bool) {
+        self.registry = PartitionOperationRegistry::new(
+            self.store.clone(),
+            PublicV1Identity::new(6),
+            ProcessSessionId::new(if predecessor {
+                "successor-session"
+            } else {
+                "session"
+            }),
+        )
+        .unwrap();
+        if bind_callbacks {
+            let callbacks = self.callbacks.clone();
+            self.registry
+                .bind_terminal_recovery(move || Ok(callbacks.clone()))
+                .unwrap();
+        }
+    }
+
+    async fn retained_close(&self) -> PublicOperationRecord {
+        self.store
+            .public_operation_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.intent.program == Some(PublicOperationProgram::Close))
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn sf06_interrupted_destructive_close_cuts_are_ambiguous_and_owned_not_repeated() {
+    for predecessor in [false, true] {
+        for index in [1, 2] {
+            for position in [
+                PublicCutPosition::InstructionSelected,
+                PublicCutPosition::CallbackSuccess,
+            ] {
+                let mut fixture = Fixture::new().await;
+                let intent = fixture.interrupt_close_at(position, index).await;
+                let events = fixture.probe.events.lock().unwrap().clone();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| *event == "replicator.close")
+                        .count(),
+                    usize::from(index == 2 || position == PublicCutPosition::CallbackSuccess)
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| *event == "application.close")
+                        .count(),
+                    usize::from(index == 2 && position == PublicCutPosition::CallbackSuccess)
+                );
+                fixture.probe.block_drain.store(true, Ordering::Release);
+                fixture.replace_registry(predecessor, true);
+                fixture.registry.recover_unowned().await.unwrap();
+                fixture.probe.drain_entered.notified().await;
+                let pending = fixture.retained_close().await;
+                assert_eq!(pending.stage, PublicOperationStage::ContainmentPending);
+                assert!(matches!(
+                    pending.disposition,
+                    Some(PublicOperationDisposition::Ambiguous(_))
+                ));
+                if !predecessor {
+                    let replay = fixture.launch(PublicOperationProgram::Close, 1).await;
+                    assert!(replay.complete_containment().await.is_err());
+                } else {
+                    assert!(fixture.registry.admit(intent).await.is_err());
+                }
+                let during = fixture.probe.events.lock().unwrap().clone();
+                for child in ["replicator.close", "application.close"] {
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event.as_str() == child)
+                            .count(),
+                        during
+                            .iter()
+                            .filter(|event| event.as_str() == child)
+                            .count()
+                    );
+                }
+                assert_eq!(
+                    during
+                        .iter()
+                        .filter(|event| *event == "application.abort")
+                        .count(),
+                    1
+                );
+                fixture.probe.drain_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while fixture.retained_close().await.stage != PublicOperationStage::Completed {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    fixture.retained_close().await.disposition,
+                    pending.disposition
+                );
+                if !predecessor {
+                    let replay = fixture.launch(PublicOperationProgram::Close, 1).await;
+                    assert_eq!(completed(&replay).await, fixture.retained_close().await);
+                    assert_eq!(fixture.probe.events.lock().unwrap().len(), during.len() + 1);
+                }
+                fixture.registry.shutdown().await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sf06_recorded_close_failure_and_cleanup_receipts_rejoin_current_process_owner() {
+    for index in [1, 2, 3] {
+        let mut fixture = Fixture::new().await;
+        fixture
+            .probe
+            .fail_replicator_close
+            .store(index == 1, Ordering::Release);
+        fixture
+            .probe
+            .fail_application_close
+            .store(index != 1, Ordering::Release);
+        fixture
+            .interrupt_close_at(PublicCutPosition::InstructionApplied, index)
+            .await;
+        // Consume the original owner's notification at the Cleanup receipt cut.
+        if index == 3 {
+            fixture.probe.drain_entered.notified().await;
+        }
+        let before = fixture.probe.events.lock().unwrap().clone();
+        fixture.probe.block_drain.store(true, Ordering::Release);
+        fixture.replace_registry(false, true);
+        fixture.registry.recover_unowned().await.unwrap();
+        let replay = fixture.launch(PublicOperationProgram::Close, 1).await;
+        fixture.probe.drain_entered.notified().await;
+        assert_eq!(replay.snapshot().stage, PublicOperationStage::Running);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), replay.wait_for_terminal())
+                .await
+                .is_err()
+        );
+        fixture.probe.drain_release.notify_one();
+        let record = completed(&replay).await;
+        assert_eq!(
+            record.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
+        assert!(record.lifecycle.outcomes.iter().any(|outcome| {
+            matches!(outcome, PublicInstructionOutcome::CloseFailure { error, .. }
+                                    if error.contains("close injected"))
+        }));
+        let after = fixture.probe.events.lock().unwrap().clone();
+        for child in ["replicator.close", "application.close"] {
+            assert_eq!(
+                before
+                    .iter()
+                    .filter(|event| event.as_str() == child)
+                    .count(),
+                after.iter().filter(|event| event.as_str() == child).count()
+            );
+        }
+        fixture.registry.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sf06_recovery_missing_owner_cleanup_error_and_lost_witness_never_settle() {
+    for failure in ["drain", "witness"] {
+        let mut fixture = Fixture::new().await;
+        let intent = fixture
+            .interrupt_close_at(PublicCutPosition::InstructionSelected, 1)
+            .await;
+        fixture.replace_registry(false, false);
+        fixture.registry.recover_unowned().await.unwrap();
+        let operation = fixture.registry.admit(intent).await.unwrap();
+        let pending = operation.snapshot();
+        assert_eq!(pending.stage, PublicOperationStage::ContainmentPending);
+        assert!(operation.complete_containment().await.is_err());
+        if failure == "drain" {
+            fixture.probe.fail_drain.store(true, Ordering::Release);
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(false);
+            fixture.callbacks.containment = Some(receiver);
+            drop(sender);
+        }
+        let callbacks = fixture.callbacks.clone();
+        fixture
+            .registry
+            .bind_terminal_recovery(move || Ok(callbacks.clone()))
+            .unwrap();
+        fixture.registry.recover_unowned().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while operation.retained_failure().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            operation
+                .retained_failure()
+                .unwrap()
+                .contains(if failure == "drain" {
+                    "drain injected"
+                } else {
+                    "witness lost"
+                })
+        );
+        assert_eq!(operation.snapshot().disposition, pending.disposition);
+        assert!(operation.complete_containment().await.is_err());
+        fixture.registry.shutdown().await.unwrap();
+        assert_eq!(
+            operation.snapshot().stage,
+            PublicOperationStage::ContainmentPending
+        );
+    }
+}
+
+#[tokio::test]
+async fn sf06_shutdown_joins_terminal_owners_first_discovered_by_final_recovery() {
+    for failure in ["none", "drain", "witness"] {
+        let mut fixture = Fixture::new().await;
+        fixture
+            .interrupt_close_at(PublicCutPosition::InstructionSelected, 1)
+            .await;
+        fixture.probe.block_drain.store(true, Ordering::Release);
+        if failure == "drain" {
+            fixture.probe.fail_drain.store(true, Ordering::Release);
+        } else if failure == "witness" {
+            let (sender, receiver) = tokio::sync::watch::channel(false);
+            fixture.callbacks.containment = Some(receiver);
+            drop(sender);
+        }
+        fixture.replace_registry(false, true);
+        let registry = fixture.registry.clone();
+        let shutdown = tokio::spawn(async move { registry.shutdown().await });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.probe.drain_entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(!shutdown.is_finished());
+        fixture.probe.drain_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let record = fixture.retained_close().await;
+        assert!(matches!(
+            record.disposition,
+            Some(PublicOperationDisposition::Ambiguous(_))
+        ));
+        assert_eq!(
+            record.stage,
+            if failure == "none" {
+                PublicOperationStage::Completed
+            } else {
+                PublicOperationStage::ContainmentPending
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn sf06_cancelled_close_retains_cleanup_error_separately_from_cancellation() {
+    let fixture = Fixture::new().await;
+    fixture
+        .probe
+        .block_application_close
+        .store(true, Ordering::Release);
+    fixture.probe.block_drain.store(true, Ordering::Release);
+    fixture.probe.fail_drain.store(true, Ordering::Release);
+    let operation = fixture.launch(PublicOperationProgram::Close, 1).await;
+    fixture.probe.close_entered.notified().await;
+    operation.cancel_root().await.unwrap();
+    fixture.probe.drain_entered.notified().await;
+    assert_eq!(
+        operation.snapshot().disposition,
+        Some(PublicOperationDisposition::Cancelled)
+    );
+    assert!(operation.complete_containment().await.is_err());
+    fixture.probe.drain_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while operation.retained_failure().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        operation
+            .retained_failure()
+            .unwrap()
+            .contains("drain injected")
+    );
+    assert_eq!(
+        operation.snapshot().disposition,
+        Some(PublicOperationDisposition::Cancelled)
+    );
+    fixture.registry.shutdown().await.unwrap();
+    assert_ne!(
+        operation.snapshot().disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+}
+
+#[tokio::test]
+async fn sf06_recorded_abort_cleanup_receipt_reestablishes_application_abort_and_join() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .interrupt_terminal_at(
+            PublicOperationProgram::Abort,
+            PublicCutPosition::InstructionApplied,
+            2,
+        )
+        .await;
+    fixture.probe.drain_entered.notified().await;
+    fixture.probe.block_drain.store(true, Ordering::Release);
+    fixture.replace_registry(false, true);
+    fixture.registry.recover_unowned().await.unwrap();
+    let operation = fixture.launch(PublicOperationProgram::Abort, 1).await;
+    fixture.probe.drain_entered.notified().await;
+    assert_eq!(operation.snapshot().stage, PublicOperationStage::Running);
+    assert_eq!(
+        fixture
+            .probe
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "application.abort")
+            .count(),
+        2
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), operation.wait_for_terminal())
+            .await
+            .is_err()
+    );
+    fixture.probe.drain_release.notify_one();
+    assert_eq!(
+        completed(&operation).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    fixture.registry.shutdown().await.unwrap();
 }

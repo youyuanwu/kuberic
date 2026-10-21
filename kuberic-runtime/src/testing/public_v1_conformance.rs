@@ -1020,7 +1020,7 @@ const GATES: [Gate; 16] = [
     },
     Gate {
         id: "KSF-14",
-        name: "contained_close_failure_remains_failed",
+        name: "contained_close_preserves_child_diagnostic",
         owner: "close",
         postgres_scenarios: &["public_v1_postgres_contained_close"],
         replacement_scenarios: &[
@@ -1028,7 +1028,7 @@ const GATES: [Gate; 16] = [
             "hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline",
             "terminal_close_restarts_fenced_without_replaying_application_open",
         ],
-        expected: "failed close preserves child diagnostics after abort containment",
+        expected: "contained child Close failure preserves diagnostics after successful outer cleanup",
         eligibility: contract_gate,
     },
     Gate {

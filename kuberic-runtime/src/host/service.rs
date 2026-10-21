@@ -621,6 +621,16 @@ where
                 "Public V1 operation runtime is already active".into(),
             )
         })?;
+        let runtime = Arc::downgrade(&self.runtime);
+        registry.bind_terminal_recovery(move || {
+            runtime
+                .upgrade()
+                .ok_or(crate::host::HostError::CommandRejected(
+                    "terminal recovery runtime lost".into(),
+                ))?
+                .public_lifecycle_callbacks()
+                .map_err(Into::into)
+        })?;
         let runtime =
             crate::host::operation_recovery::PartitionOperationRuntime::start(registry.clone());
         self.runtime

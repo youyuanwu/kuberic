@@ -53,7 +53,10 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
 pub(crate) fn repeatable(instruction: PublicInstruction) -> bool {
     !matches!(
         instruction,
-        PublicInstruction::Build | PublicInstruction::DataLoss
+        PublicInstruction::Build
+            | PublicInstruction::DataLoss
+            | PublicInstruction::ReplicatorClose
+            | PublicInstruction::ApplicationClose
     )
 }
 
@@ -248,13 +251,15 @@ pub(super) async fn execute(
             None
         }
     });
-    // An interrupted close that already recorded a child failure still needs
-    // process-local abort containment; the durable diagnostic is not a proof.
-    if record
-        .lifecycle
-        .outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, O::CloseFailure { .. } | O::RebuildRequired(_)))
+    let recovered_terminal = matches!(program, P::Close | P::Abort) && start > 1;
+    // Recorded terminal effects still need process-local Abort containment;
+    // neither a child diagnostic nor an old Abort receipt is a live proof.
+    if recovered_terminal
+        || record
+            .lifecycle
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, O::CloseFailure { .. } | O::RebuildRequired(_)))
     {
         if record
             .lifecycle
@@ -280,6 +285,11 @@ pub(super) async fn execute(
         store
             .public_instruction(&intent, index, instruction, None)
             .await?;
+        #[cfg(all(test, feature = "testing"))]
+        if let Some(cut) = &callbacks.cut {
+            cut.pause(PublicCutPosition::InstructionSelected, index)
+                .await;
+        }
         let mut rebuild_failure = None;
         let outcome = match instruction {
             ApplicationOpen => {
@@ -529,7 +539,7 @@ pub(super) async fn execute(
                 O::Done
             }
             ReplicatorClose | ApplicationClose => {
-                if close_failure.is_some() {
+                if recovered_terminal || close_failure.is_some() {
                     O::Done
                 } else {
                     let (child, result) = if instruction == ReplicatorClose {
@@ -594,8 +604,19 @@ pub(super) async fn execute(
             return Err(HostError::CommandRejected(message.into()));
         }
     }
-    match close_failure {
-        Some(error) => Err(HostError::CommandRejected(error)),
-        None => Ok(()),
+    // A durable Cleanup receipt belongs to the previous owner, not this
+    // process. Even an otherwise fully recorded program must join its owner.
+    if intent.class.is_terminal() {
+        let cleanup = callbacks
+            .terminal_cleanup
+            .as_ref()
+            .ok_or_else(|| HostError::CommandRejected("terminal cleanup is not bound".into()))?;
+        if let Err(error) = cleanup.wait().await {
+            return Err(HostError::CommandRejected(match close_failure {
+                Some(failure) => format!("{failure}; cleanup failed: {error}"),
+                None => format!("terminal cleanup failed: {error}"),
+            }));
+        }
     }
+    Ok(())
 }
