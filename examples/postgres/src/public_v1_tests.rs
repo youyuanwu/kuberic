@@ -886,6 +886,46 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
     .await;
 }
 
+async fn assert_abort_reclaimed(
+    driver: &PgReplicator,
+    process: ProcessProbe,
+    credential: &NativeCredential,
+    mut sockets: Vec<tokio::net::TcpStream>,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        process.assert_gone().await;
+        for socket in &mut sockets {
+            closed(socket).await;
+        }
+        while !driver
+            .public_owner()
+            .owner
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            driver.public_owner().state.lock().await.grants.is_empty(),
+            "retained Abort did not release grant ownership"
+        );
+        loop {
+            if tokio::net::TcpStream::connect((&*credential.host, credential.port))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Abort reclamation exceeded its shared ten-second observation deadline");
+}
+
 pub(crate) async fn public_v1_postgres_retained_abort() {
     stage("retained public Abort", async {
         let directory = OracleDataDir::new();
@@ -902,55 +942,19 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         let credential = source.driver.public_owner().state.lock().await.grants[0]
             .credential
             .clone();
-        let mut authenticated = native_socket(&credential, &credential.name).await.unwrap();
-        let mut preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
+        let authenticated = native_socket(&credential, &credential.name).await.unwrap();
+        let preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
             .await
             .unwrap();
         let process = ProcessProbe::postgres(source.driver.instance.data_dir());
         Replicator::abort(source.driver.as_ref());
-        process.assert_gone().await;
-        closed(&mut authenticated).await;
-        closed(&mut preauth).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if tokio::net::TcpStream::connect((&*credential.host, credential.port))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("retained aborted driver still owns a gateway listener");
-        assert!(
-            source
-                .driver
-                .public_owner()
-                .state
-                .lock()
-                .await
-                .grants
-                .is_empty(),
-            "retained Abort did not release grant ownership"
-        );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !source
-                .driver
-                .public_owner()
-                .owner
-                .lock()
-                .await
-                .as_ref()
-                .unwrap()
-                .is_finished()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Abort owner did not finish joining gateways/connections");
+        assert_abort_reclaimed(
+            &source.driver,
+            process,
+            &credential,
+            vec![authenticated, preauth],
+        )
+        .await;
         assert!(
             target.driver.instance.is_running().await,
             "Abort affected an unrelated process"
@@ -986,45 +990,61 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
                 .unwrap();
             state.grants.last().unwrap().credential.clone()
         };
-        let mut preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
+        let preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
             .await
             .unwrap();
+        let process = ProcessProbe::postgres(hosted.driver.instance.data_dir());
         kuberic_runtime::StatefulServiceReplica::abort(hosted.service.as_ref());
-        closed(&mut preauth).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !hosted
-                .driver
-                .public_owner()
-                .owner
-                .lock()
-                .await
-                .as_ref()
-                .unwrap()
-                .is_finished()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(
-            hosted
-                .driver
-                .public_owner()
-                .state
-                .lock()
-                .await
-                .grants
-                .is_empty()
-        );
-        assert!(
-            tokio::net::TcpStream::connect((&*credential.host, credential.port))
-                .await
-                .is_err()
-        );
+        assert_abort_reclaimed(&hosted.driver, process, &credential, vec![preauth]).await;
         // Objects remain retained until after service Abort's independent observations.
         std::hint::black_box(&hosted.service);
         hosted.shutdown().await;
+        let failing = Replica::new(directory.path().join("join-failure"), 115).await;
+        failing.singleton(1).await;
+        let mut credentials = Vec::new();
+        for id in 116..119 {
+            let mut binding = BindingFactory::new().build(&failing, &target, "join-failure");
+            binding.target.replica = native_identity(id, "join-failure-target");
+            let mut state = failing.driver.public_owner().state.lock().await;
+            failing
+                .driver
+                .public_grant(&mut state, TransportBinding::Build(binding))
+                .await
+                .unwrap();
+            credentials.push(state.grants.last().unwrap().credential.clone());
+        }
+        let mut sockets = Vec::new();
+        for credential in &credentials {
+            sockets.push(
+                tokio::net::TcpStream::connect((&*credential.host, credential.port))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let process = ProcessProbe::postgres(failing.driver.instance.data_dir());
+        {
+            let state = failing.driver.public_owner().state.lock().await;
+            state.grants[0].gateway.fail_task();
+            state.grants[0].active.cancel();
+            // The remaining cancelled batch must also be joined, not dropped
+            // when the first failed join triggers forceful Abort.
+            state.grants[2].active.cancel();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            failing.driver.cancellation.cancelled(),
+        )
+        .await
+        .unwrap();
+        assert_abort_reclaimed(&failing.driver, process, &credentials[0], sockets).await;
+        for credential in &credentials {
+            assert!(
+                tokio::net::TcpStream::connect((&*credential.host, credential.port))
+                    .await
+                    .is_err()
+            );
+        }
+        std::hint::black_box(&failing.driver);
     })
     .await;
 }

@@ -438,12 +438,16 @@ impl PgReplicator {
                         }
                         (invalid, cancelled)
                     };
+                let mut grant_drain_failed = false;
                 for grant in cancelled {
                     if let Err(error) = grant.gateway.drain().await {
                         tracing::error!(%error, "cancelled public PostgreSQL grant drainage failed");
                         driver.abort();
-                        return;
+                        grant_drain_failed = true;
                     }
+                }
+                if grant_drain_failed {
+                    break;
                 }
                 {
                     let state = public.state.lock().await;

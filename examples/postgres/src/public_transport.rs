@@ -125,6 +125,11 @@ impl NativeGateway {
         ))
     }
 
+    #[cfg(all(test, feature = "testing"))]
+    pub fn fail_task(&self) {
+        self.task.as_ref().unwrap().abort();
+    }
+
     pub async fn drain(mut self) -> Result<()> {
         self.cancellation.cancel();
         if let Some(task) = self.task.take() {
