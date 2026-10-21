@@ -288,6 +288,46 @@ async fn production_pump_drops_late_retired_ack_and_continues_live_peer_progress
 }
 
 #[tokio::test]
+async fn production_pump_keeps_retained_closed_primary_ack_fatal() {
+    let mut node = lone();
+    node.adapter.open().await.unwrap();
+    node.adapter
+        .change_role(epoch(1), Role::Primary)
+        .await
+        .unwrap();
+    // Retain the registered ingress's actual Primary target across native
+    // closure, before the role owner refreshes/unregisters that target.
+    let primary = node.adapter.owner.primary().unwrap();
+    primary.close(Duration::ZERO).unwrap();
+    let envelope =
+        route(2, 1).envelope(wire::envelope::Body::ReplicationAck(wire::ReplicationAck {
+            replication_received: 0,
+            replication_applied: 0,
+            copy_received: -1,
+            copy_applied: -1,
+            error: 0,
+        }));
+    assert!(matches!(
+        node.registry.dispatch(&envelope),
+        Err(super::super::super::ingress::IngressError::Primary(
+            PrimaryError::Closed
+        ))
+    ));
+    let (owner, access, binding) = owner(node.registry.clone(), false);
+    let pump = Pump::start(&owner, binding, 2).await;
+    pump.remote.try_send(envelope, None).unwrap();
+    until(|| access.faults.load(Ordering::SeqCst) == 1).await;
+    assert!(owner.check_health().is_err());
+    pump.stop().await;
+    owner.abort();
+    assert!(
+        owner.drain().await.is_err(),
+        "closed-owner dispatch must stay latched"
+    );
+    node.adapter.close(Duration::ZERO).await.unwrap();
+}
+
+#[tokio::test]
 async fn production_worker_errors_and_panics_remain_faults() {
     for failure in 0..3 {
         let (owner, access, _) = owner(MessageRegistry::default(), false);
