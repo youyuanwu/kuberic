@@ -99,6 +99,7 @@ fn mode(selection: PublicCatchUpMode) -> ReplicaSetQuorumMode {
 pub(super) fn replica_set(
     input: &PublicConfiguration,
     configuration: &crate::protocol::types::ConfigurationDescriptor,
+    current: bool,
 ) -> ReplicaSetConfiguration {
     ReplicaSetConfiguration {
         configuration: configuration.clone(),
@@ -114,6 +115,9 @@ pub(super) fn replica_set(
             .cloned()
             .map(|replica| {
                 let mut information: ReplicaInformation = replica.into();
+                if !current {
+                    information.must_catchup = false;
+                }
                 information.role = configuration
                     .members
                     .iter()
@@ -167,8 +171,8 @@ pub(super) async fn install(
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
-                replica_set(input, &input.current),
-                replica_set(input, previous),
+                replica_set(input, &input.current, true),
+                replica_set(input, previous, false),
             )
             .await?;
     } else if catch_up {
@@ -181,14 +185,14 @@ pub(super) async fn install(
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
-                replica_set(input, &input.current),
-                replica_set(input, &previous),
+                replica_set(input, &input.current, true),
+                replica_set(input, &previous, false),
             )
             .await?;
     } else {
         callbacks
             .primary
-            .update_current_replica_set_configuration(replica_set(input, &input.current))
+            .update_current_replica_set_configuration(replica_set(input, &input.current, true))
             .await?;
     }
     Ok(())
@@ -200,7 +204,7 @@ pub(super) async fn install_current(
 ) -> crate::Result<()> {
     callbacks
         .primary
-        .update_current_replica_set_configuration(replica_set(input, &input.current))
+        .update_current_replica_set_configuration(replica_set(input, &input.current, true))
         .await?;
     Ok(())
 }
@@ -278,14 +282,17 @@ pub(super) async fn execute(
         .enumerate()
         .skip(start)
     {
-        #[cfg(all(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::BeforeInstruction, index).await;
         }
         store
             .public_instruction(&intent, index, instruction, None)
             .await?;
-        #[cfg(all(test, feature = "testing"))]
+        if let Some(owner) = &callbacks.access_owner {
+            owner.selected(instruction);
+        }
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::InstructionSelected, index)
                 .await;
@@ -442,6 +449,9 @@ pub(super) async fn execute(
                         configuration.current.epoch,
                     )
                     .await?;
+                    if let Some(owner) = &callbacks.access_owner {
+                        owner.reinstalled(store.as_ref(), configuration).await?;
+                    }
                 }
                 let (P::CatchUp { mode: selected, .. } | P::Swap { mode: selected, .. }) = program
                 else {
@@ -588,14 +598,20 @@ pub(super) async fn execute(
             }
             _ => unreachable!("role instruction in public program"),
         };
-        #[cfg(all(test, feature = "testing"))]
+        if let Some(owner) = &callbacks.access_owner {
+            owner.callback_succeeded(instruction);
+        }
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::CallbackSuccess, index).await;
         }
         store
             .public_instruction(&intent, index, instruction, Some(outcome))
             .await?;
-        #[cfg(all(test, feature = "testing"))]
+        if let Some(owner) = &callbacks.access_owner {
+            owner.receipt(store.as_ref(), instruction).await?;
+        }
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::InstructionApplied, index)
                 .await;

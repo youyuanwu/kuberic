@@ -5,6 +5,8 @@
 
 #[path = "support/read_fencing.rs"]
 mod read_fencing;
+#[path = "support/staged_access.rs"]
+mod staged_access;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -1173,6 +1175,8 @@ impl Node {
     async fn descriptor(&self, role: ReplicaRole) -> PublicReplicaDescriptor {
         let report = self.report().await;
         PublicReplicaDescriptor {
+            is_up: true,
+            is_ready: true,
             build_id: OperationId::default(),
             identity: self.identity.clone(),
             replication_address: report.replication_address.unwrap(),
@@ -3617,12 +3621,20 @@ async fn retained_secondary_promotion_preserves_acknowledged_bytes_and_replaces_
         (&pair.source, &pair.target, ReplicaRole::Primary),
         (&pair.target, &pair.source, ReplicaRole::ActiveSecondary),
     ] {
+        let configuration = PublicConfiguration {
+            current: promoted.clone(),
+            previous: None,
+            replicas: vec![remote.descriptor(role).await],
+        };
         local
-            .command(PublicOperationProgram::Configuration(PublicConfiguration {
-                current: promoted.clone(),
-                previous: None,
-                replicas: vec![remote.descriptor(role).await],
-            }))
+            .command(if local.identity == pair.target.identity {
+                PublicOperationProgram::CatchUp {
+                    configuration,
+                    mode: PublicCatchUpMode::All,
+                }
+            } else {
+                PublicOperationProgram::Configuration(configuration)
+            })
             .await
             .unwrap();
     }

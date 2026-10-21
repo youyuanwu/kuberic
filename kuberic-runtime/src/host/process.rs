@@ -227,7 +227,35 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub fn set_public_operation_cut(&self, cut: Option<Arc<crate::testing::PublicOperationCut>>) {
+        self.runtime.set_public_operation_cut(cut);
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn execute_public_v1(
+        &self,
+        intent: crate::protocol::public_operations::PublicOperationIntent,
+    ) -> Result<()> {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "Public V1 operation runtime is unavailable".into(),
+            )
+        })?;
+        let handle = self.clone();
+        let (completed, result) = tokio::sync::oneshot::channel();
+        preview.registry.own_control_task(async move {
+            let outcome = handle.execute_public_v1_owned(intent).await;
+            let _ = completed.send(outcome);
+        });
+        result.await.map_err(|error| {
+            crate::host::HostError::CommandRejected(format!(
+                "owned public testing execution stopped before replying: {error}"
+            ))
+        })?
+    }
+
+    #[cfg(feature = "testing")]
+    async fn execute_public_v1_owned(
         &self,
         intent: crate::protocol::public_operations::PublicOperationIntent,
     ) -> Result<()> {
@@ -256,19 +284,6 @@ impl ReplicaHandle {
             intent.program.as_ref(),
             Some(crate::protocol::public_operations::PublicOperationProgram::Open { .. })
         );
-        if !matches!(
-            intent.program,
-            Some(
-                crate::protocol::public_operations::PublicOperationProgram::Progress { .. }
-                    | crate::protocol::public_operations::PublicOperationProgram::Build(_)
-                    | crate::protocol::public_operations::PublicOperationProgram::Swap {
-                        controller_composed: false,
-                        ..
-                    }
-            )
-        ) {
-            self.runtime.fence_replacement_access().await;
-        }
         let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
         if matches!(
             intent.program,
@@ -285,6 +300,7 @@ impl ReplicaHandle {
             callbacks,
         )
         .await?;
+        let mut access_guard = self.runtime.public_access_completion_guard(&operation);
         let terminal = operation.wait_for_terminal().await?;
         if terminal.stage != PublicOperationStage::Completed
             || terminal.disposition != Some(PublicOperationDisposition::Succeeded)
@@ -294,6 +310,7 @@ impl ReplicaHandle {
                 terminal.disposition
             )));
         }
+        self.runtime.complete_public_access(&operation);
         if open_program {
             self.runtime.complete_replacement_open().await;
             let state = self.store.load_state().await?;
@@ -314,6 +331,7 @@ impl ReplicaHandle {
                 )
                 .await?;
         }
+        access_guard.succeeded();
         Ok(())
     }
 

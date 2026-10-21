@@ -763,6 +763,8 @@ impl<A: Sample> Node<A> {
     async fn descriptor(&self, role: ReplicaRole) -> PublicReplicaDescriptor {
         let report = self.report().await;
         PublicReplicaDescriptor {
+            is_up: true,
+            is_ready: true,
             build_id: OperationId::default(),
             identity: self.identity.clone(),
             replication_address: report.replication_address.unwrap(),
@@ -1633,11 +1635,14 @@ async fn public_factory_real_kv_copy_quorum_commit_restart_and_promotion() {
             }))
             .await;
         target
-            .command(PublicOperationProgram::Configuration(PublicConfiguration {
-                current: promoted,
-                previous: None,
-                replicas: vec![source.descriptor(ReplicaRole::ActiveSecondary).await],
-            }))
+            .command(PublicOperationProgram::CatchUp {
+                configuration: PublicConfiguration {
+                    current: promoted,
+                    previous: None,
+                    replicas: vec![source.descriptor(ReplicaRole::ActiveSecondary).await],
+                },
+                mode: PublicCatchUpMode::All,
+            })
             .await;
         let promoted_lsn = target
             .service

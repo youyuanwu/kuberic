@@ -202,6 +202,8 @@ impl Node {
     async fn descriptor(&self, role: ReplicaRole) -> PublicReplicaDescriptor {
         let report = self.running.handle().public_v1_report().await.unwrap();
         PublicReplicaDescriptor {
+            is_up: true,
+            is_ready: true,
             build_id: OperationId::default(),
             identity: self.identity.clone(),
             replication_address: report.replication_address.unwrap(),

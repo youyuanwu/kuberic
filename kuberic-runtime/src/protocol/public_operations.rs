@@ -10,7 +10,7 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 12;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 13;
 pub(crate) const PUBLIC_V1_PROTOCOL_REGISTRATIONS: &[&str] = &["PUBLIC_V1_PROTOCOL_VERSION"];
 pub const INVALID_LSN: i64 = -1;
 
@@ -555,6 +555,8 @@ pub struct PublicReplicaDescriptor {
     pub role: ReplicaRole,
     pub current_progress: i64,
     pub catch_up_capability: i64,
+    pub is_up: bool,
+    pub is_ready: bool,
     pub must_catchup: bool,
 }
 
@@ -3124,6 +3126,8 @@ impl CanonicalEncoder {
         self.replica_role(replica.role);
         self.i64(replica.current_progress);
         self.i64(replica.catch_up_capability);
+        self.bool(replica.is_up);
+        self.bool(replica.is_ready);
         self.bool(replica.must_catchup);
     }
 

@@ -320,6 +320,8 @@ impl Fixture {
                 }
                 let report = peer.running.handle().public_v1_report().await.unwrap();
                 peers.push(PublicReplicaDescriptor {
+                    is_up: true,
+                    is_ready: true,
                     build_id: OperationId::default(),
                     identity: peer.identity.clone(),
                     replication_address: peer.address.clone(),

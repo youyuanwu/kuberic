@@ -13,6 +13,8 @@ pub mod session;
 pub mod sqlite_store;
 pub mod state;
 
+pub use crate::host::public_lifecycle::{PublicCutPosition, PublicOperationCut};
+
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Conservatively omits the specific-quorum advertisement before host attachment.

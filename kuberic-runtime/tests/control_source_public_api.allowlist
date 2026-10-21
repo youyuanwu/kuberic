@@ -958,6 +958,8 @@ public-path hidden field crate::protocol::public_operations::PublicReplicaDescri
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::catch_up_capability: i64
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::current_progress: i64
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::identity: ReplicaIdentity
+public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::is_ready: bool
+public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::is_up: bool
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::must_catchup: bool
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::replication_address: String

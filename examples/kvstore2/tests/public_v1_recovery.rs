@@ -799,6 +799,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                     current: admitted.clone(),
                     previous: None,
                     replicas: vec![PublicReplicaDescriptor {
+                        is_up: true,
+                        is_ready: true,
                         build_id: OperationId::default(),
                         identity: source_identity.clone(),
                         replication_address: format!("http://{source_address}"),
@@ -823,6 +825,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                     current: admitted,
                     previous: None,
                     replicas: vec![PublicReplicaDescriptor {
+                        is_up: true,
+                        is_ready: true,
                         build_id: OperationId::default(),
                         identity: replacement_identity.clone(),
                         replication_address: format!("http://{replacement_address}"),
@@ -1099,6 +1103,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                     current: restart_configuration.clone(),
                     previous: None,
                     replicas: vec![PublicReplicaDescriptor {
+                        is_up: true,
+                        is_ready: true,
                         build_id: OperationId::default(),
                         identity: replacement_identity.clone(),
                         replication_address: format!("http://{replacement_restart_address}"),
@@ -1123,6 +1129,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                     current: restart_configuration.clone(),
                     previous: None,
                     replicas: vec![PublicReplicaDescriptor {
+                        is_up: true,
+                        is_ready: true,
                         build_id: OperationId::default(),
                         identity: source_identity.clone(),
                         replication_address: format!("http://{source_address}"),
@@ -1198,6 +1206,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                         previous: None,
                         replicas: vec![
                             PublicReplicaDescriptor {
+                                is_up: true,
+                                is_ready: true,
                                 build_id: OperationId::default(),
                                 identity: replacement_identity.clone(),
                                 replication_address: format!(
@@ -1211,6 +1221,8 @@ async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
                                 must_catchup: false,
                             },
                             PublicReplicaDescriptor {
+                                is_up: true,
+                                is_ready: true,
                                 build_id: OperationId::default(),
                                 identity: divergent_identity.clone(),
                                 replication_address: format!("http://{divergent_address}"),
@@ -1537,6 +1549,8 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
                         current: initial_configuration.clone(),
                         previous: None,
                         replicas: vec![PublicReplicaDescriptor {
+                            is_up: true,
+                            is_ready: true,
                             build_id: OperationId::default(),
                             identity: peer,
                             replication_address: format!("http://{peer_address}"),
@@ -1928,6 +1942,8 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             current: restart_configuration.clone(),
             previous: Some(source_only_configuration.clone()),
             replicas: vec![PublicReplicaDescriptor {
+                is_up: true,
+                is_ready: true,
                 build_id: OperationId::default(),
                 identity: secondary_identity.clone(),
                 replication_address: format!("http://{secondary_address}"),
@@ -1943,6 +1959,8 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             current: restart_configuration.clone(),
             previous: Some(source_only_configuration),
             replicas: vec![PublicReplicaDescriptor {
+                is_up: true,
+                is_ready: true,
                 build_id: OperationId::default(),
                 identity: source_identity.clone(),
                 replication_address: format!("http://{source_address}"),
@@ -2096,6 +2114,8 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             current: handoff_configuration.clone(),
             previous: None,
             replicas: vec![PublicReplicaDescriptor {
+                is_up: true,
+                is_ready: true,
                 build_id: OperationId::default(),
                 identity: secondary_identity.clone(),
                 replication_address: format!("http://{secondary_address}"),
@@ -2111,6 +2131,8 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             current: handoff_configuration,
             previous: None,
             replicas: vec![PublicReplicaDescriptor {
+                is_up: true,
+                is_ready: true,
                 build_id: OperationId::default(),
                 identity: source_identity.clone(),
                 replication_address: format!("http://{source_address}"),
@@ -2513,6 +2535,8 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                         current: initial.clone(),
                         previous: None,
                         replicas: vec![PublicReplicaDescriptor {
+                            is_up: true,
+                            is_ready: true,
                             build_id: OperationId::default(),
                             identity: peer,
                             replication_address: peer_address,
@@ -2550,6 +2574,8 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                         current: initial.clone(),
                         previous: Some(source_only),
                         replicas: vec![PublicReplicaDescriptor {
+                            is_up: true,
+                            is_ready: true,
                             build_id: OperationId::default(),
                             identity: survivor_identity.clone(),
                             replication_address: survivor_address.clone(),
@@ -2620,6 +2646,8 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                     ),
                     previous: Some(failover_previous),
                     replicas: vec![PublicReplicaDescriptor {
+                        is_up: true,
+                        is_ready: true,
                         build_id: OperationId::default(),
                         identity: source_identity.clone(),
                         replication_address: source_address,

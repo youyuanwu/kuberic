@@ -23,6 +23,10 @@ use crate::replicator::{
 };
 use crate::{Result, RuntimeError};
 
+#[path = "selected_access.rs"]
+mod selected_access;
+pub(crate) use selected_access::{AccessOwner, AccessRootGuard};
+
 pub(crate) struct PodRuntime {
     host: Arc<RuntimeHost>,
 }
@@ -168,8 +172,41 @@ struct RuntimeHost {
     closed: AtomicBool,
     replacement_fault_fenced: AtomicBool,
     replacement_authority_fenced: AtomicBool,
+    selected_access: StdMutex<selected_access::SelectedAccess>,
+    #[cfg(feature = "testing")]
+    public_operation_cut: StdMutex<Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>>,
     write_admission: Arc<StdMutex<()>>,
     replacement_fault_bridge: Mutex<Option<Arc<ReplacementFaultBridge>>>,
+}
+
+impl RuntimeHost {
+    fn selected_status(&self) -> Option<(AccessStatus, AccessStatus)> {
+        if self.closed.load(Ordering::Acquire)
+            || self.aborted.load(Ordering::Acquire)
+            || self.replacement_fault_fenced.load(Ordering::Acquire)
+            || matches!(
+                *self.native_lifecycle.lock().unwrap(),
+                Some(
+                    crate::replicator::v1::LifecycleObservation::Closed
+                        | crate::replicator::v1::LifecycleObservation::Faulted
+                )
+            )
+        {
+            return Some((AccessStatus::NotPrimary, AccessStatus::NotPrimary));
+        }
+        let selected = self.selected_access.lock().unwrap().status();
+        if selected.is_some_and(|status| status.0 == AccessStatus::Granted)
+            && matches!(*self.native_lifecycle.lock().unwrap(),
+                Some(crate::replicator::v1::LifecycleObservation::Ready(role)) if role != ReplicaRole::Primary)
+        {
+            return Some((AccessStatus::NotPrimary, AccessStatus::NotPrimary));
+        }
+        selected.or_else(|| {
+            self.replacement_authority_fenced
+                .load(Ordering::Acquire)
+                .then_some((AccessStatus::NotPrimary, AccessStatus::NotPrimary))
+        })
+    }
 }
 
 struct DeferredReplicator {
@@ -304,6 +341,9 @@ impl PodRuntime {
                 closed: AtomicBool::new(false),
                 replacement_fault_fenced: AtomicBool::new(false),
                 replacement_authority_fenced: AtomicBool::new(false),
+                selected_access: StdMutex::new(selected_access::SelectedAccess::default()),
+                #[cfg(feature = "testing")]
+                public_operation_cut: StdMutex::new(None),
                 write_admission: Arc::new(StdMutex::new(())),
                 replacement_fault_bridge: Mutex::new(None),
                 replica_session: OnceLock::new(),
@@ -354,6 +394,9 @@ impl PodRuntime {
     pub(crate) fn public_lifecycle_callbacks(
         &self,
     ) -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks> {
+        let access_host = Arc::downgrade(&self.host);
+        let access_factory: crate::host::public_lifecycle::AccessFactory =
+            Arc::new(move |operation| AccessOwner::begin(access_host.clone(), operation));
         let role_host = Arc::downgrade(&self.host);
         let native_role_epoch: crate::host::public_lifecycle::NativeRoleEpoch =
             Arc::new(move || {
@@ -375,6 +418,7 @@ impl PodRuntime {
         let revoke_access: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
             let host = revoke_host.upgrade().ok_or(RuntimeError::Closed)?;
             let _admission = host.write_admission.lock().unwrap();
+            host.selected_access.lock().unwrap().revoke();
             host.replacement_authority_fenced
                 .store(true, Ordering::Release);
             Ok(())
@@ -414,9 +458,11 @@ impl PodRuntime {
                 preempt_retained_owner: registered.native_runtime_control.is_some(),
                 terminal_drain,
                 terminal_cleanup: None,
+                access_factory: Some(access_factory),
+                access_owner: None,
                 aborted: Arc::new(std::sync::Mutex::new(false)),
-                #[cfg(all(test, feature = "testing"))]
-                cut: None,
+                #[cfg(feature = "testing")]
+                cut: self.host.public_operation_cut.lock().unwrap().clone(),
             });
         }
         let control_host = Arc::downgrade(&self.host);
@@ -472,9 +518,11 @@ impl PodRuntime {
             preempt_retained_owner: false,
             terminal_drain,
             terminal_cleanup: None,
+            access_factory: Some(access_factory),
+            access_owner: None,
             aborted: Arc::new(std::sync::Mutex::new(false)),
-            #[cfg(all(test, feature = "testing"))]
-            cut: None,
+            #[cfg(feature = "testing")]
+            cut: self.host.public_operation_cut.lock().unwrap().clone(),
         })
     }
 
@@ -697,7 +745,10 @@ impl PodRuntime {
                         member.identity == self.host.identity && member.role == selected_role
                     })
             });
-        if allow_reopen && candidate_ready {
+        if allow_reopen
+            && candidate_ready
+            && !self.host.selected_access.lock().unwrap().initialized()
+        {
             self.host
                 .replacement_authority_fenced
                 .store(false, Ordering::Release);
@@ -742,8 +793,8 @@ impl PodRuntime {
                         })
                         .map_or(ReplicaRole::None, |member| member.role),
                     current: replica.role,
-                    is_up: true,
-                    ready: true,
+                    is_up: replica.is_up,
+                    ready: replica.is_ready,
                 })
                 .collect();
             crate::host::v1_lifecycle::activated_access(
@@ -776,6 +827,7 @@ impl PodRuntime {
     pub(crate) async fn fence_replacement_access(&self) {
         {
             let _admission = self.host.write_admission.lock().unwrap();
+            self.host.selected_access.lock().unwrap().invalidate();
             self.host
                 .replacement_authority_fenced
                 .store(true, Ordering::Release);
@@ -783,6 +835,28 @@ impl PodRuntime {
         let mut state = self.host.state.write().await;
         state.projection.read_status = AccessStatus::NotPrimary;
         state.projection.write_status = AccessStatus::NotPrimary;
+    }
+
+    pub(crate) fn complete_public_access(
+        &self,
+        operation: &Arc<crate::host::operation::PartitionOperation>,
+    ) {
+        selected_access::complete(&self.host, operation);
+    }
+
+    pub(crate) fn public_access_completion_guard(
+        &self,
+        operation: &Arc<crate::host::operation::PartitionOperation>,
+    ) -> AccessRootGuard {
+        selected_access::completion_guard(&self.host, operation)
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn set_public_operation_cut(
+        &self,
+        cut: Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>,
+    ) {
+        *self.host.public_operation_cut.lock().unwrap() = cut;
     }
 
     pub(crate) async fn complete_replacement_open(&self) {
@@ -861,6 +935,10 @@ impl PodRuntime {
         };
         let state = self.host.state.read().await;
         let role = state.projection.role;
+        let (read_status, write_status) = self
+            .host
+            .selected_status()
+            .unwrap_or((state.projection.read_status, state.projection.write_status));
         let replicator_creation_id = self.replacement_replicator_creation_id()?;
         Ok(crate::host::public_lifecycle::PublicV1ReportProjection {
             catch_up_specific_quorum: self
@@ -872,8 +950,8 @@ impl PodRuntime {
             replicator_creation_id,
             report_sequence,
             role,
-            read_status: state.projection.read_status,
-            write_status: state.projection.write_status,
+            read_status,
+            write_status,
             progress: PublicProgress {
                 role: match role {
                     ReplicaRole::Primary => PublicProgressRole::Primary,
@@ -1001,12 +1079,16 @@ impl PodRuntime {
         crate::protocol::public_operations::ProgressQueryResult,
     ) {
         let projection = self.host.state.read().await.projection.clone();
+        let (read_status, write_status) = self
+            .host
+            .selected_status()
+            .unwrap_or((projection.read_status, projection.write_status));
         (
             projection.open,
             projection.replication_address,
             projection.role,
-            projection.read_status,
-            projection.write_status,
+            read_status,
+            write_status,
             projection.current_progress,
             projection.catch_up_capability,
         )
@@ -1178,6 +1260,9 @@ impl PartitionAccessView for HostAccessView {
 
     async fn read_status(&self) -> Result<AccessStatus> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        if let Some(status) = host.selected_status() {
+            return Ok(status.0);
+        }
         if host.replacement_fault_fenced.load(Ordering::Acquire)
             || host.replacement_authority_fenced.load(Ordering::Acquire)
             || matches!(
@@ -1195,6 +1280,9 @@ impl PartitionAccessView for HostAccessView {
 
     async fn write_status(&self) -> Result<AccessStatus> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        if let Some(status) = host.selected_status() {
+            return Ok(status.1);
+        }
         if host.replacement_fault_fenced.load(Ordering::Acquire)
             || host.replacement_authority_fenced.load(Ordering::Acquire)
             || matches!(
@@ -1214,6 +1302,9 @@ impl PartitionAccessView for HostAccessView {
         let Some(host) = self.host.upgrade() else {
             return AccessStatus::NotPrimary;
         };
+        if let Some(status) = host.selected_status() {
+            return status.1;
+        }
         if host.closed.load(Ordering::Acquire)
             || host.aborted.load(Ordering::Acquire)
             || host.replacement_fault_fenced.load(Ordering::Acquire)
@@ -1242,6 +1333,9 @@ impl PartitionAccessView for HostAccessView {
         let Some(host) = self.host.upgrade() else {
             return AccessStatus::NotPrimary;
         };
+        if let Some(status) = host.selected_status() {
+            return status.0;
+        }
         if host.closed.load(Ordering::Acquire)
             || host.aborted.load(Ordering::Acquire)
             || host.replacement_fault_fenced.load(Ordering::Acquire)
@@ -1679,7 +1773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_authority_does_not_latch_an_independent_fault_fence() {
+    async fn historical_projection_cannot_release_an_independent_authority_fence() {
         use super::{HostAccessView, PodRuntime};
         use crate::application::{OpenContext, RoleChange, StatefulServiceReplica};
         use crate::host::state::*;
@@ -1852,8 +1946,14 @@ mod tests {
             .refresh_replacement_projection(store.as_ref(), &session, false)
             .await
             .unwrap();
-        assert_eq!(access.write_status().await.unwrap(), AccessStatus::Granted);
-        assert_eq!(access.read_status().await.unwrap(), AccessStatus::Granted);
+        assert_eq!(
+            access.write_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            access.read_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
 
         runtime.fence_replacement_access().await;
         runtime
@@ -1918,8 +2018,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             access.write_status().await.unwrap(),
-            AccessStatus::Granted,
-            "historical recovery failure cannot override completed successor configuration"
+            AccessStatus::NotPrimary,
+            "historical receipts cannot clear an unrelated process-local fence"
         );
     }
 

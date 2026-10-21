@@ -240,6 +240,8 @@ impl Fixture {
         let replication = Arc::new(Replication(probe.clone()));
         let drain_probe = probe.clone();
         let callbacks = PublicLifecycleCallbacks {
+            access_factory: None,
+            access_owner: None,
             application: Arc::new(Application(probe.clone(), replication.clone())),
             replicator: replication.clone(),
             primary: replication,
@@ -515,6 +517,8 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
         "an unpromoted idle Build still owns its logical replica slot"
     );
     let descriptor = |storage| PublicReplicaDescriptor {
+        is_up: true,
+        is_ready: true,
         build_id: OperationId::default(),
         identity: target.clone(),
         replication_address: build.replication_address.clone(),
@@ -558,6 +562,8 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
         replicas: vec![
             descriptor(target_storage.clone()),
             PublicReplicaDescriptor {
+                is_up: true,
+                is_ready: true,
                 build_id: OperationId::default(),
                 identity: epoch_primary.clone(),
                 replication_address: "http://127.0.0.1:4".into(),
