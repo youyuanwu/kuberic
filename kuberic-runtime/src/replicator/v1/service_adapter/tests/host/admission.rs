@@ -68,37 +68,49 @@ async fn access_approved_assignment_shares_actual_host_revoke_and_final_catchup_
     let writer = facade.service();
     let writer = std::thread::spawn(move || writer.begin_replicate(Bytes::from_static(b"overlap")));
     observed.recv_timeout(Duration::from_secs(5)).unwrap();
-    let serialized = gate.try_lock().is_err();
     let (attempted, attempt) = mpsc::channel();
-    let mut revoker = Some(std::thread::spawn(move || {
+    let (fenced, fence) = mpsc::channel();
+    let (captured, capture) = mpsc::channel();
+    let (finished, finish) = mpsc::channel();
+    let handoff = facade.clone();
+    let executor = tokio::runtime::Handle::current();
+    let revoker = std::thread::spawn(move || {
         attempted.send(()).unwrap();
         revoke().unwrap();
-    }));
+        fenced.send(()).unwrap();
+        executor.block_on(async move {
+            handoff
+                .update_catch_up_replica_set_configuration(final_config, empty)
+                .await
+                .unwrap();
+            captured.send(()).unwrap();
+            handoff
+                .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
+                .await
+                .unwrap();
+            finished.send(()).unwrap();
+        });
+    });
     attempt.recv_timeout(Duration::from_secs(5)).unwrap();
-    let mut barrier_finished_before_assignment = false;
-    if !serialized {
-        // Baseline: force final wait completion while the call has no LSN.
-        revoker.take().unwrap().join().unwrap();
-        facade
-            .update_catch_up_replica_set_configuration(final_config.clone(), empty.clone())
-            .await
-            .unwrap();
-        facade
-            .wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum)
-            .await
-            .unwrap();
-        barrier_finished_before_assignment = true;
-    }
+    // Revoke/capture run independently, not after writer.join(). While the
+    // actual writer is held, a missing gate on EITHER side permits the whole
+    // final barrier to return at zero. The bounded negative wait also gives
+    // the announced revoker a chance to expose that forbidden schedule.
+    let barrier_finished_before_assignment = match fence.recv_timeout(Duration::from_secs(1)) {
+        Ok(()) => {
+            capture.recv_timeout(Duration::from_secs(5)).unwrap();
+            finish.recv_timeout(Duration::from_secs(5)).unwrap();
+            true
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => false,
+        Err(error) => panic!("revoker disconnected: {error}"),
+    };
     release.send(()).unwrap();
-    let mut write = writer.join().unwrap().unwrap();
-    if serialized {
-        revoker.take().unwrap().join().unwrap();
-        // The refreshed configuration must now capture the admitted LSN.
-        facade
-            .update_catch_up_replica_set_configuration(final_config, empty)
-            .await
-            .unwrap();
+    if !barrier_finished_before_assignment {
+        fence.recv_timeout(Duration::from_secs(5)).unwrap();
+        capture.recv_timeout(Duration::from_secs(5)).unwrap();
     }
+    let mut write = writer.join().unwrap().unwrap();
     let ack = |peer, applied| {
         registry
             .dispatch(
@@ -117,13 +129,12 @@ async fn access_approved_assignment_shares_actual_host_revoke_and_final_catchup_
     // A+C completes normal quorum; successor B is still required by final wait.
     ack(3, write.lsn);
     write.completion.wait().await.unwrap();
-    if serialized {
-        let wait = facade.wait_for_catch_up_quorum(ReplicaSetQuorumMode::WriteQuorum);
-        tokio::pin!(wait);
-        assert!(wait.as_mut().now_or_never().is_none());
+    if !barrier_finished_before_assignment {
+        assert!(matches!(finish.try_recv(), Err(mpsc::TryRecvError::Empty)));
         ack(2, write.lsn);
-        wait.await.unwrap();
+        finish.recv_timeout(Duration::from_secs(5)).unwrap();
     }
+    revoker.join().unwrap();
     assert!(
         !barrier_finished_before_assignment,
         "access-approved LSN escaped final catch-up"
