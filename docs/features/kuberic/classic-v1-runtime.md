@@ -150,6 +150,18 @@ separate lifecycle obligation.
 
 ## Reproducible entry points
 
+### P6 custom-replicator and application qualification
+
+[P6 closure matrix](sf-v1-p6-closure.md) records current owners, actual regressions,
+implementation commits and limits for PostgreSQL live SQL authority, selected
+idle/slot retirement, final orderly progress, explicit unsupported marked
+WriteQuorum and retained Abort, plus KV trait-Close consumer joins and current
+factory effective-endpoint round-trip. PostgreSQL remains a no-provider custom
+replicator. Native stable-secondary access policy is unchanged. This bounded
+qualification does not close the broader P7 settings/capability ledger.
+
+### Commands
+
 ```bash
 cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
   --test classic_v1_production

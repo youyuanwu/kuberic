@@ -84,7 +84,7 @@ pub(crate) async fn create(
         registry.clone(),
     )
     .await?;
-    match compose(context, provider, settings, registry, transport.clone()).await {
+    match compose(context, provider, registry, transport.clone()).await {
         Ok(interfaces) => Ok(interfaces),
         Err(failure) => {
             transport.abort();
@@ -101,7 +101,6 @@ pub(crate) async fn create(
 async fn compose(
     context: ReplicatorFactoryContext,
     provider: Arc<dyn StateProvider>,
-    settings: ReplicatorSettings,
     registry: MessageRegistry,
     transport: Arc<Transport>,
 ) -> Result<ReplicatorInterfaces> {
@@ -213,7 +212,7 @@ async fn compose(
         inbound: tokio::sync::Mutex::new(None),
         contained: tokio::sync::watch::channel(false).0,
         epoch: Mutex::new(None),
-        settings_address: settings.replication_address,
+        settings_address: local.address.clone(),
     });
     Ok(ReplicatorInterfaces::primary(
         owner.clone(),
@@ -224,7 +223,8 @@ async fn compose(
                 crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity,
         },
     )
-    .with_native_runtime_control(owner))
+    .with_native_runtime_control(owner)
+    .with_effective_replication_address(local.address))
 }
 
 struct Production {

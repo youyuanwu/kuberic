@@ -544,6 +544,15 @@ fallback is introduced. Component tests are not counted as hosted native parity.
 | P7 Public capabilities and extension closure | P1-P6 | Complete capability ledger: settings/defaults/updates/retrieval, security enforcement, fault/health/load/move cost, metadata/data representation, optional extension obligations. | Every in-scope ledger entry has an implemented external case, including invalid/closed inputs and effective-settings round-trip. No silent/no-op capability, forced scope reduction or unreviewed protected-interface change. |
 | P8 Documentation and compatibility qualification | P1-P7 | As-built reference, porting guide, corrected audit/KSF/API coverage, complete matrix across real service/provider and controller/archive journeys. | All rows pass under supported modes; exact inventory/archive/API privacy, ordinary and routine PostgreSQL gates pass. Remaining unsupported in-scope behavior blocks the complete-alignment claim. |
 
+P6's scoped implementation and executable dispositions are recorded in the
+[P6 closure matrix](sf-v1-p6-closure.md): live partition SQL admission, conditional
+secondary replay readiness, selected idle/slot ownership, orderly stopped
+progress, retained Abort and KV trait-Close joins. Marked PostgreSQL WriteQuorum
+now rejects explicitly; capability-false All remains supported. Current-factory
+effective endpoint round-trip is requalified without expanding P7. These
+source-guided Rust/PostgreSQL results do not imply native differential or
+power-loss qualification, nor completion of P7/P8.
+
 ### Atomic Cutover Exit Contract
 
 At the P1-P4 exits, the current public data path keeps **all** existing owners;
@@ -596,7 +605,7 @@ local application commit.
 
 Newly researched access, catch-up-target, queue-progress, epoch and outer-Close
 differences are compatibility obligations above, not newly closed or silently
-reclassified historical audit IDs. Inventory remains **7 fixed / 14 open**
+reclassified historical audit IDs. The pre-P6 historical audit checkpoint was **7 fixed / 14 open**
 implementation findings plus open SF-D01.
 
 ## Conformance and Rollout Gates

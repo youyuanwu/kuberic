@@ -35,6 +35,24 @@ pub struct KvService {
     role: Mutex<ReplicaRole>,
     stop: watch::Sender<bool>,
     streams: AsyncMutex<Consumers>,
+    #[cfg(feature = "testing")]
+    stream_exit: Arc<Mutex<Option<Arc<StreamExitGate>>>>,
+}
+
+#[cfg(feature = "testing")]
+pub struct StreamExitGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "testing")]
+impl StreamExitGate {
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -67,6 +85,8 @@ impl KvService {
             role: Mutex::new(ReplicaRole::None),
             stop: watch::channel(false).0,
             streams: AsyncMutex::new(Consumers::default()),
+            #[cfg(feature = "testing")]
+            stream_exit: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -77,6 +97,42 @@ impl KvService {
     #[cfg(feature = "testing")]
     pub fn pause_next_commit(&self) -> Result<crate::v1_test_bridge::CommitGate> {
         Ok(self.committer()?.pause_next_commit())
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn pause_next_stream_exit(&self) -> Arc<StreamExitGate> {
+        let gate = Arc::new(StreamExitGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.stream_exit.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn retained_consumer_count(&self) -> usize {
+        self.streams.lock().await.tasks.len()
+    }
+
+    fn spawn_stream(
+        &self,
+        consumers: &mut Consumers,
+        task: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    ) {
+        #[cfg(feature = "testing")]
+        let exit = self.stream_exit.clone();
+        consumers.tasks.spawn(async move {
+            let result = task.await;
+            #[cfg(feature = "testing")]
+            {
+                let gate = exit.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
+            result
+        });
     }
 
     fn committer(&self) -> Result<Arc<Committer>> {
@@ -138,7 +194,10 @@ impl KvService {
     }
 
     pub async fn shutdown_and_drain(&self) -> Result<()> {
-        let service = self.close().await;
+        self.close().await
+    }
+
+    async fn drain_consumers(&self, service: Result<()>) -> Result<()> {
         let mut consumers = self.streams.lock().await;
         while let Some(result) = consumers.tasks.join_next().await {
             match result {
@@ -152,7 +211,11 @@ impl KvService {
         if consumers.errors.is_empty() {
             service
         } else {
-            Err(RuntimeError::Application(consumers.errors.join("; ")))
+            let consumers = consumers.errors.join("; ");
+            Err(RuntimeError::Application(match service {
+                Ok(()) => consumers,
+                Err(error) => format!("{error}; {consumers}"),
+            }))
         }
     }
 
@@ -171,6 +234,9 @@ impl KvService {
             .clone()
             .ok_or(RuntimeError::NotOpen)?;
         let mut consumers = self.streams.lock().await;
+        if *self.stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
         while let Some(result) = consumers.tasks.try_join_next() {
             match result {
                 Ok(Ok(())) => {}
@@ -194,7 +260,7 @@ impl KvService {
             let store = committer.clone();
             let partition = partition.clone();
             let mut stop = self.stop.subscribe();
-            consumers.tasks.spawn(async move {
+            self.spawn_stream(&mut consumers, async move {
                 tokio::select! {
                     biased;
                     _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => Ok(()),
@@ -204,7 +270,7 @@ impl KvService {
         }
         let stream = replicator.replication_operations()?;
         let mut stop = self.stop.subscribe();
-        consumers.tasks.spawn(async move {
+        self.spawn_stream(&mut consumers, async move {
             tokio::select! {
                 biased;
                 _ = async { let _ = stop.wait_for(|stopped| *stopped).await; } => Ok(()),
@@ -274,6 +340,9 @@ impl StatefulServiceReplica for KvService {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        if *self.stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
         let previous = *self.role.lock().unwrap();
         let committer = self.committer()?;
         if role == ReplicaRole::Primary || previous == ReplicaRole::Primary {
@@ -312,7 +381,7 @@ impl StatefulServiceReplica for KvService {
         self.control.write().await.take();
         self.partition.write().await.take();
         *self.role.lock().unwrap() = ReplicaRole::None;
-        result
+        self.drain_consumers(result).await
     }
 
     fn abort(&self) {
@@ -427,4 +496,33 @@ async fn consume_replication(
         operation.acknowledge()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn trait_close_joins_consumers_and_retains_failure_on_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = KvService::new(
+            Arc::new(KvPersistence::open(directory.path()).unwrap()),
+            "http://127.0.0.1:0".into(),
+            CopyGate::disabled(),
+        );
+        service
+            .streams
+            .lock()
+            .await
+            .tasks
+            .spawn(async { Err(RuntimeError::Application("owned consumer failure".into())) });
+        let first = service.close().await.unwrap_err().to_string();
+        assert!(first.contains("owned consumer failure"));
+        assert!(service.streams.lock().await.tasks.is_empty());
+        assert_eq!(service.close().await.unwrap_err().to_string(), first);
+        assert_eq!(
+            service.shutdown_and_drain().await.unwrap_err().to_string(),
+            first
+        );
+    }
 }

@@ -53,6 +53,14 @@ impl NativeCredential {
 pub(super) struct NativeGateway {
     cancellation: CancellationToken,
     task: Option<JoinHandle<()>>,
+    #[cfg(all(test, feature = "testing"))]
+    exit_gate: Arc<std::sync::Mutex<Option<Arc<GatewayExitGate>>>>,
+}
+
+#[cfg(all(test, feature = "testing"))]
+pub(super) struct GatewayExitGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 impl Drop for NativeGateway {
@@ -69,6 +77,7 @@ impl NativeGateway {
         slot: String,
         build: bool,
         valid: Arc<dyn Fn() -> bool + Send + Sync>,
+        cancellation: CancellationToken,
     ) -> Result<(Self, NativeCredential)> {
         let credential = NativeCredential {
             host: host.into(),
@@ -83,9 +92,12 @@ impl NativeGateway {
             port: listener.local_addr().map_err(application_error)?.port(),
             ..credential
         };
-        let cancellation = CancellationToken::new();
         let stopped = cancellation.clone();
         let expected = credential.clone();
+        #[cfg(all(test, feature = "testing"))]
+        let exit_gate = Arc::new(std::sync::Mutex::new(None::<Arc<GatewayExitGate>>));
+        #[cfg(all(test, feature = "testing"))]
+        let exiting = exit_gate.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             let mut tick = tokio::time::interval(Duration::from_millis(20));
@@ -115,14 +127,39 @@ impl NativeGateway {
             drop(listener);
             connections.abort_all();
             while connections.join_next().await.is_some() {}
+            #[cfg(all(test, feature = "testing"))]
+            {
+                let gate = exiting.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
         });
         Ok((
             Self {
                 cancellation,
                 task: Some(task),
+                #[cfg(all(test, feature = "testing"))]
+                exit_gate,
             },
             credential,
         ))
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub fn fail_task(&self) {
+        self.task.as_ref().unwrap().abort();
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub fn hold_exit(&self) -> Arc<GatewayExitGate> {
+        let gate = Arc::new(GatewayExitGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.exit_gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     pub async fn drain(mut self) -> Result<()> {
