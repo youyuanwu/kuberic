@@ -23,12 +23,13 @@ use crate::{Result, RuntimeError};
 use super::super::buffers::{BufferLimits, BufferPolicy, decode};
 use super::super::copy_async_operation::CopySendAction;
 use super::super::copy_context_receiver::CopyContextAck;
-use super::super::ingress::MessageRegistry;
+use super::super::ingress::{IngressError, MessageRegistry};
+use super::super::primary::PrimaryError;
 use super::super::secondary::SecondaryAck;
 use super::super::session::{SendIntent, SendKind};
 use super::super::transport::{
-    Carrier, CarrierLimits, Delivery, ExchangeService, Route, SendError, connect_with_metadata,
-    wire,
+    Carrier, CarrierLimits, Delivery, ExchangeService, Ingress, Route, SendError,
+    connect_with_metadata, wire,
 };
 
 const MAX_PAYLOAD: usize = 52_428_800;
@@ -322,7 +323,7 @@ impl Transport {
                     previous.current.store(false, Ordering::Release);
                     previous.carrier.shutdown();
                 }
-                let (carrier, mut ingress) =
+                let (carrier, ingress) =
                     Carrier::new(route.clone(), limits()).map_err(application)?;
                 let incarnation = match reuse_incarnation {
                     Some(incarnation) => incarnation,
@@ -342,44 +343,7 @@ impl Transport {
                     incarnation,
                     current: current.clone(),
                 });
-                let context = self.context.clone();
-                let registry = self.registry.clone();
-                let mut shutdown = self.stop.subscribe();
-                self.spawn(async move {
-                    loop {
-                        let delivery = tokio::select! {
-                            biased;
-                            _ = shutdown.wait_for(|stopped| *stopped) => return Ok(()),
-                            delivery = ingress.recv() => delivery,
-                        };
-                        match delivery {
-                            Some(Delivery::Message { envelope, .. }) => {
-                                if !current.load(Ordering::Acquire) {
-                                    return Ok(());
-                                }
-                                // Validate the current journal, not an old successful handshake.
-                                if let Err(error) = context.validate_native_binding(&binding).await
-                                {
-                                    tracing::debug!(%error, "retired native delivery rejected");
-                                    continue;
-                                }
-                                if !current.load(Ordering::Acquire) {
-                                    return Ok(());
-                                }
-                                if let Err(error) = validate_message_epochs(binding.epoch, &envelope) {
-                                    tracing::warn!(%error, "unauthorized native frame epoch rejected");
-                                    continue;
-                                }
-                                registry.dispatch(&envelope).map_err(application)?;
-                            }
-                            Some(Delivery::Rejected { error, .. }) => {
-                                tracing::warn!(%error, "invalid native carrier envelope rejected");
-                            }
-                            Some(Delivery::Expired { .. } | Delivery::SupersededSend { .. }) => {}
-                            None => return Ok(()),
-                        }
-                    }
-                });
+                self.spawn(self.clone().run_ingress(binding, current, ingress));
                 peers.insert(id, peer.clone());
                 peer
             }
@@ -390,6 +354,78 @@ impl Transport {
             self.spawn(async move { owner.run_connection(connection).await });
         }
         Ok(peer)
+    }
+
+    pub(super) async fn run_ingress(
+        self: Arc<Self>,
+        binding: NativeBinding,
+        current: Arc<AtomicBool>,
+        mut ingress: Ingress,
+    ) -> Result<()> {
+        let mut shutdown = self.stop.subscribe();
+        loop {
+            let delivery = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stopped| *stopped) => return Ok(()),
+                delivery = ingress.recv() => delivery,
+            };
+            match delivery {
+                Some(Delivery::Message { envelope, .. }) => {
+                    if !current.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    // Validate the current journal, not an old successful handshake.
+                    if let Err(error) = self.context.validate_native_binding(&binding).await {
+                        tracing::debug!(%error, "retired native delivery rejected");
+                        continue;
+                    }
+                    if !current.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    if let Err(error) = validate_message_epochs(binding.epoch, &envelope) {
+                        tracing::warn!(%error, "unauthorized native frame epoch rejected");
+                        continue;
+                    }
+                    match self.registry.dispatch(&envelope) {
+                        Err(IngressError::Primary(PrimaryError::UnknownSession(replica)))
+                            if matches!(
+                                envelope.body,
+                                Some(wire::envelope::Body::ReplicationAck(_))
+                            ) =>
+                        {
+                            tracing::debug!(replica, "retired native session ACK dropped");
+                        }
+                        result => {
+                            result.map_err(application)?;
+                        }
+                    }
+                }
+                Some(Delivery::Rejected { error, .. }) => {
+                    tracing::warn!(%error, "invalid native carrier envelope rejected");
+                }
+                Some(Delivery::Expired { .. } | Delivery::SupersededSend { .. }) => {}
+                None => return Ok(()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_owner(
+        context: ReplicatorFactoryContext,
+        local: NativeEndpoint,
+        registry: MessageRegistry,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            context,
+            local,
+            registry,
+            credentials: Arc::from("test-token"),
+            peers: Mutex::new(BTreeMap::new()),
+            stop: watch::channel(false).0,
+            tasks: TaskTracker::new(),
+            failure: Arc::new(Mutex::new(None)),
+            next_incarnation: AtomicI64::new(1),
+        })
     }
 
     async fn run_connection(self: Arc<Self>, peer: Arc<Peer>) -> Result<()> {

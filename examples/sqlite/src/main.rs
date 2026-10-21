@@ -64,27 +64,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             SocketAddr::new(config.pod_ip, config.replication_address.port())
         ),
     )?);
-    let mut replica = ReplicaHost::new(
-        ReplicaProcessConfig {
-            resource_uid: ResourceUid::new(&config.resource_uid),
-            replica_id: ReplicaId::new(config.replica_id),
-            pod_uid: PodUid::new(&config.pod_uid),
-            pvc_uid: PvcUid::new(&config.pvc_uid),
-            data_root: config.data_root,
-            replication_address: config.replication_address,
-            bearer_token: config.bearer_token,
-            rpc_deadline: Duration::from_secs(5),
-            transport_window_capacity: 256,
-        },
-        application.clone(),
-        storage,
-        Arc::new(KubernetesDnsResolver::new(
-            ResourceUid::new(&config.resource_uid),
-            config.namespace,
-        )),
-    )
-    .start(tokio::net::TcpListener::bind(config.control_address).await?)
-    .await?;
+    let mut replica = replica_host(&config, application.clone(), storage)
+        .start(tokio::net::TcpListener::bind(config.control_address).await?)
+        .await?;
     let listener = tokio::net::TcpListener::bind(config.application_address).await?;
     let mut shutdown = replica.shutdown_signal();
     let mut client = tokio::spawn(async move {
@@ -113,6 +95,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn replica_host(
+    config: &Config,
+    application: Arc<SqliteService>,
+    storage: ApplicationStorageState,
+) -> ReplicaHost<SqliteService, KubernetesDnsResolver> {
+    ReplicaHost::new(
+        ReplicaProcessConfig {
+            resource_uid: ResourceUid::new(&config.resource_uid),
+            replica_id: ReplicaId::new(config.replica_id),
+            pod_uid: PodUid::new(&config.pod_uid),
+            pvc_uid: PvcUid::new(&config.pvc_uid),
+            data_root: config.data_root.clone(),
+            replication_address: config.replication_address,
+            bearer_token: config.bearer_token.clone(),
+            rpc_deadline: Duration::from_secs(5),
+            transport_window_capacity: 256,
+        },
+        application,
+        storage,
+        Arc::new(KubernetesDnsResolver::new(
+            ResourceUid::new(&config.resource_uid),
+            config.namespace.clone(),
+        )),
+    )
+    .with_application_storage_paths(std::collections::BTreeMap::from([(
+        "application".into(),
+        config.data_root.join("application"),
+    )]))
+}
+
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -131,6 +143,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod production_host;
     #[test]
     fn startup_uses_replica_host_and_has_no_demo_surface() {
         assert!(

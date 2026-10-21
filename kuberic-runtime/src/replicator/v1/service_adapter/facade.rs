@@ -413,10 +413,6 @@ impl FacadeConfig {
                 member.role == ReplicaRole::Primary
                     && member.identity.replica_id == configuration.primary_id
             })
-            || !configuration
-                .members
-                .iter()
-                .any(|member| member.identity == self.local)
         {
             return Err(FacadeError::Input("voting configuration".into()));
         }
@@ -499,10 +495,13 @@ fn handle(
     let result = (|| -> Result<Option<Value>, FacadeError> {
         if let Command::CatchupConfiguration(current, _) | Command::CurrentConfiguration(current) =
             &command
-            && current.configuration.primary_id != config.local.replica_id
+            && (current.configuration.primary_id != config.local.replica_id
+                || !current.configuration.members.iter().any(|member| {
+                    member.identity == config.local && member.role == ReplicaRole::Primary
+                }))
         {
             return Err(FacadeError::Input(
-                "current configuration has a different primary".into(),
+                "current configuration must contain the exact local primary".into(),
             ));
         }
         match command {

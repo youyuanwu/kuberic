@@ -141,6 +141,9 @@ impl ServiceReplicator {
             policy: config.secondary.context.buffer_policy,
             limits: config.secondary.context.buffer_limits,
             write_access: Arc::new(Mutex::new(write_access)),
+            write_admission: None,
+            #[cfg(test)]
+            before_assignment: None,
         };
         Ok(Self {
             owner: RoleReplicator::new(config, provider.clone(), clock)?,
@@ -390,6 +393,9 @@ pub(super) struct ServiceHandle {
     policy: BufferPolicy,
     limits: BufferLimits,
     write_access: Arc<Mutex<Arc<dyn Fn() -> WriteAccess + Send + Sync>>>,
+    write_admission: Option<Arc<Mutex<()>>>,
+    #[cfg(test)]
+    before_assignment: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ServiceHandle {
@@ -414,15 +420,24 @@ impl ServiceHandle {
 
     pub(super) fn begin_replicate(&self, data: OperationData) -> Result<Replication, AdapterError> {
         buffers::decode(data.clone(), self.policy, self.limits)?;
+        let admission = self
+            .write_admission
+            .as_ref()
+            .map(|gate| gate.lock().unwrap());
         let access = self.write_access.lock().unwrap().clone();
         match access() {
             WriteAccess::Granted => {}
             denied => return Err(AdapterError::WriteAccess(denied)),
         }
+        #[cfg(test)]
+        if let Some(pause) = &self.before_assignment {
+            pause();
+        }
 
         match self.target()? {
             Target::Primary(primary) => {
-                let admitted = primary.enqueue(data, self.policy, self.limits)?;
+                let admitted =
+                    primary.enqueue_with_lease(data, self.policy, self.limits, admission)?;
                 Ok(Replication {
                     lsn: admitted.lsn,
                     completion: Completion::new(admitted.completion),

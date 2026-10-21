@@ -516,6 +516,98 @@ async fn exact_binding_and_configuration_failures_do_not_start_providers_or_muta
 }
 
 #[tokio::test]
+async fn historical_pc_can_exclude_new_primary_but_still_requires_remote_apply() {
+    let node = lone();
+    let registry = node.registry.clone();
+    let source = start(node, &[(2, true)]);
+    primary(&source).await;
+    let current = config(1, 1, &[]);
+    let mut old_primary = information(2);
+    old_primary.role = ReplicaRole::Primary;
+    old_primary.current_progress = 0;
+    let previous = ReplicaSetConfiguration {
+        configuration: ConfigurationDescriptor::new(
+            epoch(0),
+            ReplicaId::new(2),
+            vec![ConfigurationMember {
+                identity: identity(2),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        ),
+        replicas: vec![old_primary],
+    };
+    source
+        .update_catch_up_replica_set_configuration(current.clone(), previous.clone())
+        .await
+        .unwrap();
+    let mut write = source
+        .service()
+        .begin_replicate(Bytes::from_static(b"PC"))
+        .unwrap();
+    assert!(write.completion.wait().now_or_never().is_none());
+    for (applied, completed) in [(0, false), (write.lsn, true)] {
+        registry
+            .dispatch(&route(2, 1).envelope(wire::envelope::Body::ReplicationAck(
+                wire::ReplicationAck {
+                    replication_received: write.lsn,
+                    replication_applied: applied,
+                    copy_received: -1,
+                    copy_applied: -1,
+                    error: 0,
+                },
+            )))
+            .unwrap();
+        if completed {
+            write.completion.wait().await.unwrap();
+        } else {
+            assert!(write.completion.wait().now_or_never().is_none());
+        }
+    }
+    for malformed in 0..6 {
+        let mut pc = previous.clone();
+        match malformed {
+            0 => pc.replicas.clear(),
+            1 => pc.replicas[0].process_session_id = ProcessSessionId::new("wrong"),
+            2 => pc.configuration.epoch = Epoch::new(-1, 0),
+            3 => pc.configuration.write_quorum = 2,
+            4 => pc.replicas.push(pc.replicas[0].clone()),
+            _ => pc.replicas[0].must_catchup = true,
+        }
+        if malformed == 2 || malformed == 3 {
+            pc.configuration.configuration_id = pc.configuration.expected_id();
+        }
+        assert!(
+            source
+                .update_catch_up_replica_set_configuration(current.clone(), pc)
+                .await
+                .is_err(),
+            "historical validation control {malformed}"
+        );
+    }
+    // A valid historical PC is not a valid CC on this local/new primary.
+    assert!(
+        source
+            .update_current_replica_set_configuration(previous)
+            .await
+            .is_err()
+    );
+    // Native public current W1 still forbids remote CC members.
+    assert!(
+        source
+            .update_current_replica_set_configuration(config(1, 1, &[(2, 0, false)]))
+            .await
+            .is_err()
+    );
+    source
+        .update_current_replica_set_configuration(current)
+        .await
+        .unwrap();
+    source.close().await.unwrap();
+    source.join().await.unwrap();
+}
+
+#[tokio::test]
 async fn remove_idle_ends_the_actual_build_without_dropping_its_trait_waiter() {
     let node = lone();
     let provider = node.provider.clone();

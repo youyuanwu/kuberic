@@ -181,7 +181,8 @@ async fn compose(
         registry,
         Arc::new(|| WriteAccess::NotPrimary),
     );
-    let adapter = adapter.map_err(error)?;
+    let mut adapter = adapter.map_err(error)?;
+    adapter.service.write_admission = Some(context.native_write_admission()?);
     let peers: Arc<Mutex<BTreeMap<ReplicaId, PeerBinding>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let resolve = peers.clone();
     let config = FacadeConfig {
