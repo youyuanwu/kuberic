@@ -658,6 +658,55 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         let (admin, _connection) = source.driver.instance.connect().await.unwrap();
         let peer_slot = crate::native::replication_slot_name(&peer.identity);
         let idle_slot = crate::native::replication_slot_name(&idle.identity);
+        let cancelled_idle = Replica::new(directory.path().join("cancel-remove"), 106).await;
+        cancelled_idle.role(1, ReplicaRole::IdleSecondary).await;
+        let binding = BindingFactory::new().build(&source, &cancelled_idle, "cancel-remove");
+        source
+            .driver
+            .build_replica(build_replica(&binding))
+            .await
+            .unwrap();
+        let gate = {
+            let state = source.driver.public_owner().state.lock().await;
+            state
+                .grants
+                .iter()
+                .find(|grant| grant.binding.target() == &cancelled_idle.identity)
+                .unwrap()
+                .gateway
+                .hold_exit()
+        };
+        let driver = source.driver.clone();
+        let id = cancelled_idle.identity.replica_id;
+        let remove = tokio::spawn(async move { driver.remove_replica(id).await });
+        gate.entered.notified().await;
+        remove.abort();
+        assert!(remove.await.unwrap_err().is_cancelled());
+        gate.release.notify_one();
+        let cancelled_slot = crate::native::replication_slot_name(&cancelled_idle.identity);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while admin
+                .query_one(
+                    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&cancelled_slot],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+                != 0
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled Remove lost its dirty slot ownership without a retry");
+        sql.simple_query("SELECT 1").await.unwrap();
+        assert_eq!(source.driver.instance.generation_id(), generation);
+        assert_eq!(
+            std::fs::read(source.driver.instance.data_dir().join("postmaster.pid")).unwrap(),
+            process
+        );
+        cancelled_idle.driver.public_close().await.unwrap();
         assert_eq!(
             admin
                 .query_one(

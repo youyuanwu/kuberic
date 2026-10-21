@@ -781,6 +781,14 @@ impl PgReplicator {
         Ok(())
     }
 
+    async fn public_retire_grant(&self, grant: Grant) -> Result<()> {
+        self.public_owner()
+            .slots_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        grant.active.cancel();
+        grant.gateway.drain().await
+    }
+
     async fn public_start(&self) -> Result<()> {
         crate::config::PgConfig::public_replication_fence(self.instance.data_dir())
             .await
@@ -1119,7 +1127,7 @@ impl PgReplicator {
         while index < state.grants.len() {
             if state.grants[index].active.is_cancelled() {
                 let retired = state.grants.remove(index);
-                retired.gateway.drain().await?;
+                self.public_retire_grant(retired).await?;
             } else {
                 index += 1;
             }
@@ -1340,8 +1348,7 @@ impl PgReplicator {
                     index += 1;
                 } else {
                     let grant = state.grants.remove(index);
-                    grant.active.cancel();
-                    grant.gateway.drain().await?;
+                    self.public_retire_grant(grant).await?;
                 }
             }
             self.public_owner()
@@ -1936,8 +1943,7 @@ impl PgReplicator {
                 && state.grants[index].binding.target().replica_id == replica
             {
                 let grant = state.grants.remove(index);
-                grant.active.cancel();
-                grant.gateway.drain().await?;
+                self.public_retire_grant(grant).await?;
             } else {
                 index += 1;
             }
