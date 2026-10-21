@@ -401,35 +401,6 @@ impl StatefulServiceReplica for KvService {
     }
 }
 
-#[cfg(test)]
-mod close_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn trait_close_joins_consumers_and_retains_failure_on_retry() {
-        let directory = tempfile::tempdir().unwrap();
-        let service = KvService::new(
-            Arc::new(KvPersistence::open(directory.path()).unwrap()),
-            "http://127.0.0.1:0".into(),
-            CopyGate::disabled(),
-        );
-        service
-            .streams
-            .lock()
-            .await
-            .tasks
-            .spawn(async { Err(RuntimeError::Application("owned consumer failure".into())) });
-        let first = service.close().await.unwrap_err().to_string();
-        assert!(first.contains("owned consumer failure"));
-        assert!(service.streams.lock().await.tasks.is_empty());
-        assert_eq!(service.close().await.unwrap_err().to_string(), first);
-        assert_eq!(
-            service.shutdown_and_drain().await.unwrap_err().to_string(),
-            first
-        );
-    }
-}
-
 async fn failed(
     stream: OperationStream,
     partition: StatefulServicePartition,
@@ -525,4 +496,33 @@ async fn consume_replication(
         operation.acknowledge()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn trait_close_joins_consumers_and_retains_failure_on_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = KvService::new(
+            Arc::new(KvPersistence::open(directory.path()).unwrap()),
+            "http://127.0.0.1:0".into(),
+            CopyGate::disabled(),
+        );
+        service
+            .streams
+            .lock()
+            .await
+            .tasks
+            .spawn(async { Err(RuntimeError::Application("owned consumer failure".into())) });
+        let first = service.close().await.unwrap_err().to_string();
+        assert!(first.contains("owned consumer failure"));
+        assert!(service.streams.lock().await.tasks.is_empty());
+        assert_eq!(service.close().await.unwrap_err().to_string(), first);
+        assert_eq!(
+            service.shutdown_and_drain().await.unwrap_err().to_string(),
+            first
+        );
+    }
 }

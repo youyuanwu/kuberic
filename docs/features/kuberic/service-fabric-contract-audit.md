@@ -47,7 +47,7 @@ Initial inventory: **17 implementation findings: 10 P1 and 7 P2**, plus
 **one documentation/behavior mismatch**. All entries are initially open.
 This initial inventory describes the historical audit, not current status.
 
-Current inventory: **21 implementation findings: 7 fixed / 14 open**
+Pre-P6 recorded inventory (historical): **21 implementation findings: 7 fixed / 14 open**
 (5 open P1 and 9 open P2), plus **one open documentation/behavior
 mismatch** (SF-D01). SF-D02 is fixed independently of implementation counts.
 SF-04/SF-05 were fixed by PR #151; SF-14 is fixed by the implementation
@@ -55,12 +55,21 @@ published in PR #154 and recorded below. Original failure traces remain
 historical evidence. SF-18 through SF-21 track the remaining stream, context,
 primary-completion, and acknowledgement alignment requirements. SF-06 is
 fixed by local commits `ac16f97` and `d73db99`, as recorded below; SF-15
-remains open.
+was open at that checkpoint.
 SF-01 is fixed by local commit `434cd18`; SF-11's pre-existing prefix repair
 in `05f69bee` (PR #151) is now revalidated by an exact regression in
 `434cd18`. No additional SF-11 runtime change was needed.
 SF-10 is fixed by local commits `53038e3` and `dbceb59`, with source-backed native comparison
 and quiet snapshot-only regressions recorded below.
+
+P6 current dispositions are qualified by the
+[finding-to-current-code-to-regression matrix](sf-v1-p6-closure.md). SF-03,
+SF-07/08/09/16 and SF-15 are fixed within their selected application/custom
+paths. SF-13's silent-success defect is fixed by explicit unsupported rejection
+of marked WriteQuorum, not an implementation of that capability. SF-17's bounded
+current-factory case is fixed, while the broader P7 settings obligation remains
+open. These changes use actual production-path regressions and the implementation
+commits below; unrelated historical findings are not automatically reclassified.
 
 **Alignment decision:** The user requested alignment with the linked SF
 semantics on 2026-10-17. SF-18 through SF-21 are required changes, not accepted
@@ -116,28 +125,28 @@ SF-21, SF-D01 and other gaps are closure checks against that port, not independe
 replacement algorithms. Open application/custom-replicator findings remain
 mapped to later phases. Fixed findings retain their historical evidence,
 but affected contracts (including SF-01/SF-D02/SF-10) must be requalified rather
-than treated as proof of native equivalence. No status/count changes are made
-by this documentation-only planning update.
+than treated as proof of native equivalence. That historical documentation-only planning update made no status/count changes;
+the subsequent P6 implementation dispositions below are separately evidenced.
 
 | ID | Priority | Status | Finding |
 |---|---|---|---|
 | [SF-01](#sf-01-applied-kv-state-is-visible-before-the-read-fence) | P1 | Fixed | Applied KV state is visible before the read fence |
 | [SF-02](#sf-02-kv-writes-bypass-partition-write-denial) | P1 | Open | KV writes bypass partition write denial |
-| [SF-03](#sf-03-postgresql-sql-admission-ignores-partition-denial) | P1 | Open | PostgreSQL SQL admission ignores partition denial |
+| [SF-03](#sf-03-postgresql-sql-admission-ignores-partition-denial) | P1 | Fixed (P6 scoped) | PostgreSQL SQL admission ignores partition denial |
 | [SF-04](#sf-04-controller-swap-capability-conflicts-with-runtime-admission) | P1 | Fixed | Controller swap capability conflicts with runtime admission |
 | [SF-05](#sf-05-swap-installs-the-final-role-layout-before-source-catch-up) | P1 | Fixed | Swap installs the final role layout before source catch-up |
 | [SF-06](#sf-06-access-revocation-can-block-teardown-and-violate-role-ordering) | P1 | Fixed | Access revocation can block teardown and violate role ordering |
-| [SF-07](#sf-07-idle-postgresql-removal-globally-drains-the-partition) | P1 | Open | Idle PostgreSQL removal globally drains the partition |
-| [SF-08](#sf-08-retired-postgresql-grants-leak-persistent-slots) | P1 | Open | Retired PostgreSQL grants leak persistent slots |
-| [SF-09](#sf-09-postgresql-epoch-fencing-regresses-reported-progress) | P1 | Open | PostgreSQL epoch fencing regresses reported progress |
+| [SF-07](#sf-07-idle-postgresql-removal-globally-drains-the-partition) | P1 | Fixed (P6 scoped) | Idle PostgreSQL removal globally drains the partition |
+| [SF-08](#sf-08-retired-postgresql-grants-leak-persistent-slots) | P1 | Fixed (P6 ownership) | Retired PostgreSQL grants leak persistent slots |
+| [SF-09](#sf-09-postgresql-epoch-fencing-regresses-reported-progress) | P1 | Fixed (orderly observation) | PostgreSQL epoch fencing regresses reported progress |
 | [SF-10](#sf-10-quiet-snapshot-builds-fail-boundary-proof) | P1 | Fixed | Quiet snapshot builds fail boundary proof |
 | [SF-11](#sf-11-suffix-reconciliation-skips-a-missing-committed-prefix) | P2 | Fixed | Suffix reconciliation skips a missing committed prefix |
 | [SF-12](#sf-12-minority-rejection-makes-specific-quorum-catch-up-order-dependent) | P2 | Open | Minority rejection makes specific-quorum catch-up order-dependent |
-| [SF-13](#sf-13-postgresql-writequorum-ignores-the-required-peer) | P2 | Open | PostgreSQL WriteQuorum ignores the required peer |
+| [SF-13](#sf-13-postgresql-writequorum-ignores-the-required-peer) | P2 | Fixed (explicit rejection) | PostgreSQL WriteQuorum ignores the required peer |
 | [SF-14](#sf-14-built-in-operation-streams-are-disconnected-from-delivery) | P2 | Fixed | Built-in operation streams are disconnected from delivery |
-| [SF-15](#sf-15-kv-close-does-not-join-owned-consumers) | P2 | Open | KV Close does not join owned consumers |
-| [SF-16](#sf-16-postgresql-abort-leaves-gateway-grants-armed) | P2 | Open | PostgreSQL Abort leaves gateway grants armed |
-| [SF-17](#sf-17-dynamic-open-leaves-settings-guards-inconsistent) | P2 | Open | Dynamic Open leaves settings guards inconsistent |
+| [SF-15](#sf-15-kv-close-does-not-join-owned-consumers) | P2 | Fixed (service trait Close) | KV Close does not join owned consumers |
+| [SF-16](#sf-16-postgresql-abort-leaves-gateway-grants-armed) | P2 | Fixed (retained gateways) | PostgreSQL Abort leaves gateway grants armed |
+| [SF-17](#sf-17-dynamic-open-leaves-settings-guards-inconsistent) | P2 | Open (bounded factory case fixed) | Dynamic Open leaves settings guards inconsistent |
 | [SF-18](#sf-18-copy-stream-lifetime-prevents-sf-sequential-consumption) | P2 | Open | Copy stream lifetime prevents SF sequential consumption |
 | [SF-19](#sf-19-copy-context-comes-from-the-primary-instead-of-the-secondary) | P2 | Open | Copy context comes from the primary instead of the secondary |
 | [SF-20](#sf-20-primary-replication-lacks-the-sf-early-lsn-and-local-commit-pipeline) | P2 | Open | Primary replication lacks the SF early-LSN and local-commit pipeline |
@@ -247,6 +256,14 @@ ordinary HTTP PUT must fail without provider application or commitment.
 Repeat while mandatory post-revocation catch-up is pending.
 
 ### SF-03: PostgreSQL SQL admission ignores partition denial
+
+**P6 status: Fixed within current partition policy.** Commit `1a792ed55ceec10b13bcac6aa70e19ce4c169327`;
+actual `public_v1_postgres_partition_authority` and
+`public_v1_postgres_secondary_readiness` regressions, with independent negative
+and authorized ready controls. See [current owners and limits](sf-v1-p6-closure.md).
+The Failure/Evidence below preserve the historical baseline, including old host
+no-provider logic; current PgService remains usable without a dummy provider.
+Native host stable-secondary read policy is unchanged.
 
 **Contract:** Native SQL reads and writes must follow partition admission,
 including final secondary catch-up and subsequent access revocation.
@@ -446,6 +463,13 @@ client access enforcement (SF-02/SF-03), or primary progress correctness
 
 ### SF-07: Idle PostgreSQL removal globally drains the partition
 
+**P6 status: Fixed for completed idle nonvoters.** Commits `584b20eb667806af11048eec59ce088f534dd956`
+and `9f91a14f11041567c226b460b5fc474130265d66`;
+`public_v1_postgres_selected_resources` retains PID/generation, held primary
+SQL and unrelated active streaming across repeated removal and cancelled
+retirement. [Current matrix](sf-v1-p6-closure.md). Original trace below remains
+historical; active-voter removal is not the idle Remove contract.
+
 **Contract:** Removing a completed idle nonvoter releases that replica's
 resources without stopping unrelated voting replicas.
 
@@ -463,6 +487,15 @@ connection, A's streaming, and installed configurations without restarting or
 reconfiguring P. Only B's resources should disappear.
 
 ### SF-08: Retired PostgreSQL grants leak persistent slots
+
+**P6 status: Fixed selected slot/WAL ownership.** Commits `584b20e`, `1a792ed`
+and `9f91a14`; `public_v1_postgres_selected_resources` executes failed incarnation
+cycles beyond the queried slot budget, unpublished failure/cancellation,
+cancelled Remove without retry, reconnect/receiver restart, active omission and
+fresh replacement. Surviving authorized slots and live unrelated streaming are
+controls. [Exact code/test/commit mapping](sf-v1-p6-closure.md). Slot absence
+establishes release of that WAL pin; production disk-growth bounds and actual
+power-loss recovery are not inferred. The original source trace below is retained.
 
 **Contract:** Failed, removed, or retired replica grants must eventually release
 their persistent replication resources.
@@ -485,6 +518,16 @@ more than 32 sequential fresh-incarnation attempts. Preserve slots belonging
 to still-authorized peers during ordinary reconnects.
 
 ### SF-09: PostgreSQL epoch fencing regresses reported progress
+
+**P6 status: Fixed at the orderly terminal observation boundary.** Commit
+`1a792ed55ceec10b13bcac6aa70e19ce4c169327`;
+`public_v1_postgres_orderly_progress` advances beyond admission, fences
+primary/secondary with epoch/None, then queries stopped state before reopening
+with no access. [Current matrix and precise limits](sf-v1-p6-closure.md).
+Primary certified WAL is not secondary receive/replay or raw local flush.
+This is not a guarantee for unseen SQL racing shutdown, its checkpoint,
+arbitrary divergent-survivor elections, or kernel power loss. Original trace
+and broader historical closure proposal below are preserved, not claimed tested.
 
 **Contract:** Fencing old-epoch traffic must preserve accurate reporting of the
 replica's highest contiguous durable progress for recovery and selection.
@@ -625,6 +668,14 @@ Local-source failures and failures of indispensable peers must remain fatal.
 
 ### SF-13: PostgreSQL WriteQuorum ignores the required peer
 
+**P6 status: Fixed silent success by explicit unsupported rejection.** Commit
+`1a792ed55ceec10b13bcac6aa70e19ce4c169327`;
+`public_v1_postgres_marked_catchup` rejects marked WriteQuorum while ordinary
+quorum advances past the lagging required peer, without destroying primary
+SQL. All and ordinary unmarked WriteQuorum controls pass; capability-false
+swaps retain All. [Current matrix](sf-v1-p6-closure.md). Marked-specific quorum
+is not claimed implemented; the following accepted-success trace is historical.
+
 **Failure:** Accepted ordinary WriteQuorum catch-up checks aggregate native
 certified progress but not `must_catchup`. Another standby can satisfy the
 aggregate while the marked successor remains behind.
@@ -738,6 +789,13 @@ SF compatibility; SF-18 through SF-21 track their required alignment.
 
 ### SF-15: KV Close does not join owned consumers
 
+**P6 status: Fixed at service trait Close.** Commit `ca0c98ff8e785becf3f1358e5c7053bc3176129b`;
+`sf15_trait_close_retains_cancelled_consumer_drain` uses an actual owned
+secondary consumer and cancelled/retried trait Close before host exit.
+`trait_close_joins_consumers_and_retains_failure_on_retry` preserves diagnostics.
+[Current owner and evidence](sf-v1-p6-closure.md). Native completion remains
+distinct from application commitment; the missing-join trace below is historical.
+
 **Failure:** Trait Close signals cancellation and clears references but retains
 unjoined consumer tasks. Only the separate concrete `shutdown_and_drain`
 helper joins them, after the whole host terminates. Close itself is therefore
@@ -753,6 +811,16 @@ cancellation-safe join ownership and remain pending until the consumer
 terminates. This is distinct from SF-14's delivery-wiring problem.
 
 ### SF-16: PostgreSQL Abort leaves gateway grants armed
+
+**P6 status: Fixed for retained gateway/grant ownership.** Commits `584b20e`
+and `aebfa651c6a7865dbba139441113011a8d5fe3eb`;
+`public_v1_postgres_retained_abort` separately retains actual driver and hosted
+service, observes exact process/socket/listener/task reclamation without prior
+Close/Drop, and injects a task join failure with other retained grants.
+[Current matrix](sf-v1-p6-closure.md) separates synchronous disarm signals,
+forceful exact-process cleanup and asynchronous gateway joins. The regression
+deadline is not an Abort latency SLA; original missing-owner trace below remains
+historical.
 
 **Failure:** Abort cancels the lifecycle owner and reaps PostgreSQL but does not
 cancel retained grant/gateway tokens. Keeping service/driver references alive
@@ -773,6 +841,17 @@ exact-process reaping; a Close-style graceful wait is not a substitute for
 gateway containment.
 
 ### SF-17: Dynamic Open leaves settings guards inconsistent
+
+**P6 bounded status: Current-factory effective endpoint case fixed; P7 open.**
+Commit `ca0c98ff8e785becf3f1358e5c7053bc3176129b`;
+`public_factory_port_zero_effective_settings_are_immutable_and_round_trip`
+executes the actual default factory/host/registration chain and preserves
+identity/session/listener while accepting unchanged effective settings and
+rejecting a different address. [Current mapping](sf-v1-p6-closure.md).
+The replacement factory's pre-P6 source accepted original port zero but
+rejected the effective endpoint; the removed-engine inner-guard trace below
+must not be described as reproduced on current code. No original-address alias,
+new settings getter/default/update capability or P7-wide closure is claimed.
 
 **Failure:** Registering `http://host:0` and opening to a resolved port changes
 the engine address but not the outer registration-bound address. Reapplying

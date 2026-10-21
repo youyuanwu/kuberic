@@ -47,6 +47,23 @@ exporting host capabilities.
 
 ## Exact Nextest Inventory
 
+### P6 selected production-path regressions
+
+The [P6 closure matrix](sf-v1-p6-closure.md) gives exact exported PostgreSQL
+scenario names, current code owners, commit references and evidence limits.
+They belong to the existing PostgreSQL smoke catalog, not a new tier or
+source-token check. The actual KV trait-Close case is
+`sf15_trait_close_retains_cancelled_consumer_drain` in `read_fencing`; the real
+current-factory endpoint case is
+`public_factory_port_zero_effective_settings_are_immutable_and_round_trip` in
+`classic_v1_production`. Both use ordinary.
+
+For bounded local reproduction, use that document's checkout-local scratch and
+build environment, `just nextest-postgres-smoke`, and direct ordinary selectors.
+Do not use the destructive `just nextest-test` recipe with a shared target
+directory. Inventory validation lists/builds all tiers; it does not authorize or
+execute full PostgreSQL or live Kubernetes bodies.
+
 ```bash
 just nextest-validate
 ```
