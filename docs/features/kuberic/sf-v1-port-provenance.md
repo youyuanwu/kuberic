@@ -16,8 +16,8 @@ See [`THIRD-PARTY-NOTICES`](../../../THIRD-PARTY-NOTICES).
 Kuberic's root license and adapted API-documentation notices are unchanged.
 
 This register records **ancestry and transformations**, not delivery progress.
-Scoped rejection/fault vectors and new-entry gates are assessed at Kuberic
-`111cbb69f3568e272bc1b8fc29d6527ee0da9bd9`.
+Scoped rejection/fault vectors and new-entry gates use the current linked
+sources below.
 Kuberic selected-host Close/access evidence is assessed at
 `69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; Close references retain their
 explicit earlier anchors. Unchanged component ancestry
@@ -230,7 +230,7 @@ and adjacent tests, with actual manager/session/queue/carrier seams.
 ### Scoped rejection and primary-local fault entry — F02/F07/F08/F11
 
 The [owner vectors](../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230)
-and [public vectors](../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L382)
+and [public vectors](../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392)
 are **production-source-derived Rust qualification**, not translated native
 rejection-order test cases. The same clean upstream pin above governs this table.
 
@@ -246,7 +246,11 @@ PermissionDenied, forwarded unchanged by a rejection-only observer. It forwards
 the source's exact frozen binding metadata; it does not proxy a successful
 stream or synthesize progress. Source second-dial entry follows consumption of
 the first rejection. Real B persistence/ACK gates nonempty work and marked
-catch-up; local service commit remains later than native completion. Tonic
+catch-up; an opt-in [retained-native-wait handshake:590–625](../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625)
+uses an ordered same-facade query and polls the same future Pending before
+healthy release and after rejection-first consumption. It does not equate
+an unfinished outer host operation with native incompletion.
+Local service commit remains later than native completion. Tonic
 status, host configuration authority and socket routing are Kuberic
 substitutions, not native HRESULT/wire or executable differential evidence.
 Targeted [selectors](testing.md#scoped-rejection-order-and-local-fault-evidence)

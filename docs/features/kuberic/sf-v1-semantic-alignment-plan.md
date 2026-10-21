@@ -43,9 +43,8 @@ stage/interleaving qualification.
 ## Scoped rejection-order disposition
 
 The [scoped contract](classic-v1-runtime.md#rejection-and-fault-scope) has
-actual-owner and public-host both-order witnesses at Kuberic
-`111cbb69f3568e272bc1b8fc29d6527ee0da9bd9`
-([owner:18–230][rejection-owner], [public:57–382][rejection-public]).
+current actual-owner and public-host both-order witnesses
+([owner:18–230][rejection-owner], [public:57–392][rejection-public]).
 Dispensable remote idle-copy failure and an actual selected target's
 configuration-denied Exchange do not defeat sufficient healthy progress.
 Required PC/CC/marked/All evidence remains required; new entries after
@@ -169,4 +168,4 @@ do not satisfy the entire original P8 qualification claim.
 [pg-wait]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1.rs#L1476-L1504
 [fallback]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/evaluator/public_v1_topology.rs#L445-L470
 [rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
-[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L382
+[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392

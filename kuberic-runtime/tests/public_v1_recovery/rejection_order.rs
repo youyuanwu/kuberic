@@ -201,6 +201,11 @@ async fn public_rejection_order(reject_first: bool) {
         })
         .await;
     let handle = pair.source.handle();
+    pair.source
+        .service
+        .provider
+        .catchup_boundary
+        .store(write.lsn as u64, Ordering::Release);
     let mut catchup = tokio::spawn(async move { handle.execute_public_v1(catchup_intent).await });
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -208,7 +213,6 @@ async fn public_rejection_order(reject_first: bool) {
     )
     .await
     .unwrap();
-    assert!(!catchup.is_finished());
     assert!(matches!(
         write.outcome.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
@@ -225,7 +229,13 @@ async fn public_rejection_order(reject_first: bool) {
         tokio::time::timeout(Duration::from_secs(10), retry.notified())
             .await
             .unwrap();
-        assert!(!catchup.is_finished());
+        pair.source.service.provider.catchup_probe.notify_one();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            pair.source.service.provider.catchup_entered.notified(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             write.outcome.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)

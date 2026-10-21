@@ -1,7 +1,7 @@
 # SF V1: Current Source and Evidence Ledger
 
-Scoped rejection/fault evidence is assessed at Kuberic
-`111cbb69f3568e272bc1b8fc29d6527ee0da9bd9`; selected-host alignment retains
+Scoped rejection/fault evidence uses the current linked owners and public
+vectors; unchanged selected-host alignment references retain
 `69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; Close references retain explicit
 `aad23335c219a576d69133cee883bbd63e40b68a` anchors. Unchanged component references
 retain their explicit `e2a47b6c631c974aa0135e81c3a7e3a439980ded` anchors.
@@ -40,7 +40,7 @@ scenario oracle.
 | **SF-09** — stopped PG progress regresses | Supported orderly terminal observation only | [PG:567–617][pg-stop], [1507–1525][pg-progress], [test:163–249][pg-stop-test]. Primary certificate and secondary receive/replay differ; unobserved racing SQL, Abort snapshot and arbitrary survivor election remain unverified. |
 | **SF-10** — quiet snapshot needs nonexistent original record | Supported actual copy/session boundary | [public:1661–1692][quiet], [1800–1840][suffix], [CopySender:218–293][copy]. Empty/nonzero snapshots and suffixes use current gates, not old durable receipts. |
 | **SF-11** — prefix skipped before ambiguous suffix | Supported current ordered-prefix safety; exact historical shape unverified | [current prefix:146–214][prefix], [gap test:151–172][modes]. Current witness preserves acknowledged6–10 before ambiguous11; it is not the old `(11,10)` reconciliation against peer5 or its removed negative controls. |
-| **SF-12** — dispensable rejection response order fails quorum | Supported **bounded current scoped ordering**; original finding belongs to removed engine | [Owner:18–155][rejection-owner] fails remote idle Build independently of healthy progress in both orders. [Public:57–310][rejection-public] forwards an actual configuration-denied C listener response and observes source consumption before/after real B apply, marked catch-up and service commit. Required PC/CC/marked/All controls remain distinct. Not the old typed proof-loop error, every rejection class or native executable equivalence; no current dispensable-order defect reproduced. |
+| **SF-12** — dispensable rejection response order fails quorum | Supported **bounded current scoped ordering**; original finding belongs to removed engine | [Owner:18–155][rejection-owner] fails remote idle Build independently of healthy progress in both orders. [Public:57–320][rejection-public] forwards an actual configuration-denied C listener response and observes source consumption before/after real B apply, marked catch-up and service commit; a same-facade query/retained-native-future handshake establishes pending catch-up before apply. Required PC/CC/marked/All controls remain distinct. Not the old typed proof-loop error, every rejection class or native executable equivalence; no current dispensable-order defect reproduced. |
 | **SF-13** — PG ignores marked successor | Silent success removed; marked mode **explicitly unsupported** | [PG:1476–1504][pg-wait], [tests:253–368][pg-wait-test]. Marked-successor WriteQuorum rejects before waiting. Ordinary unmarked WriteQuorum/All work; false-capability swap falls back to All. |
 | **SF-14** — disconnected service delivery | Supported real receiver delivery/ACK | [production bridge:341–378][bridge], [public:1696–1796][ack]. Persisted service ACK holds actual completion; no old progress-bearing verification/automatic-apply contract. |
 | **SF-15** — KV trait Close omits joins | Supported retained trait-Close consumer drainage | [service:200–218][kv-close], [372–384][kv-tasks], [test:478–532][kv-close-test]. Cancel/retry retains joins/errors; not inferred from host shutdown. |
@@ -63,7 +63,7 @@ progress, not empty history or cross-identity reusable state
 |---|---|---|
 | Core — outer Close | [selected program:550–638][aligned-close], [public failures/joins:3114–3505][aligned-close-tests] vs [native:94–105,206–275][native-close] | Supported bounded outer-success-after-containment alignment with retained child diagnostics. Local abort-both/skip-later-graceful action difference remains intentional; no generic app-task join claim. |
 | Core — staged access | [selected policy:209–300][aligned-access], [public barriers:144–2159][aligned-access-tests] vs [native selector:288–381][aligned-native-selector] | Supported bounded same-primary/promotion/demotion stage policy, primary-context validation, same-host repromotion/reconciliation, cancellation/replay and compatible final release. Missing progress yields explicit unavailable facts; descriptor availability is not remote liveness. Broader stage/interleaving qualification remains unverified. |
-| Core — primary-local Build fault entry | [Manager:793–805,1028–1045][local-fault-entry], [owner:157–230][rejection-owner], [public:323–382][rejection-public] | New assignment/catch-up reject latched GetCopyState/EndGetNext faults. Regression negative controls demonstrated cached-ready catch-up success and new owner assignment before the gate. This is a separate local fault-entry mismatch, not SF-12 remote ordering. Pending operations and Close retain separate policies. |
+| Core — primary-local Build fault entry | [Manager:793–805,1028–1045][local-fault-entry], [owner:157–230][rejection-owner], [public:333–392][rejection-public] | New assignment/catch-up reject latched GetCopyState/EndGetNext faults. Regression negative controls demonstrated cached-ready catch-up success and new owner assignment before the gate. This is a separate local fault-entry mismatch, not SF-12 remote ordering. Pending operations and Close retain separate policies. |
 | Source-contract wording | [catch-up Rustdoc:107–119][catchup-doc], [epoch Rustdoc:53–55][epoch-doc] vs [manager:975–1024][manager], [292–302][epoch] | Stale comments; separately reconcile without changing protected signatures. No source edit in this rewrite. |
 | Security | [HTTP:177–227][http], [bearer:728–766][auth] | Authenticated but no TLS; ordinary deployment constraints remain. Missing native credential API is not accepted-but-unenforced settings. |
 | Qualification | [public external provider:1861–1939][external], [real SQLite:1731–1801][sqlite], component/native ancestry | Actual Rust/application evidence is not native binary differential, kernel power-loss or production readiness. |
@@ -150,7 +150,7 @@ maintained. Former filenames here are plain text, not live navigation targets.
 
 [aligned-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
 [rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
-[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L382
+[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
 [local-fault-entry]: ../../../kuberic-runtime/src/replicator/v1/replica_manager.rs#L793-L1045
 [aligned-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505
 [aligned-access]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L209-L300

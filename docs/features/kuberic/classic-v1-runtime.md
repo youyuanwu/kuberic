@@ -173,7 +173,7 @@ These distinctions follow [native send handling:753–790][native-send-errors]
 and [ACK handling:633–740][native-ack-errors], with actual selected
 [owner vectors:18–155][rejection-owner].
 
-The public [both-order vectors:57–310][rejection-public] exercise a real
+The public [both-order vectors:57–320][rejection-public] exercise a real
 configuration-mismatched C listener returning PermissionDenied while P/B
 retain valid authority. A rejection-only observer forwards the exact source
 binding and returns C's status unchanged; source retry entry establishes
@@ -181,6 +181,10 @@ consumption before releasing B in rejection-first order. Healthy-first holds
 C's initial dial until genuine B apply, marked WriteQuorum catch-up and service
 commit complete. Both orders use nonempty work, a captured issued boundary,
 service-owned persistence/ACK and another successful write after rejection.
+An opt-in [same-native-wait handshake:590–625][pending-native-wait] crosses
+an ordered query on the selected facade, asserts the retained native future
+pending before release, and rechecks it after rejection-first consumption.
+Outer host-task incompletion alone is not this native-pending witness.
 This is selected Rust host/carrier evidence, not a native transport run.
 
 Dispensability is operation-specific: missing required PC/CC apply still holds
@@ -191,7 +195,7 @@ immediate remote-error result or waive progress
 Primary-local GetCopyState/EndGetNext faults are separate: new assignments
 and new catch-up entries reject the latched fault before queue/wait mutation
 ([manager:793–805,1028–1045][local-fault-entry],
-[owner:157–230][rejection-owner], [public:323–382][rejection-public]).
+[owner:157–230][rejection-owner], [public:333–392][rejection-public]).
 This does not promise synchronous fault completion of every already-pending
 wait, or revoke a previously completed success. Invalid live-owner protocol,
 local representation/authority and session/epoch failures retain their own
@@ -487,5 +491,6 @@ production-readiness support from the selected Rust journeys.
 [native-send-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/RemoteSession.cpp#L753-L790
 [native-ack-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.cpp#L633-L740
 [rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
-[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L382
+[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
 [local-fault-entry]: ../../../kuberic-runtime/src/replicator/v1/replica_manager.rs#L793-L1045
+[pending-native-wait]: ../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625

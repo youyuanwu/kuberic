@@ -186,8 +186,7 @@ broad P7, native differential, power-loss or production-readiness qualification.
 
 ### Scoped rejection-order and local-fault evidence
 
-Focused actual-owner and public-host vectors at
-`111cbb69f3568e272bc1b8fc29d6527ee0da9bd9` passed under the ordinary profile.
+The current focused actual-owner and public-host vectors passed under the ordinary profile.
 Use the live names, not a fixed total:
 
 ```bash
@@ -202,11 +201,16 @@ observe failed idle C Build and genuine B progress in both orders, preserve
 current/previous/marked/All requirements, and reject new assignment/cached-ready
 catch-up after GetCopyState/EndGetNext faults. Active copy error is a separate
 replication-progress case, not a generic NACK.
-The [public vectors](../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L382)
+The [public vectors](../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392)
 use actual C-listener configuration denial, exact metadata/status forwarding
 and source retry entry as a consumption barrier. B's service-owned persistence/
 ACK is withheld across real issued work and captured-boundary marked catch-up;
 healthy-first completes native/application work before C is released.
+A [same-native-wait handshake](../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625)
+polls the real wait, crosses an ordered same-facade query and checks that
+future Pending before healthy release; rejection-first probes it again after
+source consumption. Wrapper entry or unfinished outer journal work is not
+the native-pending assertion.
 A further real write demonstrates the source is not poisoned after rejection.
 The local-source Build-fault vector exercises both acquisition/enumeration
 origins through the selected host/public native interfaces.
