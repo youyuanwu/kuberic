@@ -1,54 +1,42 @@
 # SF V1: Pending Alignment and Qualification
 
-This is a current work queue, not a delivery-phase checklist. Baselines:
-Kuberic `e2a47b6c631c974aa0135e81c3a7e3a439980ded`; native SF
+This is a current work queue, not a delivery-phase checklist. Host-alignment
+baseline: Kuberic `aad23335c219a576d69133cee883bbd63e40b68a`; native SF
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 Read [current semantics](classic-v1-runtime.md) first and use the
 [disposition ledger](sf-v1-port-ledger.md) to interpret historical SF IDs.
 Completing P6 and replacing an old engine do not prove that no core defect remains.
 
-Priorities below order **future separately authorized work**. This
-documentation reassessment implements none of it. “Verified difference” means
+Priorities below order **future separately authorized work**. “Verified difference” means
 source-confirmed divergence, not a dynamically reproduced data-loss defect;
 “unverified” means missing claim-specific qualification, not demonstrated failure.
 
-## P1 — Verified core alignment differences
+## Selected-host Close and access disposition
 
 ### Outer Close outcome
 
-**Current evidence:** the selected production journal executor retains a failed
-child result, aborts/cleans up and returns failed outer Close
-([program:531–599][close], [diagnostics test:1064–1078][close-test]).
-Native outer Close can instead complete Success after aborting a failed child
-([native:94–105][native-close-start], [206–275][native-close-end]).
-The private native-shaped host is not the selected journal executor.
-
-**Bounded next work:** reconcile selected outer outcome with the chosen native
-target without hiding child errors or weakening containment. Include
-cancellation, journal replay and retained terminal cleanup; do not substitute
-a private-host result for selected public-host behavior.
-
-**Completion criterion:** public-host failed-replicator/failed-application Close
-witnesses prove intended outer result, retained child diagnostics, no skipped
-containment, no repeated interrupted callback, and actual terminal joins.
+The selected journal executor now succeeds after contained child failure,
+retains the child diagnostic and fails on cleanup failure
+([program:550–638][aligned-close]). Actual public-host failure/interruption/
+retained-provider witnesses cover the bounded behavior
+([public:3114–3505][aligned-close-tests]). Unrecorded destructive callbacks are
+contained without reinvocation; recorded Cleanup is not a process-local join.
+This closes the selected outer-outcome difference, not every native inner
+callback sequence or generic application-task join.
 
 ### Access during reconfiguration
 
-**Current evidence:** selected production readiness/pending/fence projection
-([host:551–576][ready], [692–756][access]) does not select every native
-demotion/same-primary read stage
-([native:58–144][native-access]). This is a conservative availability
-difference, not the stale SF-02 write-bypass finding.
-
-**Bounded next work:** reconcile real selected read/write states across
-same-primary reconfiguration, promotion and pre/post-Revoke demotion, preserving
-service-local committed visibility and the shared admission/assignment cut
-([adapter:421–448][admission], [host Revoke:374–380][revoke]).
-
-**Completion criterion:** actual public-host barriers observe those stages,
-including cancellation/replay and final fence release; native-equivalent
-policy or any intentional difference is explicit. A private selector pass is
-insufficient, and an access grant is never a substitute for service isolation.
+The selected runtime now publishes same-primary, split/recipe promotion and
+standalone/composed demotion stages from operation-owned live evidence
+([policy:99–184][aligned-access], [public barriers:133–1025][aligned-access-tests]).
+The [current matrix and protocol-13 boundary](classic-v1-runtime.md#host-access-lifecycle-and-retirement)
+replace the former blanket pending/fence availability difference. Public tests
+attempt committed service reads and raw writes, including independent missing
+C/P, pre/post-Revoke, final-wait-before-receipt, cancellation, exact replay,
+late owner and final release. Descriptor availability is not live health
+certification; service isolation and the actual shared admission gate remain
+independent. This is bounded source-guided alignment, not exhaustive native
+stage/interleaving qualification.
 
 ## P2 — Focused qualification, not presumed defects
 
@@ -126,19 +114,15 @@ expectations and exclusions.
 
 Future broad qualification needs an explicit mode/capability/claim matrix,
 actual commands/environment/outcomes and bounded success criteria. It must not
-become an unprioritized resumption of P1–P8 checkboxes or erase known current core
-differences. Documentation consolidation satisfies the present documentation
-need, not the entire original P8 alignment claim.
+become an unprioritized resumption of P1–P8 checkboxes or treat these two bounded
+host changes as complete alignment. The selected regressions and documentation
+do not satisfy the entire original P8 qualification claim.
 
-[close]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/public_lifecycle_program.rs#L531-L599
-[close-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/public_lifecycle_tests.rs#L1064-L1078
-[native-close-start]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.CloseAsyncOperation.cpp#L94-L105
-[native-close-end]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.CloseAsyncOperation.cpp#L206-L275
-[ready]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L551-L576
-[access]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L692-L756
-[native-access]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L58-L144
-[admission]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter.rs#L421-L448
-[revoke]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L374-L380
+[aligned-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
+[aligned-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505
+[aligned-access]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L99-L184
+[aligned-access-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/support/staged_access.rs#L133-L1025
+
 [minority]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/public_v1_recovery.rs#L2302-L2433
 [marked]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/replica_manager/tests.rs#L690-L719
 [prefix]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/support/read_fencing.rs#L146-L214

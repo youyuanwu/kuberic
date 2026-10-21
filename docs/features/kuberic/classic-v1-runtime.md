@@ -1,13 +1,15 @@
 # Classic V1: Current Semantics
 
 This is the authoritative behavioral reference for the selected classic V1
-runtime. Its source/test citations are pinned to Kuberic
-`e2a47b6c631c974aa0135e81c3a7e3a439980ded`; the documentation rewrite changes no
-runtime or test behavior. Native comparisons use Service Fabric
+runtime. Selected-host Close/access evidence is pinned to Kuberic
+`aad23335c219a576d69133cee883bbd63e40b68a`; unchanged component references
+retain their explicit `e2a47b6c631c974aa0135e81c3a7e3a439980ded` anchors.
+Native comparisons use Service Fabric
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 
-**Evidence is bounded:** inspected source and existing Rust regression bodies
-are not a fresh test run, native binary differential, power-loss proof,
+**Evidence is bounded:** targeted Rust selected-host regressions were executed
+for the Close/access changes. Inspected source and other existing test bodies
+are not additional runs, native binary differential, power-loss proof,
 exhaustive compatibility certification or production-readiness claim. The
 [evidence/disposition ledger](sf-v1-port-ledger.md) distinguishes supported,
 explicitly unsupported/different, unverified and deferred work. See the
@@ -190,23 +192,60 @@ Revoke is access-only, not synthetic `change_role(None)`
 ([program:14–44][program]). Stable-secondary access is NotPrimary
 ([host selector:187–195][stable-secondary]).
 
-Two **verified current core differences**, not broad deferred P7 extensions,
-remain:
+Selected production now publishes live operation-owned stages, not the private
+host's full selector. Paired-role/configuration/catch-up evidence and matching
+completion determine access ([selected policy:99–184][selected-policy],
+[activation:590–629][selected-activation]):
 
-1. **Staged access:** production uses completed-intent readiness and conservative
-   pending/fence projection, with a pre-Revoke Swap exception
-   ([host:551–576][access-ready], [692–756][access-projection]).
-   Native preserves reads during particular demotion/same-primary stages
-   ([native:58–144][native-access]). The private staged selector is not wholly
-   selected by the production journal executor. This is a conservative
-   availability difference, not demonstrated unsafe admission.
-2. **Outer Close:** selected production preserves child failure, aborts,
-   retains cleanup and returns **failed outer Close**
-   ([program:531–599][outer-close], [diagnostics test:1064–1078][close-test]).
-   Native outer Close can succeed after aborting a failed child while retaining
-   diagnostics ([native:94–105][native-close-start],
-   [206–275][native-close-end]). A private host's successful outer result is not
-   selected-host closure. See [prioritized work](sf-v1-semantic-alignment-plan.md#p1--verified-core-alignment-differences).
+| Reachable stage | Read | Write |
+|---|---|---|
+| Same-primary joint install/catch-up, including caught-up joint completion | Granted | C and P; otherwise NoWriteQuorum |
+| Matching current-only activation | Granted | C; otherwise NoWriteQuorum |
+| Promotion before paired roles and catch-up | ReconfigurationPending | ReconfigurationPending |
+| Promotion caught up, before activation | Granted | ReconfigurationPending |
+| Demotion pre-Revoke catch-up | Granted | C and P; otherwise NoWriteQuorum |
+| Demotion post-Revoke final wait | Granted | ReconfigurationPending |
+| Demotion final wait returned, role transition and completion | NotPrimary | NotPrimary |
+
+C requires current electorate minimum size and available majority; P requires
+previous available majority when a previous set is supplied. Required
+`is_up`/`is_ready` descriptor facts are explicit control-plane observations,
+not live peer-health or commitment certification. No previous set makes P
+vacuous, not an invented old electorate. Joint completion retains P;
+current-only activation removes it. Actual write completion still needs native
+transport/quorum. Split controller Role/Epoch/CatchUp and lifecycle-recipe
+promotion both require catch-up; plain Configuration cannot bypass it.
+
+Stage reservations, invalidation and final publication share the real
+admission gate. Stale/cancelled/superseded owners cannot replace a newer owner;
+fault, terminal, creation and history/storage denials override grants.
+Accepted RPC publication survives reply-observer loss. Demotion denies reads
+immediately after final wait, before a fallible outcome receipt. These are the
+reachable native branches ([selector:288–381][native-stage-selector]), not its
+unreachable demotion CatchupCompleted table row. Deterministic real-public-host
+barriers attempt service committed reads and raw assignment across these cuts
+([stage witnesses:133–1025][selected-tests]); private selector tests alone are
+not the evidence.
+
+**Outer Close** records the child identity/error, aborts both children and skips
+later graceful callbacks after a child failure. Successful actual terminal
+cleanup then yields **successful outer Close**, matching the chosen native
+outer outcome ([program:550–638][selected-close],
+[native:94–105][native-close-start], [206–275][native-close-end]).
+The local abort-both sequence intentionally differs from native's per-child
+Abort/continued service Close. Diagnostics remain durable lifecycle journal
+`CloseFailure` outcomes, correlated by operation ID and child; a successful
+public response has no added child-error field. Cleanup failure still fails.
+
+An unrecorded interrupted destructive child callback is not retried: recovery
+attaches an Abort/drain/witness owner while retaining Ambiguous/Cancelled
+disposition ([recovery:79–115][selected-recovery]). Recorded Cleanup is not a
+new process-local join. Shutdown joins owners discovered by final recovery.
+Selected failed-replicator/application, interruption and retained-provider
+barriers exercise these distinctions ([public:3114–3505][selected-close-tests]).
+Some recovery cuts are deliberately seeded records; they are not power-loss
+or arbitrary process-crash qualification. Arbitrary application tasks have no
+generic join API; the failing-application fixture joins its own work.
 
 Abort requests containment; caller cancellation does not prove task drainage.
 Direct facade Close can complete while arbitrary Build provider work remains;
@@ -271,8 +310,13 @@ Authenticated missing-session **ACKs only** may be dropped after retirement;
 other dispatch errors remain failures ([ingress tests:226–370][ingress-test]).
 RPC acceptance/reconnect does not manufacture an ACK.
 
-Public protocol 12 and agent schema 13 are breaking formats, not native wire
+Public protocol 13 and agent schema 13 are breaking formats, not native wire
 versions ([protocol:13][protocol], [schema:19–21][schema]).
+Protocol 13 requires descriptor availability fields and includes them in
+canonical operation identity ([descriptor:548–562][availability],
+[encoder:3118–3133][availability-digest]). Protocol-12 identity and old
+descriptor-bearing persisted JSON without those fields reject; recreate that
+unstable state rather than infer available peers or mixed-version migration.
 Do not infer mixed-version, migration, exhaustive deployment-security or
 production-readiness support from the selected Rust journeys.
 
@@ -340,11 +384,6 @@ production-readiness support from the selected Rust journeys.
 [sentinel]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/mod.rs#L153-L163
 [program]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/public_lifecycle_program.rs#L14-L44
 [stable-secondary]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/v1_lifecycle.rs#L187-L195
-[access-ready]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L551-L576
-[access-projection]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/hosting.rs#L692-L756
-[native-access]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L58-L144
-[outer-close]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/public_lifecycle_program.rs#L531-L599
-[close-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/public_lifecycle_tests.rs#L1064-L1078
 [native-close-start]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.CloseAsyncOperation.cpp#L94-L105
 [native-close-end]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.CloseAsyncOperation.cpp#L206-L275
 [close-join]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs#L351-L387
@@ -383,5 +422,14 @@ production-readiness support from the selected Rust journeys.
 [dispatch]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/production_transport.rs#L365-L400
 [authority]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/native_transport.rs#L148-L226
 [ingress-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/tests/production_ingress.rs#L226-L370
-[protocol]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/protocol/public_operations.rs#L13
+[protocol]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/protocol/public_operations.rs#L13
+[selected-policy]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L99-L184
+[selected-activation]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/selected_access.rs#L590-L629
+[selected-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/support/staged_access.rs#L133-L1025
+[selected-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
+[selected-recovery]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L79-L115
+[selected-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505
+[availability]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/protocol/public_operations.rs#L548-L562
+[availability-digest]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/protocol/public_operations.rs#L3118-L3133
+[native-stage-selector]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L288-L381
 [schema]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/state.rs#L19-L21
