@@ -16,6 +16,8 @@ See [`THIRD-PARTY-NOTICES`](../../../THIRD-PARTY-NOTICES).
 Kuberic's root license and adapted API-documentation notices are unchanged.
 
 This register records **ancestry and transformations**, not delivery progress.
+Scoped rejection/fault vectors and new-entry gates use the current linked
+sources below.
 Kuberic selected-host Close/access evidence is assessed at
 `69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; Close references retain their
 explicit earlier anchors. Unchanged component ancestry
@@ -224,6 +226,43 @@ and adjacent tests, with actual manager/session/queue/carrier seams.
 | `ReplicaManager.cpp:792–870,1783–1832` | Remove retention/membership, sender close/copy cancel, write waiters before build cancel; exact rooted session prevents old-ID cleanup rebinding new Build. |
 | `RemoteSession.cpp:252–365`; `ReliableOperationSender.cpp:113–137,548–755`; `AckSender.cpp:64–208` | Tokio deadlines/Notify drive real StartCopy, replication/context retry and ACK timers; no alternate sender or autonomous component task. |
 | `ReplicaManager.Test.cpp:772–824` | Admission/helper ancestry; lifecycle/cancel/fault/timer vectors derive from production, not native test fixtures. |
+
+### Scoped rejection and primary-local fault entry — F02/F07/F08/F11
+
+The [owner vectors](../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230)
+and [public vectors](../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392)
+are **production-source-derived Rust qualification**, not translated native
+rejection-order test cases. The same clean upstream pin above governs this table.
+
+| Native source / inspected expectation | Selected destination, transformation and evidence limit |
+|---|---|
+| `R/RemoteSession.cpp:753–790`; `R/ReplicationTransport.cpp:202–227`; `R/PrimaryReplicator.cpp:633–740` | Ordinary send failure supplies no replication apply; copy error terminates establishment/idle Build while active replication progress is separate. `production_transport.rs:430–504` retries scoped connection/Exchange failure; `primary/tests/rejection_order.rs:18–155` uses actual ACK/Build ownership. No blanket suppression of invalid live ACK or local representation faults. |
+| `R/ReplicaManager.cpp:349–447,1061–1103,2328–2524`; `R/PrimaryReplicator.CatchupAsyncOperation.cpp:43–104` | PC/CC normal commitment and current Q/B/M versus All predicates remain real. Actual-owner required current/previous/marked/All controls do not invent missing apply or an immediate remote-error result. |
+| `R/PrimaryReplicator.BuildIdleAsyncOperation.cpp:81–124,149–158`; `R/CopyAsyncOperation.cpp:166–186`; `R/PrimaryReplicator.cpp:852–888`; `R/PrimaryReplicator.ReplicateAsyncOperation.cpp:31–38`; `R/PrimaryReplicator.CatchupAsyncOperation.cpp:31–37` | Remote Build failure versus primary-local GetCopyState/EndGetNext fault; new native entries check the primary fault latch. `replica_manager.rs:793–805,1028–1045` reuses its reported-fault check before assignment/wait mutation. Owner acquisition/enumeration negative controls demonstrated cached-ready success and assigned LSN after local fault; selected public negative control demonstrated acquisition-fault catch-up success. Accepted regressions cover both local fault origins. Pending-wait and Close behavior is not generalized from new-entry checks. |
+| `R/PublicApi.Test.cpp:1153–1226`, `TestBuildIdleWithSecondaryCopyContextErrors`; `R/ReplicaManager.Test.cpp:154–258` | Inspected failed remote Build and configuration/quorum expectations only; not native test execution, copied harness or a native controlled-order case. |
+
+Public configuration-denied Exchange uses the selected target listener's actual
+PermissionDenied, forwarded unchanged by a rejection-only observer. It forwards
+the source's exact frozen binding metadata; it does not proxy a successful
+stream or synthesize progress. Source second-dial entry follows consumption of
+the first rejection. Real B persistence/ACK gates nonempty work and marked
+catch-up; an opt-in [retained-native-wait handshake:590–625](../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625)
+uses an ordered same-facade query and polls the same future Pending before
+healthy release and after rejection-first consumption. It does not equate
+an unfinished outer host operation with native incompletion.
+Local service commit remains later than native completion. Tonic
+status, host configuration authority and socket routing are Kuberic
+substitutions, not native HRESULT/wire or executable differential evidence.
+Targeted [selectors](testing.md#scoped-rejection-order-and-local-fault-evidence)
+passed; unrelated modes/fault classes remain outside this qualification.
+
+Historical SF-12 belongs to
+`f56949996b366b14c925339ac2e859ca2fbaf637`:
+`docs/features/kuberic/service-fabric-contract-audit.md:547–558` described
+the removed `kuberic-runtime/src/replicator/stateless/mod.rs:1562–1619`
+proof loop (early typed remote rejection before quorum test). Those immutable
+historical paths are not current modules. Current vectors do not recreate that
+removed API or reinterpret the old report as a native defect.
 
 ### Secondary lifecycle — F04/F05/F06/F09/F11
 

@@ -162,6 +162,46 @@ with [native:43–105][native-catchup] ancestry and
 protected catch-up Rustdoc; comment reconciliation is
 [pending](sf-v1-semantic-alignment-plan.md#p2--source-contract-wording).
 
+### Rejection and fault scope
+
+A dispensable peer's ordinary connection/Exchange rejection supplies no apply
+progress and does not itself fail the primary's quorum wait. A remote idle
+copy/context error fails that peer's Build, not the primary's local provider.
+On an established active session a copy-error header is not a generic
+replication NACK; valid replication progress remains separately meaningful.
+These distinctions follow [native send handling:753–790][native-send-errors]
+and [ACK handling:633–740][native-ack-errors], with actual selected
+[owner vectors:18–155][rejection-owner].
+
+The public [both-order vectors:57–320][rejection-public] exercise a real
+configuration-mismatched C listener returning PermissionDenied while P/B
+retain valid authority. A rejection-only observer forwards the exact source
+binding and returns C's status unchanged; source retry entry establishes
+consumption before releasing B in rejection-first order. Healthy-first holds
+C's initial dial until genuine B apply, marked WriteQuorum catch-up and service
+commit complete. Both orders use nonempty work, a captured issued boundary,
+service-owned persistence/ACK and another successful write after rejection.
+An opt-in [same-native-wait handshake:590–625][pending-native-wait] crosses
+an ordered query on the selected facade, asserts the retained native future
+pending before release, and rechecks it after rejection-first consumption.
+Outer host-task incompletion alone is not this native-pending witness.
+This is selected Rust host/carrier evidence, not a native transport run.
+
+Dispensability is operation-specific: missing required PC/CC apply still holds
+normal replication; All requires all current members; a marked member behind
+live Q holds WriteQuorum catch-up. These conditions do not manufacture an
+immediate remote-error result or waive progress
+([actual-owner controls:93–155][rejection-owner]).
+Primary-local GetCopyState/EndGetNext faults are separate: new assignments
+and new catch-up entries reject the latched fault before queue/wait mutation
+([manager:793–805,1028–1045][local-fault-entry],
+[owner:157–230][rejection-owner], [public:333–392][rejection-public]).
+This does not promise synchronous fault completion of every already-pending
+wait, or revoke a previously completed success. Invalid live-owner protocol,
+local representation/authority and session/epoch failures retain their own
+drop/fault policies; they are not blanket dispensable errors
+([selected ingress:355–411](../../../kuberic-runtime/src/replicator/v1/service_adapter/production_transport.rs#L355-L411)).
+
 | Query | Meaning, not a durability alias | Evidence |
 |---|---|---|
 | Primary current | Queue `commit_head - 1`, native quorum progress; can precede local service commit | [queue-manager:322–331][primary-progress]; [public held-commit witness:16–71][primary-progress-test] |
@@ -448,3 +488,9 @@ production-readiness support from the selected Rust journeys.
 [availability-digest]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/protocol/public_operations.rs#L3118-L3133
 [native-stage-selector]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L288-L381
 [schema]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/state.rs#L19-L21
+[native-send-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/RemoteSession.cpp#L753-L790
+[native-ack-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.cpp#L633-L740
+[rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
+[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
+[local-fault-entry]: ../../../kuberic-runtime/src/replicator/v1/replica_manager.rs#L793-L1045
+[pending-native-wait]: ../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625

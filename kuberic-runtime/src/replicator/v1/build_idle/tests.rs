@@ -689,14 +689,31 @@ async fn build_cancel_breaks_provider_context_consumption_without_session_remova
         .receive_context(&context(20, 1, false, b"target"))
         .unwrap();
     rig.pending();
+    let (lsn, mut completion) = enqueue(&rig.manager);
     rig.handle.cancel().unwrap();
     let end = rig.build.run().await.unwrap();
     assert!(matches!(
         end.result,
         Err(BuildError::Establishment(EstablishError::Provider { .. }))
     ));
-    assert!(rig.manager.lock().unwrap().build_handle(20).is_some());
-    enqueue(&rig.manager);
+    assert_eq!(end.fault.unwrap().description, "GetCopyState");
+    {
+        let mut manager = rig.manager.lock().unwrap();
+        assert!(manager.build_handle(20).is_some());
+        assert!(matches!(
+            manager.enqueue(
+                Bytes::from_static(b"replication"),
+                BufferPolicy::RawSingle,
+                copy_config().buffer_limits,
+            ),
+            Err(ManagerError::ReportedFault {
+                description: "GetCopyState",
+                ..
+            })
+        ));
+        assert_eq!(manager.queue().last_sequence_number(), lsn);
+    }
+    assert!(matches!(completion.try_recv(), Err(TryRecvError::Empty)));
     assert!(rig.handle.0.session.retry_deadline().is_some());
 }
 

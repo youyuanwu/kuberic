@@ -40,11 +40,27 @@ after interrupted/superseded demotion have selected witnesses; nonactivating
 operations do not erase outstanding reconciliation. This is bounded source-guided alignment, not exhaustive native
 stage/interleaving qualification.
 
+## Scoped rejection-order disposition
+
+The [scoped contract](classic-v1-runtime.md#rejection-and-fault-scope) has
+current actual-owner and public-host both-order witnesses
+([owner:18–230][rejection-owner], [public:57–392][rejection-public]).
+Dispensable remote idle-copy failure and an actual selected target's
+configuration-denied Exchange do not defeat sufficient healthy progress.
+Required PC/CC/marked/All evidence remains required; new entries after
+primary-local Build faults reject separately. Targeted vectors passed with
+the [documented selectors](testing.md#scoped-rejection-order-and-local-fault-evidence).
+
+This addresses the bounded current qualification obligation, not the exact
+removed-engine typed-error API, every remote fault class, native executable
+equivalence or complete alignment. Historical SF-12 remains a finding against
+the removed implementation, not a discovered native/current rejection defect.
+Broader qualification below still requires separate authorization.
+
 ## P2 — Focused qualification, not presumed defects
 
 | Obligation | Current evidence / limit | Bounded next work and completion criterion |
 |---|---|---|
-| **SF-12 rejected-peer event ordering** | Healthy quorum versus hung minority exists ([public:2302–2433][minority]); marked-successor arithmetic exists ([manager tests:690–719][marked]). Neither is both controlled orders of a dispensable remote rejection versus required healthy response. | First establish native fault scope; exercise actual selected owners/public host with both orders. Required healthy evidence must yield the documented outcome regardless of dispensable response ordering, while indispensable-peer/local faults remain distinct. Do not restore the old proof loop or mark Fixed from engine removal. |
 | **SF-11 historical trace shape** | Current prefix regression preserves acknowledged prefix before ambiguous suffix ([test:146–214][prefix]); it is not the removed-engine `(11,10)` reconciliation against peer5. | Define a narrowly justified selected-path retained-source/behind-peer case before adding a test. Record what it proves about acknowledged-prefix recovery and what remains outside it; do not claim historical negative controls ran now. |
 | **Public copy context** | Distinct nonempty context is actual-component evidence ([test:1013–1091][context]); external public provider uses empty context ([fixture:196–207][empty-context]). | If public nonempty-context qualification is needed, use a helper-free provider with distinguishable target/source bytes including an empty item. Source must consume target data without supplying its own; keep component/public evidence separate. |
 | **Mode/fault/interleaving coverage** | Persisted/required-ACK combinations are core-tested ([tests:121–172][modes]); selected production has fixed mode/policy choices ([production:121–158][policy]). | Build a claim-specific component/public matrix and close consequential holes only. Private required-ACK volatile mode is not an exposed public setting; do not expand P7 simply to fill coverage cells. |
@@ -151,3 +167,5 @@ do not satisfy the entire original P8 qualification claim.
 [internal]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/ComReplicator.cpp#L1002-L1118
 [pg-wait]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1.rs#L1476-L1504
 [fallback]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/evaluator/public_v1_topology.rs#L445-L470
+[rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
+[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392

@@ -5,6 +5,8 @@
 
 #[path = "support/read_fencing.rs"]
 mod read_fencing;
+#[path = "public_v1_recovery/rejection_order.rs"]
+mod rejection_order;
 #[path = "support/staged_access.rs"]
 mod staged_access;
 
@@ -146,6 +148,10 @@ struct Provider {
     recovery: Gate,
     changed: Notify,
     fail_commit: AtomicBool,
+    copy_failure: AtomicU64,
+    catchup_boundary: AtomicU64,
+    catchup_entered: Notify,
+    catchup_probe: Notify,
     corrupt_copy: AtomicBool,
     recovery_outcome: AtomicU64,
     recovery_calls: AtomicU64,
@@ -191,6 +197,10 @@ impl Provider {
             recovery: Gate::default(),
             changed: Notify::new(),
             fail_commit: AtomicBool::new(false),
+            copy_failure: AtomicU64::new(0),
+            catchup_boundary: AtomicU64::new(0),
+            catchup_entered: Notify::new(),
+            catchup_probe: Notify::new(),
             corrupt_copy: AtomicBool::new(false),
             recovery_outcome: AtomicU64::new(0),
             recovery_calls: AtomicU64::new(0),
@@ -343,6 +353,15 @@ impl StateProvider for Provider {
         mut context: OperationDataStream,
     ) -> Result<OperationDataStream> {
         self.copy_calls.fetch_add(1, Ordering::SeqCst);
+        match self.copy_failure.load(Ordering::Acquire) {
+            1 => return Err(failure("injected source GetCopyState failure")),
+            2 => {
+                return Ok(Box::pin(stream::iter([Err(failure(
+                    "injected source EndGetNext failure",
+                ))])));
+            }
+            _ => {}
+        }
         struct Activity<'a> {
             active: &'a AtomicU64,
             interrupted: &'a AtomicU64,
@@ -568,7 +587,41 @@ impl PrimaryReplicator for ObservedPrimary {
                 return Err(failure("rejected raw admission changed native progress"));
             }
         }
-        self.inner.wait_for_catch_up_quorum(mode).await
+        let boundary = self.provider.catchup_boundary.swap(0, Ordering::AcqRel);
+        let native = self.inner.wait_for_catch_up_quorum(mode);
+        tokio::pin!(native);
+        if boundary != 0 {
+            assert!(
+                futures::poll!(native.as_mut()).is_pending(),
+                "native catch-up completed before required apply"
+            );
+            // Poll/enqueue the real wait before this same-facade round trip.
+            // FIFO requests install Catchup before Progress; the selected
+            // driver polls completion replies before later query requests.
+            let progress = tokio::select! {
+                biased;
+                result = native.as_mut() => panic!("native wait completed before query barrier: {result:?}"),
+                progress = self.inner.current_progress() => progress?,
+            };
+            assert!(progress < boundary as i64);
+            assert!(
+                futures::poll!(native.as_mut()).is_pending(),
+                "native catch-up was ready at the owner query barrier"
+            );
+            self.provider.catchup_entered.notify_one();
+            loop {
+                tokio::select! {
+                    biased;
+                    result = native.as_mut() => return result,
+                    () = self.provider.catchup_probe.notified() => {
+                        // The native branch was just polled Pending, not the
+                        // outer host operation or a new replacement wait.
+                        self.provider.catchup_entered.notify_one();
+                    }
+                }
+            }
+        }
+        native.await
     }
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
         self.observed

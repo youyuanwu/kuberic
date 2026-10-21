@@ -797,6 +797,7 @@ impl ReplicaManager {
         limits: BufferLimits,
     ) -> Result<Admission, ManagerError> {
         self.ensure_active()?;
+        self.check_reported_fault()?;
         let Some(current) = &self.current else {
             return Err(ManagerError::ReconfigurationPending);
         };
@@ -1029,6 +1030,7 @@ impl ReplicaManager {
         mode: CatchupMode,
     ) -> Result<(CompletionReceiver, ManagerEffects), ManagerError> {
         self.ensure_active()?;
+        self.check_reported_fault()?;
         if self.catchup_wait.is_some() {
             return Err(ManagerError::CatchupAlreadyPending);
         }

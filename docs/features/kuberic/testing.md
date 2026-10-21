@@ -180,8 +180,51 @@ Related visibility/isolation regressions remain `read_fencing::`, the KV
 Observed bounded Close/fault/renewal wait timeouts during development/review
 were followed by passing isolated/serial retries; their root cause is not
 established and retries do not erase the reliability limit. No timeout oracle
-was weakened. These runs do not close SF-12 controlled rejected-peer ordering,
+was weakened. Those Close/access runs do not establish rejected-peer ordering. The separate
+scoped rejection evidence below does not explain the earlier timeouts or close
 broad P7, native differential, power-loss or production-readiness qualification.
+
+### Scoped rejection-order and local-fault evidence
+
+The current focused actual-owner and public-host vectors passed under the ordinary profile.
+Use the live names, not a fixed total:
+
+```bash
+cargo nextest list --offline -p kuberic-runtime --all-features \
+  --profile ordinary --lib --test public_v1_recovery -E 'test(rejection_order::)'
+cargo nextest run --offline -p kuberic-runtime --all-features \
+  --profile ordinary -j 1 --lib --test public_v1_recovery -E 'test(rejection_order::)'
+```
+
+The [owner vectors](../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230)
+observe failed idle C Build and genuine B progress in both orders, preserve
+current/previous/marked/All requirements, and reject new assignment/cached-ready
+catch-up after GetCopyState/EndGetNext faults. Active copy error is a separate
+replication-progress case, not a generic NACK.
+The [public vectors](../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392)
+use actual C-listener configuration denial, exact metadata/status forwarding
+and source retry entry as a consumption barrier. B's service-owned persistence/
+ACK is withheld across real issued work and captured-boundary marked catch-up;
+healthy-first completes native/application work before C is released.
+A [same-native-wait handshake](../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625)
+polls the real wait, crosses an ordered same-facade query and checks that
+future Pending before healthy release; rejection-first probes it again after
+source consumption. Wrapper entry or unfinished outer journal work is not
+the native-pending assertion.
+A further real write demonstrates the source is not poisoned after rejection.
+The local-source Build-fault vector exercises both acquisition/enumeration
+origins through the selected host/public native interfaces.
+
+Representative existing controls also passed in the focused combined run:
+PC/CC and marked/live-Q manager predicates; required service ACK and primary
+commit failure; healthy quorum/hung minority; host identity rejection; malformed
+live ACK, retired ACK and unexpected worker fault distinctions. These controls
+are not substitutes for the new active-rejection ordering vectors.
+Scoped runtime clippy, formatting and the protected source/API guard passed.
+No PostgreSQL, whole-workspace, native executable or cluster qualification is
+implied. See [fault scope](classic-v1-runtime.md#rejection-and-fault-scope),
+the [ledger](sf-v1-port-ledger.md) and
+[source ancestry](sf-v1-port-provenance.md#scoped-rejection-and-primary-local-fault-entry--f02f07f08f11).
 
 ### In-Process Controller/Application Journeys
 

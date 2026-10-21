@@ -26,6 +26,7 @@ use crate::replicator::v1::session::{SendIntent, SendKind, SessionIdentity};
 mod admission;
 mod configuration;
 mod policy;
+mod rejection_order;
 
 #[tokio::test]
 async fn recovery_reset_requires_selected_send_and_queue_drain_without_reopening_closed_primary() {
@@ -261,6 +262,7 @@ struct Provider {
     calls: AtomicUsize,
     gate: Semaphore,
     failure: bool,
+    enumeration_failure: bool,
     context_items: AtomicUsize,
     hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -271,6 +273,7 @@ impl Provider {
             calls: AtomicUsize::new(0),
             gate: Semaphore::new(permits),
             failure: false,
+            enumeration_failure: false,
             context_items: AtomicUsize::new(0),
             hook: None,
         }
@@ -306,6 +309,11 @@ impl StateProvider for Provider {
             return Err(RuntimeError::Application(
                 "actual GetCopyState failure".into(),
             ));
+        }
+        if self.enumeration_failure {
+            return Ok(Box::pin(stream::iter([Err(RuntimeError::Application(
+                "actual EndGetNext failure".into(),
+            ))])));
         }
         Ok(Box::pin(stream::iter([Ok(Bytes::from_static(
             b"snapshot",
