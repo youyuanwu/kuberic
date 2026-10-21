@@ -53,7 +53,10 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
 pub(crate) fn repeatable(instruction: PublicInstruction) -> bool {
     !matches!(
         instruction,
-        PublicInstruction::Build | PublicInstruction::DataLoss
+        PublicInstruction::Build
+            | PublicInstruction::DataLoss
+            | PublicInstruction::ReplicatorClose
+            | PublicInstruction::ApplicationClose
     )
 }
 
@@ -96,6 +99,7 @@ fn mode(selection: PublicCatchUpMode) -> ReplicaSetQuorumMode {
 pub(super) fn replica_set(
     input: &PublicConfiguration,
     configuration: &crate::protocol::types::ConfigurationDescriptor,
+    current: bool,
 ) -> ReplicaSetConfiguration {
     ReplicaSetConfiguration {
         configuration: configuration.clone(),
@@ -111,6 +115,9 @@ pub(super) fn replica_set(
             .cloned()
             .map(|replica| {
                 let mut information: ReplicaInformation = replica.into();
+                if !current {
+                    information.must_catchup = false;
+                }
                 information.role = configuration
                     .members
                     .iter()
@@ -164,8 +171,8 @@ pub(super) async fn install(
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
-                replica_set(input, &input.current),
-                replica_set(input, previous),
+                replica_set(input, &input.current, true),
+                replica_set(input, previous, false),
             )
             .await?;
     } else if catch_up {
@@ -178,14 +185,14 @@ pub(super) async fn install(
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
-                replica_set(input, &input.current),
-                replica_set(input, &previous),
+                replica_set(input, &input.current, true),
+                replica_set(input, &previous, false),
             )
             .await?;
     } else {
         callbacks
             .primary
-            .update_current_replica_set_configuration(replica_set(input, &input.current))
+            .update_current_replica_set_configuration(replica_set(input, &input.current, true))
             .await?;
     }
     Ok(())
@@ -197,7 +204,7 @@ pub(super) async fn install_current(
 ) -> crate::Result<()> {
     callbacks
         .primary
-        .update_current_replica_set_configuration(replica_set(input, &input.current))
+        .update_current_replica_set_configuration(replica_set(input, &input.current, true))
         .await?;
     Ok(())
 }
@@ -248,13 +255,15 @@ pub(super) async fn execute(
             None
         }
     });
-    // An interrupted close that already recorded a child failure still needs
-    // process-local abort containment; the durable diagnostic is not a proof.
-    if record
-        .lifecycle
-        .outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, O::CloseFailure { .. } | O::RebuildRequired(_)))
+    let recovered_terminal = matches!(program, P::Close | P::Abort) && start > 1;
+    // Recorded terminal effects still need process-local Abort containment;
+    // neither a child diagnostic nor an old Abort receipt is a live proof.
+    if recovered_terminal
+        || record
+            .lifecycle
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, O::CloseFailure { .. } | O::RebuildRequired(_)))
     {
         if record
             .lifecycle
@@ -273,13 +282,21 @@ pub(super) async fn execute(
         .enumerate()
         .skip(start)
     {
-        #[cfg(all(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::BeforeInstruction, index).await;
         }
         store
             .public_instruction(&intent, index, instruction, None)
             .await?;
+        if let Some(owner) = &callbacks.access_owner {
+            owner.selected(instruction);
+        }
+        #[cfg(feature = "testing")]
+        if let Some(cut) = &callbacks.cut {
+            cut.pause(PublicCutPosition::InstructionSelected, index)
+                .await;
+        }
         let mut rebuild_failure = None;
         let outcome = match instruction {
             ApplicationOpen => {
@@ -356,6 +373,8 @@ pub(super) async fn execute(
                             role,
                         )
                         .await
+                    } else if role == ReplicaRole::Primary {
+                        callbacks.change_primary_role(epoch).await
                     } else {
                         callbacks.replicator.change_role(epoch, role).await
                     };
@@ -432,6 +451,9 @@ pub(super) async fn execute(
                         configuration.current.epoch,
                     )
                     .await?;
+                    if let Some(owner) = &callbacks.access_owner {
+                        owner.reinstalled(store.as_ref(), configuration).await?;
+                    }
                 }
                 let (P::CatchUp { mode: selected, .. } | P::Swap { mode: selected, .. }) = program
                 else {
@@ -529,7 +551,7 @@ pub(super) async fn execute(
                 O::Done
             }
             ReplicatorClose | ApplicationClose => {
-                if close_failure.is_some() {
+                if recovered_terminal || close_failure.is_some() {
                     O::Done
                 } else {
                     let (child, result) = if instruction == ReplicatorClose {
@@ -578,14 +600,20 @@ pub(super) async fn execute(
             }
             _ => unreachable!("role instruction in public program"),
         };
-        #[cfg(all(test, feature = "testing"))]
+        if let Some(owner) = &callbacks.access_owner {
+            owner.callback_succeeded(instruction);
+        }
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::CallbackSuccess, index).await;
         }
         store
             .public_instruction(&intent, index, instruction, Some(outcome))
             .await?;
-        #[cfg(all(test, feature = "testing"))]
+        if let Some(owner) = &callbacks.access_owner {
+            owner.receipt(store.as_ref(), instruction).await?;
+        }
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::InstructionApplied, index)
                 .await;
@@ -594,8 +622,19 @@ pub(super) async fn execute(
             return Err(HostError::CommandRejected(message.into()));
         }
     }
-    match close_failure {
-        Some(error) => Err(HostError::CommandRejected(error)),
-        None => Ok(()),
+    // A durable Cleanup receipt belongs to the previous owner, not this
+    // process. Even an otherwise fully recorded program must join its owner.
+    if intent.class.is_terminal() {
+        let cleanup = callbacks
+            .terminal_cleanup
+            .as_ref()
+            .ok_or_else(|| HostError::CommandRejected("terminal cleanup is not bound".into()))?;
+        if let Err(error) = cleanup.wait().await {
+            return Err(HostError::CommandRejected(match close_failure {
+                Some(failure) => format!("{failure}; cleanup failed: {error}"),
+                None => format!("terminal cleanup failed: {error}"),
+            }));
+        }
     }
+    Ok(())
 }

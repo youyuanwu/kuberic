@@ -16,11 +16,13 @@ See [`THIRD-PARTY-NOTICES`](../../../THIRD-PARTY-NOTICES).
 Kuberic's root license and adapted API-documentation notices are unchanged.
 
 This register records **ancestry and transformations**, not delivery progress.
-Kuberic source selection/evidence is assessed at
-`e2a47b6c631c974aa0135e81c3a7e3a439980ded` in
+Kuberic selected-host Close/access evidence is assessed at
+`69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; Close references retain their
+explicit earlier anchors. Unchanged component ancestry
+retains its original explicit anchors. See
 [current semantics](classic-v1-runtime.md) and the
 [evidence ledger](sf-v1-port-ledger.md). No native binary or native test was
-run for this documentation reassessment. Named native cases below mean selected
+run for this source-guided work. Named native cases below mean selected
 expectations, not whole native fixtures or an executable compatibility oracle.
 Production-derived Rust vectors remain distinct from translated test assertions.
 
@@ -46,8 +48,9 @@ destinations and transformations. They do not assert every native branch,
 public capability or interleaving is qualified. The default production adapter
 composes the private engine components
 ([production.rs:127–227](../../../kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L127-L227)).
-Private host staged access/outer Close is **not wholly selected** by the public
-journal executor; see [current differences](classic-v1-runtime.md#host-access-lifecycle-and-retirement).
+The private native-shaped host is not wholly selected. Production now has
+its own bounded operation-owned stage/outer-Close alignment; see
+[current semantics](classic-v1-runtime.md#host-access-lifecycle-and-retirement).
 
 ### Queue — F03
 
@@ -339,11 +342,14 @@ helper-free provider callbacks, not native fixture/binary execution.
 
 ### Host access and outer lifecycle — F01/F09/F11
 
-Destination: [`kuberic-runtime/src/host/v1_lifecycle.rs`](../../../kuberic-runtime/src/host/v1_lifecycle.rs)
+Private destination: [`kuberic-runtime/src/host/v1_lifecycle.rs`](../../../kuberic-runtime/src/host/v1_lifecycle.rs)
 and [host adapter tests](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/host.rs).
 This native-shaped private host is distinct from selected
-`host/hosting.rs`/`public_lifecycle_program.rs`; ancestry is not production
-closure of its staged access/outer-Close policy.
+`host/hosting.rs`/`selected_access.rs`/`public_lifecycle_program.rs`.
+Selected [policy:209–300][selected-policy], [activation:721–766][selected-activation],
+[Close:550–638][selected-close] and [recovery:79–115][selected-recovery] port the
+bounded reachable behavior below using the production journal and ownership
+mechanisms; ancestry alone is not the production evidence.
 
 | Selected native material | Translation / exclusions |
 |---|---|
@@ -358,6 +364,26 @@ snapshots and activation are explicit seams, not production registry/failure
 detector/RA/FM/placement. Shared handle access rebinding runs outside guards;
 optional provider evidence does not redefine native access. Private host
 in-memory visibility evidence and selected real-file service evidence differ.
+
+Selected deterministic [stage tests:144–2159][selected-stage-tests] use actual
+public hosts, committed service reads and raw write assignment. They include
+split/recipe promotion, joint/current-only configuration, missing C/P,
+pre/post-Revoke demotion, final-wait-before-receipt denial, cancellation/exact
+replay and stale owner/final release. [Close tests:3114–3505][selected-close-tests]
+separate child errors, outer success, interrupted callbacks and real retained
+provider joins; some recovery cuts are deliberately seeded. These Rust runs
+are not native executable/differential or exhaustive crash-cut qualification.
+Local abort-both/skip-later-graceful containment intentionally differs from
+native's per-child Abort/continued service Close. Required protocol-13
+availability facts are controller observations, not a new failure detector;
+old descriptor-bearing state is rejected rather than defaulted available.
+Same-live-host promotion after demotion uses actual native role/epoch
+reconciliation with compatible context/generation evidence, not an unconditional
+same-role bypass. Superseded/uninvoked reservations and nonactivating
+configuration preserve that evidence without preserving serving grants;
+successful native nonprimary role or genuine stable-primary activation
+discharges it. The selected tests distinguish these cuts from fault/terminal/
+history denials and unknown-progress controller observations.
 
 ### Service-owned KV and SQLite commitment — F02/F04/F05/F07/F09/F11
 
@@ -426,8 +452,8 @@ source-derived vectors. Current support/limits are in the ledger's
 | C4–C5 S | `PrimaryReplicator.BuildIdleAsyncOperation.cpp:111–144`; `CopySender.cpp:524–579,555–579`; `ReplicaManager.cpp:745–774,1983–2022` | EOF-issued target/copy+replication gates/upward pending retarget; not snapshot-only Build success. |
 | T1 D/S; T2 S | `ReplicationTransport.Test.cpp:594–617` **TestDropMessageToNotMatch**; `PrimaryReplicator.cpp:632–683`; `ReplicationSession.cpp:217–243,364–384,423–463`; `RemoteSession.cpp:757–790` | Remove sockets/Sleep(100), retain route/incarnation/role/epoch/expiry/failure obligations; accepted send≠ACK. |
 | D1 S | `src/prod/src/idl/public/FabricRuntime.idl:636–683`; `ReplicationOperationHeader.h:25–42`; `ReplicationAckMessageBody.h:17–24` | Empty-array/empty-segment boundaries and two epochs/sequence spaces inform private lossless codec; not native serialization/public segmented policy parity. |
-| L1–L3 S; E1–E2 S | `ReplicatorState.cpp:39–126`; `ReplicationQueueManager.cpp:58–160`; `Replicator.OnDatalossAsyncOperation.cpp:82–126`; `Replicator.CloseAsyncOperation.cpp:134–192`; `RA/FailoverUnitProxy.CloseAsyncOperation.cpp:209–276`; `ReplicaManager.cpp:871–920`; `PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31–90`; `SecondaryReplicator.cpp:951–1003` | Role edges/actual queues/reset, direct vs outer Close, issued epoch and fixed copy epoch. Native target differs from current selected outer-Close result. |
-| H1–H2 S; H3 D/S | `RA/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:34–145,58–71,101–114`; `BatchedHealthReporter.Test.cpp:107–135` **TestWarningsWithinIntervalReport**; `BatchedHealthReporter.cpp:81–125` | Native staged grants and Temp2/latest-warning/Close-clear expectations; named timer input not sleep/platform convergence. Selected production access differs; broader reporting deferred. |
+| L1–L3 S; E1–E2 S | `ReplicatorState.cpp:39–126`; `ReplicationQueueManager.cpp:58–160`; `Replicator.OnDatalossAsyncOperation.cpp:82–126`; `Replicator.CloseAsyncOperation.cpp:134–192`; `RA/FailoverUnitProxy.CloseAsyncOperation.cpp:209–276`; `ReplicaManager.cpp:871–920`; `PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31–90`; `SecondaryReplicator.cpp:951–1003` | Role edges/actual queues/reset, direct vs outer Close, issued epoch and fixed copy epoch. Selected outer success retains child diagnostics and actual cleanup; inner containment action order remains explicitly local. |
+| H1–H2 S; H3 D/S | `RA/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:34–145,288–381`; `BatchedHealthReporter.Test.cpp:107–135` **TestWarningsWithinIntervalReport**; `BatchedHealthReporter.cpp:81–125` | Reachable stage selectors, not every table row; selected bounded stage evidence above. Temp2/latest-warning/Close-clear expectations use named timer input, not sleep/platform convergence; broader reporting deferred. |
 | Protected resolved fixtures | Kuberic `application.rs:31–37`, protected traits and external positive/privacy fixture infrastructure | Kuberic-authored compiler identities/trait implementations, not native COM or segmented codec. |
 
 ### Reviewed-only context
@@ -447,6 +473,13 @@ These were source/context selections, not whole-test translations or executions:
   | `ReplicaManager.cpp:349–454,1061–1104,1783–1833,2328–2528`; `ReplicaManager.h:285–349`; `ReplicationQueueManager.cpp:369–411`; `PrimaryReplicator.CatchupAsyncOperation.cpp:62–106` | Additional configuration/quorum/admission/catch-up reference boundaries, not new algorithm-domain qualification. |
   | `RemoteSession.cpp:492–670`; `RemoteSession.h:202–259`; `ComFromBytesOperation.cpp:167–262`; `SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31–156` | ACK/callback/provider-boundary context from the public contract comparison; distinct from a native test or whole-owner translation. |
   | `src/prod/src/managed/Api/src/System/Fabric/IStateReplicator.cs:19–81,102–127`; `src/prod/src/managed/Api/src/System/Fabric/IStatefulServicePartition.cs:16–45` | Managed API contract context, not imported managed implementation or a substitute for actual native facade exposure. |
+
+[selected-policy]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L209-L300
+[selected-activation]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/src/host/selected_access.rs#L721-L766
+[selected-close]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_program.rs#L550-L638
+[selected-recovery]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/host/public_lifecycle_terminal.rs#L79-L115
+[selected-stage-tests]: https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs#L144-L2159
+[selected-close-tests]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505
 
 - `ReplicationSecondary.Test.cpp:529–579,1450–1507,1550–1587` — progress/drain modes.
 - `ChangeRole.Test.cpp:25–45` — registrations, not copied network run.

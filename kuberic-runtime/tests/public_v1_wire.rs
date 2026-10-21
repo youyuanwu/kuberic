@@ -55,6 +55,212 @@ fn target_storage() -> ReplicaStorageIncarnationContext {
     }
 }
 
+#[test]
+fn availability_is_required_canonical_evidence_for_every_configuration_input() {
+    use kuberic_runtime::protocol::public_operations::*;
+    let remote = target_storage();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        identity().replica_id,
+        vec![
+            ConfigurationMember {
+                identity: identity(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: remote.replica.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        1,
+    );
+    let configuration = PublicConfiguration {
+        current: current.clone(),
+        previous: None,
+        replicas: vec![PublicReplicaDescriptor {
+            build_id: OperationId::default(),
+            identity: remote.replica.clone(),
+            replication_address: "http://127.0.0.1:50052".into(),
+            process_session_id: ProcessSessionId::new("session-2"),
+            storage_incarnation: Some(remote),
+            role: ReplicaRole::ActiveSecondary,
+            current_progress: 0,
+            catch_up_capability: 0,
+            is_up: true,
+            is_ready: true,
+            must_catchup: false,
+        }],
+    };
+    let mut refreshed = configuration.clone();
+    refreshed.current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        identity().replica_id,
+        configuration.current.members.clone(),
+        1,
+    );
+    let programs = [
+        PublicOperationProgram::Configuration(configuration.clone()),
+        PublicOperationProgram::CatchUp {
+            configuration: configuration.clone(),
+            mode: PublicCatchUpMode::All,
+        },
+        PublicOperationProgram::Swap {
+            starting: configuration.clone(),
+            refreshed,
+            epoch: Epoch::new(0, 2),
+            handoff: ReplicaRole::ActiveSecondary,
+            catch_up_specific_quorum: false,
+            mode: PublicCatchUpMode::All,
+            controller_composed: false,
+        },
+    ];
+    for program in programs {
+        let encoded = serde_json::to_vec(&program).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<PublicOperationProgram>(&encoded).unwrap(),
+            program
+        );
+        let intent = PublicOperationIntent {
+            identity: PublicV1Identity::new(1),
+            operation_id: OperationId::new("wire-availability"),
+            revision: 1,
+            process_session_id: ProcessSessionId::new("session-1"),
+            class: if matches!(program, PublicOperationProgram::Swap { .. }) {
+                PublicOperationClass::PlannedSwap
+            } else {
+                PublicOperationClass::Authority
+            },
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program.clone()),
+        };
+        let command = PublicV1OperationCommand {
+            target: identity(),
+            intent,
+        };
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: 13,
+            resource_uid: "resource-1".into(),
+            target: Some(identity().into()),
+            expected_process_session_id: "session-1".into(),
+            command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                public_v1_operation_command_to_proto(&command).unwrap(),
+            )),
+        };
+        assert_eq!(
+            normalize_execute_request(request.clone()).unwrap().command,
+            ProtocolCommand::PublicV1Operation(Box::new(command))
+        );
+        let mut old = request;
+        old.protocol_version = 12;
+        assert!(normalize_execute_request(old).is_err());
+        for is_up in [false, true] {
+            for refreshed in [false, true] {
+                let mut changed = program.clone();
+                let configuration = match &mut changed {
+                    PublicOperationProgram::Configuration(configuration)
+                    | PublicOperationProgram::CatchUp { configuration, .. } => configuration,
+                    PublicOperationProgram::Swap {
+                        starting,
+                        refreshed: final_configuration,
+                        ..
+                    } => {
+                        if refreshed {
+                            final_configuration
+                        } else {
+                            starting
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                if is_up {
+                    configuration.replicas[0].is_up = false;
+                } else {
+                    configuration.replicas[0].is_ready = false;
+                }
+                assert_ne!(changed.digest(), program.digest());
+                let intent = PublicOperationIntent {
+                    identity: PublicV1Identity::new(1),
+                    operation_id: OperationId::new("canonical-availability"),
+                    revision: 1,
+                    process_session_id: ProcessSessionId::new("session-1"),
+                    class: if matches!(changed, PublicOperationProgram::Swap { .. }) {
+                        PublicOperationClass::PlannedSwap
+                    } else {
+                        PublicOperationClass::Authority
+                    },
+                    input_digest: program.digest(),
+                    replay_disposition: changed.replay_disposition(),
+                    lifecycle: None,
+                    program: Some(changed),
+                };
+                assert!(
+                    intent.validate().is_err(),
+                    "changed evidence reused an old canonical digest"
+                );
+            }
+        }
+    }
+    let input = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: identity(),
+        epoch: current.epoch,
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current,
+        previous: None,
+        replicas: configuration.replicas.clone(),
+        data_loss_recovery: None,
+    };
+    for up in [false, true] {
+        let mut changed = input.clone();
+        if up {
+            changed.replicas[0].is_up = false;
+        } else {
+            changed.replicas[0].is_ready = false;
+        }
+        assert_ne!(changed.digest(), input.digest());
+        assert!(
+            PublicOperationIntent {
+                identity: PublicV1Identity::new(1),
+                operation_id: OperationId::new("lifecycle-availability"),
+                revision: 1,
+                process_session_id: ProcessSessionId::new("session-1"),
+                class: PublicOperationClass::Authority,
+                input_digest: input.digest(),
+                replay_disposition: PublicOperationReplayDisposition::Convergent,
+                lifecycle: Some(changed),
+                program: None,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<PublicLifecycleInput>(&serde_json::to_vec(&input).unwrap())
+            .unwrap(),
+        input
+    );
+    let json = serde_json::to_value(&configuration.replicas[0]).unwrap();
+    for field in ["isUp", "isReady"] {
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<PublicReplicaDescriptor>(old).is_err());
+    }
+    let schema = schemars::schema_for!(PublicReplicaDescriptor);
+    let required = schema.as_value()["required"].as_array().unwrap();
+    assert!(required.iter().any(|field| field == "isUp"));
+    assert!(required.iter().any(|field| field == "isReady"));
+    assert_eq!(PUBLIC_V1_PROTOCOL_VERSION, 13);
+    assert!(
+        !PublicV1Identity {
+            protocol_version: 12,
+            generation: 1
+        }
+        .is_valid()
+    );
+}
+
 fn accepted() -> kuberic_runtime::protocol::public_operations::PublicV1AcceptedStatus {
     let resource_uid = ResourceUid::new("resource-1");
     let generation = PublicProtocolGeneration::new(1);

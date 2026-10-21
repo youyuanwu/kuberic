@@ -51,6 +51,7 @@ private-path documented impl crate::host::process::ReplicaHandle::async fn revok
 private-path documented impl crate::host::process::ReplicaHandle::fn process_session_id (& self) -> crate :: protocol :: types :: ProcessSessionId
 private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_provider_writer_count (& self) -> usize
 private-path documented impl crate::host::process::ReplicaHandle::fn public_v1_raw_retained_task_cardinality (& self) -> Result < (usize , usize) >
+private-path documented impl crate::host::process::ReplicaHandle::fn set_public_operation_cut (& self , cut : Option < Arc < crate :: testing :: PublicOperationCut > >)
 private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start (self , control_listener : tokio :: net :: TcpListener) -> Result < RunningReplica >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::async fn start_with_shutdown (self , control_listener : tokio :: net :: TcpListener , mut startup_shutdown : watch :: Receiver < bool > ,) -> Result < Option < RunningReplica > >
 private-path documented impl crate::host::process::ReplicaHost < A , R >::fn new (config : ReplicaProcessConfig , application : Arc < A > , application_storage : ApplicationStorageState , resolver : Arc < R > ,) -> Self

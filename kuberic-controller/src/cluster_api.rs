@@ -2273,6 +2273,10 @@ fn renewal_public_configuration(
                     .capability()
                     .ok_or("native catch-up capability unavailable")?,
                 must_catchup: false,
+                is_up: replica.report.has_current_open_endpoint(),
+                is_ready: replica.report.has_current_open_endpoint()
+                    && replica.report.progress.current().is_some()
+                    && replica.report.progress.capability().is_some(),
             })
         })
         .collect::<std::result::Result<Vec<_>, String>>()?;

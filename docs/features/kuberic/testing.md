@@ -2,8 +2,8 @@
 
 Validation is split into exact nextest tiers, workspace/source checks,
 provider-backed smoke tests and explicitly owned Kubernetes scenarios.
-Commands below are **reproduction entry points**, not claims they were newly
-run for the documentation reassessment. Read
+Commands below are **reproduction entry points**, not claims that every command
+was run for the selected-host changes. Read
 [current semantics](classic-v1-runtime.md), the
 [evidence/disposition ledger](sf-v1-port-ledger.md) and
 [source/test provenance](sf-v1-port-provenance.md) for what each evidence class
@@ -130,6 +130,58 @@ selects the intended current test; discovery alone is not execution. Full
 `public_v1_conformance` targets cover different lifecycle/journal/wire/structural
 boundaries. KSF source/API catalogs are not native behavioral compatibility
 certification. Actual wire old-version rejection is not native wire compatibility.
+
+### Selected-host Close and staged access
+
+Targeted runs for the host-alignment revision exercise the real selected
+`ReplicaHost` and default public factory. The
+[stage witnesses](../../../kuberic-runtime/tests/support/staged_access.rs#L144-L2159)
+hold actual executor/callback boundaries and attempt committed service reads
+and raw sequence assignment, not only a private selector. They cover joint/
+current-only same-primary, missing C/P, split/recipe promotion, current-only/
+joint standalone/composed demotion, immediate post-final-wait denial,
+cancellation/replay, late reservation/completion and final publication.
+They also cover previous-primary-context negatives and same-live-host
+repromotion after completed/interrupted demotion, including superseded
+promotion/secondary-role/Swap reservations and nonactivating configuration.
+Native role/epoch is reconciled only for compatible lineage; fresh role/
+configuration/catch-up/activation still controls serving access.
+The split-promotion observer-drop witness crosses authenticated control RPC;
+other testing-handle entries are selected-host evidence, not all RPC-ingress
+qualification.
+
+[Close witnesses](../../../kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505)
+observe child failure, durable diagnostic, outer outcome, Abort and retained
+native/provider joins separately. Explicitly seeded recovery records and unit
+callback/receipt cuts are not process-crash, power-loss or generic application
+task-join proof. Protocol-13 tests cover required availability encoding,
+changed-input rejection and deliberate old descriptor-bearing state rejection.
+Full-planner unavailable current/capability observations reach actual selected
+C/P denial/restoration through public commands. Restored raw admission in that
+producer test is not a claim of completed transport/quorum publication.
+
+Inventory the exact filter first, then run it. For checkout-owned temporary
+files, set an absolute ignored scratch directory:
+
+```bash
+mkdir -p target/host-validation-tmp
+export TMPDIR="$PWD/target/host-validation-tmp"
+cargo nextest list -p kuberic-runtime -p kuberic-controller --all-features \
+  --profile ordinary --ignore-default-filter \
+  -E 'test(staged_access::) or test(sf06) or test(availability_) or binary(public_v1_wire) or test(access_approved_assignment_shares_actual_host_revoke_and_final_catchup_cut)'
+cargo nextest run -p kuberic-runtime -p kuberic-controller --all-features \
+  --profile ordinary --ignore-default-filter -j 1 \
+  -E 'test(staged_access::) or test(sf06) or test(availability_) or binary(public_v1_wire) or test(access_approved_assignment_shares_actual_host_revoke_and_final_catchup_cut)'
+```
+
+Related visibility/isolation regressions remain `read_fencing::`, the KV
+`read_fencing` target and
+`selected_sqlite_real_wal_isolation_publication_failure_and_restart`.
+Observed bounded Close/fault/renewal wait timeouts during development/review
+were followed by passing isolated/serial retries; their root cause is not
+established and retries do not erase the reliability limit. No timeout oracle
+was weakened. These runs do not close SF-12 controlled rejected-peer ordering,
+broad P7, native differential, power-loss or production-readiness qualification.
 
 ### In-Process Controller/Application Journeys
 

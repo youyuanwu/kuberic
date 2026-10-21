@@ -36,12 +36,14 @@ pub(crate) struct PartitionOperation {
     lifecycle: Mutex<()>,
     containment: Mutex<CallbackContainment>,
     coordination_active: std::sync::atomic::AtomicBool,
+    access_invalidated: std::sync::atomic::AtomicBool,
+    access_invalidation: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     needs_recovery: std::sync::atomic::AtomicBool,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     revision: watch::Sender<u64>,
     descendants: Mutex<Option<watch::Receiver<bool>>>,
     wait_for_descendants: std::sync::atomic::AtomicBool,
-    #[cfg(all(test, feature = "testing"))]
+    #[cfg(feature = "testing")]
     cut: Mutex<Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>>,
 }
 
@@ -63,12 +65,14 @@ impl PartitionOperation {
             lifecycle: Mutex::new(()),
             containment: Mutex::new(CallbackContainment::RootTask),
             coordination_active: std::sync::atomic::AtomicBool::new(false),
+            access_invalidated: std::sync::atomic::AtomicBool::new(false),
+            access_invalidation: std::sync::Mutex::new(None),
             needs_recovery: std::sync::atomic::AtomicBool::new(needs_recovery),
             shutting_down,
             revision,
             descendants: Mutex::new(None),
             wait_for_descendants: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(all(test, feature = "testing"))]
+            #[cfg(feature = "testing")]
             cut: Mutex::new(None),
         }
     }
@@ -81,7 +85,47 @@ impl PartitionOperation {
         self.record.borrow().clone()
     }
 
-    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn access_live(&self) -> bool {
+        !self
+            .access_invalidated
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            && self.record.borrow().superseded_by.is_none()
+            && !matches!(
+                self.record.borrow().disposition,
+                Some(
+                    PublicOperationDisposition::Failed(_)
+                        | PublicOperationDisposition::Cancelled
+                        | PublicOperationDisposition::Ambiguous(_)
+                        | PublicOperationDisposition::Attached(_)
+                )
+            )
+    }
+
+    pub(crate) fn bind_access_owner(
+        &self,
+        reserve: impl FnOnce() -> Option<Arc<crate::host::hosting::AccessOwner>>,
+    ) -> Option<Arc<crate::host::hosting::AccessOwner>> {
+        // Invalidation cannot pass a reservation before its gated owner is bound.
+        let mut invalidation = self.access_invalidation.lock().unwrap();
+        let owner = reserve()?;
+        let invalidate = owner.clone();
+        *invalidation = Some(Arc::new(move || invalidate.invalidate()));
+        Some(owner)
+    }
+
+    fn invalidate_access(&self) {
+        let invalidation = self.access_invalidation.lock().unwrap();
+        if let Some(invalidate) = invalidation.as_ref() {
+            invalidate();
+        }
+        self.access_invalidated
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "testing")]
     pub(crate) async fn track_cut(
         &self,
         cut: Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>,
@@ -106,12 +150,34 @@ impl PartitionOperation {
         Ok(())
     }
 
+    pub(crate) async fn track_recovery_containment(&self, witness: watch::Receiver<bool>) -> bool {
+        let _lifecycle = self.lifecycle.lock().await;
+        let mut descendants = self.descendants.lock().await;
+        if self.snapshot().stage != PublicOperationStage::ContainmentPending
+            || descendants.is_some()
+        {
+            return false;
+        }
+        *descendants = Some(witness);
+        self.wait_for_descendants
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
+    }
+
+    pub(crate) fn record_containment_failure(&self, error: &HostError) {
+        tracing::warn!(%error, operation_id = %self.intent().operation_id, "terminal recovery remains uncontained");
+        self.failure.send_replace(Some(error.to_string()));
+        self.bump_revision();
+    }
+
     async fn descendants_contained(&self) -> bool {
-        self.descendants
-            .lock()
-            .await
-            .as_ref()
-            .is_none_or(|witness| *witness.borrow())
+        self.descendants.lock().await.as_ref().map_or(
+            !matches!(
+                self.intent().program,
+                Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
+            ),
+            |witness| *witness.borrow(),
+        )
     }
 
     async fn settle_witness(&self) -> Result<()> {
@@ -273,7 +339,7 @@ impl PartitionOperation {
             .await?;
         self.record.send_replace(applied);
         self.bump_revision();
-        #[cfg(all(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         if let Some(cut) = self.cut.lock().await.clone() {
             cut.pause(
                 crate::host::public_lifecycle::PublicCutPosition::CallbackApplied,
@@ -290,7 +356,7 @@ impl PartitionOperation {
             .await?;
         self.record.send_replace(completed);
         self.bump_revision();
-        #[cfg(all(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         if let Some(cut) = self.cut.lock().await.clone() {
             cut.pause(
                 crate::host::public_lifecycle::PublicCutPosition::Completed,
@@ -311,6 +377,7 @@ impl PartitionOperation {
             ) {
                 return Ok(current);
             }
+            self.invalidate_access();
             let task = self.task.lock().await.take();
             if let Some(task) = &task {
                 task.abort();
@@ -640,6 +707,9 @@ impl PartitionOperation {
         self.record.send_replace(recovered.clone());
         if recovered.stage == PublicOperationStage::Ready {
             self.failure.send_replace(None);
+            let _invalidation = self.access_invalidation.lock().unwrap();
+            self.access_invalidated
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         self.recovery_complete();
         Ok(Some(recovered))
@@ -651,10 +721,16 @@ impl PartitionOperation {
     }
 
     fn record_failure(&self, error: &HostError) {
+        self.invalidate_access();
         self.needs_recovery
             .store(true, std::sync::atomic::Ordering::Release);
         self.failure.send_replace(Some(error.to_string()));
         self.bump_revision();
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn retained_failure(&self) -> Option<String> {
+        self.failure.borrow().clone()
     }
 
     fn needs_recovery(&self) -> bool {
@@ -680,6 +756,7 @@ impl PartitionOperation {
             )));
         }
         if record.superseded_by.as_ref() != Some(successor) {
+            self.invalidate_access();
             record.superseded_by = Some(successor.clone());
             self.record.send_replace(record);
             self.bump_revision();
@@ -929,6 +1006,13 @@ pub(crate) struct PartitionOperationRegistry {
     control_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     terminal_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     abort_guard: Arc<std::sync::Mutex<bool>>,
+    terminal_recovery: std::sync::OnceLock<
+        Arc<
+            dyn Fn() -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl PartitionOperationRegistry {
@@ -961,7 +1045,20 @@ impl PartitionOperationRegistry {
             control_tasks: std::sync::Mutex::new(Vec::new()),
             terminal_tasks: std::sync::Mutex::new(Vec::new()),
             abort_guard: Arc::new(std::sync::Mutex::new(false)),
+            terminal_recovery: std::sync::OnceLock::new(),
         }))
+    }
+
+    pub(crate) fn bind_terminal_recovery(
+        &self,
+        callbacks: impl Fn() -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()> {
+        self.terminal_recovery
+            .set(Arc::new(callbacks))
+            .map_err(|_| HostError::CommandRejected("terminal recovery is already bound".into()))
     }
 
     pub(crate) fn revision_receiver(&self) -> watch::Receiver<u64> {
@@ -1508,6 +1605,15 @@ impl PartitionOperationRegistry {
             {
                 recovered.push(record);
             }
+            if matches!(
+                operation.intent().program,
+                Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
+            ) && operation.snapshot().stage == PublicOperationStage::ContainmentPending
+                && let Some(callbacks) = self.terminal_recovery.get()
+            {
+                crate::host::public_lifecycle::recover_terminal(self, &operation, callbacks()?)
+                    .await?;
+            }
         }
         if !recovered.is_empty() {
             self.bump_revision();
@@ -1565,6 +1671,23 @@ impl PartitionOperationRegistry {
         drop(admission);
         if let Err(error) = self.recover_unowned().await {
             first_error.get_or_insert(error);
+        }
+        // Recovery can discover a terminal record whose cleanup owner did not
+        // exist at the first join boundary. Join those owners too; shutdown is
+        // not complete merely because durable discovery has finished.
+        loop {
+            let terminals =
+                std::mem::take(&mut *self.terminal_tasks.lock().expect("terminal task lock"));
+            if terminals.is_empty() {
+                break;
+            }
+            for task in terminals {
+                if let Err(error) = task.await {
+                    first_error.get_or_insert_with(|| {
+                        HostError::CommandRejected(format!("terminal cleanup join failed: {error}"))
+                    });
+                }
+            }
         }
         match first_error {
             Some(error) => Err(error),

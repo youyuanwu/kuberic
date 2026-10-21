@@ -427,6 +427,8 @@ mod tests {
             current: current.clone(),
             previous: Some(previous.clone()),
             replicas: vec![PublicReplicaDescriptor {
+                is_up: true,
+                is_ready: true,
                 build_id: OperationId::default(),
                 identity: old.identity.clone(),
                 process_session_id: old.process_session_id.clone(),

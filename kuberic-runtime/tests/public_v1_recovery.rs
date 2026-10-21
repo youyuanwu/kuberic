@@ -5,6 +5,8 @@
 
 #[path = "support/read_fencing.rs"]
 mod read_fencing;
+#[path = "support/staged_access.rs"]
+mod staged_access;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -60,7 +62,9 @@ fn failure(error: impl std::fmt::Display) -> RuntimeError {
 }
 
 fn root() -> tempfile::TempDir {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/paw-tmp");
+    let directory = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/paw-tmp"));
     std::fs::create_dir_all(&directory).unwrap();
     tempfile::Builder::new()
         .prefix("native-recovery-")
@@ -158,6 +162,11 @@ struct Provider {
     query_capability: AtomicU64,
     conservative_quorum: AtomicBool,
     probe_fenced_admission: AtomicBool,
+    close_failure: AtomicBool,
+    synchronous_close: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    close_entered: Notify,
+    synchronous_epoch: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    epoch_entered: Notify,
 }
 
 impl Provider {
@@ -198,6 +207,11 @@ impl Provider {
             query_capability: AtomicU64::new(0),
             conservative_quorum: AtomicBool::new(false),
             probe_fenced_admission: AtomicBool::new(false),
+            close_failure: AtomicBool::new(false),
+            synchronous_close: Mutex::new(None),
+            close_entered: Notify::new(),
+            synchronous_epoch: Mutex::new(None),
+            epoch_entered: Notify::new(),
         })
     }
 
@@ -291,6 +305,13 @@ impl Provider {
 #[async_trait]
 impl StateProvider for Provider {
     async fn update_epoch(&self, epoch: Epoch, previous_epoch_last_lsn: i64) -> Result<()> {
+        let synchronous = self.synchronous_epoch.lock().unwrap().take();
+        if let Some(blocked) = synchronous {
+            self.epoch_entered.notify_one();
+            blocked
+                .recv_timeout(Duration::from_secs(15))
+                .map_err(failure)?;
+        }
         let mut state = self.state.lock().unwrap();
         if epoch < state.epoch || previous_epoch_last_lsn < 0 {
             return Err(failure("service epoch regressed"));
@@ -410,6 +431,8 @@ struct CountingFactory {
 
 #[derive(Clone, Debug)]
 enum NativeCall {
+    Close,
+    Abort,
     Role(Epoch, ReplicaRole),
     Epoch(Epoch),
     Current(ReplicaSetConfiguration),
@@ -439,9 +462,22 @@ impl Replicator for ObservedPrimary {
         self.inner.open().await
     }
     async fn close(&self) -> Result<()> {
+        self.observed.lock().unwrap().push(NativeCall::Close);
+        let synchronous = self.provider.synchronous_close.lock().unwrap().take();
+        if let Some(blocked) = synchronous {
+            self.provider.close_entered.notify_one();
+            blocked
+                .recv_timeout(Duration::from_secs(15))
+                .map_err(failure)?;
+            tokio::task::yield_now().await;
+        }
+        if self.provider.close_failure.swap(false, Ordering::AcqRel) {
+            return Err(failure("injected replicator close failure"));
+        }
         self.inner.close().await
     }
     fn abort(&self) {
+        self.observed.lock().unwrap().push(NativeCall::Abort);
         self.inner.abort();
     }
     async fn current_progress(&self) -> Result<i64> {
@@ -613,6 +649,10 @@ struct Application {
     stop: watch::Sender<bool>,
     failed: AtomicBool,
     close_failure: AtomicBool,
+    closes: AtomicU64,
+    aborts: AtomicU64,
+    synchronous_close: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    close_entered: Notify,
     opens: AtomicU64,
     factories: Arc<AtomicU64>,
     observed: Arc<Mutex<Vec<NativeCall>>>,
@@ -636,6 +676,10 @@ impl Application {
             stop: watch::channel(false).0,
             failed: AtomicBool::new(false),
             close_failure: AtomicBool::new(false),
+            closes: AtomicU64::new(0),
+            aborts: AtomicU64::new(0),
+            synchronous_close: Mutex::new(None),
+            close_entered: Notify::new(),
             opens: AtomicU64::new(0),
             factories: Arc::new(AtomicU64::new(0)),
             observed: Arc::new(Mutex::new(Vec::new())),
@@ -876,6 +920,15 @@ impl StatefulServiceReplica for Application {
     }
 
     async fn close(&self) -> Result<()> {
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        let synchronous = self.synchronous_close.lock().unwrap().take();
+        if let Some(blocked) = synchronous {
+            self.close_entered.notify_one();
+            blocked
+                .recv_timeout(Duration::from_secs(15))
+                .map_err(failure)?;
+            tokio::task::yield_now().await;
+        }
         self.stop.send_replace(true);
         self.drain().await;
         self.state.write().await.take();
@@ -888,6 +941,7 @@ impl StatefulServiceReplica for Application {
     }
 
     fn abort(&self) {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
         self.stop.send_replace(true);
         for task in self.tasks.lock().unwrap().iter() {
             task.abort();
@@ -1121,6 +1175,8 @@ impl Node {
     async fn descriptor(&self, role: ReplicaRole) -> PublicReplicaDescriptor {
         let report = self.report().await;
         PublicReplicaDescriptor {
+            is_up: true,
+            is_ready: true,
             build_id: OperationId::default(),
             identity: self.identity.clone(),
             replication_address: report.replication_address.unwrap(),
@@ -2907,14 +2963,13 @@ async fn hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_dead
     assert_eq!(observed.lock().unwrap()[0].0, TestingTcpRouteKind::Build);
     let close = source.intent(PublicOperationProgram::Close).await;
     let close_id = close.operation_id.clone();
-    let error = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(10),
         source.handle().execute_public_v1(close),
     )
     .await
     .expect("terminal containment did not drain a hung native Build")
-    .unwrap_err();
-    assert!(!error.to_string().is_empty());
+    .unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(10), build)
             .await
@@ -2941,6 +2996,7 @@ async fn hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_dead
     let state: serde_json::Value = serde_json::from_str(&json).unwrap();
     let close = &state["publicV1OperationState"]["operations"][close_id.as_str()];
     assert_eq!(close["stage"], "completed");
+    assert_eq!(close["disposition"]["kind"], "succeeded");
     assert!(
         close["lifecycle"]["outcomes"]
             .as_array()
@@ -3006,14 +3062,7 @@ async fn public_v1_open_owns_one_registration_listener_and_writer_and_close_fail
     node.service.close_failure.store(true, Ordering::Release);
     let intent = node.intent(PublicOperationProgram::Close).await;
     let operation = intent.operation_id.clone();
-    assert!(
-        node.handle()
-            .execute_public_v1(intent)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("injected application close failure")
-    );
+    node.handle().execute_public_v1(intent).await.unwrap();
     assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
     assert!(std::net::TcpListener::bind(socket).is_ok());
     let store = SqliteStore::open_public_v1(
@@ -3025,8 +3074,435 @@ async fn public_v1_open_owns_one_registration_listener_and_writer_and_close_fail
         .public_v1_operation_snapshot(&operation)
         .await
         .unwrap();
-    assert!(format!("{:?}", record.disposition).contains("Failed"));
+    assert_eq!(
+        record.disposition,
+        Some(
+            kuberic_runtime::testing::sqlite_store::PublicV1OperationSnapshotDisposition::Succeeded
+        )
+    );
+    let state = close_journal(&node, &operation);
+    assert!(
+        state["lifecycle"]["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outcome| {
+                outcome["CloseFailure"]["child"] == "Application"
+                    && outcome["CloseFailure"]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("injected application close failure"))
+            })
+    );
     node.stop().await;
+}
+
+fn close_journal(node: &Node, operation: &OperationId) -> serde_json::Value {
+    let connection =
+        rusqlite::Connection::open(SqliteStore::metadata_database_path(&node.root)).unwrap();
+    let json: String = connection
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_str(&json).unwrap();
+    state["publicV1OperationState"]["operations"][operation.as_str()].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_sf06_failed_replicator_close_retains_diagnostic_and_joins_native_provider() {
+    let root = root();
+    let mut node = Node::start(root.path(), &ResourceUid::new("close-native-join"), 1).await;
+    node.open(ReplicaRole::Primary, EPOCH).await;
+    node.single(EPOCH).await;
+    let (release, blocked) = std::sync::mpsc::channel();
+    *node.service.provider.synchronous_epoch.lock().unwrap() = Some(blocked);
+    let control = node.service.control.read().await.clone().unwrap();
+    let epoch = tokio::spawn(async move { control.update_epoch(Epoch::new(0, 2)).await });
+    node.service.provider.epoch_entered.notified().await;
+    node.service
+        .provider
+        .close_failure
+        .store(true, Ordering::Release);
+    let intent = node.intent(PublicOperationProgram::Close).await;
+    let operation = intent.operation_id.clone();
+    let handle = node.handle();
+    let replay = intent.clone();
+    let mut close = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    eventually(|| node.service.aborts.load(Ordering::SeqCst) == 1).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while close_journal(&node, &operation)["lifecycle"]["in_flight"] != "Cleanup" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = close_journal(&node, &operation);
+    assert_eq!(pending["stage"], "running");
+    assert_eq!(pending["lifecycle"]["in_flight"], "Cleanup");
+    assert!(
+        pending["lifecycle"]["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outcome| {
+                outcome["CloseFailure"]["child"] == "Replicator"
+                    && outcome["CloseFailure"]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("injected replicator close failure"))
+            })
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut close)
+            .await
+            .is_err()
+    );
+    assert!(!epoch.is_finished());
+    assert_eq!(node.service.closes.load(Ordering::SeqCst), 0);
+    assert_eq!(node.handle().public_v1_provider_writer_count(), 1);
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), close)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let _ = epoch.await.unwrap();
+    assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
+    assert_eq!(
+        node.handle()
+            .public_v1_raw_retained_task_cardinality()
+            .unwrap(),
+        (0, 0)
+    );
+    let record = close_journal(&node, &operation);
+    assert_eq!(record["stage"], "completed");
+    assert_eq!(record["disposition"]["kind"], "succeeded");
+    let calls = node.service.observed.lock().unwrap().len();
+    node.handle().execute_public_v1(replay).await.unwrap();
+    assert_eq!(node.service.observed.lock().unwrap().len(), calls);
+    assert_eq!(node.service.aborts.load(Ordering::SeqCst), 1);
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_sf06_failed_application_close_joins_service_work_despite_dropped_observer() {
+    let root = root();
+    let mut node = Node::start(root.path(), &ResourceUid::new("close-application-join"), 1).await;
+    node.open(ReplicaRole::Primary, EPOCH).await;
+    node.single(EPOCH).await;
+    let entered = Arc::new(Notify::new());
+    let joined = entered.clone();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let task = tokio::spawn(async move {
+        joined.notify_one();
+        blocked.recv_timeout(Duration::from_secs(15)).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let retained = task.abort_handle();
+    node.service.tasks.lock().unwrap().push(task);
+    entered.notified().await;
+    node.service.close_failure.store(true, Ordering::Release);
+    let intent = node.intent(PublicOperationProgram::Close).await;
+    let replay = intent.clone();
+    let operation = intent.operation_id.clone();
+    let handle = node.handle();
+    let mut observer = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+    eventually(|| node.service.closes.load(Ordering::SeqCst) == 1).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), &mut observer)
+            .await
+            .is_err()
+    );
+    assert!(!retained.is_finished());
+    assert_eq!(
+        close_journal(&node, &operation)["lifecycle"]["in_flight"],
+        "ApplicationClose"
+    );
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while close_journal(&node, &operation)["stage"] != "completed" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(retained.is_finished());
+    let record = close_journal(&node, &operation);
+    assert_eq!(record["disposition"]["kind"], "succeeded");
+    assert!(
+        record["lifecycle"]["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outcome| {
+                outcome["CloseFailure"]["child"] == "Application"
+                    && outcome["CloseFailure"]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("injected application close failure"))
+            })
+    );
+    assert_eq!(node.service.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(node.service.aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
+    assert_eq!(
+        node.handle()
+            .public_v1_raw_retained_task_cardinality()
+            .unwrap(),
+        (0, 0)
+    );
+    node.handle().execute_public_v1(replay).await.unwrap();
+    assert_eq!(node.service.closes.load(Ordering::SeqCst), 1);
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_sf06_interrupted_child_close_is_joined_cancelled_and_never_repeated() {
+    let root = root();
+    for replicator in [false, true] {
+        let mut node = Node::start(
+            &root.path().join(format!("replicator-{replicator}")),
+            &ResourceUid::new("close-interrupted-callback"),
+            1,
+        )
+        .await;
+        node.open(ReplicaRole::Primary, EPOCH).await;
+        node.single(EPOCH).await;
+        let (release, blocked) = std::sync::mpsc::channel();
+        if replicator {
+            *node.service.provider.synchronous_close.lock().unwrap() = Some(blocked);
+        } else {
+            *node.service.synchronous_close.lock().unwrap() = Some(blocked);
+        }
+        let intent = node.intent(PublicOperationProgram::Close).await;
+        let operation = intent.operation_id.clone();
+        let replay = intent.clone();
+        let handle = node.handle();
+        let observer = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+        if replicator {
+            node.service.provider.close_entered.notified().await;
+        } else {
+            node.service.close_entered.notified().await;
+        }
+        let abort = node.intent(PublicOperationProgram::Abort).await;
+        let successor = abort.operation_id.clone();
+        let handle = node.handle();
+        let mut terminal = tokio::spawn(async move { handle.execute_public_v1(abort).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while close_journal(&node, &successor)["stage"] != "waitingForContainment" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), &mut terminal)
+                .await
+                .is_err()
+        );
+        assert_eq!(close_journal(&node, &operation)["stage"], "running");
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), terminal)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(observer.await.unwrap().is_err());
+        let record = close_journal(&node, &operation);
+        assert_eq!(record["stage"], "completed");
+        assert_eq!(record["disposition"]["kind"], "cancelled");
+        let calls = node.service.observed.lock().unwrap().len();
+        let application_calls = node.service.closes.load(Ordering::SeqCst);
+        assert!(node.handle().execute_public_v1(replay).await.is_err());
+        assert_eq!(node.service.observed.lock().unwrap().len(), calls);
+        assert_eq!(
+            node.service.closes.load(Ordering::SeqCst),
+            application_calls
+        );
+        assert_eq!(application_calls, u64::from(!replicator));
+        assert_eq!(node.service.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
+        assert_eq!(
+            node.handle()
+                .public_v1_raw_retained_task_cardinality()
+                .unwrap(),
+            (0, 0)
+        );
+        node.stop().await;
+    }
+}
+
+fn seed_close_recovery(
+    node: &Node,
+    intent: &PublicOperationIntent,
+    child: &str,
+    cleanup_recorded: bool,
+    already_pending: bool,
+) {
+    let mut connection =
+        rusqlite::Connection::open(SqliteStore::metadata_database_path(&node.root)).unwrap();
+    connection.busy_timeout(Duration::from_secs(5)).unwrap();
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let json: String = transaction
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let preview = &mut state["publicV1OperationState"];
+    let outcomes = if cleanup_recorded {
+        serde_json::json!(["Done", {"CloseFailure": {
+            "child": "Replicator", "error": "retained receipt close diagnostic"
+        }}, "Done", "Done"])
+    } else if child == "ApplicationClose" {
+        serde_json::json!(["Done", "Done"])
+    } else {
+        serde_json::json!(["Done"])
+    };
+    let record = serde_json::json!({
+        "intent": intent,
+        "acceptedHistory": preview["history"],
+        "acceptedStorage": preview["storageIncarnation"],
+        "stage": if already_pending { "containmentPending" } else { "running" },
+        "disposition": if already_pending {
+            serde_json::json!({"kind": "ambiguous", "detail": "seeded lost close owner"})
+        } else { serde_json::Value::Null },
+        "containment": if already_pending { "pending" } else { "notRequired" },
+        "supersededBy": null,
+        "blockers": [],
+        "lifecycle": {
+            "in_flight": if cleanup_recorded { serde_json::Value::Null } else { serde_json::json!(child) },
+            "outcomes": outcomes
+        }
+    });
+    preview["operations"][intent.operation_id.as_str()] = record;
+    preview["currentOperation"] = serde_json::json!(intent.operation_id);
+    preview["terminal"] = serde_json::json!(true);
+    preview["writesRevoked"] = serde_json::json!(true);
+    transaction
+        .execute(
+            "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&state).unwrap()],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_sf06_recovery_attaches_real_native_join_without_dispatch_or_cleanup_receipt_trust()
+{
+    let root = root();
+    for (child, cleanup_recorded, predecessor, already_pending) in [
+        ("ReplicatorClose", false, false, false),
+        ("ApplicationClose", false, false, true),
+        ("ApplicationClose", false, true, false),
+        ("ReplicatorClose", true, false, false),
+    ] {
+        let mut node = Node::start(
+            &root
+                .path()
+                .join(format!("{child}-{cleanup_recorded}-{predecessor}")),
+            &ResourceUid::new("close-recovery-native-owner"),
+            1,
+        )
+        .await;
+        node.open(ReplicaRole::Primary, EPOCH).await;
+        node.single(EPOCH).await;
+        let (release, blocked) = std::sync::mpsc::channel();
+        *node.service.provider.synchronous_epoch.lock().unwrap() = Some(blocked);
+        let control = node.service.control.read().await.clone().unwrap();
+        let epoch = tokio::spawn(async move { control.update_epoch(Epoch::new(0, 2)).await });
+        node.service.provider.epoch_entered.notified().await;
+        let mut intent = node.intent(PublicOperationProgram::Close).await;
+        if predecessor {
+            intent.process_session_id = ProcessSessionId::new("predecessor-session");
+        }
+        let operation = intent.operation_id.clone();
+        // This is a durable recovery fixture, not a claim that this process
+        // executed the seeded callback. All containment below is the real host.
+        seed_close_recovery(&node, &intent, child, cleanup_recorded, already_pending);
+        let replay = if cleanup_recorded {
+            let handle = node.handle();
+            let intent = intent.clone();
+            Some(tokio::spawn(async move {
+                handle.execute_public_v1(intent).await
+            }))
+        } else {
+            None
+        };
+        eventually(|| node.service.aborts.load(Ordering::SeqCst) == 1).await;
+        let pending = close_journal(&node, &operation);
+        assert_eq!(
+            pending["stage"],
+            if cleanup_recorded {
+                "running"
+            } else {
+                "containmentPending"
+            }
+        );
+        assert!(!epoch.is_finished());
+        assert_eq!(node.handle().public_v1_provider_writer_count(), 1);
+        assert_eq!(node.service.closes.load(Ordering::SeqCst), 0);
+        assert!(
+            !node
+                .service
+                .observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, NativeCall::Close))
+        );
+        assert_ne!(node.report().await.write_status, AccessStatus::Granted);
+        release.send(()).unwrap();
+        let _ = epoch.await.unwrap();
+        if let Some(replay) = replay {
+            tokio::time::timeout(Duration::from_secs(10), replay)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while close_journal(&node, &operation)["stage"] != "completed" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let record = close_journal(&node, &operation);
+        assert_eq!(
+            record["disposition"]["kind"],
+            if cleanup_recorded {
+                "succeeded"
+            } else {
+                "ambiguous"
+            }
+        );
+        if cleanup_recorded {
+            assert_eq!(
+                record["lifecycle"]["outcomes"][1]["CloseFailure"]["error"],
+                "retained receipt close diagnostic"
+            );
+        } else {
+            assert!(node.handle().execute_public_v1(intent).await.is_err());
+        }
+        assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
+        assert_eq!(
+            node.handle()
+                .public_v1_raw_retained_task_cardinality()
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(node.service.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(node.service.closes.load(Ordering::SeqCst), 0);
+        node.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -3145,12 +3621,20 @@ async fn retained_secondary_promotion_preserves_acknowledged_bytes_and_replaces_
         (&pair.source, &pair.target, ReplicaRole::Primary),
         (&pair.target, &pair.source, ReplicaRole::ActiveSecondary),
     ] {
+        let configuration = PublicConfiguration {
+            current: promoted.clone(),
+            previous: None,
+            replicas: vec![remote.descriptor(role).await],
+        };
         local
-            .command(PublicOperationProgram::Configuration(PublicConfiguration {
-                current: promoted.clone(),
-                previous: None,
-                replicas: vec![remote.descriptor(role).await],
-            }))
+            .command(if local.identity == pair.target.identity {
+                PublicOperationProgram::CatchUp {
+                    configuration,
+                    mode: PublicCatchUpMode::All,
+                }
+            } else {
+                PublicOperationProgram::Configuration(configuration)
+            })
             .await
             .unwrap();
     }

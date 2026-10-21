@@ -30,6 +30,7 @@ mod program;
 #[path = "public_lifecycle_terminal.rs"]
 mod terminal;
 pub(crate) use program::{operation_instructions, repeatable, replayable};
+pub(crate) use terminal::recover as recover_terminal;
 
 pub(crate) fn instruction_selected(
     record: &super::state::PublicOperationRecord,
@@ -59,6 +60,8 @@ pub(crate) type NativeRoleEpoch = Arc<
 >;
 pub(crate) type TerminalDrain =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, crate::Result<()>> + Send + Sync>;
+pub(crate) type AccessFactory =
+    Arc<dyn Fn(&Arc<PartitionOperation>) -> Option<Arc<super::hosting::AccessOwner>> + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct PublicLifecycleCallbacks {
@@ -76,8 +79,10 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) preempt_retained_owner: bool,
     pub(crate) terminal_drain: TerminalDrain,
     pub(super) terminal_cleanup: Option<Arc<terminal::TerminalCleanup>>,
+    pub(crate) access_factory: Option<AccessFactory>,
+    pub(crate) access_owner: Option<Arc<super::hosting::AccessOwner>>,
     pub(crate) aborted: Arc<std::sync::Mutex<bool>>,
-    #[cfg(all(test, feature = "testing"))]
+    #[cfg(feature = "testing")]
     pub(crate) cut: Option<Arc<PublicOperationCut>>,
 }
 
@@ -114,25 +119,27 @@ pub(crate) fn is_replacement_role_replay(
             })
 }
 
-#[cfg(all(test, feature = "testing"))]
+#[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PublicCutPosition {
+pub enum PublicCutPosition {
+    BeforeAccessReservation,
     BeforeInstruction,
+    InstructionSelected,
     CallbackSuccess,
     InstructionApplied,
     CallbackApplied,
     Completed,
 }
 
-#[cfg(all(test, feature = "testing"))]
-pub(crate) struct PublicOperationCut {
-    pub(crate) position: PublicCutPosition,
-    pub(crate) index: usize,
-    pub(crate) entered: tokio::sync::Notify,
-    pub(crate) release: tokio::sync::Notify,
+#[cfg(feature = "testing")]
+pub struct PublicOperationCut {
+    pub position: PublicCutPosition,
+    pub index: usize,
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
-#[cfg(all(test, feature = "testing"))]
+#[cfg(feature = "testing")]
 impl PublicOperationCut {
     pub(crate) async fn pause(&self, position: PublicCutPosition, index: usize) {
         if self.position == position && self.index == index {
@@ -143,6 +150,38 @@ impl PublicOperationCut {
 }
 
 impl PublicLifecycleCallbacks {
+    async fn change_primary_role(&self, epoch: crate::protocol::types::Epoch) -> crate::Result<()> {
+        if self
+            .access_owner
+            .as_ref()
+            .is_some_and(|owner| owner.resumes_primary())
+            && let Some(
+                native @ (
+                    crate::replicator::v1::LifecycleObservation::Ready(ReplicaRole::Primary),
+                    Some(_),
+                ),
+            ) = self
+                .native_role_epoch
+                .as_ref()
+                .map(|observe| observe())
+                .transpose()?
+                .flatten()
+        {
+            // Final demotion catch-up can finish before its role callback. Reconcile
+            // the observed native role; this promotion still requires fresh catch-up.
+            return super::service::replay_role_at_epoch(
+                self.replicator.as_ref(),
+                Some(native),
+                epoch,
+                ReplicaRole::Primary,
+            )
+            .await;
+        }
+        self.replicator
+            .change_role(epoch, ReplicaRole::Primary)
+            .await
+    }
+
     pub(crate) fn application_control_matches(&self, control: &Arc<dyn Replicator>) -> bool {
         Arc::ptr_eq(control, &self.replicator)
             || self
@@ -242,8 +281,27 @@ pub(crate) async fn launch(
         ));
     }
     let operation = registry.admit(intent.clone()).await?;
+    if !matches!(
+        intent.program,
+        Some(PublicOperationProgram::Progress { .. } | PublicOperationProgram::Build(_))
+    ) && matches!(
+        operation.snapshot().stage,
+        PublicOperationStage::Ready | PublicOperationStage::WaitingForContainment
+    ) && let Some(factory) = &callbacks.access_factory
+    {
+        #[cfg(feature = "testing")]
+        if let Some(cut) = &callbacks.cut {
+            cut.pause(PublicCutPosition::BeforeAccessReservation, 0)
+                .await;
+        }
+        callbacks.access_owner = factory(&operation);
+    }
     if intent.class.is_terminal() {
         registry.fence();
+        if operation.snapshot().stage == PublicOperationStage::ContainmentPending {
+            terminal::recover(registry, &operation, callbacks).await?;
+            return Ok(operation);
+        }
         if callbacks.preempt_retained_owner
             && registry.has_uncontained_predecessors(&operation).await
         {
@@ -264,8 +322,17 @@ pub(crate) async fn launch(
             }
             let terminal_guard = if intent.class.is_terminal() {
                 let (cleanup, owner) = terminal::bind(callbacks.clone());
-                callbacks.terminal_cleanup = Some(cleanup);
-                terminal_registry.own_terminal_task(owner);
+                callbacks.terminal_cleanup = Some(cleanup.clone());
+                let terminal_operation = operation.clone();
+                terminal_registry.own_terminal_task(async move {
+                    owner.await;
+                    if let Err(error) = cleanup.wait().await {
+                        // A cancelled root no longer observes Cleanup's result.
+                        // Keep that failure independently of its disposition.
+                        let _ = terminal_operation.wait_for_terminal().await;
+                        terminal_operation.record_containment_failure(&error);
+                    }
+                });
                 Some(terminal::TerminalRootGuard(callbacks.clone()))
             } else {
                 None
@@ -283,7 +350,7 @@ pub(crate) async fn launch(
                     )
                     .await?;
             }
-            #[cfg(all(test, feature = "testing"))]
+            #[cfg(feature = "testing")]
             operation.track_cut(callbacks.cut.clone()).await;
             let containment = if intent.class.is_terminal() {
                 CallbackContainment::RootTask
@@ -295,12 +362,18 @@ pub(crate) async fn launch(
             operation
                 .spawn_root(containment, async move {
                     let _terminal_guard = terminal_guard;
-                    if intent.program.is_some() {
+                    let mut access_guard =
+                        super::hosting::AccessRootGuard::new(callbacks.access_owner.clone());
+                    let result = if intent.program.is_some() {
                         program::execute(store, intent, callbacks).await
                     } else {
                         let input = intent.lifecycle.clone().expect("validated lifecycle");
                         execute(store, intent, input, callbacks).await
+                    };
+                    if result.is_ok() {
+                        access_guard.succeeded();
                     }
+                    result
                 })
                 .await?;
             Ok(())
@@ -347,20 +420,20 @@ async fn execute(
     let captured_state = store.load_state().await?;
     let start = record.lifecycle.outcomes.len();
     for (index, instruction) in instructions(&input).into_iter().enumerate().skip(start) {
-        #[cfg(all(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::BeforeInstruction, index).await;
         }
         store
             .public_instruction(&intent, index, instruction, None)
             .await?;
+        if let Some(owner) = &callbacks.access_owner {
+            owner.selected(instruction);
+        }
         let outcome = match instruction {
             ReplicatorPrimary => {
                 local_callback(
-                    callbacks
-                        .replicator
-                        .change_role(input.epoch, ReplicaRole::Primary)
-                        .await,
+                    callbacks.change_primary_role(input.epoch).await,
                     store.as_ref(),
                     &intent,
                     index,
@@ -482,6 +555,9 @@ async fn execute(
                         input.epoch,
                     )
                     .await?;
+                    if let Some(owner) = &callbacks.access_owner {
+                        owner.reinstalled(store.as_ref(), &configuration).await?;
+                    }
                 }
                 local_callback(
                     callbacks
@@ -515,14 +591,20 @@ async fn execute(
             }
             _ => unreachable!("program instruction in role recipe"),
         };
-        #[cfg(all(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::CallbackSuccess, index).await;
+        }
+        if let Some(owner) = &callbacks.access_owner {
+            owner.callback_succeeded(instruction);
         }
         store
             .public_instruction(&intent, index, instruction, Some(outcome.clone()))
             .await?;
-        #[cfg(all(test, feature = "testing"))]
+        if let Some(owner) = &callbacks.access_owner {
+            owner.receipt(store.as_ref(), instruction).await?;
+        }
+        #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::InstructionApplied, index)
                 .await;

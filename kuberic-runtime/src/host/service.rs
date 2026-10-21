@@ -621,6 +621,16 @@ where
                 "Public V1 operation runtime is already active".into(),
             )
         })?;
+        let runtime = Arc::downgrade(&self.runtime);
+        registry.bind_terminal_recovery(move || {
+            runtime
+                .upgrade()
+                .ok_or(crate::host::HostError::CommandRejected(
+                    "terminal recovery runtime lost".into(),
+                ))?
+                .public_lifecycle_callbacks()
+                .map_err(Into::into)
+        })?;
         let runtime =
             crate::host::operation_recovery::PartitionOperationRuntime::start(registry.clone());
         self.runtime
@@ -727,19 +737,6 @@ where
             intent.program.as_ref(),
             Some(PublicOperationProgram::Open { .. })
         );
-        if !matches!(
-            intent.program,
-            Some(
-                PublicOperationProgram::Progress { .. }
-                    | PublicOperationProgram::Build(_)
-                    | PublicOperationProgram::Swap {
-                        controller_composed: false,
-                        ..
-                    }
-            )
-        ) {
-            self.runtime.fence_replacement_access().await;
-        }
         let mut callbacks = self.runtime.public_lifecycle_callbacks()?;
         if open_program {
             let state = self.store.load_state().await?;
@@ -754,6 +751,7 @@ where
         let operation =
             crate::host::public_lifecycle::launch(&registry, self.store.clone(), intent, callbacks)
                 .await?;
+        let mut access_guard = self.runtime.public_access_completion_guard(&operation);
         let terminal = operation.wait_for_terminal().await?;
         if terminal.stage != PublicOperationStage::Completed
             || terminal.disposition != Some(PublicOperationDisposition::Succeeded)
@@ -766,6 +764,7 @@ where
         registry
             .release_session_renewal_fence(&operation.intent())
             .await?;
+        self.runtime.complete_public_access(&operation);
         if open_program {
             self.runtime.complete_replacement_open().await;
             if self
@@ -784,6 +783,7 @@ where
                 .refresh_replacement_projection(self.store.as_ref(), self.session.id(), true)
                 .await?;
         }
+        access_guard.succeeded();
         Ok(())
     }
 

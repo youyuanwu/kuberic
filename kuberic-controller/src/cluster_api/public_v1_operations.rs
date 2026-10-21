@@ -281,6 +281,9 @@ impl HostedPublicV1Harness {
                     identity: member.identity.clone(),
                     replication_address: remote.replication_address.clone(),
                     process_session_id: report.process_session_id,
+                    is_up: report.replication_address.is_some(),
+                    is_ready: report.progress.current().is_some()
+                        && report.progress.capability().is_some(),
                     storage_incarnation: Some(report.storage_incarnation),
                     role: member.role,
                     current_progress: report
