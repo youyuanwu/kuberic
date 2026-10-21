@@ -228,7 +228,7 @@ specific-quorum capability false ([service:246–292][pg-factory]).
 | Boundary | Current behavior and evidence | Limit |
 |---|---|---|
 | SQL access | Samples live partition status before cache reuse; primary SQL requires read+write Granted; an otherwise eligible secondary needs receive **and replay** at its source boundary ([PG:626–731][pg-access], [tests:3–158][pg-access-test]) | Owned periodic reconciliation is not per-statement mediation or instantaneous revocation ([PG:412–421][pg-tick]). Isolated secondary test status is not host-granted stable-secondary access. |
-| Catch-up | **Marked-successor WriteQuorum explicitly rejects before waiting**; ordinary unmarked WriteQuorum and All are supported ([PG:1476–1504][pg-catchup], [tests:253–368][pg-catchup-test]) | Unsupported is not implemented/ignored. Capability-false swap chooses All ([controller:445–470][fallback], [public witness:4244–4255][fallback-test]). |
+| Catch-up | **Marked-successor WriteQuorum explicitly rejects before waiting**; ordinary unmarked WriteQuorum and All are supported ([PG:1476–1504][pg-catchup], [tests:253–368][pg-catchup-test]) | Unsupported is not implemented/ignored. Capability-false swap chooses All ([controller:445–470][fallback], [public wait assertions:4396–4412][fallback-test]). |
 | Idle Remove | Rejects current/previous voters; retires matching idle grants and reconciles managed physical slots ([PG:1919–1952][pg-remove], [slots:212–258][pg-slots], [tests:607–688][pg-remove-test]) | Same PID/healthy SQL and slot absence are bounded evidence, not a disk-growth SLA. |
 | Stopped progress | Orderly drain snapshots primary certificate versus secondary receive/replay before stopping ([PG:567–617][pg-stop], [1507–1525][pg-progress], [test:163–249][pg-stop-test]) | Not arbitrary-survivor ranking, unobserved SQL racing shutdown, an Abort snapshot or power-loss proof. |
 | Abort | Retained cleanup owns grant cancellation/gateway drain ([PG:500–516][pg-abort], [tests:940–1050][pg-abort-test]) | Existing process/socket/listener observations without prior Close/Drop are not synchronous arbitrary-work join or production latency guarantees. |
@@ -243,7 +243,7 @@ settings parity ([production:40–66][policies], [121–190][production-policy])
 | Replication queue / sender | Initial 64, maximum 8192; queue byte cap 256 MiB; no retained completed-history budget; sender retry 5s |
 | ACK / Close | Batch 15ms, max pending 1024; pending-quorum Close prewait 5s |
 | ACK/EOS | Persisted/volatile derived from lifecycle; explicit ACK forced by persistence; EOS enabled in selected receivers |
-| Data | Raw single buffer, one segment, payload cap 52,428,800 bytes; private lossless segmented codec is not a public selectable policy |
+| Data | Raw single buffer, one segment, payload cap 52,428,800 bytes ([selected buffer limits:35–43][buffer-limits]); private lossless segmented codec is not a public selectable policy |
 | Public settings | Address-only. Effective endpoint replaces initial port-zero input; unchanged effective endpoint accepted, rebinding rejects ([settings:275–283][settings], [390–438][effective], [test:451–502][effective-test]) |
 
 Native public defaults include different queue/ACK/EOS/Close choices; native
@@ -358,7 +358,7 @@ production-readiness support from the selected Rust journeys.
 [pg-catchup]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1.rs#L1476-L1504
 [pg-catchup-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1_p6_tests.rs#L253-L368
 [fallback]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/evaluator/public_v1_topology.rs#L445-L470
-[fallback-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/public_v1_recovery.rs#L4244-L4255
+[fallback-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/public_v1_recovery.rs#L4396-L4412
 [pg-remove]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1.rs#L1919-L1952
 [pg-slots]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/native.rs#L212-L258
 [pg-remove-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1_tests.rs#L607-L688
@@ -369,6 +369,7 @@ production-readiness support from the selected Rust journeys.
 [pg-abort-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1_tests.rs#L940-L1050
 [policies]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L40-L66
 [production-policy]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L121-L190
+[buffer-limits]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/production_transport.rs#L35-L43
 [settings]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/mod.rs#L275-L283
 [effective]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/mod.rs#L390-L438
 [effective-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/classic_v1_production.rs#L451-L502

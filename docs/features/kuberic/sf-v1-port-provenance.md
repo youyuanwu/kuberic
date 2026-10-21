@@ -77,14 +77,14 @@ Destinations: [`sender.rs`](../../../kuberic-runtime/src/replicator/v1/sender.rs
 
 | Selected native material | Translation / exclusions |
 |---|---|
-| `ReliableOperationSender.h:158–178,209–235`; `.cpp:25–205,207–472,509–823` | Sender state, single/replay merge, receive/apply, hints/window/retry/rearm and timer-only RequestAck. Existing rooted queue entries and selected batches replace raw pointers; injected relative time has explicit never-selected state. No second queue/LSN allocator/byte window. |
+| `ReliableOperationSender.h:158–178,209–235`; `ReliableOperationSender.cpp:25–205,207–472,509–823` | Sender state, single/replay merge, receive/apply, hints/window/retry/rearm and timer-only RequestAck. Existing rooted queue entries and selected batches replace raw pointers; injected relative time has explicit never-selected state. No second queue/LSN allocator/byte window. |
 | `ReliableOperationSender.cpp:899–985`; `REPerformanceCounters.h:12–20`; `DecayAverage.cpp:19–119` | Admission watches, positional ACK traversal, signed tick means/strict collection/decay/saturation/reset; safe iteration does not copy native iterator UB. Sparse-latency domains and dynamic config-store/trace sinks are not certified. |
-| `AckSender.h:15–62`; `.cpp:24–225` | Batch/force/pending-only final flush, force gate, issuance/trace; rooted callback rather than payload. Selected timer callbacks may outlive Close; Close is not join. Trace stopwatch persists across reopen. |
+| `AckSender.h:15–62`; `AckSender.cpp:24–225` | Batch/force/pending-only final flush, force gate, issuance/trace; rooted callback rather than payload. Selected timer callbacks may outlive Close; Close is not join. Trace stopwatch persists across reopen. |
 | `RemoteSession.cpp:33–169,434–446,448–655,757–790`; `ReplicationSession.cpp:278–325,426–463` and header declarations | Session identity/epoch/progress, coalesced ordered ACK work, replication/RequestAck and expiry. Short transitions/move-only rooted handoffs replace posting; apply sampled after sender dispatch, finish/recheck atomic with ingress, epoch sampled per send. No invented RequestAck payload. |
 | `RemoteSession.cpp:99–112,243–259,591–595` | Close/open and establishment-owned StartCopy sender seam; selected work survives Close and post-close ACK processing is not categorically rejected. |
-| `ReliableOperationSender.Test.cpp:102–143` **TestReceiveACKProgress**; `145–199` **TestAddRemove**; `201–236` **TestAddMoreThanContinuousSend**; `238–310` three **TestMaxSendingWindowSize** cases | Selected actual sender/queue assertions; manual time/deterministic arrivals replace sleeps, shuffle and racing-timer tolerance. |
+| `ReliableOperationSender.Test.cpp:102–143` **TestReceiveACKProgress**; `ReliableOperationSender.Test.cpp:145–199` **TestAddRemove**; `ReliableOperationSender.Test.cpp:201–236` **TestAddMoreThanContinuousSend**; `ReliableOperationSender.Test.cpp:238–310` three **TestMaxSendingWindowSize** cases | Selected actual sender/queue assertions; manual time/deterministic arrivals replace sleeps, shuffle and racing-timer tolerance. |
 | `ReliableOperationSender.Test.cpp:312–445` **TestOperationLatencyList** and helpers; `DecayAverage.Test.cpp:28–63` **NoDecay_Basic**, **NoDecay_Overflow**, **SimpleAverage**, **SimpleAverageOverflow** | Separate stopwatch/collection/latest/running-average/saturation expectations; dense small cases replace random100-item fixtures. |
-| Production sender `339–472,548–787`, ACK `99–225`, session `492–655` | Additional replay/time/hint/backpressure/decay/flush/close/reopen/pair-replacement/flags/reentrancy/handoff vectors, not dedicated native AckSender/RemoteSession unit tests. |
+| `ReliableOperationSender.cpp:339–472,548–787`; `AckSender.cpp:99–225`; `RemoteSession.cpp:492–655` | Additional replay/time/hint/backpressure/decay/flush/close/reopen/pair-replacement/flags/reentrancy/handoff vectors, not dedicated native AckSender/RemoteSession unit tests. |
 
 Reviewed caller/time context (not imported utility owners):
 `ReplicaManager.cpp:107–147,1138–1242,1333–1345,1835–1925`;
@@ -94,8 +94,11 @@ Reviewed caller/time context (not imported utility owners):
 `SecondaryReplicator.cpp:681–824,1214–1261,2099–2107`;
 `ReplicateCopyOperations.Test.cpp:744–878`;
 `CopyAsyncOperation.Test.cpp:276–303,352–449`;
-`src/prod/src/Common/Timer.h:33–56`, `Timer.Linux.cpp:452–489`,
-`Stopwatch.cpp:49–115`, `TimeSpan.h`, `AsyncOperation.cpp:150–195`.
+`src/prod/src/Common/Timer.h:33–56`,
+`src/prod/src/Common/Timer.Linux.cpp:452–489`,
+`src/prod/src/Common/Stopwatch.cpp:49–115`,
+`src/prod/src/Common/TimeSpan.h`,
+`src/prod/src/Common/AsyncOperation.cpp:150–195`.
 
 ### Carrier, buffers and async execution — F05/F08/F11
 
@@ -106,9 +109,9 @@ Destinations: [`transport.rs`](../../../kuberic-runtime/src/replicator/v1/transp
 
 | Selected native material | Translation / exclusions |
 |---|---|
-| `ReplicationEndpointId.h:23–80`; `ReplicationTransport.cpp:919–945` | Full partition/replica/incarnation/address routing; bound routes/supersession replace actor transport, not native authorization/hosting. |
+| `ReplicationEndpointId.h:23–80`; `ReplicationTransport.cpp:919–937` | Full partition/replica/incarnation/address routing; bound routes/supersession replace actor transport, not native authorization/hosting. |
 | `ReplicationTransport.cpp:168–266,268–355,684–878`; `ReplicationOperationHeader.h:25–110`; `StartCopyMessageBody.h:17–47` | ACK/error, original/sending epochs, segments/batches/terminal markers/StartCopy/RequestAck/InduceFault. Bidirectional tonic logical messages are not native wire format; acceptance is not service ACK. |
-| `ReplicationTransport.cpp:880–917`; `RemoteSession.cpp:757–790` | Retry/infinite expiry, queue-full-only batch stop, too-large/failure obligations; bounded Rust queue/outcome adaptation, not native transport implementation. |
+| `ReplicationTransport.cpp:880–937`; `RemoteSession.cpp:757–790` | Retry/infinite expiry, queue-full-only batch stop, too-large/failure and shared-header construction obligations; bounded Rust queue/outcome adaptation, not native transport implementation. |
 | `ReliableOperationSender.cpp:113–137,548–755`; `AckSender.cpp:64–208`; `RemoteSession.cpp:448–655` | Tokio clocks/timers drive existing algorithms with outside-lock effects and rooted final ACK/handoffs; no Common timer/cancellation implementation. |
 | `src/prod/src/idl/public/FabricRuntime.idl:626–683`; `src/prod/src/managed/Api/src/System/Fabric/OperationData.cs:16–38` | Ordered buffer arrays inform raw/framed conversion through protected bytes. Versioned framing/checked decoder are Kuberic-authored, not native serialization. |
 | `ComOperation.cpp:100–115`; OperationQueue byte admission/history/removal paths | Logical payload accounting excludes Rust framing overhead; actual queue vectors exercise suffix displacement/rewind/trim/discard. |
@@ -143,10 +146,10 @@ and adjacent tests.
 
 | Selected native material | Translation / exclusions |
 |---|---|
-| `ComFromBytesOperation.h`; `.cpp:127–257`; `ComOperation.h` metadata/NeedsAck | Five-state callback lifetime, ordinary cancel, EOS roots/late ACK; `Arc`/mutex/move-only work replaces COM. ReadyToRun blocks queue, Running releases predicate; completion/drop outside guard. Original selected callback identity survives cleanup, foreign same-LSN callback cannot release it. |
-| `SecondaryReplicationReceiver.h`; `.cpp:157–224,250–343,345–444,632–749` | Real queue heads/gaps/LSN duplicates/pressure/hints; original metadata/root retained. Receive differs from service completion; volatile default completes at dispatch. |
+| `ComFromBytesOperation.h`; `ComFromBytesOperation.cpp:127–257`; `ComOperation.h` metadata/NeedsAck | Five-state callback lifetime, ordinary cancel, EOS roots/late ACK; `Arc`/mutex/move-only work replaces COM. ReadyToRun blocks queue, Running releases predicate; completion/drop outside guard. Original selected callback identity survives cleanup, foreign same-LSN callback cannot release it. |
+| `SecondaryReplicationReceiver.h`; `SecondaryReplicationReceiver.cpp:157–224,250–343,345–444,632–749` | Real queue heads/gaps/LSN duplicates/pressure/hints; original metadata/root retained. Receive differs from service completion; volatile default completes at dispatch. |
 | `SecondaryReplicationReceiver.cpp:446–630`; `ComUpdateEpochOperation.h` | Original-epoch establishment, stream marker vs full required-ACK barrier, captured prior-epoch boundary and callback disable/replay; failed/abandoned handoff is not successful Close. |
-| `OperationStream.h/.cpp`; `OperationStream.GetOperationAsyncOperation.h/.cpp`; `ReplicationPointers.h:33` | Shared dispatch/barrier, open wait vs EOF/EOS; futures/wakers replace Begin-End/ReaderQueue. Sticky abort error once per handle, then EOF and cancellation-safe broadcast are explicit Rust policies, not COM error-result parity. |
+| `OperationStream.h`; `OperationStream.cpp`; `OperationStream.GetOperationAsyncOperation.h`; `OperationStream.GetOperationAsyncOperation.cpp`; `ReplicationPointers.h:33` | Shared dispatch/barrier, open wait vs EOF/EOS; futures/wakers replace Begin-End/ReaderQueue. Sticky abort error once per handle, then EOF and cancellation-safe broadcast are explicit Rust policies, not COM error-result parity. |
 | `SecondaryReplicator.cpp:165–193,324–350,675–679,1306–1396,1624–1701,2087–2108`; `Constants.cpp:15–19` | Persisted-or-required mode, optimistic callback omission, sending-epoch admission, ACK progress/threshold; real copy pending count feeds AckSender. InvalidLSN0 differs from NonInitializedLSN-1. |
 | `ReplicationSecondary.Test.cpp:1951–2010` **OutOfOrderReplication**, **OutOfOrderReplicationNoReply**, **OutOfOrderReplicationExceedingQueueCapacity**, **DuplicateReplication**; `2052–2105` **MultipleOperationEpochs**, **VerifyStateProviderEstablishedEpochTest** | Deterministic actual-owner ordering/duplicate/capacity/epoch assertions replace native wrappers/random ACKs/sleeps. |
 | `SecondaryReplicator.cpp:1740–1860,2247–2286` | Fault/two-receiver cleanup/drain context; receiver-local containment alone is not full owner lifecycle. |
@@ -160,8 +163,8 @@ received-operation constructor and adjacent tests.
 
 | Selected native material | Translation / exclusions |
 |---|---|
-| `SecondaryCopyReceiver.h:40–54,72`; `.cpp:24–184,186–285,302–455` | Count-only ordering/ACK/last/gap/full/duplicate/copyDone/sentinels/close/EOS; real shared queue/callbacks replace pointers. Preserve legacy terminal/wait predicate rather than guessing it away. |
-| `CopyContextReceiver.h:12–85`; `.cpp:27–63,80–97,105–145,147–234` | Target-context receive, no-service-ACK queue, terminal bookkeeping, strict threshold and close/final-ACK ordering. Small snapshot/close Arcs avoid native root cycles. |
+| `SecondaryCopyReceiver.h:40–54,72`; `SecondaryCopyReceiver.cpp:24–184,186–285,302–455` | Count-only ordering/ACK/last/gap/full/duplicate/copyDone/sentinels/close/EOS; real shared queue/callbacks replace pointers. Preserve legacy terminal/wait predicate rather than guessing it away. |
+| `CopyContextReceiver.h:12–85`; `CopyContextReceiver.cpp:27–63,80–97,105–145,147–234` | Target-context receive, no-service-ACK queue, terminal bookkeeping, strict threshold and close/final-ACK ordering. Small snapshot/close Arcs avoid native root cycles. |
 | `ComOperationDataAsyncEnumerator.cpp:59–75,90–157,188–196` | Data-only consuming stream; successful close allows pending dequeue, later calls fail; error close fails pending. Shared close/error-once-then-EOF and immediate inaccessible-data retirement are Rust policies. |
 | `ReplicationTransport.cpp:722–752,776–802`; `ComFromBytesOperation.cpp:11–24`; `Constants.cpp:15–19` | Positive protocol terminal LSN, invalid epoch(0,0), distinct zero-LSN local EOS; logical bytes, not framing overhead, classify terminal. |
 | `AckSender.cpp:98–208`; `ReplicationSession.cpp:466–509`; `SecondaryReplicator.cpp:681–825,1500–1570,1967–2055,2087–2108`; `RemoteSession.cpp:585–627` | Actual combined pending count/current-state ACK and ordered handoff; callbacks/wakes/retirement outside guard. Not a fabricated provider/build/drain success. |
@@ -175,13 +178,13 @@ and adjacent tests; existing sender's read-only pending view stages releases.
 
 | Selected native material | Translation / exclusions |
 |---|---|
-| `CopyAsyncOperation.h:12–103`; `.cpp:42–60,70–212` | Count-only clean-on-complete/ignore-commit queue from1, serial enumeration, full/EOF/inflight cancellation and provider-error precedence. Caller-driven future replaces posting/Begin-End, not provider acquisition. |
+| `CopyAsyncOperation.h:12–103`; `CopyAsyncOperation.cpp:42–60,70–212` | Count-only clean-on-complete/ignore-commit queue from1, serial enumeration, full/EOF/inflight cancellation and provider-error precedence. Caller-driven future replaces posting/Begin-End, not provider acquisition. |
 | `CopyAsyncOperation.cpp:214–271` | One parked item, next assignment, numbered EOF, last callback once before sender Add even if parked; empty bytes are data. |
 | `CopyAsyncOperation.cpp:273–365,367–417` | Receive dispatch before applied completion/parked retry; wake not inline poll; separate idempotent End/provider-fault/sender views. Ready is not invented Build success. |
 | `ComProxyAsyncEnumOperation.cpp:90–121,137–195` | Nonnull empty item vs null EOF; absent enumerator becomes explicit empty Rust stream. Weak handles/unique stream lease retain provider root through End and interrupted polling; Drop is disposal ownership, not optional COM interface parity. |
 | `CopyAsyncOperation.Test.cpp:276–303,320–449` | Cancellation timing, twelve-item success, fifteen-item/eight-slot/ACK-below-four full retry and smaller parked/EOF vectors. Invalid inputs, timer/framing/reentrancy cases are production/Rust-derived, not native harness execution. |
 | `SecondaryCopyReceiver.cpp:24–184,302–455`; `CopyContextReceiver.cpp:105–234` | Actual receiver boundaries preserve required/optimistic ACK, ordinary empty data and terminal identity; no test-only Build success. |
-| `CopySender.h:29–157`; `.cpp:26–265` | One-shot Begin/stale/prefailed completion/FinishOperation/EOF/End/disable race; caller driver, short transitions and callback root replace COM; first completion wins. |
+| `CopySender.h:29–157`; `CopySender.cpp:26–265` | One-shot Begin/stale/prefailed completion/FinishOperation/EOF/End/disable race; caller driver, short transitions and callback root replace COM; first completion wins. |
 | `CopySender.cpp:267–406` | Separate replication gate/final copy completion; normalize copy-1 to known terminal, preserve zero/no-update; disabled success still releases ACK queue. Malformed parked-terminal progress explicitly rejects. |
 | `CopySender.cpp:409–439,476–581` | Five states, context/no-replication mode, terminal identity, delegated sender views; increase target only while LSNSet, never reopen ReplCompleted. |
 | `PrimaryReplicator.BuildIdleAsyncOperation.cpp:111–166`; `RemoteSession.cpp:367–385` | Fallible latest-issued getter at actual EOF before Add, even parked; lookup error is not invented provider fault. Native zero-copy-LSN EOF recheck cannot satisfy terminal predicate. |
@@ -227,9 +230,9 @@ and adjacent tests; actual receiver/stream/establishment owners remain intact.
 | Selected native material | Translation / exclusions |
 |---|---|
 | `SecondaryReplicator.cpp:393–550` | Admission retirement, ordinary Close/End/Abort, context sender/provider wait; caller futures/weak ingress replace COM/jobs, abandonment is not Close. |
-| `SecondaryReplicator.CloseAsyncOperation.cpp:120–188,327–367` | Legacy ordinary dispatch abort/queue cleanup, reserved UpdateEpoch wait but not all ACK/context calls. Native TODO is not a universal graceful-drain guarantee. |
-| `SecondaryReplicator.CloseAsyncOperation2.cpp:116–421` | EOS ordinary Close: incomplete-copy cleanup, EOS ACK, uninitialized abort bypass, copy then replication drain, context then epoch wait. Failed drain returns; Abort retains obligations. |
-| `SecondaryReplicator.DrainQueueAsyncOperation.cpp:56–342`; `OperationStream.GetOperationAsyncOperation.cpp:139–184` | Actual dispatch then required-service-ACK drain. Empty-open is not EOF; stream fault preserves failed drain/EOS wait. |
+| `SecondaryReplicator.CloseAsyncOperation.cpp:120–188,327–362` | Legacy ordinary dispatch abort/queue cleanup, reserved UpdateEpoch wait but not all ACK/context calls. Native TODO is not a universal graceful-drain guarantee. |
+| `SecondaryReplicator.CloseAsyncOperation2.cpp:116–378` | EOS ordinary Close: incomplete-copy cleanup, EOS ACK, uninitialized abort bypass, copy then replication drain, context then epoch wait. Failed drain returns; Abort retains obligations. |
+| `SecondaryReplicator.DrainQueueAsyncOperation.cpp:56–327`; `OperationStream.GetOperationAsyncOperation.cpp:139–184` | Actual dispatch then required-service-ACK drain. Empty-open is not EOF; stream fault preserves failed drain/EOS wait. |
 | `SecondaryReplicator.cpp:1624–1965` | Reserve ACK epoch work before callback finish, call provider outside guards; full barrier failure differs from stream marker/provider fault. Retained real futures, no fabricated completion. |
 | `SecondaryReplicator.cpp:862–914,1063–1123` | Provider acquisition/EndGetNext faults vs remote context errors; acquisition forces negative ACK only while copy pending. |
 | `SecondaryReplicator.cpp:1967–2083,2235–2280`; `AckSender.cpp:64–208` | Actual copy/context checks, two-receiver ACK and stream fault/EOS waits; retained cleanup tokens avoid provider/root cycles. |
@@ -264,9 +267,9 @@ and actual queue/receiver/primary/manager seams.
 |---|---|
 | `ReplicatorState.cpp:39–126`; `Replicator.ChangeRoleAsyncOperation.cpp:37–514` | Edge matrix, provider/cache progress, close/create/handoff, idle-active drain, primary epoch and None; retained typed steps/futures replace COM roots. |
 | `ReplicationQueueManager.cpp:59–160`; `SecondaryReplicationReceiver.cpp:61–155,689–706` | Actual queue/root/original-epoch transfer. Demotion trims oldest until native count/byte bound, requires committed tail and adopts service ACK mode; no reconstructed scalar history or synthetic ACK. |
-| `SecondaryReplicator.CloseAsyncOperation.cpp:39–117,188–367`; `SecondaryReplicator.CloseAsyncOperation2.cpp:40–115`; `SecondaryReplicator.cpp:2110–2136` | Promotion vs ordinary Close, legacy required-ACK incomplete rejection, optimistic dispatch vs EOS data/ACK drain; actual context/provider futures retained. |
+| `SecondaryReplicator.CloseAsyncOperation.cpp:39–117,188–362`; `SecondaryReplicator.CloseAsyncOperation2.cpp:40–115`; `SecondaryReplicator.cpp:2110–2136` | Promotion vs ordinary Close, legacy required-ACK incomplete rejection, optimistic dispatch vs EOS data/ACK drain; actual context/provider futures retained. |
 | `ReplicaManager.cpp:792–920`; `PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31–90` | Demotion cancel before forced progress, issued-tail callback even duplicate epoch; timer driver active while provider pending. Old build providers remain for separate drain. |
-| `SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31–155`; `Replicator.UpdateEpochAsyncOperation.cpp:34–145` | Direct epoch serialization/minimum/duplicate/stale/discard/copy-fault and ACK drain. Direct secondary update is not provider call; stream barriers separate. Abort/interrupted work stays explicit. |
+| `SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31–155`; `Replicator.UpdateEpochAsyncOperation.cpp:34–133` | Direct epoch serialization/minimum/duplicate/stale/discard/copy-fault and ACK drain. Direct secondary update is not provider call; stream barriers separate. Abort/interrupted work stays explicit. |
 | `Replicator.OnDatalossAsyncOperation.cpp:30–157`; `ReplicatorState.cpp:129–139,177–186` | Fault preflight/CheckingDataLoss/provider callback/changed-only query/cache-before-reset/End restoration. Changed flag and original error retained privately even if query/reset fails. |
 | `Replicator.cpp:659–708,799–838` | Temporary primary/ACK/context admission gating, existing activities rooted and timers driven without locks across callbacks. |
 | `PrimaryReplicator.cpp:501–505`; `ReplicaManager.cpp:1015–1023`; `ReplicationQueueManager.cpp:148–160` | Real reset/next assignment/PC cursor reset. Pending work/selected activities/negative-overflow become explicit errors, not synthetic cancellation; configuration/session roots unchanged. |
@@ -282,13 +285,13 @@ and actual primary/session/build/queue/carrier seams.
 | Selected native material | Translation / exclusions |
 |---|---|
 | `ReplicaManager.cpp:530–545,716–778` | Freshness tick/strict age/committed retarget/current settings; caller-driven Tokio timer, not trace/monitoring implementation. |
-| `ReplicaManager.cpp:1832–2076`; `CopySender.cpp:524–579`; `ReplicationSession.cpp:127–173` | Successful/full admission pressure, issued-tail retarget before disable/fault and utilization recheck; real completion-disable race, selected partial effects retained on later failure. |
-| `ReplicaManager.cpp:173–284,350–432,1871–1980`; `standarddeviation.h:17–22`, `.cpp:32–76` | Spare quorum/age/fastest remote mean/deviation/strict outlier/least receive; preserve100ns threshold truncation without utility source. Fault excludes receive reclamation, not apply quorum/All/live MustCatchup. |
+| `ReplicaManager.cpp:1832–2076`; `CopySender.cpp:524–579`; `ReplicationSession.cpp:87–283` | Successful/full admission pressure, issued-tail retarget before disable/fault and utilization recheck; retain selected fault-state getters, sender Open and Close/timer cancellation as well as notification policy. Real completion-disable race, selected partial effects retained on later failure; Rust session/task/timer ownership replaces native timer/lock execution. |
+| `ReplicaManager.cpp:173–284,350–432,1871–1980`; `standarddeviation.h:17–22`, `standarddeviation.cpp:32–76` | Spare quorum/age/fastest remote mean/deviation/strict outlier/least receive; preserve100ns threshold truncation without utility source. Fault excludes receive reclamation, not apply quorum/All/live MustCatchup. |
 | `ReplicationSession.cpp:175–283`; `RemoteSession.cpp:448–490`; `ReplicaManager.cpp:1748–1750,2443–2450` | Sender close before reclaim, idle/active fault split and retrying notifications; sends do not ACK/clear retries. Faulted-idle promotion rejects. |
 | `Replicator.cpp:946–980`; `OperationQueue.cpp:135–138,205–212`; `ComOperation.cpp:18–28` | LSN-span/logical-byte utilization with truncation; creation/transfer timestamps via Tokio; operation identity retained. |
 | `src/prod/src/ServiceModel/reliability/replication/REConfigMacros.h:166–177`; `REInternalSettings.cpp:451–607` | Private settings/persisted mode sampling, not config-store or arbitrary public upgrade implementation. |
 | `ReplicationSession.cpp:251–280`; existing logical `sf_v1.proto` | InduceFault with bound target, actual tonic notification; not native wire. Selected remote host authority remains Kuberic adaptation. |
-| `DecayAverage.Test.cpp:65–108`; `ReplicatorSettings.Test.cpp:738–788` | Reviewed context only. Real sender latency observations test policy, not duplicated deviation oracle or whole native fixtures. |
+| `DecayAverage.Test.cpp:65–107`; `ReplicatorSettings.Test.cpp:738–788` | Reviewed context only. Real sender latency observations test policy, not duplicated deviation oracle or whole native fixtures. |
 
 ### Ingress, Open and restart — F01/F04/F05/F07/F08/F09/F11
 
@@ -390,14 +393,14 @@ address/persistence/bearer/basic-report boundaries and fixed policies are in
 | Native source at selected pin | Target / classification retained |
 |---|---|
 | `ComReplicator.h:12–35`; `ComReplicator.cpp:53–83,490–808,1002–1118` | Actual QI includes settings2/specific quorum; settings getter merges effective address/security. Public update compares breaking fields; credential changes validated/updated, not ignored. Internal reservation/batch E_NOTIMPL, queue counters distinct; managed Buffer/Count validation does not establish Offset bounds checking here. |
-| `ComOperationStream.h:12–24`; `.cpp:48–78`; `OperationStream.cpp:66–85` | stream2 exposed even when fault/EOS disabled; internal batch E_NOTIMPL; invalid fault kind before policy, disabled→InvalidOperation. |
+| `ComOperationStream.h:12–24`; `ComOperationStream.cpp:48–78`; `OperationStream.cpp:66–85` | stream2 exposed even when fault/EOS disabled; internal batch E_NOTIMPL; invalid fault kind before policy, disabled→InvalidOperation. |
 | `reconfig.h:12–17`; `src/prod/src/ServiceModel/reliability/replication/REConfigMacros.h:136–207`; `src/prod/src/idl/public/FabricTypes.idl:2910–2960` | Public base/EX1–EX4 fields/defaults vs internal policy. Legacy flags populate both roles, EX3 overrides per role before comparison; config-store dynamic updates are not arbitrary public upgrades. |
 | `ComReplicator.cpp:490–532,550–582,639–808`; `REConfigMacros.h:136–207` (full path above) | Retry5000ms, ACK15ms, requireACK false; native public primary64/1024/memory0, secondary64/2048/memory0, copy64/1024/no maximum-memory; max message52,428,800, clear-ACKed false, pending-Close0, max-pendingACK32, localhost:0. EOS/fault public false vs internal true. These are **native targets**, not selected production defaults. |
 | Same settings sources | Legacy initial128→both128, EX3 primary64→64/128; memory600 without legacy max-count flag→counts0/0, with max1024→1024/1024 before EX3/validation. Specified retry6000 rejects, equal/unspecified is not that error. Listen/publish fields not compared as breaking; native credential updates separate. |
 | `ReplicaManager.cpp:1092–1099`; `REConfigMacros.h:165–177` (full path above) | Specific quorum compares live marked minimum to current Q; AllowMultipleQuorumSet true, idle freshness60s are internal policy, not arbitrary public settings. |
 | `OperationStream.GetOperationAsyncOperation.cpp:116–136`; `SecondaryReplicator.cpp:165–193` | Ordinary null EOF vs enabled explicit EOS ACK; persistence forces explicit ACK even if require=false. |
 | `RA/ComStatefulServicePartition.cpp:208–350`; `BatchedHealthReporter.cpp:62–125` | Fault/load/move/scoped health acceptance is not immediate platform convergence; batching/clear are separate targets. |
-| `src/prod/src/ServiceGroup/Service/ServiceGroup.StatefulService.h:153–180`; `ServiceGroup.StatefulServiceUnit.h:27–58` (same directory) | Separate atomic wrapper boundary, absent from ordinary ComReplicator; no ServiceGroup port. |
+| `src/prod/src/ServiceGroup/Service/ServiceGroup.StatefulService.h:153–180`; `src/prod/src/ServiceGroup/Service/ServiceGroup.StatefulServiceUnit.h:27–58` | Separate atomic wrapper boundary, absent from ordinary ComReplicator; no ServiceGroup port. |
 | `ComProxyStateProvider.cpp:19–26`; `src/prod/src/data/txnreplicator/ComStateProvider.h:10–29` | Distinct internal V2 copy-until-latest marker, not public specific-quorum or classic Build; no V2 implementation incorporated. |
 
 ## Selected acceptance and test ancestry
@@ -416,20 +419,34 @@ source-derived vectors. Current support/limits are in the ledger's
 | Q4 D/S | `OperationQueue.Test.cpp:867–901` **TestSecondaryQueueTrim**; `OperationQueue.cpp:371–399` | Selected heads/history and LSN duplicate accounting, not ring allocator port. |
 | M1 D; M2–M5 S | `ReplicaManager.Test.cpp:154–220` named quorum cases above; `PrimaryReplicator.CatchupAsyncOperation.cpp:43–104`; `ReplicationQueueManager.cpp:261–272,319–357`; `ReplicaManager.cpp:1278–1333,2328–2362,2471–2524` | Quorum/reclaim, moving All, captured B/current Q/live M, W1 asymmetry and catch-up caps; actual owner arithmetic, not duplicate executable oracle. |
 | S1–S3 S | `SecondaryReplicator.cpp:165–193`; `SecondaryReplicationReceiver.cpp:177–202,632–740`; `SecondaryCopyReceiver.cpp:24–80`; `ComFromBytesOperation.cpp:167–224` | Mode split/contiguous receive vs completion/shared terminal lifetime/late callback, not identical native error-result surface. |
-| R1 D; R2–R3 S | `ReliableOperationSender.Test.cpp:102–143` **TestReceiveACKProgress**; sender `548–579,636–679,732–755`; `RemoteSession.cpp:585–611`; `AckSender.cpp:64–127,174–208` | Pending-list/receive-vs-apply/timer/window/RequestAck/order/final flush, deterministic time replaces native sleeps. |
+| R1 D; R2–R3 S | `ReliableOperationSender.Test.cpp:102–143` **TestReceiveACKProgress**; `ReliableOperationSender.cpp:548–579,636–679,732–755`; `RemoteSession.cpp:585–611`; `AckSender.cpp:64–127,174–208` | Pending-list/receive-vs-apply/timer/window/RequestAck/order/final flush, deterministic time replaces native sleeps. |
 | C1/C6 S | Actual QI/settings targets immediately above; `ComReplicator.cpp:1002–1050`; `OperationStream.cpp:66–85` | Actual exposed/internal/unsupported distinction, not every SDK declaration or implemented public Kuberic capability. |
-| C2 S | `ComProxyAsyncEnumOperation.cpp:108–121,182–195`; `CopyAsyncOperation.cpp:171–211`; `SecondaryReplicator.cpp:982–1003` | Nonnull empty item vs null EOF; persisted target context, volatile omission. |
-| C3 D/S | `CopyAsyncOperation.Test.cpp:418–449` **CopyAsync_QueueFull_Cancelled**; `.cpp:42–49,242–254`; `SecondaryCopyReceiver.cpp:388–395` | Native15/15/4/cancel-at12 reduced full/parked/cancel vector, no complete replay fixture. |
+| C2 S | `ComProxyAsyncEnumOperation.cpp:108–121,182–195`; `CopyAsyncOperation.cpp:171–254`; `SecondaryReplicator.cpp:982–1003` | Nonnull empty item vs null EOF/terminal enumeration; persisted target context, volatile omission. |
+| C3 D/S | `CopyAsyncOperation.Test.cpp:418–449` **CopyAsync_QueueFull_Cancelled**; `CopyAsyncOperation.cpp:42–49,242–254`; `SecondaryCopyReceiver.cpp:388–395` | Native15/15/4/cancel-at12 reduced full/parked/cancel vector, no complete replay fixture. |
 | C4–C5 S | `PrimaryReplicator.BuildIdleAsyncOperation.cpp:111–144`; `CopySender.cpp:524–579,555–579`; `ReplicaManager.cpp:745–774,1983–2022` | EOF-issued target/copy+replication gates/upward pending retarget; not snapshot-only Build success. |
 | T1 D/S; T2 S | `ReplicationTransport.Test.cpp:594–617` **TestDropMessageToNotMatch**; `PrimaryReplicator.cpp:632–683`; `ReplicationSession.cpp:217–243,364–384,423–463`; `RemoteSession.cpp:757–790` | Remove sockets/Sleep(100), retain route/incarnation/role/epoch/expiry/failure obligations; accepted send≠ACK. |
 | D1 S | `src/prod/src/idl/public/FabricRuntime.idl:636–683`; `ReplicationOperationHeader.h:25–42`; `ReplicationAckMessageBody.h:17–24` | Empty-array/empty-segment boundaries and two epochs/sequence spaces inform private lossless codec; not native serialization/public segmented policy parity. |
 | L1–L3 S; E1–E2 S | `ReplicatorState.cpp:39–126`; `ReplicationQueueManager.cpp:58–160`; `Replicator.OnDatalossAsyncOperation.cpp:82–126`; `Replicator.CloseAsyncOperation.cpp:134–192`; `RA/FailoverUnitProxy.CloseAsyncOperation.cpp:209–276`; `ReplicaManager.cpp:871–920`; `PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31–90`; `SecondaryReplicator.cpp:951–1003` | Role edges/actual queues/reset, direct vs outer Close, issued epoch and fixed copy epoch. Native target differs from current selected outer-Close result. |
-| H1–H2 S; H3 D/S | `RA/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:34–145,58–71,101–114`; `BatchedHealthReporter.Test.cpp:107–135` **TestWarningsWithinIntervalReport**; `.cpp:81–125` | Native staged grants and Temp2/latest-warning/Close-clear expectations; named timer input not sleep/platform convergence. Selected production access differs; broader reporting deferred. |
+| H1–H2 S; H3 D/S | `RA/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:34–145,58–71,101–114`; `BatchedHealthReporter.Test.cpp:107–135` **TestWarningsWithinIntervalReport**; `BatchedHealthReporter.cpp:81–125` | Native staged grants and Temp2/latest-warning/Close-clear expectations; named timer input not sleep/platform convergence. Selected production access differs; broader reporting deferred. |
 | Protected resolved fixtures | Kuberic `application.rs:31–37`, protected traits and external positive/privacy fixture infrastructure | Kuberic-authored compiler identities/trait implementations, not native COM or segmented codec. |
 
 ### Reviewed-only context
 
 These were source/context selections, not whole-test translations or executions:
+
+- Native behavior comparisons (not additional incorporated implementations):
+
+  | Native context | Purpose / boundary |
+  |---|---|
+  | `RA/FailoverUnitProxy.cpp:428–461,1376–1396`; `RA/ComStatefulServicePartition.cpp:75–147,482–486` | Direct Abort/access calculation and cached public status, not per-transaction service isolation. |
+  | `RA/ProxyActionsList.cpp:63–73,94–148`; `RA/FailoverUnitProxy.ReplicatorCatchupReplicaSetAsyncOperation.cpp:107–118` | Distinct action-list/direct Abort, normal child role order and catch-up completion/error scope; not an RA orchestration port. |
+  | `ReplicaManager.cpp:1025–1034,1671–1785,2467–2528`; `PrimaryReplicator.CatchupAsyncOperation.cpp:42–104`; `SecondaryCopyReceiver.cpp:160–287,377–427`; `Replicator.ReplicateAsyncOperation.cpp:43–64,103–108` | Native progress/configuration/copy/admission/completion comparison, not the removed engine's receipt or application-durability contract. |
+  | `src/prod/test/FabricTest/TestStoreService.cpp:108–155,791–817,866–883` | One native test service's staged visibility/EndReplicate/read-status example, not generic application isolation or an imported fixture. |
+  | `src/prod/src/data/txnreplicator/ComTransactionalReplicator.cpp:508–512`; `src/prod/src/data/txnreplicator/loggingreplicator/LoggingReplicatorImpl.cpp:435–445` | Distinct transactional-layer interface/query context, not incorporated V2 implementation or classic queue semantics. |
+  | `ReplicatorState.cpp:28–248`; `Replicator.CloseAsyncOperation.cpp:32–200`; `RA/FailoverUnitProxy.CloseAsyncOperation.cpp:29–109`; `RA/ComStatefulServicePartition.cpp:164–350` | Facade lifecycle, direct/outer Close and partition report target context; no claim the selected public host reproduces every branch. |
+  | `ReplicaManager.cpp:349–454,1061–1104,1783–1833,2328–2528`; `ReplicaManager.h:285–349`; `ReplicationQueueManager.cpp:369–411`; `PrimaryReplicator.CatchupAsyncOperation.cpp:62–106` | Additional configuration/quorum/admission/catch-up reference boundaries, not new algorithm-domain qualification. |
+  | `RemoteSession.cpp:492–670`; `RemoteSession.h:202–259`; `ComFromBytesOperation.cpp:167–262`; `SecondaryReplicator.UpdateEpochAsyncOperation.cpp:31–156` | ACK/callback/provider-boundary context from the public contract comparison; distinct from a native test or whole-owner translation. |
+  | `src/prod/src/managed/Api/src/System/Fabric/IStateReplicator.cs:19–81,102–127`; `src/prod/src/managed/Api/src/System/Fabric/IStatefulServicePartition.cs:16–45` | Managed API contract context, not imported managed implementation or a substitute for actual native facade exposure. |
 
 - `ReplicationSecondary.Test.cpp:529–579,1450–1507,1550–1587` — progress/drain modes.
 - `ChangeRole.Test.cpp:25–45` — registrations, not copied network run.

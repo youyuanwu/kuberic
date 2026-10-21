@@ -28,7 +28,7 @@ scenario oracle.
 | **SF-01** — visible KV apply before read fence | Supported service-isolated visibility; old mechanism superseded | [KV:195–376][kv], [test:554–611][kv-read]. Native quorum does not expose speculative primary state/client success; secondary normal reads denied. Not per-apply host read denial. |
 | **SF-02** — KV bypasses write denial | Supported selected write admission; historical Open label stale | [adapter:421–448][admission], [Revoke:374–380][revoke], [host-gate test:11–145][gate-test], [public raw-fence assertion:4413–4422][raw-fence]. Access sample/assignment share Revoke gate. No separately rerun exact HTTP-only legacy trace. |
 | **SF-03** — PG ignores partition denial | Supported periodic live-status policy | [PG:626–731][pg-access], [tests:3–158][pg-access-test]. Not instantaneous/per-statement revocation; isolated secondary status is not a stable-secondary public-host grant. |
-| **SF-04** — swap capability mismatch | Supported capability/mode binding | [controller:445–470][fallback], [public test:4244–4255][capability], [swap:4360–4468][swap]. True/WriteQuorum and false/All are distinct real-bundle cases; crossed metadata rejects. |
+| **SF-04** — swap capability mismatch | Supported capability/mode binding | [controller:445–470][fallback], [public wait assertions:4396–4412][capability], [swap:4360–4468][swap]. True/WriteQuorum and false/All are distinct real-bundle cases; crossed metadata rejects. |
 | **SF-05** — demotion precedes final catch-up | Supported source configuration/role order | [program:20–39][program], [public:4423–4451][swap], [controller journey:1320–1409][journey]. Separate staged-access/outer-Close differences remain below. |
 | **SF-06** — Revoke invokes obstructing synthetic role callback | Supported access-only Revoke and retained containment | [program:14–44][program], [cleanup/error test:1064–1102][close-test]. This does not close the selected outer-Close/native outcome difference. |
 | **SF-07** — PG idle Remove globally drains | Supported completed-idle retirement | [PG:1919–1952][pg-remove], [test:607–656][pg-remove-test]. Same process/healthy SQL survives idle Remove; voters must first leave configuration. |
@@ -152,7 +152,7 @@ maintained. Former filenames here are plain text, not live navigation targets.
 [pg-access]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1.rs#L626-L731
 [pg-access-test]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1_p6_tests.rs#L3-L158
 [fallback]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/evaluator/public_v1_topology.rs#L445-L470
-[capability]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/public_v1_recovery.rs#L4244-L4255
+[capability]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/public_v1_recovery.rs#L4396-L4412
 [swap]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/public_v1_recovery.rs#L4360-L4468
 [program]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/public_lifecycle_program.rs#L14-L44
 [journey]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-level-tests/src/in_process/journeys.rs#L1320-L1409
