@@ -322,6 +322,7 @@ struct ReplicatorCreation {
     callback_containment: StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
     native_runtime_control: StdMutex<Option<Arc<dyn NativeRuntimeControl>>>,
     settings: StdMutex<Option<BoundReplicatorSettings>>,
+    effective_address: OnceLock<String>,
     armed: AtomicBool,
 }
 
@@ -346,6 +347,7 @@ impl ReplicatorCreation {
             callback_containment: StdMutex::new(None),
             native_runtime_control: StdMutex::new(None),
             settings: StdMutex::new(None),
+            effective_address: OnceLock::new(),
             armed: AtomicBool::new(true),
         }
     }
@@ -385,7 +387,14 @@ impl ReplicatorCreation {
         *guarded = control;
     }
 
-    fn bind_settings(&self, identity: ReplicaIdentity, settings: ReplicatorSettings) -> Result<()> {
+    fn bind_settings(
+        &self,
+        identity: ReplicaIdentity,
+        mut settings: ReplicatorSettings,
+    ) -> Result<()> {
+        if let Some(effective) = self.effective_address.get() {
+            settings.replication_address = effective.clone();
+        }
         settings.validate()?;
         let owner = *self
             .identity
@@ -565,6 +574,14 @@ impl ReplicatorAttachment {
 }
 
 impl ReplicatorInterfaces {
+    pub(crate) fn with_effective_replication_address(self, address: String) -> Self {
+        self.creation
+            .effective_address
+            .set(address)
+            .expect("effective endpoint is bound once");
+        self
+    }
+
     #[cfg(feature = "testing")]
     pub(crate) fn without_catch_up_specific_quorum(self) -> Result<Self> {
         if self.creation.identity.get().is_some() {

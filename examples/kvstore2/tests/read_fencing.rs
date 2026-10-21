@@ -474,6 +474,63 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn sf15_trait_close_retains_cancelled_consumer_drain() {
+    use kuberic_runtime::StatefulServiceReplica;
+    let fixture = Fixture::start("sf15-close").await;
+    let service = fixture.replicas[1].service.clone();
+    assert!(service.retained_consumer_count().await > 0);
+    let gate = service.pause_next_stream_exit();
+    let closing = service.clone();
+    let close = tokio::spawn(async move { StatefulServiceReplica::close(closing.as_ref()).await });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered())
+        .await
+        .unwrap();
+    assert!(
+        !close.is_finished(),
+        "trait Close returned before its owned stream consumer exited"
+    );
+    close.abort();
+    assert!(close.await.unwrap_err().is_cancelled());
+    let closing = service.clone();
+    let mut retry =
+        tokio::spawn(async move { StatefulServiceReplica::close(closing.as_ref()).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut retry)
+            .await
+            .is_err(),
+        "cancelled Close detached consumer ownership"
+    );
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(service.retained_consumer_count().await, 0);
+    StatefulServiceReplica::close(service.as_ref())
+        .await
+        .unwrap();
+    // The trait boundary above is observed before host shutdown. Afterwards use
+    // forceful host cleanup: native graceful Close cannot require EOF consumption
+    // from an application whose stream consumers were explicitly already closed.
+    let mut fixture = fixture;
+    for replica in &fixture.replicas {
+        replica.running.shutdown();
+    }
+    for replica in &mut fixture.replicas {
+        tokio::time::timeout(Duration::from_secs(10), replica.running.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        let result = replica.service.shutdown_and_drain().await;
+        assert!(
+            matches!(result, Ok(()) | Err(RuntimeError::OperationCancelled)),
+            "unexpected forceful fixture cleanup diagnostic: {result:?}"
+        );
+    }
+}
+
 async fn gated_write(
     fixture: &Fixture,
 ) -> (

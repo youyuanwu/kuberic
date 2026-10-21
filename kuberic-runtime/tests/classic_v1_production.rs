@@ -352,6 +352,7 @@ struct QueryService {
     committer: Arc<kvstore2::v1_test_bridge::Committer>,
     scripts: Arc<QueryScripts>,
     control: OnceLock<Arc<dyn Replicator>>,
+    settings: OnceLock<Arc<dyn kuberic_runtime::replicator::StateReplicator>>,
 }
 
 #[async_trait::async_trait]
@@ -399,6 +400,11 @@ impl StatefulServiceReplica for QueryService {
             )
             .await?;
         let control = interfaces.replicator();
+        assert!(
+            self.settings
+                .set(interfaces.state_replicator().unwrap())
+                .is_ok()
+        );
         assert!(self.control.set(control.clone()).is_ok());
         Ok(control)
     }
@@ -430,6 +436,7 @@ impl Sample for QueryService {
                 calls: [AtomicUsize::new(0), AtomicUsize::new(0)],
             }),
             control: OnceLock::new(),
+            settings: OnceLock::new(),
         })
     }
     async fn drain(&self) -> Result<()> {
@@ -438,6 +445,61 @@ impl Sample for QueryService {
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
+}
+
+#[tokio::test]
+async fn public_factory_port_zero_effective_settings_are_immutable_and_round_trip() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let root = tempfile::tempdir().unwrap();
+        let epoch = Epoch::new(0, 1);
+        let mut node = Node::<QueryService>::start_sized(root.path(), 1, 0, 1).await;
+        node.open(ReplicaRole::Primary, epoch).await;
+        node.single(epoch).await;
+        let before = node.report().await;
+        let address = before.replication_address.clone().unwrap();
+        assert!(!address.ends_with(":0"));
+        let state = node.service.settings.get().unwrap();
+        state
+            .update_replicator_settings(ReplicatorSettings {
+                replication_address: address.clone(),
+            })
+            .await
+            .expect("unchanged effective endpoint rejected by real factory registration");
+        assert!(
+            state
+                .update_replicator_settings(ReplicatorSettings {
+                    replication_address: "http://127.0.0.1:1".into(),
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .update_replicator_settings(ReplicatorSettings {
+                    replication_address: "http://127.0.0.1:0".into(),
+                })
+                .await
+                .is_err(),
+            "unresolved input is not an effective endpoint alias"
+        );
+        let after = node.report().await;
+        assert_eq!(before.replication_address, after.replication_address);
+        assert_eq!(before.process_session_id, after.process_session_id);
+        assert_eq!(before.replicator_creation_id, after.replicator_creation_id);
+        assert_eq!(before.role, after.role);
+        let _socket = tokio::net::TcpStream::connect(
+            address
+                .trim_end_matches('/')
+                .strip_prefix("http://")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        drop(_socket);
+        node.close().await;
+    })
+    .await
+    .expect("effective settings journey exceeded its bound");
 }
 
 struct Resolver;
