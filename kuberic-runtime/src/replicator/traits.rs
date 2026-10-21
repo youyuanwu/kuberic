@@ -104,19 +104,27 @@ pub trait PrimaryReplicator: Replicator {
         previous: ReplicaSetConfiguration,
     ) -> Result<()>;
 
-    /// Waits for replicas to catch up to the current committed LSN.
+    /// Waits for replicas to satisfy the requested catch-up condition.
     ///
-    /// [`ReplicaSetQuorumMode::All`] requires all participating replicas to
-    /// catch up. [`ReplicaSetQuorumMode::WriteQuorum`] requires a write quorum
-    /// of each applicable configuration and the replica marked `must_catchup`,
-    /// if present. This lets a primary swap proceed without waiting for every
-    /// slow replica when specific-quorum catch-up is supported.
+    /// For the built-in classic V1 replicator:
+    ///
+    /// - [`ReplicaSetQuorumMode::All`] requires all current replicas' apply
+    ///   progress to reach the latest issued LSN. The target follows new writes
+    ///   while the wait is pending.
+    /// - [`ReplicaSetQuorumMode::WriteQuorum`] requires current-configuration
+    ///   quorum apply progress to reach the boundary captured by configuration
+    ///   updates. If replicas are marked `must_catchup`, their minimum apply
+    ///   progress must also reach the live current-quorum apply progress.
+    ///
+    /// Unlike ordinary replication completion, this is not an independent
+    /// previous/current-configuration quorum check. Catch-up completion alone
+    /// does not certify provider-owned commitment or client success.
     ///
     /// A primary swap can use double catch-up: once while writes are permitted,
     /// then again after write access is revoked. Other reconfigurations can
     /// catch up with writes still permitted. Implementations must follow the
     /// catch-up condition rather than assume a particular write-access status
-    /// or a single invocation; concurrent writes can advance the target LSN.
+    /// or a single invocation.
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()>;
 
     /// Supplies the current replica-set configuration and ends the previous

@@ -50,9 +50,13 @@ pub trait StateProvider: Send + Sync {
     /// separate operations sent by different primary configurations and provide
     /// a barrier against operations from an older primary.
     ///
-    /// Advances the provider epoch with the exact durable tail of the previous
-    /// epoch. Recovery callers must not substitute an observed or applied-only
-    /// position for `previous_epoch_last_lsn`.
+    /// Advances the provider epoch using the replicator-supplied
+    /// `previous_epoch_last_lsn` boundary. The built-in classic V1 primary
+    /// supplies its latest issued LSN, including on duplicate-epoch callbacks;
+    /// this does not certify quorum commitment or provider durability.
+    /// Secondary stream callbacks use their captured prior-epoch boundary.
+    /// Preserve the supplied boundary rather than substituting observed,
+    /// applied or committed progress.
     async fn update_epoch(&self, epoch: Epoch, previous_epoch_last_lsn: Lsn) -> Result<()>;
 
     /// Returns the last logical sequence number committed by the service.

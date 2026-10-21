@@ -57,6 +57,15 @@ equivalence or complete alignment. Historical SF-12 remains a finding against
 the removed implementation, not a discovered native/current rejection defect.
 Broader qualification below still requires separate authorization.
 
+## Source-contract disposition
+
+The [protected catch-up Rustdoc][catchup-doc] describes selected classic V1's
+moving All and captured-boundary/current-quorum/live-marked WriteQuorum
+conditions ([manager:975–1024][catchup]). The
+[provider epoch Rustdoc][epoch-doc] distinguishes primary issued-tail callbacks
+([manager:292–302][epoch]) from secondary stream boundaries. These contracts
+do not certify provider commitment, durability or client success.
+
 ## P2 — Focused qualification, not presumed defects
 
 | Obligation | Current evidence / limit | Bounded next work and completion criterion |
@@ -65,19 +74,6 @@ Broader qualification below still requires separate authorization.
 | **Public copy context** | Distinct nonempty context is actual-component evidence ([test:1013–1091][context]); external public provider uses empty context ([fixture:196–207][empty-context]). | If public nonempty-context qualification is needed, use a helper-free provider with distinguishable target/source bytes including an empty item. Source must consume target data without supplying its own; keep component/public evidence separate. |
 | **Mode/fault/interleaving coverage** | Persisted/required-ACK combinations are core-tested ([tests:121–172][modes]); selected production has fixed mode/policy choices ([production:121–158][policy]). | Build a claim-specific component/public matrix and close consequential holes only. Private required-ACK volatile mode is not an exposed public setting; do not expand P7 simply to fill coverage cells. |
 | **PG terminal observations** | Orderly stopped progress and retained Abort cleanup have distinct witnesses ([tests:163–249][pg-progress], [940–1050][pg-abort]). | Separately scope any need for SQL racing shutdown, Abort progress snapshots or survivor ranking. Completion requires an actual bounded scenario; existing fsynced files and process cleanup do not establish these claims. |
-
-### P2 — Source-contract wording
-
-Protected Rustdoc still describes catch-up in broader committed/per-configuration
-terms ([traits:107–119][catchup-doc]) and epoch callback as “exact durable tail”
-([provider trait:53–55][epoch-doc]). Actual selected manager uses captured
-`B`/current `Q`/live marked `M` catch-up and issued-tail epoch boundary
-([manager:975–1024][catchup], [292–302][epoch]).
-
-**Next work/criterion:** a separately reviewed source-comment-only correction
-must agree with pinned native source, preserving every protected method/type
-signature. This docs-only workflow does not edit Rust source or infer an unsafe
-election defect from stale wording.
 
 ## Deployment security qualification
 
@@ -150,8 +146,8 @@ do not satisfy the entire original P8 qualification claim.
 [policy]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L121-L158
 [pg-progress]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1_p6_tests.rs#L163-L249
 [pg-abort]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1_tests.rs#L940-L1050
-[catchup-doc]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/traits.rs#L107-L119
-[epoch-doc]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/traits.rs#L53-L55
+[catchup-doc]: ../../../kuberic-runtime/src/replicator/traits.rs#L107
+[epoch-doc]: ../../../kuberic-runtime/src/traits.rs#L53
 [catchup]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/replica_manager.rs#L975-L1024
 [epoch]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/replica_manager.rs#L292-L302
 [http]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/production_transport.rs#L177-L227
