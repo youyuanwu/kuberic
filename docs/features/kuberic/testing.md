@@ -9,6 +9,20 @@ run for the documentation reassessment. Read
 [source/test provenance](sf-v1-port-provenance.md) for what each evidence class
 does and does not establish.
 
+## Recording Evidence
+
+For a qualification claim, record the selected revision, environment, exact
+selector/recipe and actual outcome (including skips/failure). Separate:
+
+- inspected source or existing regression body from a newly executed test;
+- actual-component, selected public-host and application-file/process evidence;
+- source-derived native expectations from native binary/differential execution.
+
+List a proposed filter before running it and reject an empty/misnamed selection.
+Use the live inventory rather than fixed test totals. A successful local run
+does not erase the [remaining claim-specific gaps](sf-v1-semantic-alignment-plan.md#p2--focused-qualification-not-presumed-defects)
+or verify a different mode, fault scope, power-loss boundary or deployment.
+
 ## Workspace Checks
 
 ```bash

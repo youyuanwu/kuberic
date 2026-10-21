@@ -110,6 +110,10 @@ Neither that completion nor native progress certifies application commitment.
 Services own durable preparation, ordered commitment, visibility and client
 success; persisted secondaries durably accept before parameterless ACK.
 
-See [Classic V1 Runtime](../docs/features/kuberic/classic-v1-runtime.md),
-[Replicator Boundary](../docs/features/kuberic/replicator-boundary.md), and
-[Testing](../docs/features/kuberic/testing.md).
+See [Classic V1 current semantics](../docs/features/kuberic/classic-v1-runtime.md)
+and the [Replicator ownership boundary](../docs/features/kuberic/replicator-boundary.md).
+The [current evidence/disposition ledger](../docs/features/kuberic/sf-v1-port-ledger.md)
+separates supported behavior from explicit differences and unverified claims;
+the [pending-items plan](../docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
+prioritizes remaining alignment/qualification. [Testing](../docs/features/kuberic/testing.md)
+lists reproduction tiers, not a complete native-compatibility certificate.
