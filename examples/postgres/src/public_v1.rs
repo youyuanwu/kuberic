@@ -240,10 +240,13 @@ pub(super) struct PublicPg {
     state: Mutex<PublicState>,
     work: std::sync::Mutex<CancellationToken>,
     owner: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    slots_dirty: std::sync::atomic::AtomicBool,
     #[cfg(all(test, feature = "testing"))]
     completion_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
     #[cfg(all(test, feature = "testing"))]
     grant_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
+    #[cfg(all(test, feature = "testing"))]
+    test_access: std::sync::Mutex<(AccessStatus, AccessStatus)>,
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -271,13 +274,18 @@ impl PublicPg {
                 receiver: None,
                 access: None,
                 built: None,
+                receiver_boundary: None,
+                marked_catchup: false,
             }),
             work: std::sync::Mutex::new(CancellationToken::new()),
             owner: Mutex::new(None),
+            slots_dirty: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, feature = "testing"))]
             completion_gate: std::sync::Mutex::new(None),
             #[cfg(all(test, feature = "testing"))]
             grant_gate: std::sync::Mutex::new(None),
+            #[cfg(all(test, feature = "testing"))]
+            test_access: std::sync::Mutex::new((AccessStatus::Granted, AccessStatus::Granted)),
         }
     }
 
@@ -319,6 +327,8 @@ struct PublicState {
     receiver: Option<TransportBinding>,
     access: Option<LifecycleContext>,
     built: Option<BuildCompletion>,
+    receiver_boundary: Option<i64>,
+    marked_catchup: bool,
 }
 
 struct Grant {
@@ -413,6 +423,7 @@ impl PgReplicator {
                     break;
                 };
                 let public = driver.public_v1.get().expect("immutable owner");
+                let generation = driver.instance.generation_id();
                 let (invalid, cancelled) =
                     {
                         let mut state = public.state.lock().await;
@@ -439,6 +450,11 @@ impl PgReplicator {
                         (invalid, cancelled)
                     };
                 let mut grant_drain_failed = false;
+                if !cancelled.is_empty() {
+                    public
+                        .slots_dirty
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 for grant in cancelled {
                     if let Err(error) = grant.gateway.drain().await {
                         tracing::error!(%error, "cancelled public PostgreSQL grant drainage failed");
@@ -452,11 +468,18 @@ impl PgReplicator {
                 {
                     let state = public.state.lock().await;
                     if state.role == ReplicaRole::Primary
+                        && public
+                            .slots_dirty
+                            .load(std::sync::atomic::Ordering::Acquire)
                         && driver.instance.is_running().await
                         && let Err(error) = driver.public_reconcile_slots(&state).await
                     {
                         tracing::error!(%error, "public slot ownership reconciliation failed");
-                        driver.abort();
+                        if driver.instance.generation_id() == generation
+                            && driver.instance.is_running().await
+                        {
+                            driver.abort();
+                        }
                         continue;
                     }
                 }
@@ -466,8 +489,12 @@ impl PgReplicator {
                     break;
                 } else if !invalid && let Err(error) = driver.public_reconcile_access().await {
                     tracing::error!(%error, "public PostgreSQL access reconciliation failed");
-                    driver.abort();
-                    break;
+                    if driver.instance.generation_id() == generation
+                        && driver.instance.is_running().await
+                    {
+                        driver.abort();
+                        break;
+                    }
                 }
             }
             if let Some(driver) = weak.upgrade() {
@@ -539,6 +566,18 @@ impl PgReplicator {
 
     async fn public_drain(&self, state: &mut PublicState) -> Result<()> {
         state.access = None;
+        let final_observation =
+            if self.instance.is_running().await && !self.cancellation.is_cancelled() {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.observer.snapshot_and_persist(),
+                )
+                .await
+                .map_err(|_| RuntimeError::OperationCancelled)
+                .and_then(|result| result.map(|_| ()).map_err(application_error))
+            } else {
+                Ok(())
+            };
         // Stop first: this also joins pre-authentication SQL sockets, all native
         // senders/receivers, and in-flight base-backup helpers before replacement.
         self.instance.stop().await.map_err(application_error)?;
@@ -562,8 +601,10 @@ impl PgReplicator {
                 .map_err(application_error)?;
         }
         state.receiver = None;
+        state.receiver_boundary = None;
         state.configuration = None;
         state.previous = None;
+        state.marked_catchup = false;
         self.durable
             .update(|durable| {
                 durable.external_access_closed = true;
@@ -573,7 +614,7 @@ impl PgReplicator {
             })
             .await
             .map_err(application_error)?;
-        Ok(())
+        final_observation
     }
 
     async fn public_revoke(&self) -> Result<()> {
@@ -582,11 +623,42 @@ impl PgReplicator {
         self.public_drain(&mut state).await
     }
 
+    async fn public_partition_permits(&self, role: ReplicaRole) -> Result<bool> {
+        let (read, write) = if let Some(partition) = self.partition.upgrade() {
+            (
+                partition.get_read_status().await?,
+                partition.get_write_status().await?,
+            )
+        } else {
+            #[cfg(all(test, feature = "testing"))]
+            {
+                *self.public_owner().test_access.lock().unwrap()
+            }
+            #[cfg(not(all(test, feature = "testing")))]
+            {
+                return Err(RuntimeError::Closed);
+            }
+        };
+        Ok(read == AccessStatus::Granted
+            && (role == ReplicaRole::ActiveSecondary || write == AccessStatus::Granted))
+    }
+
     async fn public_reconcile_access(&self) -> Result<bool> {
         let mut state = self.public_owner().state.lock().await;
         let Ok(context) = self.public_owner().fence.context() else {
             return Ok(false);
         };
+        if !self.public_partition_permits(state.role).await? {
+            if self
+                .instance
+                .access_state
+                .load(std::sync::atomic::Ordering::Acquire)
+                != crate::access::CLOSED
+            {
+                self.public_drain(&mut state).await?;
+            }
+            return Ok(false);
+        }
         if state.access.as_ref() == Some(&context) {
             return Ok(true);
         }
@@ -620,6 +692,18 @@ impl PgReplicator {
                         self.public_owner().fence.validate_binding(binding).is_ok()
                     })
                     && self.instance.is_running().await
+                    && match state.receiver_boundary {
+                        Some(boundary) => {
+                            let snapshot =
+                                self.observer.snapshot().await.map_err(application_error)?;
+                            snapshot.evidence.is_some_and(|evidence| {
+                                evidence.in_recovery
+                                    && evidence.received_lsn.is_some_and(|lsn| lsn >= boundary)
+                                    && evidence.replay_lsn.is_some_and(|lsn| lsn >= boundary)
+                            })
+                        }
+                        None => false,
+                    }
             }
             _ => false,
         };
@@ -630,7 +714,10 @@ impl PgReplicator {
             .grant_role_access()
             .await
             .map_err(application_error)?;
-        if self.public_owner().fence.context()? != context {
+        if self.public_owner().fence.context()? != context
+            || !self.public_partition_permits(state.role).await?
+        {
+            self.public_drain(&mut state).await?;
             return Err(RuntimeError::OperationCancelled);
         }
         self.durable
@@ -681,10 +768,17 @@ impl PgReplicator {
     }
 
     async fn public_reconcile_slots(&self, state: &PublicState) -> Result<()> {
+        self.public_owner()
+            .slots_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         self.observer
             .reconcile_slot_owners(&self.public_slot_owners(state))
             .await
-            .map_err(application_error)
+            .map_err(application_error)?;
+        self.public_owner()
+            .slots_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     async fn public_start(&self) -> Result<()> {
@@ -1043,6 +1137,9 @@ impl PgReplicator {
         let name = crate::native::replication_application_name(binding.target(), &session);
         let slot = crate::native::replication_slot_name(binding.target());
         let (client, _connection) = self.instance.connect().await.map_err(application_error)?;
+        self.public_owner()
+            .slots_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         client
             .query(
                 "SELECT pg_create_physical_replication_slot($1, true) \
@@ -1111,6 +1208,9 @@ impl PgReplicator {
             lineage,
             boundary,
         });
+        self.public_owner()
+            .slots_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok((active, true))
     }
 
@@ -1217,6 +1317,15 @@ impl PgReplicator {
         // a separate RPC and must not wait on this same lifecycle mutex.
         self.public_owned(async {
             let mut state = self.public_owner().state.lock().await;
+            if !self.public_partition_permits(state.role).await?
+                && self
+                    .instance
+                    .access_state
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != crate::access::CLOSED
+            {
+                self.public_drain(&mut state).await?;
+            }
             state.access = None;
             let mut index = 0;
             while index < state.grants.len() {
@@ -1253,6 +1362,7 @@ impl PgReplicator {
             }
             state.configuration = Some(current.clone());
             state.previous = previous_descriptor;
+            state.marked_catchup = replicas.values().any(|replica| replica.must_catchup);
             self.public_reconcile_slots(&state).await?;
             for binding in bindings.values() {
                 let _ = self
@@ -1306,10 +1416,10 @@ impl PgReplicator {
 
     async fn public_wait_inner(
         &self,
-        state: &PublicState,
+        context: LifecycleContext,
+        sessions: BTreeMap<ReplicaIdentity, ProcessSessionId>,
         mode: ReplicaSetQuorumMode,
     ) -> Result<()> {
-        self.public_check_configuration(state, &self.public_owner().fence.context()?)?;
         let (client, _connection) = self.instance.connect().await.map_err(application_error)?;
         let row = tokio::time::timeout(
             Duration::from_secs(10),
@@ -1320,18 +1430,14 @@ impl PgReplicator {
         .map_err(application_error)?;
         let boundary = crate::monitor::parse_pg_lsn(row.get(0)).map_err(application_error)?;
         loop {
-            self.public_check_configuration(state, &self.public_owner().fence.context()?)?;
+            {
+                let state = self.public_owner().state.lock().await;
+                if self.public_owner().fence.context()? != context {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                self.public_check_configuration(&state, &context)?;
+            }
             let complete = if mode == ReplicaSetQuorumMode::All {
-                let sessions = state
-                    .grants
-                    .iter()
-                    .filter_map(|grant| match &grant.binding {
-                        TransportBinding::Peer(peer) => {
-                            Some((peer.secondary.replica.clone(), grant.session.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
                 tokio::time::timeout(
                     Duration::from_secs(10),
                     self.observer.all_replayed(&sessions, boundary),
@@ -1349,6 +1455,11 @@ impl PgReplicator {
             };
             if complete {
                 self.public_snapshot_and_persist().await?;
+                let state = self.public_owner().state.lock().await;
+                if self.public_owner().fence.context()? != context {
+                    return Err(RuntimeError::OperationCancelled);
+                }
+                self.public_check_configuration(&state, &context)?;
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1356,11 +1467,34 @@ impl PgReplicator {
     }
 
     pub(super) async fn public_wait(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
-        self.public_owned(async {
-            let state = self.public_owner().state.lock().await;
-            self.public_wait_inner(&state, mode).await
-        })
-        .await
+        let state = self.public_owner().state.lock().await;
+        let context = self.public_owner().fence.context()?;
+        self.public_check_configuration(&state, &context)?;
+        if mode == ReplicaSetQuorumMode::WriteQuorum && state.marked_catchup {
+            return Err(application_error(
+                "marked-successor WriteQuorum is unsupported by PostgreSQL; use All",
+            ));
+        }
+        let sessions = state
+            .grants
+            .iter()
+            .filter_map(|grant| match &grant.binding {
+                TransportBinding::Peer(peer) => {
+                    Some((peer.secondary.replica.clone(), grant.session.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let cancellation = self.public_owner().work.lock().unwrap().clone();
+        drop(state);
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err(RuntimeError::Closed),
+            _ = cancellation.cancelled() => Err(RuntimeError::OperationCancelled),
+            result = tokio::time::timeout(Duration::from_secs(240),
+                self.public_wait_inner(context, sessions, mode)) =>
+                result.unwrap_or(Err(RuntimeError::OperationCancelled)),
+        }
     }
 
     pub(super) async fn public_progress(&self) -> Result<i64> {
@@ -1373,10 +1507,15 @@ impl PgReplicator {
             return Ok(-1);
         }
         if !self.instance.is_running().await {
-            return Ok(match state.role {
-                ReplicaRole::None => durable.flush_lsn,
-                ReplicaRole::Primary => durable.policy_certified_lsn,
-                _ => durable.received_lsn.or(durable.replay_lsn).unwrap_or(-1),
+            return Ok(match durable.role {
+                crate::durable::PgDurableRole::Primary => durable.policy_certified_lsn,
+                crate::durable::PgDurableRole::Standby => durable
+                    .received_lsn
+                    .into_iter()
+                    .chain(durable.replay_lsn)
+                    .max()
+                    .unwrap_or(-1),
+                crate::durable::PgDurableRole::None => -1,
             });
         }
         let (client, _connection) = self.instance.connect().await.map_err(application_error)?;
@@ -1681,7 +1820,7 @@ impl PgReplicator {
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        let (credential, lineage, _) = self.public_source_for_admission(&transport).await?;
+        let (credential, lineage, boundary) = self.public_source_for_admission(&transport).await?;
         let context = self.public_owner().fence.admit_peer(&binding)?;
         self.public_owner().fence.validate_binding(&transport)?;
         self.public_owner().cancel();
@@ -1724,6 +1863,7 @@ impl PgReplicator {
                     .await);
             }
             state.receiver = Some(transport);
+            state.receiver_boundary = Some(boundary);
             Ok(())
         })
         .await

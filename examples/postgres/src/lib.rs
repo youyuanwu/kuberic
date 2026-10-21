@@ -26,6 +26,26 @@ mod testing;
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_secondary_readiness() {
+        crate::adapter::public_v1::tests::p6::public_v1_postgres_secondary_readiness().await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_partition_authority() {
+        crate::adapter::public_v1::tests::p6::public_v1_postgres_partition_authority().await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_orderly_progress() {
+        crate::adapter::public_v1::tests::p6::public_v1_postgres_orderly_progress().await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_marked_catchup() {
+        crate::adapter::public_v1::tests::p6::public_v1_postgres_marked_catchup().await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn public_v1_postgres_selected_resources() {
         crate::adapter::public_v1::tests::public_v1_postgres_selected_resources().await;
     }

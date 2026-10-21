@@ -1,4 +1,6 @@
 use super::*;
+#[path = "public_v1_p6_tests.rs"]
+pub(crate) mod p6;
 use crate::durable::{PgDurableIdentity, StorageMode};
 use crate::testing::{
     ProcessProbe, allocate_port, find_pg_bin, native_configuration, native_identity, wrapped_pg_bin,
@@ -1674,9 +1676,16 @@ async fn run_topology_scenario() {
         source.driver.public_owner().state.lock().await.grants.len(),
         1
     );
+    assert!(matches!(
+        source
+            .driver
+            .remove_replica(target.identity.replica_id)
+            .await,
+        Err(RuntimeError::AuthorityNotAdmitted)
+    ));
     source
         .driver
-        .remove_replica(target.identity.replica_id)
+        .public_application_role(ReplicaRole::None)
         .await
         .unwrap();
     assert!(
