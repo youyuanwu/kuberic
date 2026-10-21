@@ -16,24 +16,33 @@ const PENDING: Status = (
     AccessStatus::ReconfigurationPending,
 );
 
+type AccessContext = (
+    HistoryContext,
+    ReplicaStorageIncarnationContext,
+    ReplicatorCreationIdentity,
+);
+
+struct PrimaryReconciliation {
+    context: AccessContext,
+    generation: u64,
+}
+
 #[derive(Default)]
 pub(super) struct SelectedAccess {
     generation: u64,
     owner: Option<Weak<PartitionOperation>>,
-    context: Option<(
-        HistoryContext,
-        ReplicaStorageIncarnationContext,
-        ReplicatorCreationIdentity,
-    )>,
+    context: Option<AccessContext>,
     replicator_role: Option<ReplicaRole>,
     application_role: Option<ReplicaRole>,
     epoch: Option<Epoch>,
     promotion: bool,
+    primary_reconciliation: Option<PrimaryReconciliation>,
     caught_up: bool,
     configuration: Option<PublicConfiguration>,
     local: Option<ReplicaIdentity>,
     minimum: usize,
     revoked: bool,
+    demoting: bool,
     demoted: bool,
     joint_required: bool,
     valid: bool,
@@ -52,6 +61,7 @@ impl SelectedAccess {
         self.valid = false;
         self.replicator_role = None;
         self.application_role = None;
+        self.primary_reconciliation = None;
         self.caught_up = false;
         self.configuration = None;
         self.status = Some(DENIED);
@@ -72,6 +82,104 @@ impl SelectedAccess {
     fn paired_primary(&self) -> bool {
         self.replicator_role == Some(ReplicaRole::Primary)
             && self.application_role == Some(ReplicaRole::Primary)
+    }
+
+    fn can_activate_primary(&self) -> bool {
+        self.admitted
+            && !self.demoted
+            && self.paired_primary()
+            && (!self.promotion || self.caught_up)
+            && self.configuration.as_ref().is_some_and(|configuration| {
+                Some(configuration.current.epoch) == self.epoch
+                    && configuration.current.members.iter().any(|member| {
+                        Some(&member.identity) == self.local.as_ref()
+                            && member.identity.replica_id == configuration.current.primary_id
+                            && member.role == ReplicaRole::Primary
+                    })
+            })
+    }
+
+    fn reserve_context(
+        &mut self,
+        history: Option<&HistoryContext>,
+        storage: Option<&ReplicaStorageIncarnationContext>,
+        creation: Option<ReplicatorCreationIdentity>,
+    ) {
+        if let Some(context) = &self.context
+            && (history != Some(&context.0)
+                || storage != Some(&context.1)
+                || creation.is_some_and(|creation| creation != context.2))
+        {
+            *self = SelectedAccess {
+                generation: self.generation,
+                ..SelectedAccess::default()
+            };
+        }
+        // Supersession retires the old owner, not compatible final-demotion
+        // evidence. Rebind only that evidence, never promotion receipts.
+        let reconciliation = self.primary_reconciliation.take().filter(|evidence| {
+            evidence.generation == self.generation
+                && Some(&evidence.context) == self.context.as_ref()
+                && history == Some(&evidence.context.0)
+                && storage == Some(&evidence.context.1)
+                && creation == Some(evidence.context.2)
+        });
+        self.generation += 1;
+        self.primary_reconciliation = reconciliation.map(|mut evidence| {
+            evidence.generation = self.generation;
+            evidence
+        });
+    }
+
+    fn begin_promotion(&mut self) {
+        self.demoted = false;
+        self.promotion = true;
+        self.replicator_role = None;
+        self.application_role = None;
+        self.epoch = None;
+        self.configuration = None;
+        self.joint_required = false;
+        self.caught_up = false;
+        self.status = Some(PENDING);
+    }
+
+    fn callback_succeeded(&mut self, instruction: I, program: Option<&P>) {
+        match instruction {
+            I::SecondCatchUp => {
+                self.demoted = true;
+                // Final-wait evidence is an obligation, not a role or access grant.
+                self.primary_reconciliation =
+                    self.context.clone().map(|context| PrimaryReconciliation {
+                        context,
+                        generation: self.generation,
+                    });
+                self.status = Some(DENIED);
+            }
+            I::ReplicatorRole
+                if matches!(
+                    program,
+                    Some(P::Role { role, .. } | P::Swap { handoff: role, .. })
+                        if *role != ReplicaRole::Primary
+                ) =>
+            {
+                self.primary_reconciliation = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn same_primary(&self, configuration: &PublicConfiguration) -> bool {
+        let local_primary = |set: &crate::protocol::types::ConfigurationDescriptor| {
+            set.members.iter().any(|member| {
+                Some(&member.identity) == self.local.as_ref()
+                    && member.identity.replica_id == set.primary_id
+                    && member.role == ReplicaRole::Primary
+            })
+        };
+        local_primary(&configuration.current)
+            && configuration.previous.as_ref().is_none_or(|previous| {
+                previous.primary_id == configuration.current.primary_id && local_primary(previous)
+            })
     }
 
     pub(super) fn status(&self) -> Option<Status> {
@@ -118,7 +226,14 @@ impl SelectedAccess {
         let Some(configuration) = &self.configuration else {
             return PENDING;
         };
-        if !self.revoked
+        if self.joint_required
+            && !self.demoting
+            && !self.promotion
+            && !self.same_primary(configuration)
+        {
+            return PENDING;
+        }
+        if !self.demoting
             && !configuration.current.members.iter().any(|member| {
                 Some(&member.identity) == self.local.as_ref() && member.role == ReplicaRole::Primary
             })
@@ -241,24 +356,20 @@ impl AccessOwner {
                             && record.disposition == Some(PublicOperationDisposition::Succeeded)
                     });
             let creation = host.registered.get().map(|registered| registered.identity);
-            if let Some(context) = &access.context
-                && (record.accepted_history.as_ref() != Some(&context.0)
-                    || record.accepted_storage.as_ref() != Some(&context.1)
-                    || creation.is_some_and(|creation| creation != context.2))
-            {
-                *access = SelectedAccess {
-                    generation: access.generation,
-                    ..SelectedAccess::default()
-                };
-            }
-            access.generation += 1;
+            access.reserve_context(
+                record.accepted_history.as_ref(),
+                record.accepted_storage.as_ref(),
+                creation,
+            );
             access.owner = Some(Arc::downgrade(operation));
             access.local = Some(host.identity.clone());
             access.valid = true;
             access.active = false;
             access.status = Some(PENDING);
+            access.demoting = matches!(record.intent.program, Some(P::Swap { .. }));
             if record.intent.class.is_terminal() {
                 access.demoted = true;
+                access.primary_reconciliation = None;
                 access.status = Some(DENIED);
             } else {
                 match record.intent.program.as_ref() {
@@ -266,17 +377,23 @@ impl AccessOwner {
                         role: ReplicaRole::Primary,
                         ..
                     }) => {
-                        access.promotion |= matches!(
-                            access.application_role,
-                            Some(ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary)
-                        );
+                        if access.promotion
+                            || access.primary_reconciliation.is_some()
+                            || access.demoted
+                            || access.revoked
+                            || matches!(
+                                access.application_role,
+                                Some(ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary)
+                            )
+                        {
+                            access.begin_promotion();
+                        }
                     }
                     Some(P::Swap {
                         controller_composed,
                         starting,
                         ..
                     }) => {
-                        access.demoted = false;
                         access.revoked = *controller_composed;
                         if *controller_composed
                             && access.configuration.as_ref() == Some(starting)
@@ -305,9 +422,7 @@ impl AccessOwner {
                     .as_ref()
                     .is_some_and(|input| input.recipe == PublicLifecycleRecipe::FailoverPromotion)
                 {
-                    access.promotion = true;
-                    access.caught_up = false;
-                    access.status = Some(PENDING);
+                    access.begin_promotion();
                 }
             }
             host.replacement_authority_fenced
@@ -329,6 +444,25 @@ impl AccessOwner {
         if access.generation == self.generation && access.valid && operation.access_live() {
             update(&mut access, &operation.intent());
         }
+    }
+
+    pub(crate) fn resumes_primary(&self) -> bool {
+        let (Some(host), Some(operation)) = (self.host.upgrade(), self.operation.upgrade()) else {
+            return false;
+        };
+        let _admission = host.write_admission.lock().unwrap();
+        let access = host.selected_access.lock().unwrap();
+        access.generation == self.generation
+            && access.valid
+            && operation.access_live()
+            && access.promotion
+            && access
+                .primary_reconciliation
+                .as_ref()
+                .is_some_and(|evidence| {
+                    evidence.generation == self.generation
+                        && Some(&evidence.context) == access.context.as_ref()
+                })
     }
 
     pub(crate) fn selected(&self, instruction: I) {
@@ -369,12 +503,9 @@ impl AccessOwner {
     }
 
     pub(crate) fn callback_succeeded(&self, instruction: I) {
-        if instruction == I::SecondCatchUp {
-            self.update(|access, _| {
-                access.demoted = true;
-                access.status = Some(DENIED);
-            });
-        }
+        self.update(|access, intent| {
+            access.callback_succeeded(instruction, intent.program.as_ref())
+        });
     }
 
     fn activate(&self) {
@@ -614,10 +745,16 @@ pub(super) fn complete(host: &Arc<RuntimeHost>, operation: &Arc<PartitionOperati
         Some(P::CatchUp { configuration, .. }) => {
             access.caught_up && configuration.previous.is_none()
         }
-        _ => record.intent.lifecycle.is_some(),
+        _ => record.intent.lifecycle.as_ref().is_some_and(|input| {
+            matches!(
+                input.recipe,
+                PublicLifecycleRecipe::InitialPrimary | PublicLifecycleRecipe::FailoverPromotion
+            )
+        }),
     };
-    if activates && access.paired_primary() {
+    if activates && access.can_activate_primary() {
         access.promotion = false;
+        access.primary_reconciliation = None;
         access.revoked = false;
         if record.intent.lifecycle.is_some() {
             access.joint_required = false;
@@ -646,5 +783,198 @@ pub(super) fn completion_guard(
                     generation: access.generation,
                 })
             }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::types::*;
+
+    fn demotion_evidence() -> SelectedAccess {
+        let context = (
+            HistoryContext {
+                resource_uid: ResourceUid::new("lineage-resource"),
+                protocol_generation: PublicProtocolGeneration::new(1),
+                history_id: HistoryId::new("lineage-history"),
+                data_loss_number: 0,
+            },
+            ReplicaStorageIncarnationContext {
+                replica: ReplicaIdentity {
+                    replica_id: ReplicaId::new(1),
+                    instance_id: ReplicaInstanceId::new("lineage-instance"),
+                    agent_generation: AgentGeneration::new("lineage-agent"),
+                },
+                storage: ReplicaStorageIdentity::Volatile {
+                    identity: "lineage-storage".into(),
+                },
+                storage_generation: StorageGeneration::new("lineage-generation"),
+            },
+            ReplicatorCreationIdentity::new(RuntimeHostToken::new()),
+        );
+        SelectedAccess {
+            generation: 7,
+            context: Some(context.clone()),
+            primary_reconciliation: Some(PrimaryReconciliation {
+                context,
+                generation: 7,
+            }),
+            demoted: true,
+            admitted: true,
+            ..SelectedAccess::default()
+        }
+    }
+
+    fn primary_receipts() -> SelectedAccess {
+        let mut access = demotion_evidence();
+        let local = access.context.as_ref().unwrap().1.replica.clone();
+        let epoch = Epoch::new(0, 3);
+        access.demoted = false;
+        access.local = Some(local.clone());
+        access.replicator_role = Some(ReplicaRole::Primary);
+        access.application_role = Some(ReplicaRole::Primary);
+        access.epoch = Some(epoch);
+        access.caught_up = true;
+        access.configuration = Some(PublicConfiguration {
+            current: ConfigurationDescriptor::new(
+                epoch,
+                local.replica_id,
+                vec![ConfigurationMember {
+                    identity: local,
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            previous: None,
+            replicas: vec![],
+        });
+        access
+    }
+
+    #[test]
+    fn primary_reconciliation_rebinds_only_exact_context_and_generation() {
+        let mut compatible = demotion_evidence();
+        let context = compatible.context.clone().unwrap();
+        for generation in [8, 9, 10] {
+            compatible.reserve_context(Some(&context.0), Some(&context.1), Some(context.2));
+            let evidence = compatible.primary_reconciliation.as_ref().unwrap();
+            assert_eq!(compatible.generation, generation);
+            assert_eq!(evidence.generation, generation);
+            assert_eq!(evidence.context, context);
+        }
+        for crossed in 0..8 {
+            let mut access = demotion_evidence();
+            let mut context = access.context.clone().unwrap();
+            match crossed {
+                0 => context.0.history_id = HistoryId::new("other-history"),
+                1 => context.1.storage_generation = StorageGeneration::new("other-storage"),
+                2 => context.2 = ReplicatorCreationIdentity::new(RuntimeHostToken::new()),
+                3 => access.primary_reconciliation.as_mut().unwrap().generation -= 1,
+                7 => access.context = None,
+                _ => {}
+            }
+            access.reserve_context(
+                (crossed != 4).then_some(&context.0),
+                (crossed != 5).then_some(&context.1),
+                (crossed != 6).then_some(context.2),
+            );
+            assert!(access.primary_reconciliation.is_none(), "crossed {crossed}");
+        }
+    }
+
+    #[test]
+    fn promotion_reservation_preserves_evidence_not_serving_receipts() {
+        let mut access = primary_receipts();
+        access.demoted = true;
+        access.begin_promotion();
+        assert!(!access.demoted);
+        assert!(access.primary_reconciliation.is_some());
+        assert!(access.replicator_role.is_none());
+        assert!(access.application_role.is_none());
+        assert!(access.epoch.is_none());
+        assert!(access.configuration.is_none());
+        assert!(!access.caught_up);
+        assert_eq!(access.access(), PENDING);
+        access.invalidate();
+        assert!(access.primary_reconciliation.is_none());
+        assert_eq!(access.status(), Some(DENIED));
+    }
+
+    #[test]
+    fn reconciliation_retires_on_native_nonprimary_callback_not_other_receipts() {
+        for role in [
+            ReplicaRole::ActiveSecondary,
+            ReplicaRole::IdleSecondary,
+            ReplicaRole::None,
+        ] {
+            for swap in [false, true] {
+                let mut access = primary_receipts();
+                let configuration = access.configuration.clone().unwrap();
+                let epoch = configuration.current.epoch;
+                let program = if swap {
+                    P::Swap {
+                        starting: configuration.clone(),
+                        refreshed: configuration,
+                        epoch,
+                        handoff: role,
+                        catch_up_specific_quorum: true,
+                        mode: crate::protocol::public_operations::PublicCatchUpMode::WriteQuorum,
+                        controller_composed: true,
+                    }
+                } else {
+                    P::Role { epoch, role }
+                };
+                for instruction in [
+                    I::ApplicationRole,
+                    I::Configuration,
+                    I::FirstCatchUp,
+                    I::ProgramEpoch,
+                ] {
+                    access.callback_succeeded(instruction, Some(&program));
+                    assert!(access.primary_reconciliation.is_some());
+                }
+                access.callback_succeeded(
+                    I::ReplicatorRole,
+                    Some(&P::Role {
+                        epoch,
+                        role: ReplicaRole::Primary,
+                    }),
+                );
+                assert!(access.primary_reconciliation.is_some());
+                access.callback_succeeded(I::ReplicatorRole, Some(&program));
+                assert!(access.primary_reconciliation.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn activation_requires_current_primary_role_epoch_configuration_and_catchup() {
+        let mut initial = primary_receipts();
+        initial.caught_up = false;
+        assert!(initial.can_activate_primary());
+        for crossed in 0..11 {
+            let mut access = primary_receipts();
+            access.promotion = true;
+            assert!(access.can_activate_primary());
+            match crossed {
+                0 => access.demoted = true,
+                1 => access.replicator_role = None,
+                2 => access.application_role = Some(ReplicaRole::ActiveSecondary),
+                3 => access.epoch = Some(Epoch::new(0, 2)),
+                4 => access.configuration = None,
+                5 => access.local = None,
+                6 => access.configuration.as_mut().unwrap().current.primary_id = ReplicaId::new(2),
+                7 => {
+                    access.configuration.as_mut().unwrap().current.members[0].role =
+                        ReplicaRole::ActiveSecondary
+                }
+                8 => access.caught_up = false,
+                9 => access.epoch = None,
+                10 => access.admitted = false,
+                _ => unreachable!(),
+            }
+            assert!(!access.can_activate_primary(), "crossed {crossed}");
+            assert!(access.primary_reconciliation.is_some());
+        }
     }
 }

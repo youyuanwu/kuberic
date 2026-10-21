@@ -373,6 +373,8 @@ pub(super) async fn execute(
                             role,
                         )
                         .await
+                    } else if role == ReplicaRole::Primary {
+                        callbacks.change_primary_role(epoch).await
                     } else {
                         callbacks.replicator.change_role(epoch, role).await
                     };

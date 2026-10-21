@@ -1322,7 +1322,7 @@ fn public_configuration(
                     .report
                     .progress
                     .current()
-                    .ok_or("native current progress unavailable")?,
+                    .unwrap_or(kuberic_runtime::protocol::public_operations::INVALID_LSN),
                 catch_up_capability: replica
                     .report
                     .progress
@@ -1444,7 +1444,7 @@ pub(crate) fn native_public_configuration(
                     .report
                     .progress
                     .current()
-                    .ok_or("current native peer progress is unavailable")?,
+                    .unwrap_or(kuberic_runtime::protocol::public_operations::INVALID_LSN),
                 catch_up_capability: observed
                     .report
                     .progress
@@ -2081,6 +2081,96 @@ mod tests {
     }
 
     #[test]
+    fn availability_current_peer_producers_preserve_unknown_progress_and_exact_authority() {
+        use kuberic_runtime::protocol::public_operations::{INVALID_LSN, ProgressQueryResult};
+        let source = replica(1, ReplicaRole::Primary);
+        let peer = replica(2, ReplicaRole::ActiveSecondary);
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            source.report.replica.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.report.replica.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: peer.report.replica.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        for (current_ready, capability_ready) in
+            [(false, true), (true, false), (false, false), (true, true)]
+        {
+            let mut observed = vec![source.clone(), peer.clone()];
+            observed[1].report.progress.current_progress = if current_ready {
+                ProgressQueryResult::Value(0)
+            } else {
+                ProgressQueryResult::NotReady
+            };
+            observed[1].report.progress.catch_up_capability = if capability_ready {
+                ProgressQueryResult::Value(0)
+            } else {
+                ProgressQueryResult::NotReady
+            };
+            observed[1].report.validate().unwrap();
+            for input in [
+                public_configuration(&source.report.replica, &observed, &current).unwrap(),
+                native_public_configuration(
+                    &source.report.replica,
+                    &observed,
+                    &current,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ] {
+                input.validate().unwrap();
+                let descriptor = &input.replicas[0];
+                assert_eq!(descriptor.identity, peer.report.replica);
+                assert_eq!(
+                    descriptor.process_session_id,
+                    peer.report.process_session_id
+                );
+                assert_eq!(
+                    descriptor.storage_incarnation.as_ref(),
+                    Some(&peer.report.storage_incarnation)
+                );
+                assert_eq!(descriptor.replication_address, peer.replication_address);
+                assert!(descriptor.is_up);
+                assert_eq!(descriptor.is_ready, current_ready && capability_ready);
+                assert_eq!(
+                    descriptor.current_progress,
+                    if current_ready { 0 } else { INVALID_LSN }
+                );
+                assert_eq!(
+                    descriptor.catch_up_capability,
+                    if capability_ready { 0 } else { INVALID_LSN }
+                );
+            }
+        }
+        assert!(
+            public_configuration(
+                &source.report.replica,
+                std::slice::from_ref(&source),
+                &current
+            )
+            .is_err()
+        );
+        assert!(
+            native_public_configuration(
+                &source.report.replica,
+                std::slice::from_ref(&source),
+                &current,
+                None,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn availability_full_planner_refreshes_deterioration_and_restoration_before_stable() {
         let mut replicas = vec![
             replica(1, ReplicaRole::Primary),
@@ -2139,74 +2229,81 @@ mod tests {
         };
         assert_eq!(plan(&authority, &replicas), PublicV1TopologyPlan::Stable);
 
-        for ready in [false, true] {
-            let expected = if ready {
-                PublicV1TopologyPlan::Stable
-            } else {
-                PublicV1TopologyPlan::Wait
-            };
-            for peer in &mut replicas[1..] {
-                peer.report.progress.catch_up_capability = if ready {
-                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0)
+        for (missing_current, missing_capability) in [(true, false), (false, true), (true, true)] {
+            for ready in [false, true] {
+                let expected = if ready {
+                    PublicV1TopologyPlan::Stable
                 } else {
-                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady
+                    PublicV1TopologyPlan::Wait
                 };
-                peer.report.validate().unwrap();
-            }
-            assert!(matches!(
-                plan(&authority, &replicas),
-                PublicV1TopologyPlan::Begin { .. }
-            ));
-            let mut converged = false;
-            for _ in 0..24 {
-                match plan(&authority, &replicas) {
-                    PublicV1TopologyPlan::Begin { command, .. } => {
-                        assert!(matches!(
-                            command.intent.program,
-                            Some(
-                                PublicOperationProgram::Configuration(_)
-                                    | PublicOperationProgram::CatchUp { .. }
-                            )
-                        ));
-                        accept_command(&mut authority, &mut replicas, &command);
-                        let primary = &mut replicas[0].report;
-                        let installed = &primary.configuration.as_ref().unwrap().voting;
-                        primary.write_status = if installed
-                            .replicas
-                            .iter()
-                            .any(|peer| peer.is_up && peer.is_ready)
-                        {
-                            AccessStatus::Granted
-                        } else {
-                            AccessStatus::NoWriteQuorum
-                        };
-                    }
-                    terminal if terminal == expected => {
-                        converged = true;
-                        break;
-                    }
-                    other => panic!("availability-only work did not converge: {other:?}"),
+                for peer in &mut replicas[1..] {
+                    peer.report.progress.current_progress = if ready || !missing_current {
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0)
+                    } else {
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady
+                    };
+                    peer.report.progress.catch_up_capability = if ready || !missing_capability {
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::Value(0)
+                    } else {
+                        kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotReady
+                    };
+                    peer.report.validate().unwrap();
                 }
-            }
-            assert!(converged, "availability-only work never converged");
-            assert!(
-                native_configuration_step(&replicas, &desired)
-                    .unwrap()
-                    .is_none()
-            );
-            for replica in &replicas {
-                let installed = &replica.report.configuration.as_ref().unwrap().voting;
-                assert_eq!(installed.current, desired);
-                assert!(installed.previous.is_none());
-                for peer in &installed.replicas {
-                    assert!(peer.is_up);
-                    assert_eq!(
-                        peer.is_ready,
-                        ready || peer.identity.replica_id == desired.primary_id
-                    );
+                assert!(matches!(
+                    plan(&authority, &replicas),
+                    PublicV1TopologyPlan::Begin { .. }
+                ));
+                let mut converged = false;
+                for _ in 0..24 {
+                    match plan(&authority, &replicas) {
+                        PublicV1TopologyPlan::Begin { command, .. } => {
+                            assert!(matches!(
+                                command.intent.program,
+                                Some(
+                                    PublicOperationProgram::Configuration(_)
+                                        | PublicOperationProgram::CatchUp { .. }
+                                )
+                            ));
+                            accept_command(&mut authority, &mut replicas, &command);
+                            let primary = &mut replicas[0].report;
+                            let installed = &primary.configuration.as_ref().unwrap().voting;
+                            primary.write_status = if installed
+                                .replicas
+                                .iter()
+                                .any(|peer| peer.is_up && peer.is_ready)
+                            {
+                                AccessStatus::Granted
+                            } else {
+                                AccessStatus::NoWriteQuorum
+                            };
+                        }
+                        terminal if terminal == expected => {
+                            converged = true;
+                            break;
+                        }
+                        other => panic!("availability-only work did not converge: {other:?}"),
+                    }
                 }
+                assert!(converged, "availability-only work never converged");
+                assert!(
+                    native_configuration_step(&replicas, &desired)
+                        .unwrap()
+                        .is_none()
+                );
+                for replica in &replicas {
+                    let installed = &replica.report.configuration.as_ref().unwrap().voting;
+                    assert_eq!(installed.current, desired);
+                    assert!(installed.previous.is_none());
+                    for peer in &installed.replicas {
+                        assert!(peer.is_up);
+                        assert_eq!(
+                            peer.is_ready,
+                            ready || peer.identity.replica_id == desired.primary_id
+                        );
+                    }
+                }
+                assert_eq!(plan(&authority, &replicas), expected);
             }
-            assert_eq!(plan(&authority, &replicas), expected);
         }
     }
 

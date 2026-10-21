@@ -150,6 +150,38 @@ impl PublicOperationCut {
 }
 
 impl PublicLifecycleCallbacks {
+    async fn change_primary_role(&self, epoch: crate::protocol::types::Epoch) -> crate::Result<()> {
+        if self
+            .access_owner
+            .as_ref()
+            .is_some_and(|owner| owner.resumes_primary())
+            && let Some(
+                native @ (
+                    crate::replicator::v1::LifecycleObservation::Ready(ReplicaRole::Primary),
+                    Some(_),
+                ),
+            ) = self
+                .native_role_epoch
+                .as_ref()
+                .map(|observe| observe())
+                .transpose()?
+                .flatten()
+        {
+            // Final demotion catch-up can finish before its role callback. Reconcile
+            // the observed native role; this promotion still requires fresh catch-up.
+            return super::service::replay_role_at_epoch(
+                self.replicator.as_ref(),
+                Some(native),
+                epoch,
+                ReplicaRole::Primary,
+            )
+            .await;
+        }
+        self.replicator
+            .change_role(epoch, ReplicaRole::Primary)
+            .await
+    }
+
     pub(crate) fn application_control_matches(&self, control: &Arc<dyn Replicator>) -> bool {
         Arc::ptr_eq(control, &self.replicator)
             || self
@@ -401,10 +433,7 @@ async fn execute(
         let outcome = match instruction {
             ReplicatorPrimary => {
                 local_callback(
-                    callbacks
-                        .replicator
-                        .change_role(input.epoch, ReplicaRole::Primary)
-                        .await,
+                    callbacks.change_primary_role(input.epoch).await,
                     store.as_ref(),
                     &intent,
                     index,
