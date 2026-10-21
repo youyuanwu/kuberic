@@ -669,7 +669,27 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
         target
             .command(PublicOperationProgram::Epoch { epoch })
             .await;
-        target.pair(&mut source, epoch).await;
+        let current = target.pair(&mut source, epoch).await;
+        assert_eq!(
+            target
+                .running
+                .handle()
+                .public_v1_report()
+                .await
+                .unwrap()
+                .write_status,
+            AccessStatus::ReconfigurationPending
+        );
+        target
+            .command(PublicOperationProgram::CatchUp {
+                configuration: PublicConfiguration {
+                    current,
+                    previous: None,
+                    replicas: vec![source.descriptor(ReplicaRole::ActiveSecondary).await],
+                },
+                mode: PublicCatchUpMode::All,
+            })
+            .await;
         let server = SqliteServer::new(target.service.clone());
         let promoted = write(&server, "INSERT INTO data VALUES(2,'promoted')")
             .await
