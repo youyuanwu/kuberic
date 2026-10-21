@@ -74,6 +74,11 @@ delivery checks the current journal again. Reconnect and RPC completion do not
 manufacture ACK. This is not TLS; isolate the deployment network and protect
 credentials and namespace resources independently.
 
+An authenticated ACK can outlive its native session after idle removal. The
+production pump drops that typed missing-session ACK without faulting transport
+health. This exception does not suppress non-ACK dispatch errors, impossible
+live-session progress, or unexpected worker/provider/transport failures.
+
 Reports preserve independent `current_progress` and `catch_up_capability`
 outcomes: `Value`, `NotQueried`, `NotReady`, or `Failed`. Capability and current
 progress are not an ordered applied/committed pair. Routine telemetry avoids
@@ -97,6 +102,12 @@ storage: native queues do not survive process restart. Reconfiguration stages
 PC/CC, catch-up and final CC before cold peer admission. Source-local idle
 retirement releases a native slot; it does not retire remote storage.
 
+Historical PC need not include the new local primary. In the native-valid
+local-only CC/W1 and former-primary-only PC/W1 case, the former primary's applied
+progress still constrains normal completion; receive progress alone is not
+enough. Current configuration still requires the exact local primary, and W1
+with remote CC members remains invalid.
+
 Renewal closes access, advances survivor barriers, replays both native and
 application roles and installs exact fresh bindings. Necessary native epoch and
 joint-configuration preparations can run under the captured renewal fence;
@@ -108,7 +119,12 @@ an owned Existing Open before role replay. Only that exact new process can
 reactivate the predecessor's terminal lifetime; successful Open does not release
 the serving fence. Current/permanent faults, uncontained predecessors and
 crossed storage/history remain rejected. Swap retains pre-Revoke access, then
-atomically fences partition/native write admission at the actual Revoke step.
+Revoke shares a short admission gate with the write-access sample and native
+sequence assignment. A pre-fence call assigns before the refreshed final
+configuration captures its boundary, or is rejected. The gate ends before send
+effects, pressure policy or foreign callbacks; Revoke does not drain service
+commitment or wait for arbitrary provider callbacks. Final catch-up still uses
+its captured boundary and live successor requirement, not future assignments.
 
 ## Formats and shutdown
 

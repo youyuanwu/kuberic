@@ -70,8 +70,8 @@ pub trait StateProvider: Send + Sync {
     /// does not need to supply context.
     ///
     /// Providers that do not need context can return an empty stream.
-    /// Kuberic's built-in replicator currently obtains this context from the
-    /// source provider; it does not perform a secondary-to-primary exchange.
+    /// The built-in classic V1 replicator obtains context from the persisted
+    /// target secondary and streams it to the source primary's provider.
     async fn get_copy_context(&self) -> Result<OperationDataStream>;
 
     /// Obtains state on the primary that is needed to build a secondary,
@@ -80,8 +80,9 @@ pub trait StateProvider: Send + Sync {
     /// `up_to_lsn` is the maximum operation LSN represented by this copy.
     /// Operations beyond that boundary belong to subsequent replication.
     /// `copy_context` contains provider-defined context for selecting the
-    /// required state; see [`Self::get_copy_context`] for the context exchange
-    /// and Kuberic's current source-local behavior.
+    /// required state. The built-in classic V1 replicator passes the target's
+    /// incoming context at the replication start boundary minus one; see
+    /// [`Self::get_copy_context`] for the target-to-source exchange.
     ///
     /// With service-stream delivery, the output goes through the secondary's
     /// [`copy_operations`](crate::replicator::StateReplicator::copy_operations).

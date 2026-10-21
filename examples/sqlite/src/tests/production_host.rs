@@ -18,21 +18,21 @@ fn authorized<T>(message: T) -> tonic::Request<T> {
     request
 }
 
-fn tree(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+fn tree(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
     fn walk(
         base: &std::path::Path,
         path: &std::path::Path,
-        out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        out: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
     ) {
         for entry in std::fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                out.insert(path.strip_prefix(base).unwrap().to_path_buf(), Vec::new());
+                out.insert(path.strip_prefix(base).unwrap().to_path_buf(), None);
                 walk(base, &path, out);
             } else {
                 out.insert(
                     path.strip_prefix(base).unwrap().to_path_buf(),
-                    std::fs::read(&path).unwrap(),
+                    Some(std::fs::read(&path).unwrap()),
                 );
             }
         }
@@ -40,6 +40,22 @@ fn tree(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> 
     let mut result = std::collections::BTreeMap::new();
     walk(root, root, &mut result);
     result
+}
+
+fn restore_fixture(
+    root: &std::path::Path,
+    snapshot: &std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+) {
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::create_dir_all(root).unwrap();
+    for (relative, bytes) in snapshot {
+        let path = root.join(relative);
+        if let Some(bytes) = bytes {
+            std::fs::write(path, bytes).unwrap();
+        } else {
+            std::fs::create_dir_all(path).unwrap();
+        }
+    }
 }
 
 #[tokio::test]
@@ -74,20 +90,41 @@ async fn production_host_new_existing_and_invalid_storage() -> Result<(), Box<dy
     };
     let path = config.data_root.join("application");
     let manifest = path.join("state-v2.json");
-    let mut valid_manifest = Vec::new();
+    let mut established = std::collections::BTreeMap::new();
 
     // Every round uses main's constructor, deferred application, authenticated
     // control service and actual application/native Open. No metadata fixture.
     for round in 0..5 {
+        if round >= 2 {
+            // Each invalid case starts from the same successfully opened and
+            // stopped journal, not a preceding Open failure/fault fence.
+            restore_fixture(root.path(), &established);
+        }
         if round == 2 {
-            valid_manifest = std::fs::read(&manifest)?;
             std::fs::write(&manifest, b"not valid metadata")?;
         } else if round == 3 {
             std::fs::remove_file(&manifest)?;
         } else if round == 4 {
-            let mut value: serde_json::Value = serde_json::from_slice(&valid_manifest)?;
-            value["version"] = serde_json::json!(u32::MAX);
-            std::fs::write(&manifest, serde_json::to_vec(&value)?)?;
+            let checked = std::fs::read_to_string(&manifest)?;
+            let state = checked
+                .strip_prefix("{\"state\":")
+                .unwrap()
+                .rsplit_once(",\"checksum\":")
+                .unwrap()
+                .0;
+            let value: serde_json::Value = serde_json::from_str(state)?;
+            let state = state.replacen(
+                &format!("\"version\":{}", value["version"]),
+                &format!("\"version\":{}", u32::MAX),
+                1,
+            );
+            // Preserve field order and a valid checksum so this specifically
+            // exercises the incompatible version, not incidental corruption.
+            let checksum = crc32fast::hash(state.as_bytes());
+            std::fs::write(
+                &manifest,
+                format!("{{\"state\":{state},\"checksum\":{checksum}}}"),
+            )?;
         }
         let before = (round >= 2).then(|| tree(&path));
         let fresh = SqlitePersistence::is_fresh_empty(&path)?;
@@ -238,7 +275,20 @@ async fn production_host_new_existing_and_invalid_storage() -> Result<(), Box<dy
                 assert_eq!(report.open_mode, OpenMode::Existing);
                 assert!(manifest.is_file());
             } else {
-                assert!(opened.is_err(), "invalid established storage must reject");
+                let error = opened.expect_err("invalid established storage must reject");
+                let detail = error.message();
+                assert!(
+                    detail.contains("application error:"),
+                    "actual application Open must reject: {detail}"
+                );
+                if round == 3 {
+                    assert!(detail.contains("lacks classic V1 metadata"), "{detail}");
+                } else if round == 4 {
+                    assert!(
+                        detail.contains("invalid v2 storage version or progress"),
+                        "{detail}"
+                    );
+                }
                 assert_eq!(tree(&path), *before.as_ref().unwrap());
             }
             Ok::<_, Box<dyn std::error::Error>>(())
@@ -252,6 +302,9 @@ async fn production_host_new_existing_and_invalid_storage() -> Result<(), Box<dy
         match application_result {
             Ok(()) | Err(kuberic_runtime::RuntimeError::OperationCancelled) => {}
             Err(error) => return Err(error.into()),
+        }
+        if round == 1 {
+            established = tree(root.path());
         }
     }
     Ok(())
