@@ -69,6 +69,7 @@ impl NativeGateway {
         slot: String,
         build: bool,
         valid: Arc<dyn Fn() -> bool + Send + Sync>,
+        cancellation: CancellationToken,
     ) -> Result<(Self, NativeCredential)> {
         let credential = NativeCredential {
             host: host.into(),
@@ -83,7 +84,6 @@ impl NativeGateway {
             port: listener.local_addr().map_err(application_error)?.port(),
             ..credential
         };
-        let cancellation = CancellationToken::new();
         let stopped = cancellation.clone();
         let expected = credential.clone();
         let task = tokio::spawn(async move {

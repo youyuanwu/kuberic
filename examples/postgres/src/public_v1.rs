@@ -239,8 +239,11 @@ pub(super) struct PublicPg {
     fence: LifecycleFence,
     state: Mutex<PublicState>,
     work: std::sync::Mutex<CancellationToken>,
+    owner: Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(all(test, feature = "testing"))]
     completion_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
+    #[cfg(all(test, feature = "testing"))]
+    grant_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -270,8 +273,11 @@ impl PublicPg {
                 built: None,
             }),
             work: std::sync::Mutex::new(CancellationToken::new()),
+            owner: Mutex::new(None),
             #[cfg(all(test, feature = "testing"))]
             completion_gate: std::sync::Mutex::new(None),
+            #[cfg(all(test, feature = "testing"))]
+            grant_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -396,7 +402,7 @@ impl PgReplicator {
     fn start_public_owner(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let cancelled = self.cancellation.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             loop {
                 tokio::select! {
@@ -439,6 +445,17 @@ impl PgReplicator {
                         return;
                     }
                 }
+                {
+                    let state = public.state.lock().await;
+                    if state.role == ReplicaRole::Primary
+                        && driver.instance.is_running().await
+                        && let Err(error) = driver.public_reconcile_slots(&state).await
+                    {
+                        tracing::error!(%error, "public slot ownership reconciliation failed");
+                        driver.abort();
+                        continue;
+                    }
+                }
                 if invalid && let Err(error) = driver.public_revoke().await {
                     tracing::error!(%error, "public PostgreSQL owner drainage failed");
                     driver.abort();
@@ -449,7 +466,23 @@ impl PgReplicator {
                     break;
                 }
             }
+            if let Some(driver) = weak.upgrade() {
+                let mut state = driver.public_owner().state.lock().await;
+                state.access = None;
+                for grant in state.grants.drain(..) {
+                    grant.active.cancel();
+                    if let Err(error) = grant.gateway.drain().await {
+                        tracing::error!(%error, "terminal public grant drainage failed");
+                    }
+                }
+                state.receiver = None;
+            }
         });
+        *self
+            .public_owner()
+            .owner
+            .try_lock()
+            .expect("new public owner") = Some(task);
     }
 
     fn public_owner(&self) -> &PublicPg {
@@ -506,6 +539,7 @@ impl PgReplicator {
         // senders/receivers, and in-flight base-backup helpers before replacement.
         self.instance.stop().await.map_err(application_error)?;
         for grant in state.grants.drain(..) {
+            grant.active.cancel();
             grant.gateway.drain().await?;
         }
         if self
@@ -610,7 +644,43 @@ impl PgReplicator {
         self.public_revoke().await?;
         self.public_owner().state.lock().await.opened = false;
         self.cancellation.cancel();
+        let mut owner = self.public_owner().owner.lock().await;
+        if let Some(task) = owner.as_mut() {
+            task.await.map_err(application_error)?;
+        }
+        owner.take();
         Ok(())
+    }
+
+    fn public_slot_owners(&self, state: &PublicState) -> BTreeSet<ReplicaIdentity> {
+        state
+            .grants
+            .iter()
+            .filter(|grant| !grant.active.is_cancelled())
+            .map(|grant| grant.binding.target().clone())
+            .chain(
+                state
+                    .configuration
+                    .iter()
+                    .flat_map(|config| &config.replicas)
+                    .map(|replica| replica.identity.clone()),
+            )
+            .chain(
+                state
+                    .previous
+                    .iter()
+                    .flat_map(|config| &config.members)
+                    .filter(|member| member.identity != self.public_owner().fence.local.identity)
+                    .map(|member| member.identity.clone()),
+            )
+            .collect()
+    }
+
+    async fn public_reconcile_slots(&self, state: &PublicState) -> Result<()> {
+        self.observer
+            .reconcile_slot_owners(&self.public_slot_owners(state))
+            .await
+            .map_err(application_error)
     }
 
     async fn public_start(&self) -> Result<()> {
@@ -947,6 +1017,16 @@ impl PgReplicator {
         if &context.identity != binding.source() || state.role != ReplicaRole::Primary {
             return Err(RuntimeError::NotPrimary);
         }
+        let mut index = 0;
+        while index < state.grants.len() {
+            if state.grants[index].active.is_cancelled() {
+                let retired = state.grants.remove(index);
+                retired.gateway.drain().await?;
+            } else {
+                index += 1;
+            }
+        }
+        self.public_reconcile_slots(state).await?;
         if let Some(grant) = state.grants.iter().find(|grant| grant.binding == binding) {
             return Ok((grant.active.clone(), false));
         }
@@ -967,6 +1047,15 @@ impl PgReplicator {
             )
             .await
             .map_err(application_error)?;
+        #[cfg(all(test, feature = "testing"))]
+        {
+            let gate = self.public_owner().grant_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+                return Err(application_error("injected post-reservation grant failure"));
+            }
+        }
         let lineage = self.public_lineage().await?;
         let boundary = self
             .observer
@@ -982,12 +1071,20 @@ impl PgReplicator {
         let generation = instance.generation_id();
         let active = CancellationToken::new();
         let admitted = active.clone();
+        let cancellation = self.cancellation.clone();
+        let build = matches!(binding, TransportBinding::Build(_));
         let valid = Arc::new(move || {
-            !admitted.is_cancelled()
+            !cancellation.is_cancelled()
+                && !admitted.is_cancelled()
                 && instance.generation_id() == generation
                 && fence
                     .validate_binding(&validity_binding)
-                    .is_ok_and(|current| current == context)
+                    .is_ok_and(|current| {
+                        current.identity == context.identity
+                            && current.role == context.role
+                            && current.epoch == context.epoch
+                            && (build || current == context)
+                    })
         });
         let (gateway, credential) = NativeGateway::start(
             self.instance.listen_host(),
@@ -998,6 +1095,7 @@ impl PgReplicator {
             slot,
             matches!(binding, TransportBinding::Build(_)),
             valid,
+            self.cancellation.child_token(),
         )
         .await?;
         state.grants.push(Grant {
@@ -1041,12 +1139,11 @@ impl PgReplicator {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
         }
-        let context = self.public_owner().fence.update(|context| {
-            context.previous_configuration_id = previous_descriptor
-                .as_ref()
-                .map(|configuration| configuration.configuration_id.clone());
-            context.current_configuration_id = Some(current.configuration.configuration_id.clone());
-        })?;
+        let mut context = context;
+        context.previous_configuration_id = previous_descriptor
+            .as_ref()
+            .map(|configuration| configuration.configuration_id.clone());
+        context.current_configuration_id = Some(current.configuration.configuration_id.clone());
         let mut replicas = BTreeMap::new();
         for replica in current.replicas.iter().chain(
             previous
@@ -1075,7 +1172,7 @@ impl PgReplicator {
             );
             self.public_owner()
                 .fence
-                .validate_binding(&TransportBinding::Peer(binding.clone()))?;
+                .validate_process_binding(&TransportBinding::Peer(binding.clone()))?;
             if binding.primary.replica != context.identity
                 || !identities.insert(replica.identity.clone())
                 || !current
@@ -1116,8 +1213,30 @@ impl PgReplicator {
         // a separate RPC and must not wait on this same lifecycle mutex.
         self.public_owned(async {
             let mut state = self.public_owner().state.lock().await;
-            self.public_drain(&mut state).await?;
-            self.public_start().await?;
+            state.access = None;
+            let mut index = 0;
+            while index < state.grants.len() {
+                let grant = &state.grants[index];
+                let keep = match &grant.binding {
+                    TransportBinding::Build(_) => !bindings.contains_key(grant.binding.target()),
+                    TransportBinding::Peer(peer) => {
+                        bindings.get(grant.binding.target()) == Some(peer)
+                    }
+                } && !grant.active.is_cancelled();
+                if keep {
+                    index += 1;
+                } else {
+                    let grant = state.grants.remove(index);
+                    grant.active.cancel();
+                    grant.gateway.drain().await?;
+                }
+            }
+            self.public_owner()
+                .fence
+                .update(|current| *current = context.clone())?;
+            if !self.instance.is_running().await {
+                self.public_start().await?;
+            }
             let snapshot = self.public_snapshot_and_persist().await?;
             if snapshot
                 .evidence
@@ -1130,6 +1249,7 @@ impl PgReplicator {
             }
             state.configuration = Some(current.clone());
             state.previous = previous_descriptor;
+            self.public_reconcile_slots(&state).await?;
             for binding in bindings.values() {
                 let _ = self
                     .public_grant(&mut state, TransportBinding::Peer(binding.clone()))
@@ -1646,15 +1766,39 @@ impl PgReplicator {
     }
 
     pub(super) async fn public_remove(&self, replica: ReplicaId) -> Result<()> {
-        let state = self.public_owner().state.lock().await;
-        if state
-            .grants
-            .iter()
-            .any(|g| g.binding.target().replica_id == replica)
-        {
-            drop(state);
-            self.public_revoke().await?;
+        let mut state = self.public_owner().state.lock().await;
+        if self.cancellation.is_cancelled() || !state.opened {
+            return Err(RuntimeError::Closed);
         }
+        if state.role != ReplicaRole::Primary {
+            return Err(RuntimeError::NotPrimary);
+        }
+        if state
+            .configuration
+            .iter()
+            .flat_map(|c| &c.replicas)
+            .any(|r| r.identity.replica_id == replica)
+            || state
+                .previous
+                .iter()
+                .flat_map(|c| &c.members)
+                .any(|m| m.identity.replica_id == replica)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let mut index = 0;
+        while index < state.grants.len() {
+            if matches!(state.grants[index].binding, TransportBinding::Build(_))
+                && state.grants[index].binding.target().replica_id == replica
+            {
+                let grant = state.grants.remove(index);
+                grant.active.cancel();
+                grant.gateway.drain().await?;
+            } else {
+                index += 1;
+            }
+        }
+        self.public_reconcile_slots(&state).await?;
         Ok(())
     }
 }

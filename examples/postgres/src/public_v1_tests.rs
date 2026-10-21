@@ -240,10 +240,7 @@ impl OracleDataDir {
                     std::env::temp_dir()
                 }
             });
-        let path = base.join(format!(
-            "kuberic-public-v1-postgres-{}-{sequence}",
-            std::process::id()
-        ));
+        let path = base.join(format!("kpv1-{}-{sequence}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).unwrap();
         Self { path }
@@ -605,6 +602,432 @@ pub(crate) async fn public_v1_postgres_failover_switchover_and_replacement() {
         .expect("PostgreSQL topology scenario exceeded its 270-second bound");
 }
 
+pub(crate) async fn public_v1_postgres_selected_resources() {
+    stage("selected public resources", async {
+        let directory = OracleDataDir::new();
+        let source = Replica::new(directory.path().join("selected-source"), 101).await;
+        let peer = Replica::new(directory.path().join("selected-peer"), 102).await;
+        let idle = Replica::new(directory.path().join("selected-idle"), 103).await;
+        source.singleton(1).await;
+        let sql = application(&source).await;
+        sql.batch_execute("CREATE TABLE selected_resources(id integer primary key)")
+            .await
+            .unwrap();
+        drop(sql);
+        build_and_admit(&source, &peer, 1, "selected-peer").await;
+        let sql = application(&source).await;
+        let generation = source.driver.instance.generation_id();
+        let process =
+            std::fs::read(source.driver.instance.data_dir().join("postmaster.pid")).unwrap();
+        idle.role(1, ReplicaRole::IdleSecondary).await;
+        let build = BindingFactory::new().build(&source, &idle, "selected-idle");
+        source
+            .driver
+            .build_replica(build_replica(&build))
+            .await
+            .unwrap();
+        let credential = source
+            .driver
+            .public_owner()
+            .state
+            .lock()
+            .await
+            .grants
+            .iter()
+            .find(|g| g.binding.target() == &idle.identity)
+            .unwrap()
+            .credential
+            .clone();
+        let mut socket = native_socket(&credential, &credential.name).await.unwrap();
+        for _ in 0..2 {
+            PrimaryReplicator::remove_replica(source.driver.as_ref(), idle.identity.replica_id)
+                .await
+                .unwrap();
+            assert_eq!(source.driver.instance.generation_id(), generation);
+            assert_eq!(
+                std::fs::read(source.driver.instance.data_dir().join("postmaster.pid")).unwrap(),
+                process
+            );
+            sql.simple_query("SELECT 1")
+                .await
+                .expect("selected idle removal killed healthy primary SQL");
+        }
+        closed(&mut socket).await;
+        let (admin, _connection) = source.driver.instance.connect().await.unwrap();
+        let peer_slot = crate::native::replication_slot_name(&peer.identity);
+        let idle_slot = crate::native::replication_slot_name(&idle.identity);
+        assert_eq!(
+            admin
+                .query_one(
+                    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&idle_slot]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        let budget: i32 = admin
+            .query_one("SELECT current_setting('max_replication_slots')::int", &[])
+            .await
+            .unwrap()
+            .get(0);
+        // Cancellation and failure after physical reservation but before Grant publication.
+        for cancel in [true, false] {
+            let gate = Arc::new(BuildCompletionGate {
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            *source.driver.public_owner().grant_gate.lock().unwrap() = Some(gate.clone());
+            let identity = native_identity(
+                105,
+                if cancel {
+                    "unpublished-cancel"
+                } else {
+                    "unpublished-fail"
+                },
+            );
+            let slot = crate::native::replication_slot_name(&identity);
+            let mut replica = ReplicaInformation::idle_build(
+                OperationId::new(slot.clone()),
+                identity,
+                "http://127.0.0.1:1".into(),
+            );
+            replica.process_session_id = ProcessSessionId::new("unpublished-session");
+            let driver = source.driver.clone();
+            let task = tokio::spawn(async move { driver.build_replica(replica).await });
+            gate.entered.notified().await;
+            assert_eq!(
+                admin
+                    .query_one(
+                        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                        &[&slot]
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0),
+                1
+            );
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                gate.release.notify_one();
+                assert!(task.await.unwrap().is_err());
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while admin
+                    .query_one(
+                        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                        &[&slot],
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0)
+                    != 0
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("unpublished slot reservation leaked");
+        }
+        for incarnation in 0..=budget {
+            let identity = native_identity(104, &format!("failed-{incarnation}"));
+            let slot = crate::native::replication_slot_name(&identity);
+            let mut replica = ReplicaInformation::idle_build(
+                OperationId::new(format!("failed-{incarnation}")),
+                identity,
+                "http://127.0.0.1:1".into(),
+            );
+            replica.process_session_id =
+                ProcessSessionId::new(format!("failed-session-{incarnation}"));
+            assert!(source.driver.build_replica(replica).await.is_err());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if admin
+                        .query_one(
+                            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                            &[&slot],
+                        )
+                        .await
+                        .unwrap()
+                        .get::<_, i64>(0)
+                        == 0
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("failed build leaked its physical slot");
+            assert_eq!(
+                admin
+                    .query_one(
+                        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                        &[&peer_slot]
+                    )
+                    .await
+                    .unwrap()
+                    .get::<_, i64>(0),
+                1,
+                "unrelated authorized slot was retired"
+            );
+            sql.execute(
+                "INSERT INTO selected_resources VALUES ($1)",
+                &[&incarnation],
+            )
+            .await
+            .unwrap();
+        }
+        let read = application(&peer).await;
+        assert_eq!(
+            read.query_one("SELECT count(*) FROM selected_resources", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            i64::from(budget) + 1,
+            "unrelated streaming peer stopped progressing"
+        );
+        // Same-authority reconnect preserves the physical slot and its retained WAL.
+        let before: String = admin
+            .query_one(
+                "SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&peer_slot],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let config = native_configuration(&[source.identity.clone(), peer.identity.clone()], 0, 1);
+        let binding = BindingFactory::new().peer(&source, &peer, &config, None);
+        source
+            .driver
+            .public_configuration(
+                ReplicaSetConfiguration {
+                    configuration: config,
+                    replicas: vec![peer_replica(&binding)],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let (admin, _connection) = source.driver.instance.connect().await.unwrap();
+        let after: String = admin
+            .query_one(
+                "SELECT restart_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&peer_slot],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            before, after,
+            "authorized reconnect replaced its persistent slot"
+        );
+        let credential = source
+            .driver
+            .public_owner()
+            .state
+            .lock()
+            .await
+            .grants
+            .iter()
+            .find(|grant| grant.binding.target() == &peer.identity)
+            .unwrap()
+            .credential
+            .clone();
+        let mut retired_sender = native_socket(&credential, &credential.name).await.unwrap();
+        source
+            .driver
+            .public_configuration(
+                native_configuration(std::slice::from_ref(&source.identity), 0, 1).into(),
+                None,
+            )
+            .await
+            .unwrap();
+        closed(&mut retired_sender).await;
+        let replacement = Replica::new_incarnation(
+            directory.path().join("replacement"),
+            103,
+            "selected-replacement",
+            "selected-replacement-session",
+            find_pg_bin(),
+        )
+        .await;
+        replacement.role(1, ReplicaRole::IdleSecondary).await;
+        let binding = BindingFactory::new().build(&source, &replacement, "replacement-build");
+        source
+            .driver
+            .build_replica(build_replica(&binding))
+            .await
+            .unwrap();
+        assert!(replacement.driver.current_progress().await.unwrap() > 0);
+        source
+            .driver
+            .remove_replica(replacement.identity.replica_id)
+            .await
+            .unwrap();
+        replacement.driver.public_close().await.unwrap();
+        let (admin, _connection) = source.driver.instance.connect().await.unwrap();
+        assert_eq!(
+            admin
+                .query_one("SELECT count(*) FROM pg_replication_slots", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0,
+            "omitted active peer retained WAL ownership"
+        );
+        idle.driver.public_close().await.unwrap();
+        peer.driver.public_close().await.unwrap();
+        source.driver.public_close().await.unwrap();
+    })
+    .await;
+}
+
+pub(crate) async fn public_v1_postgres_retained_abort() {
+    stage("retained public Abort", async {
+        let directory = OracleDataDir::new();
+        let source = Replica::new(directory.path().join("abort-source"), 111).await;
+        let target = Replica::new(directory.path().join("abort-target"), 112).await;
+        source.singleton(1).await;
+        target.role(1, ReplicaRole::IdleSecondary).await;
+        let binding = BindingFactory::new().build(&source, &target, "abort-grant");
+        source
+            .driver
+            .build_replica(build_replica(&binding))
+            .await
+            .unwrap();
+        let credential = source.driver.public_owner().state.lock().await.grants[0]
+            .credential
+            .clone();
+        let mut authenticated = native_socket(&credential, &credential.name).await.unwrap();
+        let mut preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
+            .await
+            .unwrap();
+        let process = ProcessProbe::postgres(source.driver.instance.data_dir());
+        Replicator::abort(source.driver.as_ref());
+        process.assert_gone().await;
+        closed(&mut authenticated).await;
+        closed(&mut preauth).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if tokio::net::TcpStream::connect((&*credential.host, credential.port))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retained aborted driver still owns a gateway listener");
+        assert!(
+            source
+                .driver
+                .public_owner()
+                .state
+                .lock()
+                .await
+                .grants
+                .is_empty(),
+            "retained Abort did not release grant ownership"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !source
+                .driver
+                .public_owner()
+                .owner
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Abort owner did not finish joining gateways/connections");
+        assert!(
+            target.driver.instance.is_running().await,
+            "Abort affected an unrelated process"
+        );
+        target.driver.public_close().await.unwrap();
+        // Deliberately no Close or Drop on the source before all observations.
+        std::hint::black_box(&source.driver);
+        let hosted = production_service(directory.path().join("abort-host"), 113).await;
+        let context = hosted.driver.public_owner().fence.context().unwrap();
+        let binding = TransportBinding::Build(BuildBinding {
+            resource_uid: hosted.driver.durable.snapshot().await.identity.resource_uid,
+            epoch: context.epoch,
+            build_id: OperationId::new("service-abort"),
+            source: NativeEndpoint {
+                replica: context.identity,
+                process_session_id: hosted.driver.public_process_session(),
+                replication_address: hosted.driver.coordination.local_endpoint.clone(),
+                role: ReplicaRole::Primary,
+            },
+            target: NativeEndpoint {
+                replica: native_identity(114, "abort-unused"),
+                process_session_id: ProcessSessionId::new("unused"),
+                replication_address: "http://127.0.0.1:1".into(),
+                role: ReplicaRole::IdleSecondary,
+            },
+        });
+        let credential = {
+            let mut state = hosted.driver.public_owner().state.lock().await;
+            hosted
+                .driver
+                .public_grant(&mut state, binding)
+                .await
+                .unwrap();
+            state.grants.last().unwrap().credential.clone()
+        };
+        let mut preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
+            .await
+            .unwrap();
+        kuberic_runtime::StatefulServiceReplica::abort(hosted.service.as_ref());
+        closed(&mut preauth).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !hosted
+                .driver
+                .public_owner()
+                .owner
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            hosted
+                .driver
+                .public_owner()
+                .state
+                .lock()
+                .await
+                .grants
+                .is_empty()
+        );
+        assert!(
+            tokio::net::TcpStream::connect((&*credential.host, credential.port))
+                .await
+                .is_err()
+        );
+        // Objects remain retained until after service Abort's independent observations.
+        std::hint::black_box(&hosted.service);
+        hosted.shutdown().await;
+    })
+    .await;
+}
 async fn run_basebackup_cancellation_and_retry() {
     let directory = OracleDataDir::new();
     let source = Replica::new(directory.path().join("basebackup-source"), 61).await;
@@ -619,7 +1042,6 @@ async fn run_basebackup_cancellation_and_retry() {
     .unwrap();
     drop(sql);
     connection.abort();
-
     let gate = directory.path().join("hold-basebackup");
     let marker = directory.path().join("basebackup-child");
     std::fs::write(&gate, b"hold").unwrap();
@@ -763,6 +1185,7 @@ struct ProductionService {
     driver: Arc<PgReplicator>,
     store_path: std::path::PathBuf,
     preview: kuberic_runtime::protocol::public_operations::PublicV1Identity,
+    service: Arc<crate::service::PgService>,
 }
 
 impl ProductionService {
@@ -946,6 +1369,7 @@ async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionServ
         driver,
         store_path,
         preview,
+        service,
     }
 }
 

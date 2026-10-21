@@ -26,6 +26,16 @@ mod testing;
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_selected_resources() {
+        crate::adapter::public_v1::tests::public_v1_postgres_selected_resources().await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn public_v1_postgres_retained_abort() {
+        crate::adapter::public_v1::tests::public_v1_postgres_retained_abort().await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn public_v1_postgres_primary_lifecycle_and_joint_configuration() {
         const SCENARIO: &str = "public_v1_postgres_primary_lifecycle_and_joint_configuration";
         crate::adapter::public_v1::tests::

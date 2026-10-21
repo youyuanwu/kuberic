@@ -200,24 +200,34 @@ impl PgNativeObserver {
         local: &ReplicaIdentity,
         configuration: &kuberic_runtime::replicator::ReplicaSetConfiguration,
     ) -> Result<(), PgError> {
+        let owners = configuration
+            .replicas
+            .iter()
+            .filter(|replica| &replica.identity != local)
+            .map(|replica| replica.identity.clone())
+            .collect();
+        self.reconcile_slot_owners(&owners).await
+    }
+
+    pub(crate) async fn reconcile_slot_owners(
+        &self,
+        owners: &BTreeSet<ReplicaIdentity>,
+    ) -> Result<(), PgError> {
         self.instance
             .generation_step(
                 &self.instance.generation_lease(),
-                self.reconcile_slots_inner(local, configuration),
+                self.reconcile_slots_inner(owners),
             )
             .await
     }
 
     async fn reconcile_slots_inner(
         &self,
-        local: &ReplicaIdentity,
-        configuration: &kuberic_runtime::replicator::ReplicaSetConfiguration,
+        owners: &BTreeSet<ReplicaIdentity>,
     ) -> Result<(), PgError> {
-        let expected = configuration
-            .replicas
+        let expected = owners
             .iter()
-            .filter(|r| &r.identity != local)
-            .map(|r| replication_slot_name(&r.identity))
+            .map(replication_slot_name)
             .collect::<BTreeSet<_>>();
         let (client, _connection) = self.instance.connect().await?;
         let existing = client
