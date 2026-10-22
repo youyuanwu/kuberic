@@ -2440,6 +2440,10 @@ pub struct PublicV1AgentReport {
     /// Running host control observers. Native work can outlive a cancelled observer.
     #[serde(default)]
     pub active_operations: Vec<PublicOperationIntent>,
+    /// Returned, declared-repeatable failures awaiting explicit exact redispatch.
+    /// These are neither running callbacks nor permanent completed evidence.
+    #[serde(default)]
+    pub retry_pending_operations: Vec<PublicV1RetryPendingOperation>,
     /// Host-authoritative mode for a new Open against the current application storage.
     pub open_mode: OpenMode,
     /// The current process's successful Replicator Open result, absent before Open.
@@ -2460,6 +2464,14 @@ pub struct PublicV1AgentReport {
 pub struct PublicV1InstalledConfiguration {
     pub voting: PublicConfiguration,
     pub idle_replicas: Vec<ReplicaId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicV1RetryPendingOperation {
+    pub intent: PublicOperationIntent,
+    pub attempt: u64,
+    pub failure: String,
 }
 
 impl PublicV1AgentReport {
@@ -2539,6 +2551,46 @@ impl PublicV1AgentReport {
                     .any(|completion| completion.operation_id == intent.operation_id)
             {
                 return Err("active control observation differs from report identity");
+            }
+        }
+        for pending in &self.retry_pending_operations {
+            let intent = &pending.intent;
+            intent.validate()?;
+            if pending.attempt == 0
+                || pending.failure.is_empty()
+                || intent.identity != self.identity
+                || intent.process_session_id != self.process_session_id
+                || intent.class.is_terminal()
+                || (intent.program.is_none() && intent.lifecycle.is_none())
+                || matches!(
+                    intent.program,
+                    Some(
+                        PublicOperationProgram::Open { .. }
+                            | PublicOperationProgram::Progress { .. }
+                            | PublicOperationProgram::Build(_)
+                            | PublicOperationProgram::Remove(_)
+                            | PublicOperationProgram::RetireIdleReplica { .. }
+                            | PublicOperationProgram::Close
+                            | PublicOperationProgram::Abort
+                    )
+                )
+                || intent.lifecycle.as_ref().is_some_and(|input| {
+                    input.replica != self.replica
+                        || input.possible_data_loss == PossibleDataLossIntent::Possible
+                        || input.epoch.data_loss_number != self.history.data_loss_number
+                })
+                || !active.insert(&intent.operation_id)
+                || self
+                    .completed_operations
+                    .iter()
+                    .any(|completion| completion.operation_id == intent.operation_id)
+            {
+                return Err(
+                    "retry-pending observation differs from report identity or operation boundary",
+                );
+            }
+            if let Some(program) = &intent.program {
+                program.validate_history(&self.history)?;
             }
         }
         if let Some(observation) = &self.configuration {

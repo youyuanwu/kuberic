@@ -329,6 +329,17 @@ pub fn normalize_public_v1_agent_status_report(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
+        retry_pending_operations: public
+            .retry_pending_operations_json
+            .into_iter()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    WireError::InvalidAuthority(format!(
+                        "invalid retry-pending control observation: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         replication_address: public.replication_address,
         open_mode,
         service_location,
@@ -374,6 +385,14 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
                 .map(|intent| {
                     serde_json::to_string(intent)
                         .expect("control observation serialization is infallible")
+                })
+                .collect(),
+            retry_pending_operations_json: report
+                .retry_pending_operations
+                .iter()
+                .map(|pending| {
+                    serde_json::to_string(pending)
+                        .expect("retry-pending observation serialization is infallible")
                 })
                 .collect(),
             role: role_to_proto(report.role) as i32,

@@ -1018,6 +1018,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::replicator_creation_id: ReplicatorCreationId
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::report_sequence: u64
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::resource_uid: ResourceUid
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::retry_pending_operations: Vec < PublicV1RetryPendingOperation >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::role: ReplicaRole
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::service_location: Option < ServiceLocation >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::storage_incarnation: ReplicaStorageIncarnationContext
@@ -1047,6 +1048,9 @@ public-path hidden field crate::protocol::public_operations::PublicV1OperationCo
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::result: PublicV1OperationResult
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::revision: u64
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::storage_incarnation: ReplicaStorageIncarnationContext
+public-path hidden field crate::protocol::public_operations::PublicV1RetryPendingOperation::attempt: u64
+public-path hidden field crate::protocol::public_operations::PublicV1RetryPendingOperation::failure: String
+public-path hidden field crate::protocol::public_operations::PublicV1RetryPendingOperation::intent: PublicOperationIntent
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::barriers: Vec < PublicSessionEpochBarrier >
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::installed_configuration: Option < ConfigurationDescriptor >
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::replayed_role: Option < ReplicaRole >
@@ -1159,6 +1163,7 @@ public-path hidden struct crate::protocol::public_operations::PublicV1Identity
 public-path hidden struct crate::protocol::public_operations::PublicV1InstalledConfiguration
 public-path hidden struct crate::protocol::public_operations::PublicV1LifecycleBinding
 public-path hidden struct crate::protocol::public_operations::PublicV1OperationCompletion
+public-path hidden struct crate::protocol::public_operations::PublicV1RetryPendingOperation
 public-path hidden struct crate::protocol::public_operations::PublicV1SessionRenewalStatus
 public-path hidden struct crate::protocol::public_operations::RemoteBuildTargetRebuildRequired
 public-path hidden struct crate::protocol::public_operations::RestartActionRecord

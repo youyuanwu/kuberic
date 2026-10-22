@@ -18,7 +18,7 @@ use crate::protocol::types::{
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_V1_PHASE6_SCHEMA_VERSION: u32 = 11;
-pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 13;
+pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +39,7 @@ pub(crate) enum PublicOperationStage {
     Ready,
     Running,
     CallbackApplied,
+    RetryPending,
     ContainmentPending,
     Completed,
 }
@@ -66,6 +67,9 @@ pub(crate) enum PublicOperationContainment {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicOperationRecord {
     pub(crate) intent: PublicOperationIntent,
+    pub(crate) attempt: u64,
+    pub(crate) attempt_results: BTreeMap<u64, PublicOperationAttemptResult>,
+    pub(crate) retry_failure: Option<PublicCallbackFailure>,
     #[serde(default)]
     pub(crate) accepted_history: Option<HistoryContext>,
     #[serde(default)]
@@ -80,6 +84,56 @@ pub(crate) struct PublicOperationRecord {
     pub(crate) blockers: BTreeSet<OperationId>,
     #[serde(default)]
     pub(crate) lifecycle: PublicLifecycleRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublicOperationAttemptResult {
+    pub(crate) stage: PublicOperationStage,
+    pub(crate) disposition: PublicOperationDisposition,
+    pub(crate) lifecycle: PublicLifecycleRecord,
+    pub(crate) retry_failure: Option<PublicCallbackFailure>,
+    pub(crate) containment: PublicOperationContainment,
+    pub(crate) superseded_by: Option<OperationId>,
+    pub(crate) blockers: BTreeSet<OperationId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum PublicCallbackFamily {
+    ReplicatorRole,
+    ApplicationRole,
+    Epoch,
+    Configuration,
+    CatchUp,
+}
+
+impl PublicCallbackFamily {
+    pub(crate) fn allows(self, instruction: PublicInstruction) -> bool {
+        use PublicInstruction::*;
+        match self {
+            Self::ReplicatorRole => matches!(instruction, ReplicatorRole | ReplicatorPrimary),
+            Self::ApplicationRole => matches!(instruction, ApplicationRole | ApplicationPrimary),
+            Self::Epoch => matches!(instruction, Epoch | ProgramEpoch),
+            Self::Configuration => matches!(
+                instruction,
+                Configuration
+                    | StartingConfiguration
+                    | RefreshedConfiguration
+                    | CurrentConfiguration
+                    | CatchUpConfiguration
+                    | FirstCatchUp
+                    | SecondCatchUp
+                    | CatchUp
+            ),
+            Self::CatchUp => matches!(instruction, FirstCatchUp | SecondCatchUp | CatchUp),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PublicCallbackFailure {
+    pub(crate) instruction: PublicInstruction,
+    pub(crate) family: PublicCallbackFamily,
+    pub(crate) error: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,7 +258,111 @@ pub(crate) struct PublicV1OperationState {
     pub(crate) terminal: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicRemoteBuildState {
+    Accepted,
+    InBuild,
+    Ready,
+    InDrop,
+    Dropped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicRemoteBuildObservation {
+    pub(crate) build: PublicV1BuildRecord,
+    pub(crate) state: PublicRemoteBuildState,
+}
+
 impl PublicV1OperationState {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "host remote-state projection for report integration"
+        )
+    )]
+    pub(crate) fn remote_build_states(
+        &self,
+        session: &crate::protocol::types::ProcessSessionId,
+    ) -> Vec<PublicRemoteBuildObservation> {
+        use crate::host::public_build_store::PublicV1BuildRetirement;
+        use crate::protocol::public_operations::{PublicOperationProgram, PublicV1OperationResult};
+        self.build_records
+            .values()
+            .filter(|build| {
+                &build.source_session == session
+                    && self.history.as_ref() == Some(&build.history)
+                    && self.storage_incarnation.as_ref() == Some(&build.source_storage)
+            })
+            .map(|build| {
+                let operation = self.operations.get(&build.operation_id);
+                let exact = operation.is_some_and(|operation| {
+                    operation.intent.revision == build.admission_revision
+                        && operation.intent.process_session_id == build.source_session
+                        && operation.accepted_history.as_ref() == Some(&build.history)
+                        && operation.accepted_storage.as_ref() == Some(&build.source_storage)
+                        && matches!(operation.intent.program.as_ref(),
+                            Some(PublicOperationProgram::Build(input))
+                                if input.attempt == build.build_id
+                                    && input.epoch == build.epoch
+                                    && input.replica == build.target
+                                    && input.target_storage == build.target_storage
+                                    && input.process_session_id == build.target_session
+                                    && input.replication_address == build.target_address)
+                });
+                let retiring = self.terminal
+                    || self.absent_builds.contains(&build.build_id)
+                    || operation.is_some_and(|operation| operation.superseded_by.is_some())
+                    || self.operations.values().any(|operation| {
+                        operation.intent.process_session_id == build.source_session
+                            && operation.accepted_history.as_ref() == Some(&build.history)
+                            && operation.accepted_storage.as_ref() == Some(&build.source_storage)
+                            && match operation.intent.program.as_ref() {
+                                Some(PublicOperationProgram::Remove(input)) => {
+                                    input.attempt == build.build_id
+                                        && input.epoch == build.epoch
+                                        && input.history.as_ref() == Some(&build.history)
+                                        && input.replica == build.target
+                                        && input.target_storage == build.target_storage
+                                        && input.process_session_id == build.target_session
+                                        && input.replication_address == build.target_address
+                                }
+                                _ => false,
+                            }
+                    });
+                let state = match build.retirement {
+                    PublicV1BuildRetirement::Retired => PublicRemoteBuildState::Dropped,
+                    PublicV1BuildRetirement::Required => PublicRemoteBuildState::InDrop,
+                    PublicV1BuildRetirement::Retain if retiring => PublicRemoteBuildState::InDrop,
+                    PublicV1BuildRetirement::Retain => {
+                        if exact
+                            && operation.is_some_and(|operation| {
+                                operation.stage == PublicOperationStage::Completed
+                                    && operation.disposition
+                                        == Some(PublicOperationDisposition::Succeeded)
+                                    && build.result == Some(PublicV1OperationResult::Succeeded)
+                            })
+                        {
+                            PublicRemoteBuildState::Ready
+                        } else if exact
+                            && operation.is_some_and(|operation| {
+                                operation.stage == PublicOperationStage::Running
+                            })
+                        {
+                            PublicRemoteBuildState::InBuild
+                        } else {
+                            PublicRemoteBuildState::Accepted
+                        }
+                    }
+                };
+                PublicRemoteBuildObservation {
+                    build: build.clone(),
+                    state,
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn new_bound(binding: PublicV1LifecycleBinding) -> Self {
         Self::from_parts(binding.identity.clone(), Some(binding))
     }

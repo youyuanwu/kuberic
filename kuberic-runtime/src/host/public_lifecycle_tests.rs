@@ -15,6 +15,11 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+#[path = "public_action_state_tests.rs"]
+mod action_state_tests;
+#[path = "public_lifecycle_retry_tests.rs"]
+mod retry_tests;
+
 #[derive(Default)]
 struct Probe {
     events: Mutex<Vec<String>>,
@@ -25,6 +30,11 @@ struct Probe {
     block_application_close: AtomicBool,
     fail_role: AtomicBool,
     fail_application_role: AtomicBool,
+    fail_configuration: AtomicBool,
+    fail_catchup: AtomicBool,
+    fail_epoch: AtomicBool,
+    fail_build: AtomicBool,
+    role_rebuild: Mutex<Option<ReplicaIdentity>>,
     listener_close: Mutex<Option<TerminalDrain>>,
     listener_abort: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     role: Mutex<Option<ReplicaRole>>,
@@ -100,6 +110,16 @@ impl Replicator for Replication {
     }
     async fn change_role(&self, _: Epoch, role: ReplicaRole) -> crate::Result<()> {
         self.0.event(format!("replicator.role.{role:?}"));
+        if let Some(replica) = self.0.role_rebuild.lock().unwrap().clone() {
+            return Err(RuntimeError::ReplicaRebuildRequired(Box::new(
+                ReplicaRebuildRequired::LocalProvider(
+                    crate::protocol::public_operations::LocalProviderRebuildRequired {
+                        reason: crate::protocol::public_operations::ReplicaRebuildReason::IncompatibleRetainedHistory,
+                        provider: crate::protocol::public_operations::ProviderReplicaIdentity { replica },
+                    },
+                ),
+            )));
+        }
         if self.0.fail_role.load(Ordering::Acquire) {
             return Err(RuntimeError::Application("actual role injected".into()));
         }
@@ -108,6 +128,9 @@ impl Replicator for Replication {
     }
     async fn update_epoch(&self, _: Epoch) -> crate::Result<()> {
         self.0.event("epoch");
+        if self.0.fail_epoch.load(Ordering::Acquire) {
+            return Err(RuntimeError::Application("epoch injected".into()));
+        }
         Ok(())
     }
     async fn close(&self) -> crate::Result<()> {
@@ -148,6 +171,9 @@ impl PrimaryReplicator for Replication {
         _: ReplicaSetConfiguration,
     ) -> crate::Result<()> {
         self.0.event("configuration");
+        if self.0.fail_configuration.load(Ordering::Acquire) {
+            return Err(RuntimeError::Application("configuration injected".into()));
+        }
         Ok(())
     }
     async fn update_current_replica_set_configuration(
@@ -155,6 +181,9 @@ impl PrimaryReplicator for Replication {
         _: ReplicaSetConfiguration,
     ) -> crate::Result<()> {
         self.0.event("configuration");
+        if self.0.fail_configuration.load(Ordering::Acquire) {
+            return Err(RuntimeError::Application("configuration injected".into()));
+        }
         Ok(())
     }
     async fn wait_for_catch_up_quorum(&self, _: ReplicaSetQuorumMode) -> crate::Result<()> {
@@ -164,10 +193,16 @@ impl PrimaryReplicator for Replication {
         if self.0.block_catchup.load(Ordering::Acquire) {
             self.0.catchup_release.notified().await;
         }
+        if self.0.fail_catchup.load(Ordering::Acquire) {
+            return Err(RuntimeError::Application("catchup injected".into()));
+        }
         Ok(())
     }
     async fn build_replica(&self, _: ReplicaInformation) -> crate::Result<()> {
         self.0.event("build");
+        if self.0.fail_build.load(Ordering::Acquire) {
+            return Err(RuntimeError::Application("build injected".into()));
+        }
         Ok(())
     }
     async fn remove_replica(&self, _: ReplicaId) -> crate::Result<()> {
@@ -255,6 +290,7 @@ impl Fixture {
             wait_for_containment: false,
             preempt_retained_owner: false,
             native_observer_callbacks: false,
+            retry_proof: Default::default(),
             terminal_drain: Arc::new(move || {
                 let probe = drain_probe.clone();
                 Box::pin(async move {
@@ -418,15 +454,48 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
     use crate::protocol::public_operations::{PublicOperationClass, PublicReplicaDescriptor};
 
     let fixture = Fixture::new().await;
-    let authority = fixture
-        .launch(
-            PublicOperationProgram::Role {
-                epoch: Epoch::new(0, 1),
+    let source = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .identity
+        .local_identity;
+    let initial = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: source.clone(),
+        epoch: Epoch::new(0, 1),
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            source.replica_id,
+            vec![ConfigurationMember {
+                identity: source.clone(),
                 role: ReplicaRole::Primary,
-            },
+            }],
             1,
-        )
-        .await;
+        ),
+        previous: None,
+        replicas: Vec::new(),
+        data_loss_recovery: None,
+    };
+    let mut initial_intent = fixture.intent(
+        PublicOperationProgram::Epoch {
+            epoch: initial.epoch,
+        },
+        1,
+    );
+    initial_intent.program = None;
+    initial_intent.input_digest = initial.digest();
+    initial_intent.lifecycle = Some(initial);
+    let authority = launch(
+        &fixture.registry,
+        fixture.store.clone(),
+        initial_intent,
+        fixture.callbacks.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         completed(&authority).await.disposition,
         Some(PublicOperationDisposition::Succeeded)

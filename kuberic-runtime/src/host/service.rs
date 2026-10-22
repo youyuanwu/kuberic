@@ -748,11 +748,16 @@ where
                 "Public V1 operation runtime is unavailable".into(),
             )
         })?;
-        let operation =
-            crate::host::public_lifecycle::launch(&registry, self.store.clone(), intent, callbacks)
-                .await?;
-        let mut access_guard = self.runtime.public_access_completion_guard(&operation);
-        let terminal = operation.wait_for_terminal().await?;
+        let (operation, attempt, mut access_guard) =
+            crate::host::public_lifecycle::launch_bound_attempt(
+                &registry,
+                self.store.clone(),
+                intent,
+                callbacks,
+                |operation| self.runtime.public_access_completion_guard(operation),
+            )
+            .await?;
+        let terminal = operation.wait_for_attempt(attempt).await?;
         if terminal.stage != PublicOperationStage::Completed
             || terminal.disposition != Some(PublicOperationDisposition::Succeeded)
         {

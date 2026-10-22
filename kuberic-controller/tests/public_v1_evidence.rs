@@ -99,6 +99,7 @@ fn report(
     completion: PublicV1OperationCompletion,
 ) -> PublicV1AgentReport {
     PublicV1AgentReport {
+        retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
         identity: accepted.identity.clone(),

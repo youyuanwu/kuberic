@@ -478,6 +478,7 @@ impl PodRuntime {
                     .native_runtime_control
                     .as_ref()
                     .is_some_and(|runtime| !runtime.custom()),
+                retry_proof: Default::default(),
                 terminal_drain,
                 terminal_cleanup: None,
                 access_factory: Some(access_factory),
@@ -539,6 +540,7 @@ impl PodRuntime {
             wait_for_containment: false,
             preempt_retained_owner: false,
             native_observer_callbacks: false,
+            retry_proof: Default::default(),
             terminal_drain,
             terminal_cleanup: None,
             access_factory: Some(access_factory),
@@ -2265,6 +2267,9 @@ mod tests {
             intent.operation_id.clone(),
             PublicOperationRecord {
                 intent,
+                attempt: 1,
+                attempt_results: Default::default(),
+                retry_failure: None,
                 accepted_history: Some(history),
                 accepted_storage: Some(storage),
                 stage: PublicOperationStage::Completed,

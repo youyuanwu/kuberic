@@ -178,7 +178,7 @@ fn public_v1_source_uses_no_native_evidence() {
 
 #[tokio::test]
 async fn public_v1_evidence_report_is_structurally_public_only() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 13);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 14);
     let root = test_root("report");
     let path = SqliteStore::metadata_database_path(&root);
     let resource_uid = ResourceUid::new("evidence-resource");

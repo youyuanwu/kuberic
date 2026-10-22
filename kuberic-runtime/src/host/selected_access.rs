@@ -1,7 +1,8 @@
 use super::*;
 use crate::host::operation::PartitionOperation;
 use crate::host::state::{
-    PublicInstruction as I, PublicOperationDisposition, PublicOperationStage,
+    PublicInstruction as I, PublicInstructionOutcome, PublicOperationDisposition,
+    PublicOperationRecord, PublicOperationStage,
 };
 use crate::host::store::AgentStore;
 use crate::protocol::public_operations::{
@@ -576,6 +577,70 @@ impl AccessOwner {
         Ok(())
     }
 
+    pub(crate) async fn restore_retry_prefix(
+        &self,
+        store: &dyn AgentStore,
+        failed: &PublicOperationRecord,
+    ) -> crate::host::Result<()> {
+        let state = self.compatible(store).await?;
+        let operation = self
+            .operation
+            .upgrade()
+            .ok_or_else(|| crate::host::HostError::CommandRejected("access owner lost".into()))?;
+        let current = operation.snapshot();
+        let instructions = crate::host::public_lifecycle::operation_instructions(&failed.intent);
+        let retained = current.attempt_results.get(&failed.attempt);
+        let durable = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| preview.operations.get(&failed.intent.operation_id));
+        if failed.stage != PublicOperationStage::RetryPending
+            || failed.attempt.checked_add(1) != Some(current.attempt)
+            || current.stage != PublicOperationStage::Running
+            || current.intent != failed.intent
+            || current.accepted_history != failed.accepted_history
+            || current.accepted_storage != failed.accepted_storage
+            || current.lifecycle.outcomes != failed.lifecycle.outcomes
+            || current.lifecycle.in_flight.is_some()
+            || durable != Some(&current)
+            || retained.is_none_or(|result| {
+                result.stage != PublicOperationStage::RetryPending
+                    || Some(&result.disposition) != failed.disposition.as_ref()
+                    || result.lifecycle != failed.lifecycle
+                    || result.retry_failure != failed.retry_failure
+            })
+            || failed.retry_failure.as_ref().is_none_or(|failure| {
+                instructions.get(failed.lifecycle.outcomes.len()) != Some(&failure.instruction)
+                    || failed.lifecycle.in_flight != Some(failure.instruction)
+                    || !failure.family.allows(failure.instruction)
+            })
+            || failed.lifecycle.outcomes.iter().any(|outcome| {
+                matches!(
+                    outcome,
+                    PublicInstructionOutcome::DataLoss(_)
+                        | PublicInstructionOutcome::CloseFailure { .. }
+                        | PublicInstructionOutcome::RebuildRequired(_)
+                )
+            })
+        {
+            self.invalidate();
+            return Err(crate::host::HostError::StaleEffectCompletion(
+                "access retry prefix differs from its exact retained attempt".into(),
+            ));
+        }
+        // Only the just-resumed attempt supplies receipts. In particular, promotion
+        // reservation cleared old catch-up; no other operation can restore it.
+        for instruction in instructions
+            .into_iter()
+            .take(failed.lifecycle.outcomes.len())
+        {
+            self.selected(instruction);
+            self.callback_succeeded(instruction);
+            self.receipt(store, instruction).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn receipt(
         &self,
         store: &dyn AgentStore,
@@ -785,6 +850,10 @@ pub(super) fn completion_guard(
             }),
     }
 }
+
+#[cfg(all(test, feature = "testing"))]
+#[path = "public_lifecycle_access_retry_tests.rs"]
+mod access_retry_tests;
 
 #[cfg(test)]
 mod tests {

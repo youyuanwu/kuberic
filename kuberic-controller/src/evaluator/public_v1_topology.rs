@@ -1937,6 +1937,7 @@ mod tests {
         };
         let mut replica = PublicV1TopologyReplica {
             report: PublicV1AgentReport {
+                retry_pending_operations: Vec::new(),
                 active_operations: Vec::new(),
                 configuration: None,
                 identity: PublicV1Identity::new(1),

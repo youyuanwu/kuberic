@@ -135,6 +135,7 @@ pub(super) async fn install(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
     catch_up: bool,
+    instruction: PublicInstruction,
 ) -> crate::Result<()> {
     input
         .validate()
@@ -167,14 +168,14 @@ pub(super) async fn install(
         // Admission is subsequently rechecked against this journal per frame.
         return Ok(());
     }
-    if let Some(previous) = &input.previous {
+    let result = if let Some(previous) = &input.previous {
         callbacks
             .primary
             .update_catch_up_replica_set_configuration(
                 replica_set(input, &input.current, true),
                 replica_set(input, previous, false),
             )
-            .await?;
+            .await
     } else if catch_up {
         let previous = crate::protocol::types::ConfigurationDescriptor::new(
             input.current.epoch,
@@ -188,28 +189,43 @@ pub(super) async fn install(
                 replica_set(input, &input.current, true),
                 replica_set(input, &previous, false),
             )
-            .await?;
+            .await
     } else {
         callbacks
             .primary
             .update_current_replica_set_configuration(replica_set(input, &input.current, true))
-            .await?;
+            .await
+    };
+    if let Err(error) = &result {
+        callbacks.retry_proof.returned_error(
+            PublicCallbackFamily::Configuration,
+            instruction,
+            error,
+        );
     }
-    Ok(())
+    result
 }
 
 pub(super) async fn install_current(
     callbacks: &PublicLifecycleCallbacks,
     input: &PublicConfiguration,
+    instruction: PublicInstruction,
 ) -> crate::Result<()> {
-    callbacks
+    let result = callbacks
         .primary
         .update_current_replica_set_configuration(replica_set(input, &input.current, true))
-        .await?;
-    Ok(())
+        .await;
+    if let Err(error) = &result {
+        callbacks.retry_proof.returned_error(
+            PublicCallbackFamily::Configuration,
+            instruction,
+            error,
+        );
+    }
+    result
 }
 
-fn configuration(
+pub(crate) fn configuration(
     program: &PublicOperationProgram,
     instruction: PublicInstruction,
 ) -> &PublicConfiguration {
@@ -374,9 +390,17 @@ pub(super) async fn execute(
                         )
                         .await
                     } else if role == ReplicaRole::Primary {
-                        callbacks.change_primary_role(epoch).await
+                        callbacks.change_primary_role(epoch, instruction).await
                     } else {
-                        callbacks.replicator.change_role(epoch, role).await
+                        let result = callbacks.replicator.change_role(epoch, role).await;
+                        if let Err(error) = &result {
+                            callbacks.retry_proof.returned_error(
+                                PublicCallbackFamily::ReplicatorRole,
+                                instruction,
+                                error,
+                            );
+                        }
+                        result
                     };
                     super::local_callback(
                         result,
@@ -385,6 +409,7 @@ pub(super) async fn execute(
                         index,
                         instruction,
                         epoch,
+                        None,
                     )
                     .await?;
                     O::Done
@@ -397,6 +422,10 @@ pub(super) async fn execute(
                             index,
                             instruction,
                             epoch,
+                            Some((
+                                &callbacks.retry_proof,
+                                PublicCallbackFamily::ApplicationRole,
+                            )),
                         )
                         .await?
                         .service_address,
@@ -414,6 +443,7 @@ pub(super) async fn execute(
                     index,
                     instruction,
                     *epoch,
+                    Some((&callbacks.retry_proof, PublicCallbackFamily::Epoch)),
                 )
                 .await?;
                 O::Done
@@ -426,6 +456,7 @@ pub(super) async fn execute(
                         &callbacks,
                         configuration,
                         matches!(program, P::CatchUp { .. } | P::Swap { .. }),
+                        instruction,
                     )
                     .await,
                     store.as_ref(),
@@ -433,6 +464,7 @@ pub(super) async fn execute(
                     index,
                     instruction,
                     configuration.current.epoch,
+                    None,
                 )
                 .await?;
                 O::Done
@@ -443,12 +475,13 @@ pub(super) async fn execute(
                 if index == start && start > 0 {
                     let configuration = configuration(program, instruction);
                     super::local_callback(
-                        install(store.as_ref(), &callbacks, configuration, true).await,
+                        install(store.as_ref(), &callbacks, configuration, true, instruction).await,
                         store.as_ref(),
                         &intent,
                         index,
                         instruction,
                         configuration.current.epoch,
+                        None,
                     )
                     .await?;
                     if let Some(owner) = &callbacks.access_owner {
@@ -470,6 +503,7 @@ pub(super) async fn execute(
                     index,
                     instruction,
                     configuration.current.epoch,
+                    Some((&callbacks.retry_proof, PublicCallbackFamily::CatchUp)),
                 )
                 .await?;
                 O::Done

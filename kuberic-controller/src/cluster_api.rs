@@ -4300,6 +4300,7 @@ impl ClusterApi for InMemoryClusterApi {
                     observation.agents.insert(
                         key,
                         RawAgentObservation::PublicV1Report(Box::new(PublicV1AgentReport {
+            retry_pending_operations: Vec::new(),
             active_operations: Vec::new(),
             configuration: None,
                             identity:
@@ -5837,6 +5838,7 @@ mod corrective_replacement_tests {
         target: &ReplicaStorageIncarnationContext,
     ) -> PublicV1AgentReport {
         PublicV1AgentReport {
+            retry_pending_operations: Vec::new(),
             active_operations: Vec::new(),
             configuration: None,
             identity: expected.evidence.identity.clone(),
@@ -6559,6 +6561,7 @@ mod tests {
     ) -> PublicV1TopologyReplica {
         PublicV1TopologyReplica {
             report: PublicV1AgentReport {
+                retry_pending_operations: Vec::new(),
                 active_operations: Vec::new(),
                 configuration: None,
                 identity,

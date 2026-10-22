@@ -53,6 +53,7 @@ pub enum PublicV1OperationSnapshotStage {
     Ready,
     Running,
     CallbackApplied,
+    RetryPending,
     ContainmentPending,
     Completed,
 }
@@ -630,6 +631,9 @@ impl SqliteStore {
             }
             crate::host::state::PublicOperationStage::CallbackApplied => {
                 PublicV1OperationSnapshotStage::CallbackApplied
+            }
+            crate::host::state::PublicOperationStage::RetryPending => {
+                PublicV1OperationSnapshotStage::RetryPending
             }
             crate::host::state::PublicOperationStage::ContainmentPending => {
                 PublicV1OperationSnapshotStage::ContainmentPending

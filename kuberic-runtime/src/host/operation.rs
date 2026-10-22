@@ -230,6 +230,21 @@ impl PartitionOperation {
         F: Future<Output = std::result::Result<(), E>> + Send + 'static,
         E: std::fmt::Display + Send + 'static,
     {
+        self.spawn_root_with_retry(containment, None, future).await
+    }
+
+    pub(crate) async fn spawn_root_with_retry<F, E>(
+        self: &Arc<Self>,
+        containment: CallbackContainment,
+        returned_failure: Option<
+            Arc<std::sync::Mutex<Option<crate::host::state::PublicCallbackFailure>>>,
+        >,
+        future: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
         let _lifecycle = self.lifecycle.lock().await;
         if self
             .shutting_down
@@ -261,7 +276,10 @@ impl PartitionOperation {
                 return Ok(());
             }
             let result = future.await.map_err(|error| error.to_string());
-            let recorded = operation.record_root_result(result, containment).await;
+            let failure = returned_failure.and_then(|failure| failure.lock().unwrap().take());
+            let recorded = operation
+                .record_root_result(result, containment, failure)
+                .await;
             if let Err(error) = &recorded {
                 operation.record_failure(error);
             }
@@ -300,6 +318,7 @@ impl PartitionOperation {
         &self,
         result: std::result::Result<(), String>,
         containment: CallbackContainment,
+        returned_failure: Option<crate::host::state::PublicCallbackFailure>,
     ) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
         let current = self.snapshot();
@@ -313,6 +332,38 @@ impl PartitionOperation {
             Ok(()) => PublicOperationDisposition::Succeeded,
             Err(error) => PublicOperationDisposition::Failed(error),
         };
+        if let (Some(failure), PublicOperationDisposition::Failed(_)) =
+            (returned_failure, &disposition)
+            && !current.lifecycle.outcomes.iter().any(|outcome| {
+                matches!(
+                    outcome,
+                    crate::host::state::PublicInstructionOutcome::RebuildRequired(_)
+                )
+            })
+        {
+            let pending = match self
+                .store
+                .record_public_retry_failure(&current.intent, current.attempt, &failure)
+                .await
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    let pending = self.advance(
+                        PublicOperationStage::Running,
+                        PublicOperationStage::ContainmentPending,
+                        Some(PublicOperationDisposition::Ambiguous(format!(
+                            "returned callback failure could not retain its retry receipt: {error}"
+                        ))),
+                    ).await?;
+                    self.record.send_replace(pending);
+                    self.bump_revision();
+                    return Ok(());
+                }
+            };
+            self.record.send_replace(pending);
+            self.bump_revision();
+            return Ok(());
+        }
 
         if (containment == CallbackContainment::ObjectOwnedOnInterruption
             && matches!(disposition, PublicOperationDisposition::Failed(_)))
@@ -445,6 +496,9 @@ impl PartitionOperation {
     ) -> Result<PublicOperationRecord> {
         let containment = *self.containment.lock().await;
         let next = match containment {
+            _ if current.stage == PublicOperationStage::RetryPending => {
+                PublicOperationStage::Completed
+            }
             CallbackContainment::NativeObserver => PublicOperationStage::Completed,
             CallbackContainment::RootTask if self.descendants_contained().await => {
                 PublicOperationStage::Completed
@@ -506,14 +560,42 @@ impl PartitionOperation {
     }
 
     pub(crate) async fn wait_for_terminal(&self) -> Result<PublicOperationRecord> {
+        self.wait_for_result(None).await
+    }
+
+    pub(crate) async fn wait_for_attempt(&self, attempt: u64) -> Result<PublicOperationRecord> {
+        self.wait_for_result(Some(attempt)).await
+    }
+
+    async fn wait_for_result(&self, attempt: Option<u64>) -> Result<PublicOperationRecord> {
         let mut record = self.record.subscribe();
         let mut failure = self.failure.subscribe();
         loop {
             let current = record.borrow().clone();
+            if let Some(attempt) = attempt
+                && let Some(outcome) = current.attempt_results.get(&attempt)
+            {
+                let mut result = current.clone();
+                result.attempt = attempt;
+                result.stage = outcome.stage;
+                result.disposition = Some(outcome.disposition.clone());
+                result.lifecycle = outcome.lifecycle.clone();
+                result.retry_failure = outcome.retry_failure.clone();
+                result.containment = outcome.containment;
+                result.superseded_by = outcome.superseded_by.clone();
+                result.blockers = outcome.blockers.clone();
+                result
+                    .attempt_results
+                    .retain(|number, _| *number <= attempt);
+                return Ok(result);
+            }
             if matches!(
                 current.stage,
-                PublicOperationStage::ContainmentPending | PublicOperationStage::Completed
-            ) {
+                PublicOperationStage::RetryPending
+                    | PublicOperationStage::ContainmentPending
+                    | PublicOperationStage::Completed
+            ) && attempt.is_none_or(|attempt| current.attempt == attempt)
+            {
                 return Ok(current);
             }
             if let Some(message) = failure.borrow().clone() {
@@ -644,9 +726,26 @@ impl PartitionOperation {
                 ))
             })?;
         self.record.send_replace(record.clone());
+        let retained_failure = self.failure.borrow().clone();
+        if record.stage == PublicOperationStage::RetryPending
+            && let Some(error) = retained_failure.clone()
+        {
+            let pending = self
+                .advance(
+                    PublicOperationStage::RetryPending,
+                    PublicOperationStage::ContainmentPending,
+                    Some(PublicOperationDisposition::Ambiguous(error)),
+                )
+                .await?;
+            self.record.send_replace(pending.clone());
+            self.recovery_complete();
+            return Ok(Some(pending));
+        }
         if matches!(
             record.stage,
-            PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+            PublicOperationStage::Completed
+                | PublicOperationStage::ContainmentPending
+                | PublicOperationStage::RetryPending
         ) {
             self.recovery_complete();
             return Ok(None);
@@ -661,6 +760,7 @@ impl PartitionOperation {
 
         let same_session = &record.intent.process_session_id == current_session;
         let recovered = if same_session
+            && retained_failure.is_none()
             && record.superseded_by.is_none()
             && crate::host::public_lifecycle::replayable(&record)
             && matches!(
@@ -718,6 +818,39 @@ impl PartitionOperation {
     fn set_coordination_active(&self, active: bool) {
         self.coordination_active
             .store(active, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn resume_returned_failure(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let current = self.snapshot();
+        if current.stage != PublicOperationStage::RetryPending {
+            return Ok(());
+        }
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(HostError::CommandRejected(
+                "public-operation registry is shutting down".into(),
+            ));
+        }
+        if let Some(task) = self.task.lock().await.take() {
+            task.await.map_err(|error| {
+                HostError::CommandRejected(format!("returned callback task join failed: {error}"))
+            })??;
+        }
+        let ready = self
+            .store
+            .resume_public_operation(&current.intent, current.attempt)
+            .await?;
+        self.record.send_replace(ready);
+        self.failure.send_replace(None);
+        let _invalidation = self.access_invalidation.lock().unwrap();
+        self.access_invalidated
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.recovery_complete();
+        self.bump_revision();
+        Ok(())
     }
 
     fn record_failure(&self, error: &HostError) {
@@ -998,6 +1131,7 @@ pub(crate) struct PartitionOperationRegistry {
     identity: PublicV1Identity,
     process_session_id: ProcessSessionId,
     admission: Mutex<()>,
+    dispatch: std::sync::Mutex<BTreeMap<OperationId, Arc<Mutex<()>>>>,
     state: Mutex<RegistryState>,
     coordination: Mutex<Vec<JoinHandle<()>>>,
     revision: watch::Sender<u64>,
@@ -1037,6 +1171,7 @@ impl PartitionOperationRegistry {
             identity: preview,
             process_session_id,
             admission: Mutex::new(()),
+            dispatch: Default::default(),
             state: Mutex::new(RegistryState::default()),
             coordination: Mutex::new(Vec::new()),
             revision,
@@ -1212,6 +1347,15 @@ impl PartitionOperationRegistry {
             .lock()
             .expect("control task lock")
             .push(tokio::spawn(future));
+    }
+
+    pub(crate) fn dispatch_lock(&self, id: &OperationId) -> Arc<Mutex<()>> {
+        self.dispatch
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .clone()
     }
 
     pub(crate) fn own_terminal_task(&self, future: impl Future<Output = ()> + Send + 'static) {

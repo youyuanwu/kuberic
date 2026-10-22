@@ -212,6 +212,7 @@ fn ordinary_required(previous_epoch: Epoch, renewal_epoch: Epoch) -> ProcessSess
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
+        retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
         identity: PublicV1Identity::new(42),
@@ -994,7 +995,7 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 
 #[tokio::test]
 async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 13);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 14);
     let root = test_root("replacement_schema-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicV1Identity::new(42);

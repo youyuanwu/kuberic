@@ -178,6 +178,7 @@ fn requirement(reason: ProcessSessionRenewalReason) -> ProcessSessionRenewalRequ
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
+        retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
         identity: PublicV1Identity::new(42),
