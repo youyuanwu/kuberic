@@ -23,6 +23,8 @@ mod configuration_projection_tests;
 mod remove_planner_tests;
 #[path = "public_lifecycle_retry_tests.rs"]
 mod retry_tests;
+#[path = "public_swap_admission_tests.rs"]
+mod swap_admission_tests;
 
 #[derive(Default)]
 struct Probe {

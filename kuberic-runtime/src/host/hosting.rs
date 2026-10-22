@@ -1568,10 +1568,14 @@ impl PartitionAccessView for HostAccessView {
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
-            return host
-                .creation_live(creation)
-                .then_some(())
-                .ok_or(RuntimeError::AuthorityNotAdmitted);
+            return (host.creation_live(creation)
+                && !bridge.registry.build_authority_is_fenced(
+                    &state,
+                    &creation.to_public_id(),
+                    authority,
+                ))
+            .then_some(())
+            .ok_or(RuntimeError::AuthorityNotAdmitted);
         }
         let validated = NativeBinding {
             history: authority.history.clone(),
@@ -1606,6 +1610,11 @@ impl PartitionAccessView for HostAccessView {
                     || operation.snapshot().stage
                         != crate::host::state::PublicOperationStage::Running
             })
+            || bridge.registry.build_authority_is_fenced(
+                &state,
+                &creation.to_public_id(),
+                authority,
+            )
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }

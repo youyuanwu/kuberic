@@ -155,11 +155,12 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
                 && current_scope(preview, &intent.process_session_id, record)
         })
         .collect::<Vec<_>>();
+    let accepted_epoch = relevant
+        .iter()
+        .filter_map(|record| epoch(&record.intent))
+        .max();
     if let Some(incoming) = epoch(intent)
-        && relevant
-            .iter()
-            .filter_map(|record| epoch(&record.intent))
-            .any(|accepted| accepted > incoming)
+        && accepted_epoch.is_some_and(|accepted| accepted > incoming)
     {
         return Err(HostError::CommandRejected(
             "message epoch is older than accepted host authority".into(),
@@ -168,6 +169,17 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
     let installed =
         public_lifecycle::installed_configuration_for_state(state, &intent.process_session_id);
     let stages = public_lifecycle::program::operation_instructions(intent);
+    if stages
+        .iter()
+        .filter_map(|instruction| configuration_at(intent, *instruction))
+        .any(|configuration| {
+            accepted_epoch.is_some_and(|accepted| configuration.current.epoch < accepted)
+        })
+    {
+        return Err(HostError::CommandRejected(
+            "selected configuration stage is older than accepted host authority".into(),
+        ));
+    }
     if stages
         .iter()
         .filter_map(|instruction| configuration_at(intent, *instruction))
@@ -184,6 +196,29 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
     {
         return Err(HostError::CommandRejected(
             "joint reconfiguration cannot regress completed current-only installation".into(),
+        ));
+    }
+    if let Some(P::Swap {
+        starting,
+        controller_composed: false,
+        ..
+    }) = &intent.program
+        && installed.as_ref().is_some_and(|current| {
+            starting.current != current.current
+                || starting.previous != current.previous
+                || starting.replicas.len() != current.replicas.len()
+                || starting.replicas.iter().any(|peer| {
+                    !current.replicas.iter().any(|known| {
+                        peer.identity == known.identity
+                            && peer.process_session_id == known.process_session_id
+                            && peer.storage_incarnation == known.storage_incarnation
+                            && peer.replication_address == known.replication_address
+                    })
+                })
+        })
+    {
+        return Err(HostError::CommandRejected(
+            "Swap starting stage differs from installed source authority".into(),
         ));
     }
     // A standalone current-only wait is a fresh synchronization barrier, not

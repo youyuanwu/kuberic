@@ -1230,6 +1230,7 @@ pub(crate) struct PartitionOperationRegistry {
     revision: watch::Sender<u64>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     terminal_fence: std::sync::atomic::AtomicBool,
+    renewal_fence: std::sync::atomic::AtomicBool,
     control_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     terminal_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     abort_guard: Arc<std::sync::Mutex<bool>>,
@@ -1270,6 +1271,7 @@ impl PartitionOperationRegistry {
             revision,
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             terminal_fence: std::sync::atomic::AtomicBool::new(false),
+            renewal_fence: std::sync::atomic::AtomicBool::new(false),
             control_tasks: std::sync::Mutex::new(Vec::new()),
             terminal_tasks: std::sync::Mutex::new(Vec::new()),
             abort_guard: Arc::new(std::sync::Mutex::new(false)),
@@ -1304,6 +1306,19 @@ impl PartitionOperationRegistry {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    pub(crate) fn fence_session_renewal(&self) {
+        self.renewal_fence
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn terminal_admission_is_fenced(&self) -> bool {
+        self.terminal_fence
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn fence_and_schedule_fault_containment(self: &Arc<Self>) {
         self.fence();
         let registry = Arc::clone(self);
@@ -1331,11 +1346,9 @@ impl PartitionOperationRegistry {
     }
 
     pub(crate) fn is_fenced(&self) -> bool {
-        self.terminal_fence
+        self.renewal_fence
             .load(std::sync::atomic::Ordering::Acquire)
-            || self
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
+            || self.terminal_admission_is_fenced()
     }
 
     pub(crate) fn build_authority_is_fenced(
@@ -1344,35 +1357,30 @@ impl PartitionOperationRegistry {
         creation: &crate::protocol::types::ReplicatorCreationId,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> bool {
-        if self
-            .shutting_down
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return true;
-        }
-        if !self.is_fenced() {
-            return false;
-        }
         // Renewal keeps application/operation admission closed until configuration
         // installation, but the exact replacement must receive its copy first.
-        !state
-            .public_v1_operation_state
-            .as_ref()
-            .is_some_and(|preview| {
-                !preview.terminal
-                    && state.identity.local_identity == authority.attempt.target
-                    && preview.history.as_ref() == Some(&authority.history)
-                    && preview.storage_incarnation.as_ref()
-                        == Some(&authority.attempt.target_storage)
-                    && preview.session_renewal.as_ref().is_some_and(|renewal| {
-                        renewal_inbound_build_matches(
-                            renewal,
-                            &self.process_session_id,
-                            creation,
-                            authority,
-                        )
-                    })
-            })
+        let renewal_blocks = self
+            .renewal_fence
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !state
+                .public_v1_operation_state
+                .as_ref()
+                .is_some_and(|preview| {
+                    !preview.terminal
+                        && state.identity.local_identity == authority.attempt.target
+                        && preview.history.as_ref() == Some(&authority.history)
+                        && preview.storage_incarnation.as_ref()
+                            == Some(&authority.attempt.target_storage)
+                        && preview.session_renewal.as_ref().is_some_and(|renewal| {
+                            renewal_inbound_build_matches(
+                                renewal,
+                                &self.process_session_id,
+                                creation,
+                                authority,
+                            )
+                        })
+                });
+        renewal_blocks || self.terminal_admission_is_fenced()
     }
 
     async fn prepare_fenced_session_renewal_configuration(
@@ -1465,10 +1473,8 @@ impl PartitionOperationRegistry {
         self.store
             .persist_public_v1_session_renewal(Some(&current), &authorized)
             .await?;
-        if self.is_fenced() {
-            self.terminal_fence
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
+        self.renewal_fence
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1516,13 +1522,16 @@ impl PartitionOperationRegistry {
                 "public-operation preview or process session changed".into(),
             ));
         }
-        let renewal_configuration = if !intent.class.is_terminal() {
-            self.prepare_fenced_session_renewal_configuration(&intent)
-                .await?
-        } else {
-            false
-        };
-        if self.is_fenced() && !intent.class.is_terminal() && !renewal_configuration {
+        let renewal_configuration =
+            if !intent.class.is_terminal() && !self.terminal_admission_is_fenced() {
+                self.prepare_fenced_session_renewal_configuration(&intent)
+                    .await?
+            } else {
+                false
+            };
+        if !intent.class.is_terminal()
+            && (self.terminal_admission_is_fenced() || (self.is_fenced() && !renewal_configuration))
+        {
             return Err(HostError::CommandRejected(
                 "preview is synchronously fenced".into(),
             ));
@@ -1539,6 +1548,11 @@ impl PartitionOperationRegistry {
             ));
         }
         self.load_durable_records().await?;
+        if self.terminal_admission_is_fenced() && !intent.class.is_terminal() {
+            return Err(HostError::CommandRejected(
+                "preview is synchronously fenced".into(),
+            ));
+        }
         if let Some(existing) = self
             .state
             .lock()
@@ -1704,6 +1718,9 @@ impl PartitionOperationRegistry {
             }
         }
         if let Some(owner) = attached_to {
+            if intent.class.is_terminal() {
+                self.fence();
+            }
             let attached = self
                 .record_attachment(intent, owner.intent().operation_id)
                 .await?;
@@ -1716,6 +1733,11 @@ impl PartitionOperationRegistry {
             .iter()
             .map(|operation| operation.intent().operation_id)
             .collect::<Vec<_>>();
+        // Fence only validated registry input/relations, but before durable
+        // admission can yield or fail ambiguously. This process never reopens.
+        if intent.class.is_terminal() {
+            self.fence();
+        }
         let record = match self
             .store
             .begin_public_operation(&intent, &blocker_ids, &superseded_ids)
@@ -1979,15 +2001,29 @@ impl PartitionOperationRegistry {
     }
 
     async fn load_durable_records(&self) -> Result<()> {
-        let records = self.store.public_operation_records().await?;
-        if self
+        let records = self
+            .store
+            .public_operation_records()
+            .await
+            .inspect_err(|_| self.fence())?;
+        let durable = self
             .store
             .load_state()
-            .await?
+            .await
+            .inspect_err(|_| self.fence())?;
+        if records.iter().any(|record| {
+            record.intent.process_session_id == self.process_session_id
+                && record.intent.class.is_terminal()
+        }) {
+            self.fence();
+        }
+        if durable
             .public_v1_operation_state
             .is_some_and(|preview| preview.terminal)
         {
-            self.fence();
+            // A contained predecessor fault can remain in a replacement's
+            // journal. Only this process's terminal records close it forever.
+            self.fence_session_renewal();
         }
         let mut state = self.state.lock().await;
         for record in records {
@@ -2246,8 +2282,201 @@ mod tests {
         }
     }
 
-    #[test]
-    fn renewal_inbound_copy_requires_exact_replayed_replacement_and_surviving_primary() {
+    async fn fence_registry(
+        root: &std::path::Path,
+        session: ProcessSessionId,
+    ) -> (Arc<SqliteStore>, Arc<PartitionOperationRegistry>) {
+        let store = Arc::new(
+            SqliteStore::create_replacement_authorized(
+                root.join("fences.sqlite3"),
+                AgentState::new(StorageIdentity {
+                    schema_version: crate::host::state::SCHEMA_VERSION,
+                    resource_uid: ResourceUid::new("fence-resource"),
+                    pod_uid: PodUid::new("fence-pod"),
+                    pvc_uid: PvcUid::new("fence-pvc"),
+                    initialization_id: InitializationId::new("fence-init"),
+                    local_identity: ReplicaIdentity {
+                        replica_id: ReplicaId::new(1),
+                        instance_id: ReplicaInstanceId::new("fence-pod"),
+                        agent_generation: AgentGeneration::new("fence-generation"),
+                    },
+                    effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+                }),
+                PublicV1LifecycleBinding {
+                    identity: PublicV1Identity::new(1),
+                    resource_uid: ResourceUid::new("fence-resource"),
+                    spec_generation: 1,
+                    state_persistence: StatePersistence::Persisted,
+                },
+            )
+            .unwrap(),
+        );
+        let state = store.load_state().await.unwrap();
+        let initialization = derive_history_initialization_id(
+            &state.identity.resource_uid,
+            PublicProtocolGeneration::new(1),
+        );
+        let history = derive_bootstrap_history(
+            &state.identity.resource_uid,
+            PublicProtocolGeneration::new(1),
+            &initialization,
+        );
+        let storage = ReplicaStorageIncarnationContext {
+            replica: state.identity.local_identity,
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: state.identity.pod_uid,
+                pvc_uid: state.identity.pvc_uid,
+            },
+            storage_generation: StorageGeneration::new("fence-storage"),
+        };
+        store
+            .initialize_public_v1_history(&initialization, &history, &storage)
+            .await
+            .unwrap();
+        let registry =
+            PartitionOperationRegistry::new(store.clone(), PublicV1Identity::new(1), session)
+                .unwrap();
+        (store, registry)
+    }
+
+    fn program_intent(program: PublicOperationProgram, revision: u64) -> PublicOperationIntent {
+        let class = match &program {
+            PublicOperationProgram::Close => PublicOperationClass::Close,
+            PublicOperationProgram::Abort => PublicOperationClass::Abort,
+            _ => PublicOperationClass::Authority,
+        };
+        PublicOperationIntent {
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            program: Some(program),
+            ..intent(class, revision)
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_admission_fence_precedes_callbacks_but_not_invalid_input() {
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) = fence_registry(root.path(), ProcessSessionId::new("session")).await;
+        let epoch = program_intent(
+            PublicOperationProgram::Epoch {
+                epoch: Epoch::new(0, 1),
+            },
+            1,
+        );
+        registry.admit(epoch.clone()).await.unwrap();
+        let terminal = program_intent(PublicOperationProgram::Close, 2);
+        for invalid in [
+            PublicOperationIntent {
+                operation_id: epoch.operation_id,
+                ..terminal.clone()
+            },
+            PublicOperationIntent {
+                process_session_id: ProcessSessionId::new("stale-session"),
+                ..terminal.clone()
+            },
+            PublicOperationIntent {
+                identity: PublicV1Identity::new(2),
+                ..terminal.clone()
+            },
+            PublicOperationIntent {
+                input_digest: PublicOperationProgram::Abort.digest(),
+                ..terminal.clone()
+            },
+        ] {
+            assert!(registry.admit(invalid).await.is_err());
+            assert!(!registry.is_fenced());
+        }
+        registry.admit(terminal.clone()).await.unwrap();
+        assert!(registry.terminal_admission_is_fenced());
+        assert!(registry.is_fenced());
+        assert!(
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+                .terminal
+        );
+        registry.fence_session_renewal();
+        registry
+            .renewal_fence
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(registry.is_fenced());
+        assert!(
+            registry
+                .admit(program_intent(
+                    PublicOperationProgram::Epoch {
+                        epoch: Epoch::new(0, 2)
+                    },
+                    3
+                ))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_fence_recovery_is_current_process_not_predecessor_terminal() {
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) = fence_registry(root.path(), ProcessSessionId::new("session")).await;
+        let fault = intent(PublicOperationClass::TransientFault, 1);
+        store
+            .begin_public_operation(&fault, &[], &[])
+            .await
+            .unwrap();
+        registry.load_durable_records().await.unwrap();
+        assert!(registry.terminal_admission_is_fenced());
+        let replacement = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            ProcessSessionId::new("replacement"),
+        )
+        .unwrap();
+        replacement.load_durable_records().await.unwrap();
+        assert!(!replacement.terminal_admission_is_fenced());
+        assert!(replacement.is_fenced());
+    }
+
+    #[tokio::test]
+    async fn uncertain_terminal_admission_and_store_read_failure_remain_fenced() {
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) = fence_registry(root.path(), ProcessSessionId::new("session")).await;
+        let connection = rusqlite::Connection::open(root.path().join("fences.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_admission BEFORE UPDATE ON agent_state
+             BEGIN SELECT RAISE(FAIL, 'injected admission persistence failure'); END;",
+            )
+            .unwrap();
+        let error = registry
+            .admit(program_intent(PublicOperationProgram::Abort, 1))
+            .await
+            .err()
+            .expect("injected failure");
+        assert!(
+            error
+                .to_string()
+                .contains("injected admission persistence failure"),
+            "{error}"
+        );
+        assert!(registry.terminal_admission_is_fenced());
+        assert!(store.public_operation_records().await.unwrap().is_empty());
+        connection
+            .execute_batch("DROP TRIGGER fail_admission; DROP TABLE agent_state;")
+            .unwrap();
+        let replacement = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            ProcessSessionId::new("replacement"),
+        )
+        .unwrap();
+        assert!(replacement.load_durable_records().await.is_err());
+        assert!(replacement.terminal_admission_is_fenced());
+    }
+
+    #[tokio::test]
+    async fn renewal_inbound_copy_requires_exact_replayed_replacement_and_surviving_primary() {
         use crate::protocol::public_operations::{
             PublicBuildAttemptReference, PublicInboundBuildAuthority,
         };
@@ -2372,6 +2601,43 @@ mod tests {
             )
         };
         assert!(matches(&pending, &authority));
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) =
+            fence_registry(root.path(), replacement.process_session_id.clone()).await;
+        let mut snapshot = store.load_state().await.unwrap();
+        snapshot.identity.local_identity = replacement.identity.clone();
+        let preview = snapshot.public_v1_operation_state.as_mut().unwrap();
+        preview.history = Some(authority.history.clone());
+        preview.storage_incarnation = Some(replacement.storage_incarnation.clone());
+        preview.session_renewal = Some(pending.clone());
+        registry.fence_session_renewal();
+        assert!(registry.is_fenced());
+        assert!(!registry.build_authority_is_fenced(
+            &snapshot,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        let source_registry = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            source.process_session_id.clone(),
+        )
+        .unwrap();
+        source_registry.fence_session_renewal();
+        assert!(source_registry.build_authority_is_fenced(
+            &snapshot,
+            &source.replicator_creation_id,
+            &authority,
+        ));
+        registry.fence();
+        assert!(
+            registry.build_authority_is_fenced(
+                &snapshot,
+                &replacement.replicator_creation_id,
+                &authority,
+            ),
+            "a stale nonterminal renewal snapshot cannot weaken current terminal admission"
+        );
         assert!(!matches(&required, &authority));
         assert!(!matches(&role_pending, &authority));
         assert!(!matches(
@@ -2738,6 +3004,11 @@ mod tests {
 
     #[tokio::test]
     async fn renewal_configuration_releases_fence_only_after_durable_authorization() {
+        assert_renewal_configuration_release(false).await;
+        assert_renewal_configuration_release(true).await;
+    }
+
+    async fn assert_renewal_configuration_release(terminal: bool) {
         let root = tempfile::tempdir().unwrap();
         let resource_uid = ResourceUid::new("resource-renewal-release");
         let generation = PublicProtocolGeneration::new(1);
@@ -2857,7 +3128,7 @@ mod tests {
             intent.process_session_id.clone(),
         )
         .unwrap();
-        registry.fence();
+        registry.fence_session_renewal();
 
         assert!(
             !registry
@@ -2916,11 +3187,14 @@ mod tests {
                 .unwrap()
         );
         assert!(registry.is_fenced());
+        if terminal {
+            registry.fence();
+        }
         registry
             .release_session_renewal_fence(&intent)
             .await
             .unwrap();
-        assert!(!registry.is_fenced());
+        assert_eq!(registry.is_fenced(), terminal);
         assert_eq!(
             store
                 .load_state()

@@ -945,7 +945,7 @@ where
             PublicV1SessionRenewalCommand::CloseAccessAndIngress { .. } => {
                 self.runtime.fence_replacement_access().await;
                 if let Some(registry) = self.registry.get() {
-                    registry.fence();
+                    registry.fence_session_renewal();
                 }
                 accepted.close_access()
             }

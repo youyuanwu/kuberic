@@ -89,6 +89,12 @@ history, epoch, configuration and Build attempt remain fenced. Higher numeric
 revision cannot revive lower epoch or selected cancelled catch-up. Ordinary
 duplicate failure is not universal success.
 
+Epoch checks cover each actually executed configuration/wait stage, not merely
+a Swap's final epoch. A non-composed Swap captures compatible installed
+starting PC/CC and exact peer bindings; a newer final epoch cannot hide an
+older starting callback. Controller-composed Swap omits that stage, so unused
+starting metadata is not replayed as an action.
+
 Exact Remove withdraws the unchanged retained Build token; that token's older
 epoch is not a request to restore old authority. While Build is active, Remove
 uses its revision and still waits for successful containment. After containment
@@ -135,6 +141,12 @@ frozen Build input plus successful completion before further configuration.
 Historical completion never recreates ingress.
 
 Close/Abort stop admission and revoke access before actual retained joining.
+A monotonic current-process terminal fence is distinct from renewable access
+fencing: neither an old renewal snapshot nor later renewal authorization can
+reopen copy after valid terminal admission begins. Target validation rechecks
+that current fence at every success exit, including preinstall classification.
+Persistence uncertainty remains fail-closed; contained predecessor-session
+terminal records do not permanently fence a fresh replacement process.
 A lost response does not discard installation, cleanup or compensation.
 Returned drain errors and lost native task joins are sticky across later
 observers. Protected Close/Abort must independently wake blocked companion
@@ -177,7 +189,7 @@ or production certification is claimed.
 [coordinator]: ../../../kuberic-runtime/src/replicator/coordinator.rs#L1
 [production]: ../../../kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L223
 [companion]: ../../../kuberic-runtime/src/replicator/custom.rs#L1
-[operations]: ../../../kuberic-runtime/src/host/operation.rs#L1498
+[operations]: ../../../kuberic-runtime/src/host/operation.rs#L1504
 [program]: ../../../kuberic-runtime/src/host/public_lifecycle_program.rs#L10
 [admission]: ../../../kuberic-runtime/src/host/public_action_state.rs#L136
 [access]: ../../../kuberic-runtime/src/host/selected_access.rs#L580

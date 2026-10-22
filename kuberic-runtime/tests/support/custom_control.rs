@@ -32,6 +32,10 @@ struct Contract {
     install_hold: AtomicBool,
     install_entered: Semaphore,
     install_release: Semaphore,
+    terminal_calls: AtomicUsize,
+    drain_hold: AtomicBool,
+    drain_entered: Semaphore,
+    drain_release: Semaphore,
 }
 
 fn failure(message: &str) -> RuntimeError {
@@ -54,6 +58,10 @@ impl Contract {
         }
         if self.fail_drain.load(Ordering::SeqCst) {
             return Err(failure("owned child still live"));
+        }
+        if self.drain_hold.load(Ordering::SeqCst) {
+            self.drain_entered.add_permits(1);
+            self.drain_release.acquire().await.unwrap().forget();
         }
         self.child_cancel.cancel();
         self.build_release.add_permits(1);
@@ -137,10 +145,12 @@ impl StatefulServiceReplica for Contract {
         })
     }
     async fn close(&self) -> Result<()> {
+        self.terminal_calls.fetch_add(1, Ordering::SeqCst);
         self.install_release.add_permits(1);
         Ok(())
     }
     fn abort(&self) {
+        self.terminal_calls.fetch_add(1, Ordering::SeqCst);
         self.install_release.add_permits(1);
         self.build_release.add_permits(1);
     }
@@ -331,6 +341,10 @@ impl Sample for Contract {
             install_hold: AtomicBool::new(false),
             install_entered: Semaphore::new(0),
             install_release: Semaphore::new(0),
+            terminal_calls: AtomicUsize::new(0),
+            drain_hold: AtomicBool::new(false),
+            drain_entered: Semaphore::new(0),
+            drain_release: Semaphore::new(0),
         })
     }
     async fn drain(&self) -> Result<()> {
@@ -468,6 +482,353 @@ fn validation_cut(
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     })
+}
+
+async fn renewal_target(
+    root: &Path,
+) -> (Node<Contract>, Node<Contract>, PublicInboundBuildAuthority) {
+    let old_epoch = Epoch::new(0, 1);
+    let epoch = Epoch::new(0, 2);
+    let mut source = Node::<Contract>::start_sized(&root.join("s"), 1, 1, 2).await;
+    source.open(ReplicaRole::Primary, old_epoch).await;
+    source.single(old_epoch).await;
+    let mut predecessor = Node::<Contract>::start_sized(&root.join("t"), 2, 1, 2).await;
+    predecessor
+        .open(ReplicaRole::ActiveSecondary, old_epoch)
+        .await;
+    let old = persist_query_observation(root, "renewal-predecessor", &predecessor.report().await);
+    let revision = predecessor.revision;
+    assert!(predecessor.stop().await.is_none());
+    let mut target = Node::<Contract>::start_sized(&root.join("t"), 2, revision, 2).await;
+    target
+        .command(PublicOperationProgram::Open {
+            replica: target.identity.clone(),
+            existing: true,
+        })
+        .await;
+    let fresh = persist_query_observation(root, "renewal-replacement", &target.report().await);
+    let endpoint = |report: &PublicV1AgentReport| ProcessSessionEndpoint {
+        identity: report.replica.clone(),
+        storage_incarnation: report.storage_incarnation.clone(),
+        process_session_id: report.process_session_id.clone(),
+        replicator_creation_id: report.replicator_creation_id.clone(),
+        role: report.role,
+    };
+    let survivor = endpoint(&persist_query_observation(
+        root,
+        "renewal-survivor",
+        &source.report().await,
+    ));
+    let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+        operation_id: OperationId::new("contract-terminal-renewal"),
+        reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
+        resource_uid: old.resource_uid.clone(),
+        history: old.history.clone(),
+        previous_epoch: old_epoch,
+        renewal_epoch: epoch,
+        predecessor: endpoint(&old),
+        replacement: Some(endpoint(&fresh)),
+        surviving_sessions: vec![survivor.clone()],
+        fresh_configuration: ConfigurationDescriptor::new(
+            epoch,
+            source.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        ),
+        predecessor_contained: true,
+        data_loss: None,
+    })
+    .unwrap();
+    required
+        .required
+        .validate_replacement_report(&fresh)
+        .unwrap();
+    history(
+        &target,
+        PublicV1HistoryCommand::SessionRenewal {
+            command: Box::new(PublicV1SessionRenewalCommand::CloseAccessAndIngress {
+                accepted: required.clone(),
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let mut staged = required.close_access().unwrap();
+    for next in [
+        staged.freeze_surviving_set().unwrap(),
+        staged
+            .freeze_surviving_set()
+            .unwrap()
+            .begin_epoch_barriers()
+            .unwrap(),
+    ] {
+        target
+            .running
+            .handle()
+            .persist_public_v1_session_renewal(Some(&staged), &next)
+            .await
+            .unwrap();
+        staged = next;
+    }
+    history(
+        &source,
+        PublicV1HistoryCommand::SessionRenewal {
+            command: Box::new(PublicV1SessionRenewalCommand::UpdateEpochBarrier {
+                accepted: staged.clone(),
+                survivor: survivor.clone(),
+                epoch,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let updated = staged.record_epoch_updated(&survivor, epoch).unwrap();
+    target
+        .running
+        .handle()
+        .persist_public_v1_session_renewal(Some(&staged), &updated)
+        .await
+        .unwrap();
+    let role_pending = updated.finish_epoch_barriers().unwrap();
+    target
+        .running
+        .handle()
+        .persist_public_v1_session_renewal(Some(&updated), &role_pending)
+        .await
+        .unwrap();
+    history(
+        &target,
+        PublicV1HistoryCommand::SessionRenewal {
+            command: Box::new(PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                accepted: role_pending.clone(),
+                process_session_id: target.session.clone(),
+                epoch,
+                role: ReplicaRole::ActiveSecondary,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let report = target.report().await;
+    assert_eq!(report.role, ReplicaRole::ActiveSecondary);
+    let pending = role_pending
+        .replay_replacement_role(&target.session, epoch, ReplicaRole::ActiveSecondary)
+        .unwrap();
+    target
+        .running
+        .handle()
+        .persist_public_v1_session_renewal(Some(&pending), &pending)
+        .await
+        .unwrap();
+    source
+        .command(PublicOperationProgram::Role {
+            epoch,
+            role: ReplicaRole::Primary,
+        })
+        .await;
+    source
+        .command(PublicOperationProgram::Epoch { epoch })
+        .await;
+    let current = source.single(epoch).await;
+    let build = OperationId::new("contract-renewal-inbound");
+    let authority = PublicInboundBuildAuthority {
+        operation_id: build.clone(),
+        operation_revision: source.revision,
+        attempt: PublicBuildAttemptReference {
+            resource_uid: source.history.resource_uid.clone(),
+            epoch,
+            build_id: build,
+            source: source.identity.clone(),
+            source_storage: source.storage.clone(),
+            source_session: source.session.clone(),
+            target: target.identity.clone(),
+            target_storage: target.storage.clone(),
+            target_session: target.session.clone(),
+        },
+        history: source.history.clone(),
+        current_configuration_id: current.configuration_id,
+        source_address: source.service.endpoint.clone(),
+        target_address: target.service.endpoint.clone(),
+    };
+    (source, target, authority)
+}
+
+#[tokio::test]
+async fn custom_host_renewal_validation_cannot_cross_terminal_admission() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        for abort in [false, true] {
+            for preinstall in [false, true] {
+                let root = tempfile::tempdir_in(".").unwrap();
+                let (source, target, authority) = renewal_target(root.path()).await;
+                history(
+                    &target,
+                    PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                        authority: Box::new(authority.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+                *source.service.peer.lock().unwrap() = Some(Arc::downgrade(&target.service));
+                source.service.hold_build.store(true, Ordering::SeqCst);
+                let program = PublicOperationProgram::Build(PublicBuildInput {
+                    attempt: authority.attempt.build_id.clone(),
+                    source_address: authority.source_address.clone(),
+                    epoch: authority.attempt.epoch,
+                    current_configuration_id: Some(authority.current_configuration_id.clone()),
+                    replica: target.identity.clone(),
+                    target_storage: target.storage.clone(),
+                    process_session_id: target.session.clone(),
+                    replication_address: authority.target_address.clone(),
+                    history: Some(authority.history.clone()),
+                });
+                let source_build = execute(
+                    &source,
+                    PublicOperationIntent {
+                        identity: source.preview.clone(),
+                        operation_id: authority.operation_id.clone(),
+                        revision: authority.operation_revision,
+                        process_session_id: source.session.clone(),
+                        class: PublicOperationClass::Build {
+                            target: target.identity.replica_id,
+                        },
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
+                    },
+                );
+                source.service.build_entered.acquire().await.unwrap().forget();
+                assert!(!source_build.is_finished());
+                assert_eq!(target.service.installations.load(Ordering::SeqCst), 1);
+                assert_eq!(target.service.alive.load(Ordering::SeqCst), 1);
+                let before = target.report().await;
+                assert_ne!(before.read_status, AccessStatus::Granted);
+                assert_ne!(before.write_status, AccessStatus::Granted);
+                assert!(before.configuration.is_none());
+                let read = validation_cut(
+                    kuberic_runtime::testing::PublicCutPosition::BuildAuthorityRead,
+                );
+                target
+                    .running
+                    .handle()
+                    .set_public_operation_cut(Some(read.clone()));
+                let validation = if preinstall {
+                    // Exact install replay enters the coordinator's preinstall
+                    // scope check while its actual grant is still installed.
+                    tokio::spawn(history(
+                        &target,
+                        PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                            authority: Box::new(authority.clone()),
+                        },
+                    ))
+                } else {
+                    let service = target.service.clone();
+                    let authority = authority.clone();
+                    tokio::spawn(async move {
+                        service.accept(&authority).await.map_err(|error| {
+                            tonic::Status::failed_precondition(error.to_string())
+                        })
+                    })
+                };
+                read.entered.notified().await;
+                let terminal_cut = validation_cut(
+                    kuberic_runtime::testing::PublicCutPosition::BeforeAccessReservation,
+                );
+                target
+                    .running
+                    .handle()
+                    .set_public_operation_cut(Some(terminal_cut.clone()));
+                let program = if abort {
+                    PublicOperationProgram::Abort
+                } else {
+                    PublicOperationProgram::Close
+                };
+                let operation_id = OperationId::new("contract-terminal-during-renewal");
+                let terminal = execute(
+                    &target,
+                    PublicOperationIntent {
+                        identity: target.preview.clone(),
+                        operation_id: operation_id.clone(),
+                        revision: before
+                            .completed_operations
+                            .iter()
+                            .map(|operation| operation.revision)
+                            .max()
+                            .unwrap()
+                            + 1,
+                        process_session_id: target.session.clone(),
+                        class: if abort {
+                            PublicOperationClass::Abort
+                        } else {
+                            PublicOperationClass::Close
+                        },
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
+                    },
+                );
+                terminal_cut.entered.notified().await;
+                assert_eq!(target.service.terminal_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(target.service.inbound.lock().unwrap().as_ref(), Some(&authority));
+                read.release.notify_one();
+                assert!(
+                    validation.await.unwrap().is_err(),
+                    "stale renewal snapshot crossed terminal admission: abort={abort}, preinstall={preinstall}"
+                );
+                assert_eq!(target.service.installations.load(Ordering::SeqCst), 1);
+                assert_eq!(target.service.alive.load(Ordering::SeqCst), 1);
+                assert!(target.service.idle.lock().unwrap().is_empty());
+                assert!(source.service.idle.lock().unwrap().is_empty());
+                let admitted = target.report().await;
+                assert!(admitted.configuration.is_none());
+                assert_ne!(admitted.read_status, AccessStatus::Granted);
+                assert_ne!(admitted.write_status, AccessStatus::Granted);
+                assert!(!terminal.is_finished());
+                target.service.drain_hold.store(true, Ordering::SeqCst);
+                target.running.handle().set_public_operation_cut(None);
+                terminal_cut.release.notify_one();
+                target.service.drain_entered.acquire().await.unwrap().forget();
+                assert!(!terminal.is_finished(), "terminal must join the retained child");
+                assert_eq!(target.service.alive.load(Ordering::SeqCst), 1);
+                assert!(
+                    !target
+                        .running
+                        .handle()
+                        .public_v1_operation_is_contained(&operation_id)
+                        .await
+                        .unwrap()
+                );
+                target.service.drain_release.add_permits(1);
+                terminal.await.unwrap().unwrap();
+                assert_eq!(target.service.alive.load(Ordering::SeqCst), 0);
+                assert!(
+                    target
+                        .running
+                        .handle()
+                        .public_v1_operation_is_contained(&operation_id)
+                        .await
+                        .unwrap()
+                );
+                assert!(target.service.accept(&authority).await.is_err());
+                target.service.drain_hold.store(false, Ordering::SeqCst);
+                assert!(target.stop().await.is_none());
+                assert!(source.stop().await.is_none());
+                assert!(source_build.await.unwrap().is_err());
+            }
+        }
+    })
+    .await
+    .expect("bounded synthetic companion terminal/renewal admission regression");
 }
 
 #[tokio::test]
