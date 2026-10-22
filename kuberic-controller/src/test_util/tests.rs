@@ -256,6 +256,7 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
         "in-process/empty".into(),
         std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(20),
+        3,
     )
     .await?;
     let result: Result<()> = async {
@@ -519,6 +520,8 @@ async fn invalid_builder_is_inert_and_classified() {
         ErrorKind::InvalidConfiguration
     );
     for builder in [
+        TestCluster::builder(EmptyFactory).initial_replicas(0),
+        TestCluster::builder(EmptyFactory).initial_replicas(4),
         TestCluster::builder(EmptyFactory).scenario_timeout(std::time::Duration::MAX),
         TestCluster::builder(EmptyFactory).teardown_timeout(std::time::Duration::MAX),
     ] {
@@ -527,6 +530,7 @@ async fn invalid_builder_is_inert_and_classified() {
             ErrorKind::InvalidConfiguration
         );
     }
+
     let result = TestCluster::builder(EmptyFactory)
         .scenario_timeout(std::time::Duration::ZERO)
         .start()
@@ -537,6 +541,52 @@ async fn invalid_builder_is_inert_and_classified() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_singleton_scale_uses_real_build_and_preserves_default_controls() -> super::Result<()>
+{
+    let mut cluster = TestCluster::builder(EmptyFactory)
+        .initial_replicas(1)
+        .start()
+        .await?;
+    let result: super::Result<()> = async {
+        let singleton = cluster.settle_members(1).await?;
+        assert_eq!(singleton.members().count(), 1);
+        let before = cluster.observe().await?;
+        assert_eq!(before.set().spec.replicas, 1);
+        for invalid in [0, 4] {
+            assert_eq!(
+                cluster.scale_to(invalid).await.unwrap_err().kind(),
+                super::ErrorKind::InvalidConfiguration
+            );
+        }
+        assert_eq!(cluster.observe().await?.set().spec.replicas, 1);
+        cluster.scale_to(2).await?;
+        let pause = cluster
+            .pause_at(super::Barrier::completion(
+                kuberic_runtime::protocol::public_operations::PublicV1CallKind::Build,
+            ))
+            .await?;
+        assert!(matches!(
+            pause
+                .evidence()
+                .operation()
+                .command()
+                .unwrap()
+                .intent
+                .program,
+            Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Build(_))
+        ));
+        assert_eq!(
+            cluster.scale_to(1).await.unwrap_err().kind(),
+            super::ErrorKind::InvalidConfiguration
+        );
+        cluster.resume(pause).await?;
+        assert_eq!(cluster.settle_members(2).await?.members().count(), 2);
+        Ok(())
+    }
+    .await;
+    cluster.finish(result).await
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_cross_cluster_stopped_and_observation_references_are_checked() -> Result<()> {
     let mut first = TestCluster::builder(EmptyFactory).start().await?;

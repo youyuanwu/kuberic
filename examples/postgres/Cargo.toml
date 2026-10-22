@@ -33,6 +33,7 @@ tonic-prost.workspace = true
 rustix = { version = "1", features = ["process", "event", "rand"] }
 
 [dev-dependencies]
+kuberic-controller = { path = "../../kuberic-controller", features = ["test-util"] }
 test-log.workspace = true
 postgres-replicated = { path = ".", features = ["testing"] }
 serial_test.workspace = true

@@ -57,6 +57,10 @@ pub(super) struct NativeGateway {
     exit_gate: Arc<std::sync::Mutex<Option<Arc<GatewayExitGate>>>>,
 }
 
+pub(super) type GatewayValidity = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync,
+>;
+
 #[cfg(all(test, feature = "testing"))]
 pub(super) struct GatewayExitGate {
     pub entered: tokio::sync::Notify,
@@ -76,7 +80,7 @@ impl NativeGateway {
         name: String,
         slot: String,
         build: bool,
-        valid: Arc<dyn Fn() -> bool + Send + Sync>,
+        valid: GatewayValidity,
         cancellation: CancellationToken,
     ) -> Result<(Self, NativeCredential)> {
         let credential = NativeCredential {
@@ -105,11 +109,11 @@ impl NativeGateway {
                 tokio::select! {
                     biased;
                     _ = stopped.cancelled() => break,
-                    _ = tick.tick() => if !valid() { break; },
+                    _ = tick.tick() => if !valid().await { break; },
                     _ = connections.join_next(), if !connections.is_empty() => {},
                     accepted = listener.accept() => {
                         let Ok((client, _)) = accepted else { break; };
-                        if connections.len() >= 4 || !valid() {
+                        if connections.len() >= 4 || !valid().await {
                             continue;
                         }
                         let expected = expected.clone();

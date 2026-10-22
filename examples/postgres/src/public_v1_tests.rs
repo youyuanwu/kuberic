@@ -1,4 +1,6 @@
 use super::*;
+#[path = "public_controller_tests.rs"]
+mod controller;
 #[path = "public_v1_p6_tests.rs"]
 pub(crate) mod p6;
 use crate::durable::{PgDurableIdentity, StorageMode};
@@ -53,6 +55,7 @@ fn public_v1_process_fence_rejects_same_epoch_session_and_address_substitution()
         })
         .unwrap();
     let binding = TransportBinding::Build(BuildBinding {
+        authority: None,
         resource_uid: ResourceUid::new("authority-test"),
         epoch,
         build_id: OperationId::new("build"),
@@ -167,6 +170,7 @@ impl BindingFactory {
     fn build(&self, source: &Replica, target: &Replica, id: &str) -> BuildBinding {
         let context = source.driver.public_owner().fence.context().unwrap();
         BuildBinding {
+            authority: None,
             resource_uid: ResourceUid::new("postgres-public-oracle"),
             epoch: context.epoch,
             build_id: OperationId::new(id),
@@ -1014,39 +1018,109 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         // Deliberately no Close or Drop on the source before all observations.
         std::hint::black_box(&source.driver);
         let hosted = production_service(directory.path().join("abort-host"), 113).await;
-        let context = hosted.driver.public_owner().fence.context().unwrap();
-        let binding = TransportBinding::Build(BuildBinding {
-            resource_uid: hosted.driver.durable.snapshot().await.identity.resource_uid,
-            epoch: context.epoch,
-            build_id: OperationId::new("service-abort"),
-            source: NativeEndpoint {
-                replica: context.identity,
-                process_session_id: hosted.driver.public_process_session(),
-                replication_address: hosted.driver.coordination.local_endpoint.clone(),
-                role: ReplicaRole::Primary,
-            },
-            target: NativeEndpoint {
-                replica: native_identity(114, "abort-unused"),
-                process_session_id: ProcessSessionId::new("unused"),
-                replication_address: "http://127.0.0.1:1".into(),
-                role: ReplicaRole::IdleSecondary,
-            },
+        // Negative host fixture: a genuinely accepted source Build owns its
+        // grant while its unresponsive target cannot complete. It is not a
+        // controller/native transfer positive witness.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let stop_peer = CancellationToken::new();
+        let stopped = stop_peer.clone();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            stopped.cancelled().await;
+            drop(socket);
         });
-        let credential = {
-            let mut state = hosted.driver.public_owner().state.lock().await;
-            hosted
-                .driver
-                .public_grant(&mut state, binding)
-                .await
-                .unwrap();
-            state.grants.last().unwrap().credential.clone()
+        let handle = hosted.running.handle();
+        let report = handle.public_v1_report().await.unwrap();
+        let target_identity = native_identity(114, "abort-unused");
+        let program = PublicOperationProgram::Build(
+            kuberic_runtime::protocol::public_operations::PublicBuildInput {
+                attempt: OperationId::new("service-abort"),
+                source_address: report.replication_address.clone().unwrap(),
+                epoch: Epoch::new(0, 1),
+                current_configuration_id: Some(
+                    report
+                        .configuration
+                        .as_ref()
+                        .unwrap()
+                        .voting
+                        .current
+                        .configuration_id
+                        .clone(),
+                ),
+                replica: target_identity.clone(),
+                target_storage:
+                    kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext {
+                        replica: target_identity.clone(),
+                        storage:
+                            kuberic_runtime::protocol::types::ReplicaStorageIdentity::Volatile {
+                                identity: "negative-unresponsive-target".into(),
+                            },
+                        storage_generation:
+                            kuberic_runtime::protocol::types::StorageGeneration::new(
+                                "negative-target",
+                            ),
+                    },
+                process_session_id: ProcessSessionId::new("unused"),
+                replication_address: address,
+                history: Some(report.history),
+            },
+        );
+        let mut intent = host_intent(
+            &hosted.preview,
+            handle.process_session_id(),
+            report
+                .completed_operations
+                .iter()
+                .map(|completion| completion.revision)
+                .max()
+                .unwrap(),
+            "service-abort",
+            program,
+        );
+        intent.class = PublicOperationClass::Build {
+            target: target_identity.replica_id,
         };
+        let mut build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+        let credential = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if build.is_finished() {
+                    panic!(
+                        "negative hosted source Build ended before creating its grant: {:?}",
+                        (&mut build).await
+                    );
+                }
+                if let Some(grant) = hosted
+                    .driver
+                    .public_owner()
+                    .state
+                    .lock()
+                    .await
+                    .grants
+                    .last()
+                {
+                    break grant.credential.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
             .await
             .unwrap();
         let process = ProcessProbe::postgres(hosted.driver.instance.data_dir());
         kuberic_runtime::StatefulServiceReplica::abort(hosted.service.as_ref());
         assert_abort_reclaimed(&hosted.driver, process, &credential, vec![preauth]).await;
+        stop_peer.cancel();
+        peer.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), build)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
         // Objects remain retained until after service Abort's independent observations.
         std::hint::black_box(&hosted.service);
         hosted.shutdown().await;

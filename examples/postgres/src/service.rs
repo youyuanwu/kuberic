@@ -168,7 +168,7 @@ impl StatefulServiceReplica for PgService {
             .map_err(|_| RuntimeError::Closed)?;
         let cancellation = self.cancellation.clone();
         let instance = Arc::downgrade(&self.instance);
-        tokio::spawn(async move {
+        let reporter = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
@@ -186,6 +186,7 @@ impl StatefulServiceReplica for PgService {
                 }
             }
         });
+        driver.retain_fault_owner(reporter).await;
         let interfaces = context
             .partition
             .with_factory(Arc::new(PgReplicatorFactory(driver)))
@@ -288,6 +289,8 @@ impl ReplicatorFactory for PgReplicatorFactory {
         }
         self.0
             .configure_public_v1(settings, context.identity()?, context.process_session_id()?)?;
-        Ok(self.interfaces())
+        self.0.configure_public_host(context.clone())?;
+        self.interfaces()
+            .with_custom_control(&context, self.0.clone())
     }
 }

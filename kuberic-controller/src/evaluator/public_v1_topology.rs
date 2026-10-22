@@ -1081,6 +1081,15 @@ fn choose_primary(
         }
         return Err("planned switchover target is unavailable".into());
     }
+    if current.is_none() && !replicas.is_empty() && replicas.iter().all(fresh_unknown_history) {
+        // Local initial authority, not a retained-history election or a made-up
+        // progress value. The native database can still be uninitialized here.
+        return replicas
+            .iter()
+            .map(|replica| replica.report.replica.replica_id)
+            .min()
+            .ok_or_else(|| "no fresh initial replica".into());
+    }
     if let Some(current) = current
         && replicas.iter().any(|replica| {
             current.members.iter().any(|member| {
@@ -1185,6 +1194,30 @@ fn desired_configuration(
         members,
         write_quorum,
     ))
+}
+
+fn fresh_unknown_history(replica: &PublicV1TopologyReplica) -> bool {
+    let report = &replica.report;
+    let fresh_open = PublicOperationProgram::Open {
+        replica: report.replica.clone(),
+        existing: false,
+    };
+    report.has_current_open_endpoint()
+        && report.role == ReplicaRole::None
+        && report.configuration.is_none()
+        && report.data_loss_recovery.is_none()
+        && report.active_operations.is_empty()
+        && report.progress.current() == Some(kuberic_runtime::application::INVALID_LSN)
+        && report.progress.capability() == Some(kuberic_runtime::application::INVALID_LSN)
+        && !report.completed_operations.is_empty()
+        && report.completed_operations.iter().all(|completion| {
+            completion.call_kind == PublicV1CallKind::Open
+                && completion.result == PublicV1OperationResult::Succeeded
+                && completion.input_digest == fresh_open.digest()
+                && completion.process_session_id == report.process_session_id
+                && completion.storage_incarnation == report.storage_incarnation
+                && completion.history == report.history
+        })
 }
 
 fn majority(count: usize) -> u32 {
@@ -1975,6 +2008,256 @@ mod tests {
                 result: PublicV1OperationResult::Succeeded,
             });
         replica
+    }
+
+    fn fresh_unknown(id: i64) -> PublicV1TopologyReplica {
+        use kuberic_runtime::protocol::public_operations::ProgressQueryResult;
+        let mut replica = replica(id, ReplicaRole::None);
+        replica.report.progress.current_progress = ProgressQueryResult::Value(-1);
+        replica.report.progress.catch_up_capability = ProgressQueryResult::Value(-1);
+        // Successful Open has already advanced the current reporting mode to
+        // Existing. Only the retained exact New-Open digest establishes origin.
+        replica.report.completed_operations[0].input_digest = PublicOperationProgram::Open {
+            replica: replica.report.replica.clone(),
+            existing: false,
+        }
+        .digest();
+        replica
+    }
+
+    #[test]
+    fn fresh_initial_authority_preserves_unknown_progress_and_singleton_membership() {
+        let replicas = vec![fresh_unknown(2), fresh_unknown(1)];
+        assert_eq!(
+            choose_primary(None, &replicas, None).unwrap(),
+            ReplicaId::new(1)
+        );
+        assert_eq!(replicas[0].report.progress.current(), Some(-1));
+        let accepted = accepted(&replicas[0]);
+        let next = desired_configuration(
+            None,
+            &[replicas[1].clone()],
+            ReplicaId::new(1),
+            accepted.history.data_loss_number,
+        )
+        .unwrap();
+        assert_eq!(next.members.len(), 1);
+        assert!(
+            matches!(plan_public_v1_topology(&accepted,None,&replicas,2,None,None,"rv").unwrap(),
+            PublicV1TopologyPlan::Begin { command, .. } if matches!(command.intent.program,
+                Some(PublicOperationProgram::Role { role: ReplicaRole::Primary,.. })))
+        );
+    }
+
+    #[test]
+    fn fresh_initial_authority_rejects_missing_failed_and_retained_provenance() {
+        use kuberic_runtime::protocol::public_operations::ProgressQueryResult;
+        let fresh = fresh_unknown(1);
+        let mut mutations = Vec::new();
+        let mut changed = fresh.clone();
+        changed.report.completed_operations.clear();
+        mutations.push(changed);
+        let mut changed = fresh.clone();
+        changed.report.completed_operations[0].input_digest = PublicOperationProgram::Open {
+            replica: changed.report.replica.clone(),
+            existing: true,
+        }
+        .digest();
+        mutations.push(changed);
+        let mut changed = fresh.clone();
+        changed.report.role = ReplicaRole::IdleSecondary;
+        mutations.push(changed);
+        let mut changed = fresh.clone();
+        changed.report.completed_operations[0].process_session_id = ProcessSessionId::new("old");
+        mutations.push(changed);
+        let mut changed = fresh.clone();
+        changed.report.completed_operations[0]
+            .storage_incarnation
+            .storage_generation = StorageGeneration::new("old");
+        mutations.push(changed);
+        let mut changed = fresh.clone();
+        changed.report.completed_operations[0].history.history_id =
+            kuberic_runtime::protocol::types::HistoryId::new("old");
+        mutations.push(changed);
+        let mut changed = fresh.clone();
+        changed.report.completed_operations[0].result =
+            PublicV1OperationResult::Failed("Open failed".into());
+        mutations.push(changed);
+        let mut changed = fresh.clone();
+        let mut prior = changed.report.completed_operations[0].clone();
+        prior.call_kind = PublicV1CallKind::Role;
+        changed.report.completed_operations.push(prior);
+        mutations.push(changed);
+        for query in [
+            ProgressQueryResult::NotReady,
+            ProgressQueryResult::Failed("query failed".into()),
+            ProgressQueryResult::NotQueried("unavailable".into()),
+        ] {
+            let mut changed = fresh.clone();
+            changed.report.progress.current_progress = query.clone();
+            mutations.push(changed);
+            let mut changed = fresh.clone();
+            changed.report.progress.catch_up_capability = query;
+            mutations.push(changed);
+        }
+        for changed in mutations {
+            assert!(!fresh_unknown_history(&changed));
+            assert!(choose_primary(None, &[changed], None).is_err());
+        }
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            ReplicaId::new(2),
+            vec![ConfigurationMember {
+                identity: replica(2, ReplicaRole::Primary).report.replica,
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        assert!(
+            choose_primary(Some(&current), &[fresh.clone()], None).is_err(),
+            "a retained configuration cannot borrow fresh initialization"
+        );
+        assert!(
+            choose_primary(None, &[fresh], Some(ReplicaId::new(1))).is_err(),
+            "switchover is not initialization"
+        );
+    }
+
+    #[test]
+    fn fresh_initial_authority_requires_every_exact_participant_through_full_planner() {
+        use kuberic_runtime::protocol::public_operations::{
+            ProgressQueryResult, PublicV1InstalledConfiguration,
+        };
+        let primary = fresh_unknown(1);
+        let other = fresh_unknown(2);
+        let status = accepted(&primary);
+        let mut bad = Vec::new();
+        let mut changed = other.clone();
+        let mut later = changed.report.completed_operations[0].clone();
+        later.operation_id = OperationId::new("later-existing-open");
+        later.revision += 1;
+        later.input_digest = PublicOperationProgram::Open {
+            replica: changed.report.replica.clone(),
+            existing: true,
+        }
+        .digest();
+        changed.report.completed_operations.push(later);
+        bad.push(changed);
+        let mut changed = other.clone();
+        let program = PublicOperationProgram::Role {
+            epoch: Epoch::new(0, 1),
+            role: ReplicaRole::Primary,
+        };
+        changed.report.active_operations.push(
+            kuberic_runtime::protocol::public_operations::PublicOperationIntent {
+                identity: changed.report.identity.clone(),
+                operation_id: OperationId::new("active-role"),
+                revision: 2,
+                process_session_id: changed.report.process_session_id.clone(),
+                class:
+                    kuberic_runtime::protocol::public_operations::PublicOperationClass::Authority,
+                input_digest: program.digest(),
+                replay_disposition: program.replay_disposition(),
+                lifecycle: None,
+                program: Some(program),
+            },
+        );
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.configuration = Some(PublicV1InstalledConfiguration {
+            voting: PublicConfiguration {
+                current: ConfigurationDescriptor::new(
+                    Epoch::new(0, 1),
+                    ReplicaId::new(2),
+                    vec![ConfigurationMember {
+                        identity: changed.report.replica.clone(),
+                        role: ReplicaRole::Primary,
+                    }],
+                    1,
+                ),
+                previous: None,
+                replicas: vec![],
+            },
+            idle_replicas: vec![],
+        });
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.history.history_id =
+            kuberic_runtime::protocol::types::HistoryId::new("different-report-history");
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.history.protocol_generation = PublicProtocolGeneration::new(2);
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.completed_operations[0].history.history_id =
+            kuberic_runtime::protocol::types::HistoryId::new("different-open-history");
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.replica.instance_id = ReplicaInstanceId::new("different-pod");
+        changed.report.storage_incarnation.replica = changed.report.replica.clone();
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.replica.agent_generation = AgentGeneration::new("different-generation");
+        changed.report.storage_incarnation.replica = changed.report.replica.clone();
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.storage_incarnation.storage_generation =
+            StorageGeneration::new("different-storage-generation");
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.storage_incarnation.storage = ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("other-pod"),
+            pvc_uid: PvcUid::new("other-pvc"),
+        };
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.completed_operations[0].result = PublicV1OperationResult::Cancelled;
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.completed_operations[0].result =
+            PublicV1OperationResult::Ambiguous("uncertain Open".into());
+        bad.push(changed);
+        let mut changed = other.clone();
+        changed.report.progress.current_progress = ProgressQueryResult::Value(-2);
+        bad.push(changed);
+        for capability in [0, 99, -2] {
+            let mut changed = other.clone();
+            changed.report.progress.catch_up_capability = ProgressQueryResult::Value(capability);
+            bad.push(changed);
+        }
+        for changed in bad {
+            let result = plan_public_v1_topology(
+                &status,
+                None,
+                &[primary.clone(), changed],
+                2,
+                None,
+                None,
+                "rv",
+            );
+            assert!(
+                matches!(result, Err(_) | Ok(PublicV1TopologyPlan::Wait))
+                    || matches!(result,Ok(PublicV1TopologyPlan::Begin {command,..}) if matches!(command.intent.program,Some(PublicOperationProgram::Open {..}))),
+                "nonselected bad participant authorized initial role/configuration"
+            );
+        }
+        for current in [0, 99] {
+            let mut changed = other.clone();
+            changed.report.progress.current_progress = ProgressQueryResult::Value(current);
+            assert!(!fresh_unknown_history(&changed));
+            assert_eq!(
+                choose_primary(None, &[primary.clone(), changed], None).unwrap(),
+                ReplicaId::new(2),
+                "legitimate ordinary nonnegative selection was changed by initialization exception"
+            );
+        }
+        let mut crossed = status.clone();
+        crossed.history.history_id =
+            kuberic_runtime::protocol::types::HistoryId::new("different-accepted-history");
+        assert!(matches!(
+            plan_public_v1_topology(&crossed, None, &[primary, other], 2, None, None, "rv"),
+            Ok(PublicV1TopologyPlan::Wait)
+        ));
     }
 
     fn accepted(replica: &PublicV1TopologyReplica) -> PublicV1AcceptedStatus {

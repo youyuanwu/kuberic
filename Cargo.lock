@@ -1817,6 +1817,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "kuberic-controller",
  "kuberic-runtime",
  "postgres-replicated",
  "prost",
