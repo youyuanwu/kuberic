@@ -1130,10 +1130,11 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         for id in 116..119 {
             let mut binding = BindingFactory::new().build(&failing, &target, "join-failure");
             binding.target.replica = native_identity(id, "join-failure-target");
+            let cancellation = failing.driver.public_owner().work.lock().unwrap().clone();
             let mut state = failing.driver.public_owner().state.lock().await;
             failing
                 .driver
-                .public_grant(&mut state, TransportBinding::Build(binding))
+                .public_grant(&mut state, TransportBinding::Build(binding), &cancellation)
                 .await
                 .unwrap();
             credentials.push(state.grants.last().unwrap().credential.clone());
@@ -2195,10 +2196,15 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
 
         let cancelled = bindings.build(&source, &target, "cancelled-build");
         let (cancelled_active, cancelled_credential) = {
+            let cancellation = source.driver.public_owner().work.lock().unwrap().clone();
             let mut state = source.driver.public_owner().state.lock().await;
             let (active, created) = source
                 .driver
-                .public_grant(&mut state, TransportBinding::Build(cancelled.clone()))
+                .public_grant(
+                    &mut state,
+                    TransportBinding::Build(cancelled.clone()),
+                    &cancellation,
+                )
                 .await
                 .unwrap();
             assert!(created);

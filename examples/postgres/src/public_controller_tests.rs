@@ -199,6 +199,419 @@ async fn public_v1_postgres_controller_delayed_build_invalidation() {
     run(false, Some(false)).await;
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_controller_pre_effect_invalidation() {
+    for source_cut in [true, false] {
+        let factory = Factory::default();
+        let mut cluster = TestCluster::builder(factory.clone())
+            .initial_replicas(1)
+            .scenario_timeout(Duration::from_secs(120))
+            .start()
+            .await
+            .unwrap();
+        let mut probes = Vec::new();
+        let mut inspected = None;
+        let result: TestResult = async {
+            let topology = cluster.settle_members(1).await?;
+            let source = cluster.service(topology.primary()).await?;
+            cluster.scale_to(2).await?;
+            let intent = cluster
+                .pause_at(Barrier::intent(PublicV1CallKind::Build))
+                .await?;
+            let command = intent
+                .evidence()
+                .operation()
+                .command()
+                .map_err(|source| TestError::new(ErrorKind::Application, source.to_string()))?;
+            let Some(PublicOperationProgram::Build(input)) = command.intent.program.as_ref() else {
+                return Err(TestError::new(
+                    ErrorKind::Application,
+                    "pre-effect Build missing",
+                ));
+            };
+            let observation = cluster.observe().await?;
+            let target_ref = observation
+                .replicas()
+                .find(|reference| reference.identity() == &input.replica)
+                .cloned()
+                .ok_or_else(|| {
+                    TestError::new(ErrorKind::Application, "pre-effect target missing")
+                })?;
+            let target = cluster.service(&target_ref).await?;
+            let faulted = if source_cut {
+                source.native_driver()
+            } else {
+                target.native_driver()
+            };
+            inspected = Some(faulted.clone());
+            let gate = faulted.pause_public_build_effects();
+            let attempt = input.attempt.clone();
+            cluster.resume(intent).await?;
+            cluster
+                .drive(async {
+                    gate.entered.notified().await;
+                    Ok::<(), TestError>(())
+                })
+                .await?;
+            let authority = source
+                .native_driver()
+                .public_owner()
+                .host
+                .get()
+                .unwrap()
+                .outbound_build_authority(&attempt)
+                .await
+                .map_err(error)?;
+            check(
+                faulted
+                    .public_owner()
+                    .effect_starts
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0,
+                "effects began before serialized admission",
+            )?;
+            probes.push(ProcessProbe::postgres(source.instance().data_dir()));
+            faulted
+                .public_owner()
+                .host
+                .get()
+                .unwrap()
+                .report_fault(FaultType::Transient)
+                .await
+                .map_err(error)?;
+            check(
+                faulted
+                    .public_owner()
+                    .host
+                    .get()
+                    .unwrap()
+                    .validate_build_authority(&authority)
+                    .await
+                    .is_err(),
+                "pre-effect authority remained live",
+            )?;
+            gate.release.notify_one();
+            cluster
+                .probe(async {
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        loop {
+                            let target_settled = if source_cut {
+                                target
+                                    .native_driver()
+                                    .public_owner()
+                                    .inbound_owner
+                                    .lock()
+                                    .unwrap()
+                                    .is_none()
+                            } else {
+                                target
+                                    .native_driver()
+                                    .public_owner()
+                                    .inbound_owner
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .is_some_and(|owner| owner.result.borrow().is_some())
+                            };
+                            if target_settled
+                                && source
+                                    .native_driver()
+                                    .public_owner()
+                                    .host
+                                    .get()
+                                    .unwrap()
+                                    .validate_build_authority(&authority)
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .map_err(error)
+                })
+                .await?;
+            check(
+                faulted
+                    .public_owner()
+                    .effect_starts
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0,
+                "fenced queued request acquired mutation/cleanup scope",
+            )?;
+            check(
+                !target.instance().data_dir().join("PG_VERSION").exists()
+                    && target
+                        .native_driver()
+                        .durable
+                        .snapshot()
+                        .await
+                        .system_identifier
+                        .is_none(),
+                "fenced pre-effect request prepared native database/copy state",
+            )?;
+            if source_cut {
+                check(
+                    source
+                        .instance()
+                        .data_dir()
+                        .join("pg_replslot")
+                        .read_dir()
+                        .map_err(error)?
+                        .next()
+                        .is_none(),
+                    "dead source attempt created a persistent physical slot",
+                )?;
+                check(
+                    target
+                        .native_driver()
+                        .public_owner()
+                        .inbound_owner
+                        .lock()
+                        .unwrap()
+                        .is_none(),
+                    "dead source attempt launched a native target owner",
+                )?;
+            }
+            Ok(())
+        }
+        .await;
+        cluster.finish(result).await.unwrap_or_else(|failure| {
+            panic!(
+                "pre-effect source={source_cut}: {failure:#}; sources {:?}",
+                failure
+                    .sources()
+                    .map(|source| source.to_string())
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(
+            inspected
+                .unwrap()
+                .public_owner()
+                .effect_starts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        for probe in probes {
+            probe.assert_gone().await;
+        }
+        assert!(factory.0.lock().unwrap().is_empty());
+    }
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_graceful_close_observes_acknowledged_tail() {
+    // Direct protected-Close preservation, not a controller-formation witness.
+    let directory = OracleDataDir::new();
+    let hosted = production_service(directory.path().join("gc"), 301).await;
+    let before = hosted.driver.durable.snapshot().await.policy_certified_lsn;
+    let (sql, connection) = hosted.driver.instance.connect_application().await.unwrap();
+    sql.batch_execute(
+        "CREATE TABLE graceful_tail(id integer primary key);
+        INSERT INTO graceful_tail SELECT value FROM generate_series(1,64) AS value",
+    )
+    .await
+    .unwrap();
+    drop(sql);
+    connection.await.unwrap();
+    let acknowledged = hosted.driver.current_progress().await.unwrap();
+    assert!(acknowledged > before);
+    assert!(
+        hosted.driver.durable.snapshot().await.policy_certified_lsn < acknowledged,
+        "test must not persist an explicit snapshot before graceful Close"
+    );
+    let process = ProcessProbe::postgres(hosted.driver.instance.data_dir());
+    Replicator::close(hosted.driver.as_ref()).await.unwrap();
+    let final_state = hosted.driver.durable.revalidate().await.unwrap();
+    assert!(
+        final_state.policy_certified_lsn >= acknowledged,
+        "graceful Close skipped final durable native observation"
+    );
+    assert!(final_state.postgres_stopped && final_state.external_access_closed);
+    process.assert_reaped();
+    assert!(hosted.driver.public_owner().owner.lock().await.is_none());
+    assert!(hosted.driver.fault_owner.lock().await.is_none());
+    hosted.shutdown().await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_graceful_close_cancels_source_inspect() {
+    // Real controller dispatch/transport establishes the pending native Build;
+    // the terminal action here is deliberately direct protected Close.
+    for cached in [false, true] {
+        let factory = Factory::default();
+        let mut cluster = TestCluster::builder(factory.clone())
+            .initial_replicas(1)
+            .scenario_timeout(Duration::from_secs(120))
+            .start()
+            .await
+            .unwrap();
+        let mut gates = Vec::<Arc<BuildCompletionGate>>::new();
+        let mut observer = None;
+        let mut probes = Vec::new();
+        let result: TestResult = async {
+            let singleton = cluster.settle_members(1).await?;
+            let source = cluster.service(singleton.primary()).await?;
+            cluster.scale_to(2).await?;
+            let intent = cluster
+                .pause_at(Barrier::intent(PublicV1CallKind::Build))
+                .await?;
+            let command =
+                intent.evidence().operation().command().map_err(|failure| {
+                    TestError::new(ErrorKind::Application, failure.to_string())
+                })?;
+            let Some(PublicOperationProgram::Build(input)) = command.intent.program.as_ref() else {
+                return Err(TestError::new(
+                    ErrorKind::Application,
+                    "Inspect-cut Build missing",
+                ));
+            };
+            let observation = cluster.observe().await?;
+            let reference = observation
+                .replicas()
+                .find(|replica| replica.identity() == &input.replica)
+                .cloned()
+                .ok_or_else(|| {
+                    TestError::new(ErrorKind::Application, "Inspect-cut target missing")
+                })?;
+            let target = cluster.service(&reference).await?;
+            let inspect = if cached {
+                let completion = source.native_driver().pause_public_build_completion();
+                gates.push(completion.clone());
+                cluster.resume(intent).await?;
+                cluster
+                    .drive(async {
+                        completion.entered.notified().await;
+                        Ok::<(), TestError>(())
+                    })
+                    .await?;
+                let binding = target
+                    .native_driver()
+                    .public_owner()
+                    .state
+                    .lock()
+                    .await
+                    .built
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TestError::new(ErrorKind::Application, "actual copied target missing")
+                    })?
+                    .binding
+                    .clone();
+                let inspect = source.native_driver().pause_public_source_inspect();
+                gates.push(inspect.clone());
+                let sender = source.native_driver().clone();
+                observer = Some(tokio::spawn(async move {
+                    sender
+                        .public_rpc(
+                            &binding.target.replication_address,
+                            &Request::Build(binding.clone()),
+                        )
+                        .await
+                }));
+                inspect
+            } else {
+                let inspect = source.native_driver().pause_public_source_inspect();
+                gates.push(inspect.clone());
+                cluster.resume(intent).await?;
+                inspect
+            };
+            cluster
+                .drive(async {
+                    inspect.entered.notified().await;
+                    Ok::<(), TestError>(())
+                })
+                .await?;
+            let effects = target
+                .native_driver()
+                .public_owner()
+                .effect_starts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            check(
+                effects == usize::from(cached),
+                "Inspect reader duplicated/acquired mutation ownership",
+            )?;
+            probes.push(ProcessProbe::postgres(source.instance().data_dir()));
+            if cached {
+                probes.push(ProcessProbe::postgres(target.instance().data_dir()));
+            }
+            // Do not release the genuine source response until Close completes.
+            // An unrelated Abort must not be needed to release this reader.
+            cluster
+                .probe(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        Replicator::close(target.native_driver().as_ref()),
+                    )
+                    .await
+                    .map_err(error)?
+                    .map_err(error)
+                })
+                .await?;
+            check(
+                target.native_driver().public_closed(),
+                "Close failed to join pending Inspect owner",
+            )?;
+            check(
+                target
+                    .native_driver()
+                    .public_owner()
+                    .effect_starts
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == effects,
+                "cancelled Inspect observer entered new transfer effects",
+            )?;
+            if !cached {
+                check(
+                    !target.instance().data_dir().join("PG_VERSION").exists()
+                        && target
+                            .native_driver()
+                            .durable
+                            .snapshot()
+                            .await
+                            .system_identifier
+                            .is_none(),
+                    "preflight cancellation mutated native copy state",
+                )?;
+            }
+            if let Some(task) = observer.as_mut() {
+                check(
+                    tokio::time::timeout(Duration::from_secs(5), task)
+                        .await
+                        .map_err(error)?
+                        .map_err(error)?
+                        .is_err(),
+                    "cached observer credited completion after Close",
+                )?;
+                observer.take();
+            }
+            Ok(())
+        }
+        .await;
+        for gate in gates {
+            gate.release.notify_one();
+        }
+        if let Some(task) = observer {
+            task.abort();
+            let _ = task.await;
+        }
+        cluster
+            .finish(result)
+            .await
+            .unwrap_or_else(|failure| panic!("cached={cached}: {failure:#}"));
+        for probe in probes {
+            probe.assert_gone().await;
+        }
+        assert!(factory.0.lock().unwrap().is_empty());
+    }
+}
+
 async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
     let factory = Factory::default();
     let mut cluster = TestCluster::builder(factory.clone())
@@ -210,6 +623,9 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         .expect("native controller harness starts");
     let mut probes = Vec::new();
     let mut retained = None;
+    let mut queued_replay = None;
+    let mut cancelled_replay = None;
+    let mut pending_replay_gate = None;
     let result:TestResult=async {
         let open=cluster.pause_at(Barrier::completion(PublicV1CallKind::Open)).await?;
         let opened=cluster.observe().await?;
@@ -247,14 +663,45 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         let target=cluster.service(&target_ref).await?;
         let gate=target.native_driver().pause_public_build_completion();
         let source_gate=source.native_driver().pause_public_build_completion();
+        let effects=target.native_driver().pause_public_build_effects();
         cluster.resume(build_intent).await?;
-        cluster.drive(async { gate.entered.notified().await; Ok::<(),TestError>(()) }).await?;
-        // These negatives run while the exact controller attempt is genuinely
-        // live, after real backup/replay but before completion publication.
+        cluster.drive(async { effects.entered.notified().await; Ok::<(),TestError>(()) }).await?;
         let binding=source.native_driver().public_owner().state.lock().await.grants.iter()
             .find_map(|grant|match &grant.binding { TransportBinding::Build(build) if build.target.replica==*target_ref.identity()=>Some(build.clone()),_=>None })
             .ok_or_else(||TestError::new(ErrorKind::Application,"live native source grant missing"))?;
         let live=binding.authority.as_ref().ok_or_else(||TestError::new(ErrorKind::Application,"host authority missing"))?;
+        if !fail_cleanup && invalidate_source.is_none() {
+            pending_replay_gate=Some(target.native_driver().pause_public_build_replay());
+        }
+        let replay_source=source.native_driver().clone(); let replay_binding=binding.clone();
+        queued_replay=Some(tokio::spawn(async move {
+            replay_source.public_rpc(&replay_binding.target.replication_address,&Request::Build(replay_binding.clone())).await
+        }));
+        cluster.probe(async {
+            tokio::time::timeout(Duration::from_secs(5),async {
+                while target.native_driver().public_build_waiters()<2 {tokio::task::yield_now().await;}
+            }).await.map_err(error)
+        }).await?;
+        let replay_source=source.native_driver().clone(); let replay_binding=binding.clone();
+        cancelled_replay=Some(tokio::spawn(async move {
+            replay_source.public_rpc(&replay_binding.target.replication_address,&Request::Build(replay_binding.clone())).await
+        }));
+        cluster.probe(async {
+            tokio::time::timeout(Duration::from_secs(5),async {
+                while target.native_driver().public_build_waiters()<3 {tokio::task::yield_now().await;}
+            }).await.map_err(error)
+        }).await?;
+        let cancelled=cancelled_replay.take().unwrap();
+        cancelled.abort(); let _=cancelled.await;
+        check(target.native_driver().public_owner().effect_starts.load(std::sync::atomic::Ordering::SeqCst)==0
+            && !target.instance().data_dir().join("PG_VERSION").exists(),
+            "queued response observer acquired transfer mutation/cleanup ownership")?;
+        target.native_driver().public_owner().host.get().unwrap().validate_build_authority(live).await.map_err(error)?;
+        effects.release.notify_one();
+        cluster.drive(async { gate.entered.notified().await; Ok::<(),TestError>(()) }).await?;
+        // The same retained native owner now performed real backup/replay.
+        check(target.native_driver().public_owner().effect_starts.load(std::sync::atomic::Ordering::SeqCst)==1,
+            "overlapping exact native requests duplicated mutation ownership")?;
         source.native_driver().public_owner().host.get().unwrap().validate_build_authority(live).await.map_err(error)?;
         target.native_driver().public_owner().host.get().unwrap().validate_build_authority(live).await.map_err(error)?;
         let generation=target.instance().generation_id();
@@ -298,7 +745,27 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             probes.push(ProcessProbe::postgres(source.instance().data_dir()));
             probes.push(ProcessProbe::postgres(target.instance().data_dir()));
             let faulted=if source_fault {source.native_driver()} else {target.native_driver()};
-            faulted.public_owner().host.get().unwrap().report_fault(FaultType::Transient).await.map_err(error)?;
+            if source_fault {
+                // Helper-contract negative: force a retryable first round-trip
+                // result, using this genuinely hosted source's live validator.
+                // This is not fabricated SQL/transfer success evidence.
+                let rounds=std::sync::atomic::AtomicUsize::new(0);
+                let context=faulted.public_owner().host.get().unwrap();
+                let checked=|| async {
+                    context.validate_build_authority(live).await
+                        .map_err(|failure|crate::instance::PgError::Process(failure.to_string()))
+                };
+                let result=crate::native::retire_slot_rounds(&checked,|| async {
+                    rounds.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+                    context.report_fault(FaultType::Transient).await
+                        .map_err(|failure|crate::instance::PgError::Process(failure.to_string()))?;
+                    Ok(false)
+                }).await;
+                check(result.is_err() && rounds.load(std::sync::atomic::Ordering::SeqCst)==1,
+                    "slot retry helper issued a new mutation round after source invalidation")?;
+            } else {
+                faulted.public_owner().host.get().unwrap().report_fault(FaultType::Transient).await.map_err(error)?;
+            }
             check(faulted.public_owner().host.get().unwrap().validate_build_authority(live).await.is_err(),
                 "supported fault did not synchronously invalidate exact authority")?;
             gate.release.notify_one();
@@ -322,10 +789,19 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             check(target.native_driver().public_request(Request::Build(binding.clone())).await.is_err(),
                 "late old native attempt restarted after containment")?;
             check(target.instance().generation_id()==stopped_generation,"stale attempt mutated contained storage/process scope")?;
+            check(queued_replay.take().unwrap().await.map_err(error)?.is_err(),
+                "queued native observer credited invalidated completion")?;
             return Ok(());
         }
         gate.release.notify_one();
         cluster.drive(async { source_gate.entered.notified().await; Ok::<(),TestError>(()) }).await?;
+        if let Some(gate)=pending_replay_gate.as_ref() {
+            cluster.probe(async { gate.entered.notified().await; Ok::<(),TestError>(()) }).await?;
+        } else {
+            let concurrent=queued_replay.take().unwrap().await.map_err(error)?.map_err(error)?;
+            check(matches!(concurrent,Response::Built(ref completion) if completion.binding==binding),
+                "overlapping exact native observer did not attach to original completion")?;
+        }
         let replay_generation=target.instance().generation_id();
         let replay_metadata=target.native_driver().durable.snapshot().await.generation;
         let replay=source.native_driver().public_rpc(&binding.target.replication_address,&Request::Build(binding.clone())).await.map_err(error)?;
@@ -452,6 +928,18 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
                 "admission report scope/membership is not exact")?;
         }
         check(target.instance().connect_application().await.is_err(),"stable secondary replay was mistaken for ordinary read access")?;
+        if let Some(gate)=pending_replay_gate.take() {
+            let generation=target.instance().generation_id();
+            let metadata=target.native_driver().durable.snapshot().await.generation;
+            let receiver=target.native_driver().public_owner().state.lock().await.receiver.clone();
+            gate.release.notify_one();
+            check(queued_replay.take().unwrap().await.map_err(error)?.is_err(),
+                "queued old observer survived copy-to-peer authority advancement")?;
+            check(target.instance().generation_id()==generation
+                && target.native_driver().durable.snapshot().await.generation==metadata
+                && target.native_driver().public_owner().state.lock().await.receiver==receiver,
+                "queued old observer cleaned up or rewrote the admitted peer owner")?;
+        }
         let successor_receiver=target.native_driver().public_owner().state.lock().await.receiver.clone();
         let successor_generation=target.instance().generation_id();
         let successor_metadata=target.native_driver().durable.snapshot().await.generation;
@@ -492,6 +980,17 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         }
         Ok(())
     }.await;
+    if let Some(gate) = pending_replay_gate.take() {
+        gate.release.notify_one();
+    }
+    if let Some(observer) = queued_replay.take() {
+        observer.abort();
+        let _ = observer.await;
+    }
+    if let Some(observer) = cancelled_replay.take() {
+        observer.abort();
+        let _ = observer.await;
+    }
     let finished = cluster.finish(result).await;
     if fail_cleanup {
         assert!(

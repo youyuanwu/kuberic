@@ -322,6 +322,22 @@ rejects delayed completion. Cleanup errors remain errors while actual owners
 are joined. Native companion stale-revoke calls are explicitly component
 negatives, not substituted controller positives.
 
+Overlapping native RPCs attach before mutation ownership; dropping a queued
+observer cannot cancel the transfer or clean up a later admitted peer. Separate
+source/target pre-effect cuts reject before slot/database preparation. The
+direct protected-Close preservation case checks acknowledged WAL beyond the
+prior durable certificate without an intervening explicit snapshot; it is
+not labeled controller dispatch. Actual-host runtime cuts separately suspend
+authority reads/commit, then fence, cancel or revoke before release.
+Another direct protected-Close case holds genuine source Inspect responses
+during target preflight and cached replay, requiring bounded interruption
+without releasing the response or invoking Abort first. A scoped slot-retry
+helper negative injects a retryable first response, invalidates a genuinely
+hosted source and rejects the next mutation round; that injected helper reply
+is not database transfer/SQL success evidence. Runtime unit coverage separately
+holds compensation while shutdown observers overlap/disappear and checks
+shared sticky failure plus once-only successful application drainage.
+
 The separate
 [external runtime contract fixture](../../../kuberic-runtime/tests/support/custom_control.rs)
 uses an independently attached engine, real host journals/control dispatch and

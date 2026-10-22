@@ -143,6 +143,15 @@ installation replay cannot reauthorize copy. Failed/interrupted custom callbacks
 can remain `ContainmentPending` until actual terminal cleanup. Neither a return
 code nor cancellation fabricates a join.
 
+Protected Close/Abort must independently notify or cancel in-flight companion
+actions before awaiting serialized drain. An installer that can be released
+only by its own drain creates a dependency cycle and violates this contract.
+Successful native joining is retained once; later cleanup is exact
+compare-and-revoke and cannot repeat effects against replacement-owned storage.
+Retained compensation joins and failures are shared by concurrent and later
+shutdown observers; losing one response cannot convert a failed cleanup into
+successful containment.
+
 Use `ReplicatorFactoryContext::outbound_build_authority(build_id)` inside the
 accepted source Build to obtain its complete frozen authority. Revalidate with
 `validate_build_authority` before native effects, after awaits and before
@@ -156,6 +165,11 @@ incarnations, storage incarnations, process sessions, endpoints, epoch,
 configuration, Build ID, operation ID and revision. The canonical source input
 digest remains bound by the host's accepted operation, not a fabricated extra
 field in native callbacks or receipts.
+
+Local validation checks the coherent frozen source snapshot and the current
+operation's cancellation/fence state after awaits. Target validation checks
+both durable and process-local exact ingress ownership; a suspended reader
+cannot combine an old grant with a later revoked/fenced lifetime.
 
 Reports combine a successful exact host configuration with the companion's
 coherent native idle sample. Missing, failed, stale, torn, duplicate or
@@ -171,11 +185,11 @@ Unpublished downstream MySQL fixtures and the externally reported
 seven-completion trace are not reproduced by either fixture; downstream engines
 must requalify their own native transfer, lineage, replay, admission and fencing.
 
-Source anchors: [attachment:596–623](../../../kuberic-runtime/src/replicator/mod.rs#L596-L623),
-[read-only context:923–948](../../../kuberic-runtime/src/replicator/mod.rs#L923-L948),
-[local validation:1341–1474](../../../kuberic-runtime/src/host/hosting.rs#L1341-L1474),
-[retained actions:501–611](../../../kuberic-runtime/src/replicator/custom.rs#L501-L611),
-and [configuration evidence:890–938](../../../kuberic-runtime/src/host/public_lifecycle.rs#L890-L938).
-The [PG companion:412–502](../../../examples/postgres/src/public_v1.rs#L412-L502)
-and [controller cases:185–549](../../../examples/postgres/src/public_controller_tests.rs#L185-L549)
+Source anchors: [attachment:599–626](../../../kuberic-runtime/src/replicator/mod.rs#L599-L626),
+[read-only context:935–960](../../../kuberic-runtime/src/replicator/mod.rs#L935-L960),
+[local validation:1365–1558](../../../kuberic-runtime/src/host/hosting.rs#L1365-L1558),
+[retained actions:600–793](../../../kuberic-runtime/src/replicator/custom.rs#L600-L793),
+and [configuration evidence:892–940](../../../kuberic-runtime/src/host/public_lifecycle.rs#L892-L940).
+The [PG companion:518–612](../../../examples/postgres/src/public_v1.rs#L518-L612)
+and [controller cases:185–1048](../../../examples/postgres/src/public_controller_tests.rs#L185-L1048)
 are concrete engine/qualification references, not new native SF interfaces.

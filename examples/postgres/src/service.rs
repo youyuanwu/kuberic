@@ -88,6 +88,13 @@ impl PgService {
 
     pub fn abort_and_wait(&self) -> Result<()> {
         self.cancellation.cancel();
+        if self
+            .driver
+            .get()
+            .is_some_and(|driver| driver.public_closed())
+        {
+            return Ok(());
+        }
         self.instance.abort_owned().map_err(application_error)
     }
 
@@ -221,7 +228,15 @@ impl StatefulServiceReplica for PgService {
         self.cancellation.cancel();
         // An interrupted open has no opened driver, but may own a process tree
         // and a retained abort failure. Always join cleanup and surface that result.
-        let cleanup = self.instance.stop().await.map_err(application_error);
+        let cleanup = if self
+            .driver
+            .get()
+            .is_some_and(|driver| driver.public_closed())
+        {
+            Ok(())
+        } else {
+            self.instance.stop().await.map_err(application_error)
+        };
         match (result, cleanup) {
             (Err(error), Err(cleanup)) => Err(application_error(format!(
                 "{error}; PostgreSQL cleanup: {cleanup}"

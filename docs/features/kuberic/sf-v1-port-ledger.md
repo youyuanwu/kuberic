@@ -20,12 +20,15 @@ test discovery or a private adapter pass establishes neither current failure
 nor closure. “Supported” below is bounded to the cited behavior, not complete
 compatibility. “Unverified” is not “defective.”
 
-Bounded custom-native controller evidence is anchored to
+Bounded custom-native controller formation evidence is anchored to
 `366b362ce4e1c9fdc6aaf0fe64e6be78931e96a3`: the actual PostgreSQL
 [controller witnesses](../../../examples/postgres/src/public_controller_tests.rs)
 and runtime contract negatives were executed with the authorized PG smoke and
 targeted runtime/controller checks. This does not extend the older evidence
 above to native binary execution or unavailable downstream engines.
+Current linked witnesses additionally bound overlapping native observer
+ownership, serialized pre-effect invalidation and graceful Close observation;
+the formation anchor is not a blanket claim for every interleaving.
 
 ## Current semantic and gap dispositions
 

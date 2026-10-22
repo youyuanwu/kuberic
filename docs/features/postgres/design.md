@@ -85,8 +85,8 @@ terminal paths stop and reap the owned PostgreSQL run, join native gateways and
 leave PostgreSQL stopped. Separate authorized role/configuration work may later
 start it; closure does not unconditionally restart it or acknowledge a native
 fence merely from host status
-([drain:769–846](../../../examples/postgres/src/public_v1.rs#L769-L846),
-[denial:869–883](../../../examples/postgres/src/public_v1.rs#L869-L883)).
+([drain:1000–1072](../../../examples/postgres/src/public_v1.rs#L1000-L1072),
+[denial:1101–1117](../../../examples/postgres/src/public_v1.rs#L1101-L1117)).
 
 HBA reload and `pg_terminate_backend` alone miss accepted, unauthenticated
 sockets. Completed process fencing disconnects ordinary, retained administrative
@@ -136,6 +136,12 @@ Its exact process-local completion cache also revalidates durable/physical
 history and live source/target authority; it is not a durable generic-agent
 database receipt or permission to reopen revoked ingress.
 
+Target preflight and cached source-inspection reads observe captured work
+cancellation without acquiring process cleanup authority. Graceful Close can
+interrupt those reads before its final durable observation and lifetime join.
+Source slot retirement revalidates the hosted attempt before each new mutating
+SQL retry; this does not roll back an already-issued SQL statement.
+
 PGDATA helpers, native gateways and their retained join owners remain
 application-owned. Revocation removes copy ingress, not copied data or voter
 membership. A different uncertain receiver attempt requires containment/process
@@ -157,12 +163,12 @@ exception changes neither retained election nor native progress semantics.
 `WriteQuorum` with marked successors remains explicitly unsupported; ordinary
 unmarked waits and `All` retain their qualified native behavior.
 
-Selected implementation: [factory:278–296](../../../examples/postgres/src/service.rs#L278-L296),
-[companion:412–502](../../../examples/postgres/src/public_v1.rs#L412-L502),
-[retained drainage:506–554,957–992](../../../examples/postgres/src/public_v1.rs#L506-L554),
-[Close joins](../../../examples/postgres/src/public_v1.rs#L957-L992),
-[Build/replay:1963–2150](../../../examples/postgres/src/public_v1.rs#L1963-L2150)
-and [actual controller qualification:185–549](../../../examples/postgres/src/public_controller_tests.rs#L185-L549).
+Selected implementation: [factory:294–311](../../../examples/postgres/src/service.rs#L294-L311),
+[companion:518–612](../../../examples/postgres/src/public_v1.rs#L518-L612),
+[retained drainage:672–729](../../../examples/postgres/src/public_v1.rs#L672-L729),
+[Close joins:1189–1235](../../../examples/postgres/src/public_v1.rs#L1189-L1235),
+[Build/replay:2257–2587](../../../examples/postgres/src/public_v1.rs#L2257-L2587)
+and [native/controller qualification:185–1048](../../../examples/postgres/src/public_controller_tests.rs#L185-L1048).
 
 Physical replication slots belong to exact incarnations, not quorum votes.
 Slots reserve WAL before build and survive internal reconnection/restart.
@@ -350,6 +356,12 @@ invalidation, synchronous SQL/replay and completed native fencing. Owned short
 socket-path aliases identify the same declared backing storage, not a different
 storage incarnation. Administrative standby queries prove replay only, never
 ordinary secondary-read authorization.
+
+Hosted native retries share one retained exact attempt, while waiting/cache
+observers remain outside mutation cleanup. Captured cancellation and coherent
+host checks are repeated after serialized acquisition and preparation awaits.
+Graceful Close retains its bounded final native observation before cancelling
+the process lifetime; an already aborted owner does not invent that observation.
 
 PostgreSQL deliberately does not claim KSF-02's complete
 false/true/error/ambiguity matrix, KSF-10's Replicator-owned endpoint lifetime,

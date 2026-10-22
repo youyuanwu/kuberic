@@ -213,23 +213,43 @@ impl PgNativeObserver {
         &self,
         owners: &BTreeSet<ReplicaIdentity>,
     ) -> Result<(), PgError> {
+        self.reconcile_slot_owners_scoped(owners, || async { Ok(()) })
+            .await
+    }
+
+    pub(crate) async fn reconcile_slot_owners_scoped<F, Fut>(
+        &self,
+        owners: &BTreeSet<ReplicaIdentity>,
+        check: F,
+    ) -> Result<(), PgError>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<(), PgError>> + Send,
+    {
         self.instance
             .generation_step(
                 &self.instance.generation_lease(),
-                self.reconcile_slots_inner(owners),
+                self.reconcile_slots_inner(owners, &check),
             )
             .await
     }
 
-    async fn reconcile_slots_inner(
+    async fn reconcile_slots_inner<F, Fut>(
         &self,
         owners: &BTreeSet<ReplicaIdentity>,
-    ) -> Result<(), PgError> {
+        check: &F,
+    ) -> Result<(), PgError>
+    where
+        F: Fn() -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Result<(), PgError>> + Send,
+    {
+        check().await?;
         let expected = owners
             .iter()
             .map(replication_slot_name)
             .collect::<BTreeSet<_>>();
         let (client, _connection) = self.instance.connect().await?;
+        check().await?;
         let existing = client
             .query(
                 "SELECT slot_name, active FROM pg_replication_slots \
@@ -238,15 +258,19 @@ impl PgNativeObserver {
             )
             .await
             .map_err(|error| PgError::Query(format!("read managed physical slots: {error}")))?;
+        check().await?;
         let mut present = BTreeSet::new();
         for row in existing {
             let slot: String = row.get(0);
             present.insert(slot.clone());
             if !expected.contains(&slot) {
-                retire_slot(&client, &slot).await?;
+                check().await?;
+                retire_slot_scoped(&client, &slot, check).await?;
+                check().await?;
             }
         }
         for slot in expected.difference(&present) {
+            check().await?;
             client
                 .query_one(
                     "SELECT pg_create_physical_replication_slot($1::name, true)",
@@ -256,6 +280,7 @@ impl PgNativeObserver {
                 .map_err(|error| {
                     PgError::Query(format!("reserve physical replica WAL: {error}"))
                 })?;
+            check().await?;
         }
         Ok(())
     }
@@ -868,9 +893,17 @@ pub fn compile_synchronous_configuration(
     Ok(configuration)
 }
 
-async fn retire_slot(client: &tokio_postgres::Client, slot: &str) -> Result<(), PgError> {
+async fn retire_slot_scoped<C, CFut>(
+    client: &tokio_postgres::Client,
+    slot: &str,
+    check: &C,
+) -> Result<(), PgError>
+where
+    C: Fn() -> CFut + Send + Sync,
+    CFut: std::future::Future<Output = Result<(), PgError>> + Send,
+{
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        retire_slot_rounds(check, || async {
             // A walreceiver can reconnect after termination. Keep drain/drop in
             // one server round trip and retry that race, never acknowledge it.
             let result = client
@@ -885,26 +918,46 @@ async fn retire_slot(client: &tokio_postgres::Client, slot: &str) -> Result<(), 
                 )
                 .await;
             match result {
-                Ok(rows) if rows.iter().all(|row| row.get::<_, bool>(0)) => return Ok(()),
-                Ok(_) => {}
+                Ok(rows) if rows.iter().all(|row| row.get::<_, bool>(0)) => Ok(true),
+                Ok(_) => Ok(false),
                 Err(error)
-                    if error.code() == Some(&tokio_postgres::error::SqlState::OBJECT_IN_USE) => {}
+                    if error.code() == Some(&tokio_postgres::error::SqlState::OBJECT_IN_USE) =>
+                {
+                    Ok(false)
+                }
                 Err(error)
                     if error.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_OBJECT) =>
                 {
-                    return Ok(());
+                    Ok(true)
                 }
-                Err(error) => {
-                    return Err(PgError::Query(format!(
-                        "retire physical slot {slot}: {error:?}"
-                    )));
-                }
+                Err(error) => Err(PgError::Query(format!(
+                    "retire physical slot {slot}: {error:?}"
+                ))),
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
     })
     .await
     .map_err(|_| PgError::Timeout(format!("retire physical slot {slot}")))?
+}
+
+pub(crate) async fn retire_slot_rounds<C, CFut, F, Fut>(
+    check: &C,
+    round_trip: F,
+) -> Result<(), PgError>
+where
+    C: Fn() -> CFut + Send + Sync,
+    CFut: std::future::Future<Output = Result<(), PgError>> + Send,
+    F: Fn() -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<bool, PgError>> + Send,
+{
+    loop {
+        check().await?;
+        if round_trip().await? {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 pub(crate) fn replication_slot_name(identity: &ReplicaIdentity) -> String {

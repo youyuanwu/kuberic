@@ -8,10 +8,11 @@ retain their explicit `e2a47b6c631c974aa0135e81c3a7e3a439980ded` anchors.
 Native comparisons use Service Fabric
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 
-Custom-controller integration is separately anchored to Kuberic
+Bounded custom-controller formation evidence is separately anchored to Kuberic
 `366b362ce4e1c9fdc6aaf0fe64e6be78931e96a3` and the
 [supported companion contract](replicator-boundary.md#custom-controller-integration).
-Its actual PostgreSQL controller witnesses and runtime negative fixtures do
+Current authority/ownership contracts use the linked source and witnesses below.
+The PostgreSQL controller witnesses and runtime negative fixtures do
 not change the older pinned built-in/component evidence below.
 
 **Evidence is bounded:** targeted Rust selected-host regressions were executed
@@ -333,6 +334,18 @@ application-owned. Exact live native replay revalidates retained/physical
 history and returns the matching completion without repeating copy mutation.
 Revoked or stale authority cannot reuse that historical completion as ingress.
 
+Overlapping hosted native requests attach to one retained exact attempt.
+Queued/replay observers never acquire process cleanup authority; the serialized
+owner revalidates captured cancellation and live authority before slot/PGDATA/
+helper effects. A delayed rejected observer cannot stop or rewrite the later
+admitted peer. Direct-native caller cancellation remains a separate explicit
+operation cut, not a hosted accepted-operation response observer.
+
+Graceful Close interrupts pending work but retains a still-safe bounded final
+durable observation before lifetime cancellation; Abort does not invent that
+observation. Both paths retain exhaustive joins/errors. A completed close is
+idempotent and does not repeat effects against a later storage owner.
+
 The engine retains last successfully installed native membership and actual
 completed built-idle ownership separately from current transport/readiness.
 Normal same-history epoch advancement may drain transport without erasing the
@@ -358,9 +371,10 @@ external MySQL requalification and native executable differential remain outside
 this evidence.
 
 Current source anchors are the
-[PG companion/authority:412–593](../../../examples/postgres/src/public_v1.rs#L412-L593),
-[epoch handling:1235–1263](../../../examples/postgres/src/public_v1.rs#L1235-L1263),
-[Build/replay:1963–2150](../../../examples/postgres/src/public_v1.rs#L1963-L2150),
+[PG companion/authority:518–780](../../../examples/postgres/src/public_v1.rs#L518-L780),
+[epoch handling:1482–1516](../../../examples/postgres/src/public_v1.rs#L1482-L1516),
+[Build/replay:2257–2587](../../../examples/postgres/src/public_v1.rs#L2257-L2587),
+[graceful Close:1189–1235](../../../examples/postgres/src/public_v1.rs#L1189-L1235),
 [fresh authority gate:1084–1095,1199–1223](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1084-L1095)
 and [fresh provenance predicate](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1199-L1223).
 

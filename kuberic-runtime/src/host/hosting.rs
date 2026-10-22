@@ -181,6 +181,19 @@ struct RuntimeHost {
 }
 
 impl RuntimeHost {
+    fn custom_creation_live(&self, identity: ReplicatorCreationIdentity) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && !self.aborted.load(Ordering::Acquire)
+            && !self.replacement_fault_fenced.load(Ordering::Acquire)
+            && self.registered.get().is_some_and(|registered| {
+                registered.identity == identity
+                    && registered
+                        .native_runtime_control
+                        .as_ref()
+                        .is_some_and(|control| control.custom() && control.build_authority_open())
+            })
+    }
+
     fn selected_status(&self) -> Option<(AccessStatus, AccessStatus)> {
         if self.closed.load(Ordering::Acquire)
             || self.aborted.load(Ordering::Acquire)
@@ -1317,6 +1330,17 @@ impl ReplacementFaultBridge {
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
+    async fn revoke_custom_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.bridge()
+            .await?
+            .store
+            .revoke_exact_public_v1_inbound_build_authority(authority)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
     fn retain_custom_creation(
         &self,
         reservation: ReplicatorCreationReservation,
@@ -1346,29 +1370,48 @@ impl PartitionAccessView for HostAccessView {
     ) -> Result<()> {
         use crate::host::native_transport::{NativeBinding, NativeEndpoint};
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        if host.closed.load(Ordering::Acquire)
-            || host.aborted.load(Ordering::Acquire)
-            || host.replacement_fault_fenced.load(Ordering::Acquire)
-            || host.registered.get().is_none_or(|registered| {
-                registered.identity != reservation.identity(RuntimeHostToken::new())
-                    || registered
-                        .native_runtime_control
-                        .as_ref()
-                        .is_some_and(|control| !control.build_authority_open())
-            })
-        {
+        let creation = reservation.identity(RuntimeHostToken::new());
+        if !host.custom_creation_live(creation) {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         authority
             .validate()
             .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
-        let state = self
-            .bridge()
-            .await?
+        let bridge = self.bridge().await?;
+        let source = host.identity == authority.attempt.source;
+        let operation = if source {
+            Some(
+                bridge
+                    .registry
+                    .operation_for_validation(&authority.operation_id)
+                    .await
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+            )
+        } else {
+            None
+        };
+        let state = bridge
             .store
             .load_state()
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        #[cfg(feature = "testing")]
+        {
+            let cut = host.public_operation_cut.lock().unwrap().clone();
+            if let Some(cut) = cut {
+                cut.pause(
+                    crate::host::public_lifecycle::PublicCutPosition::BuildAuthorityRead,
+                    0,
+                )
+                .await;
+            }
+        }
+        if !host.custom_creation_live(creation)
+            || bridge.registry.is_fenced()
+            || state.identity.local_identity != host.identity
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let preview = state
             .public_v1_operation_state
             .as_ref()
@@ -1379,7 +1422,6 @@ impl PartitionAccessView for HostAccessView {
             .ok_or(RuntimeError::AuthorityNotAdmitted)?
             .1;
         let attempt = &authority.attempt;
-        let source = state.identity.local_identity == attempt.source;
         let endpoint = if source {
             &authority.source_address
         } else {
@@ -1431,10 +1473,58 @@ impl PartitionAccessView for HostAccessView {
             if record.stage != crate::host::state::PublicOperationStage::Running
                 || record.disposition.is_some()
                 || record.superseded_by.is_some()
-                || self
-                    .native_outbound_build_authority(&authority.operation_id)
-                    .await?
-                    != *authority
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            record
+                .intent
+                .validate()
+                .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
+            let Some(crate::protocol::public_operations::PublicOperationProgram::Build(input)) =
+                record.intent.program.as_ref()
+            else {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            };
+            let captured = preview
+                .build_records
+                .values()
+                .find(|captured| {
+                    captured.build_id == attempt.build_id
+                        && captured.operation_id == authority.operation_id
+                })
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            let expected = crate::protocol::public_operations::PublicInboundBuildAuthority {
+                operation_id: record.intent.operation_id.clone(),
+                operation_revision: record.intent.revision,
+                attempt: crate::protocol::public_operations::PublicBuildAttemptReference {
+                    resource_uid: state.identity.resource_uid.clone(),
+                    epoch: captured.epoch,
+                    build_id: captured.build_id.clone(),
+                    source: captured.source.clone(),
+                    source_storage: captured.source_storage.clone(),
+                    source_session: captured.source_session.clone(),
+                    target: captured.target.clone(),
+                    target_storage: captured.target_storage.clone(),
+                    target_session: captured.target_session.clone(),
+                },
+                history: captured.history.clone(),
+                current_configuration_id: input
+                    .current_configuration_id
+                    .clone()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                source_address: input.source_address.clone(),
+                target_address: captured.target_address.clone(),
+            };
+            let operation = operation.as_ref().unwrap();
+            let current = operation.snapshot();
+            if expected != *authority
+                || !operation.access_live()
+                || current.stage != crate::host::state::PublicOperationStage::Running
+                || current.disposition.is_some()
+                || current.superseded_by.is_some()
+                || current.intent != record.intent
+                || current.accepted_history != record.accepted_history
+                || current.accepted_storage != record.accepted_storage
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
@@ -1449,9 +1539,12 @@ impl PartitionAccessView for HostAccessView {
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
-            return Ok(());
+            return host
+                .custom_creation_live(creation)
+                .then_some(())
+                .ok_or(RuntimeError::AuthorityNotAdmitted);
         }
-        NativeBinding {
+        let validated = NativeBinding {
             history: authority.history.clone(),
             epoch: attempt.epoch,
             current_configuration_id: authority.current_configuration_id.clone(),
@@ -1470,7 +1563,24 @@ impl PartitionAccessView for HostAccessView {
             },
             build: Some(authority.clone()),
         }
-        .validate_for_state(&state, process, endpoint)
+        .validate_for_state(&state, process, endpoint);
+        validated?;
+        if !host.custom_creation_live(creation)
+            || (!source
+                && host
+                    .registered
+                    .get()
+                    .and_then(|registered| registered.native_runtime_control.as_ref())
+                    .is_none_or(|control| !control.inbound_build_live(authority)))
+            || operation.as_ref().is_some_and(|operation| {
+                !operation.access_live()
+                    || operation.snapshot().stage
+                        != crate::host::state::PublicOperationStage::Running
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
     }
     fn native_write_admission(&self) -> Result<Arc<StdMutex<()>>> {
         Ok(self
@@ -1779,12 +1889,43 @@ impl PartitionAccessView for HostAccessView {
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
-        self.bridge()
-            .await?
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let custom = host.registered.get().and_then(|registered| {
+            registered
+                .native_runtime_control
+                .as_ref()
+                .filter(|control| control.custom())
+                .map(|_| registered.identity)
+        });
+        let bridge = self.bridge().await?;
+        #[cfg(feature = "testing")]
+        if custom.is_some() {
+            let cut = host.public_operation_cut.lock().unwrap().clone();
+            if let Some(cut) = cut {
+                cut.pause(
+                    crate::host::public_lifecycle::PublicCutPosition::BeforeInboundBuildCommit,
+                    0,
+                )
+                .await;
+            }
+        }
+        if custom.is_some_and(|identity| !host.custom_creation_live(identity)) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        bridge
             .store
             .install_public_v1_inbound_build_authority(authority)
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        if custom.is_some_and(|identity| !host.custom_creation_live(identity)) {
+            bridge
+                .store
+                .revoke_exact_public_v1_inbound_build_authority(authority)
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
     }
 
     async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {

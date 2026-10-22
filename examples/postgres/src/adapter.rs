@@ -1251,6 +1251,9 @@ impl PgReplicator {
 
     fn abort(&self) {
         self.cancellation.cancel();
+        if self.public_closed() {
+            return;
+        }
         if let Err(error) = self.instance.abort_owned() {
             tracing::error!(%error, "PostgreSQL driver abort cleanup failed");
         }

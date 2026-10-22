@@ -29,6 +29,9 @@ struct Contract {
     factory_entered: Semaphore,
     factory_release: Semaphore,
     different_bundle: AtomicBool,
+    install_hold: AtomicBool,
+    install_entered: Semaphore,
+    install_release: Semaphore,
 }
 
 fn failure(message: &str) -> RuntimeError {
@@ -134,9 +137,11 @@ impl StatefulServiceReplica for Contract {
         })
     }
     async fn close(&self) -> Result<()> {
+        self.install_release.add_permits(1);
         Ok(())
     }
     fn abort(&self) {
+        self.install_release.add_permits(1);
         self.build_release.add_permits(1);
     }
 }
@@ -236,6 +241,11 @@ impl CustomReplicatorControl for Contract {
             .await?;
         self.installations.fetch_add(1, Ordering::SeqCst);
         *self.inbound.lock().unwrap() = Some(authority.clone());
+        if self.install_hold.load(Ordering::SeqCst) {
+            self.child().await;
+            self.install_entered.add_permits(1);
+            self.install_release.acquire().await.unwrap().forget();
+        }
         if self.fail_install.load(Ordering::SeqCst) {
             self.child().await;
             return Err(failure("partially installed contract ingress"));
@@ -317,6 +327,9 @@ impl Sample for Contract {
             factory_entered: Semaphore::new(0),
             factory_release: Semaphore::new(0),
             different_bundle: AtomicBool::new(false),
+            install_hold: AtomicBool::new(false),
+            install_entered: Semaphore::new(0),
+            install_release: Semaphore::new(0),
         })
     }
     async fn drain(&self) -> Result<()> {
@@ -324,26 +337,62 @@ impl Sample for Contract {
     }
 }
 
-async fn history(
+fn history(
     node: &Node<Contract>,
     command: PublicV1HistoryCommand,
-) -> std::result::Result<(), tonic::Status> {
-    let mut client =
-        proto::replica_peer_client::ReplicaPeerClient::connect(node.control_address.clone())
+) -> impl std::future::Future<Output = std::result::Result<(), tonic::Status>> + Send + 'static {
+    let address = node.control_address.clone();
+    let resource = node.history.resource_uid.clone();
+    let identity = node.identity.clone();
+    let session = node.session.clone();
+    async move {
+        let mut client = proto::replica_peer_client::ReplicaPeerClient::connect(address)
             .await
             .unwrap();
-    client
-        .execute(authorized(proto::ExecuteCommandRequest {
-            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-            resource_uid: node.history.resource_uid.to_string(),
-            target: Some(node.identity.clone().into()),
-            expected_process_session_id: node.session.to_string(),
-            command: Some(proto::execute_command_request::Command::PublicV1History(
-                convert::public_v1_history_command_to_proto(&command).unwrap(),
-            )),
-        }))
-        .await
-        .map(|_| ())
+        client
+            .execute(authorized(proto::ExecuteCommandRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: resource.to_string(),
+                target: Some(identity.into()),
+                expected_process_session_id: session.to_string(),
+                command: Some(proto::execute_command_request::Command::PublicV1History(
+                    convert::public_v1_history_command_to_proto(&command).unwrap(),
+                )),
+            }))
+            .await
+            .map(|_| ())
+    }
+}
+
+fn execute(
+    node: &Node<Contract>,
+    intent: PublicOperationIntent,
+) -> tokio::task::JoinHandle<std::result::Result<(), tonic::Status>> {
+    let address = node.control_address.clone();
+    let identity = node.identity.clone();
+    let resource = node.history.resource_uid.clone();
+    let session = node.session.clone();
+    tokio::spawn(async move {
+        let mut client = proto::agent_control_client::AgentControlClient::connect(address)
+            .await
+            .unwrap();
+        client
+            .execute(authorized(proto::ExecuteCommandRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: resource.to_string(),
+                target: Some(identity.clone().into()),
+                expected_process_session_id: session.to_string(),
+                command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                    convert::public_v1_operation_command_to_proto(&PublicV1OperationCommand {
+                        target: identity,
+                        intent,
+                    })
+                    .unwrap(),
+                )),
+            }))
+            .await
+            .map(|_| ())
+    })
 }
 
 async fn setup(
@@ -407,6 +456,218 @@ async fn setup(
         program: Some(program),
     };
     (source, target, authority, intent)
+}
+
+fn validation_cut(
+    position: kuberic_runtime::testing::PublicCutPosition,
+) -> Arc<kuberic_runtime::testing::PublicOperationCut> {
+    Arc::new(kuberic_runtime::testing::PublicOperationCut {
+        position,
+        index: 0,
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    })
+}
+
+#[tokio::test]
+async fn custom_host_validation_cannot_cross_source_target_cancel_or_revoke_cut() {
+    for case in 0..4 {
+        let root = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        let (source, target, authority, intent) = setup(root.path()).await;
+        source.service.hold_build.store(true, Ordering::SeqCst);
+        history(
+            &target,
+            PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                authority: Box::new(authority.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        let build = execute(&source, intent);
+        source
+            .service
+            .build_entered
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+        let node = if case == 1 || case == 3 {
+            &target
+        } else {
+            &source
+        };
+        let cut = validation_cut(kuberic_runtime::testing::PublicCutPosition::BuildAuthorityRead);
+        node.running
+            .handle()
+            .set_public_operation_cut(Some(cut.clone()));
+        let context = node.service.context.get().unwrap().clone();
+        let a = authority.clone();
+        let validation = tokio::spawn(async move { context.validate_build_authority(&a).await });
+        cut.entered.notified().await;
+        node.running.handle().set_public_operation_cut(None);
+        let mut superseding = None;
+        if case == 2 {
+            let program = PublicOperationProgram::Epoch {
+                epoch: Epoch::new(0, 2),
+            };
+            superseding = Some(execute(
+                &source,
+                PublicOperationIntent {
+                    identity: source.preview.clone(),
+                    operation_id: OperationId::new("cancel-during-validation"),
+                    revision: source.revision + 1,
+                    process_session_id: source.session.clone(),
+                    class: PublicOperationClass::Authority,
+                    input_digest: program.digest(),
+                    replay_disposition: program.replay_disposition(),
+                    lifecycle: None,
+                    program: Some(program),
+                },
+            ));
+        } else if case == 3 {
+            history(
+                &target,
+                PublicV1HistoryCommand::RevokeInboundBuildAuthority {
+                    authority: Box::new(authority.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        } else {
+            node.service
+                .context
+                .get()
+                .unwrap()
+                .report_fault(FaultType::Transient)
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node
+                .service
+                .context
+                .get()
+                .unwrap()
+                .validate_build_authority(&authority)
+                .await
+                .is_ok()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cut.release.notify_one();
+        assert!(
+            validation.await.unwrap().is_err(),
+            "snapshot crossed invalidation case {case}"
+        );
+        assert!(source.stop().await.is_none());
+        assert!(target.stop().await.is_none());
+        let _ = tokio::time::timeout(Duration::from_secs(5), build)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(superseding) = superseding {
+            let _ = tokio::time::timeout(Duration::from_secs(5), superseding)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_host_late_authority_commit_cannot_publish_after_shutdown() {
+    let root = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+    let (source, mut target, authority, _) = setup(root.path()).await;
+    let cut = validation_cut(kuberic_runtime::testing::PublicCutPosition::BeforeInboundBuildCommit);
+    target
+        .running
+        .handle()
+        .set_public_operation_cut(Some(cut.clone()));
+    let install = tokio::spawn(history(
+        &target,
+        PublicV1HistoryCommand::InstallInboundBuildAuthority {
+            authority: Box::new(authority),
+        },
+    ));
+    cut.entered.notified().await;
+    target.running.handle().set_public_operation_cut(None);
+    target.running.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while target
+            .service
+            .context
+            .get()
+            .unwrap()
+            .report_load(vec![])
+            .await
+            .is_ok()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cut.release.notify_one();
+    assert!(install.await.unwrap().is_err());
+    target.running.wait().await.unwrap();
+    assert_eq!(target.service.installations.load(Ordering::SeqCst), 0);
+    let path = kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(
+        &root.path().join("t"),
+    );
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let state: String = connection
+        .query_row(
+            "SELECT state_json FROM agent_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert!(state["publicV1OperationState"]["currentInboundBuildAuthority"].is_null());
+    assert_eq!(state["publicV1OperationState"]["inboundBuildGeneration"], 0);
+    source.close().await;
+}
+
+#[tokio::test]
+async fn custom_host_abort_or_close_unblocks_installer_before_serialized_drain() {
+    for close in [false, true] {
+        let root = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
+        let (source, mut target, authority, _) = setup(root.path()).await;
+        target.service.install_hold.store(true, Ordering::SeqCst);
+        let install = tokio::spawn(history(
+            &target,
+            PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                authority: Box::new(authority),
+            },
+        ));
+        target
+            .service
+            .install_entered
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+        assert!(target.service.alive.load(Ordering::SeqCst) > 0);
+        if close {
+            target.command(PublicOperationProgram::Close).await;
+        }
+        target.running.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), target.running.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            install.await.unwrap().is_err(),
+            "an installer cannot acknowledge across terminal fencing"
+        );
+        assert_eq!(target.service.alive.load(Ordering::SeqCst), 0);
+        source.close().await;
+    }
 }
 
 async fn late_factory_shutdown(mode: u8) {
@@ -1013,7 +1274,7 @@ async fn custom_host_terminal_failed_or_lost_drain_does_not_release_owned_child(
 async fn custom_host_partial_install_failed_or_lost_drain_retains_real_child() {
     for lost in [false, true] {
         let root = tempfile::tempdir_in(std::env::var_os("TMPDIR").unwrap()).unwrap();
-        let (source, target, authority, _) = setup(root.path()).await;
+        let (source, mut target, authority, _) = setup(root.path()).await;
         target.service.fail_install.store(true, Ordering::SeqCst);
         target.service.fail_drain.store(!lost, Ordering::SeqCst);
         target.service.panic_drain.store(lost, Ordering::SeqCst);
@@ -1056,7 +1317,17 @@ async fn custom_host_partial_install_failed_or_lost_drain_retains_real_child() {
         let service = target.service.clone();
         target.service.fail_drain.store(false, Ordering::SeqCst);
         target.service.panic_drain.store(false, Ordering::SeqCst);
-        assert!(target.stop().await.is_none());
+        target.running.shutdown();
+        let shutdown = target.running.wait().await;
+        if lost {
+            assert!(
+                shutdown.is_err(),
+                "lost retained compensation must reach process completion"
+            );
+        } else {
+            shutdown.unwrap();
+        }
+        target.service.drain().await.unwrap();
         assert_eq!(service.alive.load(Ordering::SeqCst), 0);
         source.close().await;
     }

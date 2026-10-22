@@ -1064,6 +1064,12 @@ impl PartitionOperationRegistry {
     pub(crate) fn revision_receiver(&self) -> watch::Receiver<u64> {
         self.revision.subscribe()
     }
+    pub(crate) async fn operation_for_validation(
+        &self,
+        id: &OperationId,
+    ) -> Option<Arc<PartitionOperation>> {
+        self.state.lock().await.operations.get(id).cloned()
+    }
 
     pub(crate) fn fence(&self) {
         self.terminal_fence
@@ -1099,6 +1105,9 @@ impl PartitionOperationRegistry {
     pub(crate) fn is_fenced(&self) -> bool {
         self.terminal_fence
             .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn prepare_fenced_session_renewal_configuration(

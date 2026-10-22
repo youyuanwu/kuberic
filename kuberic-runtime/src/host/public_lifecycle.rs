@@ -123,6 +123,8 @@ pub(crate) fn is_replacement_role_replay(
 #[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicCutPosition {
+    BuildAuthorityRead,
+    BeforeInboundBuildCommit,
     BeforeAccessReservation,
     BeforeInstruction,
     InstructionSelected,

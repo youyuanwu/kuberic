@@ -11,6 +11,10 @@ use tokio::sync::{Mutex, watch};
 /// observer disappears. Implementations validate host authority before native
 /// effects, after awaits and before publishing completion. Successful drainage
 /// promises actual joining of owned descendants; an error never proves joining.
+///
+/// Protected Close/Abort must independently notify/cancel companion actions
+/// before waiting for drainage. An installer cannot depend only on this
+/// companion's drain callback: the host serializes that drain behind the action.
 #[async_trait]
 pub trait CustomReplicatorControl: Send + Sync {
     async fn install_inbound_build_authority(
@@ -34,8 +38,24 @@ struct Owner {
     application: Arc<dyn CustomReplicatorControl>,
     serial: Mutex<Option<PublicInboundBuildAuthority>>,
     stopped: AtomicBool,
+    live: StdMutex<Option<PublicInboundBuildAuthority>>,
     revoked: AtomicBool,
+    drained: AtomicBool,
     contained: watch::Sender<bool>,
+    compensations: StdMutex<Vec<Arc<Mutex<Compensation>>>>,
+    #[cfg(test)]
+    compensation_gate: StdMutex<Option<Arc<CompensationGate>>>,
+}
+
+struct Compensation {
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    result: Option<std::result::Result<(), String>>,
+}
+
+#[cfg(test)]
+struct CompensationGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 pub(super) struct CustomControl(Arc<Owner>);
@@ -51,13 +71,32 @@ impl CustomControl {
             application,
             serial: Mutex::new(None),
             stopped: AtomicBool::new(false),
+            live: StdMutex::new(None),
             revoked: AtomicBool::new(false),
+            drained: AtomicBool::new(false),
             contained,
+            compensations: StdMutex::new(Vec::new()),
+            #[cfg(test)]
+            compensation_gate: StdMutex::new(None),
         }))
     }
 }
 
 impl Owner {
+    fn stop(&self) {
+        let mut live = self.live.lock().unwrap();
+        self.stopped.store(true, Ordering::Release);
+        *live = None;
+    }
+
+    fn activate(&self, authority: &PublicInboundBuildAuthority) -> Result<()> {
+        let mut live = self.live.lock().unwrap();
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        *live = Some(authority.clone());
+        Ok(())
+    }
     async fn scope(&self, authority: &PublicInboundBuildAuthority) -> Result<()> {
         if self.stopped.load(Ordering::Acquire)
             || authority.attempt.target != self.context.identity
@@ -77,13 +116,23 @@ impl Owner {
             .await
     }
 
-    async fn fail_closed(&self) -> Result<()> {
-        self.stopped.store(true, Ordering::Release);
+    async fn drain_application(&self) -> Result<()> {
+        // All callers hold serial. Once joining succeeded, a late compensation
+        // must not repeat native effects against replacement-owned storage.
+        if !self.drained.load(Ordering::Acquire) {
+            self.application.shutdown_and_drain().await?;
+            self.drained.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    async fn fail_closed(&self, authority: &PublicInboundBuildAuthority) -> Result<()> {
+        self.stop();
         let invalidation = self
             .context
-            .revoke_replacement_inbound_build_authority()
+            .revoke_custom_inbound_build_authority(authority)
             .await;
-        let drainage = self.application.shutdown_and_drain().await;
+        let drainage = self.drain_application().await;
         invalidation?;
         drainage?;
         self.contained.send_replace(true);
@@ -91,18 +140,32 @@ impl Owner {
     }
 }
 
-struct ActionGuard(Arc<Owner>, bool);
+struct ActionGuard(Arc<Owner>, bool, PublicInboundBuildAuthority);
 impl Drop for ActionGuard {
     fn drop(&mut self) {
         if self.1 {
-            self.0.stopped.store(true, Ordering::Release);
+            self.0.stop();
             let owner = self.0.clone();
-            tokio::spawn(async move {
-                let _serial = owner.serial.lock().await;
-                if let Err(error) = owner.fail_closed().await {
-                    tracing::error!(%error, "lost custom action containment failed");
+            let authority = self.2.clone();
+            #[cfg(test)]
+            let gate = owner.compensation_gate.lock().unwrap().clone();
+            let task = tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
                 }
+                let _serial = owner.serial.lock().await;
+                owner.fail_closed(&authority).await
             });
+            self.0
+                .compensations
+                .lock()
+                .unwrap()
+                .push(Arc::new(Mutex::new(Compensation {
+                    task: Some(task),
+                    result: None,
+                })));
         }
     }
 }
@@ -129,17 +192,35 @@ mod tests {
         durable: StdMutex<Option<PublicInboundBuildAuthority>>,
         generation: StdMutex<u64>,
         installs: AtomicUsize,
+        drains: AtomicUsize,
         revokes: AtomicUsize,
         fail_drain: AtomicBool,
         fail_install: AtomicBool,
         panic_install: AtomicBool,
         panic_drain: AtomicBool,
+        fail_revoke: AtomicBool,
+        drain_entered: tokio::sync::Semaphore,
         entered: Semaphore,
         release: Semaphore,
         hold: AtomicBool,
     }
     #[async_trait]
     impl PartitionAccessView for Fixture {
+        async fn revoke_custom_inbound_build_authority(
+            &self,
+            authority: &PublicInboundBuildAuthority,
+        ) -> Result<()> {
+            if self.fail_revoke.load(Ordering::SeqCst) {
+                return Err(RuntimeError::Application(
+                    "retained exact cleanup failure".into(),
+                ));
+            }
+            let mut current = self.durable.lock().unwrap();
+            if current.as_ref() == Some(authority) {
+                *current = None;
+            }
+            Ok(())
+        }
         fn partition_information(&self) -> PartitionInformation {
             PartitionInformation {
                 partition_id: PartitionId::new("contract"),
@@ -231,6 +312,8 @@ mod tests {
             Err(RuntimeError::ProgressNotReady)
         }
         async fn shutdown_and_drain(&self) -> Result<()> {
+            self.drains.fetch_add(1, Ordering::SeqCst);
+            self.drain_entered.add_permits(1);
             assert!(!self.panic_drain.load(Ordering::SeqCst), "lost drain owner");
             if self.fail_drain.load(Ordering::SeqCst) {
                 Err(RuntimeError::Application("descendant remains".into()))
@@ -285,11 +368,14 @@ mod tests {
             durable: StdMutex::new(None),
             generation: StdMutex::new(0),
             installs: AtomicUsize::new(0),
+            drains: AtomicUsize::new(0),
             revokes: AtomicUsize::new(0),
             fail_drain: AtomicBool::new(false),
             fail_install: AtomicBool::new(false),
             panic_install: AtomicBool::new(false),
             panic_drain: AtomicBool::new(false),
+            fail_revoke: AtomicBool::new(false),
+            drain_entered: tokio::sync::Semaphore::new(0),
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
             hold: AtomicBool::new(false),
@@ -332,6 +418,62 @@ mod tests {
         assert!(control.install_inbound_build_authority(&a).await.is_err());
         assert_eq!(f.installs.load(Ordering::SeqCst), 1);
         assert_eq!(f.revokes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_observers_share_compensation_join_and_sticky_failure() {
+        let (control, f, authority) = fixture();
+        let gate = Arc::new(CompensationGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *control.0.compensation_gate.lock().unwrap() = Some(gate.clone());
+        f.panic_install.store(true, Ordering::SeqCst);
+        assert!(
+            control
+                .install_inbound_build_authority(&authority)
+                .await
+                .is_err()
+        );
+        gate.entered.notified().await;
+        let c = control.clone();
+        let first = tokio::spawn(async move { c.shutdown_and_drain().await });
+        f.drain_entered.acquire().await.unwrap().forget();
+        first.abort();
+        let _ = first.await;
+        let c = control.clone();
+        let mut second = tokio::spawn(async move { c.shutdown_and_drain().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "a later observer skipped retained compensation"
+        );
+        f.fail_revoke.store(true, Ordering::SeqCst);
+        gate.release.notify_one();
+        assert!(second.await.unwrap().is_err());
+        f.fail_revoke.store(false, Ordering::SeqCst);
+        assert!(
+            control.shutdown_and_drain().await.is_err(),
+            "completed join failure was lost for later observers"
+        );
+        assert_eq!(f.drains.load(Ordering::SeqCst), 1);
+        assert!(!*control.containment().borrow());
+    }
+
+    #[tokio::test]
+    async fn late_cleanup_is_exact_and_successful_drain_is_not_repeated() {
+        let (control, f, old) = fixture();
+        control.install_inbound_build_authority(&old).await.unwrap();
+        control.shutdown_and_drain().await.unwrap();
+        let mut successor = old.clone();
+        successor.operation_revision += 1;
+        successor.attempt.target_session = ProcessSessionId::new("replacement-session");
+        *f.durable.lock().unwrap() = Some(successor.clone());
+        control.revoke_inbound_build_authority(&old).await.unwrap();
+        control.shutdown_and_drain().await.unwrap();
+        assert_eq!(f.durable.lock().unwrap().as_ref(), Some(&successor));
+        assert_eq!(f.drains.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -462,6 +604,10 @@ impl NativeRuntimeControl for CustomControl {
     fn build_authority_open(&self) -> bool {
         !self.0.stopped.load(Ordering::Acquire)
     }
+    fn inbound_build_live(&self, authority: &PublicInboundBuildAuthority) -> bool {
+        self.0.live.lock().unwrap().as_ref() == Some(authority)
+            && !self.0.stopped.load(Ordering::Acquire)
+    }
     fn containment(&self) -> watch::Receiver<bool> {
         self.0.contained.subscribe()
     }
@@ -505,8 +651,8 @@ impl NativeRuntimeControl for CustomControl {
         let owner = self.0.clone();
         let authority = authority.clone();
         retained(async move {
-            let mut guard = ActionGuard(owner.clone(), false);
             let mut installed = owner.serial.lock().await;
+            let mut guard = ActionGuard(owner.clone(), false, authority.clone());
             owner.scope(&authority).await?;
             if installed.as_ref() == Some(&authority) {
                 return owner.context.validate_build_authority(&authority).await;
@@ -520,11 +666,14 @@ impl NativeRuntimeControl for CustomControl {
                 .context
                 .classify_replacement_inbound_build_authority(&authority)
                 .await?;
+            owner.scope(&authority).await?;
             guard.1 = true;
             owner
                 .context
                 .install_replacement_inbound_build_authority(&authority)
                 .await?;
+            owner.scope(&authority).await?;
+            owner.activate(&authority)?;
             *installed = Some(authority.clone());
             let result = async {
                 owner.context.validate_build_authority(&authority).await?;
@@ -537,7 +686,7 @@ impl NativeRuntimeControl for CustomControl {
             }
             .await;
             if let Err(error) = result {
-                let cleanup = owner.fail_closed().await;
+                let cleanup = owner.fail_closed(&authority).await;
                 guard.1 = false;
                 return Err(RuntimeError::Application(format!(
                     "custom installation failed: {error}; containment: {cleanup:?}"
@@ -556,8 +705,8 @@ impl NativeRuntimeControl for CustomControl {
         let owner = self.0.clone();
         let authority = authority.clone();
         retained(async move {
-            let mut guard = ActionGuard(owner.clone(), false);
             let installed = owner.serial.lock().await;
+            let mut guard = ActionGuard(owner.clone(), false, authority.clone());
             if installed.as_ref() != Some(&authority) {
                 return Ok(());
             }
@@ -566,16 +715,22 @@ impl NativeRuntimeControl for CustomControl {
             }
             guard.1 = true;
             // Ingress is invalidated before application cleanup can await.
+            *owner.live.lock().unwrap() = None;
             owner
                 .context
-                .revoke_replacement_inbound_build_authority()
+                .revoke_custom_inbound_build_authority(&authority)
                 .await?;
+            if owner.drained.load(Ordering::Acquire) {
+                owner.revoked.store(true, Ordering::Release);
+                guard.1 = false;
+                return Ok(());
+            }
             if let Err(error) = owner
                 .application
                 .revoke_inbound_build_authority(&authority)
                 .await
             {
-                let cleanup = owner.fail_closed().await;
+                let cleanup = owner.fail_closed(&authority).await;
                 guard.1 = false;
                 return Err(RuntimeError::Application(format!(
                     "custom revocation failed: {error}; containment: {cleanup:?}"
@@ -592,17 +747,44 @@ impl NativeRuntimeControl for CustomControl {
 
     async fn shutdown_and_drain(&self) -> Result<()> {
         // Stop admission synchronously, even when installation currently awaits.
-        self.0.stopped.store(true, Ordering::Release);
+        self.0.stop();
         let owner = self.0.clone();
         retained(async move {
-            let invalidation = owner
-                .context
-                .revoke_replacement_inbound_build_authority()
-                .await;
-            let _serial = owner.serial.lock().await;
-            let drainage = owner.application.shutdown_and_drain().await;
+            let (invalidation, drainage) = {
+                let serial = owner.serial.lock().await;
+                let invalidation = match serial.as_ref() {
+                    Some(authority) => {
+                        owner
+                            .context
+                            .revoke_custom_inbound_build_authority(authority)
+                            .await
+                    }
+                    None => Ok(()),
+                };
+                (invalidation, owner.drain_application().await)
+            };
+            let tasks = owner.compensations.lock().unwrap().clone();
+            let mut compensation = Ok(());
+            for shared in tasks {
+                let mut shared = shared.lock().await;
+                if shared.result.is_none() {
+                    let result = shared
+                        .task
+                        .as_mut()
+                        .expect("unjoined compensation")
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                    shared.task.take();
+                    shared.result = Some(result);
+                }
+                if let Some(Err(error)) = shared.result.as_ref() {
+                    compensation = Err(RuntimeError::Application(error.clone()));
+                }
+            }
             invalidation?;
             drainage?;
+            compensation?;
             owner.contained.send_replace(true);
             Ok(())
         })

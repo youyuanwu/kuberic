@@ -112,6 +112,9 @@ pub(crate) trait NativeRuntimeControl: Send + Sync {
     fn build_authority_open(&self) -> bool {
         true
     }
+    fn inbound_build_live(&self, _authority: &PublicInboundBuildAuthority) -> bool {
+        true
+    }
     fn containment(&self) -> tokio::sync::watch::Receiver<bool>;
     fn selected_epoch(&self) -> Option<crate::protocol::types::Epoch>;
     fn idle_replicas(&self) -> Result<Vec<ReplicaId>>;
@@ -873,6 +876,15 @@ impl ReplicatorFactoryContext {
             .await
     }
 
+    pub(crate) async fn revoke_custom_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.access
+            .revoke_custom_inbound_build_authority(authority)
+            .await
+    }
+
     pub(crate) fn release_provider_writer(&self) {
         self.access.release_provider_writer();
     }
@@ -951,6 +963,12 @@ impl ReplicatorFactoryContext {
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
+    async fn revoke_custom_inbound_build_authority(
+        &self,
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
     fn retain_custom_creation(
         &self,
         _reservation: ReplicatorCreationReservation,
