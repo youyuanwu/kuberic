@@ -254,6 +254,7 @@ impl Fixture {
             containment: None,
             wait_for_containment: false,
             preempt_retained_owner: false,
+            native_observer_callbacks: false,
             terminal_drain: Arc::new(move || {
                 let probe = drain_probe.clone();
                 Box::pin(async move {

@@ -5710,6 +5710,17 @@ async fn hosted_public_v1_authorized_data_loss_preserves_effective_outcomes_and_
             );
             assert_eq!(report.history, proposed);
             assert_eq!(
+                report
+                    .configuration
+                    .as_ref()
+                    .expect("admitted native configuration")
+                    .voting
+                    .current
+                    .epoch
+                    .data_loss_number,
+                proposed.data_loss_number,
+            );
+            assert_eq!(
                 report.data_loss_recovery.unwrap().stage,
                 PublicDataLossRecoveryStage::Admitted
             );

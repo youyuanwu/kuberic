@@ -58,6 +58,17 @@ pub(super) fn bind(
         if let Err(error) = (callbacks.terminal_drain)().await {
             failures.push(error.to_string());
         }
+        if !failures.is_empty()
+            && callbacks
+                .containment
+                .as_ref()
+                .is_some_and(|witness| !*witness.borrow())
+        {
+            // A failed custom drain can still own live descendants. Retain its
+            // failure independently; returning is not a positive join witness.
+            result.send_replace(Some(Err(failures.join("; "))));
+            return;
+        }
         if let Some(mut witness) = callbacks.containment
             && witness.wait_for(|contained| *contained).await.is_err()
         {

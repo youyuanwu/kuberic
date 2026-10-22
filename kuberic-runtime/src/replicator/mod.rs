@@ -70,7 +70,9 @@ pub(crate) fn validate_public_v1_factories(manifest: PublicV1FactoryManifest) ->
     }
     Ok(())
 }
+mod custom;
 pub mod stream;
+pub use custom::CustomReplicatorControl;
 #[cfg(feature = "testing")]
 mod testing_transport;
 #[cfg(feature = "testing")]
@@ -104,9 +106,21 @@ use crate::{Result, RuntimeError};
 
 #[async_trait]
 pub(crate) trait NativeRuntimeControl: Send + Sync {
+    fn custom(&self) -> bool {
+        false
+    }
+    fn build_authority_open(&self) -> bool {
+        true
+    }
     fn containment(&self) -> tokio::sync::watch::Receiver<bool>;
     fn selected_epoch(&self) -> Option<crate::protocol::types::Epoch>;
     fn idle_replicas(&self) -> Result<Vec<ReplicaId>>;
+    async fn configuration_idle_replicas(
+        &self,
+        _configuration: &crate::protocol::public_operations::PublicConfiguration,
+    ) -> Result<Vec<ReplicaId>> {
+        self.idle_replicas()
+    }
 
     fn progress_query_readiness(&self) -> Result<bool> {
         Ok(true)
@@ -574,6 +588,35 @@ impl ReplicatorAttachment {
 }
 
 impl ReplicatorInterfaces {
+    /// Attaches the application's controller companion to this factory creation.
+    ///
+    /// This is a local host-authority adaptation, not an addition to the native
+    /// SF Replicator interfaces. The owner must fence and join its real native
+    /// work; it must not substitute proposed membership or invented progress.
+    pub fn with_custom_control(
+        self,
+        context: &ReplicatorFactoryContext,
+        control: Arc<dyn CustomReplicatorControl>,
+    ) -> Result<Self> {
+        context.claim_native_creation()?;
+        let reservation = context
+            .reservation
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        self.creation
+            .bind_identity(reservation.identity(RuntimeHostToken::new()))?;
+        let mut slot = self.creation.native_runtime_control.lock().unwrap();
+        if slot.is_some() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let owner: Arc<dyn NativeRuntimeControl> =
+            Arc::new(custom::CustomControl::new(context.clone(), control));
+        context
+            .access
+            .retain_custom_creation(reservation, owner.clone())?;
+        *slot = Some(owner);
+        drop(slot);
+        Ok(self)
+    }
     pub(crate) fn with_effective_replication_address(self, address: String) -> Self {
         self.creation
             .effective_address
@@ -876,11 +919,53 @@ impl ReplicatorFactoryContext {
     ) -> Result<PublicInboundBuildAuthority> {
         self.access.native_outbound_build_authority(build).await
     }
+
+    /// Resolves the host's exact, currently running source Build operation.
+    /// The returned value is data, not a bearer grant. Revalidate around native
+    /// effects and asynchronous boundaries using `validate_build_authority`.
+    pub async fn outbound_build_authority(
+        &self,
+        build: &OperationId,
+    ) -> Result<PublicInboundBuildAuthority> {
+        let authority = self.native_outbound_build_authority(build).await?;
+        self.validate_build_authority(&authority).await?;
+        Ok(authority)
+    }
+
+    /// Checks the exact live source operation or installed target ingress grant
+    /// against this registered creation, process, storage and history.
+    pub async fn validate_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.access
+            .validate_custom_build_authority(
+                self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                authority,
+                true,
+            )
+            .await
+    }
 }
 
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
+    fn retain_custom_creation(
+        &self,
+        _reservation: ReplicatorCreationReservation,
+        _owner: Arc<dyn NativeRuntimeControl>,
+    ) -> Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+    async fn validate_custom_build_authority(
+        &self,
+        _reservation: ReplicatorCreationReservation,
+        _authority: &PublicInboundBuildAuthority,
+        _require_installed: bool,
+    ) -> Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
     fn native_write_admission(&self) -> Result<Arc<std::sync::Mutex<()>>> {
         Err(RuntimeError::AuthorityNotAdmitted)
     }

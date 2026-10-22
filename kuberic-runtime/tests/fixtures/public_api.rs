@@ -24,6 +24,7 @@ use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
     ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities, ReplicatorInterfaces,
     ReplicatorSettings, StateReplicator,
+    CustomReplicatorControl, ReplicatorFactoryContext,
 };
 
 // These external identities deliberately expand aliases in both directions.
@@ -49,6 +50,30 @@ fn stream_from_concrete(
 }
 
 struct ProtectedContracts;
+
+// Compile-only independent companion: not native/database qualification.
+#[async_trait]
+impl CustomReplicatorControl for ProtectedContracts {
+    async fn install_inbound_build_authority(&self, _: &PublicInboundBuildAuthority) -> Result<()> {
+        Err(kuberic_runtime::RuntimeError::AuthorityNotAdmitted)
+    }
+    async fn revoke_inbound_build_authority(&self, _: &PublicInboundBuildAuthority) -> Result<()> {
+        Err(kuberic_runtime::RuntimeError::AuthorityNotAdmitted)
+    }
+    async fn idle_replicas(&self, _: &PublicConfiguration) -> Result<Vec<ReplicaId>> {
+        Err(kuberic_runtime::RuntimeError::ProgressNotReady)
+    }
+    async fn shutdown_and_drain(&self) -> Result<()> { Ok(()) }
+}
+
+async fn custom_controller_api(context: ReplicatorFactoryContext, build: OperationId) -> Result<()> {
+    let owner = Arc::new(ProtectedContracts);
+    let _bundle = ReplicatorInterfaces::primary(
+        owner.clone(), None, ReplicatorCapabilities::conservative(),
+    ).with_custom_control(&context, owner)?;
+    let authority = context.outbound_build_authority(&build).await?;
+    context.validate_build_authority(&authority).await
+}
 
 #[async_trait]
 impl Replicator for ProtectedContracts {
