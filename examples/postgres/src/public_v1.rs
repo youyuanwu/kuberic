@@ -240,7 +240,12 @@ impl TransportBinding {
     }
 }
 
-type DrainOwner = Arc<Mutex<Option<tokio::task::JoinHandle<Result<()>>>>>;
+type DrainOwner = Arc<Mutex<GatewayJoin>>;
+
+struct GatewayJoin {
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    result: Option<std::result::Result<(), String>>,
+}
 
 #[derive(Clone)]
 enum InboundOutcome {
@@ -279,9 +284,14 @@ impl InboundOutcome {
 struct InboundOwner {
     binding: BuildBinding,
     result: tokio::sync::watch::Receiver<Option<InboundOutcome>>,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: Mutex<InboundJoin>,
     #[cfg(all(test, feature = "testing"))]
     waiters: std::sync::atomic::AtomicUsize,
+}
+
+struct InboundJoin {
+    task: Option<tokio::task::JoinHandle<()>>,
+    result: Option<std::result::Result<(), String>>,
 }
 
 impl InboundOwner {
@@ -339,6 +349,8 @@ pub(super) struct PublicPg {
     #[cfg(all(test, feature = "testing"))]
     inspect_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
     #[cfg(all(test, feature = "testing"))]
+    publication_gate: std::sync::Mutex<Option<Arc<GrantPublicationGate>>>,
+    #[cfg(all(test, feature = "testing"))]
     test_access: std::sync::Mutex<(AccessStatus, AccessStatus)>,
 }
 
@@ -346,6 +358,21 @@ pub(super) struct PublicPg {
 pub(crate) struct BuildCompletionGate {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "testing"))]
+struct GrantPublicationGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    gateway: std::sync::Mutex<Option<ProvisionalGatewayProbe>>,
+}
+
+#[cfg(all(test, feature = "testing"))]
+#[derive(Clone)]
+struct ProvisionalGatewayProbe {
+    exit: Arc<super::public_transport::GatewayExitGate>,
+    address: std::net::SocketAddr,
+    abort: tokio::task::AbortHandle,
 }
 
 impl PublicPg {
@@ -396,6 +423,8 @@ impl PublicPg {
             replay_gate: std::sync::Mutex::new(None),
             #[cfg(all(test, feature = "testing"))]
             inspect_gate: std::sync::Mutex::new(None),
+            #[cfg(all(test, feature = "testing"))]
+            publication_gate: std::sync::Mutex::new(None),
             #[cfg(all(test, feature = "testing"))]
             test_access: std::sync::Mutex::new((AccessStatus::Granted, AccessStatus::Granted)),
         }
@@ -672,58 +701,101 @@ impl PgReplicator {
     async fn public_join_inbound(&self) -> Result<()> {
         let owner = self.public_owner().inbound_owner.lock().unwrap().clone();
         if let Some(owner) = owner {
-            let mut task = owner.task.lock().await;
-            if let Some(task) = task.as_mut() {
-                task.await.map_err(application_error)?;
+            let mut join = owner.task.lock().await;
+            if join.result.is_none() {
+                let result = match join.task.as_mut() {
+                    Some(task) => task.await.map_err(|error| error.to_string()),
+                    None => Ok(()),
+                };
+                join.task.take();
+                join.result = Some(result);
             }
-            task.take();
+            return join
+                .result
+                .as_ref()
+                .unwrap()
+                .clone()
+                .map_err(application_error);
         }
         Ok(())
     }
     pub(crate) async fn retain_fault_owner(&self, task: tokio::task::JoinHandle<()>) {
         *self.fault_owner.lock().await = Some(task);
     }
-    async fn public_drain_gateway(&self, gateway: NativeGateway) -> Result<()> {
-        let owner = Arc::new(Mutex::new(Some(tokio::spawn(gateway.drain()))));
+    fn public_retain_gateway_drain(&self, gateway: NativeGateway) -> DrainOwner {
+        let owner = Arc::new(Mutex::new(GatewayJoin {
+            task: Some(tokio::spawn(gateway.drain())),
+            result: None,
+        }));
         {
             let mut owners = self.public_owner().gateway_drains.lock().unwrap();
-            owners.retain(|owner| owner.try_lock().map_or(true, |task| task.is_some()));
+            owners.retain(|owner| {
+                owner.try_lock().map_or(true, |join| {
+                    join.result.as_ref().is_none_or(|result| result.is_err())
+                })
+            });
             owners.push(owner.clone());
         }
-        let mut task = owner.lock().await;
-        let result = task
-            .as_mut()
+        owner
+    }
+
+    fn public_retain_grant_drains(
+        &self,
+        grants: impl IntoIterator<Item = Grant>,
+    ) -> Vec<DrainOwner> {
+        grants
+            .into_iter()
+            .map(|grant| {
+                grant.active.cancel();
+                self.public_retain_gateway_drain(grant.gateway)
+            })
+            .collect()
+    }
+
+    async fn public_wait_gateway_drain(&self, owner: &DrainOwner) -> Result<()> {
+        let mut join = owner.lock().await;
+        if join.result.is_none() {
+            let result = join
+                .task
+                .as_mut()
+                .expect("unjoined gateway drain")
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            join.task.take();
+            join.result = Some(result);
+        }
+        let result = join
+            .result
+            .as_ref()
             .unwrap()
-            .await
-            .map_err(application_error)
-            .and_then(|result| result);
-        task.take();
+            .clone()
+            .map_err(application_error);
         if let Err(error) = &result {
             *self.public_owner().cleanup_error.lock().unwrap() = Some(error.to_string());
         }
         result
     }
 
+    async fn public_drain_gateway(&self, gateway: NativeGateway) -> Result<()> {
+        let owner = self.public_retain_gateway_drain(gateway);
+        self.public_wait_gateway_drain(&owner).await
+    }
+
     async fn public_join_gateway_drains(&self) -> Result<()> {
         let owners = self.public_owner().gateway_drains.lock().unwrap().clone();
         let mut failures = Vec::new();
         for owner in owners {
-            let mut task = owner.lock().await;
-            if let Some(task) = task.as_mut() {
-                if let Err(error) = task
-                    .await
-                    .map_err(application_error)
-                    .and_then(|result| result)
-                {
-                    failures.push(error.to_string());
-                }
+            if let Err(error) = self.public_wait_gateway_drain(&owner).await {
+                failures.push(error.to_string());
             }
-            task.take();
         }
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(application_error(failures.join("; ")))
+            let failure = failures.join("; ");
+            *self.public_owner().cleanup_error.lock().unwrap() = Some(failure.clone());
+            Err(application_error(failure))
         }
     }
     pub(crate) fn configure_public_host(&self, context: ReplicatorFactoryContext) -> Result<()> {
@@ -837,8 +909,9 @@ impl PgReplicator {
                         .slots_dirty
                         .store(true, std::sync::atomic::Ordering::Release);
                 }
-                for grant in cancelled {
-                    if let Err(error) = driver.public_drain_gateway(grant.gateway).await {
+                let drains = driver.public_retain_grant_drains(cancelled);
+                for owner in drains {
+                    if let Err(error) = driver.public_wait_gateway_drain(&owner).await {
                         tracing::error!(%error, "cancelled public PostgreSQL grant drainage failed");
                         driver.abort();
                         grant_drain_failed = true;
@@ -882,9 +955,9 @@ impl PgReplicator {
             if let Some(driver) = weak.upgrade() {
                 let mut state = driver.public_owner().state.lock().await;
                 state.access = None;
-                for grant in state.grants.drain(..) {
-                    grant.active.cancel();
-                    if let Err(error) = driver.public_drain_gateway(grant.gateway).await {
+                let drains = driver.public_retain_grant_drains(state.grants.drain(..));
+                for owner in drains {
+                    if let Err(error) = driver.public_wait_gateway_drain(&owner).await {
                         tracing::error!(%error, "terminal public grant drainage failed");
                     }
                 }
@@ -948,6 +1021,17 @@ impl PgReplicator {
             release: tokio::sync::Notify::new(),
         });
         *self.public_owner().inspect_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    fn pause_public_grant_publication(&self) -> Arc<GrantPublicationGate> {
+        let gate = Arc::new(GrantPublicationGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            gateway: std::sync::Mutex::new(None),
+        });
+        *self.public_owner().publication_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
@@ -1017,9 +1101,9 @@ impl PgReplicator {
         if let Err(error) = self.instance.stop().await {
             failures.push(error.to_string());
         }
-        for grant in state.grants.drain(..) {
-            grant.active.cancel();
-            if let Err(error) = self.public_drain_gateway(grant.gateway).await {
+        let drains = self.public_retain_grant_drains(state.grants.drain(..));
+        for owner in drains {
+            if let Err(error) = self.public_wait_gateway_drain(&owner).await {
                 failures.push(error.to_string());
             }
         }
@@ -1207,14 +1291,18 @@ impl PgReplicator {
         let mut owner = self.public_owner().owner.lock().await;
         if let Some(task) = owner.as_mut() {
             if let Err(error) = task.await {
-                failures.push(error.to_string());
+                let error = error.to_string();
+                *self.public_owner().cleanup_error.lock().unwrap() = Some(error.clone());
+                failures.push(error);
             }
         }
         owner.take();
         let mut reporter = self.fault_owner.lock().await;
         if let Some(task) = reporter.as_mut() {
             if let Err(error) = task.await {
-                failures.push(error.to_string());
+                let error = error.to_string();
+                *self.public_owner().cleanup_error.lock().unwrap() = Some(error.clone());
+                failures.push(error);
             }
         }
         reporter.take();
@@ -1779,15 +1867,10 @@ impl PgReplicator {
             self.cancellation.child_token(),
         )
         .await?;
-        if let Err(error) = self
-            .public_validate_attempt(&binding, attempt_cancellation)
-            .await
-        {
-            self.public_drain_gateway(gateway).await?;
-            return Err(error);
-        }
+        // Own the spawned gateway before another await can lose this callback.
+        let provisional = state.grants.len();
         state.grants.push(Grant {
-            binding,
+            binding: binding.clone(),
             credential,
             gateway,
             active: active.clone(),
@@ -1795,6 +1878,31 @@ impl PgReplicator {
             lineage,
             boundary,
         });
+        #[cfg(all(test, feature = "testing"))]
+        {
+            let gate = self.public_owner().publication_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                let grant = &state.grants[provisional];
+                *gate.gateway.lock().unwrap() = Some(ProvisionalGatewayProbe {
+                    exit: grant.gateway.hold_exit(),
+                    address: std::net::SocketAddr::new(
+                        grant.credential.host.parse().map_err(application_error)?,
+                        grant.credential.port,
+                    ),
+                    abort: grant.gateway.task_abort_handle(),
+                });
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        if let Err(error) = self
+            .public_validate_attempt(&binding, attempt_cancellation)
+            .await
+        {
+            self.public_retire_grant(state.grants.remove(provisional))
+                .await?;
+            return Err(error);
+        }
         self.public_owner()
             .slots_dirty
             .store(false, std::sync::atomic::Ordering::Release);
@@ -2380,7 +2488,10 @@ impl PgReplicator {
                 let owner = Arc::new(InboundOwner {
                     binding: build.clone(),
                     result: observed,
-                    task: Mutex::new(Some(task)),
+                    task: Mutex::new(InboundJoin {
+                        task: Some(task),
+                        result: None,
+                    }),
                     #[cfg(all(test, feature = "testing"))]
                     waiters: std::sync::atomic::AtomicUsize::new(0),
                 });

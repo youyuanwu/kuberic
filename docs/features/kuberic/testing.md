@@ -337,6 +337,20 @@ hosted source and rejects the next mutation round; that injected helper reply
 is not database transfer/SQL success evidence. Runtime unit coverage separately
 holds compensation while shutdown observers overlap/disappear and checks
 shared sticky failure plus once-only successful application drainage.
+Native ownership negatives additionally cancel the genuinely accepted source
+Build after gateway spawn, hold actual gateway exit through terminal finish,
+and check exact listener/accepted-socket drainage. A lost native Close observer
+cannot erase the retained provisional gateway's failed join. Another case
+loses the exact hosted inbound task and repeats protected/companion Close:
+the same failed task join remains an explicit error, all other owners join,
+and consuming finish stays unsuccessful instead of panicking or fabricating
+containment. These fault injections are not substitutes for the positive
+controller data-transfer/admission journey.
+The source cut includes an existing admitted native peer plus the provisional
+new gateway. Losing Close while one exit is held cannot detach the other.
+The failure variant consumes a failed first join, loses that next Close
+observer while the second join is still held, then requires the first error
+to survive actual completion of the second join and consuming finish.
 
 The separate
 [external runtime contract fixture](../../../kuberic-runtime/tests/support/custom_control.rs)

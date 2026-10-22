@@ -612,6 +612,370 @@ async fn public_v1_postgres_graceful_close_cancels_source_inspect() {
     }
 }
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_provisional_gateway_is_joined_after_cancel() {
+    for fail_join in [false, true] {
+        let factory = Factory::default();
+        let mut cluster = TestCluster::builder(factory.clone())
+            .initial_replicas(1)
+            .scenario_timeout(Duration::from_secs(120))
+            .start()
+            .await
+            .unwrap();
+        let mut gate = None;
+        let mut existing = None;
+        let mut retained = None;
+        let mut connection = None;
+        let mut probes = Vec::new();
+        let result: TestResult = async {
+            cluster.settle_members(1).await?;
+            cluster.scale_to(2).await?;
+            let formed = cluster.settle_members(2).await?;
+            let source = cluster.service(formed.primary()).await?;
+            existing = Some({
+                let driver = source.native_driver();
+                let state = driver.public_owner().state.lock().await;
+                let grant = state.grants.first().ok_or_else(|| {
+                    TestError::new(
+                        ErrorKind::Application,
+                        "admitted native peer gateway missing",
+                    )
+                })?;
+                ProvisionalGatewayProbe {
+                    exit: grant.gateway.hold_exit(),
+                    address: std::net::SocketAddr::new(
+                        grant.credential.host.parse().map_err(error)?,
+                        grant.credential.port,
+                    ),
+                    abort: grant.gateway.task_abort_handle(),
+                }
+            });
+            cluster.scale_to(3).await?;
+            let intent = cluster
+                .pause_at(Barrier::intent(PublicV1CallKind::Build))
+                .await?;
+            let publication = source.native_driver().pause_public_grant_publication();
+            gate = Some(publication.clone());
+            retained = Some(source.clone());
+            probes.push(ProcessProbe::postgres(source.instance().data_dir()));
+            cluster.resume(intent).await?;
+            cluster
+                .drive(async {
+                    publication.entered.notified().await;
+                    Ok::<(), TestError>(())
+                })
+                .await?;
+            let gateway = publication.gateway.lock().unwrap().clone().ok_or_else(|| {
+                TestError::new(ErrorKind::Application, "post-spawn gateway missing")
+            })?;
+            connection = Some(tokio::net::TcpStream::connect(gateway.address).await?);
+            // Actual host cancellation of its accepted source Build, not a
+            // fixture's direct callback/store mutation or gate release.
+            source
+                .native_driver()
+                .public_owner()
+                .host
+                .get()
+                .unwrap()
+                .report_fault(FaultType::Transient)
+                .await
+                .map_err(error)?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            if let Some(existing) = existing {
+                existing.exit.release.notify_one();
+            }
+            if let Some(gate) = gate {
+                gate.release.notify_one();
+                if let Some(p) = gate.gateway.lock().unwrap().as_ref() {
+                    p.exit.release.notify_one();
+                }
+            }
+            cluster.finish(result).await.unwrap();
+            unreachable!();
+        }
+        let gate = gate.unwrap();
+        let gateway = gate.gateway.lock().unwrap().clone().unwrap();
+        let existing = existing.unwrap();
+        let driver = retained.as_ref().unwrap().native_driver().clone();
+        let first_driver = driver.clone();
+        let first = tokio::spawn(async move { Replicator::close(first_driver.as_ref()).await });
+        let first_exit =
+            tokio::time::timeout(Duration::from_secs(15), existing.exit.entered.notified())
+                .await
+                .is_ok();
+        let second_exit =
+            tokio::time::timeout(Duration::from_secs(15), gateway.exit.entered.notified())
+                .await
+                .is_ok();
+        let all_retained = tokio::time::timeout(Duration::from_secs(15), async {
+            while driver.public_owner().gateway_drains.lock().unwrap().len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let first_blocked = !first.is_finished();
+        first.abort();
+        let _ = first.await;
+        let mut sticky = true;
+        if fail_join {
+            existing.abort.abort();
+            let second_driver = driver.clone();
+            let second =
+                tokio::spawn(async move { Replicator::close(second_driver.as_ref()).await });
+            // Lose this observer AFTER it consumed a failed first join while
+            // the actual provisional gateway's second join remains held.
+            sticky = tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let owners = driver.public_owner().gateway_drains.lock().unwrap().clone();
+                    if owners[0]
+                        .lock()
+                        .await
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.is_err())
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+                && !second.is_finished();
+            second.abort();
+            let _ = second.await;
+        }
+        let mut finish = tokio::spawn(cluster.finish(result));
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut finish).await;
+        let (blocked, mut completed) = match early {
+            Ok(result) => (false, Some(result)),
+            Err(_) => (true, None),
+        };
+        existing.exit.release.notify_one();
+        let after_first = if completed.is_none() {
+            match tokio::time::timeout(Duration::from_millis(100), &mut finish).await {
+                Ok(result) => {
+                    completed = Some(result);
+                    false
+                }
+                Err(_) => true,
+            }
+        } else {
+            false
+        };
+        gateway.exit.release.notify_one();
+        gate.release.notify_one();
+        let finished = match completed {
+            Some(result) => result,
+            None => finish.await,
+        }
+        .unwrap();
+        let reached_exit = first_exit && second_exit;
+        let blocked = blocked && after_first && all_retained && first_blocked;
+        assert!(
+            reached_exit && blocked && sticky,
+            "terminal finish skipped the provisional gateway's actual join"
+        );
+        assert_eq!(
+            finished.is_err(),
+            fail_join,
+            "provisional native join failure was lost"
+        );
+        if fail_join {
+            assert!(Replicator::close(driver.as_ref()).await.is_err());
+            assert!(
+                CustomReplicatorControl::shutdown_and_drain(driver.as_ref())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            tokio::net::TcpStream::connect(gateway.address)
+                .await
+                .is_err(),
+            "exact provisional listener survived"
+        );
+        use tokio::io::AsyncReadExt;
+        let mut socket = connection.unwrap();
+        let mut byte = [0];
+        let ended = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(
+            matches!(ended, Ok(0) | Err(_)),
+            "provisional accepted socket survived"
+        );
+        let source = retained.unwrap();
+        assert!(!source.instance().is_running().await);
+        assert!(
+            source
+                .native_driver()
+                .public_owner()
+                .state
+                .lock()
+                .await
+                .grants
+                .is_empty()
+        );
+        assert!(
+            source
+                .native_driver()
+                .public_owner()
+                .owner
+                .lock()
+                .await
+                .is_none()
+        );
+        assert!(source.native_driver().fault_owner.lock().await.is_none());
+        for probe in probes {
+            probe.assert_gone().await;
+        }
+        assert!(factory.0.lock().unwrap().is_empty());
+    }
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_lost_inbound_join_is_sticky_across_close() {
+    let factory = Factory::default();
+    let mut cluster = TestCluster::builder(factory.clone())
+        .initial_replicas(1)
+        .scenario_timeout(Duration::from_secs(120))
+        .start()
+        .await
+        .unwrap();
+    let mut effects = None;
+    let mut retained = None;
+    let mut probes = Vec::new();
+    let result: TestResult = async {
+        let singleton = cluster.settle_members(1).await?;
+        let source = cluster.service(singleton.primary()).await?;
+        probes.push(ProcessProbe::postgres(source.instance().data_dir()));
+        cluster.scale_to(2).await?;
+        let intent = cluster
+            .pause_at(Barrier::intent(PublicV1CallKind::Build))
+            .await?;
+        let command = intent
+            .evidence()
+            .operation()
+            .command()
+            .map_err(|failure| TestError::new(ErrorKind::Application, failure.to_string()))?;
+        let Some(PublicOperationProgram::Build(input)) = command.intent.program.as_ref() else {
+            return Err(TestError::new(
+                ErrorKind::Application,
+                "lost-owner Build missing",
+            ));
+        };
+        let observation = cluster.observe().await?;
+        let reference = observation
+            .replicas()
+            .find(|replica| replica.identity() == &input.replica)
+            .cloned()
+            .ok_or_else(|| TestError::new(ErrorKind::Application, "lost-owner target missing"))?;
+        let target = cluster.service(&reference).await?;
+        retained = Some(target.clone());
+        let gate = target.native_driver().pause_public_build_effects();
+        effects = Some(gate.clone());
+        cluster.resume(intent).await?;
+        cluster
+            .drive(async {
+                gate.entered.notified().await;
+                Ok::<(), TestError>(())
+            })
+            .await?;
+        let owner = target
+            .native_driver()
+            .public_owner()
+            .inbound_owner
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| {
+                TestError::new(
+                    ErrorKind::Application,
+                    "actual hosted inbound owner missing",
+                )
+            })?;
+        owner.task.lock().await.task.as_ref().unwrap().abort();
+        // Explicit task loss, not an ordinary application Build error. Both
+        // native terminal paths must retain the same consumed join failure.
+        let first = Replicator::close(target.native_driver().as_ref()).await;
+        let second = Replicator::close(target.native_driver().as_ref()).await;
+        let third =
+            CustomReplicatorControl::shutdown_and_drain(target.native_driver().as_ref()).await;
+        let first = first
+            .err()
+            .ok_or_else(|| {
+                TestError::new(
+                    ErrorKind::Application,
+                    "lost native task became successful Close",
+                )
+            })?
+            .to_string();
+        check(
+            second.err().is_some_and(|error| error.to_string() == first)
+                && third.err().is_some_and(|error| error.to_string() == first),
+            "repeated terminal observer lost or changed completed native join failure",
+        )?;
+        let join = owner.task.lock().await;
+        check(
+            join.task.is_none() && join.result.as_ref().is_some_and(|result| result.is_err()),
+            "failed inbound join was left pollable or not retained",
+        )?;
+        check(
+            !target.native_driver().public_closed(),
+            "lost inbound task fabricated successful native joining",
+        )?;
+        check(
+            target
+                .native_driver()
+                .public_owner()
+                .owner
+                .lock()
+                .await
+                .is_none()
+                && target.native_driver().fault_owner.lock().await.is_none(),
+            "inbound failure skipped remaining native owners",
+        )?;
+        Ok(())
+    }
+    .await;
+    if let Some(gate) = effects {
+        gate.release.notify_one();
+    }
+    let setup_passed = result.is_ok();
+    let finished = cluster.finish(result).await;
+    assert!(
+        setup_passed,
+        "lost inbound setup/regression failed: {finished:?}"
+    );
+    assert!(
+        finished.is_err(),
+        "lost exact hosted native task must fail consuming finish"
+    );
+    let target = retained.unwrap();
+    assert!(!target.instance().is_running().await);
+    assert!(
+        target
+            .native_driver()
+            .public_owner()
+            .owner
+            .lock()
+            .await
+            .is_none()
+    );
+    assert!(target.native_driver().fault_owner.lock().await.is_none());
+    for probe in probes {
+        probe.assert_gone().await;
+    }
+    assert!(factory.0.lock().unwrap().is_empty());
+}
+
 async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
     let factory = Factory::default();
     let mut cluster = TestCluster::builder(factory.clone())
@@ -1023,7 +1387,7 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             .clone()
         {
             assert!(
-                owner.lock().await.is_none(),
+                owner.lock().await.task.is_none(),
                 "remaining gateway join ownership was lost"
             );
         }

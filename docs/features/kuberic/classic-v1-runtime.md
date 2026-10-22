@@ -371,10 +371,10 @@ external MySQL requalification and native executable differential remain outside
 this evidence.
 
 Current source anchors are the
-[PG companion/authority:518–780](../../../examples/postgres/src/public_v1.rs#L518-L780),
-[epoch handling:1482–1516](../../../examples/postgres/src/public_v1.rs#L1482-L1516),
-[Build/replay:2257–2587](../../../examples/postgres/src/public_v1.rs#L2257-L2587),
-[graceful Close:1189–1235](../../../examples/postgres/src/public_v1.rs#L1189-L1235),
+[PG companion/authority:547–864](../../../examples/postgres/src/public_v1.rs#L547-L864),
+[epoch handling:1570–1604](../../../examples/postgres/src/public_v1.rs#L1570-L1604),
+[Build/replay:2365–2698](../../../examples/postgres/src/public_v1.rs#L2365-L2698),
+[graceful Close:1273–1323](../../../examples/postgres/src/public_v1.rs#L1273-L1323),
 [fresh authority gate:1084–1095,1199–1223](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1084-L1095)
 and [fresh provenance predicate](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1199-L1223).
 

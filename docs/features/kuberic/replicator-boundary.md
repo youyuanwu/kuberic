@@ -190,6 +190,6 @@ Source anchors: [attachment:599–626](../../../kuberic-runtime/src/replicator/m
 [local validation:1365–1558](../../../kuberic-runtime/src/host/hosting.rs#L1365-L1558),
 [retained actions:600–793](../../../kuberic-runtime/src/replicator/custom.rs#L600-L793),
 and [configuration evidence:892–940](../../../kuberic-runtime/src/host/public_lifecycle.rs#L892-L940).
-The [PG companion:518–612](../../../examples/postgres/src/public_v1.rs#L518-L612)
-and [controller cases:185–1048](../../../examples/postgres/src/public_controller_tests.rs#L185-L1048)
+The [PG companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641)
+and [controller cases:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412)
 are concrete engine/qualification references, not new native SF interfaces.

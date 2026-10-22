@@ -85,8 +85,8 @@ terminal paths stop and reap the owned PostgreSQL run, join native gateways and
 leave PostgreSQL stopped. Separate authorized role/configuration work may later
 start it; closure does not unconditionally restart it or acknowledge a native
 fence merely from host status
-([drain:1000–1072](../../../examples/postgres/src/public_v1.rs#L1000-L1072),
-[denial:1101–1117](../../../examples/postgres/src/public_v1.rs#L1101-L1117)).
+([drain:1084–1156](../../../examples/postgres/src/public_v1.rs#L1084-L1156),
+[denial:1185–1201](../../../examples/postgres/src/public_v1.rs#L1185-L1201)).
 
 HBA reload and `pg_terminate_backend` alone miss accepted, unauthenticated
 sockets. Completed process fencing disconnects ordinary, retained administrative
@@ -143,7 +143,15 @@ Source slot retirement revalidates the hosted attempt before each new mutating
 SQL retry; this does not roll back an already-issued SQL statement.
 
 PGDATA helpers, native gateways and their retained join owners remain
-application-owned. Revocation removes copy ingress, not copied data or voter
+application-owned. A spawned gateway enters creation-owned grants before any
+post-start validation await; cancellation cannot detach a provisional listener
+from terminal joining. Inbound task-join and gateway-drain failures remain
+errors across later terminal observers, not handles polled after completion.
+Terminal and periodic paths transfer every gateway to retained drain ownership
+before awaiting any exit. Each completed drain outcome is shared immediately,
+so dropping a Close while another exit is pending loses neither the remaining
+gateways nor an already-observed failure.
+Revocation removes copy ingress, not copied data or voter
 membership. A different uncertain receiver attempt requires containment/process
 replacement, not an in-place metadata reset. Failed/interrupted custom callbacks
 can remain `ContainmentPending` until explicit terminal cleanup; this bounded
@@ -164,11 +172,11 @@ exception changes neither retained election nor native progress semantics.
 unmarked waits and `All` retain their qualified native behavior.
 
 Selected implementation: [factory:294–311](../../../examples/postgres/src/service.rs#L294-L311),
-[companion:518–612](../../../examples/postgres/src/public_v1.rs#L518-L612),
-[retained drainage:672–729](../../../examples/postgres/src/public_v1.rs#L672-L729),
-[Close joins:1189–1235](../../../examples/postgres/src/public_v1.rs#L1189-L1235),
-[Build/replay:2257–2587](../../../examples/postgres/src/public_v1.rs#L2257-L2587)
-and [native/controller qualification:185–1048](../../../examples/postgres/src/public_controller_tests.rs#L185-L1048).
+[companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641),
+[retained drainage:701–800](../../../examples/postgres/src/public_v1.rs#L701-L800),
+[Close joins:1273–1323](../../../examples/postgres/src/public_v1.rs#L1273-L1323),
+[Build/replay:2365–2698](../../../examples/postgres/src/public_v1.rs#L2365-L2698)
+and [native/controller qualification:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412).
 
 Physical replication slots belong to exact incarnations, not quorum votes.
 Slots reserve WAL before build and survive internal reconnection/restart.

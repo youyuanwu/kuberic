@@ -157,6 +157,11 @@ impl NativeGateway {
     }
 
     #[cfg(all(test, feature = "testing"))]
+    pub fn task_abort_handle(&self) -> tokio::task::AbortHandle {
+        self.task.as_ref().unwrap().abort_handle()
+    }
+
+    #[cfg(all(test, feature = "testing"))]
     pub fn hold_exit(&self) -> Arc<GatewayExitGate> {
         let gate = Arc::new(GatewayExitGate {
             entered: tokio::sync::Notify::new(),
