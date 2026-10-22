@@ -59,6 +59,7 @@ impl ApplicationFactory for Factory {
                     .join("../../target/postgres-public-v1")
             });
         std::fs::create_dir_all(&parent)?;
+        let parent = parent.canonicalize()?;
         let alias = parent.join(format!(
             "c{}-{}",
             std::process::id(),
