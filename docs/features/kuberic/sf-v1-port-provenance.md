@@ -545,6 +545,36 @@ adaptations, not an RA/FM port. KV/SQLite persistence is service-owned, not an
 engine durable-progress prerequisite. Source/test evidence classes and current
 limits are [explicit in the ledger](sf-v1-port-ledger.md).
 
+### Independent custom-native controller adaptation
+
+`ReplicatorInterfaces::with_custom_control`, the factory-context Build
+lookup/validation handle and
+[`replicator/custom.rs`](../../../kuberic-runtime/src/replicator/custom.rs)
+are new **local host authority/ownership adaptation**, not translated additions
+to native public interfaces. At the pinned SF revision, public
+`src/prod/src/idl/public/FabricRuntime.idl:606–633,687–758` keeps provider and
+Replicator/PrimaryReplicator contracts separate. Native RA retains the service's
+replicator at `RA/FailoverUnitProxy.OpenReplicaAsyncOperation.cpp:112–162`;
+Build proxy order/descriptor ownership is at
+`RA/ComProxyReplicator.BuildIdleReplicaAsyncOperation.cpp:23–41`.
+
+Build remains outside voting admission. Native
+`R/PrimaryReplicator.BuildIdleAsyncOperation.cpp:42–166`
+and `R/ReplicaManager.cpp:1142–1202` establish the source/copy/catch-up boundary;
+RA completion at
+`RA/FailoverUnitProxy.ReplicatorBuildIdleReplicaAsyncOperation.cpp:256–357`
+does not resurrect a remote proxy that ceased being InBuild. The local exact
+resource/history/storage/process/operation authority protocol, coherent host
+reports and provenance-bound fresh-sentinel initialization policy are not
+claims that native SF has those same public protocols or an identical FM rule.
+
+The [PostgreSQL controller witnesses](../../../examples/postgres/src/public_controller_tests.rs)
+run the application's actual native engine, backup/WAL/lineage, RPCs and SQL
+against production Kuberic dispatch. They do not port a database algorithm into
+the controller or turn source/test ancestry into native executable comparison.
+Direct/native fixtures and the external contract-only engine remain distinct
+evidence classes. Downstream unpublished MySQL qualification remains unavailable.
+
 ## Third-party boundary and future additions
 
 Native

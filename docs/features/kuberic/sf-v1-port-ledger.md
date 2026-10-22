@@ -20,6 +20,13 @@ test discovery or a private adapter pass establishes neither current failure
 nor closure. “Supported” below is bounded to the cited behavior, not complete
 compatibility. “Unverified” is not “defective.”
 
+Bounded custom-native controller evidence is anchored to
+`366b362ce4e1c9fdc6aaf0fe64e6be78931e96a3`: the actual PostgreSQL
+[controller witnesses](../../../examples/postgres/src/public_controller_tests.rs)
+and runtime contract negatives were executed with the authorized PG smoke and
+targeted runtime/controller checks. This does not extend the older evidence
+above to native binary execution or unavailable downstream engines.
+
 ## Current semantic and gap dispositions
 
 Stable historical IDs preserve the original issue's meaning without retaining
@@ -65,6 +72,7 @@ progress, not empty history or cross-identity reusable state
 | Core — staged access | [selected policy:209–300][aligned-access], [public barriers:144–2159][aligned-access-tests] vs [native selector:288–381][aligned-native-selector] | Supported bounded same-primary/promotion/demotion stage policy, primary-context validation, same-host repromotion/reconciliation, cancellation/replay and compatible final release. Missing progress yields explicit unavailable facts; descriptor availability is not remote liveness. Broader stage/interleaving qualification remains unverified. |
 | Core — primary-local Build fault entry | [Manager:793–805,1028–1045][local-fault-entry], [owner:157–230][rejection-owner], [public:333–392][rejection-public] | New assignment/catch-up reject latched GetCopyState/EndGetNext faults. Regression negative controls demonstrated cached-ready catch-up success and new owner assignment before the gate. This is a separate local fault-entry mismatch, not SF-12 remote ordering. Pending operations and Close retain separate policies. |
 | Source-contract wording | [catch-up Rustdoc][catchup-doc], [epoch Rustdoc][epoch-doc] and [manager:975–1024][manager], [292–302][epoch] | Aligned selected V1 contract: moving All, captured-boundary/current-quorum/live-marked WriteQuorum, and issued-tail primary epoch callbacks. Secondary stream boundaries remain distinct; catch-up/epoch boundaries do not certify provider commitment or durability. Protected signatures and runtime behavior are unchanged. |
+| Custom native authority/observations | [Supported companion](replicator-boundary.md#custom-controller-integration), [actual PG controller](../../../examples/postgres/src/public_controller_tests.rs), [real-host contract negatives](../../../kuberic-runtime/tests/support/custom_control.rs) | Supported bounded independent-engine Build authority, coherent installed/idle observations, exact live native replay/invalidation and real controller joint/current-only admission with SQL fencing. Local authority/fresh-initialization policy is not an SF public protocol or native FM algorithm. No unpublished MySQL trace, automatic arbitrary failed-Build reformation, native binary differential or production-readiness claim. |
 | Security | [HTTP:177–227][http], [bearer:728–766][auth] | Authenticated but no TLS; ordinary deployment constraints remain. Missing native credential API is not accepted-but-unenforced settings. |
 | Qualification | [public external provider:1861–1939][external], [real SQLite:1731–1801][sqlite], component/native ancestry | Actual Rust/application evidence is not native binary differential, kernel power-loss or production readiness. |
 

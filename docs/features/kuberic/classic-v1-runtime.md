@@ -8,6 +8,12 @@ retain their explicit `e2a47b6c631c974aa0135e81c3a7e3a439980ded` anchors.
 Native comparisons use Service Fabric
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 
+Custom-controller integration is separately anchored to Kuberic
+`366b362ce4e1c9fdc6aaf0fe64e6be78931e96a3` and the
+[supported companion contract](replicator-boundary.md#custom-controller-integration).
+Its actual PostgreSQL controller witnesses and runtime negative fixtures do
+not change the older pinned built-in/component evidence below.
+
 **Evidence is bounded:** targeted Rust selected-host regressions were executed
 for the Close/access changes. Inspected source and other existing test bodies
 are not additional runs, native binary differential, power-loss proof,
@@ -318,6 +324,45 @@ cannot replace a new Build under an old ID
 
 PostgreSQL uses its own no-provider/no-StateReplicator bundle with conservative
 specific-quorum capability false ([service:246–292][pg-factory]).
+
+The production factory attaches its own creation-bound custom companion, not a
+built-in runtime. It validates exact host authority at native ingress, gateway/
+backup boundaries and completion; source inspection independently validates the
+live source operation. Actual WAL/lineage/replay and database evidence remain
+application-owned. Exact live native replay revalidates retained/physical
+history and returns the matching completion without repeating copy mutation.
+Revoked or stale authority cannot reuse that historical completion as ingress.
+
+The engine retains last successfully installed native membership and actual
+completed built-idle ownership separately from current transport/readiness.
+Normal same-history epoch advancement may drain transport without erasing the
+truthful predecessor needed for joint catch-up; it does not install the next
+configuration or preserve revoked copy authority. Secondary host configuration
+precedes primary native Peer admission and is not itself native peer completion.
+
+For initial authority only, the controller can select a deterministic singleton
+when every eligible replica has exact successful **New-Open completion
+provenance**, None role, no prior authority/installed state and both explicit
+`Value(INVALID_LSN)` query results. Current report Open mode is not freshness.
+This is local initialization policy, not a retained-history election or a zero
+progress claim; failed/unavailable queries do not qualify.
+
+The [actual controller cases](../../../examples/postgres/src/public_controller_tests.rs)
+qualify nonempty singleton → Build → separate joint/current-only admission,
+live replay and binding rejection, source/target invalidation before delayed
+completion, synchronous SQL/replay and retained-socket rejection after completed
+native fencing. Cleanup errors propagate while real owners are joined. Contract
+stale-revoke callbacks are explicitly negative component checks, not substituted
+controller positives. Automatic reformation after arbitrary failed custom Build,
+external MySQL requalification and native executable differential remain outside
+this evidence.
+
+Current source anchors are the
+[PG companion/authority:412–593](../../../examples/postgres/src/public_v1.rs#L412-L593),
+[epoch handling:1235–1263](../../../examples/postgres/src/public_v1.rs#L1235-L1263),
+[Build/replay:1963–2150](../../../examples/postgres/src/public_v1.rs#L1963-L2150),
+[fresh authority gate:1084–1095,1199–1223](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1084-L1095)
+and [fresh provenance predicate](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1199-L1223).
 
 | Boundary | Current behavior and evidence | Limit |
 |---|---|---|

@@ -63,6 +63,18 @@ Obtain the primary's exact reference from that observation and use `service`
 to call the application's own request API. There is no harness-defined
 key/value or transaction protocol.
 
+The default remains three replicas. A bounded formation test can use
+`builder(factory).initial_replicas(1).start()`, `settle_members(1)`, then
+`scale_to(2)` and `settle_members(2)`. Initial and desired counts are validated
+in the harness's supported range of one through three; this is not a production
+CRD cardinality restriction. Scaling changes only spec intent. Initialization,
+source/target Build and separate admission still run through the real controller.
+`settle()` retains its three-member expectation; use `settle_members` for another
+requested count.
+See [builder:1463–1520](../../../kuberic-controller/src/test_util/cluster.rs#L1463-L1520),
+[singleton settle:1639–1654](../../../kuberic-controller/src/test_util/cluster.rs#L1639-L1654)
+and [spec-only scaling:2077–2089](../../../kuberic-controller/src/test_util/cluster.rs#L2077-L2089).
+
 `drive` advances reconciliation concurrently with an application future;
 `probe` bounds the future without advancing reconciliation. All helpers share
 one scenario deadline. A failed or timed-out write can already have a durable
@@ -89,11 +101,21 @@ automatically.
 
 ## Fault and Transfer Tests
 
-The harness supports the built-in persisted Public V1 profile with three
-replicas. Controls cover cooperative restart/stop, controller-owned Pod
+The harness supports the built-in persisted Public V1 profile and bounded
+custom-native formation through the
+[custom companion](replicator-boundary.md#custom-controller-integration).
+PostgreSQL's [production-engine fixture](../../../examples/postgres/src/public_controller_tests.rs)
+owns its actual native coordination listeners, processes and storage.
+Controls cover cooperative restart/stop, controller-owned Pod
 replacement, support-resource repair, planned switchover and real loopback TCP
 isolation. Readiness validates exact accepted/live evidence, access grants,
 canonical configuration and settled progress, not only a primary role.
+
+Built-in transport cuts require an acknowledged routed built-in creation.
+Custom application transports are not borrowed from that bundle or silently
+treated as routable: unsupported transport controls return an explicit
+`UnsupportedCapability` error. Native database binaries and application-specific
+transport prerequisites remain the application's responsibility.
 
 There is one outstanding transport-fault owner per cluster, shared by manual
 group cuts and armed Build-dial faults. A second cut is rejected before
@@ -153,7 +175,7 @@ Restart is cooperative shutdown/reconstruction, not a process crash.
 The harness does not establish Kubernetes admission, RBAC, watch delivery,
 DNS/Service packet routing, image startup, application HTTP serialization,
 power-loss durability, native SF parity, arbitrary network faults, volatile
-providers, custom-replicator transport support, or V2 transactional
+providers, arbitrary custom-transport fault injection, or V2 transactional
 conformance. Retain provider-specific and owned KinD tests for their existing
 claims. See the [design](../../proposal/downstream-in-process-testing.md) and
 [test strategy](testing.md).

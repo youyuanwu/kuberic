@@ -281,6 +281,12 @@ PG implementation/regressions are
 [`public_v1.rs`](../../../examples/postgres/src/public_v1.rs),
 [`public_v1_tests.rs`](../../../examples/postgres/src/public_v1_tests.rs) and
 [`public_v1_p6_tests.rs`](../../../examples/postgres/src/public_v1_p6_tests.rs).
+The independent
+[`public_controller_tests.rs`](../../../examples/postgres/src/public_controller_tests.rs)
+uses production PgService, native PostgreSQL processes/RPCs and real controller
+dispatch. It is not a raw built-in bundle wrapper or a direct native-only Build
+fixture. Its selected names cover formation, delayed source/target invalidation
+and cleanup failure; the smoke catalog includes them.
 The `_p6` filename identifies existing tests, not today's roadmap cursor.
 Evidence distinguishes live-status drain, idle/slot retirement, orderly
 terminal progress, marked-successor WriteQuorum rejection, ordinary unmarked
@@ -289,6 +295,51 @@ WriteQuorum/All success and retained Abort. See
 [audit dispositions](sf-v1-port-ledger.md#current-semantic-and-gap-dispositions).
 Do not infer native differential, arbitrary survivor election, WAL-growth SLA
 or power-loss proof from these process/file observations.
+
+### Custom-native controller reproduction and limits
+
+Keep both scratch roots owned by the checkout, inventory the live selector,
+then run the authorized smoke entry point:
+
+```bash
+mkdir -p target/paw-tmp target/postgres-public-v1
+export TMPDIR="$PWD/target/paw-tmp"
+export KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$PWD/target/postgres-public-v1"
+just nextest-postgres-smoke-inventory
+filter="$(python3 scripts/validate_nextest_partitions.py --postgres-smoke-filter)"
+cargo nextest list -p postgres-replicated --all-features --profile postgres -E "$filter"
+just nextest-postgres-smoke
+```
+
+The actual controller witness observes successful fresh Open and explicit
+unknown-history sentinels before first Role; nonempty SQL before scaling;
+real source/target backup, lineage, receive/replay and built-idle state; separate
+role/epoch, exact joint catch-up and current-only admission; then synchronous
+SQL/replay and retained-socket rejection after completed native fencing.
+Live native retry and independently mutated authority checks cannot repeat
+copy mutation. Supported source/target fault reporting at held native cuts
+rejects delayed completion. Cleanup errors remain errors while actual owners
+are joined. Native companion stale-revoke calls are explicitly component
+negatives, not substituted controller positives.
+
+The separate
+[external runtime contract fixture](../../../kuberic-runtime/tests/support/custom_control.rs)
+uses an independently attached engine, real host journals/control dispatch and
+owned child tasks, but deliberately has no native database/quorum implementation.
+Its truthful progress-unavailable and unsupported wait results must not be
+called a native positive witness:
+
+```bash
+cargo test -p kuberic-runtime --features testing --test classic_v1_production custom_host_
+cargo test -p kuberic-runtime --features testing --lib replicator::custom::tests
+cargo test -p kuberic-runtime --test public_api_privacy -- --ignored
+```
+
+The ignored privacy test must actually be selected. Neither these contract
+fixtures nor direct PG tests alone prove custom-controller compatibility.
+This bounded upstream PG evidence is not unpublished downstream MySQL
+requalification, the reported seven-completion trace, arbitrary failed-Build
+reformation, native executable differential or Kubernetes deployment evidence.
 
 ## Archive Reproducibility
 

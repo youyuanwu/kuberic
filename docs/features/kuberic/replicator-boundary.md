@@ -15,6 +15,7 @@ core differences, unverified qualification and deferred capability work.
 - `Replicator` / `PrimaryReplicator`;
 - optional `StateReplicator`;
 - optional `StateProvider`;
+- optional local `CustomReplicatorControl` companion for independent native engines;
 - application-owned persistence; `DurableState` is not a factory prerequisite.
 
 The protected method sets are unchanged. Applications receive no agent store,
@@ -111,3 +112,70 @@ Custom implementations must:
 - return the same coherent public interface allocation.
 
 They do not receive a compatibility adapter for the removed built-in engine.
+
+### Custom controller integration
+
+An independent factory attaches its own `CustomReplicatorControl` through
+`ReplicatorInterfaces::with_custom_control(&context, owner)` while holding its
+one-shot factory context. Return that same coherent creation. Attachment and
+registration must agree on the exact owner; an abandoned or different returned
+bundle cannot discard pending cleanup ownership. `NativeRuntimeControl`, its
+TCP/queue diagnostics and host/store setters remain private. Wrapping a built-in
+bundle is not an independent native-engine implementation.
+
+The companion is a **Kuberic local authority adaptation**, not a new method on
+SF's Replicator, PrimaryReplicator or StateProvider. Its responsibilities are:
+
+| Contract | Required meaning |
+|---|---|
+| `install_inbound_build_authority` | Install the exact target copy ingress owner before acknowledging success. The controller awaits this acknowledgement before dispatching source Build. |
+| `revoke_inbound_build_authority` | Invalidate only the matching attempt's ingress. Stale revocation must not cancel another owner; revocation is not voter removal, data deletion or proof of receiver drainage. |
+| `idle_replicas(configuration)` | Observe real native idle membership coherently with the supplied last successfully installed host configuration. An error means unavailable, not observed empty membership. |
+| `shutdown_and_drain` | Fence and join the creation's actual owned native descendants. Failed/lost cleanup is not positive containment. |
+
+The host retains serialized install/revoke actions independently of an RPC
+waiter, invalidates authority before awaiting cleanup, and retains receiver
+ownership after revocation. A different receiver attempt cannot reset an
+uncertain receiver in the same creation; containment/process replacement is
+required. Exact current install replay does not duplicate installation.
+Historical source completion is distinct from a live ingress grant; revoked
+installation replay cannot reauthorize copy. Failed/interrupted custom callbacks
+can remain `ContainmentPending` until actual terminal cleanup. Neither a return
+code nor cancellation fabricates a join.
+
+Use `ReplicatorFactoryContext::outbound_build_authority(build_id)` inside the
+accepted source Build to obtain its complete frozen authority. Revalidate with
+`validate_build_authority` before native effects, after awaits and before
+publishing completion. This validates the **local** registered creation and
+source journal or target grant; it is not a distributed liveness oracle.
+The application-native protocol must also validate the other endpoint. A copied
+authority object or a credential is not self-authorizing.
+
+Bindings include resource/history and their generations, both replica
+incarnations, storage incarnations, process sessions, endpoints, epoch,
+configuration, Build ID, operation ID and revision. The canonical source input
+digest remains bound by the host's accepted operation, not a fabricated extra
+field in native callbacks or receipts.
+
+Reports combine a successful exact host configuration with the companion's
+coherent native idle sample. Missing, failed, stale, torn, duplicate or
+voting-overlap observations cannot become installed evidence. A successfully
+journaled **secondary host configuration** may precede primary native peer
+admission: it is control authority, not a nonexistent secondary
+PrimaryReplicator callback, native peer completion, or serving access.
+
+PostgreSQL supplies an actual independent
+[native controller witness](../../../examples/postgres/src/public_controller_tests.rs).
+The external runtime contract fixture is contract/negative evidence only.
+Unpublished downstream MySQL fixtures and the externally reported
+seven-completion trace are not reproduced by either fixture; downstream engines
+must requalify their own native transfer, lineage, replay, admission and fencing.
+
+Source anchors: [attachment:596–623](../../../kuberic-runtime/src/replicator/mod.rs#L596-L623),
+[read-only context:923–948](../../../kuberic-runtime/src/replicator/mod.rs#L923-L948),
+[local validation:1341–1474](../../../kuberic-runtime/src/host/hosting.rs#L1341-L1474),
+[retained actions:501–611](../../../kuberic-runtime/src/replicator/custom.rs#L501-L611),
+and [configuration evidence:890–938](../../../kuberic-runtime/src/host/public_lifecycle.rs#L890-L938).
+The [PG companion:412–502](../../../examples/postgres/src/public_v1.rs#L412-L502)
+and [controller cases:185–549](../../../examples/postgres/src/public_controller_tests.rs#L185-L549)
+are concrete engine/qualification references, not new native SF interfaces.

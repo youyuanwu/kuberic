@@ -75,6 +75,32 @@ do not certify provider commitment, durability or client success.
 | **Mode/fault/interleaving coverage** | Persisted/required-ACK combinations are core-tested ([tests:121–172][modes]); selected production has fixed mode/policy choices ([production:121–158][policy]). | Build a claim-specific component/public matrix and close consequential holes only. Private required-ACK volatile mode is not an exposed public setting; do not expand P7 simply to fill coverage cells. |
 | **PG terminal observations** | Orderly stopped progress and retained Abort cleanup have distinct witnesses ([tests:163–249][pg-progress], [940–1050][pg-abort]). | Separately scope any need for SQL racing shutdown, Abort progress snapshots or survivor ranking. Completion requires an actual bounded scenario; existing fsynced files and process cleanup do not establish these claims. |
 
+## Custom-native controller evidence and remaining obligations
+
+The [supported local companion](replicator-boundary.md#custom-controller-integration)
+and [actual PostgreSQL controller cases](../../../examples/postgres/src/public_controller_tests.rs)
+provide bounded upstream evidence for exact inbound authority, truthful installed
+voting/idle observations, real copy before admission, exact joint/current-only
+staging, native replay/invalidation, SQL/replay and completed fencing. Fresh
+sentinel initialization requires exact successful New-Open provenance; it is
+not zero progress or a retained-history election. Protected native method sets
+and representations remain unchanged.
+
+Remaining claim-specific obligations are not presumed defects or implied runs:
+
+- Downstream MySQL must attach the supported companion and requalify its own
+  source/target Build, native lineage/progress, later admission and actual access
+  fencing with exact process/storage/history/attempt bindings. Its unpublished
+  fixtures and externally reported seven-completion trace were not reproduced.
+- Native SF executable/differential validation, arbitrary failed custom-Build
+  reformation and production deployment remain outside the bounded upstream
+  witness. Failed/interrupted custom work may require explicit terminal cleanup
+  or process replacement before conflicting work can proceed; a historical
+  completion is not a renewed ingress grant.
+- Marked-successor PostgreSQL WriteQuorum remains explicitly unsupported as
+  documented below. Generic authority support does not implement missing native
+  database capabilities, broad P7 settings or new transport-fault controls.
+
 ## Deployment security qualification
 
 This is not all a rare-extension concern. Production requires HTTP and checks

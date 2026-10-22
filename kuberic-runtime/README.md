@@ -35,6 +35,16 @@ The public Service Fabric-shaped interfaces are:
 The protected `Replicator`, `PrimaryReplicator` and `StateProvider` method sets
 are unchanged. Assignment and stream APIs intentionally change.
 
+An independent native engine can additionally attach
+`replicator::CustomReplicatorControl` with
+`ReplicatorInterfaces::with_custom_control(&context, owner)` during factory
+creation. This optional **local control-plane companion**, not an SF interface,
+supports exact inbound Build authority, configuration-bound idle observations
+and owned drainage. Factory-context Build lookup/validation is read-only and
+creation-bound; it does not expose an agent store or authority setter.
+See the [custom-engine contract](../docs/features/kuberic/replicator-boundary.md#custom-controller-integration)
+and its evidence limits.
+
 ## Built-In Replicator
 
 `DefaultReplicatorFactory::new()` is the sole built-in factory. It constructs the
