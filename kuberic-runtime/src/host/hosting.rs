@@ -659,6 +659,11 @@ impl PodRuntime {
                 }
                 continue;
             }
+            if let Some(installed) =
+                crate::host::public_lifecycle::installed_configuration_from_record(record)
+            {
+                configuration = Some(installed);
+            }
             match record.intent.program.as_ref() {
                 Some(PublicOperationProgram::Open { .. }) => open = true,
                 Some(PublicOperationProgram::Role {
@@ -668,20 +673,15 @@ impl PodRuntime {
                 Some(PublicOperationProgram::Epoch {
                     epoch: selected_epoch,
                 }) => epoch = Some(*selected_epoch),
-                Some(PublicOperationProgram::Configuration(selected))
-                | Some(PublicOperationProgram::CatchUp {
-                    configuration: selected,
-                    ..
-                }) => configuration = Some(selected.clone()),
+                Some(PublicOperationProgram::Configuration(_))
+                | Some(PublicOperationProgram::CatchUp { .. }) => {}
                 Some(PublicOperationProgram::Swap {
-                    refreshed,
                     epoch: selected_epoch,
                     handoff,
                     ..
                 }) => {
                     role = Some((*selected_epoch, *handoff));
                     epoch = Some(*selected_epoch);
-                    configuration = Some(refreshed.clone());
                 }
                 Some(
                     PublicOperationProgram::Build(_)
@@ -690,20 +690,11 @@ impl PodRuntime {
                 ) => {}
                 None if record.intent.lifecycle.is_some() => {
                     let lifecycle = record.intent.lifecycle.as_ref().expect("checked lifecycle");
-                    open = true;
                     epoch = Some(lifecycle.epoch);
-                    role = Some((
-                        lifecycle.epoch,
-                        if lifecycle.recipe
-                            == crate::protocol::public_operations::PublicLifecycleRecipe::
-                                SecondaryEpochAdvance
-                        {
-                            ReplicaRole::ActiveSecondary
-                        } else {
-                            ReplicaRole::Primary
-                        },
-                    ));
-                    configuration = Some(lifecycle.configuration());
+                    if lifecycle.recipe != crate::protocol::public_operations::PublicLifecycleRecipe::SecondaryEpochAdvance {
+                        open = true;
+                        role = Some((lifecycle.epoch, ReplicaRole::Primary));
+                    }
                 }
                 Some(PublicOperationProgram::Close | PublicOperationProgram::Abort) => {
                     open = false;
@@ -953,6 +944,12 @@ impl PodRuntime {
 
         let replicator_creation_id = self.replacement_replicator_creation_id()?;
         let bridge = self.host.replacement_fault_bridge.lock().await.clone();
+        let observation_revision = bridge
+            .as_ref()
+            .map(|bridge| bridge.registry.revision_receiver());
+        let sampled_revision = observation_revision
+            .as_ref()
+            .map(|revision| *revision.borrow());
         let observation_state = match bridge {
             Some(bridge) => Some(
                 bridge
@@ -995,6 +992,9 @@ impl PodRuntime {
                 let sample_session = process_session_id.clone();
                 observation_alive = Some(Arc::new(move || {
                     alive_runtime.build_authority_open()
+                        && observation_revision
+                            .as_ref()
+                            .is_some_and(|revision| Some(*revision.borrow()) == sampled_revision)
                         && host.upgrade().is_some_and(|host| {
                             !host.closed.load(Ordering::Acquire)
                                 && !host.aborted.load(Ordering::Acquire)
@@ -1009,6 +1009,10 @@ impl PodRuntime {
                         })
                 }) as Arc<dyn Fn() -> bool + Send + Sync>);
                 if let Some(observed) = observation_state.as_ref()
+                    && crate::host::public_lifecycle::configuration_observation_safe(
+                        observed,
+                        &process_session_id,
+                    )
                     && let Some(configuration) =
                         crate::host::public_lifecycle::installed_configuration_for_state(
                             observed,

@@ -1731,7 +1731,7 @@ pub(crate) fn native_cold_copy_step(
     if installed.previous.is_some() {
         return native_configuration_step(replicas, &installed.current);
     }
-    // Exact retained uncertainty requires exact retirement even without a diagnostic.
+    // Exact retained ownership requires exact retirement even without a diagnostic.
     // An optional native idle query may only infer an otherwise unowned idle slot.
     if let Some(remote) = source.report.remote_builds.iter().find(|remote| {
         remote.build.replica.replica_id == target.report.replica.replica_id
@@ -1739,6 +1739,7 @@ pub(crate) fn native_cold_copy_step(
                 remote.state,
                 kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::Accepted
                     | kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::InBuild
+                    | kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::Ready
                     | kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::InDrop
             )
     }) {
@@ -1850,6 +1851,23 @@ fn operation_revision(
     kind: &str,
 ) -> Result<u64, String> {
     let digest = program.digest();
+    if matches!(program, PublicOperationProgram::Remove(_))
+        && let Some(active) = replica
+            .report
+            .active_operations
+            .iter()
+            .find(|active| active.operation_id == *operation_id)
+    {
+        if active.identity != accepted.identity
+            || replica.report.history != accepted.history
+            || active.process_session_id != replica.report.process_session_id
+            || active.input_digest != digest
+            || active.program.as_ref() != Some(program)
+        {
+            return Err("active operation differs from exact topology input".into());
+        }
+        return Ok(active.revision);
+    }
     if let Some(pending) = replica
         .report
         .retry_pending_operations
@@ -1881,6 +1899,9 @@ fn operation_revision(
         })
     {
         return Ok(completion.revision);
+    }
+    if let PublicOperationProgram::Remove(build) = program {
+        return exact_remove_revision(accepted, replica, operation_id, build);
     }
     replica
         .report
@@ -1921,6 +1942,165 @@ fn operation_revision(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| format!("public-v1 {kind} revision overflow"))
+}
+
+pub(crate) fn exact_remove_revision(
+    accepted: &PublicV1AcceptedStatus,
+    replica: &PublicV1TopologyReplica,
+    operation_id: &OperationId,
+    build: &PublicBuildInput,
+) -> Result<u64, String> {
+    use kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState;
+
+    if replica.report.identity != accepted.identity || replica.report.history != accepted.history {
+        return Err("exact removal differs from current source authority".into());
+    }
+    let remote = replica
+        .report
+        .remote_builds
+        .iter()
+        .find(|remote| remote.build == *build && remote.state != PublicV1RemoteBuildState::Dropped)
+        .ok_or("exact removal lacks a retained Build")?;
+    let is_authority = |kind| {
+        !matches!(
+            kind,
+            PublicV1CallKind::Build | PublicV1CallKind::Close | PublicV1CallKind::Abort
+        )
+    };
+    // Remove also names RetireIdleReplica, whose actual journal class is
+    // Authority. Including ordinary exact Remove is safe: its admission
+    // revision already equals the then-current retained authority revision,
+    // so its completion cannot inflate this high-water.
+    let in_scope = |process: &_, storage: &_, history: &_| {
+        process == &replica.report.process_session_id
+            && storage == &replica.report.storage_incarnation
+            && history == &accepted.history
+    };
+    if let Some(completion) = replica
+        .report
+        .completed_operations
+        .iter()
+        .find(|completion| {
+            completion.operation_id == *operation_id
+                && completion.call_kind == PublicV1CallKind::Remove
+                && completion.input_digest == PublicOperationProgram::Remove(build.clone()).digest()
+                && in_scope(
+                    &completion.process_session_id,
+                    &completion.storage_incarnation,
+                    &completion.history,
+                )
+        })
+    {
+        return Ok(completion.revision);
+    }
+    if replica.report.active_operations.iter().any(|intent| {
+        intent.class.is_terminal()
+            || matches!(intent.class, PublicOperationClass::Remove { target }
+                if target == build.replica.replica_id && intent.operation_id != *operation_id)
+    }) || replica
+        .report
+        .completed_operations
+        .iter()
+        .any(|completion| {
+            matches!(
+                completion.call_kind,
+                PublicV1CallKind::Close | PublicV1CallKind::Abort
+            ) && in_scope(
+                &completion.process_session_id,
+                &completion.storage_incarnation,
+                &completion.history,
+            )
+        })
+    {
+        return Err(
+            "exact removal requires resolution of retained terminal or removal ownership".into(),
+        );
+    }
+    let revision = replica
+        .report
+        .completed_operations
+        .iter()
+        .filter(|completion| {
+            is_authority(completion.call_kind)
+                && in_scope(
+                    &completion.process_session_id,
+                    &completion.storage_incarnation,
+                    &completion.history,
+                )
+        })
+        .map(|completion| completion.revision)
+        .chain(
+            accepted
+                .completed_operations
+                .iter()
+                .filter(|completion| {
+                    is_authority(completion.call_kind)
+                        && in_scope(
+                            &completion.process_session_id,
+                            &completion.storage_incarnation,
+                            &completion.history,
+                        )
+                })
+                .map(|completion| completion.revision),
+        )
+        .chain(
+            replica
+                .report
+                .active_operations
+                .iter()
+                .chain(
+                    replica
+                        .report
+                        .retry_pending_operations
+                        .iter()
+                        .map(|pending| &pending.intent),
+                )
+                .filter(|intent| {
+                    intent.identity == accepted.identity
+                        && intent.process_session_id == replica.report.process_session_id
+                        && matches!(
+                            intent.class,
+                            PublicOperationClass::Authority | PublicOperationClass::PlannedSwap
+                        )
+                })
+                .map(|intent| intent.revision),
+        )
+        .max()
+        .unwrap_or(remote.revision);
+    let completed = replica
+        .report
+        .completed_operations
+        .iter()
+        .any(|completion| {
+            completion.operation_id == remote.operation_id
+                && completion.revision == remote.revision
+                && completion.call_kind == PublicV1CallKind::Build
+                && completion.input_digest == PublicOperationProgram::Build(build.clone()).digest()
+                && in_scope(
+                    &completion.process_session_id,
+                    &completion.storage_incarnation,
+                    &completion.history,
+                )
+        });
+    // An active Build can only be superseded at its own revision. Once it is
+    // contained/completed, withdrawal instead uses the current source authority.
+    let active = replica.report.active_operations.iter().any(|intent| {
+        intent.operation_id == remote.operation_id
+            && intent.revision == remote.revision
+            && intent.program.as_ref() == Some(&PublicOperationProgram::Build(build.clone()))
+    });
+    if revision < remote.revision || (!completed && (!active || revision != remote.revision)) {
+        return Err("retained Build requires containment before current-authority removal".into());
+    }
+    if replica.report.active_operations.iter().any(|intent| {
+        matches!(
+            intent.class,
+            PublicOperationClass::Build { .. } | PublicOperationClass::Remove { .. }
+        ) && intent.revision != revision
+    }) {
+        return Err("exact removal conflicts with active remote operation authority".into());
+    }
+    Ok(revision)
 }
 
 fn retained_authority_revision(
@@ -3025,9 +3205,24 @@ mod tests {
                 result: PublicV1OperationResult::Succeeded,
             });
         report.validate().unwrap();
+        assert_eq!(
+            step(&replicas),
+            Some((
+                replicas[0].report.replica.clone(),
+                PublicOperationProgram::Remove(build)
+            )),
+            "an exact unretired Ready owner is withdrawn without inferring native membership"
+        );
+        assert!(replicas[0].report.engine_idle.is_none());
+        replicas[0].report.remote_builds[0].state = PublicV1RemoteBuildState::Dropped;
         assert!(
             step(&replicas).is_none(),
-            "historical Build success is not native idle membership"
+            "retired success cannot become renewed ownership"
+        );
+        replicas[0].report.remote_builds.clear();
+        assert!(
+            step(&replicas).is_none(),
+            "historical completion alone is not native idle membership"
         );
     }
 

@@ -40,6 +40,8 @@ const CREDENTIAL: &str = "classic-v1-test-credential";
 
 #[path = "support/custom_control.rs"]
 mod custom_control;
+#[path = "support/idle_observation.rs"]
+mod idle_observation;
 
 mod native_wire {
     tonic::include_proto!("kuberic.sf.v1");
@@ -802,7 +804,7 @@ impl<A: Sample> Node<A> {
         current
     }
 
-    async fn build(
+    async fn build_idle(
         &mut self,
         target: &mut Self,
         epoch: Epoch,
@@ -848,6 +850,16 @@ impl<A: Sample> Node<A> {
         };
         target.install_build_authority(authority.clone()).await;
         self.command(PublicOperationProgram::Build(build)).await;
+        authority
+    }
+
+    async fn build(
+        &mut self,
+        target: &mut Self,
+        epoch: Epoch,
+        current: &ConfigurationDescriptor,
+    ) -> PublicInboundBuildAuthority {
+        let authority = self.build_idle(target, epoch, current).await;
         target
             .command(PublicOperationProgram::Role {
                 epoch,

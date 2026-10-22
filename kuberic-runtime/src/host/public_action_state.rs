@@ -22,7 +22,11 @@ fn epoch(intent: &PublicOperationIntent) -> Option<Epoch> {
             | P::CatchUp {
                 configuration: c, ..
             } => Some(c.current.epoch),
-            P::Build(b) | P::Remove(b) => Some(b.epoch),
+            P::Build(b) => Some(b.epoch),
+            // Remove withdraws an immutable retained attempt, not its epoch's
+            // authority. Registry revision/containment and store exact-attempt
+            // checks still apply to the current command.
+            P::Remove(_) => None,
             _ => None,
         })
 }
@@ -54,7 +58,10 @@ fn achieved_role(record: &PublicOperationRecord, application: bool) -> Option<Re
         })
 }
 
-fn configuration_at(intent: &PublicOperationIntent, instruction: I) -> Option<PublicConfiguration> {
+pub(crate) fn configuration_at(
+    intent: &PublicOperationIntent,
+    instruction: I,
+) -> Option<PublicConfiguration> {
     if !matches!(
         instruction,
         I::Configuration
@@ -73,8 +80,27 @@ fn configuration_at(intent: &PublicOperationIntent, instruction: I) -> Option<Pu
     } else {
         public_lifecycle::program::configuration(intent.program.as_ref()?, instruction).clone()
     };
-    if instruction == I::CurrentConfiguration {
+    if instruction == I::CurrentConfiguration
+        || (instruction == I::CatchUp
+            && intent
+                .lifecycle
+                .as_ref()
+                .is_some_and(|input| input.data_loss_recovery.is_some()))
+    {
         configuration.previous = None;
+        configuration.replicas.retain_mut(|replica| {
+            if let Some(member) = configuration
+                .current
+                .members
+                .iter()
+                .find(|member| member.identity == replica.identity)
+            {
+                replica.role = member.role;
+                true
+            } else {
+                false
+            }
+        });
     }
     Some(configuration)
 }

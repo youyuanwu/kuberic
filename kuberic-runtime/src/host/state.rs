@@ -267,6 +267,51 @@ pub(crate) struct PublicRemoteBuildObservation {
 }
 
 impl PublicV1OperationState {
+    pub(crate) fn build_was_promoted(
+        &self,
+        build: &crate::protocol::public_operations::PublicBuildInput,
+    ) -> bool {
+        use crate::host::public_build_store::PublicV1BuildRetirement;
+        use crate::protocol::public_operations::PublicV1OperationResult;
+        let Some(record) = self.build_records.get(&build.attempt) else {
+            return false;
+        };
+        if record.result != Some(PublicV1OperationResult::Succeeded)
+            || record.retirement != PublicV1BuildRetirement::Retain
+        {
+            return false;
+        }
+        self.operations.values().any(|operation| {
+            if operation.intent.revision <= record.admission_revision
+                || operation.intent.process_session_id != record.source_session
+                || operation.accepted_history.as_ref() != Some(&record.history)
+                || operation.accepted_storage.as_ref() != Some(&record.source_storage)
+            {
+                return false;
+            }
+            let Some(configuration) =
+                crate::host::public_lifecycle::installed_configuration_from_record(operation)
+            else {
+                return false;
+            };
+            configuration.current.epoch >= build.epoch
+                && configuration.current.members.iter().any(|member| {
+                    member.identity == build.replica
+                        && matches!(
+                            member.role,
+                            crate::protocol::types::ReplicaRole::Primary
+                                | crate::protocol::types::ReplicaRole::ActiveSecondary
+                        )
+                })
+                && configuration.replicas.iter().any(|replica| {
+                    replica.identity == build.replica
+                        && replica.storage_incarnation.as_ref() == Some(&build.target_storage)
+                        && replica.process_session_id == build.process_session_id
+                        && replica.replication_address == build.replication_address
+                })
+        })
+    }
+
     pub(crate) fn remote_build_states(
         &self,
         session: &crate::protocol::types::ProcessSessionId,
@@ -316,9 +361,19 @@ impl PublicV1OperationState {
                                 _ => false,
                             }
                     });
+                let promoted = exact
+                    && operation
+                        .and_then(|operation| match &operation.intent.program {
+                            Some(PublicOperationProgram::Build(input)) => Some(input),
+                            _ => None,
+                        })
+                        .is_some_and(|input| self.build_was_promoted(input));
                 let state = match build.retirement {
                     PublicV1BuildRetirement::Retired => PublicRemoteBuildState::Dropped,
                     PublicV1BuildRetirement::Required => PublicRemoteBuildState::InDrop,
+                    // Configuration now owns this peer. Lazy Build-slot GC is
+                    // not continued idle ownership or proof of native presence.
+                    PublicV1BuildRetirement::Retain if promoted => PublicRemoteBuildState::Dropped,
                     PublicV1BuildRetirement::Retain if retiring => PublicRemoteBuildState::InDrop,
                     PublicV1BuildRetirement::Retain => {
                         if exact

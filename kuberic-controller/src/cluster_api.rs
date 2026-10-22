@@ -2636,12 +2636,16 @@ fn renewal_native_command(
         }
         _ => kuberic_runtime::protocol::public_operations::PublicOperationClass::Authority,
     };
-    let revision = if matches!(program, PublicOperationProgram::Build(_)) {
-        retained
-    } else {
-        retained
+    let revision = match &program {
+        PublicOperationProgram::Build(_) => retained,
+        PublicOperationProgram::Remove(build) => {
+            crate::evaluator::public_v1_topology::exact_remove_revision(
+                authority, replica, &id, build,
+            )?
+        }
+        _ => retained
             .checked_add(1)
-            .ok_or("native renewal revision exhausted")?
+            .ok_or("native renewal revision exhausted")?,
     };
     let intent = kuberic_runtime::protocol::public_operations::PublicOperationIntent {
         identity: authority.identity.clone(),
@@ -2661,6 +2665,16 @@ fn renewal_native_command(
             intent,
         },
     ))))
+}
+
+/// Exposes the production renewal preparation planner for cross-crate contract tests.
+#[cfg(feature = "runtime-test-bridge")]
+pub fn plan_public_v1_renewal_preparation(
+    authority: &PublicV1AcceptedStatus,
+    renewal: &PublicV1SessionRenewalStatus,
+    replicas: &[PublicV1TopologyReplica],
+) -> std::result::Result<Option<ProtocolCommand>, String> {
+    renewal_native_command(authority, renewal, replicas)
 }
 
 fn accepted_public_v1_status(
@@ -7006,6 +7020,23 @@ mod tests {
                     kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::InDrop,
             },
         );
+        let completion =
+            kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion {
+                operation_id: frozen.operation_id.clone(),
+                revision: frozen.revision,
+                call_kind: kuberic_runtime::protocol::public_operations::PublicV1CallKind::Build,
+                process_session_id: frozen.process_session_id.clone(),
+                input_digest: frozen.input_digest.clone(),
+                replay_disposition: frozen.replay_disposition,
+                history: renewal.required.history.clone(),
+                storage_incarnation: replicas[0].report.storage_incarnation.clone(),
+                previous_configuration_id: None,
+                current_configuration_id: build.current_configuration_id.clone(),
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+                result: PublicV1OperationResult::Failed("contained predecessor Build".into()),
+            };
+        replicas[0].report.completed_operations.push(completion);
         replicas[0].report.validate().unwrap();
         let Some(ProtocolCommand::PublicV1Operation(retirement)) =
             renewal_native_command(&authority, &renewal, &replicas).unwrap()
@@ -7022,7 +7053,7 @@ mod tests {
                 target: build.replica.replica_id
             }
         );
-        assert_eq!(retirement.intent.revision, frozen.revision + 1);
+        assert_eq!(retirement.intent.revision, frozen.revision);
         assert!(
             renewal_completed_copy_revoke(&renewal, &replicas)
                 .unwrap()
@@ -7031,23 +7062,12 @@ mod tests {
         // Simulate interruption after the retained Build succeeded but before
         // the old controller could issue revoke. A recreated controller has
         // only independently reobserved exact journal evidence, not its stack.
-        let completion =
-            kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion {
-                operation_id: frozen.operation_id.clone(),
-                revision: frozen.revision,
-                call_kind: kuberic_runtime::protocol::public_operations::PublicV1CallKind::Build,
-                process_session_id: frozen.process_session_id.clone(),
-                input_digest: frozen.input_digest.clone(),
-                replay_disposition: frozen.replay_disposition,
-                history: renewal.required.history.clone(),
-                storage_incarnation: replicas[0].report.storage_incarnation.clone(),
-                previous_configuration_id: None,
-                current_configuration_id: build.current_configuration_id.clone(),
-                catch_up_mode: None,
-                catch_up_specific_quorum: None,
-                result: PublicV1OperationResult::Succeeded,
-            };
-        replicas[0].report.completed_operations.push(completion);
+        replicas[0]
+            .report
+            .completed_operations
+            .last_mut()
+            .unwrap()
+            .result = PublicV1OperationResult::Succeeded;
         replicas[0].report.remote_builds[0].state =
             kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::Ready;
         replicas[0].report.validate().unwrap();

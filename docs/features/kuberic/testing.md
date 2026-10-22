@@ -63,6 +63,8 @@ Common operation/lifetime and controller evidence checks:
 ```bash
 cargo nextest run -j 2 -p kuberic-runtime --lib --all-features --profile ci \
   -E 'test(/^host::operation::tests::/) or test(/^host::public_lifecycle::tests::/) or test(/^replicator::coordinator::tests::/) or test(/^host::hosting::selected_access::access_retry_tests::/)'
+cargo nextest run -j 2 -p kuberic-runtime --test classic_v1_production \
+  --all-features --profile ci
 cargo nextest run -j 2 -p kuberic-controller --all-features --profile ci \
   -E 'test(/^evaluator::public_v1_topology::/) or test(/^cluster_api::tests::renewal/) or binary(=public_v1_evidence) or binary(=public_v1_production) or binary(=public_v1_session_renewal)'
 ```

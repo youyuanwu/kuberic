@@ -14,10 +14,10 @@ use crate::host::store::AgentStore;
 use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
-    PublicBuildInput, PublicCatchUpMode, PublicLifecycleInput, PublicLifecycleRecipe,
-    PublicOperationIntent, PublicOperationProgram, PublicProgress, PublicV1AgentReport,
-    PublicV1CallKind, PublicV1Identity, PublicV1OperationCompletion, PublicV1OperationResult,
-    ReplicaRebuildRequired, ServiceLocation,
+    PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicLifecycleInput,
+    PublicLifecycleRecipe, PublicOperationIntent, PublicOperationProgram, PublicProgress,
+    PublicV1AgentReport, PublicV1CallKind, PublicV1Identity, PublicV1OperationCompletion,
+    PublicV1OperationResult, ReplicaRebuildRequired, ServiceLocation,
 };
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, ProcessSessionId, ReplicaRole, ReplicatorCreationId,
@@ -648,7 +648,9 @@ async fn execute(
                 .await?,
             ),
             CurrentConfiguration => {
-                let configuration = input.configuration();
+                let configuration =
+                    super::public_action_state::configuration_at(&intent, instruction)
+                        .expect("current configuration instruction");
                 local_callback(
                     program::install_current(&callbacks, &configuration, instruction).await,
                     store.as_ref(),
@@ -684,7 +686,9 @@ async fn execute(
             }
             CatchUp => {
                 if index == start && start > 0 {
-                    let configuration = input.configuration();
+                    let configuration =
+                        super::public_action_state::configuration_at(&intent, instruction)
+                            .expect("catch-up configuration");
                     local_callback(
                         program::install(
                             store.as_ref(),
@@ -1052,27 +1056,84 @@ pub(crate) fn installed_configuration_for_state(
                 && super::public_action_state::current_scope(preview, process, record)
         })
         .filter_map(|record| {
-            let configuration = record
-                .intent
-                .lifecycle
-                .as_ref()
-                .map(|input| input.configuration())
-                .or_else(|| match record.intent.program.as_ref() {
-                    Some(
-                        PublicOperationProgram::Configuration(config)
-                        | PublicOperationProgram::CatchUp {
-                            configuration: config,
-                            ..
-                        },
-                    ) => Some(config.clone()),
-                    Some(PublicOperationProgram::Swap { refreshed, .. }) => Some(refreshed.clone()),
-                    _ => None,
-                })?;
+            let configuration = installed_configuration_from_record(record)?;
             (configuration.current.epoch.data_loss_number == history.data_loss_number)
                 .then_some((record.intent.revision, configuration))
         })
         .max_by_key(|(revision, _)| *revision)
         .map(|(_, configuration)| configuration)
+}
+
+pub(crate) fn installed_configuration_from_record(
+    record: &PublicOperationRecord,
+) -> Option<PublicConfiguration> {
+    if record.stage != PublicOperationStage::Completed
+        || record.disposition != Some(PublicOperationDisposition::Succeeded)
+    {
+        return None;
+    }
+    operation_instructions(&record.intent)
+        .into_iter()
+        .zip(&record.lifecycle.outcomes)
+        .filter(|(instruction, outcome)| {
+            configuration_instruction(*instruction) && **outcome == PublicInstructionOutcome::Done
+        })
+        .filter_map(|(instruction, _)| {
+            super::public_action_state::configuration_at(&record.intent, instruction)
+        })
+        .next_back()
+}
+
+fn configuration_instruction(instruction: PublicInstruction) -> bool {
+    matches!(
+        instruction,
+        PublicInstruction::Configuration
+            | PublicInstruction::StartingConfiguration
+            | PublicInstruction::RefreshedConfiguration
+            | PublicInstruction::CurrentConfiguration
+            | PublicInstruction::CatchUpConfiguration
+    )
+}
+
+/// An optional engine query cannot be attributed to the last completed host
+/// configuration across a newer or unfinished native topology mutation.
+pub(crate) fn configuration_observation_safe(
+    state: &crate::host::state::AgentState,
+    process: &ProcessSessionId,
+) -> bool {
+    let Some(preview) = &state.public_v1_operation_state else {
+        return false;
+    };
+    let Some(installed) = preview
+        .operations
+        .values()
+        .filter(|record| {
+            super::public_action_state::current_scope(preview, process, record)
+                && installed_configuration_from_record(record).is_some()
+        })
+        .max_by_key(|record| record.intent.revision)
+    else {
+        return false;
+    };
+    !preview.operations.values().any(|record| {
+        record.intent.operation_id != installed.intent.operation_id
+            && super::public_action_state::current_scope(preview, process, record)
+            && (record.intent.revision > installed.intent.revision
+                || record.stage != PublicOperationStage::Completed)
+            && operation_instructions(&record.intent)
+                .into_iter()
+                .any(|instruction| {
+                    configuration_instruction(instruction)
+                        || matches!(
+                            instruction,
+                            PublicInstruction::ReplicatorRole
+                                | PublicInstruction::ReplicatorPrimary
+                                | PublicInstruction::Epoch
+                                | PublicInstruction::ProgramEpoch
+                                | PublicInstruction::DataLoss
+                        )
+                })
+    })
 }
 
 pub(crate) async fn public_v1_report(
@@ -1087,6 +1148,7 @@ pub(crate) async fn public_v1_report(
     }
     let state = store.load_state().await?;
     let configuration = installed_configuration_for_state(&state, &projection.process_session_id);
+    let sample_safe = configuration_observation_safe(&state, &projection.process_session_id);
     let open_mode = state.application_open_mode();
     let preview = state.public_v1_operation_state.ok_or_else(|| {
         HostError::CommandRejected("Public V1 report requires replacement state".into())
@@ -1248,7 +1310,8 @@ pub(crate) async fn public_v1_report(
     }
     let engine_idle = projection.engine_idle.filter(|sample| {
         let distinct: std::collections::BTreeSet<_> = sample.idle_replicas.iter().collect();
-        let coherent = configuration.as_ref() == Some(&sample.configuration)
+        let coherent = sample_safe
+            && configuration.as_ref() == Some(&sample.configuration)
             && sample.history == history
             && sample.storage_incarnation == storage_incarnation
             && sample.process_session_id == projection.process_session_id
@@ -1374,20 +1437,7 @@ pub(crate) async fn public_v1_report(
 }
 
 pub(crate) fn completed_configuration(record: &PublicOperationRecord) -> bool {
-    record.stage == PublicOperationStage::Completed
-        && record.disposition == Some(PublicOperationDisposition::Succeeded)
-        && operation_instructions(&record.intent)
-            .iter()
-            .zip(&record.lifecycle.outcomes)
-            .any(|(instruction, outcome)| {
-                matches!(
-                    instruction,
-                    PublicInstruction::Configuration
-                        | PublicInstruction::CurrentConfiguration
-                        | PublicInstruction::CatchUpConfiguration
-                        | PublicInstruction::RefreshedConfiguration
-                ) && *outcome == PublicInstructionOutcome::Done
-            })
+    installed_configuration_from_record(record).is_some()
 }
 
 pub(crate) fn complete(record: &PublicOperationRecord) -> bool {

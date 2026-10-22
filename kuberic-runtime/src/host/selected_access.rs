@@ -691,24 +691,8 @@ impl AccessOwner {
                 | I::RefreshedConfiguration
                 | I::CurrentConfiguration
                 | I::CatchUpConfiguration => {
-                    let configuration = match intent.program.as_ref() {
-                        Some(
-                            P::Configuration(configuration) | P::CatchUp { configuration, .. },
-                        ) => Some(configuration.clone()),
-                        Some(P::Swap {
-                            starting,
-                            refreshed,
-                            ..
-                        }) => Some(
-                            if instruction == I::StartingConfiguration {
-                                starting
-                            } else {
-                                refreshed
-                            }
-                            .clone(),
-                        ),
-                        _ => intent.lifecycle.as_ref().map(|input| input.configuration()),
-                    };
+                    let configuration =
+                        super::super::public_action_state::configuration_at(intent, instruction);
                     let retained_catchup = instruction == I::Configuration
                         && access.caught_up
                         && configuration.as_ref().is_some_and(|next| {

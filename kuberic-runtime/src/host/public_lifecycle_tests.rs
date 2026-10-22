@@ -17,6 +17,10 @@ use tokio::sync::Notify;
 
 #[path = "public_action_state_tests.rs"]
 mod action_state_tests;
+#[path = "public_configuration_projection_tests.rs"]
+mod configuration_projection_tests;
+#[path = "public_remove_planner_tests.rs"]
+mod remove_planner_tests;
 #[path = "public_lifecycle_retry_tests.rs"]
 mod retry_tests;
 
@@ -734,6 +738,21 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
             completed(&operation).await.disposition,
             Some(PublicOperationDisposition::Succeeded)
         );
+        let state = fixture.store.load_state().await.unwrap();
+        let preview = state.public_v1_operation_state.as_ref().unwrap();
+        let projected = preview.remote_build_states(&ProcessSessionId::new("session"));
+        assert_eq!(
+            projected
+                .iter()
+                .find(|remote| remote.build.operation_id == first_intent.operation_id)
+                .unwrap()
+                .state,
+            if exact_storage {
+                crate::host::state::PublicRemoteBuildState::Dropped
+            } else {
+                crate::host::state::PublicRemoteBuildState::Ready
+            }
+        );
         successor.epoch = epoch;
         successor.current_configuration_id = Some(configuration.current.configuration_id);
         if !exact_storage {
@@ -781,6 +800,17 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
     assert_eq!(
         completed(&released).await.disposition,
         Some(PublicOperationDisposition::Succeeded)
+    );
+    let state = fixture.store.load_state().await.unwrap();
+    let preview = state.public_v1_operation_state.as_ref().unwrap();
+    assert!(
+        preview.active_builds.contains_key(&ReplicaId::new(2)),
+        "physical slot cleanup is lazy; it must not masquerade as idle ownership"
+    );
+    assert_eq!(
+        preview.remote_build_states(&ProcessSessionId::new("session"))[0].state,
+        crate::host::state::PublicRemoteBuildState::Dropped,
+        "withdrawing a voter cannot resurrect its transferred Build as Ready"
     );
     successor.epoch = retained.epoch;
     successor.current_configuration_id = Some(retained.configuration_id);

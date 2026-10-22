@@ -314,6 +314,26 @@ async fn admitted_recovery_preserves_exact_paired_roles_and_epoch_not_predecesso
         stage: PublicDataLossRecoveryStage::Admitted,
         observed_progress: None,
     });
+    let installed =
+        installed_configuration_for_state(&state, &ProcessSessionId::new("session")).unwrap();
+    assert!(
+        installed.previous.is_none(),
+        "typed recovery selected CurrentConfiguration, not its previous input"
+    );
+    let mut joint = installed.clone();
+    joint.previous = Some(installed.current.clone());
+    for program in [
+        PublicOperationProgram::Configuration(joint.clone()),
+        PublicOperationProgram::CatchUp {
+            configuration: joint,
+            mode: PublicCatchUpMode::All,
+        },
+    ] {
+        assert!(
+            matches!(crate::host::public_action_state::validate(&state, &fixture.intent(program, 2)),
+            Err(HostError::CommandRejected(detail)) if detail.contains("cannot regress"))
+        );
+    }
     let mut stale = fixture.intent(
         PublicOperationProgram::Epoch {
             epoch: Epoch::new(1, 2),

@@ -1,8 +1,9 @@
 # Engine-neutral hosting
 
 This is the bounded common-host responsibility port on top of merged #198
-(`2f97d86605ce69f3812c7d5ba1dd9c6d606ca8d7`), implemented through
-`91a2a93c3c7cf9477adb3a0d27e674b99f741a8a`. Native reference:
+(`2f97d86605ce69f3812c7d5ba1dd9c6d606ca8d7`), with initial code phases through
+`91a2a93c3c7cf9477adb3a0d27e674b99f741a8a` and the linked final-review
+retirement, achieved-receipt and query-fencing corrections. Native reference:
 Service Fabric [`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`][native].
 It is source-guided Rust/Kubernetes behavior, not native executable equivalence,
 COM/wire compatibility, wholesale RA/FM/Hosting2 or production certification.
@@ -36,6 +37,19 @@ late, duplicate or voter-overlap samples suppress only the optional sample,
 not truthful installed host authority. Ready requires exact successful retained
 completion; retirement, supersession and terminal authority dominate old success
 ([projection][remote]). No projection installs a grant.
+
+Installation derives from actual successful configuration instructions, not a
+lifecycle input descriptor. Epoch-only recipes do not install configuration.
+Current-only receipts exclude previous-only peers. Optional idle samples are
+omitted across unfinished/newer native topology effects and operation-revision
+changes, including native callback success before its host receipt.
+
+Successful exact voting installation transfers a Build's logical ownership to
+configuration. Its projection is Dropped/retired as an **idle Build**, even if
+physical slot garbage collection is lazy; later voter withdrawal cannot
+resurrect that old copy as Ready. This does not mean the native voter vanished
+or joined. Unretired Ready idle ownership still requires exact withdrawal,
+without inferring native membership from completion.
 
 Native V1 manager idle membership can exist while copy is still running.
 PostgreSQL's native `built_idle` observation publishes only completed copies.
@@ -74,6 +88,14 @@ Exact input digest, operation ID/revision, resource, process session, storage,
 history, epoch, configuration and Build attempt remain fenced. Higher numeric
 revision cannot revive lower epoch or selected cancelled catch-up. Ordinary
 duplicate failure is not universal success.
+
+Exact Remove withdraws the unchanged retained Build token; that token's older
+epoch is not a request to restore old authority. While Build is active, Remove
+uses its revision and still waits for successful containment. After containment
+or completion and authority advance, Remove uses current source authority.
+Unresolved incompatible ownership blocks preparation rather than authorizing
+a newer Remove or replacement Build. Exact session, storage, history and attempt
+checks still fence cleanup from a successor.
 
 The journal has a nonterminal `RetryPending` boundary for a **proven, selected
 returned-callback failure**, with immutable per-attempt waiter results and exact
@@ -157,9 +179,9 @@ or production certification is claimed.
 [companion]: ../../../kuberic-runtime/src/replicator/custom.rs#L1
 [operations]: ../../../kuberic-runtime/src/host/operation.rs#L1498
 [program]: ../../../kuberic-runtime/src/host/public_lifecycle_program.rs#L10
-[admission]: ../../../kuberic-runtime/src/host/public_action_state.rs#L110
+[admission]: ../../../kuberic-runtime/src/host/public_action_state.rs#L136
 [access]: ../../../kuberic-runtime/src/host/selected_access.rs#L580
-[remote]: ../../../kuberic-runtime/src/host/state.rs#L270
+[remote]: ../../../kuberic-runtime/src/host/state.rs#L315
 [report]: ../../../kuberic-runtime/src/protocol/public_operations.rs#L2476
 [renewal]: ../../../kuberic-controller/src/cluster_api.rs#L2374
 [v1-tests]: ../../../kuberic-level-tests/src/in_process/journeys.rs#L1
