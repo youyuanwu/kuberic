@@ -70,8 +70,10 @@ pub(crate) fn validate_public_v1_factories(manifest: PublicV1FactoryManifest) ->
     }
     Ok(())
 }
+mod coordinator;
 mod custom;
 pub mod stream;
+pub use custom::CallbackOwnership;
 pub use custom::CustomReplicatorControl;
 #[cfg(feature = "testing")]
 mod testing_transport;
@@ -106,15 +108,10 @@ use crate::{Result, RuntimeError};
 
 #[async_trait]
 pub(crate) trait NativeRuntimeControl: Send + Sync {
-    fn custom(&self) -> bool {
-        false
-    }
-    fn build_authority_open(&self) -> bool {
-        true
-    }
-    fn inbound_build_live(&self, _authority: &PublicInboundBuildAuthority) -> bool {
-        true
-    }
+    fn callback_ownership(&self) -> CallbackOwnership;
+    fn observes_lifecycle(&self) -> bool;
+    fn build_authority_open(&self) -> bool;
+    fn inbound_build_live(&self, authority: &PublicInboundBuildAuthority) -> bool;
     fn containment(&self) -> tokio::sync::watch::Receiver<bool>;
     fn selected_epoch(&self) -> Option<crate::protocol::types::Epoch>;
     fn idle_replicas(&self) -> Result<Vec<ReplicaId>>;
@@ -612,10 +609,10 @@ impl ReplicatorInterfaces {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         let owner: Arc<dyn NativeRuntimeControl> =
-            Arc::new(custom::CustomControl::new(context.clone(), control));
+            Arc::new(custom::control(context.clone(), control));
         context
             .access
-            .retain_custom_creation(reservation, owner.clone())?;
+            .retain_creation_control(reservation, owner.clone())?;
         *slot = Some(owner);
         drop(slot);
         Ok(self)
@@ -870,18 +867,12 @@ impl ReplicatorFactoryContext {
             .await
     }
 
-    pub(crate) async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
-        self.access
-            .revoke_replacement_inbound_build_authority()
-            .await
-    }
-
-    pub(crate) async fn revoke_custom_inbound_build_authority(
+    pub(crate) async fn revoke_exact_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
         self.access
-            .revoke_custom_inbound_build_authority(authority)
+            .revoke_exact_inbound_build_authority(authority)
             .await
     }
 
@@ -951,7 +942,7 @@ impl ReplicatorFactoryContext {
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
         self.access
-            .validate_custom_build_authority(
+            .validate_creation_build_authority(
                 self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?,
                 authority,
                 true,
@@ -963,20 +954,20 @@ impl ReplicatorFactoryContext {
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
-    async fn revoke_custom_inbound_build_authority(
+    async fn revoke_exact_inbound_build_authority(
         &self,
         _authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
         Err(RuntimeError::AuthorityNotAdmitted)
     }
-    fn retain_custom_creation(
+    fn retain_creation_control(
         &self,
         _reservation: ReplicatorCreationReservation,
         _owner: Arc<dyn NativeRuntimeControl>,
     ) -> Result<()> {
         Err(RuntimeError::AuthorityNotAdmitted)
     }
-    async fn validate_custom_build_authority(
+    async fn validate_creation_build_authority(
         &self,
         _reservation: ReplicatorCreationReservation,
         _authority: &PublicInboundBuildAuthority,
@@ -1049,8 +1040,6 @@ pub(crate) trait PartitionAccessView: Send + Sync {
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()>;
-
-    async fn revoke_replacement_inbound_build_authority(&self) -> Result<()>;
 
     fn release_provider_writer(&self);
 

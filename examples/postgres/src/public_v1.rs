@@ -11,7 +11,7 @@ use kuberic_runtime::protocol::public_operations::{
 };
 use kuberic_runtime::protocol::types::{ConfigurationId, ProcessSessionId, ResourceUid};
 use kuberic_runtime::replicator::{
-    CustomReplicatorControl, ReplicatorFactoryContext, ReplicatorSettings,
+    CallbackOwnership, CustomReplicatorControl, ReplicatorFactoryContext, ReplicatorSettings,
 };
 use serde::{Deserialize, Serialize};
 
@@ -545,6 +545,9 @@ pub(crate) enum Response {
 
 #[async_trait]
 impl CustomReplicatorControl for PgReplicator {
+    fn callback_ownership(&self) -> CallbackOwnership {
+        CallbackOwnership::ObjectOwnedOnInterruption
+    }
     async fn install_inbound_build_authority(
         &self,
         authority: &PublicInboundBuildAuthority,

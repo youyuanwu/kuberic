@@ -16,8 +16,8 @@ struct Access {
     release: Semaphore,
     pause: AtomicBool,
     faults: AtomicUsize,
+    writer_releases: AtomicUsize,
 }
-
 #[async_trait]
 impl PartitionAccessView for Access {
     fn partition_information(&self) -> PartitionInformation {
@@ -52,10 +52,9 @@ impl PartitionAccessView for Access {
     ) -> crate::Result<()> {
         Err(RuntimeError::AuthorityNotAdmitted)
     }
-    async fn revoke_replacement_inbound_build_authority(&self) -> crate::Result<()> {
-        Ok(())
+    fn release_provider_writer(&self) {
+        self.writer_releases.fetch_add(1, Ordering::SeqCst);
     }
-    fn release_provider_writer(&self) {}
     async fn report_load(&self, _: Vec<LoadMetric>) -> crate::Result<()> {
         Ok(())
     }
@@ -88,6 +87,7 @@ fn owner(registry: MessageRegistry, pause: bool) -> (Arc<Transport>, Arc<Access>
         release: Semaphore::new(0),
         pause: AtomicBool::new(pause),
         faults: AtomicUsize::new(0),
+        writer_releases: AtomicUsize::new(0),
     });
     let binding = PublicV1LifecycleBinding {
         identity: PublicV1Identity::new(1),
@@ -343,6 +343,45 @@ async fn production_worker_errors_and_panics_remain_faults() {
         assert!(owner.check_health().is_err());
         owner.abort();
         assert!(owner.drain().await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn actual_builtin_failed_drain_never_publishes_positive_containment() {
+    for lost in [false, true] {
+        let node = lone();
+        let configuration = facade_config(&node, &[]);
+        let facade = Facade::start(node.adapter, configuration).unwrap();
+        facade.open().await.unwrap();
+        let (transport, access, _) = owner(node.registry, false);
+        let context = ReplicatorFactoryContext::new(
+            crate::replicator::RuntimeHostToken::new(),
+            transport.local().identity.clone(),
+            transport.local().process_session_id.clone(),
+            access.clone(),
+            PublicV1LifecycleBinding {
+                identity: PublicV1Identity::new(1),
+                resource_uid: ResourceUid::new("pump-test"),
+                spec_generation: 1,
+                state_persistence: StatePersistence::Persisted,
+            },
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let control = super::super::production::test_control(context, facade, transport.clone());
+        transport.spawn(async move {
+            assert!(!lost, "lost actual builtin transport worker");
+            Err(RuntimeError::ControlPlane(
+                "actual builtin transport failure".into(),
+            ))
+        });
+        until(|| access.faults.load(Ordering::SeqCst) == 1).await;
+        assert!(control.shutdown_and_drain().await.is_err());
+        assert!(!*control.containment().borrow());
+        assert!(!control.build_authority_open());
+        assert!(control.shutdown_and_drain().await.is_err());
+        assert!(!*control.containment().borrow());
+        assert_eq!(access.writer_releases.load(Ordering::SeqCst), 0);
+        assert_eq!(control.raw_retained_task_cardinality(), (0, 0));
     }
 }
 

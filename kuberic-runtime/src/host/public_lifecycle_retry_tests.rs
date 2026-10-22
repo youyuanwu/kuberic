@@ -215,7 +215,7 @@ async fn retry_pending_report_is_separate_exact_and_round_trips_without_completi
             progress_history: preview.history.clone(),
             native_idle_replicas: None,
             native_configuration: None,
-            custom_observation_alive: None,
+            observation_alive: None,
         },
     )
     .await
@@ -487,14 +487,7 @@ async fn engine_role_declaration_cannot_certify_application_failure_or_native_ob
         };
         let operation = fixture.launch(program.clone(), 1).await;
         let failed = completed(&operation).await;
-        assert_eq!(
-            failed.stage,
-            if native_observer {
-                PublicOperationStage::Completed
-            } else {
-                PublicOperationStage::ContainmentPending
-            }
-        );
+        assert_eq!(failed.stage, PublicOperationStage::ContainmentPending);
         assert!(failed.retry_failure.is_none());
         fixture
             .probe

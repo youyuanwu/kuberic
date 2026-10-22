@@ -24,7 +24,7 @@ use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
     ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities, ReplicatorInterfaces,
     ReplicatorSettings, StateReplicator,
-    CustomReplicatorControl, ReplicatorFactoryContext,
+    CallbackOwnership, CustomReplicatorControl, ReplicatorFactoryContext,
 };
 
 // These external identities deliberately expand aliases in both directions.
@@ -54,6 +54,9 @@ struct ProtectedContracts;
 // Compile-only independent companion: not native/database qualification.
 #[async_trait]
 impl CustomReplicatorControl for ProtectedContracts {
+    fn callback_ownership(&self) -> CallbackOwnership {
+        CallbackOwnership::ObjectOwnedOnInterruption
+    }
     async fn install_inbound_build_authority(&self, _: &PublicInboundBuildAuthority) -> Result<()> {
         Err(kuberic_runtime::RuntimeError::AuthorityNotAdmitted)
     }

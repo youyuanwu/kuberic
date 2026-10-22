@@ -14,8 +14,8 @@ use crate::protocol::public_operations::StatePersistence;
 use crate::protocol::types::{Epoch, ReplicaId, ReplicaRole};
 use crate::replicator::stream::{OperationKind, OperationStream, ReceivedOperation};
 use crate::replicator::{
-    NativeRuntimeControl, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
-    ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities,
+    CallbackOwnership, NativeRuntimeControl, PrimaryReplicator, ReplicaInformation,
+    ReplicaSetConfiguration, ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities,
     ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorSettings, StateReplicator,
 };
 use crate::{Result, RuntimeError};
@@ -209,11 +209,24 @@ async fn compose(
         transport,
         context,
         peers,
-        inbound: tokio::sync::Mutex::new(None),
-        contained: tokio::sync::watch::channel(false).0,
         epoch: Mutex::new(None),
         settings_address: local.address.clone(),
     });
+    let control: Arc<dyn NativeRuntimeControl> = Arc::new(
+        crate::replicator::coordinator::Control::new(owner.context.clone(), owner.clone()),
+    );
+    if let Err(failure) = owner.context.access.retain_creation_control(
+        owner
+            .context
+            .reservation
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+        control.clone(),
+    ) {
+        let cleanup = control.shutdown_and_drain().await;
+        return Err(RuntimeError::Application(format!(
+            "{failure}; native creation cleanup: {cleanup:?}"
+        )));
+    }
     Ok(ReplicatorInterfaces::primary(
         owner.clone(),
         Some(owner.clone()),
@@ -223,7 +236,7 @@ async fn compose(
                 crate::protocol::public_operations::DataLossReplay::ReplaceOnAmbiguity,
         },
     )
-    .with_native_runtime_control(owner)
+    .with_native_runtime_control(control)
     .with_effective_replication_address(local.address))
 }
 
@@ -232,9 +245,6 @@ struct Production {
     transport: Arc<Transport>,
     context: ReplicatorFactoryContext,
     peers: Arc<Mutex<BTreeMap<ReplicaId, PeerBinding>>>,
-    inbound:
-        tokio::sync::Mutex<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>>,
-    contained: tokio::sync::watch::Sender<bool>,
     epoch: Mutex<Option<Epoch>>,
     settings_address: String,
 }
@@ -386,6 +396,23 @@ impl Drop for Production {
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_control(
+    context: ReplicatorFactoryContext,
+    facade: Arc<Facade>,
+    transport: Arc<Transport>,
+) -> Arc<dyn NativeRuntimeControl> {
+    let owner = Arc::new(Production {
+        settings_address: transport.local().address.clone(),
+        facade,
+        transport,
+        context: context.clone(),
+        peers: Arc::new(Mutex::new(BTreeMap::new())),
+        epoch: Mutex::new(None),
+    });
+    Arc::new(crate::replicator::coordinator::Control::new(context, owner))
+}
+
 #[async_trait]
 impl Replicator for Production {
     async fn open(&self) -> Result<String> {
@@ -450,16 +477,17 @@ impl PrimaryReplicator for Production {
     async fn build_replica(&self, information: ReplicaInformation) -> Result<()> {
         let authority = self
             .context
-            .native_outbound_build_authority(&information.build_id)
+            .outbound_build_authority(&information.build_id)
             .await?;
         self.prepare(
             &information,
             authority.attempt.epoch,
             authority.current_configuration_id.clone(),
             None,
-            Some(authority),
+            Some(authority.clone()),
         )
         .await?;
+        self.context.validate_build_authority(&authority).await?;
         self.facade.build_replica(information).await
     }
     async fn remove_replica(&self, replica: ReplicaId) -> Result<()> {
@@ -501,19 +529,28 @@ impl StateReplicator for Production {
 }
 
 #[async_trait]
-impl NativeRuntimeControl for Production {
-    fn containment(&self) -> tokio::sync::watch::Receiver<bool> {
-        self.contained.subscribe()
+impl crate::replicator::coordinator::Effects for Production {
+    fn callback_ownership(&self) -> CallbackOwnership {
+        CallbackOwnership::NativeObserver
+    }
+    fn observes_lifecycle(&self) -> bool {
+        true
     }
     fn selected_epoch(&self) -> Option<Epoch> {
         *self.epoch.lock().unwrap()
     }
-    fn idle_replicas(&self) -> Result<Vec<ReplicaId>> {
+    fn idle_replica_ids(&self) -> Result<Vec<ReplicaId>> {
         self.facade
             .service()
             .idle_replica_ids()
             .map(|ids| ids.into_iter().map(ReplicaId::new).collect())
             .map_err(error)
+    }
+    async fn idle_replicas(
+        &self,
+        _configuration: &crate::protocol::public_operations::PublicConfiguration,
+    ) -> Result<Vec<ReplicaId>> {
+        self.idle_replica_ids()
     }
     fn progress_query_readiness(&self) -> Result<bool> {
         self.facade
@@ -540,13 +577,12 @@ impl NativeRuntimeControl for Production {
     async fn shutdown_and_drain(&self) -> Result<()> {
         self.abort();
         let (facade, transport) = tokio::join!(self.facade.drain(), self.transport.drain());
-        self.context.release_provider_writer();
-        self.contained.send_replace(true);
         let failures = [facade, transport]
             .into_iter()
             .filter_map(|result| result.err().map(|error| error.to_string()))
             .collect::<Vec<_>>();
         if failures.is_empty() {
+            self.context.release_provider_writer();
             Ok(())
         } else {
             Err(RuntimeError::ControlPlane(failures.join("; ")))
@@ -554,42 +590,32 @@ impl NativeRuntimeControl for Production {
     }
     async fn install_inbound_build_authority(
         &self,
-        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+        _authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
-        let mut inbound = self.inbound.lock().await;
-        self.context
-            .classify_replacement_inbound_build_authority(authority)
-            .await?;
-        if inbound.as_ref().is_some_and(|current| current != authority) {
-            // Native streams belong to a receiver lifetime. A new authority
-            // cannot reuse dequeued application work from the old receiver.
-            self.context
-                .report_fault(crate::protocol::types::FaultType::Transient)
-                .await?;
-            self.abort();
-            return Err(RuntimeError::InvalidReplication(
-                "successor copy requires process replacement; prior receiver was retired".into(),
-            ));
-        }
-        self.context
-            .install_replacement_inbound_build_authority(authority)
-            .await?;
-        *inbound = Some(authority.clone());
         Ok(())
+    }
+    async fn reject_successor(&self) -> Result<()> {
+        // Dequeued operations belong to the original receiver, never a new grant.
+        let fault = self
+            .context
+            .report_fault(crate::protocol::types::FaultType::Transient)
+            .await;
+        self.abort();
+        fault?;
+        Err(RuntimeError::InvalidReplication(
+            "successor copy requires process replacement; prior receiver was retired".into(),
+        ))
+    }
+    fn successor_requires_replacement(&self) -> bool {
+        true
     }
     async fn revoke_inbound_build_authority(
         &self,
-        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+        _authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
-        let inbound = self.inbound.lock().await;
-        if inbound.as_ref() != Some(authority) {
-            return Err(RuntimeError::AuthorityMismatch(
-                "inbound copy revocation does not match the current receiver".into(),
-            ));
-        }
-        self.context
-            .revoke_replacement_inbound_build_authority()
-            .await
+        // Existing replication streams survive grant retirement. The common
+        // coordinator removes only exact Build ingress and keeps the barrier.
+        Ok(())
     }
     fn raw_retained_task_cardinality(&self) -> (usize, usize) {
         (

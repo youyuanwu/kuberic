@@ -30,6 +30,11 @@ struct Probe {
     block_application_close: AtomicBool,
     fail_role: AtomicBool,
     fail_application_role: AtomicBool,
+    block_application_role: AtomicBool,
+    application_role_entered: Notify,
+    application_role_calls: AtomicUsize,
+    fail_at_application_call: AtomicUsize,
+    block_at_application_call: AtomicUsize,
     fail_configuration: AtomicBool,
     fail_catchup: AtomicBool,
     fail_epoch: AtomicBool,
@@ -74,7 +79,16 @@ impl StatefulServiceReplica for Application {
         }
         assert_eq!(*self.0.role.lock().unwrap(), Some(role));
         self.0.event(format!("application.role.{role:?}"));
-        if self.0.fail_application_role.load(Ordering::Acquire) {
+        let call = self.0.application_role_calls.fetch_add(1, Ordering::AcqRel) + 1;
+        self.0.application_role_entered.notify_one();
+        if self.0.block_application_role.load(Ordering::Acquire)
+            || self.0.block_at_application_call.load(Ordering::Acquire) == call
+        {
+            std::future::pending::<()>().await;
+        }
+        if self.0.fail_application_role.load(Ordering::Acquire)
+            || self.0.fail_at_application_call.load(Ordering::Acquire) == call
+        {
             return Err(RuntimeError::Application(
                 "actual application role injected".into(),
             ));
@@ -886,9 +900,9 @@ async fn sf06_close_child_failures_abort_skip_graceful_work_and_preserve_errors(
         let operation = fixture.launch(PublicOperationProgram::Close, 1).await;
         let record = completed(&operation).await;
         assert_eq!(record.stage, PublicOperationStage::Completed);
-        assert_eq!(
-            record.disposition,
-            Some(PublicOperationDisposition::Succeeded)
+        assert!(
+            matches!(&record.disposition, Some(PublicOperationDisposition::Failed(error))
+            if error.contains("close injected"))
         );
         assert!(
             record
@@ -1196,9 +1210,9 @@ async fn sf06_failed_close_and_cancelled_abort_cannot_outrun_owned_cleanup() {
         if failed_close {
             let record = completed(&operation).await;
             assert_eq!(record.stage, PublicOperationStage::Completed);
-            assert_eq!(
-                record.disposition,
-                Some(PublicOperationDisposition::Succeeded)
+            assert!(
+                matches!(&record.disposition, Some(PublicOperationDisposition::Failed(error))
+                if error.contains("replicator close injected"))
             );
             assert!(record.lifecycle.outcomes.iter().any(|outcome| {
                 matches!(outcome, PublicInstructionOutcome::CloseFailure { error, .. }
@@ -1381,6 +1395,174 @@ async fn sf06_actual_application_role_failure_remains_failed_after_replication_r
 }
 
 #[tokio::test]
+async fn native_engine_ownership_does_not_certify_failed_or_cancelled_application_role() {
+    for cancel in [false, true] {
+        let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
+        fixture
+            .probe
+            .fail_application_role
+            .store(!cancel, Ordering::Release);
+        fixture
+            .probe
+            .block_application_role
+            .store(cancel, Ordering::Release);
+        let (contained, witness) = tokio::sync::watch::channel(false);
+        fixture.callbacks.containment = Some(witness);
+        let operation = fixture
+            .launch(
+                PublicOperationProgram::Role {
+                    epoch: Epoch::new(0, 2),
+                    role: ReplicaRole::Primary,
+                },
+                1,
+            )
+            .await;
+        fixture.probe.application_role_entered.notified().await;
+        if cancel {
+            operation.cancel_root().await.unwrap();
+        }
+        let result = completed(&operation).await;
+        assert_eq!(result.stage, PublicOperationStage::ContainmentPending);
+        assert!(if cancel {
+            result.disposition == Some(PublicOperationDisposition::Cancelled)
+        } else {
+            matches!(
+                result.disposition,
+                Some(PublicOperationDisposition::Failed(_))
+            )
+        });
+        assert!(operation.complete_containment().await.is_err());
+        let successor = fixture
+            .launch(
+                PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 3),
+                },
+                2,
+            )
+            .await;
+        assert_eq!(
+            successor.snapshot().stage,
+            PublicOperationStage::WaitingForContainment
+        );
+        contained.send_replace(true);
+        operation.complete_containment().await.unwrap();
+        assert_eq!(
+            completed(&successor).await.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
+        fixture.registry.shutdown().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn native_engine_ownership_does_not_certify_access_application_callback() {
+    for cancel in [false, true] {
+        let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
+        if cancel {
+            fixture
+                .probe
+                .block_at_application_call
+                .store(2, Ordering::Release);
+        } else {
+            fixture
+                .probe
+                .fail_at_application_call
+                .store(2, Ordering::Release);
+        }
+        let (contained, witness) = tokio::sync::watch::channel(false);
+        fixture.callbacks.containment = Some(witness);
+        let local = fixture
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .identity
+            .local_identity;
+        let input = PublicLifecycleInput {
+            recipe: PublicLifecycleRecipe::FailoverPromotion,
+            replica: local.clone(),
+            epoch: Epoch::new(0, 2),
+            possible_data_loss: PossibleDataLossIntent::NotPossible,
+            current: ConfigurationDescriptor::new(
+                Epoch::new(0, 2),
+                local.replica_id,
+                vec![ConfigurationMember {
+                    identity: local.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            ),
+            previous: Some(ConfigurationDescriptor::new(
+                Epoch::new(0, 1),
+                local.replica_id,
+                vec![ConfigurationMember {
+                    identity: local,
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )),
+            replicas: Vec::new(),
+            data_loss_recovery: None,
+        };
+        let mut intent = fixture.intent(PublicOperationProgram::Epoch { epoch: input.epoch }, 1);
+        intent.program = None;
+        intent.input_digest = input.digest();
+        intent.lifecycle = Some(input);
+        let operation = launch(
+            &fixture.registry,
+            fixture.store.clone(),
+            intent.clone(),
+            fixture.callbacks.clone(),
+        )
+        .await
+        .unwrap();
+        while fixture.probe.application_role_calls.load(Ordering::Acquire) < 2 {
+            fixture.probe.application_role_entered.notified().await;
+        }
+        if cancel {
+            assert_eq!(
+                fixture
+                    .store
+                    .load_state()
+                    .await
+                    .unwrap()
+                    .public_v1_operation_state
+                    .unwrap()
+                    .operations[&intent.operation_id]
+                    .lifecycle
+                    .in_flight,
+                Some(PublicInstruction::Access)
+            );
+            operation.cancel_root().await.unwrap();
+        }
+        let record = completed(&operation).await;
+        assert_eq!(record.stage, PublicOperationStage::ContainmentPending);
+        assert_eq!(record.lifecycle.in_flight, Some(PublicInstruction::Access));
+        assert!(operation.complete_containment().await.is_err());
+        let successor = fixture
+            .launch(
+                PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 3),
+                },
+                2,
+            )
+            .await;
+        assert_eq!(
+            successor.snapshot().stage,
+            PublicOperationStage::WaitingForContainment
+        );
+        contained.send_replace(true);
+        operation.complete_containment().await.unwrap();
+        assert_eq!(
+            completed(&successor).await.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
+        fixture.registry.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn sf06_terminal_custom_witness_blocks_completion_and_lost_witness_is_not_containment() {
     for lose_witness in [false, true] {
         let mut fixture = Fixture::new().await;
@@ -1491,7 +1673,14 @@ async fn sf06_replayed_terminal_cuts_reestablish_containment_and_preserve_first_
             .await
             .unwrap();
         let record = completed(&operation).await;
-        assert_eq!(record.stage, PublicOperationStage::Completed);
+        assert_eq!(
+            record.stage,
+            if cut == 3 {
+                PublicOperationStage::ContainmentPending
+            } else {
+                PublicOperationStage::Completed
+            }
+        );
         if cut == 0 {
             assert_eq!(
                 record.disposition,
@@ -1504,9 +1693,9 @@ async fn sf06_replayed_terminal_cuts_reestablish_containment_and_preserve_first_
                         if error.contains("drain injected") && error.contains("retained first close failure"))
                 );
             } else {
-                assert_eq!(
-                    record.disposition,
-                    Some(PublicOperationDisposition::Succeeded)
+                assert!(
+                    matches!(&record.disposition, Some(PublicOperationDisposition::Failed(error))
+                    if error.contains("retained first close failure"))
                 );
             }
             assert!(record.lifecycle.outcomes.iter().any(|outcome| {
@@ -1731,9 +1920,9 @@ async fn sf06_recorded_close_failure_and_cleanup_receipts_rejoin_current_process
         );
         fixture.probe.drain_release.notify_one();
         let record = completed(&replay).await;
-        assert_eq!(
-            record.disposition,
-            Some(PublicOperationDisposition::Succeeded)
+        assert!(
+            matches!(&record.disposition, Some(PublicOperationDisposition::Failed(error))
+            if error.contains("close injected"))
         );
         assert!(record.lifecycle.outcomes.iter().any(|outcome| {
             matches!(outcome, PublicInstructionOutcome::CloseFailure { error, .. }

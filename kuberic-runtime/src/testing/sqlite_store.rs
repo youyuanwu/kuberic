@@ -865,7 +865,7 @@ impl SqliteStore {
                     .and_then(|preview| preview.history),
                 native_idle_replicas: Some(Vec::new()),
                 native_configuration: None,
-                custom_observation_alive: None,
+                observation_alive: None,
             },
         )
         .await

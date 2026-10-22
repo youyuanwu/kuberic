@@ -922,7 +922,7 @@ pub(crate) struct PublicV1ReportProjection {
         crate::protocol::types::HistoryContext,
         crate::protocol::types::ReplicaStorageIncarnationContext,
     )>,
-    pub(crate) custom_observation_alive: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub(crate) observation_alive: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind> {
@@ -1252,7 +1252,7 @@ pub(crate) async fn public_v1_report(
     }
     let configuration = configuration.filter(|configuration| {
         if projection
-            .custom_observation_alive
+            .observation_alive
             .as_ref()
             .is_some_and(|alive| !alive() || preview.terminal)
         {

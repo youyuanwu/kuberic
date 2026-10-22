@@ -303,6 +303,15 @@ impl Transport {
             return Err(RuntimeError::Closed);
         }
         self.context.validate_native_binding(&binding).await?;
+        let existing = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .any(|peer| peer.binding == binding);
+        if !existing && let Some(authority) = binding.build.as_ref() {
+            self.context.validate_build_authority(authority).await?;
+        }
         let route = route(&binding, &self.local)?;
         let id = route.destination.replica;
         let peer = {
@@ -377,6 +386,21 @@ impl Transport {
                     // Validate the current journal, not an old successful handshake.
                     if let Err(error) = self.context.validate_native_binding(&binding).await {
                         tracing::debug!(%error, "retired native delivery rejected");
+                        continue;
+                    }
+                    // Replication and context cleanup retain their receiver
+                    // lifetime; starting/applying copy still needs live ingress.
+                    if let Some(authority) = binding.build.as_ref()
+                        && matches!(
+                            envelope.body,
+                            Some(
+                                wire::envelope::Body::StartCopy(_)
+                                    | wire::envelope::Body::CopyOperation(_)
+                            )
+                        )
+                        && let Err(error) = self.context.validate_build_authority(authority).await
+                    {
+                        tracing::debug!(%error, "retired Build delivery rejected");
                         continue;
                     }
                     if !current.load(Ordering::Acquire) {

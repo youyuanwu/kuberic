@@ -365,6 +365,7 @@ impl PartitionOperation {
             return Ok(());
         }
 
+        let containment = self.selected_containment(containment).await;
         if (containment == CallbackContainment::ObjectOwnedOnInterruption
             && matches!(disposition, PublicOperationDisposition::Failed(_)))
             || (containment == CallbackContainment::RootTask && !self.descendants_contained().await)
@@ -494,7 +495,9 @@ impl PartitionOperation {
         current: PublicOperationRecord,
         task_failure: Option<String>,
     ) -> Result<PublicOperationRecord> {
-        let containment = *self.containment.lock().await;
+        let containment = self
+            .selected_containment(*self.containment.lock().await)
+            .await;
         let next = match containment {
             _ if current.stage == PublicOperationStage::RetryPending => {
                 PublicOperationStage::Completed
@@ -521,6 +524,65 @@ impl PartitionOperation {
         self.record.send_replace(updated.clone());
         self.bump_revision();
         Ok(updated)
+    }
+
+    async fn selected_containment(&self, declared: CallbackContainment) -> CallbackContainment {
+        if declared != CallbackContainment::NativeObserver {
+            return declared;
+        }
+        // An engine's declaration cannot certify the independent application.
+        // Read the durable selection, not the coarse Running watch snapshot.
+        let selected = self
+            .store
+            .public_operation_records()
+            .await
+            .ok()
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.intent == self.intent())
+            })
+            .and_then(|record| {
+                record.lifecycle.in_flight.or_else(|| {
+                    // Canonical replacement evidence is a recorded returned
+                    // callback outcome, not an unknown lost-receipt failure.
+                    matches!(
+                        record.lifecycle.outcomes.last(),
+                        Some(crate::host::state::PublicInstructionOutcome::RebuildRequired(_))
+                    )
+                    .then(|| {
+                        super::public_lifecycle::program::operation_instructions(&record.intent)
+                            .get(record.lifecycle.outcomes.len().checked_sub(1)?)
+                            .copied()
+                    })
+                    .flatten()
+                })
+            });
+        use crate::host::state::PublicInstruction::*;
+        match selected {
+            Some(
+                ReplicatorOpen
+                | ReplicatorRole
+                | ReplicatorPrimary
+                | ProgramEpoch
+                | Epoch
+                | Configuration
+                | StartingConfiguration
+                | RefreshedConfiguration
+                | CurrentConfiguration
+                | CatchUpConfiguration
+                | FirstCatchUp
+                | SecondCatchUp
+                | CatchUp
+                | DataLoss
+                | Progress
+                | Build
+                | Remove,
+            ) => declared,
+            // Access refreshes the application role/address. Host bookkeeping
+            // and unknown provenance also cannot borrow an engine declaration.
+            _ => CallbackContainment::ObjectOwnedOnInterruption,
+        }
     }
 
     pub(crate) async fn complete_containment(&self) -> Result<PublicOperationRecord> {

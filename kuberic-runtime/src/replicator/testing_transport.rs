@@ -508,9 +508,6 @@ mod tests {
             ) -> Result<()> {
                 unreachable!()
             }
-            async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
-                unreachable!()
-            }
             fn release_provider_writer(&self) {}
             async fn report_load(&self, _: Vec<LoadMetric>) -> Result<()> {
                 unreachable!()

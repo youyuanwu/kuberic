@@ -167,7 +167,7 @@ struct RuntimeHost {
     public_v1_replication_address: std::net::SocketAddr,
     state: RwLock<HostState>,
     registered: OnceLock<RegisteredReplicator>,
-    pending_custom: StdMutex<Option<Arc<dyn crate::replicator::NativeRuntimeControl>>>,
+    pending_control: StdMutex<Option<Arc<dyn crate::replicator::NativeRuntimeControl>>>,
     replicator_creation: StdMutex<ReplicatorCreationState>,
     aborted: AtomicBool,
     closed: AtomicBool,
@@ -181,16 +181,23 @@ struct RuntimeHost {
 }
 
 impl RuntimeHost {
-    fn custom_creation_live(&self, identity: ReplicatorCreationIdentity) -> bool {
+    fn creation_live(&self, identity: ReplicatorCreationIdentity) -> bool {
         !self.closed.load(Ordering::Acquire)
             && !self.aborted.load(Ordering::Acquire)
             && !self.replacement_fault_fenced.load(Ordering::Acquire)
+            && !matches!(
+                *self.native_lifecycle.lock().unwrap(),
+                Some(
+                    crate::replicator::v1::LifecycleObservation::Closed
+                        | crate::replicator::v1::LifecycleObservation::Faulted
+                )
+            )
             && self.registered.get().is_some_and(|registered| {
                 registered.identity == identity
                     && registered
                         .native_runtime_control
                         .as_ref()
-                        .is_some_and(|control| control.custom() && control.build_authority_open())
+                        .is_some_and(|control| control.build_authority_open())
             })
     }
 
@@ -348,7 +355,7 @@ impl PodRuntime {
                     reported_fault: None,
                 }),
                 registered: OnceLock::new(),
-                pending_custom: StdMutex::new(None),
+                pending_control: StdMutex::new(None),
                 replicator_creation: StdMutex::new(ReplicatorCreationState::Available(
                     ReplicatorCreationIdentity::new(RuntimeHostToken::new()),
                 )),
@@ -423,7 +430,7 @@ impl PodRuntime {
                 else {
                     return Ok(None);
                 };
-                if native.custom() {
+                if !native.observes_lifecycle() {
                     return Ok(None);
                 }
                 let observation = host.native_lifecycle.lock().unwrap().ok_or_else(|| {
@@ -474,10 +481,12 @@ impl PodRuntime {
                 wait_for_containment: registered.native_runtime_control.is_some()
                     || registered.callback_containment.is_some(),
                 preempt_retained_owner: registered.native_runtime_control.is_some(),
-                native_observer_callbacks: registered
-                    .native_runtime_control
-                    .as_ref()
-                    .is_some_and(|runtime| !runtime.custom()),
+                native_observer_callbacks: registered.native_runtime_control.as_ref().is_some_and(
+                    |runtime| {
+                        runtime.callback_ownership()
+                            == crate::replicator::CallbackOwnership::NativeObserver
+                    },
+                ),
                 retry_proof: Default::default(),
                 terminal_drain,
                 terminal_cleanup: None,
@@ -931,7 +940,6 @@ impl PodRuntime {
             .registered
             .get()
             .and_then(|registered| registered.native_runtime_control.clone())
-            .filter(|runtime| !runtime.custom())
             .ok_or(RuntimeError::NotOpen)
             .map(|control| control.raw_retained_task_cardinality())
     }
@@ -973,25 +981,24 @@ impl PodRuntime {
         };
         let mut native_configuration = None;
         let mut native_idle_replicas = None;
-        let mut custom_observation_alive = None;
+        let mut observation_alive = None;
         if let Some(runtime) = self
             .host
             .registered
             .get()
             .and_then(|registered| registered.native_runtime_control.as_ref())
         {
-            if runtime.custom() {
+            {
                 let alive_runtime = runtime.clone();
                 let host = Arc::downgrade(&self.host);
-                custom_observation_alive = Some(Arc::new(move || {
+                observation_alive = Some(Arc::new(move || {
                     alive_runtime.build_authority_open()
                         && host.upgrade().is_some_and(|host| {
                             !host.closed.load(Ordering::Acquire)
                                 && !host.aborted.load(Ordering::Acquire)
                                 && !host.replacement_fault_fenced.load(Ordering::Acquire)
                         })
-                })
-                    as Arc<dyn Fn() -> bool + Send + Sync>);
+                }) as Arc<dyn Fn() -> bool + Send + Sync>);
                 if let Some(observed) = observation_state.as_ref()
                     && let Some(configuration) =
                         crate::host::public_lifecycle::installed_configuration_for_state(
@@ -1009,12 +1016,10 @@ impl PodRuntime {
                                 Some((configuration, history.clone(), storage.clone()));
                         }
                         Err(error) => {
-                            tracing::debug!(%error, "custom installed observations unavailable")
+                            tracing::debug!(%error, "engine installed observations unavailable")
                         }
                     }
                 }
-            } else {
-                native_idle_replicas = runtime.idle_replicas().ok();
             }
         }
         let state = self.host.state.read().await;
@@ -1052,7 +1057,7 @@ impl PodRuntime {
                 .and_then(|preview| preview.history),
             native_idle_replicas,
             native_configuration,
-            custom_observation_alive,
+            observation_alive,
         })
     }
 
@@ -1135,7 +1140,7 @@ impl PodRuntime {
         else {
             return Ok(None);
         };
-        if native.custom() {
+        if !native.observes_lifecycle() {
             return Ok(None);
         }
         let observation =
@@ -1198,7 +1203,7 @@ impl PodRuntime {
             .registered
             .get()
             .and_then(|registered| registered.native_runtime_control.clone())
-            .or_else(|| self.host.pending_custom.lock().unwrap().clone());
+            .or_else(|| self.host.pending_control.lock().unwrap().clone());
         if let Some(control) = control {
             control.shutdown_and_drain().await
         } else {
@@ -1206,8 +1211,8 @@ impl PodRuntime {
         }
     }
 
-    pub(crate) async fn drain_pending_custom(&self) -> Result<()> {
-        let pending = self.host.pending_custom.lock().unwrap().clone();
+    pub(crate) async fn drain_pending_control(&self) -> Result<()> {
+        let pending = self.host.pending_control.lock().unwrap().clone();
         if let Some(pending) = pending {
             pending.shutdown_and_drain().await?;
         }
@@ -1332,7 +1337,7 @@ impl ReplacementFaultBridge {
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
-    async fn revoke_custom_inbound_build_authority(
+    async fn revoke_exact_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
@@ -1343,7 +1348,7 @@ impl PartitionAccessView for HostAccessView {
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))
     }
-    fn retain_custom_creation(
+    fn retain_creation_control(
         &self,
         reservation: ReplicatorCreationReservation,
         owner: Arc<dyn crate::replicator::NativeRuntimeControl>,
@@ -1357,14 +1362,14 @@ impl PartitionAccessView for HostAccessView {
         {
             return Err(RuntimeError::Closed);
         }
-        let mut pending = host.pending_custom.lock().unwrap();
+        let mut pending = host.pending_control.lock().unwrap();
         if pending.is_some() {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         *pending = Some(owner);
         Ok(())
     }
-    async fn validate_custom_build_authority(
+    async fn validate_creation_build_authority(
         &self,
         reservation: ReplicatorCreationReservation,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
@@ -1373,7 +1378,7 @@ impl PartitionAccessView for HostAccessView {
         use crate::host::native_transport::{NativeBinding, NativeEndpoint};
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
         let creation = reservation.identity(RuntimeHostToken::new());
-        if !host.custom_creation_live(creation) {
+        if !host.creation_live(creation) {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         authority
@@ -1408,7 +1413,7 @@ impl PartitionAccessView for HostAccessView {
                 .await;
             }
         }
-        if !host.custom_creation_live(creation)
+        if !host.creation_live(creation)
             || bridge.registry.is_fenced()
             || state.identity.local_identity != host.identity
         {
@@ -1542,7 +1547,7 @@ impl PartitionAccessView for HostAccessView {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
             return host
-                .custom_creation_live(creation)
+                .creation_live(creation)
                 .then_some(())
                 .ok_or(RuntimeError::AuthorityNotAdmitted);
         }
@@ -1567,7 +1572,7 @@ impl PartitionAccessView for HostAccessView {
         }
         .validate_for_state(&state, process, endpoint);
         validated?;
-        if !host.custom_creation_live(creation)
+        if !host.creation_live(creation)
             || (!source
                 && host
                     .registered
@@ -1892,16 +1897,14 @@ impl PartitionAccessView for HostAccessView {
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        let custom = host.registered.get().and_then(|registered| {
-            registered
-                .native_runtime_control
-                .as_ref()
-                .filter(|control| control.custom())
-                .map(|_| registered.identity)
-        });
+        let creation = host
+            .registered
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?
+            .identity;
         let bridge = self.bridge().await?;
         #[cfg(feature = "testing")]
-        if custom.is_some() {
+        {
             let cut = host.public_operation_cut.lock().unwrap().clone();
             if let Some(cut) = cut {
                 cut.pause(
@@ -1911,7 +1914,7 @@ impl PartitionAccessView for HostAccessView {
                 .await;
             }
         }
-        if custom.is_some_and(|identity| !host.custom_creation_live(identity)) {
+        if !host.creation_live(creation) {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         bridge
@@ -1919,7 +1922,7 @@ impl PartitionAccessView for HostAccessView {
             .install_public_v1_inbound_build_authority(authority)
             .await
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        if custom.is_some_and(|identity| !host.custom_creation_live(identity)) {
+        if !host.creation_live(creation) {
             bridge
                 .store
                 .revoke_exact_public_v1_inbound_build_authority(authority)
@@ -1928,15 +1931,6 @@ impl PartitionAccessView for HostAccessView {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         Ok(())
-    }
-
-    async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
-        self.bridge()
-            .await?
-            .store
-            .revoke_public_v1_inbound_build_authority()
-            .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))
     }
 
     fn release_provider_writer(&self) {
@@ -2021,7 +2015,7 @@ impl ReplicatorRegistration for RuntimeHost {
         if self.closed.load(Ordering::Acquire) || self.aborted.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
-        if self.pending_custom.lock().unwrap().is_some() {
+        if self.pending_control.lock().unwrap().is_some() {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         match &*creation {
@@ -2090,13 +2084,13 @@ impl ReplicatorRegistration for RuntimeHost {
         let consumes_provider_writer =
             provider.is_some() && attachment.has_provider_writer(RuntimeHostToken::new());
         let native_runtime_control = attachment.native_runtime_control(RuntimeHostToken::new());
-        if let Some(pending) = self.pending_custom.lock().unwrap().as_ref()
+        if let Some(pending) = self.pending_control.lock().unwrap().as_ref()
             && native_runtime_control
                 .as_ref()
                 .is_none_or(|candidate| !Arc::ptr_eq(candidate, pending))
         {
             return Err(RuntimeError::AuthorityMismatch(
-                "returned bundle does not match retained custom creation".into(),
+                "returned bundle does not match retained creation control".into(),
             ));
         }
         if consumes_provider_writer && provider_writer.consumed {
@@ -2122,7 +2116,7 @@ impl ReplicatorRegistration for RuntimeHost {
             })?;
         provider_writer.consumed = consumes_provider_writer;
         *creation = ReplicatorCreationState::Registered;
-        self.pending_custom.lock().unwrap().take();
+        self.pending_control.lock().unwrap().take();
         Ok(())
     }
 }

@@ -670,5 +670,8 @@ pub(super) async fn execute(
             }));
         }
     }
+    if let Some(failure) = close_failure {
+        return Err(HostError::CommandRejected(failure));
+    }
     Ok(())
 }

@@ -817,7 +817,7 @@ async fn custom_host_returned_bundle_cannot_discard_different_retained_creation(
             result
                 .unwrap_err()
                 .message()
-                .contains("does not match retained custom creation")
+                .contains("does not match retained creation control")
         );
         assert!(source.service.alive.load(Ordering::SeqCst) > 0);
         source.running.shutdown();
@@ -1152,7 +1152,7 @@ async fn custom_host_nonoverlapping_torn_configuration_sample_is_discarded() {
 async fn custom_host_terminal_failed_or_lost_drain_does_not_release_owned_child() {
     for lost in [false, true] {
         let root = tempfile::tempdir().unwrap();
-        let (source, target, authority, intent) = setup(root.path()).await;
+        let (mut source, target, authority, intent) = setup(root.path()).await;
         source.service.hold_build.store(true, Ordering::SeqCst);
         history(
             &target,
@@ -1254,7 +1254,12 @@ async fn custom_host_terminal_failed_or_lost_drain_does_not_release_owned_child(
         let service = source.service.clone();
         source.service.fail_drain.store(false, Ordering::SeqCst);
         source.service.panic_drain.store(false, Ordering::SeqCst);
-        assert!(source.stop().await.is_none());
+        source.running.shutdown();
+        assert!(
+            source.running.wait().await.is_err(),
+            "actual drain failure must survive a later process observer"
+        );
+        source.service.drain().await.unwrap();
         assert_eq!(service.alive.load(Ordering::SeqCst), 0);
         if let Some(close) = close {
             let _ = tokio::time::timeout(Duration::from_secs(5), close)
@@ -1319,14 +1324,10 @@ async fn custom_host_partial_install_failed_or_lost_drain_retains_real_child() {
         target.service.panic_drain.store(false, Ordering::SeqCst);
         target.running.shutdown();
         let shutdown = target.running.wait().await;
-        if lost {
-            assert!(
-                shutdown.is_err(),
-                "lost retained compensation must reach process completion"
-            );
-        } else {
-            shutdown.unwrap();
-        }
+        assert!(
+            shutdown.is_err(),
+            "failed or lost actual drainage remains sticky at process completion"
+        );
         target.service.drain().await.unwrap();
         assert_eq!(service.alive.load(Ordering::SeqCst), 0);
         source.close().await;
