@@ -169,7 +169,7 @@ pub(crate) struct BuildBinding {
     source: NativeEndpoint,
     target: NativeEndpoint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    authority: Option<PublicInboundBuildAuthority>,
+    authority: Option<Box<PublicInboundBuildAuthority>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,7 +249,7 @@ struct GatewayJoin {
 
 #[derive(Clone)]
 enum InboundOutcome {
-    Built(BuildCompletion),
+    Built(Box<BuildCompletion>),
     Rebuild(ReplicaRebuildRequired),
     Closed,
     Cancelled,
@@ -260,7 +260,7 @@ enum InboundOutcome {
 impl InboundOutcome {
     fn capture(result: Result<BuildCompletion>) -> Self {
         match result {
-            Ok(completed) => Self::Built(completed),
+            Ok(completed) => Self::Built(Box::new(completed)),
             Err(RuntimeError::ReplicaRebuildRequired(reason)) => Self::Rebuild(*reason),
             Err(RuntimeError::Closed) => Self::Closed,
             Err(RuntimeError::OperationCancelled) => Self::Cancelled,
@@ -271,7 +271,7 @@ impl InboundOutcome {
     }
     fn result(self) -> Result<BuildCompletion> {
         match self {
-            Self::Built(completed) => Ok(completed),
+            Self::Built(completed) => Ok(*completed),
             Self::Rebuild(reason) => Err(RuntimeError::ReplicaRebuildRequired(Box::new(reason))),
             Self::Closed => Err(RuntimeError::Closed),
             Self::Cancelled => Err(RuntimeError::OperationCancelled),
@@ -594,7 +594,7 @@ impl CustomReplicatorControl for PgReplicator {
         if state
             .built
             .as_ref()
-            .is_none_or(|completed| completed.binding.authority.as_ref() != Some(authority))
+            .is_none_or(|completed| completed.binding.authority.as_deref() != Some(authority))
         {
             drop(state);
             self.instance.stop().await.map_err(application_error)?;
@@ -806,7 +806,7 @@ impl PgReplicator {
     }
 
     async fn public_validate_build_authority(&self, build: &BuildBinding) -> Result<()> {
-        match (&self.public_owner().host.get(), &build.authority) {
+        match (self.public_owner().host.get(), build.authority.as_deref()) {
             (Some(host), Some(authority)) => {
                 if authority.attempt.resource_uid != build.resource_uid
                     || authority.attempt.epoch != build.epoch
@@ -1289,21 +1289,21 @@ impl PgReplicator {
         self.public_owner().state.lock().await.opened = false;
         self.cancellation.cancel();
         let mut owner = self.public_owner().owner.lock().await;
-        if let Some(task) = owner.as_mut() {
-            if let Err(error) = task.await {
-                let error = error.to_string();
-                *self.public_owner().cleanup_error.lock().unwrap() = Some(error.clone());
-                failures.push(error);
-            }
+        if let Some(task) = owner.as_mut()
+            && let Err(error) = task.await
+        {
+            let error = error.to_string();
+            *self.public_owner().cleanup_error.lock().unwrap() = Some(error.clone());
+            failures.push(error);
         }
         owner.take();
         let mut reporter = self.fault_owner.lock().await;
-        if let Some(task) = reporter.as_mut() {
-            if let Err(error) = task.await {
-                let error = error.to_string();
-                *self.public_owner().cleanup_error.lock().unwrap() = Some(error.clone());
-                failures.push(error);
-            }
+        if let Some(task) = reporter.as_mut()
+            && let Err(error) = task.await
+        {
+            let error = error.to_string();
+            *self.public_owner().cleanup_error.lock().unwrap() = Some(error.clone());
+            failures.push(error);
         }
         reporter.take();
         if let Err(error) = self.public_join_gateway_drains().await {
@@ -1704,7 +1704,7 @@ impl PgReplicator {
                 {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
-                Some(authority)
+                Some(Box::new(authority))
             }
             None => None,
         };

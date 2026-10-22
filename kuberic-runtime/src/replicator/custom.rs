@@ -179,6 +179,202 @@ async fn retained(
     })?
 }
 
+#[async_trait]
+impl NativeRuntimeControl for CustomControl {
+    fn custom(&self) -> bool {
+        true
+    }
+    fn build_authority_open(&self) -> bool {
+        !self.0.stopped.load(Ordering::Acquire)
+    }
+    fn inbound_build_live(&self, authority: &PublicInboundBuildAuthority) -> bool {
+        self.0.live.lock().unwrap().as_ref() == Some(authority)
+            && !self.0.stopped.load(Ordering::Acquire)
+    }
+    fn containment(&self) -> watch::Receiver<bool> {
+        self.0.contained.subscribe()
+    }
+    fn selected_epoch(&self) -> Option<crate::protocol::types::Epoch> {
+        None
+    }
+    fn idle_replicas(&self) -> Result<Vec<ReplicaId>> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+    async fn configuration_idle_replicas(
+        &self,
+        configuration: &PublicConfiguration,
+    ) -> Result<Vec<ReplicaId>> {
+        if self.0.stopped.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        let ids = self.0.application.idle_replicas(configuration).await?;
+        if self.0.stopped.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
+        Ok(ids)
+    }
+    #[cfg(feature = "testing")]
+    fn testing_tcp_binding(
+        &self,
+    ) -> Option<(
+        ReplicaIdentity,
+        ProcessSessionId,
+        ReplicatorCreationReservation,
+    )> {
+        None
+    }
+    fn raw_retained_task_cardinality(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    async fn install_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let owner = self.0.clone();
+        let authority = authority.clone();
+        retained(async move {
+            let mut installed = owner.serial.lock().await;
+            let mut guard = ActionGuard(owner.clone(), false, authority.clone());
+            owner.scope(&authority).await?;
+            if installed.as_ref() == Some(&authority) {
+                return owner.context.validate_build_authority(&authority).await;
+            }
+            if installed.is_some() {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "custom receiver successor requires containment or process replacement".into(),
+                ));
+            }
+            owner
+                .context
+                .classify_replacement_inbound_build_authority(&authority)
+                .await?;
+            owner.scope(&authority).await?;
+            guard.1 = true;
+            owner
+                .context
+                .install_replacement_inbound_build_authority(&authority)
+                .await?;
+            owner.scope(&authority).await?;
+            owner.activate(&authority)?;
+            *installed = Some(authority.clone());
+            let result = async {
+                owner.context.validate_build_authority(&authority).await?;
+                owner
+                    .application
+                    .install_inbound_build_authority(&authority)
+                    .await?;
+                owner.scope(&authority).await?;
+                owner.context.validate_build_authority(&authority).await
+            }
+            .await;
+            if let Err(error) = result {
+                let cleanup = owner.fail_closed(&authority).await;
+                guard.1 = false;
+                return Err(RuntimeError::Application(format!(
+                    "custom installation failed: {error}; containment: {cleanup:?}"
+                )));
+            }
+            guard.1 = false;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn revoke_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let owner = self.0.clone();
+        let authority = authority.clone();
+        retained(async move {
+            let installed = owner.serial.lock().await;
+            let mut guard = ActionGuard(owner.clone(), false, authority.clone());
+            if installed.as_ref() != Some(&authority) {
+                return Ok(());
+            }
+            if owner.revoked.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            guard.1 = true;
+            // Ingress is invalidated before application cleanup can await.
+            *owner.live.lock().unwrap() = None;
+            owner
+                .context
+                .revoke_custom_inbound_build_authority(&authority)
+                .await?;
+            if owner.drained.load(Ordering::Acquire) {
+                owner.revoked.store(true, Ordering::Release);
+                guard.1 = false;
+                return Ok(());
+            }
+            if let Err(error) = owner
+                .application
+                .revoke_inbound_build_authority(&authority)
+                .await
+            {
+                let cleanup = owner.fail_closed(&authority).await;
+                guard.1 = false;
+                return Err(RuntimeError::Application(format!(
+                    "custom revocation failed: {error}; containment: {cleanup:?}"
+                )));
+            }
+            // Removing ingress does not prove the old native receiver joined.
+            // Retain the receiver barrier for this process lifetime.
+            owner.revoked.store(true, Ordering::Release);
+            guard.1 = false;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn shutdown_and_drain(&self) -> Result<()> {
+        // Stop admission synchronously, even when installation currently awaits.
+        self.0.stop();
+        let owner = self.0.clone();
+        retained(async move {
+            let (invalidation, drainage) = {
+                let serial = owner.serial.lock().await;
+                let invalidation = match serial.as_ref() {
+                    Some(authority) => {
+                        owner
+                            .context
+                            .revoke_custom_inbound_build_authority(authority)
+                            .await
+                    }
+                    None => Ok(()),
+                };
+                (invalidation, owner.drain_application().await)
+            };
+            let tasks = owner.compensations.lock().unwrap().clone();
+            let mut compensation = Ok(());
+            for shared in tasks {
+                let mut shared = shared.lock().await;
+                if shared.result.is_none() {
+                    let result = shared
+                        .task
+                        .as_mut()
+                        .expect("unjoined compensation")
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                    shared.task.take();
+                    shared.result = Some(result);
+                }
+                if let Some(Err(error)) = shared.result.as_ref() {
+                    compensation = Err(RuntimeError::Application(error.clone()));
+                }
+            }
+            invalidation?;
+            drainage?;
+            compensation?;
+            owner.contained.send_replace(true);
+            Ok(())
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,200 +790,5 @@ mod tests {
         shutdown.await.unwrap().unwrap();
         assert!(*control.containment().borrow());
         assert!(control.install_inbound_build_authority(&a).await.is_err());
-    }
-}
-#[async_trait]
-impl NativeRuntimeControl for CustomControl {
-    fn custom(&self) -> bool {
-        true
-    }
-    fn build_authority_open(&self) -> bool {
-        !self.0.stopped.load(Ordering::Acquire)
-    }
-    fn inbound_build_live(&self, authority: &PublicInboundBuildAuthority) -> bool {
-        self.0.live.lock().unwrap().as_ref() == Some(authority)
-            && !self.0.stopped.load(Ordering::Acquire)
-    }
-    fn containment(&self) -> watch::Receiver<bool> {
-        self.0.contained.subscribe()
-    }
-    fn selected_epoch(&self) -> Option<crate::protocol::types::Epoch> {
-        None
-    }
-    fn idle_replicas(&self) -> Result<Vec<ReplicaId>> {
-        Err(RuntimeError::AuthorityNotAdmitted)
-    }
-    async fn configuration_idle_replicas(
-        &self,
-        configuration: &PublicConfiguration,
-    ) -> Result<Vec<ReplicaId>> {
-        if self.0.stopped.load(Ordering::Acquire) {
-            return Err(RuntimeError::Closed);
-        }
-        let ids = self.0.application.idle_replicas(configuration).await?;
-        if self.0.stopped.load(Ordering::Acquire) {
-            return Err(RuntimeError::Closed);
-        }
-        Ok(ids)
-    }
-    #[cfg(feature = "testing")]
-    fn testing_tcp_binding(
-        &self,
-    ) -> Option<(
-        ReplicaIdentity,
-        ProcessSessionId,
-        ReplicatorCreationReservation,
-    )> {
-        None
-    }
-    fn raw_retained_task_cardinality(&self) -> (usize, usize) {
-        (0, 0)
-    }
-
-    async fn install_inbound_build_authority(
-        &self,
-        authority: &PublicInboundBuildAuthority,
-    ) -> Result<()> {
-        let owner = self.0.clone();
-        let authority = authority.clone();
-        retained(async move {
-            let mut installed = owner.serial.lock().await;
-            let mut guard = ActionGuard(owner.clone(), false, authority.clone());
-            owner.scope(&authority).await?;
-            if installed.as_ref() == Some(&authority) {
-                return owner.context.validate_build_authority(&authority).await;
-            }
-            if installed.is_some() {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "custom receiver successor requires containment or process replacement".into(),
-                ));
-            }
-            owner
-                .context
-                .classify_replacement_inbound_build_authority(&authority)
-                .await?;
-            owner.scope(&authority).await?;
-            guard.1 = true;
-            owner
-                .context
-                .install_replacement_inbound_build_authority(&authority)
-                .await?;
-            owner.scope(&authority).await?;
-            owner.activate(&authority)?;
-            *installed = Some(authority.clone());
-            let result = async {
-                owner.context.validate_build_authority(&authority).await?;
-                owner
-                    .application
-                    .install_inbound_build_authority(&authority)
-                    .await?;
-                owner.scope(&authority).await?;
-                owner.context.validate_build_authority(&authority).await
-            }
-            .await;
-            if let Err(error) = result {
-                let cleanup = owner.fail_closed(&authority).await;
-                guard.1 = false;
-                return Err(RuntimeError::Application(format!(
-                    "custom installation failed: {error}; containment: {cleanup:?}"
-                )));
-            }
-            guard.1 = false;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn revoke_inbound_build_authority(
-        &self,
-        authority: &PublicInboundBuildAuthority,
-    ) -> Result<()> {
-        let owner = self.0.clone();
-        let authority = authority.clone();
-        retained(async move {
-            let installed = owner.serial.lock().await;
-            let mut guard = ActionGuard(owner.clone(), false, authority.clone());
-            if installed.as_ref() != Some(&authority) {
-                return Ok(());
-            }
-            if owner.revoked.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            guard.1 = true;
-            // Ingress is invalidated before application cleanup can await.
-            *owner.live.lock().unwrap() = None;
-            owner
-                .context
-                .revoke_custom_inbound_build_authority(&authority)
-                .await?;
-            if owner.drained.load(Ordering::Acquire) {
-                owner.revoked.store(true, Ordering::Release);
-                guard.1 = false;
-                return Ok(());
-            }
-            if let Err(error) = owner
-                .application
-                .revoke_inbound_build_authority(&authority)
-                .await
-            {
-                let cleanup = owner.fail_closed(&authority).await;
-                guard.1 = false;
-                return Err(RuntimeError::Application(format!(
-                    "custom revocation failed: {error}; containment: {cleanup:?}"
-                )));
-            }
-            // Removing ingress does not prove the old native receiver joined.
-            // Retain the receiver barrier for this process lifetime.
-            owner.revoked.store(true, Ordering::Release);
-            guard.1 = false;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn shutdown_and_drain(&self) -> Result<()> {
-        // Stop admission synchronously, even when installation currently awaits.
-        self.0.stop();
-        let owner = self.0.clone();
-        retained(async move {
-            let (invalidation, drainage) = {
-                let serial = owner.serial.lock().await;
-                let invalidation = match serial.as_ref() {
-                    Some(authority) => {
-                        owner
-                            .context
-                            .revoke_custom_inbound_build_authority(authority)
-                            .await
-                    }
-                    None => Ok(()),
-                };
-                (invalidation, owner.drain_application().await)
-            };
-            let tasks = owner.compensations.lock().unwrap().clone();
-            let mut compensation = Ok(());
-            for shared in tasks {
-                let mut shared = shared.lock().await;
-                if shared.result.is_none() {
-                    let result = shared
-                        .task
-                        .as_mut()
-                        .expect("unjoined compensation")
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result.map_err(|error| error.to_string()));
-                    shared.task.take();
-                    shared.result = Some(result);
-                }
-                if let Some(Err(error)) = shared.result.as_ref() {
-                    compensation = Err(RuntimeError::Application(error.clone()));
-                }
-            }
-            invalidation?;
-            drainage?;
-            compensation?;
-            owner.contained.send_replace(true);
-            Ok(())
-        })
-        .await
     }
 }

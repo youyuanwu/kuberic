@@ -188,7 +188,7 @@ must requalify their own native transfer, lineage, replay, admission and fencing
 Source anchors: [attachment:599–626](../../../kuberic-runtime/src/replicator/mod.rs#L599-L626),
 [read-only context:935–960](../../../kuberic-runtime/src/replicator/mod.rs#L935-L960),
 [local validation:1365–1558](../../../kuberic-runtime/src/host/hosting.rs#L1365-L1558),
-[retained actions:600–793](../../../kuberic-runtime/src/replicator/custom.rs#L600-L793),
+[retained actions:183–376](../../../kuberic-runtime/src/replicator/custom.rs#L183-L376),
 and [configuration evidence:892–940](../../../kuberic-runtime/src/host/public_lifecycle.rs#L892-L940).
 The [PG companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641)
 and [controller cases:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412)

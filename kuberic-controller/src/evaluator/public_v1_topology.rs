@@ -1207,8 +1207,10 @@ fn fresh_unknown_history(replica: &PublicV1TopologyReplica) -> bool {
         && report.configuration.is_none()
         && report.data_loss_recovery.is_none()
         && report.active_operations.is_empty()
-        && report.progress.current() == Some(kuberic_runtime::application::INVALID_LSN)
-        && report.progress.capability() == Some(kuberic_runtime::application::INVALID_LSN)
+        && report.progress.current()
+            == Some(kuberic_runtime::protocol::public_operations::INVALID_LSN)
+        && report.progress.capability()
+            == Some(kuberic_runtime::protocol::public_operations::INVALID_LSN)
         && !report.completed_operations.is_empty()
         && report.completed_operations.iter().all(|completion| {
             completion.call_kind == PublicV1CallKind::Open
@@ -2114,7 +2116,7 @@ mod tests {
             1,
         );
         assert!(
-            choose_primary(Some(&current), &[fresh.clone()], None).is_err(),
+            choose_primary(Some(&current), std::slice::from_ref(&fresh), None).is_err(),
             "a retained configuration cannot borrow fresh initialization"
         );
         assert!(

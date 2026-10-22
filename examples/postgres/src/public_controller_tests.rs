@@ -1033,7 +1033,11 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         let binding=source.native_driver().public_owner().state.lock().await.grants.iter()
             .find_map(|grant|match &grant.binding { TransportBinding::Build(build) if build.target.replica==*target_ref.identity()=>Some(build.clone()),_=>None })
             .ok_or_else(||TestError::new(ErrorKind::Application,"live native source grant missing"))?;
-        let live=binding.authority.as_ref().ok_or_else(||TestError::new(ErrorKind::Application,"host authority missing"))?;
+        let live=binding.authority.as_deref().ok_or_else(||TestError::new(ErrorKind::Application,"host authority missing"))?;
+        let encoded_binding=serde_json::to_value(&binding).map_err(error)?;
+        check(encoded_binding["authority"]==serde_json::to_value(live).map_err(error)?,"boxed native authority changed its wire shape")?;
+        let decoded_binding:BuildBinding=serde_json::from_value(encoded_binding).map_err(error)?;
+        check(decoded_binding==binding,"native Build binding did not round-trip exactly")?;
         if !fail_cleanup && invalidate_source.is_none() {
             pending_replay_gate=Some(target.native_driver().pause_public_build_replay());
         }
@@ -1088,7 +1092,7 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
                 _=>continue,
             };
             if let Ok(authority)=serde_json::from_value::<PublicInboundBuildAuthority>(changed) {
-                let mut changed=binding.clone(); changed.authority=Some(authority);
+                let mut changed=binding.clone(); changed.authority=Some(Box::new(authority));
                 let rejected=tokio::time::timeout(Duration::from_secs(2),target.native_driver().public_request(Request::Build(changed))).await.map_err(error)?;
                 check(rejected.is_err(),"mutated live native authority reached copy effects/completion credit")?;
             }
@@ -1186,7 +1190,7 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         let target=cluster.service(&target_ref).await?;
         let native=target.native_driver().public_owner().state.lock().await.built.clone()
             .ok_or_else(||TestError::new(ErrorKind::Application,"actual target native Build completion missing"))?;
-        let authority=native.binding.authority.as_ref().ok_or_else(||TestError::new(ErrorKind::Application,"hosted Build lacked exact authority"))?;
+        let authority=native.binding.authority.as_deref().ok_or_else(||TestError::new(ErrorKind::Application,"hosted Build lacked exact authority"))?;
         let before=target.instance().generation_id();
         let metadata_before=target.native_driver().durable.snapshot().await.generation;
         check(target.native_driver().public_request(Request::Build(native.binding.clone())).await.is_err(),
@@ -1378,14 +1382,14 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             source.native_driver().fault_owner.lock().await.is_none(),
             "fault reporter was not joined after cleanup error"
         );
-        for owner in source
+        let drains = source
             .native_driver()
             .public_owner()
             .gateway_drains
             .lock()
             .unwrap()
-            .clone()
-        {
+            .clone();
+        for owner in drains {
             assert!(
                 owner.lock().await.task.is_none(),
                 "remaining gateway join ownership was lost"
