@@ -77,6 +77,7 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) wait_for_containment: bool,
     pub(crate) preempt_retained_owner: bool,
+    pub(crate) native_observer_callbacks: bool,
     pub(crate) terminal_drain: TerminalDrain,
     pub(super) terminal_cleanup: Option<Arc<terminal::TerminalCleanup>>,
     pub(crate) access_factory: Option<AccessFactory>,
@@ -122,6 +123,8 @@ pub(crate) fn is_replacement_role_replay(
 #[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicCutPosition {
+    BuildAuthorityRead,
+    BeforeInboundBuildCommit,
     BeforeAccessReservation,
     BeforeInstruction,
     InstructionSelected,
@@ -310,6 +313,7 @@ pub(crate) async fn launch(
                 // The owner retains the same outcome for the terminal
                 // instruction/cleanup path; containment is not Close success.
                 tracing::warn!(%error, "terminal preemption retained a child failure");
+                operation.record_containment_failure(&HostError::from(error));
             }
         }
     }
@@ -354,7 +358,7 @@ pub(crate) async fn launch(
             operation.track_cut(callbacks.cut.clone()).await;
             let containment = if intent.class.is_terminal() {
                 CallbackContainment::RootTask
-            } else if callbacks.preempt_retained_owner {
+            } else if callbacks.native_observer_callbacks {
                 CallbackContainment::NativeObserver
             } else {
                 CallbackContainment::ObjectOwnedOnInterruption
@@ -762,6 +766,12 @@ pub(crate) struct PublicV1ReportProjection {
     pub(crate) progress: PublicProgress,
     pub(crate) progress_history: Option<crate::protocol::types::HistoryContext>,
     pub(crate) native_idle_replicas: Option<Vec<crate::protocol::types::ReplicaId>>,
+    pub(crate) native_configuration: Option<(
+        crate::protocol::public_operations::PublicConfiguration,
+        crate::protocol::types::HistoryContext,
+        crate::protocol::types::ReplicaStorageIncarnationContext,
+    )>,
+    pub(crate) custom_observation_alive: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind> {
@@ -879,6 +889,57 @@ fn public_v1_completion_authority(
     })
 }
 
+pub(crate) fn installed_configuration_for_state(
+    state: &crate::host::state::AgentState,
+    process: &ProcessSessionId,
+) -> Option<crate::protocol::public_operations::PublicConfiguration> {
+    let preview = state.public_v1_operation_state.as_ref()?;
+    let storage = preview.storage_incarnation.as_ref()?;
+    let history = preview.history.as_ref()?;
+    preview
+        .operations
+        .values()
+        .filter(|record| {
+            record.stage == PublicOperationStage::Completed
+                && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                && &record.intent.process_session_id == process
+                && record.accepted_storage.as_ref() == Some(storage)
+                && (record.accepted_history.as_ref() == Some(history)
+                    || record.intent.lifecycle.as_ref()
+                        .and_then(|input| input.data_loss_recovery.as_ref())
+                        .is_some_and(|input| {
+                            preview.data_loss_recovery.as_ref().is_some_and(|recovery| {
+                                recovery.stage == crate::protocol::public_operations::PublicDataLossRecoveryStage::Admitted
+                                    && &recovery.proposed_history == history
+                                    && recovery.attempt == input.attempt
+                                    && recovery.logical_authorization() == input.authorization
+                            })
+                        }))
+        })
+        .filter_map(|record| {
+            let configuration = record
+                .intent
+                .lifecycle
+                .as_ref()
+                .map(|input| input.configuration())
+                .or_else(|| match record.intent.program.as_ref() {
+                    Some(
+                        PublicOperationProgram::Configuration(config)
+                        | PublicOperationProgram::CatchUp {
+                            configuration: config,
+                            ..
+                        },
+                    ) => Some(config.clone()),
+                    Some(PublicOperationProgram::Swap { refreshed, .. }) => Some(refreshed.clone()),
+                    _ => None,
+                })?;
+            (configuration.current.epoch.data_loss_number == history.data_loss_number)
+                .then_some((record.intent.revision, configuration))
+        })
+        .max_by_key(|(revision, _)| *revision)
+        .map(|(_, configuration)| configuration)
+}
+
 pub(crate) async fn public_v1_report(
     store: &dyn AgentStore,
     identity: &PublicV1Identity,
@@ -890,6 +951,7 @@ pub(crate) async fn public_v1_report(
         ));
     }
     let state = store.load_state().await?;
+    let configuration = installed_configuration_for_state(&state, &projection.process_session_id);
     let open_mode = state.application_open_mode();
     let preview = state.public_v1_operation_state.ok_or_else(|| {
         HostError::CommandRejected("Public V1 report requires replacement state".into())
@@ -1049,51 +1111,42 @@ pub(crate) async fn public_v1_report(
         progress.current_progress = pending.clone();
         progress.catch_up_capability = pending;
     }
-    let configuration = preview
-        .operations
-        .values()
-        .filter(|record| {
-            record.stage == PublicOperationStage::Completed
-                && record.disposition == Some(PublicOperationDisposition::Succeeded)
-                && record.intent.process_session_id == projection.process_session_id
-                && record.accepted_storage.as_ref() == Some(&storage_incarnation)
-        })
-        .filter_map(|record| {
-            let configuration = record
-                .intent
-                .lifecycle
-                .as_ref()
-                .map(|input| input.configuration())
-                .or_else(|| match record.intent.program.as_ref() {
-                    Some(
-                        PublicOperationProgram::Configuration(configuration)
-                        | PublicOperationProgram::CatchUp { configuration, .. },
-                    ) => Some(configuration.clone()),
-                    Some(PublicOperationProgram::Swap { refreshed, .. }) => Some(refreshed.clone()),
-                    _ => None,
-                })?;
-            (configuration.current.epoch.data_loss_number == history.data_loss_number)
-                .then_some((record.intent.revision, configuration))
-        })
-        .max_by_key(|(revision, _)| *revision)
-        .map(|(_, configuration)| configuration);
+    let configuration = configuration.filter(|configuration| {
+        if projection
+            .custom_observation_alive
+            .as_ref()
+            .is_some_and(|alive| !alive() || preview.terminal)
+        {
+            return false;
+        }
+        projection.native_configuration.as_ref().is_none_or(
+            |(sample, sample_history, sample_storage)| {
+                sample == configuration
+                    && sample_history == &history
+                    && sample_storage == &storage_incarnation
+            },
+        )
+    });
     let configuration =
         configuration
             .zip(projection.native_idle_replicas)
             .and_then(|(voting, idle_replicas)| {
-                if idle_replicas.iter().any(|id| {
-                    voting
-                        .current
-                        .members
-                        .iter()
-                        .chain(
-                            voting
-                                .previous
-                                .iter()
-                                .flat_map(|previous| &previous.members),
-                        )
-                        .any(|member| member.identity.replica_id == *id)
-                }) {
+                let distinct: std::collections::BTreeSet<_> = idle_replicas.iter().collect();
+                if distinct.len() != idle_replicas.len()
+                    || idle_replicas.iter().any(|id| {
+                        voting
+                            .current
+                            .members
+                            .iter()
+                            .chain(
+                                voting
+                                    .previous
+                                    .iter()
+                                    .flat_map(|previous| &previous.members),
+                            )
+                            .any(|member| member.identity.replica_id == *id)
+                    })
+                {
                     tracing::debug!(
                         "native voting/idle observations crossed a configuration transition"
                     );

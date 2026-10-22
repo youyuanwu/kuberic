@@ -176,6 +176,15 @@ pub(crate) trait AgentStore: Send + Sync {
         ))
     }
 
+    async fn revoke_exact_public_v1_inbound_build_authority(
+        &self,
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "exact inbound authority revocation is not enabled for this store".into(),
+        ))
+    }
+
     async fn public_v1_outbound_build_authority(
         &self,
         _build_id: &OperationId,

@@ -88,6 +88,13 @@ impl PgService {
 
     pub fn abort_and_wait(&self) -> Result<()> {
         self.cancellation.cancel();
+        if self
+            .driver
+            .get()
+            .is_some_and(|driver| driver.public_closed())
+        {
+            return Ok(());
+        }
         self.instance.abort_owned().map_err(application_error)
     }
 
@@ -168,7 +175,7 @@ impl StatefulServiceReplica for PgService {
             .map_err(|_| RuntimeError::Closed)?;
         let cancellation = self.cancellation.clone();
         let instance = Arc::downgrade(&self.instance);
-        tokio::spawn(async move {
+        let reporter = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
@@ -186,6 +193,7 @@ impl StatefulServiceReplica for PgService {
                 }
             }
         });
+        driver.retain_fault_owner(reporter).await;
         let interfaces = context
             .partition
             .with_factory(Arc::new(PgReplicatorFactory(driver)))
@@ -220,7 +228,15 @@ impl StatefulServiceReplica for PgService {
         self.cancellation.cancel();
         // An interrupted open has no opened driver, but may own a process tree
         // and a retained abort failure. Always join cleanup and surface that result.
-        let cleanup = self.instance.stop().await.map_err(application_error);
+        let cleanup = if self
+            .driver
+            .get()
+            .is_some_and(|driver| driver.public_closed())
+        {
+            Ok(())
+        } else {
+            self.instance.stop().await.map_err(application_error)
+        };
         match (result, cleanup) {
             (Err(error), Err(cleanup)) => Err(application_error(format!(
                 "{error}; PostgreSQL cleanup: {cleanup}"
@@ -288,6 +304,8 @@ impl ReplicatorFactory for PgReplicatorFactory {
         }
         self.0
             .configure_public_v1(settings, context.identity()?, context.process_session_id()?)?;
-        Ok(self.interfaces())
+        self.0.configure_public_host(context.clone())?;
+        self.interfaces()
+            .with_custom_control(&context, self.0.clone())
     }
 }

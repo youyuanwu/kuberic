@@ -1,13 +1,16 @@
 # PostgreSQL: Native Replication on Kuberic Public V1
 
-The `postgres-replicated` package uses the level-triggered Public V1 runtime.
-PostgreSQL Workstream 4 is complete with unit and
-host-local subprocess validation. Images, deployment assets and distribution
+The `postgres-replicated` package supplies an independent native engine for the
+level-triggered Public V1 runtime and its supported custom-controller route.
+Bounded local qualification includes actual controller-driven formation and
+native database evidence. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
-Use fresh protocol-11 / agent-schema-12 state. Prior agent/provider formats
-reject unchanged; there is no import, mixed-version, or rolling mode.
+Use the current protocol/schema declared by the
+[runtime guide](../kuberic/classic-v1-runtime.md#production-policies-and-security).
+Prior unsupported agent/provider formats reject unchanged; there is no import,
+mixed-version or rolling mode implied by custom-controller integration.
 
 The current implementation uses a separate checksummed PostgreSQL metadata
 store. Its removal is blocked on the application-neutral reconfiguration work
@@ -36,8 +39,12 @@ driver hierarchy.
 The agent delivers exact incarnation, session, endpoint, role and frozen progress
 descriptions through `ReplicaInformation` / `ReplicaSetConfiguration` and the
 existing configuration/build/catch-up callbacks. Authority stores and mutation
-capabilities remain private. Unmanaged custom replicators remain fail-closed for
-managed admission.
+capabilities remain private. The production factory attaches its own
+`CustomReplicatorControl` to the same creation; it does not borrow a built-in
+bundle. The separate
+[companion contract](../kuberic/replicator-boundary.md#custom-controller-integration)
+adds exact inbound copy authority, coherent idle observations and owned drainage
+without adding methods to the protected native traits.
 
 PostgreSQL uses the same common lifecycle owner as the built-in engine but does
 not register the built-in replication/copy data plane. Delayed native callback
@@ -57,10 +64,11 @@ database evidence travels only over application-owned `pgdata.v2`.
 ## SQL Access and Acknowledged Writes
 
 The retained partition handle's independent read/write statuses govern access,
-not role notifications or PostgreSQL promotion alone. Progress observation
-reconciles SQL access before private hosting acknowledges an access effect.
-Accepted secondaries serve read-only SQL while PostgreSQL recovery rejects
-writes. Idle/unadmitted replicas remain closed.
+not role notifications, progress polling or PostgreSQL promotion alone. An
+owned periodic worker reconciles actual access. The selected host denies
+ordinary stable-secondary reads and writes despite native replay; internal
+administrative evidence is not a client read grant. Idle/unadmitted replicas
+also remain closed.
 
 Ordinary clients use the non-superuser database-owner role `kuberic_app`, database
 `kuberic`, and `synchronous_commit=remote_apply`. PostgreSQL owns synchronous
@@ -71,18 +79,23 @@ standbys. SQL cannot reopen on stale policy metadata after process restart.
 Deliberately selecting local/asynchronous acknowledgement is outside the
 acknowledged-data guarantee.
 
-Closing previously granted access stops and reaps the entire owned PostgreSQL
-run, then restarts with closed managed HBA rules before acknowledging closure.
-HBA reload and `pg_terminate_backend` alone miss accepted, unauthenticated
-sockets. The stop fence disconnects ordinary clients, retained administrative
-connections and pre-authentication sockets; later regrant cannot revive them.
-Grant/close serialize, and grant confirms a real application-role login.
-Cancelling an unfinished grant still requires the full fence.
+Host authority/access invalidation precedes application-owned native drainage;
+it does not instantly mediate SQL statements. The selected Public V1 denial and
+terminal paths stop and reap the owned PostgreSQL run, join native gateways and
+leave PostgreSQL stopped. Separate authorized role/configuration work may later
+start it; closure does not unconditionally restart it or acknowledge a native
+fence merely from host status
+([drain:1084–1156](../../../examples/postgres/src/public_v1.rs#L1084-L1156),
+[denial:1185–1201](../../../examples/postgres/src/public_v1.rs#L1185-L1201)).
 
-External-client closure can leave a restarted PostgreSQL available for internal
-control and replication; a completed **PostgreSQL-stopped** postcondition is
-stronger and leaves no SQL session usable. Both deliberately interrupt
-connections. A transaction already inside PostgreSQL and waiting for synchronous
+HBA reload and `pg_terminate_backend` alone miss accepted, unauthenticated
+sockets. Completed process fencing disconnects ordinary, retained administrative
+and pre-authentication connections; later regrant cannot revive them. The
+separate direct/legacy `PgAccessController::close_external` can restart with
+closed HBA rules; that is not the selected controller route or the
+actual-controller witness's closure postcondition.
+
+A transaction already inside PostgreSQL and waiting for synchronous
 acknowledgement when connectivity is lost has an **unknown outcome**, not a
 promised rollback. A unique write attempted after the completed fence is
 definitively rejected without a database side effect.
@@ -94,8 +107,10 @@ authentication, loopback application access, local administrative sockets and
 trust-authenticated physical replication (including an IPv4 replication HBA
 rule). PostgreSQL listens on all addresses; this is not hardened network
 isolation. Do not expose the database/replication port to untrusted networks.
-Coordination RPCs use the agent bearer credential over HTTP, not a supplied TLS
-deployment. Managed settings must not be replaced or bypassed.
+Agent control uses the configured bearer credential over HTTP. The selected
+native Public V1 route additionally validates exact host/engine authority; this
+is not complete coordination-authentication or TLS hardening. Managed settings
+must not be replaced or bypassed.
 
 Completed fences disconnect retained administrative test sessions, but do not
 protect against hostile administrators changing configuration or relaunching
@@ -106,42 +121,62 @@ managed lifetime; there is no independent orphan self-fencing mechanism.
 
 ## Native Build and Catch-Up
 
-Private hosting durably selects one immutable build generation per logical
-target slot. Completion receipts bind that authority to both current sessions
-and the local attempt. Supersession/replacement withdraws the old description;
-one scalar cannot certify multiple builds or resurrect completion after reopen.
-If supersession arrives while the old native callback is unwinding, the new
-configuration is deferred under a bounded generation-owned task. It can return
-durable admission without waiting behind the stale callback, but must complete
-within its deadline and revalidate authority/session/terminal state before the
-configuration becomes visible.
+The controller installs exact inbound authority before source dispatch.
+PostgreSQL's hosted native Build envelope carries that full authority: both
+replica/storage/process endpoints, history, epoch, configuration and operation/
+Build attempt. The creation-bound source context resolves only its accepted
+running Build. Target installation alone is not source liveness; native source
+inspection independently validates the source journal and grant.
 
-The target validates its locally installed SF description and source evidence
-before destructive work. Configuration replacement cancels and joins stale work.
-PGDATA clearing runs in a private generation-owned helper, not Tokio filesystem
-workers. Cancellation, timeout and dropped build futures terminate and reap that
-helper before releasing the build lock; failed cleanup remains retained and
-blocks replacement. Recursive directory removal, file unlinking and the final
-directory fsync share this ownership, so no stale deletion can resolve paths in
-a successor's live PGDATA. Interrupted clearing leaves `Copying` durable and
-re-admitted retries take a fresh backup, as with interrupted backup/rewind.
-`pgdata.v2` carries authenticated, canonical JSON envelopes bounded to 64 KiB,
-with exact resource, identities, sessions, build boundary and PostgreSQL lineage.
-Unknown, missing, duplicate, oversized and wrong-version fields are rejected.
+The selected native owner revalidates around gateway creation, destructive
+backup/receiver work, asynchronous completion cuts and publication. Native
+`pg_basebackup`, compatible system/timeline history, receive **and replay** at
+the captured source boundary, and a checkpoint establish its actual completion.
+Its exact process-local completion cache also revalidates durable/physical
+history and live source/target authority; it is not a durable generic-agent
+database receipt or permission to reopen revoked ingress.
 
-Durable build stages are `Intent`, `Copying`, `Installed`, `Recovering` and
-`Complete`. Native `pg_basebackup` supplies the copy. Compatible established
-lineage permits `pg_rewind`; failed rewind explicitly switches to a fresh backup,
-while unrelated system identities/incompatible histories are rejected.
-Interrupted destructive work resumes only under re-admitted exact authority;
-installed data is reused. Old sessions cannot reconnect on reopen.
+Target preflight and cached source-inspection reads observe captured work
+cancellation without acquiring process cleanup authority. Graceful Close can
+interrupt those reads before its final durable observation and lifetime join.
+Source slot retirement revalidates the hosted attempt before each new mutating
+SQL retry; this does not roll back an already-issued SQL statement.
 
-Completion requires compatible system/timeline history, flushed WAL **and replay**
-at or beyond the frozen boundary, including equality. Checkpointed installed
-recovery and durable completion precede admission. Receipt or flush without
-replay is insufficient. `WriteQuorum` uses policy-certified replay; SF `All`
-requires every required exact session to replay its frozen boundary. Waits release
-the lifecycle lock between probes and cancel on authority/access/shutdown changes.
+PGDATA helpers, native gateways and their retained join owners remain
+application-owned. A spawned gateway enters creation-owned grants before any
+post-start validation await; cancellation cannot detach a provisional listener
+from terminal joining. Inbound task-join and gateway-drain failures remain
+errors across later terminal observers, not handles polled after completion.
+Terminal and periodic paths transfer every gateway to retained drain ownership
+before awaiting any exit. Each completed drain outcome is shared immediately,
+so dropping a Close while another exit is pending loses neither the remaining
+gateways nor an already-observed failure.
+Revocation removes copy ingress, not copied data or voter
+membership. A different uncertain receiver attempt requires containment/process
+replacement, not an in-place metadata reset. Failed/interrupted custom callbacks
+can remain `ContainmentPending` until explicit terminal cleanup; this bounded
+route does not promise arbitrary failed-Build automatic reformation.
+
+Successful built-idle ownership and last installed native membership are
+separate from live transport/readiness. Same-history epoch advancement can
+drain transport while retaining the exact predecessor for joint catch-up;
+completed copy authority is not reused as a current grant. Secondary host
+configuration authority precedes primary native Peer admission and supplies
+neither a primary-only callback nor serving access.
+
+An empty uninitialized native history reports the unknown sentinel, not a
+fabricated zero. Initial singleton authority requires exact successful New-Open
+provenance and both explicit sentinel query results; this local initialization
+exception changes neither retained election nor native progress semantics.
+`WriteQuorum` with marked successors remains explicitly unsupported; ordinary
+unmarked waits and `All` retain their qualified native behavior.
+
+Selected implementation: [factory:294–311](../../../examples/postgres/src/service.rs#L294-L311),
+[companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641),
+[retained drainage:701–800](../../../examples/postgres/src/public_v1.rs#L701-L800),
+[Close joins:1273–1323](../../../examples/postgres/src/public_v1.rs#L1273-L1323),
+[Build/replay:2365–2698](../../../examples/postgres/src/public_v1.rs#L2365-L2698)
+and [native/controller qualification:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412).
 
 Physical replication slots belong to exact incarnations, not quorum votes.
 Slots reserve WAL before build and survive internal reconnection/restart.
@@ -150,6 +185,10 @@ Retired consumers drain before slot deletion; an in-use slot is not reported
 removed. Unix sockets live in `PGDATA/pg_stat_tmp`, excluded by backup/rewind.
 
 ## Failover and Planned Switchover
+
+The application-owned recovery protocol below has separate native/direct and
+manual-host evidence. It is not a claim that the bounded real-controller
+formation witness executes arbitrary restart/failover/reformation scenarios.
 
 Generic hosting installs write-closed authority and awaits the existing primary
 role callback. PostgreSQL, not a shared native selector, performs recovery:
@@ -276,9 +315,10 @@ cargo run -p postgres-replicated -- \
 ```
 
 This starts an authority-waiting host, **not** a writable standalone database.
-Authenticated `InitializeAgentStore`, exact `EnsureConfiguration` and a separate
-write grant are required. The tests provide local choreography; no deployment
-controller or bootstrap CLI is supplied for PostgreSQL.
+The real controller must initialize exact history and drive Open, role, epoch,
+configuration and access admission. Direct fixture choreography is not a
+substitute for controller qualification. No PostgreSQL deployment/bootstrap CLI
+or container distribution is supplied.
 
 | Options / environment | Meaning |
 |---|---|
@@ -303,26 +343,33 @@ Configuration is implementation-owned, not a general PostgreSQL tuning API.
 ```sh
 just nextest-postgres-smoke-inventory
 just nextest-postgres-smoke
-just nextest-postgres
-# One deterministic shard, normally run on its own isolated CI runner:
-just nextest-postgres 1/4
-# Smaller native build/recovery and reconfiguration selections:
-cargo test -p postgres-replicated --all-features --test native_build --test failover -- --test-threads=1
-cargo test -p postgres-replicated --all-features --test reconfiguration --test authority_races --test switchover_checkpoints --test validation_oracles -- --test-threads=1
-cargo clippy -p postgres-replicated --all-targets --all-features -- -D warnings
 ```
 
-The smoke inventory requires four exact Public V1 scenario tests before
-PostgreSQL starts: primary lifecycle/joint configuration, build
-cancellation/retirement, data-loss history/replay and contained close. Each
-scenario records its applicable KSF rows and remains independently bounded
-below the five-minute nextest limit. The smoke recipe builds the owned command
-binary, then runs exactly those four tests serially in one package-only pass.
+The smoke inventory validates the live catalog before PostgreSQL starts.
+The recipe builds the owned command binary, then runs its selected native and
+actual-controller cases serially in one package-only pass. Selectors and
+evidence limits are in the [testing guide](../kuberic/testing.md#custom-native-controller-reproduction-and-limits);
+do not copy test totals or historical removed selectors.
 Public V1 fixtures use
 `KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set; the smoke recipe otherwise uses
 `/dev/shm` when at least 2 GiB is available and falls back to `/tmp`. The
 full target is reserved for the dedicated
 resource-owning validation path or explicit requests.
+
+The actual controller fixture constructs inert production PgService instances
+and owns their native coordination listeners. It checks pre-Role sentinel/Open
+provenance, committed seed data, real source/target Build, built-idle state,
+exact joint/current-only admission, live native replay, source/target
+invalidation, synchronous SQL/replay and completed native fencing. Owned short
+socket-path aliases identify the same declared backing storage, not a different
+storage incarnation. Administrative standby queries prove replay only, never
+ordinary secondary-read authorization.
+
+Hosted native retries share one retained exact attempt, while waiting/cache
+observers remain outside mutation cleanup. Captured cancellation and coherent
+host checks are repeated after serialized acquisition and preparation awaits.
+Graceful Close retains its bounded final native observation before cancelling
+the process lifetime; an already aborted owner does not invent that observation.
 
 PostgreSQL deliberately does not claim KSF-02's complete
 false/true/error/ambiguity matrix, KSF-10's Replicator-owned endpoint lifetime,
@@ -337,24 +384,17 @@ executable, not a test-runner override. Missing binaries fail the prerequisite;
 tests do not silently skip. Fixtures own their worker stacks; no extra runner
 stack override is required.
 
-`testing::PgGroup` drives real agent stores and SF hosts with local PostgreSQL
-subprocesses; it supplies generic decisions rather than invented WAL receipts.
-Coverage includes 1→2→3 growth, 3→2→1 removal, replacement, repeated
-failover/switchover across identities, retained/pre-auth/admin fencing, quorum
-restoration, admission-cut application/agent restart and storage/process faults.
-Unique-write and complete-SQL-set oracles distinguish definitive fences from
-timeouts, generic SQL errors and unknown outcomes. Teardown checks retained
-pidfds, allocated listener addresses and exact fixture roots under
-`target/postgresql-v2-tests/<unique-id>`.
-Compact IDs encode the Linux PID and a bounded process-local counter to leave
-room for PostgreSQL Unix sockets in the hosted CI checkout. Existing directories
-are skipped, never removed to allocate a new fixture.
+Direct/native and manual-host fixtures remain separate from the real-controller
+cases in the live catalog. Their recovery/slot/access observations do not
+automatically qualify controller recovery or a different database engine.
+Teardown checks owned processes, helpers, gateways and listeners; failed joins
+propagate instead of becoming successful containment.
 
 CI builds one all-features nextest archive, then runs four deterministic hash
 partitions on isolated runners. The `postgres` profile and test group both
 enforce one test process at a time within each runner; the measured unsafe
-same-runner four-way mode is not used. The current PostgreSQL inventory is 20
-tests with partition counts `6, 6, 5, 3`. PostgreSQL is absent from KinD/live
+same-runner four-way mode is not used. Discover the current inventory and
+partition accounting from the validator. PostgreSQL is absent from KinD/live
 jobs and selectors.
 Shared regressions, partition validation and guard commands are in the
 [testing guide](../kuberic/testing.md#postgresql).

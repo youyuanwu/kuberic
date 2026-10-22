@@ -751,8 +751,27 @@ where
             .expect("prepared before readiness");
         let supervisor_shutdown = shutdown.clone();
         let supervisor_runtime = handle.runtime.clone();
+        let mut stopping = shutdown.subscribe();
         let completion = tokio::spawn(async move {
-            let first = (&mut control_task).await;
+            let first = tokio::select! {
+                    _ = async { stopping.wait_for(|stopped| *stopped).await.map(|_| ()) } => {
+                        // Custom descendants may be the reason a control RPC
+                        // cannot finish. Drain their owner before waiting for
+                        // the graceful control-server acknowledgement.
+                        // Fence creation registration even if an in-flight Open
+                        // has not returned its bundle yet. Its failed-registration
+                        // path owns cleanup; it cannot publish a late creation.
+                        supervisor_runtime.abort();
+                        let drain = drain_runtime(&supervisor_runtime).await;
+                        let control = finish_control(&mut control_task).await;
+                        let late = tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, supervisor_runtime.drain_pending_custom())
+                            .await.map_err(|_| crate::host::HostError::CommandRejected("late custom creation drain timed out".into()))
+                            .and_then(|result| result.map_err(crate::host::HostError::Runtime));
+                        let drain = with_shutdown_error(drain, late, "late custom creation drain");
+                        return with_shutdown_error(control, drain, "replicator drain");
+                    }
+                    result = &mut control_task => result,
+            };
             supervisor_shutdown.send_replace(true);
             supervisor_runtime.abort();
             let first = first

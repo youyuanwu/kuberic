@@ -11,6 +11,54 @@ Priorities below order **future separately authorized work**. “Verified differ
 source-confirmed divergence, not a dynamically reproduced data-loss defect;
 “unverified” means missing claim-specific qualification, not demonstrated failure.
 
+## Next — Native-style engine-neutral hosting
+
+**Entry condition:** the bounded custom-native controller fix in PR #198 clears
+CI and is merged. Its supported companion and actual PostgreSQL journey provide
+a regression baseline, not complete native hosting alignment. This section
+plans a separate source-guided implementation; it does not start that port.
+
+At the pinned native source, service Open returns a replicator to the
+[common proxy][native-host-open], which obtains standard interfaces and
+[optional capabilities][native-host-proxy]. RA dispatches Build through that
+proxy and tracks [remote Build state/completion][native-host-build].
+Kuberic shares its host but still branches on engine identity for
+[callback/lifecycle policy](../../../kuberic-runtime/src/host/hosting.rs#L416-L487)
+and [configuration/idle sampling](../../../kuberic-runtime/src/host/hosting.rs#L974-L1021).
+That is a structural alignment difference, not evidence that native SF needs
+separate custom hosting or that another runtime defect has been reproduced.
+
+**Bounded port scope:**
+
+- Map the relevant `ComProxyReplicator` and FailoverUnitProxy creation,
+  lifecycle/configuration/catch-up dispatch, remote Build-state and cancellation/
+  Close/Abort ownership semantics to current Rust owners before selecting changes.
+- Establish common engine-neutral hosting, authority and operation-lifetime
+  policy. Replace engine-kind branches with explicit capability/ownership
+  contracts where semantics genuinely differ; do not simply delete proven
+  interruption, stale-result or success-only containment checks.
+- Keep V1 queues/provider streams and custom native transports/processes behind
+  narrow engine adapters. Diagnostics remain optional; a custom engine must not
+  need a borrowed built-in attachment or fabricated observations.
+- Preserve Kuberic's journal, exact inbound grants, session/storage/history
+  fencing and retained Rust-task joins as explicit local adaptations. Do not
+  describe them as native SF public interfaces or remove them for superficial
+  source similarity.
+
+**Completion criterion:** V1 and an independent native engine exercise the same
+host-policy path through actual public controller dispatch, with separate idle
+Build and voting admission, truthful observations, exact retries/stale callbacks,
+cancellation and successful/failed terminal joining. Retain the actual PG
+transfer/admission/SQL-fencing regressions, protected interfaces/representations,
+optional capability behavior, production feature-off builds and API/privacy
+guards. Update the disposition ledger and provenance from source-backed evidence.
+No `.custom()` policy fork should remain unexplained; any necessary difference
+must be tied to an explicit contract rather than engine identity alone.
+
+Wholesale `Hosting2`, RA/FM, broad P7/security, automatic failed-Build recovery,
+native executable equivalence and downstream MySQL requalification are not
+implied by this bounded hosting port.
+
 ## Selected-host Close and access disposition
 
 ### Outer Close outcome
@@ -74,6 +122,32 @@ do not certify provider commitment, durability or client success.
 | **Public copy context** | Distinct nonempty context is actual-component evidence ([test:1013–1091][context]); external public provider uses empty context ([fixture:196–207][empty-context]). | If public nonempty-context qualification is needed, use a helper-free provider with distinguishable target/source bytes including an empty item. Source must consume target data without supplying its own; keep component/public evidence separate. |
 | **Mode/fault/interleaving coverage** | Persisted/required-ACK combinations are core-tested ([tests:121–172][modes]); selected production has fixed mode/policy choices ([production:121–158][policy]). | Build a claim-specific component/public matrix and close consequential holes only. Private required-ACK volatile mode is not an exposed public setting; do not expand P7 simply to fill coverage cells. |
 | **PG terminal observations** | Orderly stopped progress and retained Abort cleanup have distinct witnesses ([tests:163–249][pg-progress], [940–1050][pg-abort]). | Separately scope any need for SQL racing shutdown, Abort progress snapshots or survivor ranking. Completion requires an actual bounded scenario; existing fsynced files and process cleanup do not establish these claims. |
+
+## Custom-native controller evidence and remaining obligations
+
+The [supported local companion](replicator-boundary.md#custom-controller-integration)
+and [actual PostgreSQL controller cases](../../../examples/postgres/src/public_controller_tests.rs)
+provide bounded upstream evidence for exact inbound authority, truthful installed
+voting/idle observations, real copy before admission, exact joint/current-only
+staging, native replay/invalidation, SQL/replay and completed fencing. Fresh
+sentinel initialization requires exact successful New-Open provenance; it is
+not zero progress or a retained-history election. Protected native method sets
+and representations remain unchanged.
+
+Remaining claim-specific obligations are not presumed defects or implied runs:
+
+- Downstream MySQL must attach the supported companion and requalify its own
+  source/target Build, native lineage/progress, later admission and actual access
+  fencing with exact process/storage/history/attempt bindings. Its unpublished
+  fixtures and externally reported seven-completion trace were not reproduced.
+- Native SF executable/differential validation, arbitrary failed custom-Build
+  reformation and production deployment remain outside the bounded upstream
+  witness. Failed/interrupted custom work may require explicit terminal cleanup
+  or process replacement before conflicting work can proceed; a historical
+  completion is not a renewed ingress grant.
+- Marked-successor PostgreSQL WriteQuorum remains explicitly unsupported as
+  documented below. Generic authority support does not implement missing native
+  database capabilities, broad P7 settings or new transport-fault controls.
 
 ## Deployment security qualification
 
@@ -165,3 +239,6 @@ do not satisfy the entire original P8 qualification claim.
 [fallback]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/evaluator/public_v1_topology.rs#L445-L470
 [rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
 [rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
+[native-host-open]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComProxyStatefulService.OpenAsyncOperation.cpp#L17-L39
+[native-host-proxy]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComProxyReplicator.h#L17-L35
+[native-host-build]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReplicatorBuildIdleReplicaAsyncOperation.cpp#L256-L357

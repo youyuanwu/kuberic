@@ -169,6 +169,7 @@ impl<F: ApplicationFactory> Harness<F> {
         image: String,
         timeout: Duration,
         teardown_timeout: Duration,
+        initial_replicas: u32,
     ) -> Result<Self> {
         let api = TestApi::new(&namespace);
         let reconciler = Self::reconciler(&api, &namespace)?;
@@ -181,7 +182,7 @@ impl<F: ApplicationFactory> Harness<F> {
         let set = KubericSet::new(
             &name,
             KubericSetSpec {
-                replicas: 3,
+                replicas: initial_replicas,
                 image: image.clone(),
                 failover_delay_seconds: 1,
                 switchover: None,
@@ -1448,7 +1449,7 @@ pub enum SupportResource {
     CredentialsSecret,
 }
 
-/// Configuration for one three-replica persisted application.
+/// Configuration for one persisted application (three replicas by default).
 pub struct ClusterBuilder<F> {
     factory: F,
     namespace: String,
@@ -1456,8 +1457,13 @@ pub struct ClusterBuilder<F> {
     image: String,
     timeout: Duration,
     teardown_timeout: Duration,
+    initial_replicas: u32,
 }
 impl<F: ApplicationFactory> ClusterBuilder<F> {
+    pub fn initial_replicas(mut self, replicas: u32) -> Self {
+        self.initial_replicas = replicas;
+        self
+    }
     pub fn namespace(mut self, value: impl Into<String>) -> Self {
         self.namespace = value.into();
         self
@@ -1490,6 +1496,7 @@ impl<F: ApplicationFactory> ClusterBuilder<F> {
         }
         let now = Instant::now();
         if self.image.trim().is_empty()
+            || !(1..=3).contains(&self.initial_replicas)
             || self.timeout.is_zero()
             || self.teardown_timeout.is_zero()
             || now.checked_add(self.timeout).is_none()
@@ -1507,6 +1514,7 @@ impl<F: ApplicationFactory> ClusterBuilder<F> {
             self.image,
             self.timeout,
             self.teardown_timeout,
+            self.initial_replicas,
         )
         .await?;
         Ok(TestCluster {
@@ -1532,6 +1540,7 @@ impl<F: ApplicationFactory> TestCluster<F> {
             image: "in-process/application".into(),
             timeout: TIMEOUT,
             teardown_timeout: Duration::from_secs(45),
+            initial_replicas: 3,
         }
     }
     fn reference(&self, report: &PublicV1AgentReport) -> ReplicaRef {
@@ -1629,10 +1638,10 @@ impl<F: ApplicationFactory> TestCluster<F> {
     }
     pub async fn settle_members(&mut self, expected: usize) -> super::Result<Topology> {
         self.driving()?;
-        if !(2..=3).contains(&expected) {
+        if !(1..=3).contains(&expected) {
             return Err(TestError::new(
                 ErrorKind::InvalidConfiguration,
-                "only two or three admitted members are supported",
+                "one through three admitted members are supported",
             ));
         }
         let deadline = self.core.deadline;
@@ -2062,6 +2071,21 @@ impl<F: ApplicationFactory> TestCluster<F> {
         });
         self.replace_spec(set).await?;
         Ok(request)
+    }
+    /// Changes only desired spec cardinality; the real controller performs
+    /// initialization, Build and separate configuration admission.
+    pub async fn scale_to(&mut self, replicas: u32) -> super::Result<()> {
+        self.driving()?;
+        if !(1..=3).contains(&replicas) {
+            return Err(TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "one through three replicas are supported",
+            ));
+        }
+        self.check().await?;
+        let mut set = self.core.set().await?;
+        set.spec.replicas = replicas;
+        self.replace_spec(set).await
     }
     async fn replace_spec(&self, set: KubericSet) -> super::Result<()> {
         tokio::time::timeout_at(
@@ -2532,6 +2556,7 @@ mod readiness_lifecycle_tests {
             "in-process/empty".into(),
             Duration::from_secs(90),
             Duration::from_secs(15),
+            3,
         )
         .await?;
         let result = async {

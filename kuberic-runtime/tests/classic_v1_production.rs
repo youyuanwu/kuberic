@@ -38,6 +38,9 @@ use sqlite_replicated::service::SqliteService;
 
 const CREDENTIAL: &str = "classic-v1-test-credential";
 
+#[path = "support/custom_control.rs"]
+mod custom_control;
+
 mod native_wire {
     tonic::include_proto!("kuberic.sf.v1");
 }

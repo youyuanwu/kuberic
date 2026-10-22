@@ -93,6 +93,7 @@ struct PgConfiguration {
 
 pub struct PgReplicator {
     public_v1: std::sync::OnceLock<public_v1::PublicPg>,
+    fault_owner: Mutex<Option<tokio::task::JoinHandle<()>>>,
     instance: Arc<PgInstanceManager>,
     durable: Arc<PgDurableStore>,
     observer: PgNativeObserver,
@@ -194,6 +195,7 @@ impl PgReplicator {
     ) -> Self {
         Self {
             public_v1: std::sync::OnceLock::new(),
+            fault_owner: Mutex::new(None),
             observer: PgNativeObserver::with_store(instance.clone(), durable.clone()).await,
             instance,
             durable,
@@ -1249,6 +1251,9 @@ impl PgReplicator {
 
     fn abort(&self) {
         self.cancellation.cancel();
+        if self.public_closed() {
+            return;
+        }
         if let Err(error) = self.instance.abort_owned() {
             tracing::error!(%error, "PostgreSQL driver abort cleanup failed");
         }

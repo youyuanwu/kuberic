@@ -167,6 +167,7 @@ struct RuntimeHost {
     public_v1_replication_address: std::net::SocketAddr,
     state: RwLock<HostState>,
     registered: OnceLock<RegisteredReplicator>,
+    pending_custom: StdMutex<Option<Arc<dyn crate::replicator::NativeRuntimeControl>>>,
     replicator_creation: StdMutex<ReplicatorCreationState>,
     aborted: AtomicBool,
     closed: AtomicBool,
@@ -180,6 +181,19 @@ struct RuntimeHost {
 }
 
 impl RuntimeHost {
+    fn custom_creation_live(&self, identity: ReplicatorCreationIdentity) -> bool {
+        !self.closed.load(Ordering::Acquire)
+            && !self.aborted.load(Ordering::Acquire)
+            && !self.replacement_fault_fenced.load(Ordering::Acquire)
+            && self.registered.get().is_some_and(|registered| {
+                registered.identity == identity
+                    && registered
+                        .native_runtime_control
+                        .as_ref()
+                        .is_some_and(|control| control.custom() && control.build_authority_open())
+            })
+    }
+
     fn selected_status(&self) -> Option<(AccessStatus, AccessStatus)> {
         if self.closed.load(Ordering::Acquire)
             || self.aborted.load(Ordering::Acquire)
@@ -334,6 +348,7 @@ impl PodRuntime {
                     reported_fault: None,
                 }),
                 registered: OnceLock::new(),
+                pending_custom: StdMutex::new(None),
                 replicator_creation: StdMutex::new(ReplicatorCreationState::Available(
                     ReplicatorCreationIdentity::new(RuntimeHostToken::new()),
                 )),
@@ -408,6 +423,9 @@ impl PodRuntime {
                 else {
                     return Ok(None);
                 };
+                if native.custom() {
+                    return Ok(None);
+                }
                 let observation = host.native_lifecycle.lock().unwrap().ok_or_else(|| {
                     RuntimeError::ControlPlane("native lifecycle is not opened".into())
                 })?;
@@ -456,6 +474,10 @@ impl PodRuntime {
                 wait_for_containment: registered.native_runtime_control.is_some()
                     || registered.callback_containment.is_some(),
                 preempt_retained_owner: registered.native_runtime_control.is_some(),
+                native_observer_callbacks: registered
+                    .native_runtime_control
+                    .as_ref()
+                    .is_some_and(|runtime| !runtime.custom()),
                 terminal_drain,
                 terminal_cleanup: None,
                 access_factory: Some(access_factory),
@@ -516,6 +538,7 @@ impl PodRuntime {
             containment: None,
             wait_for_containment: false,
             preempt_retained_owner: false,
+            native_observer_callbacks: false,
             terminal_drain,
             terminal_cleanup: None,
             access_factory: Some(access_factory),
@@ -870,8 +893,14 @@ impl PodRuntime {
         self.host
             .registered
             .get()
-            .and_then(|registered| registered.native_runtime_control.clone())
             .ok_or(RuntimeError::NotOpen)?
+            .native_runtime_control
+            .clone()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not support controller Build authority".into(),
+                )
+            })?
             .install_inbound_build_authority(authority)
             .await
     }
@@ -883,8 +912,14 @@ impl PodRuntime {
         self.host
             .registered
             .get()
-            .and_then(|registered| registered.native_runtime_control.clone())
             .ok_or(RuntimeError::NotOpen)?
+            .native_runtime_control
+            .clone()
+            .ok_or_else(|| {
+                RuntimeError::Application(
+                    "replicator does not support controller Build authority".into(),
+                )
+            })?
             .revoke_inbound_build_authority(authority)
             .await
     }
@@ -894,6 +929,7 @@ impl PodRuntime {
             .registered
             .get()
             .and_then(|registered| registered.native_runtime_control.clone())
+            .filter(|runtime| !runtime.custom())
             .ok_or(RuntimeError::NotOpen)
             .map(|control| control.raw_retained_task_cardinality())
     }
@@ -933,6 +969,52 @@ impl PodRuntime {
                 crate::protocol::public_operations::ProgressQueryResult::NotReady,
             ),
         };
+        let mut native_configuration = None;
+        let mut native_idle_replicas = None;
+        let mut custom_observation_alive = None;
+        if let Some(runtime) = self
+            .host
+            .registered
+            .get()
+            .and_then(|registered| registered.native_runtime_control.as_ref())
+        {
+            if runtime.custom() {
+                let alive_runtime = runtime.clone();
+                let host = Arc::downgrade(&self.host);
+                custom_observation_alive = Some(Arc::new(move || {
+                    alive_runtime.build_authority_open()
+                        && host.upgrade().is_some_and(|host| {
+                            !host.closed.load(Ordering::Acquire)
+                                && !host.aborted.load(Ordering::Acquire)
+                                && !host.replacement_fault_fenced.load(Ordering::Acquire)
+                        })
+                })
+                    as Arc<dyn Fn() -> bool + Send + Sync>);
+                if let Some(observed) = observation_state.as_ref()
+                    && let Some(configuration) =
+                        crate::host::public_lifecycle::installed_configuration_for_state(
+                            observed,
+                            &process_session_id,
+                        )
+                    && let Some(preview) = observed.public_v1_operation_state.as_ref()
+                    && let (Some(history), Some(storage)) =
+                        (&preview.history, &preview.storage_incarnation)
+                {
+                    match runtime.configuration_idle_replicas(&configuration).await {
+                        Ok(ids) => {
+                            native_idle_replicas = Some(ids);
+                            native_configuration =
+                                Some((configuration, history.clone(), storage.clone()));
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "custom installed observations unavailable")
+                        }
+                    }
+                }
+            } else {
+                native_idle_replicas = runtime.idle_replicas().ok();
+            }
+        }
         let state = self.host.state.read().await;
         let role = state.projection.role;
         let (read_status, write_status) = self
@@ -966,18 +1048,9 @@ impl PodRuntime {
             progress_history: observation_state
                 .and_then(|state| state.public_v1_operation_state)
                 .and_then(|preview| preview.history),
-            native_idle_replicas: self
-                .host
-                .registered
-                .get()
-                .and_then(|registered| registered.native_runtime_control.as_ref())
-                .and_then(|runtime| match runtime.idle_replicas() {
-                    Ok(ids) => Some(ids),
-                    Err(error) => {
-                        tracing::debug!(%error, "native idle observations are unavailable");
-                        None
-                    }
-                }),
+            native_idle_replicas,
+            native_configuration,
+            custom_observation_alive,
         })
     }
 
@@ -1060,6 +1133,9 @@ impl PodRuntime {
         else {
             return Ok(None);
         };
+        if native.custom() {
+            return Ok(None);
+        }
         let observation =
             self.host.native_lifecycle.lock().unwrap().ok_or_else(|| {
                 RuntimeError::ControlPlane("native lifecycle is not opened".into())
@@ -1115,16 +1191,25 @@ impl PodRuntime {
 
     pub(crate) async fn shutdown_and_drain(&self) -> Result<()> {
         self.abort();
-        if let Some(control) = self
+        let control = self
             .host
             .registered
             .get()
             .and_then(|registered| registered.native_runtime_control.clone())
-        {
+            .or_else(|| self.host.pending_custom.lock().unwrap().clone());
+        if let Some(control) = control {
             control.shutdown_and_drain().await
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) async fn drain_pending_custom(&self) -> Result<()> {
+        let pending = self.host.pending_custom.lock().unwrap().clone();
+        if let Some(pending) = pending {
+            pending.shutdown_and_drain().await?;
+        }
+        Ok(())
     }
 }
 
@@ -1245,6 +1330,258 @@ impl ReplacementFaultBridge {
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
+    async fn revoke_custom_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.bridge()
+            .await?
+            .store
+            .revoke_exact_public_v1_inbound_build_authority(authority)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+    fn retain_custom_creation(
+        &self,
+        reservation: ReplicatorCreationReservation,
+        owner: Arc<dyn crate::replicator::NativeRuntimeControl>,
+    ) -> Result<()> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let creation = host.replicator_creation.lock().unwrap();
+        if host.aborted.load(Ordering::Acquire)
+            || host.closed.load(Ordering::Acquire)
+            || !matches!(&*creation, ReplicatorCreationState::Reserved { identity, .. }
+                if *identity == reservation.identity(RuntimeHostToken::new()))
+        {
+            return Err(RuntimeError::Closed);
+        }
+        let mut pending = host.pending_custom.lock().unwrap();
+        if pending.is_some() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        *pending = Some(owner);
+        Ok(())
+    }
+    async fn validate_custom_build_authority(
+        &self,
+        reservation: ReplicatorCreationReservation,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+        require_installed: bool,
+    ) -> Result<()> {
+        use crate::host::native_transport::{NativeBinding, NativeEndpoint};
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let creation = reservation.identity(RuntimeHostToken::new());
+        if !host.custom_creation_live(creation) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        authority
+            .validate()
+            .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
+        let bridge = self.bridge().await?;
+        let source = host.identity == authority.attempt.source;
+        let operation = if source {
+            Some(
+                bridge
+                    .registry
+                    .operation_for_validation(&authority.operation_id)
+                    .await
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+            )
+        } else {
+            None
+        };
+        let state = bridge
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        #[cfg(feature = "testing")]
+        {
+            let cut = host.public_operation_cut.lock().unwrap().clone();
+            if let Some(cut) = cut {
+                cut.pause(
+                    crate::host::public_lifecycle::PublicCutPosition::BuildAuthorityRead,
+                    0,
+                )
+                .await;
+            }
+        }
+        if !host.custom_creation_live(creation)
+            || bridge.registry.is_fenced()
+            || state.identity.local_identity != host.identity
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let preview = state
+            .public_v1_operation_state
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let process = &host
+            .replica_session
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?
+            .1;
+        let attempt = &authority.attempt;
+        let endpoint = if source {
+            &authority.source_address
+        } else {
+            &authority.target_address
+        };
+        let opened_endpoint =
+            preview
+                .operations
+                .values()
+                .filter(|record| {
+                    record.stage == crate::host::state::PublicOperationStage::Completed
+                        && record.disposition
+                            == Some(crate::host::state::PublicOperationDisposition::Succeeded)
+                        && &record.intent.process_session_id == process
+                        && matches!(record.intent.program, Some(
+                    crate::protocol::public_operations::PublicOperationProgram::Open { .. }
+                    | crate::protocol::public_operations::PublicOperationProgram::Close
+                    | crate::protocol::public_operations::PublicOperationProgram::Abort))
+                })
+                .max_by_key(|record| (&record.intent.revision, &record.intent.operation_id))
+                .filter(|record| {
+                    matches!(
+                        record.intent.program,
+                        Some(
+                            crate::protocol::public_operations::PublicOperationProgram::Open { .. }
+                        )
+                    )
+                })
+                .and_then(|record| {
+                    record
+                        .lifecycle
+                        .outcomes
+                        .iter()
+                        .find_map(|outcome| match outcome {
+                            crate::host::state::PublicInstructionOutcome::Endpoint(address) => {
+                                Some(address)
+                            }
+                            _ => None,
+                        })
+                });
+        if opened_endpoint != Some(endpoint) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if source {
+            let record = preview
+                .operations
+                .get(&authority.operation_id)
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if record.stage != crate::host::state::PublicOperationStage::Running
+                || record.disposition.is_some()
+                || record.superseded_by.is_some()
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            record
+                .intent
+                .validate()
+                .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
+            let Some(crate::protocol::public_operations::PublicOperationProgram::Build(input)) =
+                record.intent.program.as_ref()
+            else {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            };
+            let captured = preview
+                .build_records
+                .values()
+                .find(|captured| {
+                    captured.build_id == attempt.build_id
+                        && captured.operation_id == authority.operation_id
+                })
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            let expected = crate::protocol::public_operations::PublicInboundBuildAuthority {
+                operation_id: record.intent.operation_id.clone(),
+                operation_revision: record.intent.revision,
+                attempt: crate::protocol::public_operations::PublicBuildAttemptReference {
+                    resource_uid: state.identity.resource_uid.clone(),
+                    epoch: captured.epoch,
+                    build_id: captured.build_id.clone(),
+                    source: captured.source.clone(),
+                    source_storage: captured.source_storage.clone(),
+                    source_session: captured.source_session.clone(),
+                    target: captured.target.clone(),
+                    target_storage: captured.target_storage.clone(),
+                    target_session: captured.target_session.clone(),
+                },
+                history: captured.history.clone(),
+                current_configuration_id: input
+                    .current_configuration_id
+                    .clone()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                source_address: input.source_address.clone(),
+                target_address: captured.target_address.clone(),
+            };
+            let operation = operation.as_ref().unwrap();
+            let current = operation.snapshot();
+            if expected != *authority
+                || !operation.access_live()
+                || current.stage != crate::host::state::PublicOperationStage::Running
+                || current.disposition.is_some()
+                || current.superseded_by.is_some()
+                || current.intent != record.intent
+                || current.accepted_history != record.accepted_history
+                || current.accepted_storage != record.accepted_storage
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+        } else if !require_installed {
+            // Classification is not a live grant. Validate its target scope
+            // without publishing a provisional grant to native code.
+            if preview.terminal
+                || attempt.target != state.identity.local_identity
+                || &attempt.target_session != process
+                || preview.history.as_ref() != Some(&authority.history)
+                || preview.storage_incarnation.as_ref() != Some(&attempt.target_storage)
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            return host
+                .custom_creation_live(creation)
+                .then_some(())
+                .ok_or(RuntimeError::AuthorityNotAdmitted);
+        }
+        let validated = NativeBinding {
+            history: authority.history.clone(),
+            epoch: attempt.epoch,
+            current_configuration_id: authority.current_configuration_id.clone(),
+            previous_configuration_id: None,
+            primary: NativeEndpoint {
+                identity: attempt.source.clone(),
+                process_session_id: attempt.source_session.clone(),
+                storage: attempt.source_storage.clone(),
+                address: authority.source_address.clone(),
+            },
+            secondary: NativeEndpoint {
+                identity: attempt.target.clone(),
+                process_session_id: attempt.target_session.clone(),
+                storage: attempt.target_storage.clone(),
+                address: authority.target_address.clone(),
+            },
+            build: Some(authority.clone()),
+        }
+        .validate_for_state(&state, process, endpoint);
+        validated?;
+        if !host.custom_creation_live(creation)
+            || (!source
+                && host
+                    .registered
+                    .get()
+                    .and_then(|registered| registered.native_runtime_control.as_ref())
+                    .is_none_or(|control| !control.inbound_build_live(authority)))
+            || operation.as_ref().is_some_and(|operation| {
+                !operation.access_live()
+                    || operation.snapshot().stage
+                        != crate::host::state::PublicOperationStage::Running
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
     fn native_write_admission(&self) -> Result<Arc<StdMutex<()>>> {
         Ok(self
             .host
@@ -1552,12 +1889,43 @@ impl PartitionAccessView for HostAccessView {
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
     ) -> Result<()> {
-        self.bridge()
-            .await?
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let custom = host.registered.get().and_then(|registered| {
+            registered
+                .native_runtime_control
+                .as_ref()
+                .filter(|control| control.custom())
+                .map(|_| registered.identity)
+        });
+        let bridge = self.bridge().await?;
+        #[cfg(feature = "testing")]
+        if custom.is_some() {
+            let cut = host.public_operation_cut.lock().unwrap().clone();
+            if let Some(cut) = cut {
+                cut.pause(
+                    crate::host::public_lifecycle::PublicCutPosition::BeforeInboundBuildCommit,
+                    0,
+                )
+                .await;
+            }
+        }
+        if custom.is_some_and(|identity| !host.custom_creation_live(identity)) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        bridge
             .store
             .install_public_v1_inbound_build_authority(authority)
             .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        if custom.is_some_and(|identity| !host.custom_creation_live(identity)) {
+            bridge
+                .store
+                .revoke_exact_public_v1_inbound_build_authority(authority)
+                .await
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
     }
 
     async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
@@ -1651,6 +2019,9 @@ impl ReplicatorRegistration for RuntimeHost {
         if self.closed.load(Ordering::Acquire) || self.aborted.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
+        if self.pending_custom.lock().unwrap().is_some() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         match &*creation {
             ReplicatorCreationState::Available(identity) => {
                 let reservation = ReplicatorCreationReservation::from_identity(
@@ -1716,6 +2087,16 @@ impl ReplicatorRegistration for RuntimeHost {
         }
         let consumes_provider_writer =
             provider.is_some() && attachment.has_provider_writer(RuntimeHostToken::new());
+        let native_runtime_control = attachment.native_runtime_control(RuntimeHostToken::new());
+        if let Some(pending) = self.pending_custom.lock().unwrap().as_ref()
+            && native_runtime_control
+                .as_ref()
+                .is_none_or(|candidate| !Arc::ptr_eq(candidate, pending))
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "returned bundle does not match retained custom creation".into(),
+            ));
+        }
         if consumes_provider_writer && provider_writer.consumed {
             return Err(RuntimeError::Application(
                 "provider writer lease was already consumed".into(),
@@ -1728,7 +2109,7 @@ impl ReplicatorRegistration for RuntimeHost {
                 primary: attachment.primary_replicator(RuntimeHostToken::new()),
                 identity: *identity,
                 callback_containment: attachment.callback_containment(RuntimeHostToken::new()),
-                native_runtime_control: attachment.native_runtime_control(RuntimeHostToken::new()),
+                native_runtime_control,
                 capabilities: attachment.capabilities(RuntimeHostToken::new()),
                 provider_writer_lease_consumed,
             })
@@ -1739,6 +2120,7 @@ impl ReplicatorRegistration for RuntimeHost {
             })?;
         provider_writer.consumed = consumes_provider_writer;
         *creation = ReplicatorCreationState::Registered;
+        self.pending_custom.lock().unwrap().take();
         Ok(())
     }
 }

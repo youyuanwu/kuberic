@@ -2175,6 +2175,25 @@ impl AgentStore for SqliteStore {
         })
     }
 
+    async fn revoke_exact_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "exact revocation requires a public-v1 store".into(),
+                )
+            })?;
+            if preview.current_inbound_build_authority.as_ref() == Some(authority) {
+                preview.current_inbound_build_authority = None;
+                write_agent_state(transaction, &state)?;
+            }
+            Ok(())
+        })
+    }
+
     async fn public_v1_outbound_build_authority(
         &self,
         build_id: &OperationId,
@@ -2623,6 +2642,113 @@ mod tests {
             },
             effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn exact_revocation_cannot_clear_a_successor_session_or_attempt() {
+        use crate::protocol::public_operations::*;
+        use crate::protocol::types::*;
+        let directory = crate::host::tests::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let binding = PublicV1LifecycleBinding {
+            identity: PublicV1Identity::new(1),
+            resource_uid: identity().resource_uid,
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let store = SqliteStore::create_replacement_authorized(
+            &path,
+            AgentState::new(identity()),
+            binding.clone(),
+        )
+        .unwrap();
+        let initialization = derive_history_initialization_id(
+            &binding.resource_uid,
+            PublicProtocolGeneration::new(1),
+        );
+        let history = derive_bootstrap_history(
+            &binding.resource_uid,
+            PublicProtocolGeneration::new(1),
+            &initialization,
+        );
+        let target = ReplicaStorageIncarnationContext {
+            replica: identity().local_identity,
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: identity().pod_uid,
+                pvc_uid: identity().pvc_uid,
+            },
+            storage_generation: StorageGeneration::new("target"),
+        };
+        store
+            .initialize_public_v1_history(&initialization, &history, &target)
+            .await
+            .unwrap();
+        let source = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new("source"),
+            agent_generation: AgentGeneration::new("source-generation"),
+        };
+        let old = PublicInboundBuildAuthority {
+            operation_id: OperationId::new("old"),
+            operation_revision: 1,
+            attempt: PublicBuildAttemptReference {
+                resource_uid: binding.resource_uid,
+                epoch: Epoch::new(0, 1),
+                build_id: OperationId::new("old"),
+                source: source.clone(),
+                source_storage: ReplicaStorageIncarnationContext {
+                    replica: source,
+                    storage: ReplicaStorageIdentity::Persistent {
+                        pod_uid: PodUid::new("source"),
+                        pvc_uid: PvcUid::new("source-pvc"),
+                    },
+                    storage_generation: StorageGeneration::new("source-storage"),
+                },
+                source_session: ProcessSessionId::new("source-session"),
+                target: target.replica.clone(),
+                target_storage: target,
+                target_session: ProcessSessionId::new("old-session"),
+            },
+            history,
+            current_configuration_id: ConfigurationId::new("configuration"),
+            source_address: "http://source".into(),
+            target_address: "http://target".into(),
+        };
+        store
+            .install_public_v1_inbound_build_authority(&old)
+            .await
+            .unwrap();
+        let mut successor = old.clone();
+        successor.operation_id = OperationId::new("successor");
+        successor.operation_revision = 2;
+        successor.attempt.build_id = OperationId::new("successor");
+        successor.attempt.target_session = ProcessSessionId::new("successor-session");
+        store
+            .install_public_v1_inbound_build_authority(&successor)
+            .await
+            .unwrap();
+        store
+            .revoke_exact_public_v1_inbound_build_authority(&old)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .public_v1_inbound_build_authority(&successor.attempt.build_id)
+                .await
+                .unwrap(),
+            Some(successor.clone())
+        );
+        store
+            .revoke_exact_public_v1_inbound_build_authority(&successor)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .public_v1_inbound_build_authority(&successor.attempt.build_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
