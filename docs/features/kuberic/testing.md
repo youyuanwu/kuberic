@@ -23,6 +23,70 @@ Use the live inventory rather than fixed test totals. A successful local run
 does not erase the [remaining claim-specific gaps](sf-v1-semantic-alignment-plan.md#p2--focused-qualification-not-presumed-defects)
 or verify a different mode, fault scope, power-loss boundary or deployment.
 
+## Engine-neutral hosting
+
+The [bounded hosting map](engine-neutral-hosting.md) distinguishes host
+installation, exact remote Build state and optional actual engine observations.
+Its real V1/independent PostgreSQL witnesses traverse production controller
+dispatch; a manual planner or synthetic companion pass is not that evidence.
+
+On a resource-constrained checkout, use task-owned output rather than deleting
+shared build output. Keep the PostgreSQL scratch parent short for Unix sockets:
+
+```bash
+owned="$(mktemp -d /tmp/kuberic-hosting-XXXXXXXX)"
+export CARGO_TARGET_DIR="$owned/target" TMPDIR="$owned/tmp"
+export KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$owned/pg"
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_BUILD_JOBS=2
+mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR" "$KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR"
+
+cargo nextest list -p kuberic-level-tests --lib --all-features --profile ci \
+  -E 'test(/^in_process::journeys::actual_v1_/)'
+cargo nextest run -j 1 -p kuberic-level-tests --lib --all-features --profile ci \
+  -E 'test(/^in_process::journeys::actual_v1_/)'
+cargo nextest run -j 2 -p kuberic-level-tests --lib --all-features --profile ci \
+  -E 'test(/^in_process::journeys::/)'
+just nextest-postgres-smoke
+```
+
+The V1 copy witness holds real provider copy while observing engine idle
+membership and host InBuild independently, then checks Ready, controller
+acceptance/revoke and separate voter admission. Both engines' hosted terminal
+witnesses distinguish successful Close, child failure after successful join,
+and lost real native joins. PostgreSQL smoke includes actual SQL/replay,
+revocation, delayed/pre-effect invalidation and retained lifetime cases.
+Direct negative fault injection is setup; production dispatch performs effects.
+
+Common operation/lifetime and controller evidence checks:
+
+```bash
+cargo nextest run -j 2 -p kuberic-runtime --lib --all-features --profile ci \
+  -E 'test(/^host::operation::tests::/) or test(/^host::public_lifecycle::tests::/) or test(/^replicator::coordinator::tests::/) or test(/^host::hosting::selected_access::access_retry_tests::/)'
+cargo nextest run -j 2 -p kuberic-controller --all-features --profile ci \
+  -E 'test(/^evaluator::public_v1_topology::/) or test(/^cluster_api::tests::renewal/) or binary(=public_v1_evidence) or binary(=public_v1_production) or binary(=public_v1_session_renewal)'
+```
+
+Run source/API guards explicitly: nextest filters can exclude their binaries
+even when a similarly named selection succeeds. External package proof requires
+scratch outside the checkout and is not replaced by a path-dependency check:
+
+```bash
+cargo test -p kuberic-runtime --all-features \
+  --test public_api_inventory --test lifecycle_capability_boundaries
+cargo test -p kuberic-runtime --all-features --test public_api_privacy -- --ignored
+scripts/check_runtime_public_api.sh --rustdoc-only
+cargo check --locked --offline --no-default-features -p kuberic-runtime --lib
+cargo check --locked --offline --no-default-features -p kuberic-controller --bins
+cargo test -p kuberic-level-tests --all-features --test source_checks \
+  packaged_controller_test_util_boundary -- --ignored
+```
+
+These are reproduction commands, not fixed test totals or certification.
+Do not substitute the destructive ordinary `just nextest-test` recipe when
+shared targets must be preserved. Full PostgreSQL qualification is a separate
+explicit decision, not routine smoke.
+
 ## Workspace Checks
 
 ```bash
@@ -361,7 +425,7 @@ called a native positive witness:
 
 ```bash
 cargo test -p kuberic-runtime --features testing --test classic_v1_production custom_host_
-cargo test -p kuberic-runtime --features testing --lib replicator::custom::tests
+cargo test -p kuberic-runtime --features testing --lib replicator::coordinator::tests
 cargo test -p kuberic-runtime --test public_api_privacy -- --ignored
 ```
 

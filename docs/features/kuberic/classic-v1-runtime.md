@@ -1,5 +1,11 @@
 # Classic V1: Current Semantics
 
+The [engine-neutral hosting contract](engine-neutral-hosting.md) supersedes
+older host-only anchors below for common admission, retained authority,
+observation separation and public terminal outcomes. Its implementation is
+anchored through `91a2a93c3c7cf9477adb3a0d27e674b99f741a8a`; older queue/
+provider/component anchors remain historical evidence, not rerun claims.
+
 This is the authoritative behavioral reference for the selected classic V1
 runtime. Selected-host Close/access evidence is pinned to Kuberic
 `69b1cfe3c85d296463da0def3e80eaca0ddcd0a7` (Close references retain their
@@ -291,13 +297,16 @@ distinct from a completed transported write.
 
 **Outer Close** records the child identity/error, aborts both children and skips
 later graceful callbacks after a child failure. Successful actual terminal
-cleanup then yields **successful outer Close**, matching the chosen native
-outer outcome ([program:550–638][selected-close],
-[native:94–105][native-close-start], [206–275][native-close-end]).
-The local abort-both sequence intentionally differs from native's per-child
-Abort/continued service Close. Diagnostics remain durable lifecycle journal
-`CloseFailure` outcomes, correlated by operation ID and child; a successful
-public response has no added child-error field. Cleanup failure still fails.
+cleanup yields positive containment, but the current common executor retains a
+**failed public Close result**. This deliberately differs from native's
+success-shaped outer outcome and supersedes the older selected-host disposition
+([current program](../../../kuberic-runtime/src/host/public_lifecycle_program.rs#L587),
+[current terminal owner](../../../kuberic-runtime/src/host/public_lifecycle_terminal.rs#L41)).
+The local abort-both/skip-later-graceful sequence is also intentional. Durable
+`CloseFailure` outcomes retain child/operation diagnostics; cleanup failure
+remains failed and cannot publish positive containment. Actual controller-
+dispatched V1 and PostgreSQL terminal witnesses are described in the
+[bounded hosting reference](engine-neutral-hosting.md#compatibility-and-qualification).
 
 An unrecorded interrupted destructive child callback is not retried: recovery
 attaches an Abort/drain/witness owner while retaining Ambiguous/Cancelled
@@ -424,7 +433,7 @@ Authenticated missing-session **ACKs only** may be dropped after retirement;
 other dispatch errors remain failures ([ingress tests:226–370][ingress-test]).
 RPC acceptance/reconnect does not manufacture an ACK.
 
-Public protocol 13 and agent schema 13 are breaking formats, not native wire
+Public protocol 13 and agent schema 14 are breaking formats, not native wire
 versions ([protocol:13][protocol], [schema:19–21][schema]).
 Protocol 13 requires descriptor availability fields and includes them in
 canonical operation identity ([descriptor:548–562][availability],
@@ -550,7 +559,7 @@ production-readiness support from the selected Rust journeys.
 [availability]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/protocol/public_operations.rs#L548-L562
 [availability-digest]: https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/src/protocol/public_operations.rs#L3118-L3133
 [native-stage-selector]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.cpp#L288-L381
-[schema]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/host/state.rs#L19-L21
+[schema]: ../../../kuberic-runtime/src/host/state.rs#L19-L21
 [native-send-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/RemoteSession.cpp#L753-L790
 [native-ack-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.cpp#L633-L740
 [rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230

@@ -128,6 +128,7 @@ SF's Replicator, PrimaryReplicator or StateProvider. Its responsibilities are:
 
 | Contract | Required meaning |
 |---|---|
+| `callback_ownership()` | Immutable engine-only interruption contract; conservative object-owned default. NativeObserver does not certify application callbacks, repeatability or successful drainage. |
 | `install_inbound_build_authority` | Install the exact target copy ingress owner before acknowledging success. The controller awaits this acknowledgement before dispatching source Build. |
 | `revoke_inbound_build_authority` | Invalidate only the matching attempt's ingress. Stale revocation must not cancel another owner; revocation is not voter removal, data deletion or proof of receiver drainage. |
 | `idle_replicas(configuration)` | Observe real native idle membership coherently with the supplied last successfully installed host configuration. An error means unavailable, not observed empty membership. |
@@ -171,9 +172,11 @@ operation's cancellation/fence state after awaits. Target validation checks
 both durable and process-local exact ingress ownership; a suspended reader
 cannot combine an old grant with a later revoked/fenced lifetime.
 
-Reports combine a successful exact host configuration with the companion's
-coherent native idle sample. Missing, failed, stale, torn, duplicate or
-voting-overlap observations cannot become installed evidence. A successfully
+Reports publish successful exact host configuration independently of the
+optional coherent `engine_idle` sample. Missing, failed, stale, torn, duplicate
+or voting-overlap observations suppress only that sample; `None` is not
+observed empty. Exact `remote_builds` are host journal state, not native idle
+membership or a new grant. A successfully
 journaled **secondary host configuration** may precede primary native peer
 admission: it is control authority, not a nonexistent secondary
 PrimaryReplicator callback, native peer completion, or serving access.
@@ -185,11 +188,17 @@ Unpublished downstream MySQL fixtures and the externally reported
 seven-completion trace are not reproduced by either fixture; downstream engines
 must requalify their own native transfer, lineage, replay, admission and fencing.
 
-Source anchors: [attachment:599–626](../../../kuberic-runtime/src/replicator/mod.rs#L599-L626),
+Both engines use the [same retained coordinator](../../../kuberic-runtime/src/replicator/coordinator.rs#L1).
+Adapters provide actual ingress/drain effects and optional diagnostics, not
+engine-selected authority policy. Current production returned-failure retry
+proof remains Never; unsafe or undeclared callback failures require containment.
+See the [message/state mapping and limits](engine-neutral-hosting.md).
+
+Source anchors: [attachment](../../../kuberic-runtime/src/replicator/mod.rs#L596),
 [read-only context:935–960](../../../kuberic-runtime/src/replicator/mod.rs#L935-L960),
 [local validation:1365–1558](../../../kuberic-runtime/src/host/hosting.rs#L1365-L1558),
-[retained actions:183–376](../../../kuberic-runtime/src/replicator/custom.rs#L183-L376),
-and [configuration evidence:892–940](../../../kuberic-runtime/src/host/public_lifecycle.rs#L892-L940).
+[retained actions](../../../kuberic-runtime/src/replicator/coordinator.rs#L173),
+and [configuration evidence](../../../kuberic-runtime/src/host/public_lifecycle.rs#L1044).
 The [PG companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641)
 and [controller cases:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412)
 are concrete engine/qualification references, not new native SF interfaces.

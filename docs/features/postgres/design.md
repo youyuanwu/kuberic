@@ -7,6 +7,16 @@ native database evidence. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
+The [engine-neutral host](../kuberic/engine-neutral-hosting.md) uses one retained
+authority/lifetime coordinator for this independent allocation and built-in V1.
+Host-installed configuration, exact host remote Build state and optional native
+idle observations are separate facts. PostgreSQL's `built_idle` query still
+means completed native copy, unlike V1 membership that can appear during copy;
+neither grants voting or SQL access. Production callback repeatability remains
+conservative. Actual controller-dispatched hosted terminal cases retain child
+Close failure after successful cleanup and reject lost native joins, alongside
+the real backup/replay/SQL-fencing formation witnesses.
+
 Use the current protocol/schema declared by the
 [runtime guide](../kuberic/classic-v1-runtime.md#production-policies-and-security).
 Prior unsupported agent/provider formats reject unchanged; there is no import,
