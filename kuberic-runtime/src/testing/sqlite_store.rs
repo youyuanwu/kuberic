@@ -327,6 +327,66 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Seed explicit successful instruction receipts for a store-only fixture.
+    /// Does not execute an engine and must not be used as native qualification.
+    pub async fn complete_public_v1_initial_primary_fixture(
+        &self,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+    ) -> crate::host::Result<()> {
+        use crate::host::state::{
+            PublicInstruction as I, PublicInstructionOutcome as O, PublicOperationDisposition as D,
+            PublicOperationStage as S,
+        };
+        if intent.lifecycle.as_ref().is_none_or(|input| {
+            input.recipe
+                != crate::protocol::public_operations::PublicLifecycleRecipe::InitialPrimary
+                || input.possible_data_loss
+                    != crate::protocol::public_operations::PossibleDataLossIntent::NotPossible
+        }) {
+            return Err(crate::host::HostError::CommandRejected(
+                "initial-primary fixture required".into(),
+            ));
+        }
+        self.inner.begin_public_operation(intent, &[], &[]).await?;
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                S::Ready,
+                S::Running,
+                None,
+            )
+            .await?;
+        for (index, (instruction, outcome)) in [
+            (I::ReplicatorPrimary, O::Done),
+            (I::ApplicationPrimary, O::ApplicationRole(None)),
+            (I::CurrentConfiguration, O::Done),
+            (I::Access, O::Done),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.inner
+                .public_instruction(intent, index, instruction, None)
+                .await?;
+            self.inner
+                .public_instruction(intent, index, instruction, Some(outcome))
+                .await?;
+        }
+        self.inner
+            .advance_public_operation(
+                &intent.operation_id,
+                intent.revision,
+                &intent.process_session_id,
+                S::Running,
+                S::Completed,
+                Some(D::Succeeded),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn public_v1_operation_intents(
         &self,
     ) -> crate::host::Result<Vec<crate::protocol::public_operations::PublicOperationIntent>> {
@@ -863,8 +923,7 @@ impl SqliteStore {
                     .await?
                     .public_v1_operation_state
                     .and_then(|preview| preview.history),
-                native_idle_replicas: Some(Vec::new()),
-                native_configuration: None,
+                engine_idle: None,
                 observation_alive: None,
             },
         )

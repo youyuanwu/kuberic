@@ -318,6 +318,25 @@ pub fn normalize_public_v1_agent_status_report(
                 })
             })
             .transpose()?,
+        engine_idle: public
+            .engine_idle_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    WireError::InvalidAuthority(format!("invalid engine idle sample: {error}"))
+                })
+            })
+            .transpose()?,
+        remote_builds: public
+            .remote_builds_json
+            .into_iter()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    WireError::InvalidAuthority(format!(
+                        "invalid remote build observation: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         active_operations: public
             .active_operations_json
             .into_iter()
@@ -379,6 +398,17 @@ pub fn public_v1_agent_status_to_proto(report: &PublicV1AgentReport) -> proto::A
                 serde_json::to_string(configuration)
                     .expect("public configuration serialization is infallible")
             }),
+            engine_idle_json: report.engine_idle.as_ref().map(|sample| {
+                serde_json::to_string(sample)
+                    .expect("engine idle sample serialization is infallible")
+            }),
+            remote_builds_json: report
+                .remote_builds
+                .iter()
+                .map(|build| {
+                    serde_json::to_string(build).expect("remote build serialization is infallible")
+                })
+                .collect(),
             active_operations_json: report
                 .active_operations
                 .iter()

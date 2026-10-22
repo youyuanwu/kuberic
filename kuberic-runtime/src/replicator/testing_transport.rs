@@ -26,6 +26,7 @@ struct Registration {
     route: Route,
     generation: Arc<()>,
     evidence: Option<(ProcessSessionId, Weak<ReplicatorCreation>)>,
+    driver_loss: Option<Arc<dyn Fn() -> BoxFuture<'static, std::io::Result<()>> + Send + Sync>>,
 }
 
 fn routes() -> &'static Mutex<BTreeMap<String, Registration>> {
@@ -49,6 +50,7 @@ pub(in crate::replicator) fn before_attachment(
         .get_mut(instance)
         .map(|registration| {
             registration.evidence = None;
+            registration.driver_loss = None;
             registration.generation = Arc::new(());
             AttachmentRoute {
                 instance: instance.to_owned(),
@@ -56,6 +58,15 @@ pub(in crate::replicator) fn before_attachment(
                 generation: Arc::downgrade(&registration.generation),
             }
         })
+}
+
+pub(in crate::replicator) fn retain_driver_loss(
+    instance: &str,
+    loss: impl Fn() -> BoxFuture<'static, std::io::Result<()>> + Send + Sync + 'static,
+) {
+    if let Some(registration) = routes().lock().unwrap().get_mut(instance) {
+        registration.driver_loss = Some(Arc::new(loss));
+    }
 }
 
 pub(in crate::replicator) fn acknowledge(
@@ -114,6 +125,7 @@ impl TestingTcpRoute {
                 route: Arc::new(route),
                 generation: Arc::new(()),
                 evidence: None,
+                driver_loss: None,
             },
         );
         Ok(Self { instance })
@@ -138,6 +150,35 @@ impl TestingTcpRoute {
                         })
                 })
         })
+    }
+
+    /// Lose the real retained V1 driver task for one exactly attached creation.
+    /// This is negative native fault setup, not terminal execution or drainage.
+    pub async fn lose_native_driver(
+        session: &ProcessSessionId,
+        creation: &ReplicatorCreationId,
+    ) -> std::io::Result<()> {
+        let loss =
+            routes()
+                .lock()
+                .unwrap()
+                .values()
+                .find(|registration| {
+                    registration
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|(bound, owner)| {
+                            bound == session
+                                && owner.upgrade().is_some_and(|owner| {
+                                    owner.identity.get().is_some_and(|identity| {
+                                        identity.to_public_id() == *creation
+                                    }) && !owner.armed.load(std::sync::atomic::Ordering::Acquire)
+                                })
+                        })
+                })
+                .and_then(|registration| registration.driver_loss.clone())
+                .ok_or_else(|| std::io::Error::other("exact live V1 driver unavailable"))?;
+        loss().await
     }
 }
 

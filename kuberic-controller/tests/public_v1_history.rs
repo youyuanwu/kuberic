@@ -105,6 +105,8 @@ fn public_v1_data_loss_invalidation_is_owner_local_and_exact() {
     );
     let storage = storage();
     let report = PublicV1AgentReport {
+        engine_idle: None,
+        remote_builds: Vec::new(),
         retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
@@ -218,6 +220,8 @@ fn public_v1_recovery_progress_only_selects_access_closed_provisional_primary() 
         }),
     };
     let mut report = PublicV1AgentReport {
+        engine_idle: None,
+        remote_builds: Vec::new(),
         retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
@@ -300,6 +304,8 @@ fn public_v1_all_survivor_election_requires_history_and_storage_admission() {
     };
     second_storage.storage_generation = StorageGeneration::new("storage-2");
     let report = |storage: ReplicaStorageIncarnationContext, progress: i64| PublicV1AgentReport {
+        engine_idle: None,
+        remote_builds: Vec::new(),
         retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
@@ -751,6 +757,8 @@ async fn public_v1_history_controller_command_journal_and_report_round_trip() {
         program: None,
     };
     let replacement_report = PublicV1AgentReport {
+        engine_idle: None,
+        remote_builds: Vec::new(),
         retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,

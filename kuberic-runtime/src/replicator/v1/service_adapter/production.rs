@@ -204,6 +204,22 @@ async fn compose(
         Arc::new(move || access.native_write_status()),
         Arc::new(move |observation| observations.observe_native_lifecycle(observation)),
     )?;
+    #[cfg(feature = "testing")]
+    {
+        let driver = Arc::downgrade(&facade);
+        crate::replicator::testing_transport::retain_driver_loss(
+            local.identity.instance_id.as_str(),
+            move || {
+                let driver = driver.upgrade();
+                Box::pin(async move {
+                    driver
+                        .ok_or_else(|| std::io::Error::other("native V1 driver released"))?
+                        .lose_driver()
+                        .await
+                })
+            },
+        );
+    }
     let owner = Arc::new(Production {
         facade,
         transport,
@@ -397,21 +413,10 @@ impl Drop for Production {
 }
 
 #[cfg(test)]
-pub(super) fn test_control(
-    context: ReplicatorFactoryContext,
-    facade: Arc<Facade>,
-    transport: Arc<Transport>,
-) -> Arc<dyn NativeRuntimeControl> {
-    let owner = Arc::new(Production {
-        settings_address: transport.local().address.clone(),
-        facade,
-        transport,
-        context: context.clone(),
-        peers: Arc::new(Mutex::new(BTreeMap::new())),
-        epoch: Mutex::new(None),
-    });
-    Arc::new(crate::replicator::coordinator::Control::new(context, owner))
-}
+#[path = "production_test_control.rs"]
+mod test_control;
+#[cfg(test)]
+pub(super) use test_control::test_control;
 
 #[async_trait]
 impl Replicator for Production {

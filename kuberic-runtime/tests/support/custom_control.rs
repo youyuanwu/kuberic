@@ -275,6 +275,7 @@ impl CustomReplicatorControl for Contract {
             2 => vec![ReplicaId::new(2), ReplicaId::new(2)],
             3 => vec![ReplicaId::new(1)],
             4 => return Err(failure("different disjoint installed configuration")),
+            5 => vec![ReplicaId::new(-1)],
             _ => {
                 if self.installed.lock().unwrap().as_ref() != Some(&configuration.current) {
                     return Err(failure("configuration mismatch"));
@@ -838,6 +839,80 @@ async fn custom_host_returned_bundle_cannot_discard_different_retained_creation(
 }
 
 #[tokio::test]
+async fn custom_host_unavailable_idle_diagnostic_preserves_installed_authority_and_exact_build() {
+    use kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState;
+    let root = tempfile::tempdir().unwrap();
+    let (mut source, target, authority, intent) = setup(root.path()).await;
+    let installed = source.report().await.configuration.unwrap();
+    source.service.observation.store(1, Ordering::SeqCst);
+    let before = source.report().await;
+    assert_eq!(before.configuration.as_ref(), Some(&installed));
+    assert!(
+        before.engine_idle.is_none(),
+        "unavailable is not observed empty"
+    );
+    assert!(before.remote_builds.is_empty());
+    history(
+        &target,
+        PublicV1HistoryCommand::InstallInboundBuildAuthority {
+            authority: Box::new(authority.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    source
+        .submit(PublicV1OperationCommand {
+            target: source.identity.clone(),
+            intent: intent.clone(),
+        })
+        .await;
+    let after = source.report().await;
+    assert_eq!(after.configuration.as_ref(), Some(&installed));
+    assert!(
+        after.engine_idle.is_none(),
+        "Build success cannot synthesize a sample"
+    );
+    let remote = after
+        .remote_builds
+        .iter()
+        .find(|remote| remote.operation_id == intent.operation_id)
+        .unwrap();
+    assert_eq!(remote.revision, intent.revision);
+    assert_eq!(
+        Some(PublicOperationProgram::Build(remote.build.clone())),
+        intent.program
+    );
+    assert_eq!(remote.state, PublicV1RemoteBuildState::Ready);
+    assert!(
+        !installed
+            .voting
+            .current
+            .members
+            .iter()
+            .any(|member| { member.identity == target.identity }),
+        "exact Build success is not voting admission"
+    );
+    let target_report = target.report().await;
+    assert_eq!(target_report.role, ReplicaRole::IdleSecondary);
+    assert_ne!(target_report.write_status, AccessStatus::Granted);
+    history(
+        &target,
+        PublicV1HistoryCommand::RevokeInboundBuildAuthority {
+            authority: Box::new(authority),
+        },
+    )
+    .await
+    .unwrap();
+    source.service.observation.store(0, Ordering::SeqCst);
+    assert_eq!(
+        source.report().await.engine_idle.unwrap().idle_replicas,
+        vec![target.identity.replica_id]
+    );
+    source.close().await;
+    target.close().await;
+}
+
+#[tokio::test]
 async fn custom_host_exact_binding_reporting_revoke_and_receiver_barrier() {
     let root = tempfile::tempdir().unwrap();
     let (mut source, target, authority, intent) = setup(root.path()).await;
@@ -862,12 +937,17 @@ async fn custom_host_exact_binding_reporting_revoke_and_receiver_barrier() {
             .is_err()
     );
     assert_eq!(
-        source.report().await.configuration.unwrap().idle_replicas,
+        source.report().await.engine_idle.unwrap().idle_replicas,
         vec![]
     );
-    for mode in 1..=4 {
+    for mode in 1..=5 {
         source.service.observation.store(mode, Ordering::SeqCst);
-        assert!(source.report().await.configuration.is_none(), "mode {mode}");
+        let report = source.report().await;
+        assert!(
+            report.configuration.is_some(),
+            "host install lost in mode {mode}"
+        );
+        assert!(report.engine_idle.is_none(), "mode {mode}");
     }
     source.service.observation.store(0, Ordering::SeqCst);
     history(
@@ -956,7 +1036,7 @@ async fn custom_host_exact_binding_reporting_revoke_and_receiver_barrier() {
             .is_err()
     );
     assert_eq!(
-        source.report().await.configuration.unwrap().idle_replicas,
+        source.report().await.engine_idle.unwrap().idle_replicas,
         vec![target.identity.replica_id]
     );
     assert!(
@@ -1070,7 +1150,7 @@ async fn custom_host_exact_binding_reporting_revoke_and_receiver_barrier() {
         source
             .report()
             .await
-            .configuration
+            .engine_idle
             .unwrap()
             .idle_replicas
             .is_empty()
@@ -1100,7 +1180,9 @@ async fn custom_host_late_observation_after_completed_terminal_is_discarded() {
         .forget();
     source.command(PublicOperationProgram::Close).await;
     source.service.observe_release.add_permits(1);
-    assert!(report.await.unwrap().configuration.is_none());
+    let report = report.await.unwrap();
+    assert!(report.engine_idle.is_none());
+    assert!(report.configuration.is_some());
     source.stop().await;
     target.close().await;
 }
@@ -1131,7 +1213,12 @@ async fn custom_host_nonoverlapping_torn_configuration_sample_is_discarded() {
         .await;
     source.single(Epoch::new(0, 2)).await;
     source.service.observe_release.add_permits(1);
-    assert!(report.await.unwrap().configuration.is_none());
+    let report = report.await.unwrap();
+    assert!(report.engine_idle.is_none());
+    assert_eq!(
+        report.configuration.unwrap().voting.current.epoch,
+        Epoch::new(0, 2)
+    );
     source.service.observe_hold.store(false, Ordering::SeqCst);
     assert_eq!(
         source

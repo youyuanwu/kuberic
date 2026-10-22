@@ -2437,6 +2437,12 @@ pub struct PublicV1AgentReport {
     /// This is control authority, not application durability or a serving grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<PublicV1InstalledConfiguration>,
+    /// Optional coherent engine membership query. None is unavailable, not observed empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_idle: Option<PublicV1EngineIdleObservation>,
+    /// Exact host Build bookkeeping, independent of engine membership and voting admission.
+    #[serde(default)]
+    pub remote_builds: Vec<PublicV1RemoteBuildObservation>,
     /// Running host control observers. Native work can outlive a cancelled observer.
     #[serde(default)]
     pub active_operations: Vec<PublicOperationIntent>,
@@ -2460,10 +2466,39 @@ pub struct PublicV1AgentReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicV1InstalledConfiguration {
     pub voting: PublicConfiguration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicV1EngineIdleObservation {
+    pub configuration: PublicConfiguration,
+    pub history: HistoryContext,
+    pub storage_incarnation: ReplicaStorageIncarnationContext,
+    pub process_session_id: ProcessSessionId,
+    pub replicator_creation_id: ReplicatorCreationId,
     pub idle_replicas: Vec<ReplicaId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicV1RemoteBuildState {
+    Accepted,
+    InBuild,
+    Ready,
+    InDrop,
+    Dropped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicV1RemoteBuildObservation {
+    pub operation_id: OperationId,
+    pub revision: u64,
+    pub build: PublicBuildInput,
+    pub state: PublicV1RemoteBuildState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2615,6 +2650,21 @@ impl PublicV1AgentReport {
             {
                 return Err("installed configuration differs from report history or identity");
             }
+        }
+        if let Some(observation) = &self.engine_idle {
+            let configuration = &observation.configuration;
+            if self
+                .configuration
+                .as_ref()
+                .map(|installed| &installed.voting)
+                != Some(configuration)
+                || observation.history != self.history
+                || observation.storage_incarnation != self.storage_incarnation
+                || observation.process_session_id != self.process_session_id
+                || observation.replicator_creation_id != self.replicator_creation_id
+            {
+                return Err("engine idle sample differs from current installed authority");
+            }
             let mut idle = std::collections::BTreeSet::new();
             if observation.idle_replicas.iter().any(|id| {
                 id.value() <= 0
@@ -2632,6 +2682,77 @@ impl PublicV1AgentReport {
                         .any(|member| member.identity.replica_id == *id)
             }) {
                 return Err("idle replica observation overlaps voting membership");
+            }
+        }
+        let mut builds = std::collections::BTreeSet::new();
+        for observation in &self.remote_builds {
+            let program = PublicOperationProgram::Build(observation.build.clone());
+            program.validate(
+                &PublicOperationClass::Build {
+                    target: observation.build.replica.replica_id,
+                },
+                &observation.operation_id,
+            )?;
+            program.validate_history(&self.history)?;
+            if observation.operation_id.is_empty()
+                || observation.operation_id != observation.build.attempt
+                || observation.revision == 0
+                || observation.build.history.as_ref() != Some(&self.history)
+                || observation.build.replica.replica_id == self.replica.replica_id
+                || !builds.insert(&observation.operation_id)
+            {
+                return Err("remote build differs from exact report authority");
+            }
+            let exact_completion = self.completed_operations.iter().find(|completion| {
+                completion.operation_id == observation.operation_id
+                    && completion.revision == observation.revision
+                    && completion.call_kind == PublicV1CallKind::Build
+                    && completion.input_digest == program.digest()
+                    && completion.process_session_id == self.process_session_id
+                    && completion.history == self.history
+                    && completion.storage_incarnation == self.storage_incarnation
+                    && completion.current_configuration_id
+                        == observation.build.current_configuration_id
+                    && completion.previous_configuration_id.is_none()
+                    && completion.catch_up_mode.is_none()
+                    && completion.catch_up_specific_quorum.is_none()
+                    && completion.replay_disposition == program.replay_disposition()
+            });
+            let exact_active = self.active_operations.iter().any(|intent| {
+                intent.operation_id == observation.operation_id
+                    && intent.revision == observation.revision
+                    && intent.program.as_ref() == Some(&program)
+            });
+            if self
+                .completed_operations
+                .iter()
+                .any(|completion| completion.operation_id == observation.operation_id)
+                && exact_completion.is_none()
+                || self
+                    .active_operations
+                    .iter()
+                    .any(|intent| intent.operation_id == observation.operation_id)
+                    && !exact_active
+            {
+                return Err("remote build conflicts with its exact operation evidence");
+            }
+            match observation.state {
+                PublicV1RemoteBuildState::Ready
+                    if !exact_completion.is_some_and(|completion| {
+                        completion.result == PublicV1OperationResult::Succeeded
+                    }) =>
+                {
+                    return Err("ready remote build lacks exact successful completion");
+                }
+                PublicV1RemoteBuildState::InBuild if !exact_active => {
+                    return Err("running remote build lacks exact active operation");
+                }
+                PublicV1RemoteBuildState::Accepted
+                    if exact_active || exact_completion.is_some() =>
+                {
+                    return Err("accepted remote build already has running or completed evidence");
+                }
+                _ => {}
             }
         }
         if self

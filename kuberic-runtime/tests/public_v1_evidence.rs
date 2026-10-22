@@ -266,7 +266,251 @@ async fn public_v1_evidence_report_is_structurally_public_only() {
             })
         );
     }
+    split_report_wire_cases(&mut report);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn split_report_wire_cases(
+    report: &mut kuberic_runtime::protocol::public_operations::PublicV1AgentReport,
+) {
+    use kuberic_runtime::protocol::public_operations::*;
+    use kuberic_runtime::protocol::types::{
+        ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId,
+    };
+    let epoch = Epoch::new(report.history.data_loss_number, 1);
+    let voting = PublicConfiguration {
+        current: ConfigurationDescriptor::new(
+            epoch,
+            report.replica.replica_id,
+            vec![ConfigurationMember {
+                identity: report.replica.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        ),
+        previous: None,
+        replicas: Vec::new(),
+    };
+    report.configuration = Some(PublicV1InstalledConfiguration {
+        voting: voting.clone(),
+    });
+    assert_eq!(
+        normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(report)).unwrap(),
+        *report
+    );
+    assert!(report.engine_idle.is_none());
+    report.engine_idle = Some(PublicV1EngineIdleObservation {
+        configuration: voting.clone(),
+        history: report.history.clone(),
+        storage_incarnation: report.storage_incarnation.clone(),
+        process_session_id: report.process_session_id.clone(),
+        replicator_creation_id: report.replicator_creation_id.clone(),
+        idle_replicas: Vec::new(),
+    });
+    assert_eq!(
+        normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(report)).unwrap(),
+        *report
+    );
+    for case in [
+        "configuration",
+        "history",
+        "storage",
+        "process",
+        "creation",
+        "voter",
+        "duplicate",
+        "negative",
+        "missing-install",
+    ] {
+        let mut invalid = report.clone();
+        let sample = invalid.engine_idle.as_mut().unwrap();
+        match case {
+            "configuration" => sample.configuration.current.epoch.configuration_number += 1,
+            "history" => sample.history.data_loss_number += 1,
+            "storage" => {
+                sample.storage_incarnation.storage_generation = StorageGeneration::new("other")
+            }
+            "process" => sample.process_session_id = ProcessSessionId::new("other"),
+            "creation" => {
+                sample.replicator_creation_id =
+                    kuberic_runtime::protocol::types::ReplicatorCreationId::new("other")
+            }
+            "voter" => sample.idle_replicas = vec![report.replica.replica_id],
+            "duplicate" => sample.idle_replicas = vec![ReplicaId::new(2), ReplicaId::new(2)],
+            "negative" => sample.idle_replicas = vec![ReplicaId::new(-1)],
+            _ => invalid.configuration = None,
+        }
+        assert!(invalid.validate().is_err(), "{case}");
+        assert!(
+            normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(&invalid))
+                .is_err(),
+            "{case}"
+        );
+    }
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        ..report.replica.clone()
+    };
+    let build = PublicBuildInput {
+        attempt: OperationId::new("wire-build"),
+        epoch,
+        current_configuration_id: Some(voting.current.configuration_id),
+        history: Some(report.history.clone()),
+        target_storage: storage(target.clone()),
+        replica: target,
+        process_session_id: ProcessSessionId::new("target-session"),
+        source_address: "http://source:7000".into(),
+        replication_address: "http://target:7000".into(),
+    };
+    let program = PublicOperationProgram::Build(build.clone());
+    let remote = PublicV1RemoteBuildObservation {
+        operation_id: build.attempt.clone(),
+        revision: 2,
+        build: build.clone(),
+        state: PublicV1RemoteBuildState::Accepted,
+    };
+    report.remote_builds = vec![remote];
+    // Presence in a real query need not mean Build completion.
+    report.engine_idle.as_mut().unwrap().idle_replicas = vec![ReplicaId::new(2)];
+    assert_eq!(
+        normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(report)).unwrap(),
+        *report
+    );
+    for case in [
+        "ready-without-success",
+        "running-without-operation",
+        "attempt",
+        "revision",
+        "history",
+        "storage",
+        "self",
+        "duplicate",
+    ] {
+        let mut invalid = report.clone();
+        let remote = &mut invalid.remote_builds[0];
+        match case {
+            "ready-without-success" => remote.state = PublicV1RemoteBuildState::Ready,
+            "running-without-operation" => remote.state = PublicV1RemoteBuildState::InBuild,
+            "attempt" => remote.operation_id = OperationId::new("other"),
+            "revision" => remote.revision = 0,
+            "history" => remote.build.history = None,
+            "storage" => remote.build.target_storage.replica = report.replica.clone(),
+            "self" => {
+                remote.build.replica = report.replica.clone();
+                remote.build.target_storage = report.storage_incarnation.clone();
+            }
+            _ => invalid.remote_builds.push(report.remote_builds[0].clone()),
+        }
+        assert!(invalid.validate().is_err(), "{case}");
+        assert!(
+            normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(&invalid))
+                .is_err(),
+            "{case}"
+        );
+    }
+    report.remote_builds[0].state = PublicV1RemoteBuildState::InBuild;
+    report.active_operations.push(PublicOperationIntent {
+        identity: report.identity.clone(),
+        operation_id: build.attempt.clone(),
+        revision: 2,
+        process_session_id: report.process_session_id.clone(),
+        class: PublicOperationClass::Build {
+            target: build.replica.replica_id,
+        },
+        input_digest: program.digest(),
+        replay_disposition: program.replay_disposition(),
+        lifecycle: None,
+        program: Some(program.clone()),
+    });
+    assert_eq!(
+        normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(report)).unwrap(),
+        *report
+    );
+    report.active_operations.clear();
+    report
+        .completed_operations
+        .push(PublicV1OperationCompletion {
+            operation_id: build.attempt,
+            revision: 2,
+            call_kind: PublicV1CallKind::Build,
+            process_session_id: report.process_session_id.clone(),
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            history: report.history.clone(),
+            storage_incarnation: report.storage_incarnation.clone(),
+            previous_configuration_id: None,
+            current_configuration_id: build.current_configuration_id,
+            catch_up_mode: None,
+            catch_up_specific_quorum: None,
+            result: PublicV1OperationResult::Succeeded,
+        });
+    for case in [
+        "failed",
+        "revision",
+        "target-session",
+        "configuration",
+        "source-storage",
+        "accepted",
+        "running",
+    ] {
+        let mut invalid = report.clone();
+        invalid.engine_idle = None;
+        invalid.remote_builds[0].state = PublicV1RemoteBuildState::Ready;
+        match case {
+            "failed" => {
+                invalid.completed_operations.last_mut().unwrap().result =
+                    PublicV1OperationResult::Failed("copy failed".into())
+            }
+            "revision" => invalid.remote_builds[0].revision += 1,
+            "target-session" => {
+                invalid.remote_builds[0].build.process_session_id =
+                    ProcessSessionId::new("changed-target")
+            }
+            "configuration" => {
+                invalid.remote_builds[0].build.current_configuration_id = Some(
+                    kuberic_runtime::protocol::types::ConfigurationId::new("changed-configuration"),
+                )
+            }
+            "source-storage" => {
+                invalid.storage_incarnation.storage_generation =
+                    StorageGeneration::new("changed-source")
+            }
+            "accepted" => invalid.remote_builds[0].state = PublicV1RemoteBuildState::Accepted,
+            _ => invalid.remote_builds[0].state = PublicV1RemoteBuildState::InBuild,
+        }
+        assert!(invalid.validate().is_err(), "{case}");
+        assert!(
+            normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(&invalid))
+                .is_err(),
+            "{case}"
+        );
+    }
+    for state in [
+        PublicV1RemoteBuildState::Ready,
+        PublicV1RemoteBuildState::InDrop,
+        PublicV1RemoteBuildState::Dropped,
+    ] {
+        report.remote_builds[0].state = state;
+        assert_eq!(
+            normalize_public_v1_agent_status_report(public_v1_agent_status_to_proto(report))
+                .unwrap(),
+            *report
+        );
+    }
+    for (field, json) in [
+        ("engine", "{}"),
+        ("remote", "{}"),
+        ("remote", r#"{"state":"Voting"}"#),
+    ] {
+        let mut invalid = public_v1_agent_status_to_proto(report);
+        let public = invalid.public_v1.as_mut().unwrap();
+        if field == "engine" {
+            public.engine_idle_json = Some(json.into());
+        } else {
+            public.remote_builds_json = vec![json.into()];
+        }
+        assert!(normalize_public_v1_agent_status_report(invalid).is_err());
+    }
 }
 
 #[test]

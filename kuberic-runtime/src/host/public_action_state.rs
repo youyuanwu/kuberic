@@ -149,6 +149,10 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
             incoming.previous.is_some()
                 && installed.as_ref().is_some_and(|current| {
                     current.previous.is_none() && current.current.epoch == incoming.current.epoch
+                        // Secondary installation is host transport authority,
+                        // not an achieved primary engine configuration stage.
+                        && current.current.primary_id == state.identity.local_identity.replica_id
+                        && incoming.current.primary_id == state.identity.local_identity.replica_id
                 })
         })
     {

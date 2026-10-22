@@ -1531,6 +1531,16 @@ pub struct TestCluster<F: ApplicationFactory> {
     nonce: uuid::Uuid,
     paused: Option<uuid::Uuid>,
 }
+
+/// Detached results of an exact persisted command dispatched by the production API.
+#[derive(Clone, Debug)]
+pub struct OperationDispatch {
+    pub evidence: OperationEvidence,
+    pub dispatch_result: std::result::Result<(), String>,
+    pub report: PublicV1AgentReport,
+    pub contained: bool,
+}
+
 impl<F: ApplicationFactory> TestCluster<F> {
     pub fn builder(factory: F) -> ClusterBuilder<F> {
         ClusterBuilder {
@@ -1983,7 +1993,7 @@ impl<F: ApplicationFactory> TestCluster<F> {
                 Kind::Service => {
                     Api::<k8s_openapi::api::core::v1::Service>::namespaced(
                         self.core.api.client(),
-                        &self.core.namespace,
+                        self.core.namespace.as_str(),
                     )
                     .delete(name, &params)
                     .await?;
@@ -2200,6 +2210,286 @@ impl<F: ApplicationFactory> TestCluster<F> {
         self.core.recreate_controller()?;
         Ok(())
     }
+
+    /// Read the actual target grant without creating or changing native authority.
+    pub async fn inbound_build_authority(
+        &mut self,
+        replica: &ReplicaRef,
+    ) -> super::Result<
+        Option<kuberic_runtime::protocol::public_operations::PublicInboundBuildAuthority>,
+    > {
+        self.check().await?;
+        if replica.cluster != self.nonce {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "replica belongs to another cluster",
+            ));
+        }
+        let handle = self
+            .core
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .get(replica.instance_id())
+            .and_then(|host| host.running.as_ref())
+            .map(RunningReplica::handle)
+            .ok_or_else(|| TestError::new(ErrorKind::InvalidReference, "host missing"))?;
+        if handle.process_session_id() != replica.session {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "replica process session changed",
+            ));
+        }
+        tokio::time::timeout_at(
+            self.core.deadline,
+            handle.public_v1_inbound_build_authority(),
+        )
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(anyhow::Error::from)
+        .map_err(Into::into)
+    }
+
+    /// Observe only this exact replica over the production control RPC.
+    /// Does not wait for unrelated replicas whose native copy may be held.
+    pub async fn report_replica(
+        &mut self,
+        replica: &ReplicaRef,
+    ) -> super::Result<PublicV1AgentReport> {
+        self.check().await?;
+        if replica.cluster != self.nonce {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "replica belongs to another cluster",
+            ));
+        }
+        let report = self.core.report_uid(replica.instance_id()).await?;
+        if self.reference(&report) != *replica {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "replica scope changed",
+            ));
+        }
+        Ok(report)
+    }
+
+    /// Persist a frozen terminal intent, then use production controller dispatch.
+    /// Ordinary topology reconciliation does not originate Close/Abort commands.
+    pub async fn dispatch_terminal(
+        &mut self,
+        replica: &ReplicaRef,
+        kind: kuberic_runtime::protocol::public_operations::PublicV1CallKind,
+    ) -> super::Result<OperationDispatch> {
+        use crate::cluster_api::{PublicV1OperationApi, PublicV1Scope};
+        use crate::evaluator::public_v1_evidence::{
+            PublicV1AcceptedTransitionIntent, PublicV1AcceptedTransitionStatus,
+            PublicV1EvidenceConsumer, PublicV1ResourceAuthority,
+        };
+        use kuberic_runtime::protocol::command::PublicV1OperationCommand;
+        use kuberic_runtime::protocol::public_operations::PublicV1CallKind;
+        use kuberic_runtime::protocol::types::{OperationId, ResourceUid};
+
+        self.driving()?;
+        self.check().await?;
+        let program = match kind {
+            PublicV1CallKind::Close => PublicOperationProgram::Close,
+            PublicV1CallKind::Abort => PublicOperationProgram::Abort,
+            _ => {
+                return Err(TestError::new(
+                    ErrorKind::InvalidConfiguration,
+                    "terminal dispatch requires Close or Abort",
+                ));
+            }
+        };
+        let report = self.validate(replica).await?;
+        self.core.cancel_controller_call();
+        let set = self.core.set().await?;
+        let authority = set
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_authority.as_ref())
+            .context("accepted authority missing")?
+            .authority()
+            .map_err(anyhow::Error::msg)?;
+        let pod: Pod = self
+            .core
+            .api
+            .snapshot(Kind::Pod)
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<Vec<Pod>, _>>()
+            .map_err(anyhow::Error::from)?
+            .into_iter()
+            .find(|pod| pod.uid().as_deref() == Some(replica.instance_id()))
+            .context("terminal target Pod missing")?;
+        let handle = self
+            .core
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .get(replica.instance_id())
+            .and_then(|host| host.running.as_ref())
+            .map(RunningReplica::handle)
+            .context("terminal target host missing")?;
+        let revision = handle
+            .public_v1_next_operation_revision()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let intent = PublicOperationIntent {
+            identity: report.identity,
+            operation_id: OperationId::new(format!("terminal-{}", uuid::Uuid::new_v4())),
+            revision,
+            process_session_id: report.process_session_id.clone(),
+            class: if kind == PublicV1CallKind::Close {
+                kuberic_runtime::protocol::public_operations::PublicOperationClass::Close
+            } else {
+                kuberic_runtime::protocol::public_operations::PublicOperationClass::Abort
+            },
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
+        };
+        let transition = PublicV1AcceptedTransitionStatus {
+            resource_version: set
+                .resource_version()
+                .context("set resource version missing")?,
+            evidence: authority.clone(),
+            intent: PublicV1AcceptedTransitionIntent {
+                consumer: PublicV1EvidenceConsumer::Removal,
+                operation_id: intent.operation_id.clone(),
+                revision,
+                call_kind: kind,
+                history: report.history,
+                source: PublicV1ResourceAuthority {
+                    storage_incarnation: report.storage_incarnation,
+                    resource_version: pod
+                        .resource_version()
+                        .context("Pod resource version missing")?,
+                },
+                target: None,
+                process_session_id: report.process_session_id,
+                input_digest: intent.input_digest.clone(),
+                replay_disposition: intent.replay_disposition,
+                previous_configuration_id: None,
+                current_configuration_id: None,
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+            },
+        };
+        let command = PublicV1OperationCommand {
+            target: replica.identity.clone(),
+            intent,
+        };
+        let api = KubeClusterApi::new(
+            self.core.api.client(),
+            Arc::new(GrpcAgentApi::new(pod::RPC_DEADLINE)),
+            "local-test-token",
+            self.core.namespace.as_str(),
+        )
+        .map_err(anyhow::Error::from)?;
+        let scope = PublicV1Scope {
+            namespace: self.core.namespace.clone(),
+            name: self.core.name.clone(),
+            resource_uid: ResourceUid::new(replica.resource_uid.as_str()),
+        };
+        tokio::time::timeout_at(
+            self.core.deadline,
+            api.begin_public_v1_operation(&scope, &authority, &transition, &command),
+        )
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(anyhow::Error::msg)?;
+        let evidence = OperationEvidence::new(self.core.set().await?);
+        self.redispatch_operation(&evidence).await
+    }
+
+    /// Redispatch only the same persisted program; never call an engine directly.
+    pub async fn redispatch_operation(
+        &mut self,
+        evidence: &OperationEvidence,
+    ) -> super::Result<OperationDispatch> {
+        use crate::cluster_api::{PublicV1OperationApi, PublicV1Scope};
+        use kuberic_runtime::protocol::command::ProtocolCommand;
+
+        self.driving()?;
+        self.check().await?;
+        self.core.cancel_controller_call();
+        let mut expected = evidence
+            .transition()
+            .transition()
+            .map_err(anyhow::Error::msg)?;
+        let command = evidence.operation().command().map_err(anyhow::Error::msg)?;
+        if evidence.set().uid() != self.core.set().await?.uid() {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "operation evidence is not for this cluster",
+            ));
+        }
+        let api = KubeClusterApi::new(
+            self.core.api.client(),
+            Arc::new(GrpcAgentApi::new(pod::RPC_DEADLINE)),
+            "local-test-token",
+            self.core.namespace.as_str(),
+        )
+        .map_err(anyhow::Error::from)?;
+        let scope = PublicV1Scope {
+            namespace: self.core.namespace.clone(),
+            name: self.core.name.clone(),
+            resource_uid: expected.intent.history.resource_uid.clone(),
+        };
+        let current = api
+            .observe_public_v1_operation(&scope)
+            .await
+            .map_err(anyhow::Error::msg)?
+            .context("persisted operation disappeared")?;
+        if current.intent != expected.intent || current.evidence != expected.evidence {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "persisted operation authority changed before exact redispatch",
+            ));
+        }
+        // Status persistence advances resourceVersion; retain frozen authority
+        // but use the same fresh CAS observation as the production reconciler.
+        expected.resource_version = current.resource_version;
+        let dispatch_result = tokio::time::timeout_at(
+            self.core.deadline,
+            api.dispatch_public_v1_operation(
+                &scope,
+                &expected,
+                &ProtocolCommand::PublicV1Operation(Box::new(command.clone())),
+            ),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+        let report = self
+            .core
+            .report_uid(command.target.instance_id.as_str())
+            .await?;
+        let handle = self
+            .core
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .get(command.target.instance_id.as_str())
+            .and_then(|host| host.running.as_ref())
+            .map(RunningReplica::handle)
+            .context("terminal host missing")?;
+        let contained = handle
+            .public_v1_operation_is_contained(&command.intent.operation_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(OperationDispatch {
+            evidence: evidence.clone(),
+            dispatch_result,
+            report,
+            contained,
+        })
+    }
+
     pub async fn recreate_controller_at(
         &mut self,
         barrier: Barrier,

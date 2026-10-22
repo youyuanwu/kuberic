@@ -434,6 +434,34 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn public_v1_inbound_build_authority(
+        &self,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        Ok(self
+            .store
+            .load_state()
+            .await?
+            .public_v1_operation_state
+            .and_then(|state| state.current_inbound_build_authority))
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn public_v1_operation_is_contained(
+        &self,
+        operation_id: &crate::protocol::types::OperationId,
+    ) -> Result<bool> {
+        Ok(self
+            .store
+            .load_state()
+            .await?
+            .public_v1_operation_state
+            .and_then(|state| state.operations.get(operation_id).cloned())
+            .is_some_and(|record| {
+                record.containment == super::state::PublicOperationContainment::Complete
+            }))
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn authorize_public_v1_session_renewal(
         &self,
         required: crate::protocol::public_operations::ProcessSessionRenewalRequired,

@@ -916,12 +916,8 @@ pub(crate) struct PublicV1ReportProjection {
     pub(crate) write_status: AccessStatus,
     pub(crate) progress: PublicProgress,
     pub(crate) progress_history: Option<crate::protocol::types::HistoryContext>,
-    pub(crate) native_idle_replicas: Option<Vec<crate::protocol::types::ReplicaId>>,
-    pub(crate) native_configuration: Option<(
-        crate::protocol::public_operations::PublicConfiguration,
-        crate::protocol::types::HistoryContext,
-        crate::protocol::types::ReplicaStorageIncarnationContext,
-    )>,
+    pub(crate) engine_idle:
+        Option<crate::protocol::public_operations::PublicV1EngineIdleObservation>,
     pub(crate) observation_alive: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
@@ -1250,55 +1246,65 @@ pub(crate) async fn public_v1_report(
         progress.current_progress = pending.clone();
         progress.catch_up_capability = pending;
     }
-    let configuration = configuration.filter(|configuration| {
-        if projection
-            .observation_alive
-            .as_ref()
-            .is_some_and(|alive| !alive() || preview.terminal)
-        {
-            return false;
-        }
-        projection.native_configuration.as_ref().is_none_or(
-            |(sample, sample_history, sample_storage)| {
-                sample == configuration
-                    && sample_history == &history
-                    && sample_storage == &storage_incarnation
-            },
-        )
-    });
-    let configuration =
-        configuration
-            .zip(projection.native_idle_replicas)
-            .and_then(|(voting, idle_replicas)| {
-                let distinct: std::collections::BTreeSet<_> = idle_replicas.iter().collect();
-                if distinct.len() != idle_replicas.len()
-                    || idle_replicas.iter().any(|id| {
-                        voting
-                            .current
-                            .members
-                            .iter()
-                            .chain(
-                                voting
-                                    .previous
-                                    .iter()
-                                    .flat_map(|previous| &previous.members),
-                            )
-                            .any(|member| member.identity.replica_id == *id)
-                    })
-                {
-                    tracing::debug!(
-                        "native voting/idle observations crossed a configuration transition"
-                    );
-                    None
-                } else {
-                    Some(
-                        crate::protocol::public_operations::PublicV1InstalledConfiguration {
-                            voting,
-                            idle_replicas,
-                        },
-                    )
-                }
+    let engine_idle = projection.engine_idle.filter(|sample| {
+        let distinct: std::collections::BTreeSet<_> = sample.idle_replicas.iter().collect();
+        let coherent = configuration.as_ref() == Some(&sample.configuration)
+            && sample.history == history
+            && sample.storage_incarnation == storage_incarnation
+            && sample.process_session_id == projection.process_session_id
+            && sample.replicator_creation_id == projection.replicator_creation_id
+            && !preview.terminal
+            && projection
+                .observation_alive
+                .as_ref()
+                .is_some_and(|alive| alive())
+            && distinct.len() == sample.idle_replicas.len()
+            && sample.idle_replicas.iter().all(|id| {
+                id.value() > 0
+                    && !sample
+                        .configuration
+                        .current
+                        .members
+                        .iter()
+                        .chain(
+                            sample
+                                .configuration
+                                .previous
+                                .iter()
+                                .flat_map(|previous| &previous.members),
+                        )
+                        .any(|member| member.identity.replica_id == *id)
             });
+        if !coherent {
+            tracing::debug!("discarding incoherent or late engine idle sample");
+        }
+        coherent
+    });
+    let remote_builds = preview
+        .remote_build_states(&projection.process_session_id)
+        .into_iter()
+        .map(|observation| {
+            let build = observation.build;
+            let input = preview
+                .operations
+                .get(&build.operation_id)
+                .and_then(|record| match record.intent.program.as_ref() {
+                    Some(PublicOperationProgram::Build(input)) => Some(input.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    HostError::Corrupt("remote build lacks its exact source program".into())
+                })?;
+            Ok(
+                crate::protocol::public_operations::PublicV1RemoteBuildObservation {
+                    operation_id: build.operation_id,
+                    revision: build.admission_revision,
+                    build: input,
+                    state: observation.state,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     let report = PublicV1AgentReport {
         identity: identity.clone(),
         resource_uid: state.identity.resource_uid,
@@ -1312,7 +1318,11 @@ pub(crate) async fn public_v1_report(
         history: history.clone(),
         storage_incarnation: storage_incarnation.clone(),
         progress,
-        configuration,
+        configuration: configuration.map(|voting| {
+            crate::protocol::public_operations::PublicV1InstalledConfiguration { voting }
+        }),
+        engine_idle,
+        remote_builds,
         active_operations: preview
             .operations
             .values()

@@ -1097,6 +1097,37 @@ fn renewal_endpoint_matches_intent(
         })
 }
 
+fn renewal_inbound_build_matches(
+    renewal: &PublicV1SessionRenewalStatus,
+    process: &ProcessSessionId,
+    creation: &crate::protocol::types::ReplicatorCreationId,
+    authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+) -> bool {
+    use crate::protocol::types::ReplicaRole;
+
+    let required = &renewal.required;
+    renewal.validate().is_ok()
+        && renewal.stage == PublicSessionRenewalStage::ConfigurationPending
+        && required.predecessor_contained
+        && required.predecessor.role == ReplicaRole::ActiveSecondary
+        && required.history == authority.history
+        && required.renewal_epoch == authority.attempt.epoch
+        && required.replacement.as_ref().is_some_and(|replacement| {
+            replacement.identity == authority.attempt.target
+                && replacement.storage_incarnation == authority.attempt.target_storage
+                && replacement.process_session_id == authority.attempt.target_session
+                && &replacement.process_session_id == process
+                && &replacement.replicator_creation_id == creation
+        })
+        && required.surviving_sessions.iter().any(|survivor| {
+            survivor.role == ReplicaRole::Primary
+                && survivor.identity.replica_id == required.fresh_configuration.primary_id
+                && survivor.identity == authority.attempt.source
+                && survivor.storage_incarnation == authority.attempt.source_storage
+                && survivor.process_session_id == authority.attempt.source_session
+        })
+}
+
 fn is_retained_replacement_open(
     renewal: &PublicV1SessionRenewalStatus,
     local: &ReplicaIdentity,
@@ -1305,6 +1336,43 @@ impl PartitionOperationRegistry {
             || self
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn build_authority_is_fenced(
+        &self,
+        state: &super::state::AgentState,
+        creation: &crate::protocol::types::ReplicatorCreationId,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> bool {
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return true;
+        }
+        if !self.is_fenced() {
+            return false;
+        }
+        // Renewal keeps application/operation admission closed until configuration
+        // installation, but the exact replacement must receive its copy first.
+        !state
+            .public_v1_operation_state
+            .as_ref()
+            .is_some_and(|preview| {
+                !preview.terminal
+                    && state.identity.local_identity == authority.attempt.target
+                    && preview.history.as_ref() == Some(&authority.history)
+                    && preview.storage_incarnation.as_ref()
+                        == Some(&authority.attempt.target_storage)
+                    && preview.session_renewal.as_ref().is_some_and(|renewal| {
+                        renewal_inbound_build_matches(
+                            renewal,
+                            &self.process_session_id,
+                            creation,
+                            authority,
+                        )
+                    })
+            })
     }
 
     async fn prepare_fenced_session_renewal_configuration(
@@ -2176,6 +2244,196 @@ mod tests {
             lifecycle: None,
             program: None,
         }
+    }
+
+    #[test]
+    fn renewal_inbound_copy_requires_exact_replayed_replacement_and_surviving_primary() {
+        use crate::protocol::public_operations::{
+            PublicBuildAttemptReference, PublicInboundBuildAuthority,
+        };
+
+        let resource = ResourceUid::new("resource-renewal-inbound");
+        let generation = PublicProtocolGeneration::new(1);
+        let initialization = derive_history_initialization_id(&resource, generation);
+        let history = derive_bootstrap_history(&resource, generation, &initialization);
+        let endpoint = |id, role| {
+            let identity = ReplicaIdentity {
+                replica_id: ReplicaId::new(id),
+                instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+                agent_generation: AgentGeneration::new(format!("generation-{id}")),
+            };
+            ProcessSessionEndpoint {
+                storage_incarnation: ReplicaStorageIncarnationContext {
+                    replica: identity.clone(),
+                    storage: ReplicaStorageIdentity::Persistent {
+                        pod_uid: PodUid::new(format!("pod-{id}")),
+                        pvc_uid: PvcUid::new(format!("pvc-{id}")),
+                    },
+                    storage_generation: StorageGeneration::new(format!("storage-{id}")),
+                },
+                identity,
+                process_session_id: ProcessSessionId::new(format!("session-{id}")),
+                replicator_creation_id: ReplicatorCreationId::new(format!("creation-{id}")),
+                role,
+            }
+        };
+        let source = endpoint(1, ReplicaRole::Primary);
+        let predecessor = endpoint(2, ReplicaRole::ActiveSecondary);
+        let replacement = ProcessSessionEndpoint {
+            process_session_id: ProcessSessionId::new("replacement-session"),
+            replicator_creation_id: ReplicatorCreationId::new("replacement-creation"),
+            role: ReplicaRole::None,
+            ..predecessor.clone()
+        };
+        let epoch = Epoch::new(0, 2);
+        let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+            operation_id: OperationId::new("renewal-inbound"),
+            reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
+            resource_uid: resource.clone(),
+            history: history.clone(),
+            previous_epoch: Epoch::new(0, 1),
+            renewal_epoch: epoch,
+            predecessor: predecessor.clone(),
+            replacement: Some(replacement.clone()),
+            surviving_sessions: vec![source.clone()],
+            fresh_configuration: ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![
+                    ConfigurationMember {
+                        identity: source.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: replacement.identity.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                    },
+                ],
+                2,
+            ),
+            predecessor_contained: true,
+            data_loss: None,
+        })
+        .unwrap();
+        let role_pending = required
+            .close_access()
+            .unwrap()
+            .freeze_surviving_set()
+            .unwrap()
+            .begin_epoch_barriers()
+            .unwrap()
+            .record_epoch_updated(&source, epoch)
+            .unwrap()
+            .finish_epoch_barriers()
+            .unwrap();
+        let pending = role_pending
+            .replay_replacement_role(
+                &replacement.process_session_id,
+                epoch,
+                ReplicaRole::ActiveSecondary,
+            )
+            .unwrap();
+        let authority = PublicInboundBuildAuthority {
+            operation_id: OperationId::new("renewal-inbound-copy"),
+            operation_revision: 10,
+            attempt: PublicBuildAttemptReference {
+                resource_uid: resource,
+                epoch,
+                build_id: OperationId::new("renewal-inbound-copy"),
+                source: source.identity.clone(),
+                source_storage: source.storage_incarnation.clone(),
+                source_session: source.process_session_id.clone(),
+                target: replacement.identity.clone(),
+                target_storage: replacement.storage_incarnation.clone(),
+                target_session: replacement.process_session_id.clone(),
+            },
+            history,
+            current_configuration_id: ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )
+            .configuration_id,
+            source_address: "http://127.0.0.1:7001".into(),
+            target_address: "http://127.0.0.1:7002".into(),
+        };
+        authority.validate().unwrap();
+        let matches = |renewal: &PublicV1SessionRenewalStatus,
+                       authority: &PublicInboundBuildAuthority| {
+            renewal_inbound_build_matches(
+                renewal,
+                &replacement.process_session_id,
+                &replacement.replicator_creation_id,
+                authority,
+            )
+        };
+        assert!(matches(&pending, &authority));
+        assert!(!matches(&required, &authority));
+        assert!(!matches(&role_pending, &authority));
+        assert!(!matches(
+            &pending
+                .install_fresh_configuration(&pending.required.fresh_configuration)
+                .unwrap(),
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &predecessor.process_session_id,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &replacement.process_session_id,
+            &predecessor.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &source.process_session_id,
+            &source.replicator_creation_id,
+            &authority,
+        ));
+        let changes: [fn(&mut PublicInboundBuildAuthority); 7] = [
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_session = ProcessSessionId::new("historical-target");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_session = ProcessSessionId::new("historical-source");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_storage.storage_generation =
+                    StorageGeneration::new("other-target-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_storage.storage_generation =
+                    StorageGeneration::new("other-source-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 1);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 3);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.history.data_loss_number += 1;
+            },
+        ];
+        for change in changes {
+            let mut changed = authority.clone();
+            change(&mut changed);
+            assert!(!matches(&pending, &changed), "{changed:?}");
+        }
+        let mut changed = pending.clone();
+        changed.required.predecessor_contained = false;
+        assert!(!matches(&changed, &authority));
+        let mut changed = pending;
+        changed.replayed_role = None;
+        assert!(!matches(&changed, &authority));
     }
 
     #[test]

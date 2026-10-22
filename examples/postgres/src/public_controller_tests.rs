@@ -202,6 +202,283 @@ async fn public_v1_postgres_controller_delayed_build_invalidation() {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[serial_test::serial]
+async fn public_v1_postgres_controller_terminal_success() {
+    controller_terminal(0).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_controller_terminal_child_close_failure() {
+    controller_terminal(1).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_controller_terminal_lost_native_join() {
+    controller_terminal(2).await;
+}
+
+async fn controller_terminal(fault: u8) {
+    use kuberic_runtime::protocol::public_operations::PublicV1OperationResult;
+    let factory = Factory::default();
+    let mut cluster = TestCluster::builder(factory.clone())
+        .initial_replicas(1)
+        .scenario_timeout(Duration::from_secs(120))
+        .start()
+        .await
+        .unwrap();
+    let mut probes = Vec::new();
+    let mut retained = None;
+    let result: TestResult = async {
+        cluster.settle_members(1).await?;
+        if fault == 2 {
+            cluster.scale_to(2).await?;
+        }
+        let topology = cluster
+            .settle_members(if fault == 2 { 2 } else { 1 })
+            .await?;
+        for replica in topology.members() {
+            let service = cluster.service(replica).await?;
+            probes.push(ProcessProbe::postgres(service.instance().data_dir()));
+        }
+        let primary = topology.primary().clone();
+        let source = cluster.service(&primary).await?;
+        retained = Some(source.clone());
+        let (sql, connection) = cluster.probe(application_connection(&source)).await?;
+        sql.batch_execute(
+            "CREATE TABLE hosted_terminal_tail(id integer primary key);
+             INSERT INTO hosted_terminal_tail SELECT value FROM generate_series(1,64) AS value",
+        )
+        .await
+        .map_err(error)?;
+        let acknowledged = source
+            .native_driver()
+            .current_progress()
+            .await
+            .map_err(error)?;
+        if fault == 1 {
+            // Negative setup affects the actual application child Close only.
+            source.fail_next_close();
+        } else if fault == 2 {
+            // Negative native setup loses an actual controller-created peer gateway.
+            // The common public terminal operation must consume its real failed join.
+            let state = source.native_driver().public_owner().state.lock().await;
+            check(!state.grants.is_empty(), "no actual native gateway to lose")?;
+            state.grants[0].gateway.fail_task();
+        }
+        let terminal = cluster
+            .dispatch_terminal(&primary, PublicV1CallKind::Close)
+            .await?;
+        let command = terminal
+            .evidence
+            .operation()
+            .command()
+            .map_err(|source| TestError::new(ErrorKind::Application, source))?;
+        check(
+            terminal.dispatch_result.is_ok() == (fault == 0),
+            "hosted terminal RPC hid failure or rejected successful join",
+        )?;
+        check(
+            terminal.contained == (fault != 2),
+            "failed/lost native join fabricated positive containment",
+        )?;
+        let completion = terminal
+            .report
+            .completed_operations
+            .iter()
+            .find(|completion| completion.operation_id == command.intent.operation_id);
+        if fault != 2 {
+            let completion = completion.ok_or_else(|| {
+                TestError::new(ErrorKind::Application, "hosted terminal completion missing")
+            })?;
+            check(
+                completion.call_kind == PublicV1CallKind::Close
+                    && completion.revision == command.intent.revision
+                    && completion.input_digest == command.intent.input_digest
+                    && completion.process_session_id == command.intent.process_session_id
+                    && completion.storage_incarnation == *primary.storage_incarnation(),
+                "public terminal completion lost its frozen authority",
+            )?;
+            check(
+                if fault == 0 {
+                    completion.result == PublicV1OperationResult::Succeeded
+                } else {
+                    matches!(&completion.result, PublicV1OperationResult::Failed(detail)
+                    if detail.contains("injected PostgreSQL application Close failure"))
+                },
+                "child Close failure became public success after successful cleanup",
+            )?;
+            let durable = source
+                .native_driver()
+                .durable
+                .revalidate()
+                .await
+                .map_err(error)?;
+            check(
+                durable.policy_certified_lsn >= acknowledged
+                    && durable.postgres_stopped
+                    && durable.external_access_closed,
+                "successful native join omitted acknowledged SQL tail/fences",
+            )?;
+            check(
+                source.native_driver().public_closed(),
+                "successful native join not observed",
+            )?;
+        } else {
+            check(
+                completion.is_none_or(|completion| {
+                    completion.result != PublicV1OperationResult::Succeeded
+                }) && !source.native_driver().public_closed(),
+                "lost actual native task certified terminal success",
+            )?;
+        }
+        check(
+            terminal.report.read_status != AccessStatus::Granted
+                && terminal.report.write_status != AccessStatus::Granted
+                && terminal.report.engine_idle.is_none(),
+            "terminal report retained serving authority or a late native sample",
+        )?;
+        check(
+            sql.query_one("SELECT 1", &[]).await.is_err()
+                && source.instance().connect_application().await.is_err(),
+            "public terminal left old/new ordinary SQL access open",
+        )?;
+        drop(sql);
+        connection.await.map_err(error)?;
+        cluster.recreate_controller().await?;
+        let retry = cluster.redispatch_operation(&terminal.evidence).await?;
+        check(
+            retry.dispatch_result == terminal.dispatch_result
+                && retry.contained == terminal.contained
+                && retry.report.completed_operations == terminal.report.completed_operations
+                && retry.report.read_status != AccessStatus::Granted
+                && retry.report.write_status != AccessStatus::Granted,
+            "terminal exact replay changed failure/containment or restored authority",
+        )?;
+        Ok(())
+    }
+    .await;
+    let passed = result.is_ok();
+    let finished = cluster.finish(result).await;
+    assert!(passed, "hosted terminal fault={fault}: {finished:#?}");
+    if fault == 2 {
+        assert!(
+            finished.is_err(),
+            "lost actual native join hidden by final teardown"
+        );
+        assert!(!retained.unwrap().native_driver().public_closed());
+    } else {
+        finished.unwrap_or_else(|failure| panic!("hosted terminal fault={fault}: {failure:#}"));
+    }
+    for probe in probes {
+        probe.assert_gone().await;
+    }
+    assert!(factory.0.lock().unwrap().is_empty());
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn public_v1_postgres_controller_undeclared_role_failure_is_not_retried() {
+    let factory = Factory::default();
+    let mut cluster = TestCluster::builder(factory.clone())
+        .initial_replicas(1)
+        .scenario_timeout(Duration::from_secs(120))
+        .start()
+        .await
+        .unwrap();
+    let mut probes = Vec::new();
+    let result: TestResult = async {
+        let singleton = cluster.settle_members(1).await?;
+        let source = cluster.service(singleton.primary()).await?;
+        probes.push(ProcessProbe::postgres(source.instance().data_dir()));
+        cluster.scale_to(2).await?;
+        let intent = cluster
+            .pause_at(Barrier::intent(PublicV1CallKind::Role))
+            .await?;
+        let command = intent
+            .evidence()
+            .operation()
+            .command()
+            .map_err(|source| TestError::new(ErrorKind::Application, source))?;
+        check(
+            matches!(
+                command.intent.program,
+                Some(PublicOperationProgram::Role {
+                    role: ReplicaRole::IdleSecondary,
+                    ..
+                })
+            ),
+            "new idle Role was not the actual controller intent",
+        )?;
+        let observed = cluster.observe().await?;
+        let target = observed
+            .replicas()
+            .find(|replica| replica.identity() == &command.target)
+            .cloned()
+            .ok_or_else(|| TestError::new(ErrorKind::Application, "Role target missing"))?;
+        let service = cluster.service(&target).await?;
+        check(
+            !service
+                .instance()
+                .data_dir()
+                .join("postmaster.pid")
+                .exists(),
+            "idle preparation unexpectedly started PostgreSQL before Build",
+        )?;
+        let before = service.role_callback_count();
+        // Negative setup only; execution and exact replay use production dispatch.
+        service.fail_next_role();
+        let evidence = cluster.resume(intent).await?;
+        let first = cluster.redispatch_operation(&evidence).await?;
+        check(
+            service.role_callback_count() == before + 1,
+            "actual failed callback was not entered once",
+        )?;
+        check(
+            first.dispatch_result.as_ref().is_err_and(|detail| {
+                detail.contains("injected undeclared PostgreSQL application Role failure")
+            }) && !first.contained
+                && first.report.retry_pending_operations.is_empty()
+                && first.report.read_status != AccessStatus::Granted
+                && first.report.write_status != AccessStatus::Granted,
+            "undeclared failure became retryable or serving",
+        )?;
+        check(
+            !first
+                .report
+                .completed_operations
+                .iter()
+                .any(|completion| completion.operation_id == command.intent.operation_id),
+            "undeclared application failure fabricated completed containment",
+        )?;
+        cluster.recreate_controller().await?;
+        let second = cluster.redispatch_operation(&evidence).await?;
+        check(
+            second.dispatch_result == first.dispatch_result
+                && second.report.completed_operations == first.report.completed_operations
+                && second.report.retry_pending_operations.is_empty()
+                && service.role_callback_count() == before + 1,
+            "undeclared callback was re-entered by exact production retry",
+        )?;
+        check(
+            service.instance().connect_application().await.is_err(),
+            "failed Role left ordinary SQL access open",
+        )?;
+        Ok(())
+    }
+    .await;
+    cluster
+        .finish(result)
+        .await
+        .unwrap_or_else(|failure| panic!("undeclared Role: {failure:#}"));
+    for probe in probes {
+        probe.assert_gone().await;
+    }
+    assert!(factory.0.lock().unwrap().is_empty());
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
 async fn public_v1_postgres_controller_pre_effect_invalidation() {
     for source_cut in [true, false] {
         let factory = Factory::default();
@@ -1068,6 +1345,15 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         target.native_driver().public_owner().host.get().unwrap().validate_build_authority(live).await.map_err(error)?;
         effects.release.notify_one();
         cluster.drive(async { gate.entered.notified().await; Ok::<(),TestError>(()) }).await?;
+        let source_in_progress=cluster.report_replica(&primary).await?;
+        check(source_in_progress.remote_builds.iter().any(|remote|remote.operation_id==frozen.intent.operation_id
+            && remote.revision==frozen.intent.revision && remote.build==*input
+            && remote.state==kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::InBuild),
+            "actual source Build was not reported as exact InBuild")?;
+        check(source_in_progress.engine_idle.as_ref().is_some_and(|sample|sample.idle_replicas.is_empty()),
+            "PostgreSQL native query fabricated built-idle before completed native publication")?;
+        check(cluster.inbound_build_authority(&target_ref).await?.as_ref()==Some(live),
+            "actual running PostgreSQL target grant differs from exact controller authority")?;
         // The same retained native owner now performed real backup/replay.
         check(target.native_driver().public_owner().effect_starts.load(std::sync::atomic::Ordering::SeqCst)==1,
             "overlapping exact native requests duplicated mutation ownership")?;
@@ -1214,8 +1500,14 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             && report.write_status!=AccessStatus::Granted,"Build must remain idle/nonserving")?;
         check(target.instance().connect_application().await.is_err(),"ordinary SQL was open on built idle")?;
         let source_report=observed.report(&primary).ok_or_else(||TestError::new(ErrorKind::Application,"source report missing"))?;
+        check(source_report.remote_builds.iter().any(|remote|remote.operation_id==command.intent.operation_id
+            && remote.revision==command.intent.revision && remote.build==*input
+            && remote.state==kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::Ready),
+            "completed PostgreSQL copy lacks exact host Ready evidence")?;
+        check(cluster.inbound_build_authority(&target_ref).await?.as_ref()==Some(authority),
+            "source completion alone invented controller acceptance/revocation")?;
         let old=source_report.configuration.as_ref().ok_or_else(||TestError::new(ErrorKind::Application,"installed source predecessor missing"))?.voting.current.clone();
-        check(old.members.len()==1 && source_report.configuration.as_ref().unwrap().idle_replicas==vec![target_ref.identity().replica_id],
+        check(old.members.len()==1 && source_report.engine_idle.as_ref().is_some_and(|sample| sample.idle_replicas==vec![target_ref.identity().replica_id]),
             "source must truthfully observe a built idle outside voting")?;
         let target_snapshot=target.native_driver().observer.snapshot().await.map_err(error)?;
         let evidence=target_snapshot.evidence.as_ref().ok_or_else(||TestError::new(ErrorKind::Application,"native target WAL evidence absent"))?;
@@ -1233,6 +1525,8 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             "source Epoch erased truthful predecessor membership")?;
         cluster.resume(epoch).await?;
         let joint=cluster.pause_at(Barrier::Operation { stage:BarrierStage::Intent,kind:Some(PublicV1CallKind::CatchUp),participant:Some(primary.clone()) }).await?;
+        check(cluster.inbound_build_authority(&target_ref).await?.is_none(),
+            "controller acceptance retained target ingress before voting admission")?;
         let command=joint.evidence().operation().command().map_err(|source|TestError::new(ErrorKind::Application,source.to_string()))?;
         let Some(PublicOperationProgram::CatchUp {configuration:joint_configuration,..})=command.intent.program.as_ref() else {
             return Err(TestError::new(ErrorKind::Application,"controller skipped joint catch-up"));
@@ -1293,7 +1587,8 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             check(report.history==authority.history && report.storage_incarnation==*reference.storage_incarnation()
                 && report.process_session_id==*reference.process_session_id()
                 && report.configuration.as_ref().is_some_and(|configuration| configuration.voting.current.members.len()==2
-                    && configuration.voting.previous.is_none() && configuration.idle_replicas.is_empty()),
+                    && configuration.voting.previous.is_none())
+                && report.engine_idle.as_ref().is_some_and(|sample| sample.idle_replicas.is_empty()),
                 "admission report scope/membership is not exact")?;
         }
         check(target.instance().connect_application().await.is_err(),"stable secondary replay was mistaken for ordinary read access")?;

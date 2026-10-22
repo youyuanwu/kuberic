@@ -35,6 +35,12 @@ pub struct PgService {
     driver: OnceLock<Arc<PgReplicator>>,
     cancellation: CancellationToken,
     coordination_token: String,
+    #[cfg(test)]
+    fail_close: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_role: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    role_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl PgService {
@@ -50,6 +56,12 @@ impl PgService {
             driver: OnceLock::new(),
             cancellation: CancellationToken::new(),
             coordination_token: String::new(),
+            #[cfg(test)]
+            fail_close: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_role: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            role_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -73,6 +85,23 @@ impl PgService {
 
     pub fn instance(&self) -> &Arc<PgInstanceManager> {
         &self.instance
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_role(&self) {
+        self.fail_role
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn role_callback_count(&self) -> usize {
+        self.role_calls.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_close(&self) {
+        self.fail_close
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn with_coordination_token(mut self, token: String) -> Self {
@@ -209,6 +238,19 @@ impl StatefulServiceReplica for PgService {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        #[cfg(test)]
+        {
+            self.role_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if self
+                .fail_role
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(application_error(
+                    "injected undeclared PostgreSQL application Role failure",
+                ));
+            }
+        }
         if let Some(driver) = self.driver.get()
             && driver.is_public_v1()
         {
@@ -221,6 +263,15 @@ impl StatefulServiceReplica for PgService {
     }
 
     async fn close(&self) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_close
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(application_error(
+                "injected PostgreSQL application Close failure",
+            ));
+        }
         let result = match self.driver.get() {
             Some(driver) => driver.close().await,
             None => Ok(()),

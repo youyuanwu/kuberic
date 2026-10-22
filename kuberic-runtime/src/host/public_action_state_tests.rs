@@ -110,6 +110,95 @@ async fn completed_current_rejects_joint_regression_but_allows_fresh_current_syn
 }
 
 #[tokio::test]
+async fn secondary_host_installation_does_not_claim_primary_configuration_stage() {
+    use crate::protocol::public_operations::PublicReplicaDescriptor;
+    let fixture = Fixture::new().await;
+    let local = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .identity
+        .local_identity;
+    let primary = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("other-primary"),
+        agent_generation: AgentGeneration::new("other-agent"),
+    };
+    let mut configuration = PublicConfiguration {
+        current: ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            primary.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: local,
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: primary.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            2,
+        ),
+        previous: None,
+        replicas: vec![PublicReplicaDescriptor {
+            identity: primary.clone(),
+            role: ReplicaRole::Primary,
+            build_id: OperationId::default(),
+            replication_address: "http://127.0.0.1:2".into(),
+            process_session_id: ProcessSessionId::new("other-session"),
+            storage_incarnation: Some(ReplicaStorageIncarnationContext {
+                replica: primary,
+                storage: ReplicaStorageIdentity::Persistent {
+                    pod_uid: PodUid::new("other-pod"),
+                    pvc_uid: PvcUid::new("other-pvc"),
+                },
+                storage_generation: StorageGeneration::new("other-storage"),
+            }),
+            current_progress: 0,
+            catch_up_capability: 0,
+            is_up: true,
+            is_ready: true,
+            must_catchup: false,
+        }],
+    };
+    let first = fixture
+        .launch(
+            PublicOperationProgram::Configuration(configuration.clone()),
+            1,
+        )
+        .await;
+    assert_eq!(
+        completed(&first).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    configuration.previous = Some(configuration.current.clone());
+    let joint = fixture
+        .launch(
+            PublicOperationProgram::Configuration(configuration.clone()),
+            2,
+        )
+        .await;
+    assert_eq!(
+        completed(&joint).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    assert!(
+        fixture.probe.events.lock().unwrap().is_empty(),
+        "secondary host installation must not fabricate a primary engine callback"
+    );
+    assert_eq!(
+        installed_configuration_for_state(
+            &fixture.store.load_state().await.unwrap(),
+            &ProcessSessionId::new("session")
+        ),
+        Some(configuration)
+    );
+    fixture.registry.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn admitted_recovery_preserves_exact_paired_roles_and_epoch_not_predecessor_authority() {
     use crate::protocol::public_operations::{
         DataLossAttempt, DataLossAuthorization, DataLossReplay, ProcessAttemptContext,

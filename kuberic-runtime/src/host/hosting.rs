@@ -951,6 +951,7 @@ impl PodRuntime {
     ) -> Result<crate::host::public_lifecycle::PublicV1ReportProjection> {
         use crate::protocol::public_operations::{PublicProgress, PublicProgressRole};
 
+        let replicator_creation_id = self.replacement_replicator_creation_id()?;
         let bridge = self.host.replacement_fault_bridge.lock().await.clone();
         let observation_state = match bridge {
             Some(bridge) => Some(
@@ -979,8 +980,7 @@ impl PodRuntime {
                 crate::protocol::public_operations::ProgressQueryResult::NotReady,
             ),
         };
-        let mut native_configuration = None;
-        let mut native_idle_replicas = None;
+        let mut engine_idle = None;
         let mut observation_alive = None;
         if let Some(runtime) = self
             .host
@@ -991,12 +991,21 @@ impl PodRuntime {
             {
                 let alive_runtime = runtime.clone();
                 let host = Arc::downgrade(&self.host);
+                let sample_creation = replicator_creation_id.clone();
+                let sample_session = process_session_id.clone();
                 observation_alive = Some(Arc::new(move || {
                     alive_runtime.build_authority_open()
                         && host.upgrade().is_some_and(|host| {
                             !host.closed.load(Ordering::Acquire)
                                 && !host.aborted.load(Ordering::Acquire)
                                 && !host.replacement_fault_fenced.load(Ordering::Acquire)
+                                && host.registered.get().is_some_and(|registered| {
+                                    registered.identity.to_public_id() == sample_creation
+                                })
+                                && host
+                                    .replica_session
+                                    .get()
+                                    .is_some_and(|(_, process)| process == &sample_session)
                         })
                 }) as Arc<dyn Fn() -> bool + Send + Sync>);
                 if let Some(observed) = observation_state.as_ref()
@@ -1011,12 +1020,19 @@ impl PodRuntime {
                 {
                     match runtime.configuration_idle_replicas(&configuration).await {
                         Ok(ids) => {
-                            native_idle_replicas = Some(ids);
-                            native_configuration =
-                                Some((configuration, history.clone(), storage.clone()));
+                            engine_idle = Some(
+                                crate::protocol::public_operations::PublicV1EngineIdleObservation {
+                                    configuration,
+                                    history: history.clone(),
+                                    storage_incarnation: storage.clone(),
+                                    process_session_id: process_session_id.clone(),
+                                    replicator_creation_id: replicator_creation_id.clone(),
+                                    idle_replicas: ids,
+                                },
+                            );
                         }
                         Err(error) => {
-                            tracing::debug!(%error, "engine installed observations unavailable")
+                            tracing::debug!(%error, "engine idle observation unavailable")
                         }
                     }
                 }
@@ -1028,7 +1044,6 @@ impl PodRuntime {
             .host
             .selected_status()
             .unwrap_or((state.projection.read_status, state.projection.write_status));
-        let replicator_creation_id = self.replacement_replicator_creation_id()?;
         Ok(crate::host::public_lifecycle::PublicV1ReportProjection {
             catch_up_specific_quorum: self
                 .host
@@ -1055,8 +1070,7 @@ impl PodRuntime {
             progress_history: observation_state
                 .and_then(|state| state.public_v1_operation_state)
                 .and_then(|preview| preview.history),
-            native_idle_replicas,
-            native_configuration,
+            engine_idle,
             observation_alive,
         })
     }
@@ -1414,7 +1428,11 @@ impl PartitionAccessView for HostAccessView {
             }
         }
         if !host.creation_live(creation)
-            || bridge.registry.is_fenced()
+            || bridge.registry.build_authority_is_fenced(
+                &state,
+                &creation.to_public_id(),
+                authority,
+            )
             || state.identity.local_identity != host.identity
         {
             return Err(RuntimeError::AuthorityNotAdmitted);

@@ -170,6 +170,129 @@ async fn declared_application_role_retry_keeps_prefix_and_immutable_earlier_atte
 }
 
 #[tokio::test]
+async fn host_install_survives_unavailable_and_invalid_optional_idle_projection() {
+    use crate::protocol::public_operations::{
+        ProgressQueryResult, PublicProgressRole, PublicV1EngineIdleObservation,
+    };
+    let fixture = Fixture::new().await;
+    let configuration = configuration(&fixture).await;
+    let installed = fixture
+        .launch(
+            PublicOperationProgram::Configuration(configuration.clone()),
+            1,
+        )
+        .await;
+    assert_eq!(
+        completed(&installed).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    let preview = fixture
+        .store
+        .load_state()
+        .await
+        .unwrap()
+        .public_v1_operation_state
+        .unwrap();
+    let sample = PublicV1EngineIdleObservation {
+        configuration: configuration.clone(),
+        history: preview.history.clone().unwrap(),
+        storage_incarnation: preview.storage_incarnation.clone().unwrap(),
+        process_session_id: ProcessSessionId::new("session"),
+        replicator_creation_id: ReplicatorCreationId::new("creation"),
+        idle_replicas: Vec::new(),
+    };
+    for case in [
+        "valid",
+        "unavailable",
+        "configuration",
+        "history",
+        "storage",
+        "process",
+        "creation",
+        "closed",
+        "unbound",
+        "duplicate",
+        "voter",
+        "invalid-id",
+    ] {
+        let mut engine_idle = Some(sample.clone());
+        match case {
+            "unavailable" => engine_idle = None,
+            "configuration" => {
+                engine_idle
+                    .as_mut()
+                    .unwrap()
+                    .configuration
+                    .current
+                    .epoch
+                    .configuration_number += 1
+            }
+            "history" => engine_idle.as_mut().unwrap().history.data_loss_number += 1,
+            "storage" => {
+                engine_idle
+                    .as_mut()
+                    .unwrap()
+                    .storage_incarnation
+                    .storage_generation = StorageGeneration::new("other")
+            }
+            "process" => {
+                engine_idle.as_mut().unwrap().process_session_id = ProcessSessionId::new("other")
+            }
+            "creation" => {
+                engine_idle.as_mut().unwrap().replicator_creation_id =
+                    ReplicatorCreationId::new("other")
+            }
+            "duplicate" => {
+                engine_idle.as_mut().unwrap().idle_replicas =
+                    vec![ReplicaId::new(2), ReplicaId::new(2)]
+            }
+            "voter" => engine_idle.as_mut().unwrap().idle_replicas = vec![ReplicaId::new(1)],
+            "invalid-id" => engine_idle.as_mut().unwrap().idle_replicas = vec![ReplicaId::new(0)],
+            _ => {}
+        }
+        let live = case != "closed";
+        let report = public_v1_report(
+            fixture.store.as_ref(),
+            &preview.identity,
+            PublicV1ReportProjection {
+                catch_up_specific_quorum: None,
+                process_session_id: sample.process_session_id.clone(),
+                replicator_creation_id: sample.replicator_creation_id.clone(),
+                report_sequence: 1,
+                role: ReplicaRole::None,
+                read_status: AccessStatus::ReconfigurationPending,
+                write_status: AccessStatus::ReconfigurationPending,
+                progress: PublicProgress {
+                    role: PublicProgressRole::Recovery,
+                    current_progress: ProgressQueryResult::NotReady,
+                    catch_up_capability: ProgressQueryResult::NotReady,
+                },
+                progress_history: preview.history.clone(),
+                engine_idle,
+                observation_alive: if case == "unbound" {
+                    None
+                } else {
+                    Some(Arc::new(move || live))
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report
+                .configuration
+                .as_ref()
+                .map(|installed| &installed.voting),
+            Some(&configuration),
+            "{case}"
+        );
+        assert_eq!(report.engine_idle.is_some(), case == "valid", "{case}");
+        assert!(report.remote_builds.is_empty());
+    }
+    fixture.registry.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn retry_pending_report_is_separate_exact_and_round_trips_without_completion() {
     use crate::control::convert::{
         normalize_public_v1_agent_status_report, public_v1_agent_status_to_proto,
@@ -213,8 +336,7 @@ async fn retry_pending_report_is_separate_exact_and_round_trips_without_completi
                 catch_up_capability: ProgressQueryResult::NotReady,
             },
             progress_history: preview.history.clone(),
-            native_idle_replicas: None,
-            native_configuration: None,
+            engine_idle: None,
             observation_alive: None,
         },
     )

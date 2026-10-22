@@ -1205,6 +1205,9 @@ fn fresh_unknown_history(replica: &PublicV1TopologyReplica) -> bool {
     report.has_current_open_endpoint()
         && report.role == ReplicaRole::None
         && report.configuration.is_none()
+        && report.engine_idle.is_none()
+        && report.remote_builds.is_empty()
+        && report.retry_pending_operations.is_empty()
         && report.data_loss_recovery.is_none()
         && report.active_operations.is_empty()
         && report.progress.current()
@@ -1563,8 +1566,18 @@ pub(crate) fn native_configuration_step(
         .map(|observation| &observation.voting);
     let installed =
         native_public_configuration(&source.report.replica, replicas, desired, None, known)?;
+    // Renewal may have finalized a retained voter set at this epoch before
+    // copying the replacement. Adding its now-built peer is a fresh current-set
+    // synchronization (native UpdateReplicas analogue), not reopening PC/CC.
+    let synchronize_current = known.is_some_and(|known| {
+        known.previous.is_none()
+            && known.current.epoch == desired.epoch
+            && !same_bindings(known, &installed)
+    });
     let previous = known
-        .filter(|known| known.current != *desired || !same_bindings(known, &installed))
+        .filter(|known| {
+            !synchronize_current && (known.current != *desired || !same_bindings(known, &installed))
+        })
         .map(|known| &known.current);
     let previous = match known {
         Some(known) if known.current == *desired && known.previous.is_some() => {
@@ -1635,7 +1648,14 @@ pub(crate) fn native_configuration_step(
     if !known.is_some_and(|known| same_bindings(known, &installed)) {
         return Ok(Some((
             source.report.replica.clone(),
-            PublicOperationProgram::Configuration(installed),
+            if synchronize_current {
+                PublicOperationProgram::CatchUp {
+                    configuration: installed,
+                    mode: PublicCatchUpMode::WriteQuorum,
+                }
+            } else {
+                PublicOperationProgram::Configuration(installed)
+            },
         )));
     }
     Ok(None)
@@ -1711,10 +1731,27 @@ pub(crate) fn native_cold_copy_step(
     if installed.previous.is_some() {
         return native_configuration_step(replicas, &installed.current);
     }
-    if observation
-        .idle_replicas
-        .contains(&target.report.replica.replica_id)
-    {
+    // Exact retained uncertainty requires exact retirement even without a diagnostic.
+    // An optional native idle query may only infer an otherwise unowned idle slot.
+    if let Some(remote) = source.report.remote_builds.iter().find(|remote| {
+        remote.build.replica.replica_id == target.report.replica.replica_id
+            && matches!(
+                remote.state,
+                kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::Accepted
+                    | kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::InBuild
+                    | kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::InDrop
+            )
+    }) {
+        return Ok(Some((
+            source.report.replica.clone(),
+            PublicOperationProgram::Remove(remote.build.clone()),
+        )));
+    }
+    if source.report.engine_idle.as_ref().is_some_and(|sample| {
+        sample
+            .idle_replicas
+            .contains(&target.report.replica.replica_id)
+    }) {
         return Ok(Some((
             source.report.replica.clone(),
             PublicOperationProgram::RetireIdleReplica {
@@ -1813,6 +1850,22 @@ fn operation_revision(
     kind: &str,
 ) -> Result<u64, String> {
     let digest = program.digest();
+    if let Some(pending) = replica
+        .report
+        .retry_pending_operations
+        .iter()
+        .find(|pending| pending.intent.operation_id == *operation_id)
+    {
+        if pending.intent.identity != accepted.identity
+            || replica.report.history != accepted.history
+            || pending.intent.process_session_id != replica.report.process_session_id
+            || pending.intent.input_digest != digest
+            || pending.intent.program.as_ref() != Some(program)
+        {
+            return Err("retry-pending operation differs from exact topology input".into());
+        }
+        return Ok(pending.intent.revision);
+    }
     if let Some(completion) = replica
         .report
         .completed_operations
@@ -1834,6 +1887,27 @@ fn operation_revision(
         .completed_operations
         .iter()
         .map(|completion| completion.revision)
+        .chain(
+            replica
+                .report
+                .retry_pending_operations
+                .iter()
+                .map(|pending| pending.intent.revision),
+        )
+        .chain(
+            replica
+                .report
+                .active_operations
+                .iter()
+                .map(|intent| intent.revision),
+        )
+        .chain(
+            replica
+                .report
+                .remote_builds
+                .iter()
+                .map(|build| build.revision),
+        )
         .chain(
             accepted
                 .completed_operations
@@ -1913,6 +1987,7 @@ fn configuration_ids(
 
 #[cfg(test)]
 mod tests {
+    include!("public_v1_topology_sync_tests.rs");
     use super::*;
     use kuberic_runtime::protocol::public_operations::{
         PublicProgress, PublicProgressRole, PublicV1AcceptedOperationCompletion,
@@ -1937,6 +2012,8 @@ mod tests {
         };
         let mut replica = PublicV1TopologyReplica {
             report: PublicV1AgentReport {
+                engine_idle: None,
+                remote_builds: Vec::new(),
                 retry_pending_operations: Vec::new(),
                 active_operations: Vec::new(),
                 configuration: None,
@@ -2181,7 +2258,6 @@ mod tests {
                 previous: None,
                 replicas: vec![],
             },
-            idle_replicas: vec![],
         });
         bad.push(changed);
         let mut changed = other.clone();
@@ -2730,6 +2806,231 @@ mod tests {
         );
     }
 
+    #[test]
+    fn topology_pending_retry_retains_revision_instead_of_inventing_completion() {
+        use kuberic_runtime::protocol::public_operations::PublicV1RetryPendingOperation;
+        let mut source = replica(1, ReplicaRole::Primary);
+        let authority = accepted(&source);
+        let program = PublicOperationProgram::Epoch {
+            epoch: Epoch::new(0, 2),
+        };
+        let intent = PublicOperationIntent {
+            identity: authority.identity.clone(),
+            operation_id: OperationId::new("pending-epoch"),
+            revision: 7,
+            process_session_id: source.report.process_session_id.clone(),
+            class: PublicOperationClass::Authority,
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program.clone()),
+        };
+        source
+            .report
+            .retry_pending_operations
+            .push(PublicV1RetryPendingOperation {
+                intent: intent.clone(),
+                attempt: 1,
+                failure: "declared quiescent epoch failure".into(),
+            });
+        source.report.validate().unwrap();
+        let (_, retry) = begin_operation(
+            &authority,
+            &source,
+            program.clone(),
+            intent.operation_id.clone(),
+            "pending-retry",
+        )
+        .unwrap();
+        assert_eq!(retry.intent, intent);
+        assert_eq!(
+            operation_revision(
+                &authority,
+                &source,
+                &OperationId::new("new-operation"),
+                &program,
+                "new",
+            )
+            .unwrap(),
+            8
+        );
+        assert!(
+            operation_revision(
+                &authority,
+                &source,
+                &intent.operation_id,
+                &PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 3)
+                },
+                "changed",
+            )
+            .is_err()
+        );
+        assert!(
+            source
+                .report
+                .completed_operations
+                .iter()
+                .all(|completed| { completed.operation_id != intent.operation_id })
+        );
+    }
+
+    #[test]
+    fn generic_clean_formation_does_not_require_engine_idle_diagnostic() {
+        let mut replicas = vec![replica(1, ReplicaRole::None)];
+        let mut authority = accepted(&replicas[0]);
+        let mut current = None;
+        let mut routed = None;
+        let mut stable = false;
+        for _ in 0..24 {
+            assert!(replicas[0].report.engine_idle.is_none());
+            assert!(replicas[0].report.remote_builds.is_empty());
+            match plan_public_v1_topology(
+                &authority,
+                current.as_ref(),
+                &replicas,
+                1,
+                None,
+                routed,
+                "generic-formation",
+            )
+            .unwrap()
+            {
+                PublicV1TopologyPlan::Begin { command, .. } => {
+                    accept_command(&mut authority, &mut replicas, &command);
+                }
+                PublicV1TopologyPlan::PersistTopology { next, .. } => current = Some(*next),
+                PublicV1TopologyPlan::RoutePrimary { primary } => routed = Some(primary.replica_id),
+                PublicV1TopologyPlan::Stable => {
+                    stable = true;
+                    break;
+                }
+                PublicV1TopologyPlan::Wait => panic!("optional diagnostic blocked clean formation"),
+            }
+        }
+        assert!(stable, "generic singleton did not form");
+        assert_eq!(current.unwrap().members.len(), 1);
+        assert!(replicas[0].report.configuration.is_some());
+        assert!(
+            replicas[0].report.engine_idle.is_none(),
+            "host installation is not an empty query"
+        );
+    }
+
+    #[test]
+    fn cold_copy_separates_optional_idle_inference_from_exact_retirement() {
+        use kuberic_runtime::protocol::public_operations::{
+            PublicV1EngineIdleObservation, PublicV1InstalledConfiguration,
+            PublicV1RemoteBuildObservation, PublicV1RemoteBuildState,
+        };
+        let mut replicas = vec![
+            replica(1, ReplicaRole::Primary),
+            replica(2, ReplicaRole::IdleSecondary),
+        ];
+        let installed = desired_configuration(None, &replicas[..1], ReplicaId::new(1), 0).unwrap();
+        let voting = native_public_configuration(
+            &replicas[0].report.replica,
+            &replicas,
+            &installed,
+            None,
+            None,
+        )
+        .unwrap();
+        replicas[0].report.configuration = Some(PublicV1InstalledConfiguration {
+            voting: voting.clone(),
+        });
+        let step = |replicas: &[PublicV1TopologyReplica]| {
+            native_cold_copy_step(replicas, &replicas[0], &replicas[1], installed.epoch).unwrap()
+        };
+        assert!(step(&replicas).is_none());
+        assert!(replicas[0].report.engine_idle.is_none());
+        replicas[0].report.engine_idle = Some(PublicV1EngineIdleObservation {
+            configuration: voting,
+            history: replicas[0].report.history.clone(),
+            storage_incarnation: replicas[0].report.storage_incarnation.clone(),
+            process_session_id: replicas[0].report.process_session_id.clone(),
+            replicator_creation_id: replicas[0].report.replicator_creation_id.clone(),
+            idle_replicas: Vec::new(),
+        });
+        assert!(step(&replicas).is_none());
+        replicas[0]
+            .report
+            .engine_idle
+            .as_mut()
+            .unwrap()
+            .idle_replicas
+            .push(ReplicaId::new(2));
+        assert!(
+            matches!(step(&replicas), Some((_, PublicOperationProgram::RetireIdleReplica { replica_id })) if replica_id == ReplicaId::new(2))
+        );
+        let build = PublicBuildInput {
+            attempt: OperationId::new("uncertain-copy"),
+            epoch: installed.epoch,
+            current_configuration_id: Some(installed.configuration_id),
+            replica: replicas[1].report.replica.clone(),
+            target_storage: replicas[1].report.storage_incarnation.clone(),
+            process_session_id: replicas[1].report.process_session_id.clone(),
+            source_address: replicas[0].replication_address.clone(),
+            replication_address: replicas[1].replication_address.clone(),
+            history: Some(replicas[0].report.history.clone()),
+        };
+        replicas[0]
+            .report
+            .remote_builds
+            .push(PublicV1RemoteBuildObservation {
+                operation_id: build.attempt.clone(),
+                revision: 2,
+                build: build.clone(),
+                state: PublicV1RemoteBuildState::InDrop,
+            });
+        for diagnostic in [true, false] {
+            if !diagnostic {
+                replicas[0].report.engine_idle = None;
+            }
+
+            replicas[0].report.validate().unwrap();
+            assert_eq!(
+                step(&replicas),
+                Some((
+                    replicas[0].report.replica.clone(),
+                    PublicOperationProgram::Remove(build.clone())
+                )),
+                "known exact uncertainty must not become unowned idle inference"
+            );
+        }
+        replicas[0].report.remote_builds[0].state = PublicV1RemoteBuildState::Dropped;
+        assert!(step(&replicas).is_none());
+        assert!(
+            replicas[0].report.engine_idle.is_none(),
+            "exact retirement did not perform a query"
+        );
+        replicas[0].report.remote_builds[0].state = PublicV1RemoteBuildState::Ready;
+        let program = PublicOperationProgram::Build(build.clone());
+        let report = &mut replicas[0].report;
+        report
+            .completed_operations
+            .push(PublicV1OperationCompletion {
+                operation_id: build.attempt.clone(),
+                revision: 2,
+                call_kind: PublicV1CallKind::Build,
+                process_session_id: report.process_session_id.clone(),
+                input_digest: program.digest(),
+                replay_disposition: program.replay_disposition(),
+                history: report.history.clone(),
+                storage_incarnation: report.storage_incarnation.clone(),
+                previous_configuration_id: None,
+                current_configuration_id: build.current_configuration_id.clone(),
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+                result: PublicV1OperationResult::Succeeded,
+            });
+        report.validate().unwrap();
+        assert!(
+            step(&replicas).is_none(),
+            "historical Build success is not native idle membership"
+        );
+    }
+
     fn accept_command(
         accepted: &mut PublicV1AcceptedStatus,
         replicas: &mut [PublicV1TopologyReplica],
@@ -2773,7 +3074,6 @@ mod tests {
                 report.report.configuration = Some(
                     kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration {
                         voting: configuration.clone(),
-                        idle_replicas: Vec::new(),
                     },
                 );
                 report.report.read_status = if report.report.role == ReplicaRole::Primary {
@@ -2804,7 +3104,6 @@ mod tests {
                 report.report.configuration = Some(
                     kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration {
                         voting: configuration.clone(),
-                        idle_replicas: Vec::new(),
                     },
                 );
                 report.report.read_status = AccessStatus::Granted;

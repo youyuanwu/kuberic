@@ -4479,7 +4479,10 @@ async fn native_remove_cancels_session_without_late_install_and_close_drains_ret
     let installed = report.configuration.as_ref().unwrap();
     assert_eq!(installed.voting.current, single);
     assert!(
-        !installed
+        !report
+            .engine_idle
+            .as_ref()
+            .unwrap()
             .idle_replicas
             .contains(&target.identity.replica_id)
     );
@@ -4540,7 +4543,7 @@ async fn native_remove_cancels_session_without_late_install_and_close_drains_ret
     }));
     assert!(
         !report
-            .configuration
+            .engine_idle
             .as_ref()
             .unwrap()
             .idle_replicas

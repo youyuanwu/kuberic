@@ -258,14 +258,7 @@ pub(crate) struct PublicV1OperationState {
     pub(crate) terminal: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicRemoteBuildState {
-    Accepted,
-    InBuild,
-    Ready,
-    InDrop,
-    Dropped,
-}
+pub(crate) use crate::protocol::public_operations::PublicV1RemoteBuildState as PublicRemoteBuildState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublicRemoteBuildObservation {
@@ -274,13 +267,6 @@ pub(crate) struct PublicRemoteBuildObservation {
 }
 
 impl PublicV1OperationState {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "host remote-state projection for report integration"
-        )
-    )]
     pub(crate) fn remote_build_states(
         &self,
         session: &crate::protocol::types::ProcessSessionId,

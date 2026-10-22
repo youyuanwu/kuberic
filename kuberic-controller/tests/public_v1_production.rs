@@ -73,6 +73,8 @@ fn report_for(observation: &RawObservation) -> PublicV1AgentReport {
         agent_generation: derive_agent_generation(&initialization_id),
     };
     let report = PublicV1AgentReport {
+        engine_idle: None,
+        remote_builds: Vec::new(),
         retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
