@@ -7,7 +7,7 @@ It is experimental and intended for development and CI. Images are not
 published and no production activation procedure is provided.
 This page describes **CURRENT** behavior. The
 [controller/local-agent/host redesign](engine-neutral-hosting.md#controller-to-host-messages-and-action-selection)
-and [R1–R5 runtime roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+and [M1–M3 runtime roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
 are **NOT IMPLEMENTED**; no Kubernetes resource/control behavior changes here.
 
 ## Architecture

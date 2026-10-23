@@ -479,10 +479,15 @@ fallback is not removed by this redesign.
 ### Migration and unresolved proof risks
 
 The [single project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
-orders new dispatch, built-in and real independent PG migration, recovery,
-removal and maintenance-only upgrade. Its acceptance gates must prove effect
-linearization, source retirement/target quarantine, Close-after-Abort settlement,
-data-preserving format transition and no stale Ready reuse. These are unresolved
+orders M1 host/controller replacement, M2 built-in and real independent PG
+integration, and M3 recovery/failure qualification. Superseded paths are removed
+alongside their replacements, not retained for a later compatibility cutover.
+The target supports fresh deployments only: no old-state import, upgrade or
+downgrade path, no mixed-version mode and no automatic data/PGDATA reset.
+Incompatible metadata and commands reject before mutation; matching-format
+restart still recovers existing durable state. Its acceptance gates must prove
+effect linearization, source retirement/target quarantine, Close-after-Abort settlement,
+same-format crash recovery and no stale Ready reuse. These are unresolved
 **implementation risks**, not permission to leave target owners unspecified or
 claims that new code exists. Current selectors in [testing](testing.md#hosting-redesign-baselines-and-future-acceptance)
 are baselines, not proof of the proposal.

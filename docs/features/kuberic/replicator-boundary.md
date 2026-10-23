@@ -2,7 +2,7 @@
 
 **CURRENT integration contract.** The
 [SF-shaped ordinary-engine target](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
-and [runtime migration roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+and [runtime replacement roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
 are **PROPOSED / NOT IMPLEMENTED**. Do not remove the current companion from a
 controller-integrated engine based on a documentation-only redesign.
 

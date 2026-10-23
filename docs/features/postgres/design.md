@@ -2,7 +2,7 @@
 
 **CURRENT implementation.** The
 [ordinary-engine host target](../kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
-and [R3 PostgreSQL migration](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+and [M2 PostgreSQL integration](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
 are **PROPOSED / NOT IMPLEMENTED**. This design/docs delivery changes no
 PostgreSQL runtime, on-disk format or qualification result.
 
@@ -418,13 +418,15 @@ Shared regressions, partition validation and guard commands are in the
 
 ## Limitations and Future Work
 
-- Hosting migration R3 removes the companion and controller-attempt grant
-  coupling only after R1 production routing and R2 reference-contract coverage.
+- Hosting integration M2 removes the companion and controller-attempt grant
+  coupling through M1 production routing, alongside built-in engine qualification.
   PG then owns authenticated engine Active/Retired transfer sessions, target
   quarantine and ordinary Close-after-Abort joins; backup/WAL/lineage/replay,
   SQL fences, slot/process ownership and metadata remain PG responsibilities.
-  Production controller recovery/upgrade qualification follows in R4/R5, not
-  from current formation tests. See the [single roadmap](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented).
+  M3 qualifies same-format recovery and failures, not old-state upgrades.
+  The target supports fresh deployments only and never automatically resets
+  existing PGDATA; current formation tests do not qualify the replacement.
+  See the [single roadmap](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented).
 - Images, distribution and deployment assets remain future work. No PostgreSQL
   Kubernetes/container dependency, manifest or live test is part of this port.
 - Physical-slot lifecycle is implemented, but WAL-retention limits

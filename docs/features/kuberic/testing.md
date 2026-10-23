@@ -92,7 +92,7 @@ explicit decision, not routine smoke.
 ## Hosting redesign baselines and future acceptance
 
 The [target boundary](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
-and [R1–R5 roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+and [M1–M3 roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
 are **NOT IMPLEMENTED**. Commands below select **existing baseline** evidence
 at `b37009f8af7a7b2ed91f58f4889ed74e06013861`; they were source-inspected, not
 run for this design/docs delivery. A passing current grant/coordinator test
@@ -108,21 +108,21 @@ suite as a docs check.
 
 | Future gate | Existing source-inspected baseline | Missing redesign acceptance (not invented test names) |
 |---|---|---|
-| R1 host authority/operation retention | [optional diagnostics/remote projection:173–294,394–527](../../../kuberic-runtime/src/host/public_lifecycle_retry_tests.rs#L173-L527); [lost host observer:106–266](../../../kuberic-runtime/src/host/service_cancellation_tests.rs#L106-L266) | Ordinary-only generic bundle without companion; compatible/incompatible action table; scope withdrawal/Abort→Close barrier and missing diagnostics; new production routing |
-| R2 engine ingress/lifetime | [carrier/Remove:4407–4611](../../../kuberic-runtime/tests/public_v1_recovery.rs#L4407-L4611); [held provider vs Close/join:351–418](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs#L351-L418) | Engine Active/Retired sessions without grants; delayed first handshake, lost cancel while Primary remains live, scope/effect race, real target quarantine/join and no late successor install |
-| R2 public context and controller Build | [workspace provider/contract crate](../../../kuberic-public-v1-tests/Cargo.toml), [actual V1 journeys](../../../kuberic-level-tests/src/in_process/journeys.rs) | Same semantics through new production goal/PrepareIdle/Build route; separate voting/access, no controller-attempt carrier fields |
-| R3 real independent PG | [production formation/retained transfer:1257–1570](../../../examples/postgres/src/public_controller_tests.rs#L1257-L1570); [hosted terminal cases:205–378](../../../examples/postgres/src/public_controller_tests.rs#L205-L378) | Ordinary-only factory; native session retirement, lost target cancel/PG helper quarantine, Close-after-Abort settlement, native replay/lineage/SQL fences through new route |
-| R4 restart/recovery | [current session/ambiguity reopen:733–835,1476–1586](../../../kuberic-runtime/tests/public_v1_session_renewal.rs#L733-L1586) | Two-ended Ready revalidation after target reopen/lost reply; source/target/controller selection/effect/receipt crashes, acknowledged-prefix/PC/CC/access proof |
-| R5 removal/upgrade | Existing [source/API/package commands](#engine-neutral-hosting), schema-rejection selection below | Property coverage moved before API deletion; incompatible new formats reject; maintained data import; pre-serving rollback and unsafe post-acknowledgement rollback rejection |
+| M1 host authority/operation retention | [optional diagnostics/remote projection:173–294,394–527](../../../kuberic-runtime/src/host/public_lifecycle_retry_tests.rs#L173-L527); [lost host observer:106–266](../../../kuberic-runtime/src/host/service_cancellation_tests.rs#L106-L266) | Ordinary-only generic bundle without companion; compatible/incompatible action table; scope withdrawal/Abort→Close barrier and missing diagnostics; new production routing |
+| M2 engine ingress/lifetime | [carrier/Remove:4407–4611](../../../kuberic-runtime/tests/public_v1_recovery.rs#L4407-L4611); [held provider vs Close/join:351–418](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs#L351-L418) | Engine Active/Retired sessions without grants; delayed first handshake, lost cancel while Primary remains live, scope/effect race, real target quarantine/join and no late successor install |
+| M2 public context and controller Build | [workspace provider/contract crate](../../../kuberic-public-v1-tests/Cargo.toml), [actual V1 journeys](../../../kuberic-level-tests/src/in_process/journeys.rs) | Same semantics through new production goal/PrepareIdle/Build route; separate voting/access, no controller-attempt carrier fields |
+| M2 real independent PG | [production formation/retained transfer:1257–1570](../../../examples/postgres/src/public_controller_tests.rs#L1257-L1570); [hosted terminal cases:205–378](../../../examples/postgres/src/public_controller_tests.rs#L205-L378) | Ordinary-only factory; native session retirement, lost target cancel/PG helper quarantine, Close-after-Abort settlement, native replay/lineage/SQL fences through new route |
+| M3 same-format restart/recovery | [current session/ambiguity reopen:733–835,1476–1586](../../../kuberic-runtime/tests/public_v1_session_renewal.rs#L733-L1586); [hot rollback-journal recovery:1730–1758](../../../kuberic-runtime/tests/public_v1_session_renewal.rs#L1730-L1758) | Two-ended Ready revalidation after target reopen/lost reply; source/target/controller selection/effect/receipt crashes, acknowledged-prefix/PC/CC/access proof; recover matching-format state without resetting it |
+| M3 clean deployment and removal | Existing [source/API/package commands](#engine-neutral-hosting), schema-rejection selection below | Replacement property coverage before each API deletion; no superseded production path remains; incompatible stores/commands/CRD intents reject before mutation; no old-state import, upgrade/downgrade or automatic data/PGDATA reset |
 
 Focused current selectors:
 
 ```bash
-# Host facts and response-independent execution (R1 baseline):
+# Host facts and response-independent execution (M1 baseline):
 cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
   -E 'test(/host_install_survives_unavailable_and_invalid_optional_idle_projection/) or test(/remote_build_projection_separates_admission_running_success_and_retirement/) or test(/cancelled_configuration_request_does_not_strand_durable_completion_behind_access_fence/)'
 
-# Built-in carrier/Remove and held provider lifetime (R2 baseline):
+# Built-in carrier/Remove and held provider lifetime (M2 baseline):
 cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
   -E 'test(=production_carrier_rejects_crossed_process_storage_history_epoch_and_endpoint) or test(=native_remove_cancels_session_without_late_install_and_close_drains_retained_provider) or test(/close_finishes_before_held_build_provider_but_join_and_cancelled_build_stay_rooted/)'
 
@@ -137,17 +137,17 @@ Do not use a removed `scripts/fixtures/classic-v1-provider` path as a current
 command; pinned historical links keep original provenance.
 
 ```bash
-# Actual independent PG controller formation/invalidation (R3 baseline):
+# Actual independent PG controller formation/invalidation (M2 baseline):
 cargo nextest run -p postgres-replicated --all-features --profile postgres \
   -E 'test(=adapter::public_v1::tests::controller::public_v1_postgres_controller_formation) or test(=adapter::public_v1::tests::controller::public_v1_postgres_controller_delayed_build_invalidation) or test(=adapter::public_v1::tests::controller::public_v1_postgres_controller_pre_effect_invalidation)'
 
-# Actual PG terminal outcome versus real native join (R3 baseline):
+# Actual PG terminal outcome versus real native join (M2 baseline):
 cargo nextest run -p postgres-replicated --all-features --profile postgres \
   -E 'test(=adapter::public_v1::tests::controller::public_v1_postgres_controller_terminal_success) or test(=adapter::public_v1::tests::controller::public_v1_postgres_controller_terminal_child_close_failure) or test(=adapter::public_v1::tests::controller::public_v1_postgres_controller_terminal_lost_native_join)'
 
-# Current restart ambiguity and prior-schema rejection (R4/R5 baseline):
+# Current same-format recovery, restart ambiguity and prior-schema rejection (M3 baseline):
 cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
-  -E 'binary(=public_v1_session_renewal) and (test(=public_v1_replacement_schema_build_ambiguity_requires_retirement) or test(=public_v1_replacement_schema_failed_build_containment_survives_reopen) or test(=public_v1_replacement_schema_rejects_prior_preview_stores))'
+  -E 'binary(=public_v1_session_renewal) and (test(=public_v1_replacement_schema_build_ambiguity_requires_retirement) or test(=public_v1_replacement_schema_failed_build_containment_survives_reopen) or test(=public_v1_replacement_schema_recovers_hot_rollback_journal) or test(=public_v1_replacement_schema_rejects_prior_preview_stores))'
 ```
 
 Current common-coordinator negatives remain useful property inventories:
