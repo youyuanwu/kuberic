@@ -1,4 +1,4 @@
-//! Independently compiled persisted provider and service. This crate deliberately
+//! Public V1 provider fixtures and service. This crate deliberately
 //! uses no runtime testing, engine storage, receipts, or additional provider hook.
 
 use std::io::Write;

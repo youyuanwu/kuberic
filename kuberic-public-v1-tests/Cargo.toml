@@ -1,0 +1,23 @@
+[package]
+name = "kuberic-public-v1-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Public V1 runtime qualification and provider fixtures"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+futures.workspace = true
+kuberic-runtime = { workspace = true, features = ["host"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tonic.workspace = true

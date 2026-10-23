@@ -3,10 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use external_classic_v1_provider::{
+use futures::FutureExt;
+use kuberic_public_v1_tests::{
     CopyContextObservations, CopyStateObservation, ExternalService, PersistedSnapshot,
 };
-use futures::FutureExt;
 use kuberic_runtime::control::{convert, proto};
 use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,

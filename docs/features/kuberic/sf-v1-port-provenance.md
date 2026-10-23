@@ -263,10 +263,16 @@ inspection is not native executable/differential validation.
 | Selected Rust ancestry / destination | Actual evidence and boundary |
 |---|---|
 | [Existing external provider][public-context-provider] and [public host/Build harness][public-context-harness] | Opt-in advertised/expected context and callback observations reuse the checked snapshot, service commit, install-before-ACK and retained task owners. Expected bytes validate the actual incoming stream; they never supply it. The default constructor still emits/requires no items. No production runtime logic or protected interface changed. |
-| [Shared standalone scenario][public-context], imported by the [workspace wrapper][public-context-wrapper] | Authenticated public authority/Build through the default factory; distinguishable target/source bytes, middle empty item and actual EOF; zero source-context acquisition. Genuine singleton-source commits copy meaningful application values into fresh idle-target storage, with matched successful Build/Ready and successful public Close/host waits/provider drains. Target bootstrap includes itself but it stays outside source voters with serving reads denied. |
-| [Provider callback controls][public-context-controls], [KSF-05 registration][public-context-ksf] and [standalone CI step][public-context-ci] | Actual local controls reject wrong-origin, missing/changed/reordered/surplus items and stream errors; matching prefixes wait for EOF, and default empty policy rejects even an empty data item. KSF mapping/partition guards and exact ordinary wrapper execution passed. CI runs the complete standalone fixture suite with nextest's no-tests failure, plus lint/format checks; no remote CI run is claimed. |
+| [Historical shared fixture scenario][public-context] and [workspace wrapper][public-context-wrapper] | Authenticated public authority/Build through the default factory; distinguishable target/source bytes, middle empty item and actual EOF; zero source-context acquisition. Genuine singleton-source commits copy meaningful application values into fresh idle-target storage, with matched successful Build/Ready and successful public Close/host waits/provider drains. Target bootstrap includes itself but it stays outside source voters with serving reads denied. |
+| [Provider callback controls][public-context-controls], [KSF-05 registration][public-context-ksf] and [package-only CI step][public-context-ci] | Actual local controls reject wrong-origin, missing/changed/reordered/surplus items and stream errors; matching prefixes wait for EOF, and default empty policy rejects even an empty data item. KSF mapping/partition guards and exact ordinary wrapper execution passed at the original pin. CI runs the complete public-test crate suite with nextest's no-tests failure; existing workspace jobs cover lint/format. No remote CI run is claimed. |
 
-The standalone resolved runtime graph enables `host`, not `testing`; workspace
+The current provider and integration test are in the root-workspace member
+[`kuberic-public-v1-tests`](../../../kuberic-public-v1-tests/Cargo.toml);
+the old pinned paths above retain historical ancestry. The cross-directory
+wrapper is removed, ordinary workspace discovery owns the integration test
+directly, and KSF execution includes its actual package/name.
+
+The package-only resolved runtime graph enables `host`, not `testing`; workspace
 dev-feature unification does not establish that boundary. Separate actual
 privacy/Rustdoc/source/conformance/feature-off and packaged-consumer gates
 passed. The package gate compiles packaged consumers/test closure; it does not
