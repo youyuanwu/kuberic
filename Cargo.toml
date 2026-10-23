@@ -7,8 +7,8 @@ members = [
   "kuberic-runtime",
   "kuberic-controller",
   "kuberic-level-tests",
+  "kuberic-public-v1-tests",
 ]
-exclude = ["scripts/fixtures/classic-v1-provider"]
 
 [workspace.package]
 version = "0.0.1"

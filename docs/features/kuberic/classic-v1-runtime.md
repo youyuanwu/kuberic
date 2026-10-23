@@ -136,8 +136,10 @@ reach the source in an actual-component test
 ([test:1013–1091][context-test]). Separately, an executed helper-free
 [external public Build][public-context] consumes exactly
 `[b"target/context", empty, b"target/trailer"]` through EOF, with no source
-context acquisition. The standalone runtime feature graph contains `host`,
-not `testing`; its workspace wrapper is testing-unified evidence. Real
+context acquisition. The provider and scenario now live in the workspace crate
+[`kuberic-public-v1-tests`](../../../kuberic-public-v1-tests/Cargo.toml).
+Its package-only runtime feature graph contains `host`, not `testing`;
+workspace-wide runs are testing-unified evidence. Real
 pre-Build service commits supply a nonzero copy boundary and distinct
 application values installed into fresh checked target storage. The matched
 Build completion is successful, the exact remote Build is Ready, and both

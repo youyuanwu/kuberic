@@ -637,20 +637,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "external-classic-v1-provider"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "kuberic-runtime",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
-]
-
-[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1398,17 +1384,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuberic-public-v1-tests"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "kuberic-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kuberic-runtime"
 version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bytes",
- "external-classic-v1-provider",
  "futures",
  "k8s-openapi",
  "kube",
  "kuberic-controller",
+ "kuberic-public-v1-tests",
  "kvstore2",
  "prost",
  "quote",

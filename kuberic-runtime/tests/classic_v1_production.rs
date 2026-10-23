@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use external_classic_v1_provider::ExternalService;
+use kuberic_public_v1_tests::ExternalService;
 use kuberic_runtime::StatefulServiceReplica;
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::control::{convert, proto};
@@ -42,8 +42,6 @@ const CREDENTIAL: &str = "classic-v1-test-credential";
 mod custom_control;
 #[path = "support/idle_observation.rs"]
 mod idle_observation;
-#[path = "../../scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs"]
-mod public_copy_context;
 
 mod native_wire {
     tonic::include_proto!("kuberic.sf.v1");

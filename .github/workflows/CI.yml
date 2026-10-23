@@ -98,7 +98,7 @@ jobs:
       - name: Run all source and packaging gates
         run: just nextest-source
 
-      - name: Test external provider
+      - name: Test public V1 crate
         timeout-minutes: 30
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target/public-copy-context
@@ -106,12 +106,9 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: 0
         run: |
           set -euo pipefail
-          fixture=scripts/fixtures/classic-v1-provider/Cargo.toml
-          cargo generate-lockfile --offline --manifest-path "$fixture"
-          cargo tree --offline --locked -e features -i kuberic-runtime --manifest-path "$fixture"
-          cargo nextest run --offline --locked --manifest-path "$fixture" --all-targets --no-tests fail
-          cargo clippy --offline --locked --manifest-path "$fixture" --all-targets -- -D warnings
-          cargo fmt --manifest-path "$fixture" -- --check
+          package=kuberic-public-v1-tests
+          cargo tree --offline --locked -p "$package" -e features -i kuberic-runtime
+          cargo nextest run --offline --locked -p "$package" --all-targets --no-tests fail
 
   validate-archive:
     name: Validate exact test coverage
