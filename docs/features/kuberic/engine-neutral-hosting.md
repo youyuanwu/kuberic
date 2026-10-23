@@ -296,16 +296,22 @@ role recovery; pending recovery must not block the connectivity it needs.
 
 Remove `with_custom_control` and public outbound Build-authority accessors.
 Keep read-only partition/lifecycle/creation context and generic peer discovery.
-The local agent publishes current endpoint identity after successful Open and
-ordinary role/epoch preparation. A peer-scope snapshot contains resource,
+The local agent publishes the fresh endpoint immediately after successful Open
+as **DiscoveryPending**, before any peer-dependent role/epoch/configuration
+callback must complete. Authenticated discovery and engine-owned recovery/status
+traffic can progress; ordinary copy, voter admission and service access remain
+closed. Accepted role intent is not an achieved role. After applicable ordinary
+callbacks and their host receipts complete, publish **AchievedScope** eligible
+for the Active-session checks below. A peer-scope snapshot contains resource,
 replica/storage/process/creation, endpoint, accepted epoch/primary/configuration
 scope and monotonic publication generation. It contains **no** controller
 operation ID/revision, Build ID or exact inbound grant, and invokes no engine
 install/revoke callback. Engines can use the built-in carrier or their own
 protocol with equivalent authenticated peer checks.
 
-Target preparation gives ordinary epoch and Idle role, closed access and current
-generic source scope. A secondary host records that scope without issuing a
+Target preparation first opens/publishes DiscoveryPending, then completes
+ordinary epoch and Idle role under closed access and publishes AchievedScope
+with current generic source scope. A secondary host records that scope without issuing a
 primary-only configuration callback. Engine establishment checks current local
 role/epoch/creation, authenticated current source Primary identity, endpoint and
 compatible history; a bearer credential or copied descriptor alone is insufficient.
@@ -313,7 +319,9 @@ Discovery failure remains pending/closed.
 
 ### Selected scope fence and engine session retirement
 
-Peer publication permits **discovery**, not arbitrary future effects. Compatible
+DiscoveryPending publication linearizes after successful Open and permits
+discovery/recovery only; AchievedScope publication linearizes after the matching
+ordinary callback receipts. Neither permits arbitrary future effects. Compatible
 same-creation configuration changes use ordinary callbacks. An incompatible
 primary/history/storage/epoch scope change:
 
@@ -370,7 +378,7 @@ These are logical proposed messages, **not delivered API signatures**:
 | Request / direction | Preconditions, action, completion and stale rule |
 |---|---|
 | ReconcileReplica: controller → local agent | Goal revision, identities, epoch, PC/CC, role/stage. Persist accepted goal; reject stale/changed identity. Return achieved stage or pending, not engine diagnostics as proof. |
-| PrepareIdle: agent coordination → target host | Open real endpoint, set epoch/Idle under closed access, publish generic identity/source scope. Completion is creation, not copy. |
+| PrepareIdle: agent coordination → target host | Open real endpoint and publish DiscoveryPending before peer-dependent callbacks; complete epoch/Idle under closed access, then publish AchievedScope with generic identity/source scope. Completion is prepared creation, not copy. Failed preparation withdraws through the same Abort→Close barrier. |
 | BuildIdle: source agent → source host | Paired Primary, current epoch and exact target publication. Retain ordinary Build and source remote state. Active duplicates attach. Ready replay requires unchanged **both** endpoint creations/process/storage and scope, revalidated before voter admission. |
 | Cancel/RemoveIdle: agent → source host | Fence generation first. Ready/Open/Primary: ordinary Remove retires local engine transfer; target settlement is separate. InBuild: portable Abort→retained Close/drain→retire/reopen; never ordinary Remove on an aborted allocation. Late success cannot replace InDrop/Dropped. |
 | Reconfigure: agent → local host | Select ordered epoch/data-loss/role/catch-up/configuration/access actions from goal/stage and compatibility. Successful prefixes reusable only in unchanged generation. Secondary scope installation is not a primary-only callback. |
@@ -429,8 +437,12 @@ Remove target grant journal/reauthorization receipts. Host reports do not
 replace engine data/history.
 
 Restart unpublishes process-bound endpoints/sessions and stays closed. Open
-endpoint, publish fresh process/creation, reconcile ordinary epoch/role/config
-and fresh native recovery/quorum evidence. Old in-flight Build is uncertain,
+endpoint, publish fresh process/creation as DiscoveryPending, reconcile ordinary
+epoch/role/config and fresh native recovery/quorum evidence, then publish
+AchievedScope before copy/admission eligibility. Multiple replicas may resolve
+one another while role recovery is held; discovery never waits for that callback.
+Failed preparation safely withdraws the new publication through Abort→Close.
+Old in-flight Build is uncertain,
 not replayable success. Same-live-host lost-reply recovery may return completed
 outcome only if **both endpoints** and scope remain unchanged. Target reopen
 invalidates Ready even with stable replica instance; controller revalidates
