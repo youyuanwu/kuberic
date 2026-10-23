@@ -3016,13 +3016,18 @@ async fn hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_dead
     assert_eq!(observed.lock().unwrap()[0].0, TestingTcpRouteKind::Build);
     let close = source.intent(PublicOperationProgram::Close).await;
     let close_id = close.operation_id.clone();
-    tokio::time::timeout(
+    let replay = close.clone();
+    // Terminal preemption must Abort the native owner before waiting for the
+    // hung Build. Its subsequent Close is honestly failed, not successful
+    // merely because the retained provider/transport join succeeds.
+    let failure = tokio::time::timeout(
         Duration::from_secs(10),
         source.handle().execute_public_v1(close),
     )
     .await
     .expect("terminal containment did not drain a hung native Build")
-    .unwrap();
+    .unwrap_err();
+    assert!(failure.to_string().contains("Replicator Close failed"));
     assert!(
         tokio::time::timeout(Duration::from_secs(10), build)
             .await
@@ -3049,7 +3054,7 @@ async fn hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_dead
     let state: serde_json::Value = serde_json::from_str(&json).unwrap();
     let close = &state["publicV1OperationState"]["operations"][close_id.as_str()];
     assert_eq!(close["stage"], "completed");
-    assert_eq!(close["disposition"]["kind"], "succeeded");
+    assert_eq!(close["disposition"]["kind"], "failed");
     assert!(
         close["lifecycle"]["outcomes"]
             .as_array()
@@ -3063,6 +3068,9 @@ async fn hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_dead
             }),
         "native child Close failure was not retained after outer containment"
     );
+    let calls = source.service.observed.lock().unwrap().len();
+    assert!(source.handle().execute_public_v1(replay).await.is_err());
+    assert_eq!(source.service.observed.lock().unwrap().len(), calls);
     assert_ne!(source.report().await.write_status, AccessStatus::Granted);
     drop(route);
     server.abort();
@@ -3115,7 +3123,13 @@ async fn public_v1_open_owns_one_registration_listener_and_writer_and_close_fail
     node.service.close_failure.store(true, Ordering::Release);
     let intent = node.intent(PublicOperationProgram::Close).await;
     let operation = intent.operation_id.clone();
-    node.handle().execute_public_v1(intent).await.unwrap();
+    let replay = intent.clone();
+    let failure = node.handle().execute_public_v1(intent).await.unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("injected application close failure")
+    );
     assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
     assert!(std::net::TcpListener::bind(socket).is_ok());
     let store = SqliteStore::open_public_v1(
@@ -3127,12 +3141,12 @@ async fn public_v1_open_owns_one_registration_listener_and_writer_and_close_fail
         .public_v1_operation_snapshot(&operation)
         .await
         .unwrap();
-    assert_eq!(
+    assert!(matches!(
         record.disposition,
         Some(
-            kuberic_runtime::testing::sqlite_store::PublicV1OperationSnapshotDisposition::Succeeded
+            kuberic_runtime::testing::sqlite_store::PublicV1OperationSnapshotDisposition::Failed(_)
         )
-    );
+    ));
     let state = close_journal(&node, &operation);
     assert!(
         state["lifecycle"]["outcomes"]
@@ -3146,6 +3160,9 @@ async fn public_v1_open_owns_one_registration_listener_and_writer_and_close_fail
                         .is_some_and(|error| error.contains("injected application close failure"))
             })
     );
+    let calls = node.service.closes.load(Ordering::SeqCst);
+    assert!(node.handle().execute_public_v1(replay).await.is_err());
+    assert_eq!(node.service.closes.load(Ordering::SeqCst), calls);
     node.stop().await;
 }
 
@@ -3215,11 +3232,16 @@ async fn hosted_sf06_failed_replicator_close_retains_diagnostic_and_joins_native
     assert_eq!(node.service.closes.load(Ordering::SeqCst), 0);
     assert_eq!(node.handle().public_v1_provider_writer_count(), 1);
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), close)
+    let failure = tokio::time::timeout(Duration::from_secs(10), close)
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("injected replicator close failure")
+    );
     let _ = epoch.await.unwrap();
     assert_eq!(node.handle().public_v1_provider_writer_count(), 0);
     assert_eq!(
@@ -3230,9 +3252,9 @@ async fn hosted_sf06_failed_replicator_close_retains_diagnostic_and_joins_native
     );
     let record = close_journal(&node, &operation);
     assert_eq!(record["stage"], "completed");
-    assert_eq!(record["disposition"]["kind"], "succeeded");
+    assert_eq!(record["disposition"]["kind"], "failed");
     let calls = node.service.observed.lock().unwrap().len();
-    node.handle().execute_public_v1(replay).await.unwrap();
+    assert!(node.handle().execute_public_v1(replay).await.is_err());
     assert_eq!(node.service.observed.lock().unwrap().len(), calls);
     assert_eq!(node.service.aborts.load(Ordering::SeqCst), 1);
     node.stop().await;
@@ -3284,7 +3306,7 @@ async fn hosted_sf06_failed_application_close_joins_service_work_despite_dropped
     .unwrap();
     assert!(retained.is_finished());
     let record = close_journal(&node, &operation);
-    assert_eq!(record["disposition"]["kind"], "succeeded");
+    assert_eq!(record["disposition"]["kind"], "failed");
     assert!(
         record["lifecycle"]["outcomes"]
             .as_array()
@@ -3306,7 +3328,7 @@ async fn hosted_sf06_failed_application_close_joins_service_work_despite_dropped
             .unwrap(),
         (0, 0)
     );
-    node.handle().execute_public_v1(replay).await.unwrap();
+    assert!(node.handle().execute_public_v1(replay).await.is_err());
     assert_eq!(node.service.closes.load(Ordering::SeqCst), 1);
     node.stop().await;
 }
@@ -3420,6 +3442,9 @@ fn seed_close_recovery(
     };
     let record = serde_json::json!({
         "intent": intent,
+        "attempt": 1,
+        "attemptResults": {},
+        "retryFailure": null,
         "acceptedHistory": preview["history"],
         "acceptedStorage": preview["storageIncarnation"],
         "stage": if already_pending { "containmentPending" } else { "running" },
@@ -3515,11 +3540,16 @@ async fn hosted_sf06_recovery_attaches_real_native_join_without_dispatch_or_clea
         release.send(()).unwrap();
         let _ = epoch.await.unwrap();
         if let Some(replay) = replay {
-            tokio::time::timeout(Duration::from_secs(10), replay)
+            let failure = tokio::time::timeout(Duration::from_secs(10), replay)
                 .await
                 .unwrap()
                 .unwrap()
-                .unwrap();
+                .unwrap_err();
+            assert!(
+                failure
+                    .to_string()
+                    .contains("retained receipt close diagnostic")
+            );
         }
         tokio::time::timeout(Duration::from_secs(10), async {
             while close_journal(&node, &operation)["stage"] != "completed" {
@@ -3532,7 +3562,7 @@ async fn hosted_sf06_recovery_attaches_real_native_join_without_dispatch_or_clea
         assert_eq!(
             record["disposition"]["kind"],
             if cleanup_recorded {
-                "succeeded"
+                "failed"
             } else {
                 "ambiguous"
             }
@@ -3542,6 +3572,7 @@ async fn hosted_sf06_recovery_attaches_real_native_join_without_dispatch_or_clea
                 record["lifecycle"]["outcomes"][1]["CloseFailure"]["error"],
                 "retained receipt close diagnostic"
             );
+            assert!(node.handle().execute_public_v1(intent).await.is_err());
         } else {
             assert!(node.handle().execute_public_v1(intent).await.is_err());
         }

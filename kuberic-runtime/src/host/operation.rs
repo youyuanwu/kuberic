@@ -532,7 +532,7 @@ impl PartitionOperation {
         }
         // An engine's declaration cannot certify the independent application.
         // Read the durable selection, not the coarse Running watch snapshot.
-        let selected = self
+        let record = self
             .store
             .public_operation_records()
             .await
@@ -541,23 +541,19 @@ impl PartitionOperation {
                 records
                     .into_iter()
                     .find(|record| record.intent == self.intent())
-            })
-            .and_then(|record| {
-                record.lifecycle.in_flight.or_else(|| {
-                    // Canonical replacement evidence is a recorded returned
-                    // callback outcome, not an unknown lost-receipt failure.
-                    matches!(
-                        record.lifecycle.outcomes.last(),
-                        Some(crate::host::state::PublicInstructionOutcome::RebuildRequired(_))
-                    )
-                    .then(|| {
-                        super::public_lifecycle::program::operation_instructions(&record.intent)
-                            .get(record.lifecycle.outcomes.len().checked_sub(1)?)
-                            .copied()
-                    })
-                    .flatten()
-                })
             });
+        // A joined root between journaled callbacks has no interrupted child.
+        // In particular, a successful application receipt does not require
+        // shutting down the application merely to supersede the next stage.
+        // A callback-success/receipt-loss still has in_flight set and cannot
+        // take this path; missing store evidence remains conservative below.
+        if record
+            .as_ref()
+            .is_some_and(|record| record.lifecycle.in_flight.is_none())
+        {
+            return declared;
+        }
+        let selected = record.and_then(|record| record.lifecycle.in_flight);
         use crate::host::state::PublicInstruction::*;
         match selected {
             Some(
@@ -577,10 +573,14 @@ impl PartitionOperation {
                 | DataLoss
                 | Progress
                 | Build
-                | Remove,
+                | Remove
+                // Synchronous host-owned revocation has no external child to
+                // outlive the joined root, even at its selected test barrier.
+                | Revoke,
             ) => declared,
-            // Access refreshes the application role/address. Host bookkeeping
-            // and unknown provenance also cannot borrow an engine declaration.
+            // Access refreshes the application role/address. An active
+            // application selection and unknown provenance cannot borrow an
+            // engine declaration.
             _ => CallbackContainment::ObjectOwnedOnInterruption,
         }
     }

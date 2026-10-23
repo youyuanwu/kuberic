@@ -1427,6 +1427,147 @@ async fn sf06_actual_application_role_failure_remains_failed_after_replication_r
 }
 
 #[tokio::test]
+async fn native_observer_between_receipted_callbacks_does_not_require_runtime_shutdown() {
+    for (position, index, receipts) in [
+        (PublicCutPosition::BeforeInstruction, 0, 0),
+        (PublicCutPosition::BeforeInstruction, 1, 1),
+        (PublicCutPosition::InstructionApplied, 0, 1),
+        (PublicCutPosition::InstructionApplied, 1, 2),
+    ] {
+        let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
+        let (_contained, witness) = tokio::sync::watch::channel(false);
+        fixture.callbacks.containment = Some(witness);
+        let cut = Arc::new(PublicOperationCut {
+            position,
+            index,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        fixture.callbacks.cut = Some(cut.clone());
+        let operation = fixture
+            .launch(
+                PublicOperationProgram::Role {
+                    epoch: Epoch::new(0, 2),
+                    role: ReplicaRole::Primary,
+                },
+                1,
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), cut.entered.notified())
+            .await
+            .unwrap();
+        let record = fixture
+            .store
+            .public_operation_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.intent == operation.intent())
+            .unwrap();
+        assert_eq!(record.lifecycle.outcomes.len(), receipts);
+        assert!(record.lifecycle.in_flight.is_none());
+        let cancelled = operation.cancel_root().await.unwrap();
+        assert_eq!(cancelled.stage, PublicOperationStage::Completed);
+        assert_eq!(
+            cancelled.disposition,
+            Some(PublicOperationDisposition::Cancelled)
+        );
+        fixture.callbacks.cut = None;
+        let successor = fixture
+            .launch(
+                PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 3),
+                },
+                2,
+            )
+            .await;
+        assert_eq!(
+            completed(&successor).await.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
+        assert!(!*fixture.callbacks.containment.as_ref().unwrap().borrow());
+        assert!(
+            !fixture
+                .probe
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.starts_with("drain"))
+        );
+        fixture.registry.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn native_observer_selected_host_revoke_does_not_require_runtime_shutdown() {
+    for composed in [false, true] {
+        let (mut fixture, configuration) = swap_admission_tests::installed_primary().await;
+        fixture.callbacks.native_observer_callbacks = true;
+        let (_contained, witness) = tokio::sync::watch::channel(false);
+        fixture.callbacks.containment = Some(witness);
+        let mut refreshed = configuration.clone();
+        let epoch = Epoch::new(0, 4);
+        refreshed.current = ConfigurationDescriptor::new(
+            epoch,
+            refreshed.current.primary_id,
+            refreshed.current.members.clone(),
+            refreshed.current.write_quorum,
+        );
+        let cut = Arc::new(PublicOperationCut {
+            position: PublicCutPosition::InstructionSelected,
+            index: if composed { 0 } else { 2 },
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        fixture.callbacks.cut = Some(cut.clone());
+        let operation = fixture
+            .launch(
+                PublicOperationProgram::Swap {
+                    starting: configuration,
+                    refreshed,
+                    epoch,
+                    handoff: ReplicaRole::ActiveSecondary,
+                    catch_up_specific_quorum: false,
+                    mode: PublicCatchUpMode::All,
+                    controller_composed: composed,
+                },
+                3,
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), cut.entered.notified())
+            .await
+            .unwrap();
+        let cancelled = operation.cancel_root().await.unwrap();
+        assert_eq!(
+            cancelled.lifecycle.in_flight,
+            Some(PublicInstruction::Revoke)
+        );
+        assert_eq!(cancelled.stage, PublicOperationStage::Completed);
+        assert_eq!(
+            cancelled.disposition,
+            Some(PublicOperationDisposition::Cancelled)
+        );
+        assert!(!*fixture.callbacks.containment.as_ref().unwrap().borrow());
+        fixture.callbacks.cut = None;
+        let successor = fixture
+            .launch(
+                PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 5),
+                },
+                4,
+            )
+            .await;
+        assert_eq!(
+            completed(&successor).await.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
+        fixture.registry.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn native_engine_ownership_does_not_certify_failed_or_cancelled_application_role() {
     for cancel in [false, true] {
         let mut fixture = Fixture::new().await;

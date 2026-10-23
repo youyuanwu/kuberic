@@ -203,22 +203,36 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
         controller_composed: false,
         ..
     }) = &intent.program
-        && installed.as_ref().is_some_and(|current| {
-            starting.current != current.current
-                || starting.previous != current.previous
-                || starting.replicas.len() != current.replicas.len()
-                || starting.replicas.iter().any(|peer| {
-                    !current.replicas.iter().any(|known| {
-                        peer.identity == known.identity
-                            && peer.process_session_id == known.process_session_id
-                            && peer.storage_incarnation == known.storage_incarnation
-                            && peer.replication_address == known.replication_address
+        // An unfinished demotion may have receipted the refreshed native
+        // configuration before its role handoff. A successor must start there,
+        // not from the last completed whole operation or an older request.
+        && relevant
+            .iter()
+            .filter(|record| matches!(record.disposition, None | Some(D::Succeeded)))
+            .filter_map(|record| {
+                public_lifecycle::achieved_configuration_from_record(record)
+                    .map(|configuration| (record.intent.revision, configuration))
+            })
+            .max_by_key(|(revision, _)| *revision)
+            .map(|(_, configuration)| configuration)
+            .or_else(|| installed.clone())
+            .as_ref()
+            .is_some_and(|current| {
+                starting.current != current.current
+                    || starting.previous != current.previous
+                    || starting.replicas.len() != current.replicas.len()
+                    || starting.replicas.iter().any(|peer| {
+                        !current.replicas.iter().any(|known| {
+                            peer.identity == known.identity
+                                && peer.process_session_id == known.process_session_id
+                                && peer.storage_incarnation == known.storage_incarnation
+                                && peer.replication_address == known.replication_address
+                        })
                     })
-                })
-        })
+            })
     {
         return Err(HostError::CommandRejected(
-            "Swap starting stage differs from installed source authority".into(),
+            "Swap starting stage differs from achieved source authority".into(),
         ));
     }
     // A standalone current-only wait is a fresh synchronization barrier, not

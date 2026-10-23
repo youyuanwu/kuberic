@@ -1938,8 +1938,35 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             ))
             .await
             .unwrap();
+        // Copy used the installed singleton authority. Voting admission is a
+        // new reconfiguration epoch on both actual native children, not a
+        // Catchup regression into that singleton's completed Current stage.
+        let voting_epoch = Epoch::new(0, 3);
+        for (handle, name) in [
+            (&source_handle, "kv-composite-source-voting-epoch"),
+            (&secondary_handle, "kv-composite-secondary-voting-epoch"),
+        ] {
+            handle
+                .execute_public_v1(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    10,
+                    name,
+                    PublicOperationProgram::Epoch {
+                        epoch: voting_epoch,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let voting_configuration = ConfigurationDescriptor::new(
+            voting_epoch,
+            restart_configuration.primary_id,
+            restart_configuration.members.clone(),
+            restart_configuration.write_quorum,
+        );
         let source_configuration = PublicConfiguration {
-            current: restart_configuration.clone(),
+            current: voting_configuration.clone(),
             previous: Some(source_only_configuration.clone()),
             replicas: vec![PublicReplicaDescriptor {
                 is_up: true,
@@ -1956,7 +1983,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             }],
         };
         let secondary_configuration = PublicConfiguration {
-            current: restart_configuration.clone(),
+            current: voting_configuration.clone(),
             previous: Some(source_only_configuration),
             replicas: vec![PublicReplicaDescriptor {
                 is_up: true,
@@ -1976,7 +2003,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
-                10,
+                11,
                 "kv-composite-secondary-reconfiguration",
                 PublicOperationProgram::Configuration(secondary_configuration),
             ))
@@ -1986,7 +2013,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
-                10,
+                11,
                 "kv-composite-source-reconfiguration",
                 PublicOperationProgram::Configuration(source_configuration.clone()),
             ))
@@ -1996,7 +2023,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
-                11,
+                12,
                 "kv-composite-settle-suffix",
                 PublicOperationProgram::CatchUp {
                     configuration: source_configuration,
@@ -2054,7 +2081,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
         assert_eq!(source_report.write_status, AccessStatus::Granted);
         assert_ne!(secondary_report.write_status, AccessStatus::Granted);
 
-        let handoff_epoch = Epoch::new(0, 3);
+        let handoff_epoch = Epoch::new(0, 4);
         let handoff_configuration = ConfigurationDescriptor::new(
             handoff_epoch,
             secondary_identity.replica_id,
@@ -2073,13 +2100,13 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
         for (handle, revision, name, role) in [
             (
                 &source_handle,
-                12,
+                13,
                 "kv-composite-source-handoff-role",
                 ReplicaRole::ActiveSecondary,
             ),
             (
                 &secondary_handle,
-                11,
+                12,
                 "kv-composite-secondary-handoff-role",
                 ReplicaRole::Primary,
             ),
@@ -2148,7 +2175,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
-                14,
+                15,
                 "kv-composite-source-handoff-configuration",
                 PublicOperationProgram::Configuration(source_handoff),
             ))
@@ -2158,7 +2185,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
-                13,
+                14,
                 "kv-composite-secondary-handoff-configuration",
                 PublicOperationProgram::Configuration(secondary_handoff.clone()),
             ))
@@ -2168,7 +2195,7 @@ async fn kvstore2_real_provider_restart_settlement_and_handoff() {
             .execute_public_v1(intent(
                 &preview,
                 secondary_handle.process_session_id(),
-                14,
+                15,
                 "kv-composite-secondary-handoff-catch-up",
                 PublicOperationProgram::CatchUp {
                     configuration: secondary_handoff,
@@ -2366,7 +2393,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
         assert_ne!(source_address, survivor_address);
         let initial_epoch = Epoch::new(0, 1);
         let initial = ConfigurationDescriptor::new(
-            initial_epoch,
+            Epoch::new(0, 2),
             source_identity.replica_id,
             vec![
                 ConfigurationMember {
@@ -2505,6 +2532,23 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             ))
             .await
             .unwrap();
+        for (handle, name) in [
+            (&source_handle, "kv-failover-source-voting-epoch"),
+            (&survivor_handle, "kv-failover-survivor-voting-epoch"),
+        ] {
+            handle
+                .execute_public_v1(intent(
+                    &preview,
+                    handle.process_session_id(),
+                    5,
+                    name,
+                    PublicOperationProgram::Epoch {
+                        epoch: initial.epoch,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
         for (handle, name, peer, peer_address, peer_session, peer_storage, peer_role) in [
             (
                 &survivor_handle,
@@ -2529,11 +2573,11 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 .execute_public_v1(intent(
                     &preview,
                     handle.process_session_id(),
-                    5,
+                    6,
                     name,
                     PublicOperationProgram::Configuration(PublicConfiguration {
                         current: initial.clone(),
-                        previous: None,
+                        previous: Some(source_only.clone()),
                         replicas: vec![PublicReplicaDescriptor {
                             is_up: true,
                             is_ready: true,
@@ -2567,7 +2611,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             source_handle.execute_public_v1(intent(
                 &preview,
                 source_handle.process_session_id(),
-                6,
+                7,
                 "kv-failover-catch-up",
                 PublicOperationProgram::CatchUp {
                     configuration: PublicConfiguration {
@@ -2607,9 +2651,9 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
                 .is_err()
         );
 
-        let failover_epoch = Epoch::new(0, 2);
+        let failover_epoch = Epoch::new(0, 3);
         let failover_previous = ConfigurationDescriptor::new(
-            initial_epoch,
+            initial.epoch,
             survivor_identity.replica_id,
             vec![
                 ConfigurationMember {
@@ -2628,7 +2672,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             survivor_handle.execute_public_v1(lifecycle_intent(
                 &preview,
                 survivor_handle.process_session_id(),
-                6,
+                7,
                 "kv-original-primary-loss",
                 PublicLifecycleInput {
                     recipe: PublicLifecycleRecipe::FailoverPromotion,
@@ -2669,7 +2713,7 @@ async fn kvstore2_original_primary_loss_promotes_survivor_and_fences_return() {
             .execute_public_v1(intent(
                 &preview,
                 survivor_handle.process_session_id(),
-                7,
+                8,
                 "kv-failover-final-current",
                 PublicOperationProgram::Configuration(PublicConfiguration {
                     current: ConfigurationDescriptor::new(

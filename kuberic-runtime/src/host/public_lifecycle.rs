@@ -1072,6 +1072,15 @@ pub(crate) fn installed_configuration_from_record(
     {
         return None;
     }
+    achieved_configuration_from_record(record)
+}
+
+/// The last successfully receipted configuration in this exact program prefix.
+/// This is native starting-stage evidence, not a completed host installation
+/// or an observation that the remaining role/access instructions succeeded.
+pub(crate) fn achieved_configuration_from_record(
+    record: &PublicOperationRecord,
+) -> Option<PublicConfiguration> {
     operation_instructions(&record.intent)
         .into_iter()
         .zip(&record.lifecycle.outcomes)

@@ -82,6 +82,14 @@ This maps the relevant RAP/FUP/common-proxy semantics, not full RA
 reconfiguration stages, FM placement, Hosting2 process management, native
 compatibility tables, settings or automatic recovery policy.
 
+Joint voting admission after a completed current-only stage needs a new
+reconfiguration epoch, with actual child epoch and peer transport authority
+advanced coherently; a newer operation revision alone is insufficient.
+Standalone Swap's pre-revoke configuration/catch-up runs **before** its epoch
+advance (`ProxyActionsList.cpp:130–142`). The peer must retain the starting
+channel until that wait finishes, then install the refreshed authority for the
+second wait. Controller-composed Swap has already performed the first wait.
+
 ## Acceptance, retry and access
 
 Exact input digest, operation ID/revision, resource, process session, storage,
@@ -141,6 +149,12 @@ frozen Build input plus successful completion before further configuration.
 Historical completion never recreates ingress.
 
 Close/Abort stop admission and revoke access before actual retained joining.
+For a native-observer engine, cancellation joins the operation root and checks
+the exact durable callback selection. A gap between successfully journaled
+callbacks has no interrupted child and does not require whole-runtime shutdown
+before a successor can run. An in-flight application callback, including one
+whose successful return lost its receipt, cannot borrow the engine's ownership
+declaration; unknown store evidence remains conservative.
 A monotonic current-process terminal fence is distinct from renewable access
 fencing: neither an old renewal snapshot nor later renewal authorization can
 reopen copy after valid terminal admission begins. Target validation rechecks

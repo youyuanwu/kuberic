@@ -1,7 +1,7 @@
 use super::*;
 use crate::protocol::public_operations::PublicReplicaDescriptor;
 
-async fn installed_primary() -> (Fixture, PublicConfiguration) {
+pub(super) async fn installed_primary() -> (Fixture, PublicConfiguration) {
     let fixture = Fixture::new().await;
     let local = fixture
         .store
@@ -165,6 +165,7 @@ async fn swap_current_starting_context_executes_but_controller_composed_unused_c
                 1,
             );
         }
+
         fixture.probe.events.lock().unwrap().clear();
         let operation = fixture.launch(swap(starting, composed), 3).await;
         assert_eq!(
@@ -190,4 +191,63 @@ async fn swap_current_starting_context_executes_but_controller_composed_unused_c
         }
         fixture.registry.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn successor_swap_starts_from_receipted_configuration_before_predecessor_role_handoff() {
+    let (mut fixture, current) = installed_primary().await;
+    let cut = Arc::new(PublicOperationCut {
+        position: PublicCutPosition::BeforeInstruction,
+        index: 6,
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    fixture.callbacks.cut = Some(cut.clone());
+    fixture.callbacks.native_observer_callbacks = true;
+    let predecessor = fixture.launch(swap(current.clone(), false), 3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), cut.entered.notified())
+        .await
+        .unwrap();
+    let state = fixture.store.load_state().await.unwrap();
+    assert_eq!(
+        installed_configuration_for_state(&state, &ProcessSessionId::new("session")),
+        Some(current.clone()),
+        "unfinished role handoff must not be reported as completed installation"
+    );
+    fixture.callbacks.cut = None;
+    let stale = fixture.intent(swap(current.clone(), false), 4);
+    assert!(matches!(
+        launch(&fixture.registry, fixture.store.clone(), stale, fixture.callbacks.clone()).await,
+        Err(HostError::CommandRejected(detail)) if detail.contains("older")
+    ));
+    let mut starting = current;
+    starting.current = ConfigurationDescriptor::new(
+        Epoch::new(0, 4),
+        starting.current.primary_id,
+        starting.current.members.clone(),
+        starting.current.write_quorum,
+    );
+    let mut successor = swap(starting, false);
+    if let PublicOperationProgram::Swap {
+        epoch, refreshed, ..
+    } = &mut successor
+    {
+        *epoch = Epoch::new(0, 5);
+        refreshed.current = ConfigurationDescriptor::new(
+            *epoch,
+            refreshed.current.primary_id,
+            refreshed.current.members.clone(),
+            refreshed.current.write_quorum,
+        );
+    }
+    let successor = fixture.launch(successor, 4).await;
+    assert_eq!(
+        completed(&successor).await.disposition,
+        Some(PublicOperationDisposition::Succeeded)
+    );
+    assert_eq!(
+        completed(&predecessor).await.disposition,
+        Some(PublicOperationDisposition::Cancelled)
+    );
+    fixture.registry.shutdown().await.unwrap();
 }
