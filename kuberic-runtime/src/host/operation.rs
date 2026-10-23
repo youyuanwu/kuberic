@@ -542,18 +542,36 @@ impl PartitionOperation {
                     .into_iter()
                     .find(|record| record.intent == self.intent())
             });
-        // A joined root between journaled callbacks has no interrupted child.
+        let canonical_failure = record.as_ref().is_some_and(|record| {
+            matches!(
+                record.lifecycle.outcomes.last(),
+                Some(crate::host::state::PublicInstructionOutcome::RebuildRequired(_))
+            )
+        });
+        // A joined root between successful callbacks has no interrupted child.
         // In particular, a successful application receipt does not require
         // shutting down the application merely to supersede the next stage.
         // A callback-success/receipt-loss still has in_flight set and cannot
-        // take this path; missing store evidence remains conservative below.
-        if record
-            .as_ref()
-            .is_some_and(|record| record.lifecycle.in_flight.is_none())
+        // take this path. A receipted canonical failure is not success either:
+        // recover its callback provenance below, including application owners.
+        // Missing store evidence remains conservative.
+        if !canonical_failure
+            && record
+                .as_ref()
+                .is_some_and(|record| record.lifecycle.in_flight.is_none())
         {
             return declared;
         }
-        let selected = record.and_then(|record| record.lifecycle.in_flight);
+        let selected = record.and_then(|record| {
+            record.lifecycle.in_flight.or_else(|| {
+                if !canonical_failure {
+                    return None;
+                }
+                super::public_lifecycle::program::operation_instructions(&record.intent)
+                    .get(record.lifecycle.outcomes.len().checked_sub(1)?)
+                    .copied()
+            })
+        });
         use crate::host::state::PublicInstruction::*;
         match selected {
             Some(

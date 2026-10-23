@@ -152,7 +152,10 @@ Close/Abort stop admission and revoke access before actual retained joining.
 For a native-observer engine, cancellation joins the operation root and checks
 the exact durable callback selection. A gap between successfully journaled
 callbacks has no interrupted child and does not require whole-runtime shutdown
-before a successor can run. An in-flight application callback, including one
+before a successor can run. A canonical rebuild receipt still denotes a failed
+callback, not a successful gap; its application/native ownership is retained
+even when the receipt clears the in-flight selection. An in-flight application
+callback, including one
 whose successful return lost its receipt, cannot borrow the engine's ownership
 declaration; unknown store evidence remains conservative.
 A monotonic current-process terminal fence is distinct from renewable access

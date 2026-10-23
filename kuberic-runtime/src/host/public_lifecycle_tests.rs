@@ -46,6 +46,10 @@ struct Probe {
     fail_epoch: AtomicBool,
     fail_build: AtomicBool,
     role_rebuild: Mutex<Option<ReplicaIdentity>>,
+    application_rebuild: Mutex<Option<ReplicaIdentity>>,
+    application_child: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    application_child_entered: Notify,
+    application_child_release: Notify,
     listener_close: Mutex<Option<TerminalDrain>>,
     listener_abort: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     role: Mutex<Option<ReplicaRole>>,
@@ -91,6 +95,22 @@ impl StatefulServiceReplica for Application {
             || self.0.block_at_application_call.load(Ordering::Acquire) == call
         {
             std::future::pending::<()>().await;
+        }
+        if let Some(replica) = self.0.application_rebuild.lock().unwrap().clone() {
+            let owner = self.0.clone();
+            let child = tokio::spawn(async move {
+                owner.application_child_entered.notify_one();
+                owner.application_child_release.notified().await;
+            });
+            *self.0.application_child.lock().unwrap() = Some(child);
+            return Err(RuntimeError::ReplicaRebuildRequired(Box::new(
+                ReplicaRebuildRequired::LocalProvider(
+                    crate::protocol::public_operations::LocalProviderRebuildRequired {
+                        reason: crate::protocol::public_operations::ReplicaRebuildReason::IncompatibleRetainedHistory,
+                        provider: crate::protocol::public_operations::ProviderReplicaIdentity { replica },
+                    },
+                ),
+            )));
         }
         if self.0.fail_application_role.load(Ordering::Acquire)
             || self.0.fail_at_application_call.load(Ordering::Acquire) == call
@@ -1562,6 +1582,166 @@ async fn native_observer_selected_host_revoke_does_not_require_runtime_shutdown(
         assert_eq!(
             completed(&successor).await.disposition,
             Some(PublicOperationDisposition::Succeeded)
+        );
+        fixture.registry.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn canonical_application_rebuild_receipt_keeps_real_child_containment_and_blocks_successor() {
+    for recipe in [false, true] {
+        let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
+        // Match a live creation's retained witness: supersession must observe
+        // its eventual actual join, rather than a one-off bare-fixture poll.
+        fixture.callbacks.wait_for_containment = true;
+        let local = fixture
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .identity
+            .local_identity;
+        *fixture.probe.application_rebuild.lock().unwrap() = Some(local.clone());
+        let (contained, witness) = tokio::sync::watch::channel(false);
+        fixture.callbacks.containment = Some(witness);
+        let epoch = Epoch::new(0, 2);
+        let mut intent = fixture.intent(
+            PublicOperationProgram::Role {
+                epoch,
+                role: ReplicaRole::Primary,
+            },
+            1,
+        );
+        if recipe {
+            let input = PublicLifecycleInput {
+                recipe: PublicLifecycleRecipe::FailoverPromotion,
+                replica: local.clone(),
+                epoch,
+                possible_data_loss: PossibleDataLossIntent::NotPossible,
+                current: ConfigurationDescriptor::new(
+                    epoch,
+                    local.replica_id,
+                    vec![ConfigurationMember {
+                        identity: local.clone(),
+                        role: ReplicaRole::Primary,
+                    }],
+                    1,
+                ),
+                previous: Some(ConfigurationDescriptor::new(
+                    Epoch::new(0, 1),
+                    local.replica_id,
+                    vec![ConfigurationMember {
+                        identity: local,
+                        role: ReplicaRole::Primary,
+                    }],
+                    1,
+                )),
+                replicas: Vec::new(),
+                data_loss_recovery: None,
+            };
+            intent.program = None;
+            intent.input_digest = input.digest();
+            intent.lifecycle = Some(input);
+        }
+        let operation = launch(
+            &fixture.registry,
+            fixture.store.clone(),
+            intent.clone(),
+            fixture.callbacks.clone(),
+        )
+        .await
+        .unwrap();
+        fixture.probe.application_child_entered.notified().await;
+        let child = fixture
+            .probe
+            .application_child
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        assert!(!child.is_finished());
+        eprintln!("canonical application recipe={recipe}: waiting for failed callback");
+        let record = completed(&operation).await;
+        assert_eq!(record.stage, PublicOperationStage::ContainmentPending);
+        assert!(matches!(
+            record.disposition,
+            Some(PublicOperationDisposition::Failed(_))
+        ));
+        assert!(
+            record.lifecycle.in_flight.is_none(),
+            "canonical failure is receipted, not a successful gap"
+        );
+        assert!(matches!(
+            record.lifecycle.outcomes.last(),
+            Some(PublicInstructionOutcome::RebuildRequired(_))
+        ));
+        assert_eq!(
+            operation_instructions(&intent)[record.lifecycle.outcomes.len() - 1],
+            if recipe {
+                PublicInstruction::ApplicationPrimary
+            } else {
+                PublicInstruction::ApplicationRole
+            },
+        );
+        assert!(record.retry_failure.is_none());
+        assert!(operation.complete_containment().await.is_err());
+        let calls = fixture.probe.application_role_calls.load(Ordering::Acquire);
+        let replay = launch(
+            &fixture.registry,
+            fixture.store.clone(),
+            intent,
+            fixture.callbacks.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.snapshot().attempt, record.attempt);
+        assert_eq!(
+            replay.snapshot().stage,
+            PublicOperationStage::ContainmentPending
+        );
+        assert_eq!(
+            fixture.probe.application_role_calls.load(Ordering::Acquire),
+            calls
+        );
+        assert!(!child.is_finished());
+        let successor = fixture
+            .launch(
+                PublicOperationProgram::Epoch {
+                    epoch: Epoch::new(0, 3),
+                },
+                2,
+            )
+            .await;
+        eprintln!(
+            "canonical application recipe={recipe}: successor {:?}",
+            successor.snapshot().stage
+        );
+        assert_eq!(
+            successor.snapshot().stage,
+            PublicOperationStage::WaitingForContainment
+        );
+        fixture.probe.application_child_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), child)
+            .await
+            .unwrap()
+            .unwrap();
+        // Only this actual application-child join supplies positive containment.
+        contained.send_replace(true);
+        operation.complete_containment().await.unwrap();
+        eprintln!(
+            "canonical application recipe={recipe}: joined child, old {:?}, successor {:?}",
+            operation.snapshot().stage,
+            successor.snapshot().stage
+        );
+        assert_eq!(
+            completed(&successor).await.disposition,
+            Some(PublicOperationDisposition::Succeeded)
+        );
+        assert_eq!(operation.snapshot().disposition, record.disposition);
+        assert_eq!(
+            fixture.probe.application_role_calls.load(Ordering::Acquire),
+            calls
         );
         fixture.registry.shutdown().await.unwrap();
     }
