@@ -169,7 +169,33 @@ struct Provider {
     hold_recovery: AtomicBool,
     recovery_entered: Notify,
     recovery_release: Notify,
+    advertised_context: Vec<Bytes>,
+    expected_context: Vec<Bytes>,
+    context_observations: Mutex<CopyContextObservations>,
 }
+
+/// Observations recorded by actual copy-context and copy-state callbacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopyContextObservations {
+    pub context_acquisitions: usize,
+    pub copy_state_acquisitions: Vec<CopyStateObservation>,
+}
+
+/// One copy-state callback's boundary, received items, and observed termination.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyStateObservation {
+    pub up_to: i64,
+    pub items: Vec<Bytes>,
+    pub reached_eof: bool,
+}
+
+/// Committed application state decoded from the provider's checked file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedSnapshot {
+    pub committed_lsn: i64,
+    pub values: Vec<Bytes>,
+}
+
 impl Provider {
     fn store(&self) -> Result<&Arc<Store>> {
         self.store.get().ok_or(RuntimeError::NotOpen)
@@ -194,16 +220,52 @@ impl StateProvider for Provider {
         Ok(self.store()?.state.lock().unwrap().committed.len() as i64)
     }
     async fn get_copy_context(&self) -> Result<OperationDataStream> {
-        Ok(Box::pin(stream::empty()))
+        self.context_observations
+            .lock()
+            .unwrap()
+            .context_acquisitions += 1;
+        Ok(Box::pin(stream::iter(
+            self.advertised_context.clone().into_iter().map(Ok),
+        )))
     }
     async fn get_copy_state(
         &self,
         up_to: i64,
         mut context: OperationDataStream,
     ) -> Result<OperationDataStream> {
-        if let Some(item) = context.next().await {
-            item?;
-            return Err(failure("unexpected copy context"));
+        let acquisition = {
+            let mut observations = self.context_observations.lock().unwrap();
+            let index = observations.copy_state_acquisitions.len();
+            observations
+                .copy_state_acquisitions
+                .push(CopyStateObservation {
+                    up_to,
+                    items: Vec::new(),
+                    reached_eof: false,
+                });
+            index
+        };
+        let mut received = 0;
+        while let Some(item) = context.next().await {
+            let item = item?;
+            self.context_observations
+                .lock()
+                .unwrap()
+                .copy_state_acquisitions[acquisition]
+                .items
+                .push(item.clone());
+            if self.expected_context.get(received) != Some(&item) {
+                return Err(failure("unexpected copy context"));
+            }
+            received += 1;
+        }
+        self.context_observations
+            .lock()
+            .unwrap()
+            .copy_state_acquisitions[acquisition]
+            .reached_eof = true;
+        if received != self.expected_context.len() {
+            return Err(failure("incomplete copy context"));
         }
         if up_to < 0 {
             return Err(failure("negative copy boundary"));
@@ -306,6 +368,18 @@ pub struct ExternalService {
 
 impl ExternalService {
     pub fn new(root: PathBuf, address: String) -> Self {
+        Self::with_copy_context(root, address, Vec::new(), Vec::new())
+    }
+
+    /// Configures independently advertised context and the accepted incoming sequence.
+    ///
+    /// Expected items validate the supplied stream; they never replace its input.
+    pub fn with_copy_context(
+        root: PathBuf,
+        address: String,
+        advertised_context: Vec<Bytes>,
+        expected_context: Vec<Bytes>,
+    ) -> Self {
         let aborted = Arc::new(AtomicBool::new(false));
         Self {
             provider: Arc::new(Provider {
@@ -316,6 +390,9 @@ impl ExternalService {
                 hold_recovery: AtomicBool::new(false),
                 recovery_entered: Notify::new(),
                 recovery_release: Notify::new(),
+                advertised_context,
+                expected_context,
+                context_observations: Mutex::new(CopyContextObservations::default()),
             }),
             address,
             partition: Mutex::new(None),
@@ -332,6 +409,23 @@ impl ExternalService {
             aborted,
         }
     }
+
+    /// Returns an owned snapshot of observations recorded by provider callbacks.
+    pub fn copy_context_observations(&self) -> CopyContextObservations {
+        self.provider.context_observations.lock().unwrap().clone()
+    }
+
+    /// Reads persisted application state with the normal format/checksum decoder.
+    ///
+    /// This does not grant serving access or relax [`Self::values`]'s access check.
+    pub fn read_persisted_snapshot(root: &Path) -> Result<PersistedSnapshot> {
+        let state = decode(&std::fs::read(root.join("state.json")).map_err(failure)?)?;
+        Ok(PersistedSnapshot {
+            committed_lsn: state.committed.len() as i64,
+            values: state.committed,
+        })
+    }
+
     pub fn is_fresh(root: &Path) -> std::io::Result<bool> {
         match std::fs::read_dir(root) {
             Ok(mut entries) => Ok(entries.next().transpose()?.is_none()),
@@ -495,12 +589,12 @@ impl ExternalService {
                     return Ok(());
                 }
                 while let Some(operation) = stream.get_operation().await? {
-                    if !operation.end_of_stream {
-                        if let Err(error) = store.commit(operation.lsn, operation.data.clone()) {
-                            stream.report_fault(error.to_string())?;
-                            partition.report_fault(FaultType::Transient).await?;
-                            return Err(error);
-                        }
+                    if !operation.end_of_stream
+                        && let Err(error) = store.commit(operation.lsn, operation.data.clone())
+                    {
+                        stream.report_fault(error.to_string())?;
+                        partition.report_fault(FaultType::Transient).await?;
+                        return Err(error);
                     }
                     operation.acknowledge()?;
                 }
@@ -617,5 +711,193 @@ impl StatefulServiceReplica for ExternalService {
         if let Ok(mut control) = self.control.try_lock() {
             control.take();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn target_context() -> Vec<Bytes> {
+        vec![
+            Bytes::from_static(b"target/context"),
+            Bytes::new(),
+            Bytes::from_static(b"target/trailer"),
+        ]
+    }
+
+    fn input(items: Vec<Bytes>) -> OperationDataStream {
+        Box::pin(stream::iter(items.into_iter().map(Ok)))
+    }
+
+    async fn rejects(provider: &Provider, context: OperationDataStream, expected: &str) {
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), provider.get_copy_state(1, context))
+                .await
+                .expect("invalid context must reject without waiting for the remaining stream");
+        match result {
+            Err(RuntimeError::Application(message)) => assert_eq!(message, expected),
+            Err(other) => panic!("wrong rejection: {other}"),
+            Ok(_) => panic!("invalid context exposed a successful snapshot stream"),
+        }
+    }
+
+    async fn succeeds_only_after_eof(provider: &Provider, items: Vec<Bytes>) {
+        let (release, eof) = oneshot::channel();
+        let tail = stream::once(async move {
+            eof.await.unwrap();
+            None::<Result<Bytes>>
+        })
+        .filter_map(futures::future::ready);
+        let copy = provider.get_copy_state(1, Box::pin(input(items).chain(tail)));
+        tokio::pin!(copy);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut copy)
+                .await
+                .is_err(),
+            "matching items without EOF must not expose a snapshot"
+        );
+        assert!(
+            !provider
+                .context_observations
+                .lock()
+                .unwrap()
+                .copy_state_acquisitions
+                .last()
+                .unwrap()
+                .reached_eof
+        );
+        release.send(()).unwrap();
+        let mut snapshot = tokio::time::timeout(Duration::from_secs(1), &mut copy)
+            .await
+            .expect("EOF releases snapshot acquisition")
+            .unwrap();
+        let copied = decode(&snapshot.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(copied.committed, [Bytes::from_static(b"application/value")]);
+        assert!(snapshot.next().await.is_none());
+        assert!(
+            provider
+                .context_observations
+                .lock()
+                .unwrap()
+                .copy_state_acquisitions
+                .last()
+                .unwrap()
+                .reached_eof
+        );
+    }
+
+    fn opened_service(root: &Path, expected: Vec<Bytes>) -> ExternalService {
+        let service = ExternalService::with_copy_context(
+            root.to_path_buf(),
+            "http://127.0.0.1:0".into(),
+            vec![
+                Bytes::from_static(b"source/context"),
+                Bytes::new(),
+                Bytes::from_static(b"source/trailer"),
+            ],
+            expected,
+        );
+        let store = Arc::new(Store::open(root).unwrap());
+        store
+            .commit(1, Bytes::from_static(b"application/value"))
+            .unwrap();
+        assert!(service.provider.store.set(store).is_ok());
+        service
+    }
+
+    #[tokio::test]
+    async fn copy_context_policy_rejects_non_target_or_incomplete_streams() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = target_context();
+        let service = opened_service(root.path(), expected.clone());
+        let provider = &service.provider;
+        let mut surplus = expected.clone();
+        surplus.push(Bytes::from_static(b"surplus"));
+        let source = provider.advertised_context.clone();
+        let no_middle = vec![expected[0].clone(), expected[2].clone()];
+        let changed = vec![
+            expected[0].clone(),
+            Bytes::from_static(b"changed"),
+            expected[2].clone(),
+        ];
+        let reordered = vec![
+            expected[2].clone(),
+            expected[1].clone(),
+            expected[0].clone(),
+        ];
+        for items in [surplus, source, no_middle, changed, reordered] {
+            rejects(provider, input(items), "unexpected copy context").await;
+        }
+        for items in [Vec::new(), expected[..1].to_vec(), expected[..2].to_vec()] {
+            rejects(provider, input(items), "incomplete copy context").await;
+        }
+        rejects(
+            provider,
+            Box::pin(input(vec![Bytes::from_static(b"source/context")]).chain(stream::pending())),
+            "unexpected copy context",
+        )
+        .await;
+        rejects(
+            provider,
+            Box::pin(input(expected.clone()).chain(stream::iter([Err(failure(
+                "injected context stream failure",
+            ))]))),
+            "injected context stream failure",
+        )
+        .await;
+        succeeds_only_after_eof(provider, expected.clone()).await;
+        let observed = service.copy_context_observations();
+        assert_eq!(observed.context_acquisitions, 0);
+        assert_eq!(
+            observed.copy_state_acquisitions.last().unwrap().items,
+            expected
+        );
+        assert!(
+            observed
+                .copy_state_acquisitions
+                .iter()
+                .all(|call| call.up_to == 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn default_copy_context_policy_still_requires_empty_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let service = ExternalService::new(root.path().to_path_buf(), "http://127.0.0.1:0".into());
+        let store = Arc::new(Store::open(root.path()).unwrap());
+        store
+            .commit(1, Bytes::from_static(b"application/value"))
+            .unwrap();
+        assert!(service.provider.store.set(store).is_ok());
+        let provider = &service.provider;
+        let mut advertised = provider.get_copy_context().await.unwrap();
+        assert!(advertised.next().await.is_none());
+        rejects(
+            provider,
+            input(vec![Bytes::new()]),
+            "unexpected copy context",
+        )
+        .await;
+        rejects(
+            provider,
+            Box::pin(input(vec![Bytes::new()]).chain(stream::pending())),
+            "unexpected copy context",
+        )
+        .await;
+        rejects(
+            provider,
+            Box::pin(stream::iter([Err(failure(
+                "injected context stream failure",
+            ))])),
+            "injected context stream failure",
+        )
+        .await;
+        succeeds_only_after_eof(provider, Vec::new()).await;
+        let observed = service.copy_context_observations();
+        assert_eq!(observed.context_acquisitions, 1);
+        assert_eq!(observed.copy_state_acquisitions[1].items, [Bytes::new()]);
+        assert!(!observed.copy_state_acquisitions[1].reached_eof);
     }
 }

@@ -42,6 +42,8 @@ const CREDENTIAL: &str = "classic-v1-test-credential";
 mod custom_control;
 #[path = "support/idle_observation.rs"]
 mod idle_observation;
+#[path = "../../scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs"]
+mod public_copy_context;
 
 mod native_wire {
     tonic::include_proto!("kuberic.sf.v1");

@@ -912,6 +912,7 @@ const GATES: [Gate; 16] = [
             "hosted_operation_stream_copy_and_eof_wait_for_service_owned_snapshot_ack",
             "successor_inbound_build_retires_native_receiver_instead_of_resetting_metadata",
             "native_build_binding_pins_frozen_source_address_even_when_source_is_unreachable",
+            "public_copy_context::public_build_consumes_target_context_and_installs_nonempty_snapshot",
         ],
         expected: "build target is idle, outside PC/CC, and has invalid progress",
         eligibility: contract_gate,

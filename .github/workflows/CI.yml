@@ -83,6 +83,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
+          components: rustfmt, clippy
           build-warnings: ""
 
       - name: Install pinned source-check tools
@@ -96,6 +97,79 @@ jobs:
 
       - name: Run all source and packaging gates
         run: just nextest-source
+
+      - name: Qualify normal-feature external provider
+        timeout-minutes: 30
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/public-copy-context
+          TMPDIR: ${{ github.workspace }}/target/public-copy-context-scratch
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          set -euo pipefail
+          fixture=scripts/fixtures/classic-v1-provider/Cargo.toml
+          evidence_dir="$GITHUB_WORKSPACE/target/public-copy-context-evidence"
+          mkdir -p "$TMPDIR" "$evidence_dir"
+          cargo generate-lockfile --offline --manifest-path "$fixture"
+          cargo metadata --offline --locked --format-version 1 --manifest-path "$fixture" \
+            > "$evidence_dir/metadata.json"
+          python3 - "$evidence_dir/metadata.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              metadata = json.load(source)
+          runtime_ids = [
+              package["id"] for package in metadata["packages"]
+              if package["name"] == "kuberic-runtime"
+          ]
+          if len(runtime_ids) != 1:
+              raise SystemExit(f"expected one resolved runtime package, got {runtime_ids}")
+          nodes = [
+              node for node in metadata["resolve"]["nodes"]
+              if node["id"] == runtime_ids[0]
+          ]
+          if len(nodes) != 1:
+              raise SystemExit("missing or ambiguous resolved runtime node")
+          features = set(nodes[0]["features"])
+          print(f"independent runtime features (including fixture dev graph): {sorted(features)}")
+          if "host" not in features or "testing" in features:
+              raise SystemExit("external provider must enable host without testing")
+          PY
+          cargo tree --offline --locked -e features -i kuberic-runtime --manifest-path "$fixture"
+          cargo test --offline --locked --manifest-path "$fixture" --lib --test public_copy_context \
+            -- --list > "$evidence_dir/inventory.txt"
+          cat "$evidence_dir/inventory.txt"
+          python3 - "$evidence_dir/inventory.txt" <<'PY'
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              inventory = source.read().splitlines()
+          for name in [
+              "tests::copy_context_policy_rejects_non_target_or_incomplete_streams",
+              "tests::default_copy_context_policy_still_requires_empty_stream",
+              "public_build_consumes_target_context_and_installs_nonempty_snapshot",
+          ]:
+              if inventory.count(f"{name}: test") != 1:
+                  raise SystemExit(f"missing or ambiguous standalone test: {name}")
+          PY
+          cargo test --offline --locked --manifest-path "$fixture" --lib \
+            tests::copy_context_policy_rejects_non_target_or_incomplete_streams -- --exact --nocapture
+          cargo test --offline --locked --manifest-path "$fixture" --lib \
+            tests::default_copy_context_policy_still_requires_empty_stream -- --exact --nocapture
+          cargo test --offline --locked --manifest-path "$fixture" --test public_copy_context \
+            public_build_consumes_target_context_and_installs_nonempty_snapshot -- --exact --nocapture
+          cargo clippy --offline --locked --manifest-path "$fixture" --all-targets -- -D warnings
+          cargo fmt --manifest-path "$fixture" -- --check
+
+      - name: Retain normal-feature provider inventory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: public-copy-context-feature-inventory
+          path: target/public-copy-context-evidence
+          if-no-files-found: ignore
+          retention-days: 1
 
   validate-archive:
     name: Validate exact test coverage
