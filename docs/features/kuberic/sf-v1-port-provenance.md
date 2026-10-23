@@ -250,6 +250,32 @@ and adjacent tests, with actual manager/session/queue/carrier seams.
 | `RemoteSession.cpp:252–365`; `ReliableOperationSender.cpp:113–137,548–755`; `AckSender.cpp:64–208` | Tokio deadlines/Notify drive real StartCopy, replication/context retry and ACK timers; no alternate sender or autonomous component task. |
 | `ReplicaManager.Test.cpp:772–824` | Admission/helper ancestry; lifecycle/cancel/fault/timer vectors derive from production, not native test fixtures. |
 
+### Public target-origin copy-context qualification
+
+Kuberic `d624d40dff2a36d424faa237f5f62082a943bffe` adds a bounded
+**production-source-derived Rust witness**, not a translated native test.
+The native pin above remains
+`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`: target-context acquisition and
+source GetCopyState(start-1) ancestry are the establishment rows above;
+nonnull empty data versus null EOF is the enumeration ancestry. Source
+inspection is not native executable/differential validation.
+
+| Selected Rust ancestry / destination | Actual evidence and boundary |
+|---|---|
+| [Existing external provider][public-context-provider] and [public host/Build harness][public-context-harness] | Opt-in advertised/expected context and callback observations reuse the checked snapshot, service commit, install-before-ACK and retained task owners. Expected bytes validate the actual incoming stream; they never supply it. The default constructor still emits/requires no items. No production runtime logic or protected interface changed. |
+| [Shared standalone scenario][public-context], imported by the [workspace wrapper][public-context-wrapper] | Authenticated public authority/Build through the default factory; distinguishable target/source bytes, middle empty item and actual EOF; zero source-context acquisition. Genuine singleton-source commits copy meaningful application values into fresh idle-target storage, with matched successful Build/Ready and successful public Close/host waits/provider drains. Target bootstrap includes itself but it stays outside source voters with serving reads denied. |
+| [Provider callback controls][public-context-controls], [KSF-05 registration][public-context-ksf] and [standalone CI step][public-context-ci] | Actual local controls reject wrong-origin, missing/changed/reordered/surplus items and stream errors; matching prefixes wait for EOF, and default empty policy rejects even an empty data item. KSF mapping/partition guards and exact ordinary wrapper execution passed. CI metadata/inventory guards accepted real evidence and rejected synthetic missing/ambiguous/feature/selection mutations locally; no remote CI run is claimed. |
+
+The standalone resolved runtime graph enables `host`, not `testing`; workspace
+dev-feature unification does not establish that boundary. Separate actual
+privacy/Rustdoc/source/conformance/feature-off and packaged-consumer gates
+passed. The package gate compiles packaged consumers/test closure; it does not
+execute this scenario from a package. The earlier component witness and
+default empty-context public journey retain their distinct scopes. See
+[reproduction](testing.md#public-target-origin-copy-context); this does not
+qualify arbitrary failed-Build recovery, controller-managed scale-up, native
+wire/binary equivalence, power-loss durability or production readiness.
+
 ### Scoped rejection and primary-local fault entry — F02/F07/F08/F11
 
 The [owner vectors](../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230)
@@ -616,3 +642,11 @@ Future selections must extend this register with immutable pin, path/range/case,
 Rust destination, transformation, retained notice, third-party origin and actual
 execution/review status. Do not omit applicable notices, blindly copy unrelated
 umbrella notices, or infer all-distribution legal certification from this register.
+
+[public-context-provider]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/src/lib.rs#L165-L427
+[public-context-harness]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/kuberic-runtime/tests/classic_v1_production.rs#L534-L972
+[public-context]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
+[public-context-wrapper]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/kuberic-runtime/tests/classic_v1_production.rs#L45-L46
+[public-context-controls]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/src/lib.rs#L717-L903
+[public-context-ksf]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/kuberic-runtime/src/testing/public_v1_conformance.rs#L905-L918
+[public-context-ci]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/.github/workflows/CI.yml#L102-L163
