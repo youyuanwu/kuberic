@@ -40,6 +40,8 @@ const CREDENTIAL: &str = "classic-v1-test-credential";
 
 #[path = "support/custom_control.rs"]
 mod custom_control;
+#[path = "support/idle_observation.rs"]
+mod idle_observation;
 
 mod native_wire {
     tonic::include_proto!("kuberic.sf.v1");
@@ -802,7 +804,7 @@ impl<A: Sample> Node<A> {
         current
     }
 
-    async fn build(
+    async fn build_idle(
         &mut self,
         target: &mut Self,
         epoch: Epoch,
@@ -848,6 +850,16 @@ impl<A: Sample> Node<A> {
         };
         target.install_build_authority(authority.clone()).await;
         self.command(PublicOperationProgram::Build(build)).await;
+        authority
+    }
+
+    async fn build(
+        &mut self,
+        target: &mut Self,
+        epoch: Epoch,
+        current: &ConfigurationDescriptor,
+    ) -> PublicInboundBuildAuthority {
+        let authority = self.build_idle(target, epoch, current).await;
         target
             .command(PublicOperationProgram::Role {
                 epoch,
@@ -1429,6 +1441,28 @@ async fn public_factory_primary_process_renewal_retains_exact_role_address_autho
             waiter.abort();
             assert!(waiter.await.unwrap_err().is_cancelled());
             replacement.service.primary_release.notify_one();
+            if fail_replay {
+                let mut client = proto::agent_control_client::AgentControlClient::connect(
+                    replacement.control_address.clone()).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(10),
+                    client.execute(authorized(replacement.renewal_request(replay.clone()))))
+                    .await.expect("exact retry observes the retained application failure");
+                assert!(result.unwrap_err().message().contains("replacement application role rejected"));
+                let rejected = replacement.report().await;
+                assert!(!rejected.completed_operations.iter().any(|completion|
+                    completion.operation_id == role_intent.operation_id),
+                    "an engine observer cannot publish application failure as contained completion");
+                assert_ne!(rejected.write_status, AccessStatus::Granted);
+                assert!(rejected.service_location.is_none());
+                assert!(replacement.service.inner.replicate_put("renewal".into(), "rejected".into()).await.is_err());
+                assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
+                let drainage = replacement.stop().await;
+                // Uncertain application failure requires actual Abort/join;
+                // the KV committer retains its expected aborted-work result.
+                assert!(matches!(drainage, Some(kuberic_runtime::RuntimeError::OperationCancelled)),
+                    "{drainage:?}");
+                continue;
+            }
             let completed = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let report = replacement.report().await;
@@ -1449,28 +1483,6 @@ async fn public_factory_primary_process_renewal_retains_exact_role_address_autho
             assert_eq!(completed.history, fresh.history);
             assert_eq!(completed.storage_incarnation, fresh.storage_incarnation);
             replacement.revision = completed.revision;
-            if fail_replay {
-                assert!(
-                    matches!(&completed.result, PublicV1OperationResult::Failed(error)
-                        if error.contains("replacement application role rejected")),
-                    "{completed:?}"
-                );
-                replacement
-                    .command(PublicOperationProgram::Configuration(PublicConfiguration {
-                        current: configuration,
-                        previous: None,
-                        replicas: Vec::new(),
-                    }))
-                    .await;
-                let rejected = replacement.report().await;
-                assert!(rejected.configuration.is_some());
-                assert_ne!(rejected.write_status, AccessStatus::Granted);
-                assert!(rejected.service_location.is_none());
-                assert!(replacement.service.inner.replicate_put("renewal".into(), "rejected".into()).await.is_err());
-                assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
-                replacement.close().await;
-                continue;
-            }
             assert_eq!(completed.result, PublicV1OperationResult::Succeeded);
             replacement.renewal(replay.clone()).await;
             assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);

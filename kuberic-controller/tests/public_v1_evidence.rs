@@ -99,6 +99,9 @@ fn report(
     completion: PublicV1OperationCompletion,
 ) -> PublicV1AgentReport {
     PublicV1AgentReport {
+        engine_idle: None,
+        remote_builds: Vec::new(),
+        retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
         identity: accepted.identity.clone(),
@@ -221,6 +224,7 @@ fn call_for(consumer: PublicV1EvidenceConsumer) -> PublicV1CallKind {
 struct DispatchProbe {
     observed: Mutex<Option<PublicV1AcceptedTransitionStatus>>,
     dispatches: AtomicUsize,
+    report: Mutex<Option<PublicV1AgentReport>>,
 }
 
 #[async_trait::async_trait]
@@ -247,8 +251,142 @@ impl PublicV1OperationApi for DispatchProbe {
         _scope: &PublicV1Scope,
         _expected: &PublicV1AcceptedTransitionStatus,
     ) -> Result<PublicV1AgentReport, String> {
-        Err("dispatch probe does not publish runtime reports".into())
+        self.report
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "dispatch probe does not publish runtime reports".into())
     }
+}
+
+#[async_trait::async_trait]
+impl kuberic_controller::evaluator::testing::PublicV1EvidenceApi for DispatchProbe {
+    async fn observe_public_v1_evidence_status(
+        &self,
+        _: &PublicV1Scope,
+    ) -> Result<Option<PublicV1AcceptedTransitionStatus>, String> {
+        Ok(self.observed.lock().unwrap().clone())
+    }
+    async fn persist_public_v1_evidence_status(
+        &self,
+        _: &PublicV1Scope,
+        _: &PublicV1AcceptedTransitionStatus,
+        _: &PublicV1AcceptedStatus,
+    ) -> Result<(), String> {
+        panic!("pending operation must not persist a completion")
+    }
+    async fn accept_public_v1_completion(
+        &self,
+        _: &PublicV1Scope,
+        _: &PublicV1AcceptedTransitionStatus,
+        _: &PublicV1OperationCompletion,
+    ) -> Result<(), String> {
+        panic!("pending operation must not be accepted")
+    }
+    async fn retire_public_v1_incarnation(
+        &self,
+        _: &PublicV1Scope,
+        _: &PublicV1AcceptedTransitionStatus,
+        _: &PublicV1OperationCompletion,
+        _: &PublicV1ResourceAuthority,
+    ) -> Result<(), String> {
+        panic!("pending operation must not retire its incarnation")
+    }
+    async fn provision_public_v1_replacement(
+        &self,
+        _: &PublicV1Scope,
+        _: &PublicV1AcceptedTransitionStatus,
+        _: &PublicV1OperationCompletion,
+        _: &PublicV1ResourceAuthority,
+        _: &CanonicalReplicaRebuildRequired,
+    ) -> Result<(), String> {
+        panic!("pending operation must not provision a replacement")
+    }
+}
+
+#[tokio::test]
+async fn retry_pending_is_nonterminal_and_explicitly_redispatches_only_frozen_authority() {
+    use kuberic_controller::evaluator::testing::{
+        PublicV1EvidencePlan, plan_public_v1_evidence, reconcile_public_v1_operation,
+    };
+    use kuberic_runtime::protocol::public_operations::PublicV1RetryPendingOperation;
+    let authority = accepted();
+    let program = PublicOperationProgram::Role {
+        epoch: Epoch::new(0, 1),
+        role: ReplicaRole::Primary,
+    };
+    let mut intent = operation_intent(&authority, "repeatable-role", program);
+    intent.process_session_id = ProcessSessionId::new("session-1");
+    let mut witness = completion(
+        &authority,
+        "repeatable-role",
+        PublicV1CallKind::Role,
+        PublicV1OperationResult::Succeeded,
+    );
+    witness.revision = intent.revision;
+    witness.input_digest = intent.input_digest.clone();
+    witness.previous_configuration_id = None;
+    witness.current_configuration_id = None;
+    let expected = transition(
+        authority.clone(),
+        PublicV1EvidenceConsumer::Topology,
+        &witness,
+        None,
+    );
+    let mut pending = report(&authority, witness);
+    pending.completed_operations.clear();
+    pending
+        .retry_pending_operations
+        .push(PublicV1RetryPendingOperation {
+            intent: intent.clone(),
+            attempt: 1,
+            failure: "declared quiescent callback failure".into(),
+        });
+    assert_eq!(
+        plan_public_v1_evidence(&expected, &pending).unwrap(),
+        PublicV1EvidencePlan::Wait
+    );
+    let probe = DispatchProbe {
+        observed: Mutex::new(Some(expected.clone())),
+        dispatches: AtomicUsize::new(0),
+        report: Mutex::new(Some(pending.clone())),
+    };
+    let command = ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
+        target: replica(1),
+        intent: intent.clone(),
+    }));
+    assert_eq!(
+        reconcile_public_v1_operation(&probe, &test_scope(), command.clone())
+            .await
+            .unwrap(),
+        PublicV1ReconciliationOutcome::Waiting
+    );
+    assert_eq!(probe.dispatches.load(Ordering::SeqCst), 1);
+    assert!(
+        probe
+            .observed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .evidence
+            .completed_operations
+            .is_empty()
+    );
+    let changed = &mut pending.retry_pending_operations[0].intent;
+    changed.program = Some(PublicOperationProgram::Role {
+        epoch: Epoch::new(0, 2),
+        role: ReplicaRole::Primary,
+    });
+    changed.input_digest = changed.program.as_ref().unwrap().digest();
+    pending.validate().unwrap();
+    *probe.report.lock().unwrap() = Some(pending);
+    assert!(
+        reconcile_public_v1_operation(&probe, &test_scope(), command)
+            .await
+            .is_err()
+    );
+    assert_eq!(probe.dispatches.load(Ordering::SeqCst), 1);
 }
 
 fn test_scope() -> PublicV1Scope {
@@ -432,6 +570,7 @@ async fn wrong_operation_target_is_fenced_before_dispatch_for_every_mutating_pro
             let probe = DispatchProbe {
                 observed: Mutex::new(Some(expected.clone())),
                 dispatches: AtomicUsize::new(0),
+                report: Mutex::new(None),
             };
             let command = ProtocolCommand::PublicV1Operation(Box::new(PublicV1OperationCommand {
                 target: target.clone(),

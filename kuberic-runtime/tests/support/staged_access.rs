@@ -421,6 +421,84 @@ async fn configuration(pair: &Pair) -> PublicConfiguration {
     }
 }
 
+// A new joint stage follows a new message epoch, not the completed Current
+// stage of Pair::start. Advance the real children and target transport authority;
+// leave the source joint callback to the operation under test.
+async fn next_joint(
+    pair: &mut Pair,
+    previous: ConfigurationDescriptor,
+    previous_peers: Vec<PublicReplicaDescriptor>,
+) -> PublicConfiguration {
+    let epoch = Epoch::new(
+        pair.configuration.epoch.data_loss_number,
+        pair.configuration.epoch.configuration_number + 1,
+    );
+    pair.configuration = ConfigurationDescriptor::new(
+        epoch,
+        pair.configuration.primary_id,
+        pair.configuration.members.clone(),
+        pair.configuration.write_quorum,
+    );
+    for node in [&pair.source, &pair.target] {
+        node.command(PublicOperationProgram::Epoch { epoch })
+            .await
+            .unwrap();
+    }
+    let mut target_peers = vec![pair.source.descriptor(ReplicaRole::Primary).await];
+    target_peers.extend(previous_peers.iter().cloned());
+    pair.target
+        .command(PublicOperationProgram::Configuration(PublicConfiguration {
+            current: pair.configuration.clone(),
+            previous: Some(previous.clone()),
+            replicas: target_peers,
+        }))
+        .await
+        .unwrap();
+    let mut input = PublicConfiguration {
+        previous: Some(previous),
+        ..configuration(pair).await
+    };
+    input.replicas.extend(previous_peers);
+    input
+}
+
+// Standalone Swap really catches up the starting authority before UpdateEpoch.
+// Moving the peer first invalidates that live channel and deadlocks its quorum.
+// Prepare the peer only after the source's successful native epoch callback;
+// the second wait then uses matching real transport authority on both hosts.
+async fn advance_swap_peer(
+    pair: &Pair,
+    configuration: PublicConfiguration,
+) -> tokio::task::JoinHandle<()> {
+    let observed = pair.source.service.observed.clone();
+    let target = pair.target.handle();
+    let epoch = configuration.current.epoch;
+    let epoch_intent = pair
+        .target
+        .intent(PublicOperationProgram::Epoch { epoch })
+        .await;
+    let mut configuration_intent = pair
+        .target
+        .intent(PublicOperationProgram::Configuration(configuration))
+        .await;
+    configuration_intent.revision = epoch_intent.revision + 1;
+    tokio::spawn(async move {
+        eventually(|| {
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, NativeCall::Epoch(applied) if *applied == epoch))
+        })
+        .await;
+        target.execute_public_v1(epoch_intent).await.unwrap();
+        target
+            .execute_public_v1(configuration_intent)
+            .await
+            .unwrap();
+    })
+}
+
 async fn planner_primary_configuration(pair: &Pair) -> PublicConfiguration {
     use kuberic_controller::evaluator::public_v1_topology::{
         PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
@@ -603,9 +681,8 @@ async fn selected_changed_primary_context_cannot_borrow_same_primary_grants() {
     use AccessStatus::*;
     let root = root();
     for catch_up in [false, true] {
-        let pair = Pair::start(&root.path().join(catch_up.to_string()), 1).await;
-        let mut changed = configuration(&pair).await;
-        changed.previous = Some(ConfigurationDescriptor::new(
+        let mut pair = Pair::start(&root.path().join(catch_up.to_string()), 1).await;
+        let previous = ConfigurationDescriptor::new(
             Epoch::new(0, 0),
             pair.target.identity.replica_id,
             vec![
@@ -619,7 +696,8 @@ async fn selected_changed_primary_context_cannot_borrow_same_primary_grants() {
                 },
             ],
             2,
-        ));
+        );
+        let changed = next_joint(&mut pair, previous, Vec::new()).await;
         changed.validate().unwrap();
         let program = if catch_up {
             PublicOperationProgram::CatchUp {
@@ -635,6 +713,14 @@ async fn selected_changed_primary_context_cannot_borrow_same_primary_grants() {
         entered(&cut, &mut task).await;
         stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
         pair.source.handle().set_public_operation_cut(None);
+        pair.target
+            .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                current: pair.configuration.clone(),
+                previous: None,
+                replicas: vec![pair.source.descriptor(ReplicaRole::Primary).await],
+            }))
+            .await
+            .unwrap();
         if catch_up {
             // The successor replaces the uncertain wait, not its missing promotion evidence.
             pair.source
@@ -687,18 +773,15 @@ async fn selected_changed_primary_context_after_revoke_cannot_borrow_demotion_re
         pair.configuration.members.clone(),
         2,
     );
-    pair.target
-        .command(PublicOperationProgram::Epoch { epoch })
-        .await
-        .unwrap();
-    pair.target
-        .command(PublicOperationProgram::Configuration(PublicConfiguration {
+    let peer = advance_swap_peer(
+        &pair,
+        PublicConfiguration {
             current: refreshed.current.clone(),
             previous: None,
             replicas: vec![pair.source.descriptor(ReplicaRole::Primary).await],
-        }))
-        .await
-        .unwrap();
+        },
+    )
+    .await;
     let mut final_configuration = refreshed.clone();
     final_configuration.replicas[0].must_catchup = false;
     let old_cut = hold(&pair.source, Cut::BeforeInstruction, 5);
@@ -716,6 +799,7 @@ async fn selected_changed_primary_context_after_revoke_cannot_borrow_demotion_re
         .await;
     let mut old_task = execute(&pair.source, swap);
     entered(&old_cut, &mut old_task).await;
+    peer.await.unwrap();
     stage(&pair.source, Granted, ReconfigurationPending).await;
     let mut changed = final_configuration.clone();
     changed.previous = Some(ConfigurationDescriptor::new(
@@ -779,18 +863,15 @@ async fn demote_before_repromotion(
         pair.configuration.members.clone(),
         2,
     );
-    pair.target
-        .command(PublicOperationProgram::Epoch { epoch })
-        .await
-        .unwrap();
-    pair.target
-        .command(PublicOperationProgram::Configuration(PublicConfiguration {
+    let peer = advance_swap_peer(
+        pair,
+        PublicConfiguration {
             current: refreshed.current.clone(),
             previous: None,
             replicas: vec![pair.source.descriptor(ReplicaRole::Primary).await],
-        }))
-        .await
-        .unwrap();
+        },
+    )
+    .await;
     let previous = refreshed.current.clone();
     let intent = pair
         .source
@@ -823,6 +904,7 @@ async fn demote_before_repromotion(
         );
         None
     };
+    peer.await.unwrap();
     stage(
         &pair.source,
         AccessStatus::NotPrimary,
@@ -1027,7 +1109,26 @@ async fn superseded_nonprimary_reservation(recipe: bool, swap: bool) {
             let (previous, old) =
                 demote_before_repromotion(&pair, composed, Some(Cut::InstructionSelected)).await;
             let program = if swap {
-                old.as_ref().unwrap().2.program.clone().unwrap()
+                let mut program = old.as_ref().unwrap().2.program.clone().unwrap();
+                if let PublicOperationProgram::Swap {
+                    starting,
+                    refreshed,
+                    epoch,
+                    ..
+                } = &mut program
+                {
+                    // This successor is new work, not exact replay of the
+                    // predecessor's now-retired pre-epoch channel.
+                    *starting = refreshed.clone();
+                    *epoch = Epoch::new(0, 3);
+                    refreshed.current = ConfigurationDescriptor::new(
+                        *epoch,
+                        starting.current.primary_id,
+                        starting.current.members.clone(),
+                        starting.current.write_quorum,
+                    );
+                }
+                program
             } else {
                 PublicOperationProgram::Role {
                     epoch: previous.epoch,
@@ -1548,17 +1649,9 @@ async fn selected_resumed_promotion_cannot_clear_fault_terminal_or_late_generati
 async fn selected_same_primary_joint_and_final_use_real_c_and_p() {
     use AccessStatus::*;
     let root = root();
-    let pair = Pair::start(root.path(), 1).await;
-    let mut joint = configuration(&pair).await;
-    joint.previous = Some(joint.current.clone());
-    pair.target
-        .command(PublicOperationProgram::Configuration(PublicConfiguration {
-            current: joint.current.clone(),
-            previous: joint.previous.clone(),
-            replicas: vec![pair.source.descriptor(ReplicaRole::Primary).await],
-        }))
-        .await
-        .unwrap();
+    let mut pair = Pair::start(root.path(), 1).await;
+    let previous = pair.configuration.clone();
+    let joint = next_joint(&mut pair, previous, Vec::new()).await;
     let cut = hold(&pair.source, Cut::BeforeInstruction, 1);
     let intent = pair
         .source
@@ -1582,11 +1675,13 @@ async fn selected_same_primary_joint_and_final_use_real_c_and_p() {
 
     let resource = pair.source.history.resource_uid.clone();
     let mut previous_only = Node::start(&root.path().join("previous"), &resource, 3).await;
-    previous_only.open(ReplicaRole::IdleSecondary, EPOCH).await;
+    previous_only
+        .open(ReplicaRole::IdleSecondary, pair.configuration.epoch)
+        .await;
     pair.source.build(&previous_only, &pair.configuration).await;
     previous_only
         .command(PublicOperationProgram::Role {
-            epoch: EPOCH,
+            epoch: pair.configuration.epoch,
             role: ReplicaRole::ActiveSecondary,
         })
         .await
@@ -1605,9 +1700,8 @@ async fn selected_same_primary_joint_and_final_use_real_c_and_p() {
         is_up: false,
         is_ready: false,
     };
-    let mut no_p = joint;
-    no_p.previous = Some(ConfigurationDescriptor::new(
-        EPOCH,
+    let previous = ConfigurationDescriptor::new(
+        pair.configuration.epoch,
         pair.source.identity.replica_id,
         vec![
             ConfigurationMember {
@@ -1620,8 +1714,7 @@ async fn selected_same_primary_joint_and_final_use_real_c_and_p() {
             },
         ],
         1,
-    ));
-    no_p.replicas.push(peer);
+    );
     // Finish the prior joint configuration before selecting a different previous electorate.
     pair.source
         .command(PublicOperationProgram::Configuration(
@@ -1629,6 +1722,7 @@ async fn selected_same_primary_joint_and_final_use_real_c_and_p() {
         ))
         .await
         .unwrap();
+    let no_p = next_joint(&mut pair, previous, vec![peer]).await;
     pair.source
         .command(PublicOperationProgram::Configuration(no_p.clone()))
         .await
@@ -2066,22 +2160,19 @@ async fn selected_swap_standalone_and_composed_current_and_joint_stages() {
                 let directory = root
                     .path()
                     .join(format!("{composed}-{joint}-{position:?}-{index}"));
-                let pair = Pair::start(&directory, 1).await;
-                let mut starting = configuration(&pair).await;
-                starting.replicas[0].must_catchup = true;
-                if joint {
-                    starting.previous = Some(starting.current.clone());
-                }
-                if joint {
-                    pair.target
-                        .command(PublicOperationProgram::Configuration(PublicConfiguration {
-                            current: starting.current.clone(),
-                            previous: starting.previous.clone(),
-                            replicas: vec![pair.source.descriptor(ReplicaRole::Primary).await],
-                        }))
+                let mut pair = Pair::start(&directory, 1).await;
+                let mut starting = if joint {
+                    let previous = pair.configuration.clone();
+                    let input = next_joint(&mut pair, previous, Vec::new()).await;
+                    pair.source
+                        .command(PublicOperationProgram::Configuration(input.clone()))
                         .await
                         .unwrap();
-                }
+                    input
+                } else {
+                    configuration(&pair).await
+                };
+                starting.replicas[0].must_catchup = true;
                 if composed {
                     pair.source
                         .command(PublicOperationProgram::CatchUp {
@@ -2091,7 +2182,7 @@ async fn selected_swap_standalone_and_composed_current_and_joint_stages() {
                         .await
                         .unwrap();
                 }
-                let epoch = Epoch::new(0, 2);
+                let epoch = Epoch::new(0, pair.configuration.epoch.configuration_number + 1);
                 let mut refreshed = starting.clone();
                 refreshed.current = ConfigurationDescriptor::new(
                     epoch,
@@ -2104,19 +2195,7 @@ async fn selected_swap_standalone_and_composed_current_and_joint_stages() {
                     previous: refreshed.previous.clone(),
                     replicas: vec![pair.source.descriptor(ReplicaRole::Primary).await],
                 };
-                let prepare_before = expected_write != Granted;
-                if prepare_before {
-                    pair.target
-                        .command(PublicOperationProgram::Epoch { epoch })
-                        .await
-                        .unwrap();
-                    pair.target
-                        .command(PublicOperationProgram::Configuration(
-                            target_configuration.clone(),
-                        ))
-                        .await
-                        .unwrap();
-                }
+                let peer = advance_swap_peer(&pair, target_configuration).await;
                 let intent = pair
                     .source
                     .intent(PublicOperationProgram::Swap {
@@ -2134,17 +2213,8 @@ async fn selected_swap_standalone_and_composed_current_and_joint_stages() {
                 let mut task = execute(&pair.source, intent);
                 entered(&cut, &mut task).await;
                 stage(&pair.source, expected_read, expected_write).await;
-                if !prepare_before {
-                    pair.target
-                        .command(PublicOperationProgram::Epoch { epoch })
-                        .await
-                        .unwrap();
-                    pair.target
-                        .command(PublicOperationProgram::Configuration(target_configuration))
-                        .await
-                        .unwrap();
-                }
                 finish(&pair.source, &cut, task).await;
+                peer.await.unwrap();
                 stage(&pair.source, NotPrimary, NotPrimary).await;
                 pair.source
                     .handle()

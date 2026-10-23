@@ -531,9 +531,11 @@ fn factory_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
             "implReplicatorforProduction{",
             "implPrimaryReplicatorforProduction{",
             "implStateReplicatorforProduction{",
-            "implNativeRuntimeControlforProduction{",
+            "implcrate::replicator::coordinator::EffectsforProduction{",
+            "crate::replicator::coordinator::Control::new(owner.context.clone(),owner.clone())",
+            "owner.context.access.retain_creation_control(",
             "Ok(ReplicatorInterfaces::primary(",
-            ".with_native_runtime_control(owner)",
+            ".with_native_runtime_control(control)",
         ]
         .into_iter()
         .all(|binding| occurrences(&production, binding) == 1)
@@ -804,9 +806,13 @@ fn replacement_ownership_gate() {
         ..production_sources()
     });
     let alternate_composition = NATIVE_PRODUCTION_SOURCE.replacen(
-        ".with_native_runtime_control(owner)",
-        ".with_alternate_runtime_control(owner)",
+        ".with_native_runtime_control(control)",
+        ".with_alternate_runtime_control(control)",
         1,
+    );
+    assert_ne!(
+        alternate_composition, NATIVE_PRODUCTION_SOURCE,
+        "composition mutation must alter the actual common coordinator attachment"
     );
     let alternate_native_composition = discover_inventory(&ProductionSources {
         native_production_source: &alternate_composition,

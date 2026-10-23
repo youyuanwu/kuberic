@@ -6,17 +6,18 @@ use std::sync::Arc;
 use crate::application::StatefulServiceReplica;
 use crate::host::operation::{CallbackContainment, PartitionOperation, PartitionOperationRegistry};
 use crate::host::state::{
-    DataLossOutcome, PublicInstruction, PublicInstructionOutcome, PublicOperationDisposition,
-    PublicOperationRecord, PublicOperationStage,
+    DataLossOutcome, PublicCallbackFailure, PublicCallbackFamily, PublicInstruction,
+    PublicInstructionOutcome, PublicOperationDisposition, PublicOperationRecord,
+    PublicOperationStage,
 };
 use crate::host::store::AgentStore;
 use crate::host::{HostError, Result};
 use crate::protocol::public_operations::{
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, PossibleDataLossIntent,
-    PublicBuildInput, PublicCatchUpMode, PublicLifecycleInput, PublicLifecycleRecipe,
-    PublicOperationIntent, PublicOperationProgram, PublicProgress, PublicV1AgentReport,
-    PublicV1CallKind, PublicV1Identity, PublicV1OperationCompletion, PublicV1OperationResult,
-    ReplicaRebuildRequired, ServiceLocation,
+    PublicBuildInput, PublicCatchUpMode, PublicConfiguration, PublicLifecycleInput,
+    PublicLifecycleRecipe, PublicOperationIntent, PublicOperationProgram, PublicProgress,
+    PublicV1AgentReport, PublicV1CallKind, PublicV1Identity, PublicV1OperationCompletion,
+    PublicV1OperationResult, ReplicaRebuildRequired, ServiceLocation,
 };
 use crate::protocol::types::{
     AccessStatus, ConfigurationId, ProcessSessionId, ReplicaRole, ReplicatorCreationId,
@@ -26,7 +27,7 @@ use crate::replicator::{
 };
 
 #[path = "public_lifecycle_program.rs"]
-mod program;
+pub(super) mod program;
 #[path = "public_lifecycle_terminal.rs"]
 mod terminal;
 pub(crate) use program::{operation_instructions, repeatable, replayable};
@@ -63,6 +64,47 @@ pub(crate) type TerminalDrain =
 pub(crate) type AccessFactory =
     Arc<dyn Fn(&Arc<PartitionOperation>) -> Option<Arc<super::hosting::AccessOwner>> + Send + Sync>;
 
+#[derive(Clone, Default)]
+pub(crate) struct PublicCallbackRetryProof {
+    families: std::collections::BTreeSet<PublicCallbackFamily>,
+    returned_failure: Arc<std::sync::Mutex<Option<PublicCallbackFailure>>>,
+}
+
+impl PublicCallbackRetryProof {
+    fn for_attempt(&self) -> Self {
+        Self {
+            families: self.families.clone(),
+            returned_failure: Default::default(),
+        }
+    }
+
+    fn returned_error(
+        &self,
+        family: PublicCallbackFamily,
+        instruction: PublicInstruction,
+        error: &crate::RuntimeError,
+    ) {
+        if self.families.contains(&family)
+            && family.allows(instruction)
+            && !matches!(error, crate::RuntimeError::ReplicaRebuildRequired(_))
+        {
+            *self.returned_failure.lock().unwrap() = Some(PublicCallbackFailure {
+                instruction,
+                family,
+                error: error.to_string(),
+            });
+        }
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn declared(families: impl IntoIterator<Item = PublicCallbackFamily>) -> Self {
+        Self {
+            families: families.into_iter().collect(),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) application: Arc<dyn StatefulServiceReplica>,
@@ -78,6 +120,7 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) wait_for_containment: bool,
     pub(crate) preempt_retained_owner: bool,
     pub(crate) native_observer_callbacks: bool,
+    pub(crate) retry_proof: PublicCallbackRetryProof,
     pub(crate) terminal_drain: TerminalDrain,
     pub(super) terminal_cleanup: Option<Arc<terminal::TerminalCleanup>>,
     pub(crate) access_factory: Option<AccessFactory>,
@@ -153,7 +196,11 @@ impl PublicOperationCut {
 }
 
 impl PublicLifecycleCallbacks {
-    async fn change_primary_role(&self, epoch: crate::protocol::types::Epoch) -> crate::Result<()> {
+    async fn change_primary_role(
+        &self,
+        epoch: crate::protocol::types::Epoch,
+        instruction: PublicInstruction,
+    ) -> crate::Result<()> {
         if self
             .access_owner
             .as_ref()
@@ -180,9 +227,18 @@ impl PublicLifecycleCallbacks {
             )
             .await;
         }
-        self.replicator
+        let result = self
+            .replicator
             .change_role(epoch, ReplicaRole::Primary)
-            .await
+            .await;
+        if let Err(error) = &result {
+            self.retry_proof.returned_error(
+                PublicCallbackFamily::ReplicatorRole,
+                instruction,
+                error,
+            );
+        }
+        result
     }
 
     pub(crate) fn application_control_matches(&self, control: &Arc<dyn Replicator>) -> bool {
@@ -271,19 +327,67 @@ pub(crate) async fn launch(
     registry: &Arc<PartitionOperationRegistry>,
     store: Arc<dyn AgentStore>,
     intent: PublicOperationIntent,
-    mut callbacks: PublicLifecycleCallbacks,
+    callbacks: PublicLifecycleCallbacks,
 ) -> Result<Arc<PartitionOperation>> {
+    launch_attempt(registry, store, intent, callbacks)
+        .await
+        .map(|(operation, _)| operation)
+}
+
+pub(crate) async fn launch_attempt(
+    registry: &Arc<PartitionOperationRegistry>,
+    store: Arc<dyn AgentStore>,
+    intent: PublicOperationIntent,
+    callbacks: PublicLifecycleCallbacks,
+) -> Result<(Arc<PartitionOperation>, u64)> {
+    launch_bound_attempt(registry, store, intent, callbacks, |_| ())
+        .await
+        .map(|(operation, attempt, ())| (operation, attempt))
+}
+
+pub(crate) async fn launch_bound_attempt<T>(
+    registry: &Arc<PartitionOperationRegistry>,
+    store: Arc<dyn AgentStore>,
+    intent: PublicOperationIntent,
+    mut callbacks: PublicLifecycleCallbacks,
+    bind_observer: impl FnOnce(&Arc<PartitionOperation>) -> T,
+) -> Result<(Arc<PartitionOperation>, u64, T)> {
+    let dispatch_lock = registry.dispatch_lock(&intent.operation_id);
+    let _dispatch = dispatch_lock.lock().await;
     intent
         .validate()
         .map_err(|message| HostError::CommandRejected(message.into()))?;
     callbacks.validate_intent_capabilities(&intent)?;
     callbacks.aborted = registry.abort_guard();
+    callbacks.retry_proof = callbacks.retry_proof.for_attempt();
+    if intent.class.is_terminal()
+        || intent
+            .lifecycle
+            .as_ref()
+            .is_some_and(|input| input.possible_data_loss == PossibleDataLossIntent::Possible)
+    {
+        callbacks.retry_proof = Default::default();
+    }
     if intent.lifecycle.is_none() && intent.program.is_none() {
         return Err(HostError::CommandRejected(
             "preview lifecycle input required".into(),
         ));
     }
     let operation = registry.admit(intent.clone()).await?;
+    let retry_prefix = if operation.snapshot().stage == PublicOperationStage::RetryPending
+        && operation
+            .snapshot()
+            .retry_failure
+            .as_ref()
+            .is_some_and(|failure| callbacks.retry_proof.families.contains(&failure.family))
+    {
+        let failed = operation.snapshot();
+        operation.resume_returned_failure().await?;
+        Some(failed)
+    } else {
+        None
+    };
+    let attempt = operation.snapshot().attempt;
     if !matches!(
         intent.program,
         Some(PublicOperationProgram::Progress { .. } | PublicOperationProgram::Build(_))
@@ -299,11 +403,12 @@ pub(crate) async fn launch(
         }
         callbacks.access_owner = factory(&operation);
     }
+    let observer = bind_observer(&operation);
     if intent.class.is_terminal() {
         registry.fence();
         if operation.snapshot().stage == PublicOperationStage::ContainmentPending {
             terminal::recover(registry, &operation, callbacks).await?;
-            return Ok(operation);
+            return Ok((operation, attempt, observer));
         }
         if callbacks.preempt_retained_owner
             && registry.has_uncontained_predecessors(&operation).await
@@ -364,21 +469,33 @@ pub(crate) async fn launch(
                 CallbackContainment::ObjectOwnedOnInterruption
             };
             operation
-                .spawn_root(containment, async move {
-                    let _terminal_guard = terminal_guard;
-                    let mut access_guard =
-                        super::hosting::AccessRootGuard::new(callbacks.access_owner.clone());
-                    let result = if intent.program.is_some() {
-                        program::execute(store, intent, callbacks).await
-                    } else {
-                        let input = intent.lifecycle.clone().expect("validated lifecycle");
-                        execute(store, intent, input, callbacks).await
-                    };
-                    if result.is_ok() {
-                        access_guard.succeeded();
-                    }
-                    result
-                })
+                .spawn_root_with_retry(
+                    containment,
+                    Some(callbacks.retry_proof.returned_failure.clone()),
+                    async move {
+                        let _terminal_guard = terminal_guard;
+                        let mut access_guard =
+                            super::hosting::AccessRootGuard::new(callbacks.access_owner.clone());
+                        let result = async {
+                            if let (Some(owner), Some(failed)) =
+                                (&callbacks.access_owner, &retry_prefix)
+                            {
+                                owner.restore_retry_prefix(store.as_ref(), failed).await?;
+                            }
+                            if intent.program.is_some() {
+                                program::execute(store, intent, callbacks).await
+                            } else {
+                                let input = intent.lifecycle.clone().expect("validated lifecycle");
+                                execute(store, intent, input, callbacks).await
+                            }
+                        }
+                        .await;
+                        if result.is_ok() {
+                            access_guard.succeeded();
+                        }
+                        result
+                    },
+                )
                 .await?;
             Ok(())
         }
@@ -392,7 +509,7 @@ pub(crate) async fn launch(
             }
         });
     }
-    Ok(operation)
+    Ok((operation, attempt, observer))
 }
 
 async fn execute(
@@ -437,12 +554,15 @@ async fn execute(
         let outcome = match instruction {
             ReplicatorPrimary => {
                 local_callback(
-                    callbacks.change_primary_role(input.epoch).await,
+                    callbacks
+                        .change_primary_role(input.epoch, instruction)
+                        .await,
                     store.as_ref(),
                     &intent,
                     index,
                     instruction,
                     input.epoch,
+                    None,
                 )
                 .await?;
                 PublicInstructionOutcome::Done
@@ -455,6 +575,7 @@ async fn execute(
                     index,
                     instruction,
                     input.epoch,
+                    Some((&callbacks.retry_proof, PublicCallbackFamily::Epoch)),
                 )
                 .await?;
                 PublicInstructionOutcome::Done
@@ -470,6 +591,10 @@ async fn execute(
                     index,
                     instruction,
                     input.epoch,
+                    Some((
+                        &callbacks.retry_proof,
+                        PublicCallbackFamily::ApplicationRole,
+                    )),
                 )
                 .await?;
                 PublicInstructionOutcome::ApplicationRole(role.service_address)
@@ -518,18 +643,22 @@ async fn execute(
                     index,
                     instruction,
                     input.epoch,
+                    None,
                 )
                 .await?,
             ),
             CurrentConfiguration => {
-                let configuration = input.configuration();
+                let configuration =
+                    super::public_action_state::configuration_at(&intent, instruction)
+                        .expect("current configuration instruction");
                 local_callback(
-                    program::install_current(&callbacks, &configuration).await,
+                    program::install_current(&callbacks, &configuration, instruction).await,
                     store.as_ref(),
                     &intent,
                     index,
                     instruction,
                     input.epoch,
+                    None,
                 )
                 .await?;
                 PublicInstructionOutcome::Done
@@ -537,26 +666,44 @@ async fn execute(
             CatchUpConfiguration => {
                 let configuration = input.configuration();
                 local_callback(
-                    program::install(store.as_ref(), &callbacks, &configuration, true).await,
+                    program::install(
+                        store.as_ref(),
+                        &callbacks,
+                        &configuration,
+                        true,
+                        instruction,
+                    )
+                    .await,
                     store.as_ref(),
                     &intent,
                     index,
                     instruction,
                     input.epoch,
+                    None,
                 )
                 .await?;
                 PublicInstructionOutcome::Done
             }
             CatchUp => {
                 if index == start && start > 0 {
-                    let configuration = input.configuration();
+                    let configuration =
+                        super::public_action_state::configuration_at(&intent, instruction)
+                            .expect("catch-up configuration");
                     local_callback(
-                        program::install(store.as_ref(), &callbacks, &configuration, true).await,
+                        program::install(
+                            store.as_ref(),
+                            &callbacks,
+                            &configuration,
+                            true,
+                            instruction,
+                        )
+                        .await,
                         store.as_ref(),
                         &intent,
                         index,
                         instruction,
                         input.epoch,
+                        None,
                     )
                     .await?;
                     if let Some(owner) = &callbacks.access_owner {
@@ -573,6 +720,7 @@ async fn execute(
                     index,
                     instruction,
                     input.epoch,
+                    Some((&callbacks.retry_proof, PublicCallbackFamily::CatchUp)),
                 )
                 .await?;
                 PublicInstructionOutcome::Done
@@ -589,6 +737,7 @@ async fn execute(
                     index,
                     instruction,
                     input.epoch,
+                    None,
                 )
                 .await?;
                 PublicInstructionOutcome::Done
@@ -680,6 +829,7 @@ async fn local_callback<T>(
     index: usize,
     instruction: PublicInstruction,
     epoch: crate::protocol::types::Epoch,
+    retry: Option<(&PublicCallbackRetryProof, PublicCallbackFamily)>,
 ) -> Result<T> {
     match result {
         Ok(value) => Ok(value),
@@ -711,7 +861,12 @@ async fn local_callback<T>(
         Err(crate::RuntimeError::ReplicaRebuildRequired(_)) => Err(HostError::CommandRejected(
             "remote build failure substituted for local-provider failure".into(),
         )),
-        Err(error) => Err(error.into()),
+        Err(error) => {
+            if let Some((proof, family)) = retry {
+                proof.returned_error(family, instruction, &error);
+            }
+            Err(error.into())
+        }
     }
 }
 
@@ -765,13 +920,9 @@ pub(crate) struct PublicV1ReportProjection {
     pub(crate) write_status: AccessStatus,
     pub(crate) progress: PublicProgress,
     pub(crate) progress_history: Option<crate::protocol::types::HistoryContext>,
-    pub(crate) native_idle_replicas: Option<Vec<crate::protocol::types::ReplicaId>>,
-    pub(crate) native_configuration: Option<(
-        crate::protocol::public_operations::PublicConfiguration,
-        crate::protocol::types::HistoryContext,
-        crate::protocol::types::ReplicaStorageIncarnationContext,
-    )>,
-    pub(crate) custom_observation_alive: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub(crate) engine_idle:
+        Option<crate::protocol::public_operations::PublicV1EngineIdleObservation>,
+    pub(crate) observation_alive: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind> {
@@ -894,7 +1045,7 @@ pub(crate) fn installed_configuration_for_state(
     process: &ProcessSessionId,
 ) -> Option<crate::protocol::public_operations::PublicConfiguration> {
     let preview = state.public_v1_operation_state.as_ref()?;
-    let storage = preview.storage_incarnation.as_ref()?;
+    preview.storage_incarnation.as_ref()?;
     let history = preview.history.as_ref()?;
     preview
         .operations
@@ -902,42 +1053,96 @@ pub(crate) fn installed_configuration_for_state(
         .filter(|record| {
             record.stage == PublicOperationStage::Completed
                 && record.disposition == Some(PublicOperationDisposition::Succeeded)
-                && &record.intent.process_session_id == process
-                && record.accepted_storage.as_ref() == Some(storage)
-                && (record.accepted_history.as_ref() == Some(history)
-                    || record.intent.lifecycle.as_ref()
-                        .and_then(|input| input.data_loss_recovery.as_ref())
-                        .is_some_and(|input| {
-                            preview.data_loss_recovery.as_ref().is_some_and(|recovery| {
-                                recovery.stage == crate::protocol::public_operations::PublicDataLossRecoveryStage::Admitted
-                                    && &recovery.proposed_history == history
-                                    && recovery.attempt == input.attempt
-                                    && recovery.logical_authorization() == input.authorization
-                            })
-                        }))
+                && super::public_action_state::current_scope(preview, process, record)
         })
         .filter_map(|record| {
-            let configuration = record
-                .intent
-                .lifecycle
-                .as_ref()
-                .map(|input| input.configuration())
-                .or_else(|| match record.intent.program.as_ref() {
-                    Some(
-                        PublicOperationProgram::Configuration(config)
-                        | PublicOperationProgram::CatchUp {
-                            configuration: config,
-                            ..
-                        },
-                    ) => Some(config.clone()),
-                    Some(PublicOperationProgram::Swap { refreshed, .. }) => Some(refreshed.clone()),
-                    _ => None,
-                })?;
+            let configuration = installed_configuration_from_record(record)?;
             (configuration.current.epoch.data_loss_number == history.data_loss_number)
                 .then_some((record.intent.revision, configuration))
         })
         .max_by_key(|(revision, _)| *revision)
         .map(|(_, configuration)| configuration)
+}
+
+pub(crate) fn installed_configuration_from_record(
+    record: &PublicOperationRecord,
+) -> Option<PublicConfiguration> {
+    if record.stage != PublicOperationStage::Completed
+        || record.disposition != Some(PublicOperationDisposition::Succeeded)
+    {
+        return None;
+    }
+    achieved_configuration_from_record(record)
+}
+
+/// The last successfully receipted configuration in this exact program prefix.
+/// This is native starting-stage evidence, not a completed host installation
+/// or an observation that the remaining role/access instructions succeeded.
+pub(crate) fn achieved_configuration_from_record(
+    record: &PublicOperationRecord,
+) -> Option<PublicConfiguration> {
+    operation_instructions(&record.intent)
+        .into_iter()
+        .zip(&record.lifecycle.outcomes)
+        .filter(|(instruction, outcome)| {
+            configuration_instruction(*instruction) && **outcome == PublicInstructionOutcome::Done
+        })
+        .filter_map(|(instruction, _)| {
+            super::public_action_state::configuration_at(&record.intent, instruction)
+        })
+        .next_back()
+}
+
+fn configuration_instruction(instruction: PublicInstruction) -> bool {
+    matches!(
+        instruction,
+        PublicInstruction::Configuration
+            | PublicInstruction::StartingConfiguration
+            | PublicInstruction::RefreshedConfiguration
+            | PublicInstruction::CurrentConfiguration
+            | PublicInstruction::CatchUpConfiguration
+    )
+}
+
+/// An optional engine query cannot be attributed to the last completed host
+/// configuration across a newer or unfinished native topology mutation.
+pub(crate) fn configuration_observation_safe(
+    state: &crate::host::state::AgentState,
+    process: &ProcessSessionId,
+) -> bool {
+    let Some(preview) = &state.public_v1_operation_state else {
+        return false;
+    };
+    let Some(installed) = preview
+        .operations
+        .values()
+        .filter(|record| {
+            super::public_action_state::current_scope(preview, process, record)
+                && installed_configuration_from_record(record).is_some()
+        })
+        .max_by_key(|record| record.intent.revision)
+    else {
+        return false;
+    };
+    !preview.operations.values().any(|record| {
+        record.intent.operation_id != installed.intent.operation_id
+            && super::public_action_state::current_scope(preview, process, record)
+            && (record.intent.revision > installed.intent.revision
+                || record.stage != PublicOperationStage::Completed)
+            && operation_instructions(&record.intent)
+                .into_iter()
+                .any(|instruction| {
+                    configuration_instruction(instruction)
+                        || matches!(
+                            instruction,
+                            PublicInstruction::ReplicatorRole
+                                | PublicInstruction::ReplicatorPrimary
+                                | PublicInstruction::Epoch
+                                | PublicInstruction::ProgramEpoch
+                                | PublicInstruction::DataLoss
+                        )
+                })
+    })
 }
 
 pub(crate) async fn public_v1_report(
@@ -952,6 +1157,7 @@ pub(crate) async fn public_v1_report(
     }
     let state = store.load_state().await?;
     let configuration = installed_configuration_for_state(&state, &projection.process_session_id);
+    let sample_safe = configuration_observation_safe(&state, &projection.process_session_id);
     let open_mode = state.application_open_mode();
     let preview = state.public_v1_operation_state.ok_or_else(|| {
         HostError::CommandRejected("Public V1 report requires replacement state".into())
@@ -1111,55 +1317,66 @@ pub(crate) async fn public_v1_report(
         progress.current_progress = pending.clone();
         progress.catch_up_capability = pending;
     }
-    let configuration = configuration.filter(|configuration| {
-        if projection
-            .custom_observation_alive
-            .as_ref()
-            .is_some_and(|alive| !alive() || preview.terminal)
-        {
-            return false;
-        }
-        projection.native_configuration.as_ref().is_none_or(
-            |(sample, sample_history, sample_storage)| {
-                sample == configuration
-                    && sample_history == &history
-                    && sample_storage == &storage_incarnation
-            },
-        )
-    });
-    let configuration =
-        configuration
-            .zip(projection.native_idle_replicas)
-            .and_then(|(voting, idle_replicas)| {
-                let distinct: std::collections::BTreeSet<_> = idle_replicas.iter().collect();
-                if distinct.len() != idle_replicas.len()
-                    || idle_replicas.iter().any(|id| {
-                        voting
-                            .current
-                            .members
-                            .iter()
-                            .chain(
-                                voting
-                                    .previous
-                                    .iter()
-                                    .flat_map(|previous| &previous.members),
-                            )
-                            .any(|member| member.identity.replica_id == *id)
-                    })
-                {
-                    tracing::debug!(
-                        "native voting/idle observations crossed a configuration transition"
-                    );
-                    None
-                } else {
-                    Some(
-                        crate::protocol::public_operations::PublicV1InstalledConfiguration {
-                            voting,
-                            idle_replicas,
-                        },
-                    )
-                }
+    let engine_idle = projection.engine_idle.filter(|sample| {
+        let distinct: std::collections::BTreeSet<_> = sample.idle_replicas.iter().collect();
+        let coherent = sample_safe
+            && configuration.as_ref() == Some(&sample.configuration)
+            && sample.history == history
+            && sample.storage_incarnation == storage_incarnation
+            && sample.process_session_id == projection.process_session_id
+            && sample.replicator_creation_id == projection.replicator_creation_id
+            && !preview.terminal
+            && projection
+                .observation_alive
+                .as_ref()
+                .is_some_and(|alive| alive())
+            && distinct.len() == sample.idle_replicas.len()
+            && sample.idle_replicas.iter().all(|id| {
+                id.value() > 0
+                    && !sample
+                        .configuration
+                        .current
+                        .members
+                        .iter()
+                        .chain(
+                            sample
+                                .configuration
+                                .previous
+                                .iter()
+                                .flat_map(|previous| &previous.members),
+                        )
+                        .any(|member| member.identity.replica_id == *id)
             });
+        if !coherent {
+            tracing::debug!("discarding incoherent or late engine idle sample");
+        }
+        coherent
+    });
+    let remote_builds = preview
+        .remote_build_states(&projection.process_session_id)
+        .into_iter()
+        .map(|observation| {
+            let build = observation.build;
+            let input = preview
+                .operations
+                .get(&build.operation_id)
+                .and_then(|record| match record.intent.program.as_ref() {
+                    Some(PublicOperationProgram::Build(input)) => Some(input.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    HostError::Corrupt("remote build lacks its exact source program".into())
+                })?;
+            Ok(
+                crate::protocol::public_operations::PublicV1RemoteBuildObservation {
+                    operation_id: build.operation_id,
+                    revision: build.admission_revision,
+                    build: input,
+                    state: observation.state,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     let report = PublicV1AgentReport {
         identity: identity.clone(),
         resource_uid: state.identity.resource_uid,
@@ -1170,10 +1387,14 @@ pub(crate) async fn public_v1_report(
         role: projection.role,
         read_status: projection.read_status,
         write_status: projection.write_status,
-        history,
+        history: history.clone(),
         storage_incarnation: storage_incarnation.clone(),
         progress,
-        configuration,
+        configuration: configuration.map(|voting| {
+            crate::protocol::public_operations::PublicV1InstalledConfiguration { voting }
+        }),
+        engine_idle,
+        remote_builds,
         active_operations: preview
             .operations
             .values()
@@ -1185,6 +1406,29 @@ pub(crate) async fn public_v1_report(
             })
             .map(|record| record.intent.clone())
             .collect(),
+        retry_pending_operations: preview
+            .operations
+            .values()
+            .filter(|record| {
+                record.stage == PublicOperationStage::RetryPending
+                    && record.superseded_by.is_none()
+                    && record.intent.process_session_id == projection.process_session_id
+                    && record.accepted_history.as_ref() == Some(&history)
+                    && record.accepted_storage.as_ref() == Some(&storage_incarnation)
+            })
+            .map(|record| {
+                let failure = record.retry_failure.as_ref().ok_or_else(|| {
+                    HostError::Corrupt("retry-pending operation lacks callback provenance".into())
+                })?;
+                Ok(
+                    crate::protocol::public_operations::PublicV1RetryPendingOperation {
+                        intent: record.intent.clone(),
+                        attempt: record.attempt,
+                        failure: failure.error.clone(),
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
         open_mode,
         replication_address,
         service_location,
@@ -1202,20 +1446,7 @@ pub(crate) async fn public_v1_report(
 }
 
 pub(crate) fn completed_configuration(record: &PublicOperationRecord) -> bool {
-    record.stage == PublicOperationStage::Completed
-        && record.disposition == Some(PublicOperationDisposition::Succeeded)
-        && operation_instructions(&record.intent)
-            .iter()
-            .zip(&record.lifecycle.outcomes)
-            .any(|(instruction, outcome)| {
-                matches!(
-                    instruction,
-                    PublicInstruction::Configuration
-                        | PublicInstruction::CurrentConfiguration
-                        | PublicInstruction::CatchUpConfiguration
-                        | PublicInstruction::RefreshedConfiguration
-                ) && *outcome == PublicInstructionOutcome::Done
-            })
+    installed_configuration_from_record(record).is_some()
 }
 
 pub(crate) fn complete(record: &PublicOperationRecord) -> bool {

@@ -190,6 +190,23 @@ pub fn plan_public_v1_evidence(
         return Err("public-v1 report differs from accepted transition authority".into());
     }
     let Some(completion) = completion else {
+        if let Some(pending) = report
+            .retry_pending_operations
+            .iter()
+            .find(|pending| pending.intent.operation_id == intent.operation_id)
+            && !crate::cluster_api::public_v1_operations::operation_matches_transition(
+                accepted,
+                &pending.intent,
+            )
+        {
+            return Err(
+                "retry-pending observation differs from frozen accepted transition authority"
+                    .into(),
+            );
+        }
+        // A declared quiescent failure remains nonterminal. The operation
+        // reconciler explicitly redispatches the frozen command through the
+        // ordinary exact-authority executor; it never accepts pending as success.
         return Ok(PublicV1EvidencePlan::Wait);
     };
     if !intent.matches(completion) {
@@ -420,7 +437,10 @@ fn consumer_accepts_call(consumer: PublicV1EvidenceConsumer, call: PublicV1CallK
                 PublicV1CallKind::Remove | PublicV1CallKind::Configuration
             )
         }
-        PublicV1EvidenceConsumer::Removal => call == PublicV1CallKind::Remove,
+        PublicV1EvidenceConsumer::Removal => matches!(
+            call,
+            PublicV1CallKind::Remove | PublicV1CallKind::Close | PublicV1CallKind::Abort
+        ),
         PublicV1EvidenceConsumer::DataLoss => matches!(
             call,
             PublicV1CallKind::InitialPrimary | PublicV1CallKind::FailoverPromotion

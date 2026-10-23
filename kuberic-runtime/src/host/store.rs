@@ -106,6 +106,27 @@ pub(crate) trait AgentStore: Send + Sync {
         ))
     }
 
+    async fn record_public_retry_failure(
+        &self,
+        _intent: &PublicOperationIntent,
+        _attempt: u64,
+        _failure: &crate::host::state::PublicCallbackFailure,
+    ) -> Result<PublicOperationRecord> {
+        Err(crate::host::HostError::CommandRejected(
+            "returned callback retry is not enabled for this store".into(),
+        ))
+    }
+
+    async fn resume_public_operation(
+        &self,
+        _intent: &PublicOperationIntent,
+        _attempt: u64,
+    ) -> Result<PublicOperationRecord> {
+        Err(crate::host::HostError::CommandRejected(
+            "returned callback retry is not enabled for this store".into(),
+        ))
+    }
+
     async fn attach_public_operation(
         &self,
         _intent: &PublicOperationIntent,

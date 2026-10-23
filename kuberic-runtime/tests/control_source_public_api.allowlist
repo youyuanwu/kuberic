@@ -818,6 +818,7 @@ public-path hidden enum crate::protocol::public_operations::PublicV1AcceptedRepl
 public-path hidden enum crate::protocol::public_operations::PublicV1AcceptedResult
 public-path hidden enum crate::protocol::public_operations::PublicV1CallKind
 public-path hidden enum crate::protocol::public_operations::PublicV1OperationResult
+public-path hidden enum crate::protocol::public_operations::PublicV1RemoteBuildState
 public-path hidden enum crate::protocol::public_operations::ReplicaRebuildReason
 public-path hidden enum crate::protocol::public_operations::ReplicaRebuildRequired
 public-path hidden enum crate::protocol::public_operations::RestartActionStage
@@ -1006,6 +1007,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::completed_operations: Vec < PublicV1OperationCompletion >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::configuration: Option < PublicV1InstalledConfiguration >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::data_loss_recovery: Option < PublicDataLossRecoveryStatus >
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::engine_idle: Option < PublicV1EngineIdleObservation >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::extensions: PublicV1Extensions
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::history: HistoryContext
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::identity: PublicV1Identity
@@ -1013,11 +1015,13 @@ public-path hidden field crate::protocol::public_operations::PublicV1AgentReport
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::process_session_id: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::progress: PublicProgress
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::read_status: AccessStatus
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::remote_builds: Vec < PublicV1RemoteBuildObservation >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::replica: ReplicaIdentity
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::replication_address: Option < String >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::replicator_creation_id: ReplicatorCreationId
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::report_sequence: u64
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::resource_uid: ResourceUid
+public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::retry_pending_operations: Vec < PublicV1RetryPendingOperation >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::role: ReplicaRole
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::service_location: Option < ServiceLocation >
 public-path hidden field crate::protocol::public_operations::PublicV1AgentReport::storage_incarnation: ReplicaStorageIncarnationContext
@@ -1028,7 +1032,12 @@ public-path hidden field crate::protocol::public_operations::PublicV1Extensions:
 public-path hidden field crate::protocol::public_operations::PublicV1Extensions::public_build_evidence: Option < PublicV1ExtensionSlot >
 public-path hidden field crate::protocol::public_operations::PublicV1Identity::generation: u64
 public-path hidden field crate::protocol::public_operations::PublicV1Identity::protocol_version: u32
-public-path hidden field crate::protocol::public_operations::PublicV1InstalledConfiguration::idle_replicas: Vec < ReplicaId >
+public-path hidden field crate::protocol::public_operations::PublicV1EngineIdleObservation::configuration: PublicConfiguration
+public-path hidden field crate::protocol::public_operations::PublicV1EngineIdleObservation::history: HistoryContext
+public-path hidden field crate::protocol::public_operations::PublicV1EngineIdleObservation::idle_replicas: Vec < ReplicaId >
+public-path hidden field crate::protocol::public_operations::PublicV1EngineIdleObservation::process_session_id: ProcessSessionId
+public-path hidden field crate::protocol::public_operations::PublicV1EngineIdleObservation::replicator_creation_id: ReplicatorCreationId
+public-path hidden field crate::protocol::public_operations::PublicV1EngineIdleObservation::storage_incarnation: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicV1InstalledConfiguration::voting: PublicConfiguration
 public-path hidden field crate::protocol::public_operations::PublicV1LifecycleBinding::identity: PublicV1Identity
 public-path hidden field crate::protocol::public_operations::PublicV1LifecycleBinding::resource_uid: ResourceUid
@@ -1047,6 +1056,13 @@ public-path hidden field crate::protocol::public_operations::PublicV1OperationCo
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::result: PublicV1OperationResult
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::revision: u64
 public-path hidden field crate::protocol::public_operations::PublicV1OperationCompletion::storage_incarnation: ReplicaStorageIncarnationContext
+public-path hidden field crate::protocol::public_operations::PublicV1RetryPendingOperation::attempt: u64
+public-path hidden field crate::protocol::public_operations::PublicV1RemoteBuildObservation::build: PublicBuildInput
+public-path hidden field crate::protocol::public_operations::PublicV1RemoteBuildObservation::operation_id: OperationId
+public-path hidden field crate::protocol::public_operations::PublicV1RemoteBuildObservation::revision: u64
+public-path hidden field crate::protocol::public_operations::PublicV1RemoteBuildObservation::state: PublicV1RemoteBuildState
+public-path hidden field crate::protocol::public_operations::PublicV1RetryPendingOperation::failure: String
+public-path hidden field crate::protocol::public_operations::PublicV1RetryPendingOperation::intent: PublicOperationIntent
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::barriers: Vec < PublicSessionEpochBarrier >
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::installed_configuration: Option < ConfigurationDescriptor >
 public-path hidden field crate::protocol::public_operations::PublicV1SessionRenewalStatus::replayed_role: Option < ReplicaRole >
@@ -1157,8 +1173,11 @@ public-path hidden struct crate::protocol::public_operations::PublicV1ExtensionS
 public-path hidden struct crate::protocol::public_operations::PublicV1Extensions
 public-path hidden struct crate::protocol::public_operations::PublicV1Identity
 public-path hidden struct crate::protocol::public_operations::PublicV1InstalledConfiguration
+public-path hidden struct crate::protocol::public_operations::PublicV1EngineIdleObservation
 public-path hidden struct crate::protocol::public_operations::PublicV1LifecycleBinding
 public-path hidden struct crate::protocol::public_operations::PublicV1OperationCompletion
+public-path hidden struct crate::protocol::public_operations::PublicV1RetryPendingOperation
+public-path hidden struct crate::protocol::public_operations::PublicV1RemoteBuildObservation
 public-path hidden struct crate::protocol::public_operations::PublicV1SessionRenewalStatus
 public-path hidden struct crate::protocol::public_operations::RemoteBuildTargetRebuildRequired
 public-path hidden struct crate::protocol::public_operations::RestartActionRecord
@@ -1228,6 +1247,11 @@ public-path hidden variant crate::protocol::public_operations::PublicOperationRe
 public-path hidden variant crate::protocol::public_operations::PublicProgressRole::Primary
 public-path hidden variant crate::protocol::public_operations::PublicProgressRole::Recovery
 public-path hidden variant crate::protocol::public_operations::PublicProgressRole::Secondary
+public-path hidden variant crate::protocol::public_operations::PublicV1RemoteBuildState::Accepted
+public-path hidden variant crate::protocol::public_operations::PublicV1RemoteBuildState::Dropped
+public-path hidden variant crate::protocol::public_operations::PublicV1RemoteBuildState::InBuild
+public-path hidden variant crate::protocol::public_operations::PublicV1RemoteBuildState::InDrop
+public-path hidden variant crate::protocol::public_operations::PublicV1RemoteBuildState::Ready
 public-path hidden variant crate::protocol::public_operations::PublicServiceClearStage::Pending
 public-path hidden variant crate::protocol::public_operations::PublicServiceClearStage::PublishedAbsent
 public-path hidden variant crate::protocol::public_operations::PublicSessionEpochBarrierStage::Excluded

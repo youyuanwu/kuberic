@@ -13,6 +13,7 @@ mod operation_recovery;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;
+mod public_action_state;
 pub(crate) mod public_build_store;
 #[allow(clippy::disallowed_types)]
 pub(crate) mod public_lifecycle;

@@ -37,6 +37,12 @@ pub struct KvService {
     streams: AsyncMutex<Consumers>,
     #[cfg(feature = "testing")]
     stream_exit: Arc<Mutex<Option<Arc<StreamExitGate>>>>,
+    #[cfg(feature = "testing")]
+    fail_close: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "testing")]
+    fail_role: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "testing")]
+    role_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "testing")]
@@ -87,11 +93,34 @@ impl KvService {
             streams: AsyncMutex::new(Consumers::default()),
             #[cfg(feature = "testing")]
             stream_exit: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "testing")]
+            fail_close: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            fail_role: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            role_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     pub fn persistence(&self) -> &Arc<KvPersistence> {
         self.provider.persistence()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn fail_next_role(&self) {
+        self.fail_role
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn role_callback_count(&self) -> usize {
+        self.role_calls.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn fail_next_close(&self) {
+        self.fail_close
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     #[cfg(feature = "testing")]
@@ -340,6 +369,19 @@ impl StatefulServiceReplica for KvService {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        #[cfg(feature = "testing")]
+        {
+            self.role_calls
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if self
+                .fail_role
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(RuntimeError::Application(
+                    "injected undeclared KV application Role failure".into(),
+                ));
+            }
+        }
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);
         }
@@ -370,6 +412,15 @@ impl StatefulServiceReplica for KvService {
     }
 
     async fn close(&self) -> Result<()> {
+        #[cfg(feature = "testing")]
+        if self
+            .fail_close
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(RuntimeError::Application(
+                "injected KV application Close failure".into(),
+            ));
+        }
         let committer = self.committer.lock().unwrap().clone();
         let result = if let Some(committer) = committer {
             committer.close().await.map_err(application)

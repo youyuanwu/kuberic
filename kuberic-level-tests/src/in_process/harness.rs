@@ -24,7 +24,7 @@ impl ApplicationFactory for KvFactory {
             Arc::new(KvService::new(
                 persistence,
                 context.replication_address().into(),
-                CopyGate::disabled(),
+                CopyGate::enabled(root.join("copy-gate"))?,
             )),
             if fresh {
                 ApplicationStorageState::FreshEmpty
@@ -97,8 +97,12 @@ pub(super) struct Harness {
 }
 impl Harness {
     pub async fn new() -> Result<Self> {
+        Self::with_members(3).await
+    }
+    pub async fn with_members(members: u32) -> Result<Self> {
         let cluster = TestCluster::builder(KvFactory)
             .image("in-process/kvstore2")
+            .initial_replicas(members)
             .start()
             .await?;
         Ok(Self {
@@ -107,6 +111,15 @@ impl Harness {
             refs: BTreeMap::new(),
             reconcile_errors: 0,
         })
+    }
+    pub async fn copy_gate(&mut self, id: i64) -> Result<CopyGate> {
+        let reference = self.reference(id).await?;
+        Ok(CopyGate::enabled(
+            self.cluster
+                .application_root(&reference)
+                .await?
+                .join("copy-gate"),
+        )?)
     }
     pub async fn refresh(&mut self) -> Result<()> {
         let observation = self.cluster.observe().await?;

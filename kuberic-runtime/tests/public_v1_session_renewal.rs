@@ -129,9 +129,18 @@ fn build_intent(
         attempt: operation_id.clone(),
         source_address: "https://10.0.0.1:7000".into(),
         epoch: Epoch::new(history.data_loss_number, 7),
-        current_configuration_id: Some(kuberic_runtime::protocol::types::ConfigurationId::new(
-            "replacement_schema-build-configuration",
-        )),
+        current_configuration_id: Some(
+            ConfigurationDescriptor::new(
+                Epoch::new(history.data_loss_number, 7),
+                replica(1).replica_id,
+                vec![ConfigurationMember {
+                    identity: replica(1),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )
+            .configuration_id,
+        ),
         replica: target.replica.clone(),
         target_storage: target.clone(),
         process_session_id: target_session,
@@ -151,6 +160,56 @@ fn build_intent(
         lifecycle: None,
         program: Some(program),
     }
+}
+
+async fn seed_build_primary_fixture(
+    store: &SqliteStore,
+    build: &PublicOperationIntent,
+) -> PublicOperationIntent {
+    use kuberic_runtime::protocol::public_operations::{
+        PossibleDataLossIntent, PublicLifecycleInput, PublicLifecycleRecipe,
+    };
+    let Some(PublicOperationProgram::Build(input)) = &build.program else {
+        panic!("Build fixture required")
+    };
+    let lifecycle = PublicLifecycleInput {
+        recipe: PublicLifecycleRecipe::InitialPrimary,
+        replica: replica(1),
+        epoch: input.epoch,
+        possible_data_loss: PossibleDataLossIntent::NotPossible,
+        current: ConfigurationDescriptor::new(
+            input.epoch,
+            replica(1).replica_id,
+            vec![ConfigurationMember {
+                identity: replica(1),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        ),
+        previous: None,
+        replicas: Vec::new(),
+        data_loss_recovery: None,
+    };
+    assert_eq!(
+        Some(&lifecycle.current.configuration_id),
+        input.current_configuration_id.as_ref()
+    );
+    let authority = PublicOperationIntent {
+        identity: build.identity.clone(),
+        operation_id: OperationId::new("replacement_schema-authority"),
+        revision: build.revision,
+        process_session_id: build.process_session_id.clone(),
+        class: PublicOperationClass::Authority,
+        input_digest: lifecycle.digest(),
+        replay_disposition: PublicOperationReplayDisposition::Convergent,
+        program: None,
+        lifecycle: Some(lifecycle),
+    };
+    store
+        .complete_public_v1_initial_primary_fixture(&authority)
+        .await
+        .unwrap();
+    authority
 }
 
 fn endpoint(id: i64, session: &str, creation: &str, role: ReplicaRole) -> ProcessSessionEndpoint {
@@ -212,6 +271,9 @@ fn ordinary_required(previous_epoch: Epoch, renewal_epoch: Epoch) -> ProcessSess
 fn replacement_report(required: &ProcessSessionRenewalRequired) -> PublicV1AgentReport {
     let replacement = required.replacement.as_ref().unwrap();
     PublicV1AgentReport {
+        engine_idle: None,
+        remote_builds: Vec::new(),
+        retry_pending_operations: Vec::new(),
         active_operations: Vec::new(),
         configuration: None,
         identity: PublicV1Identity::new(42),
@@ -994,7 +1056,7 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 
 #[tokio::test]
 async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 13);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 14);
     let root = test_root("replacement_schema-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicV1Identity::new(42);
@@ -1025,6 +1087,7 @@ async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
         .unwrap();
     let build_intent = build_intent(&preview, &history, storage(replica(2)));
     build_intent.validate().unwrap();
+    let authority_fixture = seed_build_primary_fixture(&store, &build_intent).await;
     store
         .begin_public_v1_operation(&build_intent)
         .await
@@ -1039,7 +1102,7 @@ async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
     let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
     assert_eq!(
         reopened.public_v1_operation_intents().await.unwrap(),
-        vec![build_intent.clone()]
+        vec![authority_fixture, build_intent.clone()]
     );
     let active_builds = reopened.public_v1_build_records().await.unwrap();
     assert_eq!(active_builds.len(), 1);
@@ -1148,8 +1211,12 @@ async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
         )
         .await
         .unwrap();
-    assert_eq!(report.completed_operations.len(), 1);
-    let completion = &report.completed_operations[0];
+    assert_eq!(report.completed_operations.len(), 2);
+    let completion = report
+        .completed_operations
+        .iter()
+        .find(|completion| completion.operation_id == build_intent.operation_id)
+        .unwrap();
     assert_eq!(
         completion.call_kind,
         kuberic_runtime::protocol::public_operations::PublicV1CallKind::Build
@@ -1436,6 +1503,7 @@ async fn public_v1_replacement_schema_build_ambiguity_requires_retirement() {
         .await
         .unwrap();
     let intent = build_intent(&preview, &history, storage(replica(2)));
+    seed_build_primary_fixture(&store, &intent).await;
     store.begin_public_v1_operation(&intent).await.unwrap();
     store.mark_public_v1_build_ambiguous(&intent).await.unwrap();
     drop(store);
@@ -1485,6 +1553,7 @@ async fn public_v1_replacement_schema_failed_build_containment_survives_reopen()
         .await
         .unwrap();
     let intent = build_intent(&preview, &history, storage(replica(2)));
+    seed_build_primary_fixture(&store, &intent).await;
     store.begin_public_v1_operation(&intent).await.unwrap();
     store
         .mark_public_v1_build_failed_pending(&intent, "build callback failed")
@@ -1552,6 +1621,7 @@ async fn public_v1_replacement_schema_rebuild_then_cancellation_survives_reopen(
         .await
         .unwrap();
     let intent = build_intent(&preview, &history, target_storage.clone());
+    seed_build_primary_fixture(&store, &intent).await;
     let PublicOperationProgram::Build(build) = intent.program.as_ref().unwrap() else {
         panic!("expected build program");
     };

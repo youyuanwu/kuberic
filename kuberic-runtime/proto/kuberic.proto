@@ -152,6 +152,9 @@ message PublicV1AgentStatus {
   PublicV1ProgressQuery catch_up_capability = 26;
   optional string configuration_json = 27;
   repeated string active_operations_json = 28;
+  repeated string retry_pending_operations_json = 29;
+  optional string engine_idle_json = 30;
+  repeated string remote_builds_json = 31;
 }
 
 enum PublicV1OpenMode {

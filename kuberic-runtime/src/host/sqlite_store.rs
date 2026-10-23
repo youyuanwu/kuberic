@@ -449,54 +449,7 @@ fn classify_public_v1_inbound_build_authority(
 }
 
 fn build_was_promoted(preview: &PublicV1OperationState, build: &PublicBuildInput) -> bool {
-    use crate::protocol::public_operations::{PublicOperationProgram, PublicV1OperationResult};
-
-    let Some(record) = preview.build_records.get(&build.attempt) else {
-        return false;
-    };
-    if record.result != Some(PublicV1OperationResult::Succeeded)
-        || record.retirement != PublicV1BuildRetirement::Retain
-    {
-        return false;
-    }
-    preview.operations.values().any(|operation| {
-        if !crate::host::public_lifecycle::completed_configuration(operation)
-            || operation.intent.revision <= record.admission_revision
-            || operation.intent.process_session_id != record.source_session
-            || operation.accepted_history.as_ref() != Some(&record.history)
-            || operation.accepted_storage.as_ref() != Some(&record.source_storage)
-        {
-            return false;
-        }
-        let (current, replicas) = match operation.intent.program.as_ref() {
-            Some(PublicOperationProgram::Configuration(configuration))
-            | Some(PublicOperationProgram::CatchUp { configuration, .. }) => {
-                (&configuration.current, &configuration.replicas)
-            }
-            Some(PublicOperationProgram::Swap { refreshed, .. }) => {
-                (&refreshed.current, &refreshed.replicas)
-            }
-            None => match operation.intent.lifecycle.as_ref() {
-                Some(input) => (&input.current, &input.replicas),
-                None => return false,
-            },
-            _ => return false,
-        };
-        current.epoch >= build.epoch
-            && current.members.iter().any(|member| {
-                member.identity == build.replica
-                    && matches!(
-                        member.role,
-                        ReplicaRole::Primary | ReplicaRole::ActiveSecondary
-                    )
-            })
-            && replicas.iter().any(|replica| {
-                replica.identity == build.replica
-                    && replica.storage_incarnation.as_ref() == Some(&build.target_storage)
-                    && replica.process_session_id == build.process_session_id
-                    && replica.replication_address == build.replication_address
-            })
-    })
+    preview.build_was_promoted(build)
 }
 
 #[async_trait]
@@ -696,6 +649,7 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             let local_identity = state.identity.local_identity.clone();
+            super::public_action_state::validate(&state, intent)?;
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
@@ -718,6 +672,7 @@ impl AgentStore for SqliteStore {
                     }
                     PublicOperationStage::Ready
                     | PublicOperationStage::Running
+                    | PublicOperationStage::RetryPending
                     | PublicOperationStage::CallbackApplied => {
                         BeginPublicOperation::Pending(existing.clone())
                     }
@@ -1248,6 +1203,9 @@ impl AgentStore for SqliteStore {
             };
             let record = PublicOperationRecord {
                 intent: intent.clone(),
+                attempt: 1,
+                attempt_results: Default::default(),
+                retry_failure: None,
                 accepted_history: preview.history.clone(),
                 accepted_storage: preview.storage_incarnation.clone(),
                 stage,
@@ -1433,6 +1391,9 @@ impl AgentStore for SqliteStore {
             );
             let successor = PublicOperationRecord {
                 intent: intent.clone(),
+                attempt: 1,
+                attempt_results: Default::default(),
+                retry_failure: None,
                 accepted_history: preview.history.clone(),
                 accepted_storage: preview.storage_incarnation.clone(),
                 stage: if decision == DataLossRenewalDecision::InvokeCallback {
@@ -1607,6 +1568,23 @@ impl AgentStore for SqliteStore {
                     "completed public operation requires a disposition".into(),
                 ));
             }
+            if matches!(
+                next,
+                PublicOperationStage::ContainmentPending | PublicOperationStage::Completed
+            ) && let Some(disposition) = record.disposition.clone()
+            {
+                record.attempt_results.entry(record.attempt).or_insert_with(|| {
+                    crate::host::state::PublicOperationAttemptResult {
+                        stage: next,
+                        disposition,
+                        lifecycle: record.lifecycle.clone(),
+                        retry_failure: record.retry_failure.clone(),
+                        containment: record.containment,
+                        superseded_by: record.superseded_by.clone(),
+                        blockers: record.blockers.clone(),
+                    }
+                });
+            }
             if next == PublicOperationStage::Ready {
                 record.blockers.clear();
                 record.lifecycle.in_flight = None;
@@ -1642,6 +1620,133 @@ impl AgentStore for SqliteStore {
                 preview.terminal = false;
                 state.reported_fault = None;
             }
+            write_agent_state(transaction, &state)?;
+            Ok(result)
+        })
+    }
+
+    async fn record_public_retry_failure(
+        &self,
+        intent: &PublicOperationIntent,
+        attempt: u64,
+        failure: &crate::host::state::PublicCallbackFailure,
+    ) -> Result<PublicOperationRecord> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("replacement store required".into())
+            })?;
+            let record = preview
+                .operations
+                .get_mut(&intent.operation_id)
+                .ok_or_else(|| {
+                    crate::host::HostError::CommandRejected("unknown retry operation".into())
+                })?;
+            if &record.intent != intent
+                || attempt == 0
+                || record.attempt != attempt
+                || record.stage != PublicOperationStage::Running
+                || record.superseded_by.is_some()
+                || record.lifecycle.in_flight != Some(failure.instruction)
+                || crate::host::public_lifecycle::operation_instructions(intent)
+                    .get(record.lifecycle.outcomes.len())
+                    != Some(&failure.instruction)
+                || !failure.family.allows(failure.instruction)
+                || failure.error.is_empty()
+                || intent.class.is_terminal()
+                || intent.lifecycle.as_ref().is_some_and(|input| {
+                    input.possible_data_loss == PossibleDataLossIntent::Possible
+                })
+                || record
+                    .lifecycle
+                    .outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, PublicInstructionOutcome::RebuildRequired(_)))
+                || record.attempt_results.contains_key(&attempt)
+            {
+                return Err(crate::host::HostError::StaleEffectCompletion(
+                    "callback failure lacks an exact retryable selected boundary".into(),
+                ));
+            }
+            let disposition = PublicOperationDisposition::Failed(failure.error.clone());
+            record.attempt_results.insert(
+                attempt,
+                crate::host::state::PublicOperationAttemptResult {
+                    stage: PublicOperationStage::RetryPending,
+                    disposition: disposition.clone(),
+                    lifecycle: record.lifecycle.clone(),
+                    retry_failure: Some(failure.clone()),
+                    containment: record.containment,
+                    superseded_by: record.superseded_by.clone(),
+                    blockers: record.blockers.clone(),
+                },
+            );
+            record.stage = PublicOperationStage::RetryPending;
+            record.disposition = Some(disposition);
+            record.retry_failure = Some(failure.clone());
+            let result = record.clone();
+            write_agent_state(transaction, &state)?;
+            Ok(result)
+        })
+    }
+
+    async fn resume_public_operation(
+        &self,
+        intent: &PublicOperationIntent,
+        attempt: u64,
+    ) -> Result<PublicOperationRecord> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            super::public_action_state::validate(&state, intent)?;
+            let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
+                crate::host::HostError::CommandRejected("replacement store required".into())
+            })?;
+            let record = preview.operations.get(&intent.operation_id).ok_or_else(|| {
+                crate::host::HostError::CommandRejected("unknown retry operation".into())
+            })?;
+            if &record.intent != intent
+                || attempt == 0
+                || record.attempt != attempt
+                || record.stage != PublicOperationStage::RetryPending
+                || record.superseded_by.is_some()
+                || record.accepted_history != preview.history
+                || record.accepted_storage != preview.storage_incarnation
+                || preview.terminal
+                || !preview.history_barriers.is_empty()
+                || !record.blockers.is_empty()
+                || record.retry_failure.as_ref().is_none_or(|failure| {
+                    record.lifecycle.in_flight != Some(failure.instruction)
+                        || !failure.family.allows(failure.instruction)
+                        || record.disposition != Some(PublicOperationDisposition::Failed(failure.error.clone()))
+                })
+                || record.attempt_results.get(&attempt).is_none_or(|result| {
+                    result.stage != PublicOperationStage::RetryPending
+                        || Some(result.disposition.clone()) != record.disposition
+                        || result.lifecycle != record.lifecycle
+                        || result.retry_failure != record.retry_failure
+                })
+                || (intent.class == crate::protocol::public_operations::PublicOperationClass::Authority
+                    && preview.current_operation.as_ref() != Some(&intent.operation_id))
+                || preview.operations.values().any(|other| {
+                    other.intent.revision > intent.revision
+                        && matches!(other.intent.class,
+                            crate::protocol::public_operations::PublicOperationClass::Authority
+                                | crate::protocol::public_operations::PublicOperationClass::PlannedSwap)
+                })
+            {
+                return Err(crate::host::HostError::StaleEffectCompletion(
+                    "retry no longer owns its exact live authority".into(),
+                ));
+            }
+            let record = preview.operations.get_mut(&intent.operation_id).expect("checked operation");
+            record.attempt = attempt.checked_add(1).ok_or_else(|| {
+                crate::host::HostError::CommandRejected("operation attempt exhausted".into())
+            })?;
+            record.stage = PublicOperationStage::Ready;
+            record.disposition = None;
+            record.retry_failure = None;
+            record.lifecycle.in_flight = None;
+            let result = record.clone();
             write_agent_state(transaction, &state)?;
             Ok(result)
         })
@@ -1693,6 +1798,9 @@ impl AgentStore for SqliteStore {
             let owner_completed = owner_record.stage == PublicOperationStage::Completed;
             let record = PublicOperationRecord {
                 intent: intent.clone(),
+                attempt: 1,
+                attempt_results: Default::default(),
+                retry_failure: None,
                 accepted_history: owner_record.accepted_history.clone(),
                 accepted_storage: owner_record.accepted_storage.clone(),
                 stage: if owner_completed {
@@ -2363,6 +2471,14 @@ fn valid_public_operation_transition(
             | (
                 PublicOperationStage::ContainmentPending,
                 PublicOperationStage::Completed
+            )
+            | (
+                PublicOperationStage::RetryPending,
+                PublicOperationStage::Completed
+            )
+            | (
+                PublicOperationStage::RetryPending,
+                PublicOperationStage::ContainmentPending
             )
     )
 }

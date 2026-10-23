@@ -298,6 +298,17 @@ impl Facade {
         self.join().await.map_err(RuntimeError::from)
     }
 
+    #[cfg(feature = "testing")]
+    pub(crate) async fn lose_driver(&self) -> std::io::Result<()> {
+        let join = self.join.lock().await;
+        let task = join
+            .task
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("native driver already joined"))?;
+        task.abort();
+        Ok(())
+    }
+
     pub(super) fn retained_task_count(&self) -> usize {
         usize::from(self.retained_driver.load(Ordering::Acquire))
     }

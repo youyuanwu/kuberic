@@ -45,6 +45,29 @@ Production-derived Rust vectors remain distinct from translated test assertions.
 
 ## Component material register
 
+### Common host message/action responsibility port
+
+Kuberic implementation through `91a2a93c3c7cf9477adb3a0d27e674b99f741a8a`
+extends the merged #198 base, not a historical review or native executable
+oracle. The [full mapping](engine-neutral-hosting.md#pinned-message--action--state-mapping)
+records acceptance, retry, stages, remote state, cancellation and terminal
+lifetime. Selected native material at the pin:
+
+| Native material | Rust destination / transformation |
+|---|---|
+| `RA/Message.h:20–51`, request/reply bodies; `ReconfigurationAgentProxy.cpp:180–280` | Exact local Public V1 programs/control messages and durable admission replace native IPC/no-reply retry. No wire compatibility. |
+| `RA/ComProxyReplicator.h:17–35`, Open creation paths | Coherent one-shot factory allocation, explicit supplemental ownership and optional native diagnostics; no protected method/representation changes. |
+| `RA/ProxyActionsList.cpp:34–193`, state-dependent UpdateConfiguration `ReconfigurationAgentProxy.cpp:761–974` | Existing Rust journals/access owners plus instruction-derived admission; paired achieved roles/configuration/catch-up. Secondary host-only transport authority is not a primary native stage. Fresh current-only synchronization is the bounded peer-update adaptation. |
+| `RA/FailoverUnitProxy.ReplicatorBuildIdleReplicaAsyncOperation.cpp:256–357`, Remove/cancel/drain owners | Exact retained Build journal projects remote states independently of engine idle queries. Common creation-bound grant coordinator and cancellation-independent Rust joins replace COM operation lifetime. Historical success never creates a grant or sample. |
+| `RA/ReconfigurationAgentProxy.cpp:1386–1456`, Close child `:78–111` | Intentional local difference: child failure remains publicly failed after successful cleanup; failed/lost joins cannot produce containment. |
+
+Actual Rust qualification uses production controller dispatch for V1 and an
+independent PostgreSQL engine, real copy/replay/SQL fences and public terminal
+outcomes. Source inspection and seeded store fixtures remain separate evidence.
+Whole RA/FM/Hosting2, arbitrary failed-Build recovery, native binary differential
+and downstream unpublished-engine certification are not imported. Existing
+upstream notices/licenses above remain applicable and unchanged.
+
 Tables preserve selected native source/test ranges, named cases, Rust
 destinations and transformations. They do not assert every native branch,
 public capability or interleaving is qualified. The default production adapter
@@ -409,8 +432,10 @@ public hosts, committed service reads and raw write assignment. They include
 split/recipe promotion, joint/current-only configuration, missing C/P,
 pre/post-Revoke demotion, final-wait-before-receipt denial, cancellation/exact
 replay and stale owner/final release. [Close tests:3114–3505][selected-close-tests]
-separate child errors, outer success, interrupted callbacks and real retained
-provider joins; some recovery cuts are deliberately seeded. These Rust runs
+separate child errors, the earlier outer-success policy, interrupted callbacks
+and real retained provider joins; the current common public-failure policy
+supersedes that outer result, as mapped above. Some recovery cuts are
+deliberately seeded. These Rust runs
 are not native executable/differential or exhaustive crash-cut qualification.
 Local abort-both/skip-later-graceful containment intentionally differs from
 native's per-child Abort/continued service Close. Required protocol-13
@@ -491,7 +516,7 @@ source-derived vectors. Current support/limits are in the ledger's
 | C4–C5 S | `PrimaryReplicator.BuildIdleAsyncOperation.cpp:111–144`; `CopySender.cpp:524–579,555–579`; `ReplicaManager.cpp:745–774,1983–2022` | EOF-issued target/copy+replication gates/upward pending retarget; not snapshot-only Build success. |
 | T1 D/S; T2 S | `ReplicationTransport.Test.cpp:594–617` **TestDropMessageToNotMatch**; `PrimaryReplicator.cpp:632–683`; `ReplicationSession.cpp:217–243,364–384,423–463`; `RemoteSession.cpp:757–790` | Remove sockets/Sleep(100), retain route/incarnation/role/epoch/expiry/failure obligations; accepted send≠ACK. |
 | D1 S | `src/prod/src/idl/public/FabricRuntime.idl:636–683`; `ReplicationOperationHeader.h:25–42`; `ReplicationAckMessageBody.h:17–24` | Empty-array/empty-segment boundaries and two epochs/sequence spaces inform private lossless codec; not native serialization/public segmented policy parity. |
-| L1–L3 S; E1–E2 S | `ReplicatorState.cpp:39–126`; `ReplicationQueueManager.cpp:58–160`; `Replicator.OnDatalossAsyncOperation.cpp:82–126`; `Replicator.CloseAsyncOperation.cpp:134–192`; `RA/FailoverUnitProxy.CloseAsyncOperation.cpp:209–276`; `ReplicaManager.cpp:871–920`; `PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31–90`; `SecondaryReplicator.cpp:951–1003` | Role edges/actual queues/reset, direct vs outer Close, issued epoch and fixed copy epoch. Selected outer success retains child diagnostics and actual cleanup; inner containment action order remains explicitly local. |
+| L1–L3 S; E1–E2 S | `ReplicatorState.cpp:39–126`; `ReplicationQueueManager.cpp:58–160`; `Replicator.OnDatalossAsyncOperation.cpp:82–126`; `Replicator.CloseAsyncOperation.cpp:134–192`; `RA/FailoverUnitProxy.CloseAsyncOperation.cpp:209–276`; `ReplicaManager.cpp:871–920`; `PrimaryReplicator.UpdateEpochAsyncOperation.cpp:31–90`; `SecondaryReplicator.cpp:951–1003` | Role edges/actual queues/reset, direct vs outer Close, issued epoch and fixed copy epoch. The earlier selected outer-success result is historical; current common hosting retains publicly failed child results after actual cleanup. Inner containment action order remains explicitly local. |
 | H1–H2 S; H3 D/S | `RA/FailoverUnitProxy.ReadWriteStatusCalculator.cpp:34–145,288–381`; `BatchedHealthReporter.Test.cpp:107–135` **TestWarningsWithinIntervalReport**; `BatchedHealthReporter.cpp:81–125` | Reachable stage selectors, not every table row; selected bounded stage evidence above. Temp2/latest-warning/Close-clear expectations use named timer input, not sleep/platform convergence; broader reporting deferred. |
 | Protected resolved fixtures | Kuberic `application.rs:31–37`, protected traits and external positive/privacy fixture infrastructure | Kuberic-authored compiler identities/trait implementations, not native COM or segmented codec. |
 

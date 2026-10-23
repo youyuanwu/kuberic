@@ -16,15 +16,16 @@ use kuberic_runtime::host::{
 use kuberic_runtime::protocol::public_operations::{
     ProgressQueryResult, PublicBuildInput, PublicConfiguration, PublicInboundBuildAuthority,
     PublicOperationIntent, PublicOperationProgram, PublicOperationReplayDisposition,
-    PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1InstalledConfiguration,
+    PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1EngineIdleObservation,
+    PublicV1InstalledConfiguration, PublicV1RemoteBuildObservation, PublicV1RemoteBuildState,
 };
 use kuberic_runtime::protocol::types::{Epoch, OperationId, ReplicaId, ReplicaRole};
 use kuberic_runtime::replicator::stream::{OperationKind, OperationStream, ReceivedOperation};
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
-    ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities, ReplicatorInterfaces,
-    ReplicatorSettings, StateReplicator,
-    CustomReplicatorControl, ReplicatorFactoryContext,
+    CallbackOwnership, CustomReplicatorControl, DefaultReplicatorFactory, PrimaryReplicator,
+    ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode, Replication, Replicator,
+    ReplicatorCapabilities, ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorSettings,
+    StateReplicator,
 };
 
 // These external identities deliberately expand aliases in both directions.
@@ -54,6 +55,9 @@ struct ProtectedContracts;
 // Compile-only independent companion: not native/database qualification.
 #[async_trait]
 impl CustomReplicatorControl for ProtectedContracts {
+    fn callback_ownership(&self) -> CallbackOwnership {
+        CallbackOwnership::ObjectOwnedOnInterruption
+    }
     async fn install_inbound_build_authority(&self, _: &PublicInboundBuildAuthority) -> Result<()> {
         Err(kuberic_runtime::RuntimeError::AuthorityNotAdmitted)
     }
@@ -63,14 +67,19 @@ impl CustomReplicatorControl for ProtectedContracts {
     async fn idle_replicas(&self, _: &PublicConfiguration) -> Result<Vec<ReplicaId>> {
         Err(kuberic_runtime::RuntimeError::ProgressNotReady)
     }
-    async fn shutdown_and_drain(&self) -> Result<()> { Ok(()) }
+    async fn shutdown_and_drain(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
-async fn custom_controller_api(context: ReplicatorFactoryContext, build: OperationId) -> Result<()> {
+async fn custom_controller_api(
+    context: ReplicatorFactoryContext,
+    build: OperationId,
+) -> Result<()> {
     let owner = Arc::new(ProtectedContracts);
-    let _bundle = ReplicatorInterfaces::primary(
-        owner.clone(), None, ReplicatorCapabilities::conservative(),
-    ).with_custom_control(&context, owner)?;
+    let _bundle =
+        ReplicatorInterfaces::primary(owner.clone(), None, ReplicatorCapabilities::conservative())
+            .with_custom_control(&context, owner)?;
     let authority = context.outbound_build_authority(&build).await?;
     context.validate_build_authority(&authority).await
 }
@@ -219,12 +228,30 @@ fn installed_configuration_api(
     wire: &mut kuberic_runtime::control::proto::PublicV1AgentStatus,
 ) {
     let installed = PublicV1InstalledConfiguration {
-        voting,
-        idle_replicas,
+        voting: voting.clone(),
     };
     report.configuration = Some(installed);
+    report.engine_idle = Some(PublicV1EngineIdleObservation {
+        configuration: voting,
+        history: report.history.clone(),
+        storage_incarnation: report.storage_incarnation.clone(),
+        process_session_id: report.process_session_id.clone(),
+        replicator_creation_id: report.replicator_creation_id.clone(),
+        idle_replicas,
+    });
     let _: &Option<PublicV1InstalledConfiguration> = &report.configuration;
+    let _: &Option<PublicV1EngineIdleObservation> = &report.engine_idle;
+    let _: &Vec<PublicV1RemoteBuildObservation> = &report.remote_builds;
+    let _ = [
+        PublicV1RemoteBuildState::Accepted,
+        PublicV1RemoteBuildState::InBuild,
+        PublicV1RemoteBuildState::Ready,
+        PublicV1RemoteBuildState::InDrop,
+        PublicV1RemoteBuildState::Dropped,
+    ];
     let _: &Option<String> = &wire.configuration_json;
+    let _: &Option<String> = &wire.engine_idle_json;
+    let _: &Vec<String> = &wire.remote_builds_json;
     wire.configuration_json = None;
 }
 
@@ -237,6 +264,19 @@ fn active_control_observers_api(
     let _: &Vec<PublicOperationIntent> = &report.active_operations;
     let _: &Vec<String> = &wire.active_operations_json;
     wire.active_operations_json = Vec::new();
+}
+
+fn remote_build_observation_api(
+    report: &mut PublicV1AgentReport,
+    build: PublicBuildInput,
+    revision: u64,
+) {
+    report.remote_builds = vec![PublicV1RemoteBuildObservation {
+        operation_id: build.attempt.clone(),
+        revision,
+        build,
+        state: PublicV1RemoteBuildState::Accepted,
+    }];
 }
 
 fn frozen_build_endpoints_api(

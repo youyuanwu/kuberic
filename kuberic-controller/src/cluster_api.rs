@@ -2371,6 +2371,101 @@ fn renewal_configuration_commands(
     Ok(commands)
 }
 
+fn renewal_completed_copy_revoke(
+    renewal: &PublicV1SessionRenewalStatus,
+    replicas: &[PublicV1TopologyReplica],
+) -> std::result::Result<Option<ProtocolCommand>, String> {
+    use kuberic_runtime::protocol::public_operations::PublicV1CallKind;
+    let Some(replacement) = renewal
+        .required
+        .replacement
+        .as_ref()
+        .filter(|_| renewal.required.predecessor.role == ReplicaRole::ActiveSecondary)
+    else {
+        return Ok(None);
+    };
+    let source = replicas
+        .iter()
+        .find(|replica| {
+            replica.report.replica.replica_id == renewal.required.fresh_configuration.primary_id
+        })
+        .ok_or("renewal revoke lacks exact source")?;
+    let copy_id = OperationId::new(format!(
+        "{}-native-copy-{}",
+        renewal.required.operation_id, replacement.process_session_id
+    ));
+    let Some(completion) = source
+        .report
+        .completed_operations
+        .iter()
+        .find(|completion| {
+            completion.operation_id == copy_id
+                && completion.call_kind == PublicV1CallKind::Build
+                && completion.result == PublicV1OperationResult::Succeeded
+                && completion.process_session_id == source.report.process_session_id
+                && completion.storage_incarnation == source.report.storage_incarnation
+                && completion.history == renewal.required.history
+        })
+    else {
+        return Ok(None);
+    };
+    let remote = source
+        .report
+        .remote_builds
+        .iter()
+        .find(|remote| remote.operation_id == copy_id && remote.revision == completion.revision)
+        .ok_or("completed renewal copy lacks exact retained Build input for revocation")?;
+    let build = &remote.build;
+    let target = replicas
+        .iter()
+        .find(|replica| replica.report.replica == replacement.identity)
+        .ok_or("renewal revoke lacks exact replacement")?;
+    if build.attempt != copy_id
+        || build.epoch != renewal.required.renewal_epoch
+        || build.replica != replacement.identity
+        || build.target_storage != replacement.storage_incarnation
+        || build.process_session_id != replacement.process_session_id
+        || target.report.process_session_id != replacement.process_session_id
+        || target.report.storage_incarnation != replacement.storage_incarnation
+        || build.source_address != source.replication_address
+        || build.replication_address != target.replication_address
+        || build.history.as_ref() != Some(&renewal.required.history)
+        || completion.input_digest != PublicOperationProgram::Build(build.clone()).digest()
+    {
+        return Err("completed renewal copy revocation differs from frozen authority".into());
+    }
+    let authority = PublicInboundBuildAuthority {
+        operation_id: copy_id.clone(),
+        operation_revision: remote.revision,
+        attempt: PublicBuildAttemptReference {
+            resource_uid: renewal.required.resource_uid.clone(),
+            epoch: build.epoch,
+            build_id: copy_id,
+            source: source.report.replica.clone(),
+            source_storage: source.report.storage_incarnation.clone(),
+            source_session: source.report.process_session_id.clone(),
+            target: build.replica.clone(),
+            target_storage: build.target_storage.clone(),
+            target_session: build.process_session_id.clone(),
+        },
+        history: renewal.required.history.clone(),
+        current_configuration_id: build
+            .current_configuration_id
+            .clone()
+            .ok_or("renewal revoke lacks configuration")?,
+        source_address: build.source_address.clone(),
+        target_address: build.replication_address.clone(),
+    };
+    authority.validate().map_err(str::to_owned)?;
+    // Historical success may justify only an exact compare-revoke, never
+    // reinstall authority or fabricate a fresh engine observation.
+    Ok(Some(ProtocolCommand::PublicV1History(Box::new(
+        kuberic_runtime::protocol::command::PublicV1HistoryCommand::RevokeInboundBuildAuthority {
+            authority: Box::new(authority),
+        },
+    ))))
+}
+
 fn renewal_native_command(
     authority: &PublicV1AcceptedStatus,
     renewal: &PublicV1SessionRenewalStatus,
@@ -2469,12 +2564,54 @@ fn renewal_native_command(
     } else {
         return Ok(None);
     };
+    if let Some(pending) = replica
+        .report
+        .retry_pending_operations
+        .iter()
+        .find(|pending| pending.intent.operation_id == id)
+    {
+        if pending.intent.identity != authority.identity
+            || replica.report.history != authority.history
+            || pending.intent.process_session_id != replica.report.process_session_id
+            || pending.intent.program.as_ref() != Some(&program)
+            || pending.intent.input_digest != program.digest()
+        {
+            return Err("native renewal retry differs from exact frozen operation".into());
+        }
+        return Ok(Some(ProtocolCommand::PublicV1Operation(Box::new(
+            PublicV1OperationCommand {
+                target: replica.report.replica.clone(),
+                intent: pending.intent.clone(),
+            },
+        ))));
+    }
     let retained = replica
         .report
         .completed_operations
         .iter()
         .filter(|completion| completion.process_session_id == replica.report.process_session_id)
         .map(|completion| completion.revision)
+        .chain(
+            replica
+                .report
+                .active_operations
+                .iter()
+                .map(|intent| intent.revision),
+        )
+        .chain(
+            replica
+                .report
+                .remote_builds
+                .iter()
+                .map(|build| build.revision),
+        )
+        .chain(
+            replica
+                .report
+                .retry_pending_operations
+                .iter()
+                .map(|pending| pending.intent.revision),
+        )
         .chain(
             authority
                 .completed_operations
@@ -2486,20 +2623,29 @@ fn renewal_native_command(
         )
         .max()
         .unwrap_or(0);
-    let (class, revision) = if let PublicOperationProgram::Build(build) = &program {
-        (
+    let class = match &program {
+        PublicOperationProgram::Build(build) => {
             kuberic_runtime::protocol::public_operations::PublicOperationClass::Build {
                 target: build.replica.replica_id,
-            },
-            retained,
-        )
-    } else {
-        (
-            kuberic_runtime::protocol::public_operations::PublicOperationClass::Authority,
-            retained
-                .checked_add(1)
-                .ok_or("native renewal revision exhausted")?,
-        )
+            }
+        }
+        PublicOperationProgram::Remove(build) => {
+            kuberic_runtime::protocol::public_operations::PublicOperationClass::Remove {
+                target: build.replica.replica_id,
+            }
+        }
+        _ => kuberic_runtime::protocol::public_operations::PublicOperationClass::Authority,
+    };
+    let revision = match &program {
+        PublicOperationProgram::Build(_) => retained,
+        PublicOperationProgram::Remove(build) => {
+            crate::evaluator::public_v1_topology::exact_remove_revision(
+                authority, replica, &id, build,
+            )?
+        }
+        _ => retained
+            .checked_add(1)
+            .ok_or("native renewal revision exhausted")?,
     };
     let intent = kuberic_runtime::protocol::public_operations::PublicOperationIntent {
         identity: authority.identity.clone(),
@@ -2519,6 +2665,16 @@ fn renewal_native_command(
             intent,
         },
     ))))
+}
+
+/// Exposes the production renewal preparation planner for cross-crate contract tests.
+#[cfg(feature = "runtime-test-bridge")]
+pub fn plan_public_v1_renewal_preparation(
+    authority: &PublicV1AcceptedStatus,
+    renewal: &PublicV1SessionRenewalStatus,
+    replicas: &[PublicV1TopologyReplica],
+) -> std::result::Result<Option<ProtocolCommand>, String> {
+    renewal_native_command(authority, renewal, replicas)
 }
 
 fn accepted_public_v1_status(
@@ -2815,6 +2971,13 @@ where
                 .ok_or_else(|| "session renewal lacks accepted public-v1 authority".to_string())?;
             loop {
                 let replicas = renewal_topology_replicas(&observation, expected)?;
+                // Reobserve retained completion on every invocation. A lost
+                // Build response or controller recreation cannot skip revoke.
+                if let Some(revoke) = renewal_completed_copy_revoke(expected, &replicas)? {
+                    self.execute_command(&observation, &revoke)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
                 let Some(preparation) = renewal_native_command(&authority, expected, &replicas)?
                 else {
                     break;
@@ -4300,6 +4463,9 @@ impl ClusterApi for InMemoryClusterApi {
                     observation.agents.insert(
                         key,
                         RawAgentObservation::PublicV1Report(Box::new(PublicV1AgentReport {
+            engine_idle: None,
+            remote_builds: Vec::new(),
+            retry_pending_operations: Vec::new(),
             active_operations: Vec::new(),
             configuration: None,
                             identity:
@@ -4432,7 +4598,7 @@ impl ClusterApi for InMemoryClusterApi {
                                 configuration,
                                 ..
                             } => {
-                                report.configuration = Some(kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration { voting: configuration.clone(), idle_replicas: Vec::new() });
+                                report.configuration = Some(kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration { voting: configuration.clone() });
                                 if report.role == ReplicaRole::Primary {
                                     report.read_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
                                     report.write_status = kuberic_runtime::protocol::types::AccessStatus::Granted;
@@ -4473,7 +4639,7 @@ impl ClusterApi for InMemoryClusterApi {
                                 refreshed,
                                 ..
                             } => {
-                                report.configuration = Some(kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration { voting: refreshed.clone(), idle_replicas: Vec::new() });
+                                report.configuration = Some(kuberic_runtime::protocol::public_operations::PublicV1InstalledConfiguration { voting: refreshed.clone() });
                                 report.role = *handoff;
                                 report.progress.role =
                                     kuberic_runtime::protocol::public_operations::PublicProgressRole::Secondary;
@@ -5837,6 +6003,9 @@ mod corrective_replacement_tests {
         target: &ReplicaStorageIncarnationContext,
     ) -> PublicV1AgentReport {
         PublicV1AgentReport {
+            engine_idle: None,
+            remote_builds: Vec::new(),
+            retry_pending_operations: Vec::new(),
             active_operations: Vec::new(),
             configuration: None,
             identity: expected.evidence.identity.clone(),
@@ -6559,6 +6728,9 @@ mod tests {
     ) -> PublicV1TopologyReplica {
         PublicV1TopologyReplica {
             report: PublicV1AgentReport {
+                engine_idle: None,
+                remote_builds: Vec::new(),
+                retry_pending_operations: Vec::new(),
                 active_operations: Vec::new(),
                 configuration: None,
                 identity,
@@ -6771,10 +6943,17 @@ mod tests {
             None,
         )
         .unwrap();
-        replicas[0].report.configuration = Some(PublicV1InstalledConfiguration {
-            voting,
-            idle_replicas: vec![replacement.identity.replica_id],
-        });
+        replicas[0].report.engine_idle = Some(
+            kuberic_runtime::protocol::public_operations::PublicV1EngineIdleObservation {
+                configuration: voting.clone(),
+                history: replicas[0].report.history.clone(),
+                storage_incarnation: replicas[0].report.storage_incarnation.clone(),
+                process_session_id: replicas[0].report.process_session_id.clone(),
+                replicator_creation_id: replicas[0].report.replicator_creation_id.clone(),
+                idle_replicas: vec![replacement.identity.replica_id],
+            },
+        );
+        replicas[0].report.configuration = Some(PublicV1InstalledConfiguration { voting });
         let pending = ProgressQueryResult::NotQueried("native copy is incomplete".into());
         replicas[1].report.progress.current_progress = pending.clone();
         replicas[1].report.progress.catch_up_capability = pending;
@@ -6828,6 +7007,96 @@ mod tests {
                 replica_id: replacement.identity.replica_id,
             })
         );
+        let Some(PublicOperationProgram::Build(build)) = frozen.program.as_ref() else {
+            panic!("fixture lost exact Build");
+        };
+        replicas[0].report.engine_idle = None;
+        replicas[0].report.remote_builds.push(
+            kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildObservation {
+                operation_id: frozen.operation_id.clone(),
+                revision: frozen.revision,
+                build: build.clone(),
+                state:
+                    kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::InDrop,
+            },
+        );
+        let completion =
+            kuberic_runtime::protocol::public_operations::PublicV1OperationCompletion {
+                operation_id: frozen.operation_id.clone(),
+                revision: frozen.revision,
+                call_kind: kuberic_runtime::protocol::public_operations::PublicV1CallKind::Build,
+                process_session_id: frozen.process_session_id.clone(),
+                input_digest: frozen.input_digest.clone(),
+                replay_disposition: frozen.replay_disposition,
+                history: renewal.required.history.clone(),
+                storage_incarnation: replicas[0].report.storage_incarnation.clone(),
+                previous_configuration_id: None,
+                current_configuration_id: build.current_configuration_id.clone(),
+                catch_up_mode: None,
+                catch_up_specific_quorum: None,
+                result: PublicV1OperationResult::Failed("contained predecessor Build".into()),
+            };
+        replicas[0].report.completed_operations.push(completion);
+        replicas[0].report.validate().unwrap();
+        let Some(ProtocolCommand::PublicV1Operation(retirement)) =
+            renewal_native_command(&authority, &renewal, &replicas).unwrap()
+        else {
+            panic!("unavailable diagnostic must not hide known exact retirement");
+        };
+        assert_eq!(
+            retirement.intent.program,
+            Some(PublicOperationProgram::Remove(build.clone()))
+        );
+        assert_eq!(
+            retirement.intent.class,
+            PublicOperationClass::Remove {
+                target: build.replica.replica_id
+            }
+        );
+        assert_eq!(retirement.intent.revision, frozen.revision);
+        assert!(
+            renewal_completed_copy_revoke(&renewal, &replicas)
+                .unwrap()
+                .is_none()
+        );
+        // Simulate interruption after the retained Build succeeded but before
+        // the old controller could issue revoke. A recreated controller has
+        // only independently reobserved exact journal evidence, not its stack.
+        replicas[0]
+            .report
+            .completed_operations
+            .last_mut()
+            .unwrap()
+            .result = PublicV1OperationResult::Succeeded;
+        replicas[0].report.remote_builds[0].state =
+            kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::Ready;
+        replicas[0].report.validate().unwrap();
+        let first_revoke = renewal_completed_copy_revoke(&renewal, &replicas)
+            .unwrap()
+            .unwrap();
+        let mut reobserved = replicas.clone();
+        for replica in &mut reobserved {
+            replica.report =
+                serde_json::from_slice(&serde_json::to_vec(&replica.report).unwrap()).unwrap();
+        }
+        assert_eq!(
+            renewal_completed_copy_revoke(&renewal, &reobserved).unwrap(),
+            Some(first_revoke.clone())
+        );
+        let ProtocolCommand::PublicV1History(command) = first_revoke else {
+            panic!("expected exact revoke")
+        };
+        let kuberic_runtime::protocol::command::PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } = *command
+            else { panic!("historical completion cannot reinstall a grant") };
+        assert_eq!(authority.operation_id, frozen.operation_id);
+        assert_eq!(authority.operation_revision, frozen.revision);
+        assert_eq!(authority.attempt.target_session, build.process_session_id);
+        assert_eq!(authority.attempt.target_storage, build.target_storage);
+        assert_eq!(authority.attempt.source_session, frozen.process_session_id);
+        assert_eq!(authority.source_address, build.source_address);
+        assert_eq!(authority.target_address, build.replication_address);
+        reobserved[1].report.process_session_id = ProcessSessionId::new("successor-session");
+        assert!(renewal_completed_copy_revoke(&renewal, &reobserved).is_err());
     }
 
     #[test]

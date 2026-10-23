@@ -1,6 +1,7 @@
 private-path documented enum crate::error::RuntimeError
 private-path documented enum crate::host::error::HostError
 private-path documented enum crate::host::process::ApplicationStorageState
+private-path documented enum crate::replicator::custom::CallbackOwnership
 private-path documented field crate::host::process::ReplicaBuildDiagnostics::build_id: String
 private-path documented field crate::host::process::ReplicaBuildDiagnostics::catch_up_boundary_lsn: Option < i64 >
 private-path documented field crate::host::process::ReplicaBuildDiagnostics::completed: bool
@@ -43,7 +44,9 @@ private-path documented impl crate::host::process::ReplicaHandle::async fn fence
 private-path documented impl crate::host::process::ReplicaHandle::async fn initialize_public_v1_history (& self , initialization_id : & crate :: protocol :: types :: HistoryInitializationId , history : & crate :: protocol :: types :: HistoryContext , storage : & crate :: protocol :: types :: ReplicaStorageIncarnationContext ,) -> Result < () >
 private-path documented impl crate::host::process::ReplicaHandle::async fn install_public_v1_inbound_build_authority (& self , authority : & crate :: protocol :: public_operations :: PublicInboundBuildAuthority ,) -> Result < () >
 private-path documented impl crate::host::process::ReplicaHandle::async fn persist_public_v1_session_renewal (& self , expected : Option < & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus > , next : & crate :: protocol :: public_operations :: PublicV1SessionRenewalStatus ,) -> Result < () >
+private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_inbound_build_authority (& self ,) -> Result < Option < crate :: protocol :: public_operations :: PublicInboundBuildAuthority > >
 private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_next_operation_revision (& self) -> Result < u64 >
+private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_operation_is_contained (& self , operation_id : & crate :: protocol :: types :: OperationId ,) -> Result < bool >
 private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_operation_intent (& self , operation_id : & crate :: protocol :: types :: OperationId ,) -> Result < Option < crate :: protocol :: public_operations :: PublicOperationIntent > >
 private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_process_endpoint (& self , role : crate :: protocol :: types :: ReplicaRole ,) -> Result < crate :: protocol :: types :: ProcessSessionEndpoint >
 private-path documented impl crate::host::process::ReplicaHandle::async fn public_v1_report (& self ,) -> Result < crate :: protocol :: public_operations :: PublicV1AgentReport >
@@ -78,6 +81,7 @@ private-path documented trait crate::replicator::custom::CustomReplicatorControl
 private-path documented trait crate::replicator::custom::CustomReplicatorControl::async fn install_inbound_build_authority (& self , authority : & PublicInboundBuildAuthority ,) -> Result < () >
 private-path documented trait crate::replicator::custom::CustomReplicatorControl::async fn revoke_inbound_build_authority (& self , authority : & PublicInboundBuildAuthority ,) -> Result < () >
 private-path documented trait crate::replicator::custom::CustomReplicatorControl::async fn shutdown_and_drain (& self) -> Result < () >
+private-path documented trait crate::replicator::custom::CustomReplicatorControl::fn callback_ownership (& self) -> CallbackOwnership
 private-path documented trait crate::replicator::traits::PrimaryReplicator: Replicator
 private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn build_replica (& self , replica : ReplicaInformation) -> Result < () >
 private-path documented trait crate::replicator::traits::PrimaryReplicator::async fn on_data_loss (& self) -> Result < bool >
@@ -271,6 +275,9 @@ public-path documented use crate::host::error :: { HostError , Result }
 public-path documented use crate::host::process :: { ApplicationStorageState , ReplicaBuildDiagnostics , ReplicaDiagnostics , ReplicaHandle , ReplicaHost , ReplicaProcessConfig , RunningReplica , }
 public-path documented use crate::host::transport :: { KubernetesDnsResolver , ReplicaEndpointResolver }
 public-path documented use crate::replicator :: { DefaultReplicatorFactory , PrimaryReplicator , Replicator , ReplicatorFactory , ReplicatorInterfaces , StateReplicator , StatefulServicePartition , }
+private-path documented variant crate::replicator::custom::CallbackOwnership::NativeObserver
+private-path documented variant crate::replicator::custom::CallbackOwnership::ObjectOwnedOnInterruption
+public-path documented use crate::replicator::custom :: CallbackOwnership
 public-path documented use crate::replicator::custom :: CustomReplicatorControl
 public-path documented use crate::replicator::traits :: { PrimaryReplicator , Replicator , ReplicatorFactory , StateReplicator }
 public-path documented variant crate::replicator::ReplicaSetQuorumMode::All

@@ -10,6 +10,434 @@ use kuberic_runtime::protocol::public_operations::{
 use super::harness::Harness;
 use kuberic_controller::test_util::{Barrier, BarrierStage, ResourceKind as Kind, SupportResource};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_v1_nonempty_copy_separates_remote_ready_idle_and_voting() -> Result<()> {
+    use kuberic_runtime::engine::DurableState;
+    use kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState;
+    use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
+    use std::time::Duration;
+
+    let mut harness = Harness::with_members(1).await?;
+    let mut held = None;
+    let result = async {
+        let source_id = harness.ready_members(1).await?;
+        let primary = harness.reference(source_id).await?;
+        let source = harness.cluster.service(&primary).await?;
+        harness
+            .cluster
+            .probe(source.replicate_put("copied-before-build".into(), "nonempty".into()))
+            .await?;
+        let predecessor = harness
+            .report(source_id)
+            .await?
+            .configuration
+            .context("source install missing")?;
+        let gate = harness.copy_gate(source_id).await?;
+        gate.hold()?;
+        held = Some(gate.clone());
+        harness.cluster.scale_to(2).await?;
+        let intent = harness
+            .cluster
+            .pause_at(Barrier::intent(PublicV1CallKind::Build))
+            .await?;
+        let command = intent
+            .evidence()
+            .operation()
+            .command()
+            .map_err(anyhow::Error::msg)?;
+        let Some(PublicOperationProgram::Build(build)) = command.intent.program.clone() else {
+            bail!("controller did not freeze Build");
+        };
+        let observed = harness.cluster.observe().await?;
+        let target_ref = observed
+            .replicas()
+            .find(|replica| replica.identity() == &build.replica)
+            .cloned()
+            .context("target missing")?;
+        let target = harness.cluster.service(&target_ref).await?;
+        harness.cluster.resume(intent).await?;
+
+        // Drive the real RPC only until native copy is held, not until its response.
+        let (running, grant) = loop {
+            harness
+                .cluster
+                .drive(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?;
+            let observed = harness.cluster.observe().await?;
+            let source_report = observed.report(&primary).context("source unavailable")?;
+            if source_report.remote_builds.iter().any(|remote| {
+                remote.operation_id == command.intent.operation_id
+                    && remote.state == PublicV1RemoteBuildState::InBuild
+            }) && source_report.engine_idle.as_ref().is_some_and(|sample| {
+                sample
+                    .idle_replicas
+                    .contains(&target_ref.identity().replica_id)
+            }) {
+                let grant = harness
+                    .cluster
+                    .inbound_build_authority(&target_ref)
+                    .await?
+                    .context("actual in-progress target grant missing")?;
+                break (source_report.clone(), grant);
+            }
+        };
+        ensure!(running.configuration.as_ref() == Some(&predecessor));
+        let remote = running
+            .remote_builds
+            .iter()
+            .find(|remote| remote.operation_id == command.intent.operation_id)
+            .context("running remote missing")?;
+        ensure!(
+            remote.revision == command.intent.revision
+                && remote.build == build
+                && remote.state == PublicV1RemoteBuildState::InBuild
+        );
+        ensure!(
+            !running
+                .completed_operations
+                .iter()
+                .any(|completion| completion.operation_id == command.intent.operation_id),
+            "native idle presence fabricated completed copy"
+        );
+        ensure!(
+            grant.operation_id == command.intent.operation_id
+                && grant.operation_revision == command.intent.revision
+                && grant.attempt.build_id == build.attempt
+                && grant.attempt.source == *primary.identity()
+                && grant.attempt.source_storage == *primary.storage_incarnation()
+                && grant.attempt.source_session == *primary.process_session_id()
+                && grant.attempt.target == *target_ref.identity()
+                && grant.attempt.target_storage == *target_ref.storage_incarnation()
+                && grant.attempt.target_session == *target_ref.process_session_id()
+                && grant.attempt.epoch == build.epoch
+                && Some(&grant.history) == build.history.as_ref()
+                && Some(&grant.current_configuration_id) == build.current_configuration_id.as_ref()
+                && grant.source_address == build.source_address
+                && grant.target_address == build.replication_address
+        );
+        let idle = running
+            .engine_idle
+            .context("actual V1 idle query missing")?;
+        ensure!(
+            idle.configuration == predecessor.voting
+                && idle.history == running.history
+                && idle.storage_incarnation == running.storage_incarnation
+                && idle.process_session_id == running.process_session_id
+                && idle.replicator_creation_id == running.replicator_creation_id
+                && idle.idle_replicas == vec![target_ref.identity().replica_id]
+        );
+
+        gate.release()?;
+        let completed = harness
+            .cluster
+            .pause_at(Barrier::completion(PublicV1CallKind::Build))
+            .await?;
+        ensure!(
+            completed
+                .evidence()
+                .operation()
+                .command()
+                .map_err(anyhow::Error::msg)?
+                == command,
+            "completion changed the frozen Build"
+        );
+        let observed = harness.cluster.observe().await?;
+        let report = observed
+            .report(&primary)
+            .context("source completion report missing")?;
+        ensure!(report.configuration.as_ref() == Some(&predecessor));
+        ensure!(report.remote_builds.iter().any(|remote| {
+            remote.operation_id == command.intent.operation_id
+                && remote.revision == command.intent.revision
+                && remote.build == build
+                && remote.state == PublicV1RemoteBuildState::Ready
+        }));
+        let completion = report
+            .completed_operations
+            .iter()
+            .find(|completion| completion.operation_id == command.intent.operation_id)
+            .context("actual completed Build missing")?;
+        ensure!(
+            completion.result == PublicV1OperationResult::Succeeded
+                && completion.revision == command.intent.revision
+                && completion.process_session_id == command.intent.process_session_id
+                && completion.input_digest == command.intent.input_digest
+                && completion.history == grant.history
+                && completion.storage_incarnation == grant.attempt.source_storage
+        );
+        ensure!(
+            harness.cluster.inbound_build_authority(&target_ref).await? == Some(grant.clone()),
+            "source completion alone must not invent controller acceptance/revocation"
+        );
+        let report = observed
+            .report(&target_ref)
+            .context("target report missing")?;
+        ensure!(
+            report.role == ReplicaRole::IdleSecondary
+                && report.read_status != AccessStatus::Granted
+                && report.write_status != AccessStatus::Granted
+        );
+        ensure!(
+            !predecessor
+                .voting
+                .current
+                .members
+                .iter()
+                .any(|member| member.identity == report.replica)
+        );
+        ensure!(
+            target.get("copied-before-build").await.is_err()
+                && target
+                    .replicate_put("forbidden-idle".into(), "write".into())
+                    .await
+                    .is_err()
+        );
+        let committed = target.persistence().durable_progress().await?.committed_lsn;
+        ensure!(
+            target
+                .persistence()
+                .snapshot_at(committed)?
+                .get("copied-before-build")
+                .map(String::as_str)
+                == Some("nonempty"),
+            "real V1 copy omitted preexisting KV contents"
+        );
+        harness.cluster.resume(completed).await?;
+        let joint = harness
+            .cluster
+            .pause_at(Barrier::Operation {
+                stage: BarrierStage::Intent,
+                kind: Some(PublicV1CallKind::CatchUp),
+                participant: Some(primary.clone()),
+            })
+            .await?;
+        let joint_command = joint
+            .evidence()
+            .operation()
+            .command()
+            .map_err(anyhow::Error::msg)?;
+        ensure!(
+            harness
+                .cluster
+                .inbound_build_authority(&target_ref)
+                .await?
+                .is_none(),
+            "controller acceptance did not revoke the exact completed grant before admission"
+        );
+        let Some(PublicOperationProgram::CatchUp { configuration, .. }) =
+            &joint_command.intent.program
+        else {
+            bail!("controller skipped separate joint admission");
+        };
+        ensure!(
+            configuration.previous.as_ref() == Some(&predecessor.voting.current)
+                && configuration
+                    .current
+                    .members
+                    .iter()
+                    .any(|member| member.identity == *target_ref.identity())
+        );
+        harness.cluster.resume(joint).await?;
+        let topology = harness.cluster.settle_members(2).await?;
+        let observed = harness.cluster.observe().await?;
+        let installed = observed
+            .report(topology.primary())
+            .and_then(|report| report.configuration.as_ref())
+            .context("admitted configuration missing")?;
+        ensure!(
+            installed.voting.previous.is_none()
+                && installed
+                    .voting
+                    .current
+                    .members
+                    .iter()
+                    .any(|member| member.identity == *target_ref.identity())
+        );
+        harness
+            .cluster
+            .probe(source.replicate_put("after-admission".into(), "replicated".into()))
+            .await?;
+        harness
+            .assert_values_on_members("copied-before-build", "nonempty", 2)
+            .await?;
+        harness
+            .assert_values_on_members("after-admission", "replicated", 2)
+            .await?;
+        ensure!(
+            target.get("after-admission").await.is_err()
+                && target
+                    .replicate_put("forbidden-secondary".into(), "write".into())
+                    .await
+                    .is_err(),
+            "voter admission bypassed primary-only client fences"
+        );
+        Ok(())
+    }
+    .await;
+    if let Some(gate) = held {
+        gate.release()?;
+    }
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_v1_controller_terminal_success_joins_before_public_success() -> Result<()> {
+    actual_v1_controller_terminal(0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_v1_controller_terminal_child_failure_retains_failed_completion() -> Result<()> {
+    actual_v1_controller_terminal(1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_v1_controller_terminal_lost_native_join_never_certifies_containment() -> Result<()>
+{
+    actual_v1_controller_terminal(2).await
+}
+
+async fn actual_v1_controller_terminal(fault: u8) -> Result<()> {
+    use kuberic_runtime::protocol::types::AccessStatus;
+    let mut harness = Harness::with_members(1).await?;
+    let result = async {
+        let primary_id = harness.ready_members(1).await?;
+        let primary = harness.reference(primary_id).await?;
+        let service = harness.cluster.service(&primary).await?;
+        harness.cluster.probe(service.replicate_put("terminal-tail".into(), "acknowledged".into())).await?;
+        if fault == 1 {
+            // Negative setup affects the real application's child Close callback.
+            service.fail_next_close();
+        } else if fault == 2 {
+            // Negative setup loses the actual native driver's retained JoinHandle task.
+            let report = harness.report(primary_id).await?;
+            kuberic_runtime::replicator::TestingTcpRoute::lose_native_driver(
+                &report.process_session_id, &report.replicator_creation_id,
+            ).await?;
+        }
+        let terminal = harness.cluster.dispatch_terminal(&primary, PublicV1CallKind::Close).await?;
+        let command = terminal.evidence.operation().command().map_err(anyhow::Error::msg)?;
+        ensure!(terminal.dispatch_result.is_ok() == (fault == 0), "dispatch: {:?}", terminal.dispatch_result);
+        ensure!(terminal.contained == (fault != 2), "public success/child failure and native join evidence conflated");
+        let completion = terminal.report.completed_operations.iter().find(|completion| completion.operation_id == command.intent.operation_id);
+        if fault != 2 {
+            let completion = completion.context("terminal completion missing")?;
+            ensure!(completion.revision == command.intent.revision
+                && completion.input_digest == command.intent.input_digest
+                && completion.process_session_id == command.intent.process_session_id
+                && completion.call_kind == PublicV1CallKind::Close);
+            if fault == 0 {
+                ensure!(completion.result == PublicV1OperationResult::Succeeded);
+            } else {
+                ensure!(matches!(&completion.result, PublicV1OperationResult::Failed(detail) if detail.contains("injected KV application Close failure")));
+            }
+        } else {
+            ensure!(completion.is_none_or(|completion| completion.result != PublicV1OperationResult::Succeeded));
+        }
+        ensure!(terminal.report.read_status != AccessStatus::Granted
+            && terminal.report.write_status != AccessStatus::Granted
+            && terminal.report.engine_idle.is_none());
+        ensure!(service.get("terminal-tail").await.is_err()
+            && service.replicate_put("late-terminal".into(), "forbidden".into()).await.is_err());
+        harness.cluster.recreate_controller().await?;
+        let retry = harness.cluster.redispatch_operation(&terminal.evidence).await?;
+        ensure!(retry.dispatch_result == terminal.dispatch_result && retry.contained == terminal.contained);
+        ensure!(retry.report.completed_operations == terminal.report.completed_operations
+            && retry.report.read_status != AccessStatus::Granted && retry.report.write_status != AccessStatus::Granted,
+            "late duplicate terminal restored authority or changed its result");
+        Ok(())
+    }.await;
+    if fault == 2 {
+        let passed = result.is_ok();
+        let finished = harness.finish(result).await;
+        ensure!(passed, "lost-driver assertions failed: {finished:?}");
+        ensure!(finished.is_err(), "lost native task was hidden by teardown");
+        Ok(())
+    } else {
+        harness.finish(result).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_v1_controller_undeclared_role_failure_is_not_retried() -> Result<()> {
+    use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
+    let mut harness = Harness::with_members(1).await?;
+    let result = async {
+        harness.ready_members(1).await?;
+        harness.cluster.scale_to(2).await?;
+        let intent = harness
+            .cluster
+            .pause_at(Barrier::intent(PublicV1CallKind::Role))
+            .await?;
+        let command = intent
+            .evidence()
+            .operation()
+            .command()
+            .map_err(anyhow::Error::msg)?;
+        ensure!(matches!(
+            command.intent.program,
+            Some(PublicOperationProgram::Role {
+                role: ReplicaRole::IdleSecondary,
+                ..
+            })
+        ));
+        let observed = harness.cluster.observe().await?;
+        let target = observed
+            .replicas()
+            .find(|replica| replica.identity() == &command.target)
+            .cloned()
+            .context("Role target missing")?;
+        let service = harness.cluster.service(&target).await?;
+        let before = service.role_callback_count();
+        // Negative setup only; actual controller dispatch invokes the real callback.
+        service.fail_next_role();
+        let evidence = harness.cluster.resume(intent).await?;
+        let first = harness.cluster.redispatch_operation(&evidence).await?;
+        ensure!(
+            service.role_callback_count() == before + 1,
+            "dispatch: {:?}",
+            first.dispatch_result
+        );
+        ensure!(
+            first.dispatch_result.as_ref().is_err_and(
+                |detail| detail.contains("injected undeclared KV application Role failure")
+            ) && !first.contained
+                && first.report.retry_pending_operations.is_empty()
+                && first.report.read_status != AccessStatus::Granted
+                && first.report.write_status != AccessStatus::Granted
+        );
+        ensure!(
+            !first
+                .report
+                .completed_operations
+                .iter()
+                .any(|completion| { completion.operation_id == command.intent.operation_id }),
+            "undeclared application failure fabricated completed containment"
+        );
+        harness.cluster.recreate_controller().await?;
+        let second = harness.cluster.redispatch_operation(&evidence).await?;
+        ensure!(
+            second.dispatch_result == first.dispatch_result
+                && second.report.completed_operations == first.report.completed_operations
+                && second.report.retry_pending_operations.is_empty()
+                && service.role_callback_count() == before + 1,
+            "undeclared application failure re-entered its failed callback"
+        );
+        ensure!(
+            service.get("not-serving").await.is_err()
+                && service
+                    .replicate_put("not-serving".into(), "forbidden".into())
+                    .await
+                    .is_err()
+        );
+        Ok(())
+    }
+    .await;
+    harness.finish(result).await
+}
+
 async fn delete_secondary(harness: &mut Harness) -> Result<Vec<(Kind, String, String)>> {
     let old = harness.report(2).await?;
     let uid = old.replica.instance_id.as_str();

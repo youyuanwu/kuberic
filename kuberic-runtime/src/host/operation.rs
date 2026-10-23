@@ -230,6 +230,21 @@ impl PartitionOperation {
         F: Future<Output = std::result::Result<(), E>> + Send + 'static,
         E: std::fmt::Display + Send + 'static,
     {
+        self.spawn_root_with_retry(containment, None, future).await
+    }
+
+    pub(crate) async fn spawn_root_with_retry<F, E>(
+        self: &Arc<Self>,
+        containment: CallbackContainment,
+        returned_failure: Option<
+            Arc<std::sync::Mutex<Option<crate::host::state::PublicCallbackFailure>>>,
+        >,
+        future: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = std::result::Result<(), E>> + Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
         let _lifecycle = self.lifecycle.lock().await;
         if self
             .shutting_down
@@ -261,7 +276,10 @@ impl PartitionOperation {
                 return Ok(());
             }
             let result = future.await.map_err(|error| error.to_string());
-            let recorded = operation.record_root_result(result, containment).await;
+            let failure = returned_failure.and_then(|failure| failure.lock().unwrap().take());
+            let recorded = operation
+                .record_root_result(result, containment, failure)
+                .await;
             if let Err(error) = &recorded {
                 operation.record_failure(error);
             }
@@ -300,6 +318,7 @@ impl PartitionOperation {
         &self,
         result: std::result::Result<(), String>,
         containment: CallbackContainment,
+        returned_failure: Option<crate::host::state::PublicCallbackFailure>,
     ) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
         let current = self.snapshot();
@@ -313,7 +332,40 @@ impl PartitionOperation {
             Ok(()) => PublicOperationDisposition::Succeeded,
             Err(error) => PublicOperationDisposition::Failed(error),
         };
+        if let (Some(failure), PublicOperationDisposition::Failed(_)) =
+            (returned_failure, &disposition)
+            && !current.lifecycle.outcomes.iter().any(|outcome| {
+                matches!(
+                    outcome,
+                    crate::host::state::PublicInstructionOutcome::RebuildRequired(_)
+                )
+            })
+        {
+            let pending = match self
+                .store
+                .record_public_retry_failure(&current.intent, current.attempt, &failure)
+                .await
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    let pending = self.advance(
+                        PublicOperationStage::Running,
+                        PublicOperationStage::ContainmentPending,
+                        Some(PublicOperationDisposition::Ambiguous(format!(
+                            "returned callback failure could not retain its retry receipt: {error}"
+                        ))),
+                    ).await?;
+                    self.record.send_replace(pending);
+                    self.bump_revision();
+                    return Ok(());
+                }
+            };
+            self.record.send_replace(pending);
+            self.bump_revision();
+            return Ok(());
+        }
 
+        let containment = self.selected_containment(containment).await;
         if (containment == CallbackContainment::ObjectOwnedOnInterruption
             && matches!(disposition, PublicOperationDisposition::Failed(_)))
             || (containment == CallbackContainment::RootTask && !self.descendants_contained().await)
@@ -443,8 +495,13 @@ impl PartitionOperation {
         current: PublicOperationRecord,
         task_failure: Option<String>,
     ) -> Result<PublicOperationRecord> {
-        let containment = *self.containment.lock().await;
+        let containment = self
+            .selected_containment(*self.containment.lock().await)
+            .await;
         let next = match containment {
+            _ if current.stage == PublicOperationStage::RetryPending => {
+                PublicOperationStage::Completed
+            }
             CallbackContainment::NativeObserver => PublicOperationStage::Completed,
             CallbackContainment::RootTask if self.descendants_contained().await => {
                 PublicOperationStage::Completed
@@ -467,6 +524,83 @@ impl PartitionOperation {
         self.record.send_replace(updated.clone());
         self.bump_revision();
         Ok(updated)
+    }
+
+    async fn selected_containment(&self, declared: CallbackContainment) -> CallbackContainment {
+        if declared != CallbackContainment::NativeObserver {
+            return declared;
+        }
+        // An engine's declaration cannot certify the independent application.
+        // Read the durable selection, not the coarse Running watch snapshot.
+        let record = self
+            .store
+            .public_operation_records()
+            .await
+            .ok()
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.intent == self.intent())
+            });
+        let canonical_failure = record.as_ref().is_some_and(|record| {
+            matches!(
+                record.lifecycle.outcomes.last(),
+                Some(crate::host::state::PublicInstructionOutcome::RebuildRequired(_))
+            )
+        });
+        // A joined root between successful callbacks has no interrupted child.
+        // In particular, a successful application receipt does not require
+        // shutting down the application merely to supersede the next stage.
+        // A callback-success/receipt-loss still has in_flight set and cannot
+        // take this path. A receipted canonical failure is not success either:
+        // recover its callback provenance below, including application owners.
+        // Missing store evidence remains conservative.
+        if !canonical_failure
+            && record
+                .as_ref()
+                .is_some_and(|record| record.lifecycle.in_flight.is_none())
+        {
+            return declared;
+        }
+        let selected = record.and_then(|record| {
+            record.lifecycle.in_flight.or_else(|| {
+                if !canonical_failure {
+                    return None;
+                }
+                super::public_lifecycle::program::operation_instructions(&record.intent)
+                    .get(record.lifecycle.outcomes.len().checked_sub(1)?)
+                    .copied()
+            })
+        });
+        use crate::host::state::PublicInstruction::*;
+        match selected {
+            Some(
+                ReplicatorOpen
+                | ReplicatorRole
+                | ReplicatorPrimary
+                | ProgramEpoch
+                | Epoch
+                | Configuration
+                | StartingConfiguration
+                | RefreshedConfiguration
+                | CurrentConfiguration
+                | CatchUpConfiguration
+                | FirstCatchUp
+                | SecondCatchUp
+                | CatchUp
+                | DataLoss
+                | Progress
+                | Build
+                | Remove
+                // Synchronous host-owned revocation has no external child to
+                // outlive the joined root, even at its selected test barrier.
+                | Revoke,
+            ) => declared,
+            // Access refreshes the application role/address. An active
+            // application selection and unknown provenance cannot borrow an
+            // engine declaration.
+            _ => CallbackContainment::ObjectOwnedOnInterruption,
+        }
     }
 
     pub(crate) async fn complete_containment(&self) -> Result<PublicOperationRecord> {
@@ -506,14 +640,42 @@ impl PartitionOperation {
     }
 
     pub(crate) async fn wait_for_terminal(&self) -> Result<PublicOperationRecord> {
+        self.wait_for_result(None).await
+    }
+
+    pub(crate) async fn wait_for_attempt(&self, attempt: u64) -> Result<PublicOperationRecord> {
+        self.wait_for_result(Some(attempt)).await
+    }
+
+    async fn wait_for_result(&self, attempt: Option<u64>) -> Result<PublicOperationRecord> {
         let mut record = self.record.subscribe();
         let mut failure = self.failure.subscribe();
         loop {
             let current = record.borrow().clone();
+            if let Some(attempt) = attempt
+                && let Some(outcome) = current.attempt_results.get(&attempt)
+            {
+                let mut result = current.clone();
+                result.attempt = attempt;
+                result.stage = outcome.stage;
+                result.disposition = Some(outcome.disposition.clone());
+                result.lifecycle = outcome.lifecycle.clone();
+                result.retry_failure = outcome.retry_failure.clone();
+                result.containment = outcome.containment;
+                result.superseded_by = outcome.superseded_by.clone();
+                result.blockers = outcome.blockers.clone();
+                result
+                    .attempt_results
+                    .retain(|number, _| *number <= attempt);
+                return Ok(result);
+            }
             if matches!(
                 current.stage,
-                PublicOperationStage::ContainmentPending | PublicOperationStage::Completed
-            ) {
+                PublicOperationStage::RetryPending
+                    | PublicOperationStage::ContainmentPending
+                    | PublicOperationStage::Completed
+            ) && attempt.is_none_or(|attempt| current.attempt == attempt)
+            {
                 return Ok(current);
             }
             if let Some(message) = failure.borrow().clone() {
@@ -644,9 +806,26 @@ impl PartitionOperation {
                 ))
             })?;
         self.record.send_replace(record.clone());
+        let retained_failure = self.failure.borrow().clone();
+        if record.stage == PublicOperationStage::RetryPending
+            && let Some(error) = retained_failure.clone()
+        {
+            let pending = self
+                .advance(
+                    PublicOperationStage::RetryPending,
+                    PublicOperationStage::ContainmentPending,
+                    Some(PublicOperationDisposition::Ambiguous(error)),
+                )
+                .await?;
+            self.record.send_replace(pending.clone());
+            self.recovery_complete();
+            return Ok(Some(pending));
+        }
         if matches!(
             record.stage,
-            PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+            PublicOperationStage::Completed
+                | PublicOperationStage::ContainmentPending
+                | PublicOperationStage::RetryPending
         ) {
             self.recovery_complete();
             return Ok(None);
@@ -661,6 +840,7 @@ impl PartitionOperation {
 
         let same_session = &record.intent.process_session_id == current_session;
         let recovered = if same_session
+            && retained_failure.is_none()
             && record.superseded_by.is_none()
             && crate::host::public_lifecycle::replayable(&record)
             && matches!(
@@ -718,6 +898,39 @@ impl PartitionOperation {
     fn set_coordination_active(&self, active: bool) {
         self.coordination_active
             .store(active, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) async fn resume_returned_failure(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let current = self.snapshot();
+        if current.stage != PublicOperationStage::RetryPending {
+            return Ok(());
+        }
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(HostError::CommandRejected(
+                "public-operation registry is shutting down".into(),
+            ));
+        }
+        if let Some(task) = self.task.lock().await.take() {
+            task.await.map_err(|error| {
+                HostError::CommandRejected(format!("returned callback task join failed: {error}"))
+            })??;
+        }
+        let ready = self
+            .store
+            .resume_public_operation(&current.intent, current.attempt)
+            .await?;
+        self.record.send_replace(ready);
+        self.failure.send_replace(None);
+        let _invalidation = self.access_invalidation.lock().unwrap();
+        self.access_invalidated
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.recovery_complete();
+        self.bump_revision();
+        Ok(())
     }
 
     fn record_failure(&self, error: &HostError) {
@@ -902,6 +1115,37 @@ fn renewal_endpoint_matches_intent(
         })
 }
 
+fn renewal_inbound_build_matches(
+    renewal: &PublicV1SessionRenewalStatus,
+    process: &ProcessSessionId,
+    creation: &crate::protocol::types::ReplicatorCreationId,
+    authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+) -> bool {
+    use crate::protocol::types::ReplicaRole;
+
+    let required = &renewal.required;
+    renewal.validate().is_ok()
+        && renewal.stage == PublicSessionRenewalStage::ConfigurationPending
+        && required.predecessor_contained
+        && required.predecessor.role == ReplicaRole::ActiveSecondary
+        && required.history == authority.history
+        && required.renewal_epoch == authority.attempt.epoch
+        && required.replacement.as_ref().is_some_and(|replacement| {
+            replacement.identity == authority.attempt.target
+                && replacement.storage_incarnation == authority.attempt.target_storage
+                && replacement.process_session_id == authority.attempt.target_session
+                && &replacement.process_session_id == process
+                && &replacement.replicator_creation_id == creation
+        })
+        && required.surviving_sessions.iter().any(|survivor| {
+            survivor.role == ReplicaRole::Primary
+                && survivor.identity.replica_id == required.fresh_configuration.primary_id
+                && survivor.identity == authority.attempt.source
+                && survivor.storage_incarnation == authority.attempt.source_storage
+                && survivor.process_session_id == authority.attempt.source_session
+        })
+}
+
 fn is_retained_replacement_open(
     renewal: &PublicV1SessionRenewalStatus,
     local: &ReplicaIdentity,
@@ -998,11 +1242,13 @@ pub(crate) struct PartitionOperationRegistry {
     identity: PublicV1Identity,
     process_session_id: ProcessSessionId,
     admission: Mutex<()>,
+    dispatch: std::sync::Mutex<BTreeMap<OperationId, Arc<Mutex<()>>>>,
     state: Mutex<RegistryState>,
     coordination: Mutex<Vec<JoinHandle<()>>>,
     revision: watch::Sender<u64>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     terminal_fence: std::sync::atomic::AtomicBool,
+    renewal_fence: std::sync::atomic::AtomicBool,
     control_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     terminal_tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     abort_guard: Arc<std::sync::Mutex<bool>>,
@@ -1037,11 +1283,13 @@ impl PartitionOperationRegistry {
             identity: preview,
             process_session_id,
             admission: Mutex::new(()),
+            dispatch: Default::default(),
             state: Mutex::new(RegistryState::default()),
             coordination: Mutex::new(Vec::new()),
             revision,
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             terminal_fence: std::sync::atomic::AtomicBool::new(false),
+            renewal_fence: std::sync::atomic::AtomicBool::new(false),
             control_tasks: std::sync::Mutex::new(Vec::new()),
             terminal_tasks: std::sync::Mutex::new(Vec::new()),
             abort_guard: Arc::new(std::sync::Mutex::new(false)),
@@ -1076,6 +1324,19 @@ impl PartitionOperationRegistry {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    pub(crate) fn fence_session_renewal(&self) {
+        self.renewal_fence
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn terminal_admission_is_fenced(&self) -> bool {
+        self.terminal_fence
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn fence_and_schedule_fault_containment(self: &Arc<Self>) {
         self.fence();
         let registry = Arc::clone(self);
@@ -1103,11 +1364,41 @@ impl PartitionOperationRegistry {
     }
 
     pub(crate) fn is_fenced(&self) -> bool {
-        self.terminal_fence
+        self.renewal_fence
             .load(std::sync::atomic::Ordering::Acquire)
-            || self
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
+            || self.terminal_admission_is_fenced()
+    }
+
+    pub(crate) fn build_authority_is_fenced(
+        &self,
+        state: &super::state::AgentState,
+        creation: &crate::protocol::types::ReplicatorCreationId,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> bool {
+        // Renewal keeps application/operation admission closed until configuration
+        // installation, but the exact replacement must receive its copy first.
+        let renewal_blocks = self
+            .renewal_fence
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !state
+                .public_v1_operation_state
+                .as_ref()
+                .is_some_and(|preview| {
+                    !preview.terminal
+                        && state.identity.local_identity == authority.attempt.target
+                        && preview.history.as_ref() == Some(&authority.history)
+                        && preview.storage_incarnation.as_ref()
+                            == Some(&authority.attempt.target_storage)
+                        && preview.session_renewal.as_ref().is_some_and(|renewal| {
+                            renewal_inbound_build_matches(
+                                renewal,
+                                &self.process_session_id,
+                                creation,
+                                authority,
+                            )
+                        })
+                });
+        renewal_blocks || self.terminal_admission_is_fenced()
     }
 
     async fn prepare_fenced_session_renewal_configuration(
@@ -1200,10 +1491,8 @@ impl PartitionOperationRegistry {
         self.store
             .persist_public_v1_session_renewal(Some(&current), &authorized)
             .await?;
-        if self.is_fenced() {
-            self.terminal_fence
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
+        self.renewal_fence
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1212,6 +1501,15 @@ impl PartitionOperationRegistry {
             .lock()
             .expect("control task lock")
             .push(tokio::spawn(future));
+    }
+
+    pub(crate) fn dispatch_lock(&self, id: &OperationId) -> Arc<Mutex<()>> {
+        self.dispatch
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .clone()
     }
 
     pub(crate) fn own_terminal_task(&self, future: impl Future<Output = ()> + Send + 'static) {
@@ -1242,13 +1540,16 @@ impl PartitionOperationRegistry {
                 "public-operation preview or process session changed".into(),
             ));
         }
-        let renewal_configuration = if !intent.class.is_terminal() {
-            self.prepare_fenced_session_renewal_configuration(&intent)
-                .await?
-        } else {
-            false
-        };
-        if self.is_fenced() && !intent.class.is_terminal() && !renewal_configuration {
+        let renewal_configuration =
+            if !intent.class.is_terminal() && !self.terminal_admission_is_fenced() {
+                self.prepare_fenced_session_renewal_configuration(&intent)
+                    .await?
+            } else {
+                false
+            };
+        if !intent.class.is_terminal()
+            && (self.terminal_admission_is_fenced() || (self.is_fenced() && !renewal_configuration))
+        {
             return Err(HostError::CommandRejected(
                 "preview is synchronously fenced".into(),
             ));
@@ -1265,6 +1566,11 @@ impl PartitionOperationRegistry {
             ));
         }
         self.load_durable_records().await?;
+        if self.terminal_admission_is_fenced() && !intent.class.is_terminal() {
+            return Err(HostError::CommandRejected(
+                "preview is synchronously fenced".into(),
+            ));
+        }
         if let Some(existing) = self
             .state
             .lock()
@@ -1430,6 +1736,9 @@ impl PartitionOperationRegistry {
             }
         }
         if let Some(owner) = attached_to {
+            if intent.class.is_terminal() {
+                self.fence();
+            }
             let attached = self
                 .record_attachment(intent, owner.intent().operation_id)
                 .await?;
@@ -1442,6 +1751,11 @@ impl PartitionOperationRegistry {
             .iter()
             .map(|operation| operation.intent().operation_id)
             .collect::<Vec<_>>();
+        // Fence only validated registry input/relations, but before durable
+        // admission can yield or fail ambiguously. This process never reopens.
+        if intent.class.is_terminal() {
+            self.fence();
+        }
         let record = match self
             .store
             .begin_public_operation(&intent, &blocker_ids, &superseded_ids)
@@ -1705,15 +2019,29 @@ impl PartitionOperationRegistry {
     }
 
     async fn load_durable_records(&self) -> Result<()> {
-        let records = self.store.public_operation_records().await?;
-        if self
+        let records = self
+            .store
+            .public_operation_records()
+            .await
+            .inspect_err(|_| self.fence())?;
+        let durable = self
             .store
             .load_state()
-            .await?
+            .await
+            .inspect_err(|_| self.fence())?;
+        if records.iter().any(|record| {
+            record.intent.process_session_id == self.process_session_id
+                && record.intent.class.is_terminal()
+        }) {
+            self.fence();
+        }
+        if durable
             .public_v1_operation_state
             .is_some_and(|preview| preview.terminal)
         {
-            self.fence();
+            // A contained predecessor fault can remain in a replacement's
+            // journal. Only this process's terminal records close it forever.
+            self.fence_session_renewal();
         }
         let mut state = self.state.lock().await;
         for record in records {
@@ -1970,6 +2298,426 @@ mod tests {
             lifecycle: None,
             program: None,
         }
+    }
+
+    async fn fence_registry(
+        root: &std::path::Path,
+        session: ProcessSessionId,
+    ) -> (Arc<SqliteStore>, Arc<PartitionOperationRegistry>) {
+        let store = Arc::new(
+            SqliteStore::create_replacement_authorized(
+                root.join("fences.sqlite3"),
+                AgentState::new(StorageIdentity {
+                    schema_version: crate::host::state::SCHEMA_VERSION,
+                    resource_uid: ResourceUid::new("fence-resource"),
+                    pod_uid: PodUid::new("fence-pod"),
+                    pvc_uid: PvcUid::new("fence-pvc"),
+                    initialization_id: InitializationId::new("fence-init"),
+                    local_identity: ReplicaIdentity {
+                        replica_id: ReplicaId::new(1),
+                        instance_id: ReplicaInstanceId::new("fence-pod"),
+                        agent_generation: AgentGeneration::new("fence-generation"),
+                    },
+                    effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+                }),
+                PublicV1LifecycleBinding {
+                    identity: PublicV1Identity::new(1),
+                    resource_uid: ResourceUid::new("fence-resource"),
+                    spec_generation: 1,
+                    state_persistence: StatePersistence::Persisted,
+                },
+            )
+            .unwrap(),
+        );
+        let state = store.load_state().await.unwrap();
+        let initialization = derive_history_initialization_id(
+            &state.identity.resource_uid,
+            PublicProtocolGeneration::new(1),
+        );
+        let history = derive_bootstrap_history(
+            &state.identity.resource_uid,
+            PublicProtocolGeneration::new(1),
+            &initialization,
+        );
+        let storage = ReplicaStorageIncarnationContext {
+            replica: state.identity.local_identity,
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: state.identity.pod_uid,
+                pvc_uid: state.identity.pvc_uid,
+            },
+            storage_generation: StorageGeneration::new("fence-storage"),
+        };
+        store
+            .initialize_public_v1_history(&initialization, &history, &storage)
+            .await
+            .unwrap();
+        let registry =
+            PartitionOperationRegistry::new(store.clone(), PublicV1Identity::new(1), session)
+                .unwrap();
+        (store, registry)
+    }
+
+    fn program_intent(program: PublicOperationProgram, revision: u64) -> PublicOperationIntent {
+        let class = match &program {
+            PublicOperationProgram::Close => PublicOperationClass::Close,
+            PublicOperationProgram::Abort => PublicOperationClass::Abort,
+            _ => PublicOperationClass::Authority,
+        };
+        PublicOperationIntent {
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            program: Some(program),
+            ..intent(class, revision)
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_admission_fence_precedes_callbacks_but_not_invalid_input() {
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) = fence_registry(root.path(), ProcessSessionId::new("session")).await;
+        let epoch = program_intent(
+            PublicOperationProgram::Epoch {
+                epoch: Epoch::new(0, 1),
+            },
+            1,
+        );
+        registry.admit(epoch.clone()).await.unwrap();
+        let terminal = program_intent(PublicOperationProgram::Close, 2);
+        for invalid in [
+            PublicOperationIntent {
+                operation_id: epoch.operation_id,
+                ..terminal.clone()
+            },
+            PublicOperationIntent {
+                process_session_id: ProcessSessionId::new("stale-session"),
+                ..terminal.clone()
+            },
+            PublicOperationIntent {
+                identity: PublicV1Identity::new(2),
+                ..terminal.clone()
+            },
+            PublicOperationIntent {
+                input_digest: PublicOperationProgram::Abort.digest(),
+                ..terminal.clone()
+            },
+        ] {
+            assert!(registry.admit(invalid).await.is_err());
+            assert!(!registry.is_fenced());
+        }
+        registry.admit(terminal.clone()).await.unwrap();
+        assert!(registry.terminal_admission_is_fenced());
+        assert!(registry.is_fenced());
+        assert!(
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+                .terminal
+        );
+        registry.fence_session_renewal();
+        registry
+            .renewal_fence
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(registry.is_fenced());
+        assert!(
+            registry
+                .admit(program_intent(
+                    PublicOperationProgram::Epoch {
+                        epoch: Epoch::new(0, 2)
+                    },
+                    3
+                ))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_fence_recovery_is_current_process_not_predecessor_terminal() {
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) = fence_registry(root.path(), ProcessSessionId::new("session")).await;
+        let fault = intent(PublicOperationClass::TransientFault, 1);
+        store
+            .begin_public_operation(&fault, &[], &[])
+            .await
+            .unwrap();
+        registry.load_durable_records().await.unwrap();
+        assert!(registry.terminal_admission_is_fenced());
+        let replacement = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            ProcessSessionId::new("replacement"),
+        )
+        .unwrap();
+        replacement.load_durable_records().await.unwrap();
+        assert!(!replacement.terminal_admission_is_fenced());
+        assert!(replacement.is_fenced());
+    }
+
+    #[tokio::test]
+    async fn uncertain_terminal_admission_and_store_read_failure_remain_fenced() {
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) = fence_registry(root.path(), ProcessSessionId::new("session")).await;
+        let connection = rusqlite::Connection::open(root.path().join("fences.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_admission BEFORE UPDATE ON agent_state
+             BEGIN SELECT RAISE(FAIL, 'injected admission persistence failure'); END;",
+            )
+            .unwrap();
+        let error = registry
+            .admit(program_intent(PublicOperationProgram::Abort, 1))
+            .await
+            .err()
+            .expect("injected failure");
+        assert!(
+            error
+                .to_string()
+                .contains("injected admission persistence failure"),
+            "{error}"
+        );
+        assert!(registry.terminal_admission_is_fenced());
+        assert!(store.public_operation_records().await.unwrap().is_empty());
+        connection
+            .execute_batch("DROP TRIGGER fail_admission; DROP TABLE agent_state;")
+            .unwrap();
+        let replacement = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            ProcessSessionId::new("replacement"),
+        )
+        .unwrap();
+        assert!(replacement.load_durable_records().await.is_err());
+        assert!(replacement.terminal_admission_is_fenced());
+    }
+
+    #[tokio::test]
+    async fn renewal_inbound_copy_requires_exact_replayed_replacement_and_surviving_primary() {
+        use crate::protocol::public_operations::{
+            PublicBuildAttemptReference, PublicInboundBuildAuthority,
+        };
+
+        let resource = ResourceUid::new("resource-renewal-inbound");
+        let generation = PublicProtocolGeneration::new(1);
+        let initialization = derive_history_initialization_id(&resource, generation);
+        let history = derive_bootstrap_history(&resource, generation, &initialization);
+        let endpoint = |id, role| {
+            let identity = ReplicaIdentity {
+                replica_id: ReplicaId::new(id),
+                instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+                agent_generation: AgentGeneration::new(format!("generation-{id}")),
+            };
+            ProcessSessionEndpoint {
+                storage_incarnation: ReplicaStorageIncarnationContext {
+                    replica: identity.clone(),
+                    storage: ReplicaStorageIdentity::Persistent {
+                        pod_uid: PodUid::new(format!("pod-{id}")),
+                        pvc_uid: PvcUid::new(format!("pvc-{id}")),
+                    },
+                    storage_generation: StorageGeneration::new(format!("storage-{id}")),
+                },
+                identity,
+                process_session_id: ProcessSessionId::new(format!("session-{id}")),
+                replicator_creation_id: ReplicatorCreationId::new(format!("creation-{id}")),
+                role,
+            }
+        };
+        let source = endpoint(1, ReplicaRole::Primary);
+        let predecessor = endpoint(2, ReplicaRole::ActiveSecondary);
+        let replacement = ProcessSessionEndpoint {
+            process_session_id: ProcessSessionId::new("replacement-session"),
+            replicator_creation_id: ReplicatorCreationId::new("replacement-creation"),
+            role: ReplicaRole::None,
+            ..predecessor.clone()
+        };
+        let epoch = Epoch::new(0, 2);
+        let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+            operation_id: OperationId::new("renewal-inbound"),
+            reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
+            resource_uid: resource.clone(),
+            history: history.clone(),
+            previous_epoch: Epoch::new(0, 1),
+            renewal_epoch: epoch,
+            predecessor: predecessor.clone(),
+            replacement: Some(replacement.clone()),
+            surviving_sessions: vec![source.clone()],
+            fresh_configuration: ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![
+                    ConfigurationMember {
+                        identity: source.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: replacement.identity.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                    },
+                ],
+                2,
+            ),
+            predecessor_contained: true,
+            data_loss: None,
+        })
+        .unwrap();
+        let role_pending = required
+            .close_access()
+            .unwrap()
+            .freeze_surviving_set()
+            .unwrap()
+            .begin_epoch_barriers()
+            .unwrap()
+            .record_epoch_updated(&source, epoch)
+            .unwrap()
+            .finish_epoch_barriers()
+            .unwrap();
+        let pending = role_pending
+            .replay_replacement_role(
+                &replacement.process_session_id,
+                epoch,
+                ReplicaRole::ActiveSecondary,
+            )
+            .unwrap();
+        let authority = PublicInboundBuildAuthority {
+            operation_id: OperationId::new("renewal-inbound-copy"),
+            operation_revision: 10,
+            attempt: PublicBuildAttemptReference {
+                resource_uid: resource,
+                epoch,
+                build_id: OperationId::new("renewal-inbound-copy"),
+                source: source.identity.clone(),
+                source_storage: source.storage_incarnation.clone(),
+                source_session: source.process_session_id.clone(),
+                target: replacement.identity.clone(),
+                target_storage: replacement.storage_incarnation.clone(),
+                target_session: replacement.process_session_id.clone(),
+            },
+            history,
+            current_configuration_id: ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )
+            .configuration_id,
+            source_address: "http://127.0.0.1:7001".into(),
+            target_address: "http://127.0.0.1:7002".into(),
+        };
+        authority.validate().unwrap();
+        let matches = |renewal: &PublicV1SessionRenewalStatus,
+                       authority: &PublicInboundBuildAuthority| {
+            renewal_inbound_build_matches(
+                renewal,
+                &replacement.process_session_id,
+                &replacement.replicator_creation_id,
+                authority,
+            )
+        };
+        assert!(matches(&pending, &authority));
+        let root = crate::host::tests::tempdir().unwrap();
+        let (store, registry) =
+            fence_registry(root.path(), replacement.process_session_id.clone()).await;
+        let mut snapshot = store.load_state().await.unwrap();
+        snapshot.identity.local_identity = replacement.identity.clone();
+        let preview = snapshot.public_v1_operation_state.as_mut().unwrap();
+        preview.history = Some(authority.history.clone());
+        preview.storage_incarnation = Some(replacement.storage_incarnation.clone());
+        preview.session_renewal = Some(pending.clone());
+        registry.fence_session_renewal();
+        assert!(registry.is_fenced());
+        assert!(!registry.build_authority_is_fenced(
+            &snapshot,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        let source_registry = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            source.process_session_id.clone(),
+        )
+        .unwrap();
+        source_registry.fence_session_renewal();
+        assert!(source_registry.build_authority_is_fenced(
+            &snapshot,
+            &source.replicator_creation_id,
+            &authority,
+        ));
+        registry.fence();
+        assert!(
+            registry.build_authority_is_fenced(
+                &snapshot,
+                &replacement.replicator_creation_id,
+                &authority,
+            ),
+            "a stale nonterminal renewal snapshot cannot weaken current terminal admission"
+        );
+        assert!(!matches(&required, &authority));
+        assert!(!matches(&role_pending, &authority));
+        assert!(!matches(
+            &pending
+                .install_fresh_configuration(&pending.required.fresh_configuration)
+                .unwrap(),
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &predecessor.process_session_id,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &replacement.process_session_id,
+            &predecessor.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &source.process_session_id,
+            &source.replicator_creation_id,
+            &authority,
+        ));
+        let changes: [fn(&mut PublicInboundBuildAuthority); 7] = [
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_session = ProcessSessionId::new("historical-target");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_session = ProcessSessionId::new("historical-source");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_storage.storage_generation =
+                    StorageGeneration::new("other-target-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_storage.storage_generation =
+                    StorageGeneration::new("other-source-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 1);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 3);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.history.data_loss_number += 1;
+            },
+        ];
+        for change in changes {
+            let mut changed = authority.clone();
+            change(&mut changed);
+            assert!(!matches(&pending, &changed), "{changed:?}");
+        }
+        let mut changed = pending.clone();
+        changed.required.predecessor_contained = false;
+        assert!(!matches(&changed, &authority));
+        let mut changed = pending;
+        changed.replayed_role = None;
+        assert!(!matches(&changed, &authority));
     }
 
     #[test]
@@ -2274,6 +3022,11 @@ mod tests {
 
     #[tokio::test]
     async fn renewal_configuration_releases_fence_only_after_durable_authorization() {
+        assert_renewal_configuration_release(false).await;
+        assert_renewal_configuration_release(true).await;
+    }
+
+    async fn assert_renewal_configuration_release(terminal: bool) {
         let root = tempfile::tempdir().unwrap();
         let resource_uid = ResourceUid::new("resource-renewal-release");
         let generation = PublicProtocolGeneration::new(1);
@@ -2393,7 +3146,7 @@ mod tests {
             intent.process_session_id.clone(),
         )
         .unwrap();
-        registry.fence();
+        registry.fence_session_renewal();
 
         assert!(
             !registry
@@ -2452,11 +3205,14 @@ mod tests {
                 .unwrap()
         );
         assert!(registry.is_fenced());
+        if terminal {
+            registry.fence();
+        }
         registry
             .release_session_renewal_fence(&intent)
             .await
             .unwrap();
-        assert!(!registry.is_fenced());
+        assert_eq!(registry.is_fenced(), terminal);
         assert_eq!(
             store
                 .load_state()

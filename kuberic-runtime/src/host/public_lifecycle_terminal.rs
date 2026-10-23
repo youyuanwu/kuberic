@@ -58,14 +58,9 @@ pub(super) fn bind(
         if let Err(error) = (callbacks.terminal_drain)().await {
             failures.push(error.to_string());
         }
-        if !failures.is_empty()
-            && callbacks
-                .containment
-                .as_ref()
-                .is_some_and(|witness| !*witness.borrow())
-        {
-            // A failed custom drain can still own live descendants. Retain its
-            // failure independently; returning is not a positive join witness.
+        if !failures.is_empty() {
+            // A returned failure is never positive proof of actual drainage,
+            // even without a diagnostic witness or after an old notification.
             result.send_replace(Some(Err(failures.join("; "))));
             return;
         }
@@ -78,11 +73,7 @@ pub(super) fn bind(
             return;
         }
         contained.send_replace(true);
-        result.send_replace(Some(if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(failures.join("; "))
-        }));
+        result.send_replace(Some(Ok(())));
     };
     (cleanup, task)
 }

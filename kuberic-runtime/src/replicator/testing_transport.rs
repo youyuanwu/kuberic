@@ -26,6 +26,7 @@ struct Registration {
     route: Route,
     generation: Arc<()>,
     evidence: Option<(ProcessSessionId, Weak<ReplicatorCreation>)>,
+    driver_loss: Option<Arc<dyn Fn() -> BoxFuture<'static, std::io::Result<()>> + Send + Sync>>,
 }
 
 fn routes() -> &'static Mutex<BTreeMap<String, Registration>> {
@@ -49,6 +50,7 @@ pub(in crate::replicator) fn before_attachment(
         .get_mut(instance)
         .map(|registration| {
             registration.evidence = None;
+            registration.driver_loss = None;
             registration.generation = Arc::new(());
             AttachmentRoute {
                 instance: instance.to_owned(),
@@ -56,6 +58,15 @@ pub(in crate::replicator) fn before_attachment(
                 generation: Arc::downgrade(&registration.generation),
             }
         })
+}
+
+pub(in crate::replicator) fn retain_driver_loss(
+    instance: &str,
+    loss: impl Fn() -> BoxFuture<'static, std::io::Result<()>> + Send + Sync + 'static,
+) {
+    if let Some(registration) = routes().lock().unwrap().get_mut(instance) {
+        registration.driver_loss = Some(Arc::new(loss));
+    }
 }
 
 pub(in crate::replicator) fn acknowledge(
@@ -114,6 +125,7 @@ impl TestingTcpRoute {
                 route: Arc::new(route),
                 generation: Arc::new(()),
                 evidence: None,
+                driver_loss: None,
             },
         );
         Ok(Self { instance })
@@ -138,6 +150,35 @@ impl TestingTcpRoute {
                         })
                 })
         })
+    }
+
+    /// Lose the real retained V1 driver task for one exactly attached creation.
+    /// This is negative native fault setup, not terminal execution or drainage.
+    pub async fn lose_native_driver(
+        session: &ProcessSessionId,
+        creation: &ReplicatorCreationId,
+    ) -> std::io::Result<()> {
+        let loss =
+            routes()
+                .lock()
+                .unwrap()
+                .values()
+                .find(|registration| {
+                    registration
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|(bound, owner)| {
+                            bound == session
+                                && owner.upgrade().is_some_and(|owner| {
+                                    owner.identity.get().is_some_and(|identity| {
+                                        identity.to_public_id() == *creation
+                                    }) && !owner.armed.load(std::sync::atomic::Ordering::Acquire)
+                                })
+                        })
+                })
+                .and_then(|registration| registration.driver_loss.clone())
+                .ok_or_else(|| std::io::Error::other("exact live V1 driver unavailable"))?;
+        loss().await
     }
 }
 
@@ -396,10 +437,10 @@ mod tests {
             ReplicaStorageIncarnationContext, ResourceUid,
         };
         use crate::replicator::{
-            DefaultReplicatorFactory, PartitionAccessView, ReplicatorAttachment,
-            ReplicatorCreationReservation, ReplicatorFactory, ReplicatorFactoryContext,
-            ReplicatorInterfaces, ReplicatorRegistration, ReplicatorSettings,
-            StatefulServicePartition,
+            DefaultReplicatorFactory, NativeRuntimeControl, PartitionAccessView,
+            ReplicatorAttachment, ReplicatorCreationReservation, ReplicatorFactory,
+            ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
+            ReplicatorSettings, StatefulServicePartition,
         };
         use crate::{Result, RuntimeError};
 
@@ -408,26 +449,72 @@ mod tests {
             fail_registration: std::sync::atomic::AtomicBool,
             binding: Mutex<Option<(ReplicaIdentity, ProcessSessionId)>>,
             write_admission: Arc<Mutex<()>>,
+            creation: Mutex<Creation>,
+        }
+
+        #[derive(Default)]
+        struct Creation {
+            reserved: Option<ReplicatorCreationReservation>,
+            pending: Option<Arc<dyn NativeRuntimeControl>>,
+            retained: Vec<Arc<dyn NativeRuntimeControl>>,
+        }
+
+        impl Fixture {
+            async fn drain(&self) {
+                let owners = {
+                    let mut creation = self.creation.lock().unwrap();
+                    assert!(creation.reserved.is_none());
+                    assert!(creation.pending.is_none());
+                    std::mem::take(&mut creation.retained)
+                };
+                for owner in owners {
+                    owner.shutdown_and_drain().await.unwrap();
+                }
+            }
         }
 
         #[async_trait]
         impl ReplicatorRegistration for Fixture {
             fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
-                Ok(ReplicatorCreationReservation::new(RuntimeHostToken::new()))
+                let mut creation = self.creation.lock().unwrap();
+                if creation.reserved.is_some() || creation.pending.is_some() {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+                creation.reserved = Some(reservation);
+                Ok(reservation)
             }
-            fn cancel_replicator_creation(&self, _: ReplicatorCreationReservation) {}
+            fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation) {
+                let mut creation = self.creation.lock().unwrap();
+                assert_eq!(creation.reserved, Some(reservation));
+                creation.reserved = None;
+                if let Some(owner) = creation.pending.take() {
+                    creation.retained.push(owner);
+                }
+            }
             async fn register_interfaces(
                 &self,
-                _: &ReplicatorAttachment,
+                attachment: &ReplicatorAttachment,
                 _: Option<Arc<dyn StateProvider>>,
-                _: ReplicatorCreationReservation,
+                reservation: ReplicatorCreationReservation,
             ) -> Result<()> {
+                let mut creation = self.creation.lock().unwrap();
+                if creation.reserved != Some(reservation)
+                    || attachment.identity(RuntimeHostToken::new())
+                        != reservation.identity(RuntimeHostToken::new())
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
                 if self
                     .fail_registration
                     .load(std::sync::atomic::Ordering::Acquire)
                 {
                     Err(RuntimeError::Closed)
                 } else {
+                    creation.reserved = None;
+                    if let Some(owner) = creation.pending.take() {
+                        creation.retained.push(owner);
+                    }
                     Ok(())
                 }
             }
@@ -435,12 +522,32 @@ mod tests {
 
         #[async_trait]
         impl PartitionAccessView for Fixture {
+            fn retain_creation_control(
+                &self,
+                reservation: ReplicatorCreationReservation,
+                owner: Arc<dyn NativeRuntimeControl>,
+            ) -> Result<()> {
+                let mut creation = self.creation.lock().unwrap();
+                if creation.reserved != Some(reservation) || creation.pending.is_some() {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                creation.pending = Some(owner);
+                Ok(())
+            }
+
             fn native_write_admission(&self) -> Result<Arc<Mutex<()>>> {
                 Ok(self.write_admission.clone())
             }
 
-            fn validate_native_creation(&self, _: ReplicatorCreationReservation) -> Result<()> {
-                Ok(())
+            fn validate_native_creation(
+                &self,
+                reservation: ReplicatorCreationReservation,
+            ) -> Result<()> {
+                if self.creation.lock().unwrap().reserved == Some(reservation) {
+                    Ok(())
+                } else {
+                    Err(RuntimeError::AuthorityNotAdmitted)
+                }
             }
             async fn native_credentials(&self) -> Result<Arc<str>> {
                 Ok(Arc::from("route-fixture"))
@@ -506,9 +613,6 @@ mod tests {
                 &self,
                 _: &PublicInboundBuildAuthority,
             ) -> Result<()> {
-                unreachable!()
-            }
-            async fn revoke_replacement_inbound_build_authority(&self) -> Result<()> {
                 unreachable!()
             }
             fn release_provider_writer(&self) {}
@@ -651,11 +755,12 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::Release);
             assert!(
                 partition
-                    .create_replicator(Some(fixture), settings)
+                    .create_replicator(Some(fixture.clone()), settings)
                     .await
                     .is_err()
             );
             assert!(!TestingTcpRoute::supports(&session, &built_in_id));
+            fixture.drain().await;
         }
 
         #[tokio::test]
@@ -670,7 +775,7 @@ mod tests {
                 .with_factory(Arc::new(DefaultReplicatorFactory::new()));
             let built_in = partition
                 .create_replicator(
-                    Some(fixture),
+                    Some(fixture.clone()),
                     Some(ReplicatorSettings {
                         replication_address: "http://127.0.0.1:0".into(),
                     }),
@@ -682,6 +787,7 @@ mod tests {
                 TestingTcpRoute::register(instance, |_, endpoint| Box::pin(async { Ok(endpoint) }))
                     .unwrap();
             assert!(!TestingTcpRoute::supports(&session, &id));
+            fixture.drain().await;
         }
 
         #[tokio::test]
@@ -720,6 +826,7 @@ mod tests {
                 assert!(matches!(replayed, Err(RuntimeError::AuthorityNotAdmitted)));
                 assert!(!TestingTcpRoute::supports(&session, &first_id));
             }
+            fixture.drain().await;
         }
     }
 }

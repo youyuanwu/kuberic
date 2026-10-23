@@ -434,6 +434,34 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn public_v1_inbound_build_authority(
+        &self,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        Ok(self
+            .store
+            .load_state()
+            .await?
+            .public_v1_operation_state
+            .and_then(|state| state.current_inbound_build_authority))
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn public_v1_operation_is_contained(
+        &self,
+        operation_id: &crate::protocol::types::OperationId,
+    ) -> Result<bool> {
+        Ok(self
+            .store
+            .load_state()
+            .await?
+            .public_v1_operation_state
+            .and_then(|state| state.operations.get(operation_id).cloned())
+            .is_some_and(|record| {
+                record.containment == super::state::PublicOperationContainment::Complete
+            }))
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn authorize_public_v1_session_renewal(
         &self,
         required: crate::protocol::public_operations::ProcessSessionRenewalRequired,
@@ -764,10 +792,10 @@ where
                         supervisor_runtime.abort();
                         let drain = drain_runtime(&supervisor_runtime).await;
                         let control = finish_control(&mut control_task).await;
-                        let late = tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, supervisor_runtime.drain_pending_custom())
-                            .await.map_err(|_| crate::host::HostError::CommandRejected("late custom creation drain timed out".into()))
+                        let late = tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, supervisor_runtime.drain_pending_control())
+                            .await.map_err(|_| crate::host::HostError::CommandRejected("late creation control drain timed out".into()))
                             .and_then(|result| result.map_err(crate::host::HostError::Runtime));
-                        let drain = with_shutdown_error(drain, late, "late custom creation drain");
+                        let drain = with_shutdown_error(drain, late, "late creation control drain");
                         return with_shutdown_error(control, drain, "replicator drain");
                     }
                     result = &mut control_task => result,

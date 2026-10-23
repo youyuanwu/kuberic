@@ -11,66 +11,37 @@ Priorities below order **future separately authorized work**. “Verified differ
 source-confirmed divergence, not a dynamically reproduced data-loss defect;
 “unverified” means missing claim-specific qualification, not demonstrated failure.
 
-## Next — Native-style engine-neutral hosting
+## Delivered — Native-style engine-neutral hosting
 
-**Entry condition:** the bounded custom-native controller fix in PR #198 clears
-CI and is merged. Its supported companion and actual PostgreSQL journey provide
-a regression baseline, not complete native hosting alignment. This section
-plans a separate source-guided implementation; it does not start that port.
+Merged #198 supplied the regression baseline; the separately scoped bounded
+port is implemented through `91a2a93c3c7cf9477adb3a0d27e674b99f741a8a`.
+The [message/action/state map](engine-neutral-hosting.md) records pinned native
+evidence, common host admission/authority/lifetime owners, optional diagnostics,
+exact remote Build state and intentional Rust/Kubernetes adaptations.
 
-At the pinned native source, service Open returns a replicator to the
-[common proxy][native-host-open], which obtains standard interfaces and
-[optional capabilities][native-host-proxy]. RA dispatches Build through that
-proxy and tracks [remote Build state/completion][native-host-build].
-Kuberic shares its host but still branches on engine identity for
-[callback/lifecycle policy](../../../kuberic-runtime/src/host/hosting.rs#L416-L487)
-and [configuration/idle sampling](../../../kuberic-runtime/src/host/hosting.rs#L974-L1021).
-That is a structural alignment difference, not evidence that native SF needs
-separate custom hosting or that another runtime defect has been reproduced.
+Actual V1 and independent PostgreSQL controller dispatch now qualify real copy
+outside voting, truthful host/engine observations, separate admission, exact
+retry/revoke/cancel and successful/failed hosted terminal joins. Production
+failed-callback repeatability remains conservative; native observation ownership
+does not certify an application's failure or a native join. Historical success
+never creates a new grant or an engine idle observation.
 
-**Bounded port scope:**
-
-- Map the relevant `ComProxyReplicator` and FailoverUnitProxy creation,
-  lifecycle/configuration/catch-up dispatch, remote Build-state and cancellation/
-  Close/Abort ownership semantics to current Rust owners before selecting changes.
-- Establish common engine-neutral hosting, authority and operation-lifetime
-  policy. Replace engine-kind branches with explicit capability/ownership
-  contracts where semantics genuinely differ; do not simply delete proven
-  interruption, stale-result or success-only containment checks.
-- Keep V1 queues/provider streams and custom native transports/processes behind
-  narrow engine adapters. Diagnostics remain optional; a custom engine must not
-  need a borrowed built-in attachment or fabricated observations.
-- Preserve Kuberic's journal, exact inbound grants, session/storage/history
-  fencing and retained Rust-task joins as explicit local adaptations. Do not
-  describe them as native SF public interfaces or remove them for superficial
-  source similarity.
-
-**Completion criterion:** V1 and an independent native engine exercise the same
-host-policy path through actual public controller dispatch, with separate idle
-Build and voting admission, truthful observations, exact retries/stale callbacks,
-cancellation and successful/failed terminal joining. Retain the actual PG
-transfer/admission/SQL-fencing regressions, protected interfaces/representations,
-optional capability behavior, production feature-off builds and API/privacy
-guards. Update the disposition ledger and provenance from source-backed evidence.
-No `.custom()` policy fork should remain unexplained; any necessary difference
-must be tied to an explicit contract rather than engine identity alone.
-
-Wholesale `Hosting2`, RA/FM, broad P7/security, automatic failed-Build recovery,
-native executable equivalence and downstream MySQL requalification are not
-implied by this bounded hosting port.
+This closes the bounded structural hosting queue item, not wholesale Hosting2,
+RA/FM, P7/security/settings, arbitrary failed-Build recovery, native executable
+equivalence, downstream MySQL qualification or production certification.
 
 ## Selected-host Close and access disposition
 
 ### Outer Close outcome
 
-The selected journal executor now succeeds after contained child failure,
-retains the child diagnostic and fails on cleanup failure
-([program:550–638][aligned-close]). Actual public-host failure/interruption/
-retained-provider witnesses cover the bounded behavior
-([public:3114–3505][aligned-close-tests]). Unrecorded destructive callbacks are
-contained without reinvocation; recorded Cleanup is not a process-local join.
-This closes the selected outer-outcome difference, not every native inner
-callback sequence or generic application-task join.
+The current common journal deliberately retains a failed public result after a
+child Close error, even when actual cleanup succeeds. Positive containment and
+successful Close are different facts; failed/lost drainage never becomes a
+positive witness. This supersedes the earlier native-style success-shaped outer
+Close disposition, while preserving cancellation-independent terminal joins.
+See the [current terminal contract and actual engine witnesses](engine-neutral-hosting.md).
+Unrecorded destructive callbacks are contained without reinvocation; recorded
+Cleanup is not a process-local join or a generic application-task join.
 
 ### Access during reconfiguration
 
