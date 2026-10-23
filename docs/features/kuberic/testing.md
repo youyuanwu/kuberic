@@ -227,7 +227,7 @@ use `just nextest-test` or remove shared `target`:
 set -euo pipefail
 owned="$PWD/target/public-copy-context-local"
 test ! -e "$owned"
-mkdir -p "$owned/standalone" "$owned/workspace" "$owned/scratch" "$owned/evidence"
+mkdir -p "$owned/standalone" "$owned/workspace" "$owned/scratch"
 export TMPDIR="$owned/scratch" CARGO_TARGET_DIR="$owned/standalone"
 export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
@@ -236,33 +236,23 @@ fixture=scripts/fixtures/classic-v1-provider/Cargo.toml
 
 # Deliberate independent lock resolution; keep this fixture lock ignored.
 cargo generate-lockfile --offline --manifest-path "$fixture"
-cargo metadata --offline --locked --format-version 1 --manifest-path "$fixture" \
-  > "$owned/evidence/metadata.json"
 cargo tree --offline --locked -e features -i kuberic-runtime --manifest-path "$fixture"
-cargo test --offline --locked --manifest-path "$fixture" --lib --test public_copy_context \
-  -- --list > "$owned/evidence/inventory.txt"
-cat "$owned/evidence/inventory.txt"
-```
-
-Before execution, inspect the complete resolved metadata: require a unique
-`kuberic-runtime` package/node, `host` present and `testing` absent. Require each
-exact name below in discovery; missing/ambiguous graph nodes or missing/
-duplicate selections are failures, not successful coverage. The
-[CI step][public-context-ci] implements these fail-closed guards.
-
-| Independent test name | Boundary |
-|---|---|
-| `tests::copy_context_policy_rejects_non_target_or_incomplete_streams` | Actual provider rejects source substitution, surplus/missing/reordered/changed data, omission of the middle empty item and stream errors. Matching items without EOF cannot expose a snapshot. |
-| `tests::default_copy_context_policy_still_requires_empty_stream` | Default emits no items and rejects a single empty item immediately, including before a pending tail; real EOF is required for success. |
-| `public_build_consumes_target_context_and_installs_nonempty_snapshot` | Actual helper-free public Build, meaningful copied persistence and joined lifetime, not only a component/mock relay. |
-
-```bash
-cargo test --offline --locked --manifest-path "$fixture" --lib -- --nocapture
-cargo test --offline --locked --manifest-path "$fixture" --test public_copy_context \
-  public_build_consumes_target_context_and_installs_nonempty_snapshot -- --exact --nocapture
+cargo nextest run --offline --locked --manifest-path "$fixture" --all-targets --no-tests fail
 cargo clippy --offline --locked --manifest-path "$fixture" --all-targets -- -D warnings
 cargo fmt --manifest-path "$fixture" -- --check
+```
 
+The [CI step][public-context-ci] runs the whole standalone fixture suite without
+test-name filters; nextest fails if no tests run. `cargo tree` logs the resolved
+feature graph for inspection, rather than enforcing a custom metadata policy.
+The suite retains the public Build and provider controls for wrong, missing,
+reordered or surplus context, stream errors, empty-item/EOF distinctions and
+the default empty-context policy. Existing source/API/package guards remain
+separate and unchanged.
+
+For workspace regression coverage:
+
+```bash
 export CARGO_TARGET_DIR="$owned/workspace"
 filter='test(=public_copy_context::public_build_consumes_target_context_and_installs_nonempty_snapshot) or test(=externally_compiled_helper_free_provider_uses_public_factory_host_and_transport) or test(=replicator::v1::copy_establishment::tests::persisted_target_context_flows_through_actual_receivers_and_senders) or test(=replicator::v1::copy_establishment::tests::nonpersisted_target_never_calls_get_copy_context) or test(=replicator::v1::copy_async_operation::tests::empty_data_is_an_item_and_provider_is_never_polled_after_eof)'
 cargo nextest list --offline --locked -p kuberic-runtime --all-features --lib \
@@ -277,11 +267,9 @@ persisted/volatile/empty-item component regressions; these remain separate
 claims. [KSF-05 registration][public-context-ksf] is additive. Nonignored KSF
 catalog/mapping/partition/mutation guards passed, not the ignored broad nested
 scenario executors or a locally rebuilt whole-workspace archive.
-The explicit [standalone CI step][public-context-ci] invokes the excluded
-fixture, controls, metadata/discovery guards and lint/format checks separately
-from archive/source flows. Its guards were executed locally with actual
-metadata/inventory and synthetic fail-closed mutations; this is not remote CI
-execution.
+The explicit standalone CI step invokes the excluded fixture suite and
+lint/format checks separately from archive/source flows. Local execution is
+not a remote CI result.
 
 Actual separate source/API/privacy/Rustdoc, production runtime/controller
 feature-off and vendored packaged-consumer gates also passed, along with
@@ -599,4 +587,4 @@ hosted differential, deployment-security certification or production readiness.
 
 [public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
 [public-context-ksf]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/kuberic-runtime/src/testing/public_v1_conformance.rs#L905-L918
-[public-context-ci]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/.github/workflows/CI.yml#L102-L163
+[public-context-ci]: ../../../.github/workflows/CI.yml
