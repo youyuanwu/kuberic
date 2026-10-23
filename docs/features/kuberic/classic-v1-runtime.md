@@ -133,9 +133,20 @@ to source `get_copy_state(start - 1, context)`; volatile mode omits context
 acquisition ([establishment:473–478][context-mode],
 [738–757][context-source]). Distinct nonempty target bytes and an empty item
 reach the source in an actual-component test
-([test:1013–1091][context-test]). The public external provider uses empty
-context, so it does not qualify that distinct-nonempty public case
-([fixture:196–207][empty-context]).
+([test:1013–1091][context-test]). Separately, an executed helper-free
+[external public Build][public-context] consumes exactly
+`[b"target/context", empty, b"target/trailer"]` through EOF, with no source
+context acquisition. The standalone runtime feature graph contains `host`,
+not `testing`; its workspace wrapper is testing-unified evidence. Real
+pre-Build service commits supply a nonzero copy boundary and distinct
+application values installed into fresh checked target storage. The matched
+Build completion is successful, the exact remote Build is Ready, and both
+public Close/host waits/provider drains succeed. The target remains idle
+outside voters with serving reads denied: copied persistence is not admission
+or catch-up certification. The [default empty policy][context-default] and
+original [empty-context public journey][external] remain unchanged; the
+[historical empty-only fixture][empty-context] retains its original pin.
+See [reproduction and evidence limits](testing.md#public-target-origin-copy-context).
 
 At actual enumeration EOF, CopySender samples **latest issued**, not merely
 committed, replication progress. Final-copy application and replication apply
@@ -566,3 +577,5 @@ production-readiness support from the selected Rust journeys.
 [rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
 [local-fault-entry]: ../../../kuberic-runtime/src/replicator/v1/replica_manager.rs#L793-L1045
 [pending-native-wait]: ../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625
+[public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
+[context-default]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/src/lib.rs#L369-L411

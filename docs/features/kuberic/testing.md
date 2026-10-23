@@ -197,6 +197,114 @@ selects the intended current test; discovery alone is not execution. Full
 boundaries. KSF source/API catalogs are not native behavioral compatibility
 certification. Actual wire old-version rejection is not native wire compatibility.
 
+### Public target-origin copy context
+
+The [shared external-provider scenario][public-context] at
+`45749d3744b43095be9bc9ec3fb4abf20633a537` actually passed locally both as an
+independent fixture test and through `classic_v1_production`. It consumes
+`[b"target/context", empty, b"target/trailer"]` through EOF at the real nonzero
+pre-Build committed boundary; the source advertises different bytes and never
+acquires its own context. A fresh target installs checked application values
+distinct from the context. Exact successful Build completion, remote Ready,
+public Close, actual host waits and provider write/stream drainage are checked.
+The target remains idle outside voters with serving reads denied; file
+inspection is not admission or a serving read.
+
+The fixture is excluded from the root workspace. Its resolved runtime feature
+graph has `host` and no `testing`, including fixture dev dependencies.
+Workspace dev dependencies unify `testing`, even without an explicit
+`--all-features`; that run alone is not normal-feature proof.
+Checkout `kuberic_workspace_tests` cfg is a different boundary again.
+
+Reproduction commands below are not additional execution claims. Reserve a
+previously absent, task-owned ignored output directory with sufficient disk
+capacity for separate standalone/workspace builds. Stop if reservation fails;
+do not delete or reuse another task's output. Run hosted selections serially,
+retain exact argv/status/raw output and source/manifest/lock hashes, and do not
+use `just nextest-test` or remove shared `target`:
+
+```bash
+set -euo pipefail
+owned="$PWD/target/public-copy-context-local"
+test ! -e "$owned"
+mkdir -p "$owned/standalone" "$owned/workspace" "$owned/scratch"
+export TMPDIR="$owned/scratch" CARGO_TARGET_DIR="$owned/standalone"
+export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+unset NEXTEST_ARCHIVE
+fixture=scripts/fixtures/classic-v1-provider/Cargo.toml
+
+# Deliberate independent lock resolution; keep this fixture lock ignored.
+cargo generate-lockfile --offline --manifest-path "$fixture"
+cargo tree --offline --locked -e features -i kuberic-runtime --manifest-path "$fixture"
+cargo nextest run --offline --locked --manifest-path "$fixture" --all-targets --no-tests fail
+cargo clippy --offline --locked --manifest-path "$fixture" --all-targets -- -D warnings
+cargo fmt --manifest-path "$fixture" -- --check
+```
+
+The [CI step][public-context-ci] runs the whole standalone fixture suite without
+test-name filters; nextest fails if no tests run. `cargo tree` logs the resolved
+feature graph for inspection, rather than enforcing a custom metadata policy.
+The suite retains the public Build and provider controls for wrong, missing,
+reordered or surplus context, stream errors, empty-item/EOF distinctions and
+the default empty-context policy. Existing source/API/package guards remain
+separate and unchanged.
+
+For workspace regression coverage:
+
+```bash
+export CARGO_TARGET_DIR="$owned/workspace"
+filter='test(=public_copy_context::public_build_consumes_target_context_and_installs_nonempty_snapshot) or test(=externally_compiled_helper_free_provider_uses_public_factory_host_and_transport) or test(=replicator::v1::copy_establishment::tests::persisted_target_context_flows_through_actual_receivers_and_senders) or test(=replicator::v1::copy_establishment::tests::nonpersisted_target_never_calls_get_copy_context) or test(=replicator::v1::copy_async_operation::tests::empty_data_is_an_item_and_provider_is_never_polled_after_eof)'
+cargo nextest list --offline --locked -p kuberic-runtime --all-features --lib \
+  --test classic_v1_production --profile ordinary --message-format json -E "$filter"
+cargo nextest run --offline --locked -j 1 -p kuberic-runtime --all-features --lib \
+  --test classic_v1_production --profile ordinary --success-output immediate -E "$filter"
+```
+
+Verify exact nonignored ordinary selection before running. The workspace
+selection also passed the unchanged default empty-context public journey and
+persisted/volatile/empty-item component regressions; these remain separate
+claims. [KSF-05 registration][public-context-ksf] is additive. Nonignored KSF
+catalog/mapping/partition/mutation guards passed, not the ignored broad nested
+scenario executors or a locally rebuilt whole-workspace archive.
+The explicit standalone CI step invokes the excluded fixture suite and
+lint/format checks separately from archive/source flows. Local execution is
+not a remote CI result.
+
+Actual separate source/API/privacy/Rustdoc, production runtime/controller
+feature-off and vendored packaged-consumer gates also passed, along with
+targeted Clippy/formatting. The initial standalone Clippy failed on a
+preexisting fixture `collapsible_if`; the equivalent condition was repaired and
+the same gate passed, without runtime production/interface changes.
+Host-only runtime dependency warnings remain distinct from fixture lint
+success. Reproduce the nonignored conformance/source selection explicitly:
+
+```bash
+env -u UPDATE_RUNTIME_SOURCE_API -u UPDATE_RUNTIME_CONTROL_SOURCE_API \
+  cargo test --offline --locked -p kuberic-runtime --all-features \
+  --test public_api_inventory --test lifecycle_capability_boundaries --test public_v1_conformance
+cargo test --offline --locked -p kuberic-runtime --all-features \
+  --test public_v1_evidence public_v1_source_uses_no_native_evidence -- --exact
+cargo test --offline --locked -p kuberic-runtime --all-features \
+  --test public_v1_recovery production_config_has_no_protocol_selector_or_application_commit_oracle \
+  -- --exact
+```
+
+Separate privacy/Rustdoc/feature-off/package reproduction uses the
+[commands above](#engine-neutral-hosting). The package gate requires
+separately authorized, task-owned **outside-checkout** scratch supplied via
+`TMPDIR` for that command; the checkout-owned scratch above cannot satisfy its
+isolation assertion. Its packaged test closure is compiled, not an execution
+of this new scenario from a published package. Verify fixed compiler-fixture
+path ownership/concurrency before source guards, and clean only proven owned
+paths after their processes finish.
+
+Provider negative controls are not public network-fault/failed-Build recovery
+tests. No PostgreSQL, broad suite, cluster, native executable/differential,
+power-loss or production-certification result is implied. See
+[current semantics](classic-v1-runtime.md#copy-and-build) and
+[source ancestry](sf-v1-port-provenance.md#public-target-origin-copy-context-qualification).
+
 ### Selected-host Close and staged access
 
 Targeted runs for the host-alignment revision exercise the real selected
@@ -476,3 +584,7 @@ fencing, with sustained containerd pause/resume in failover; see
 [live tests](../../../kuberic-level-tests/tests).
 Do not run this tier to validate a Markdown edit or confuse it with native SF
 hosted differential, deployment-security certification or production readiness.
+
+[public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
+[public-context-ksf]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/kuberic-runtime/src/testing/public_v1_conformance.rs#L905-L918
+[public-context-ci]: ../../../.github/workflows/CI.yml
