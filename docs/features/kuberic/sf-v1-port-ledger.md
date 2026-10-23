@@ -240,5 +240,5 @@ maintained. Former filenames here are plain text, not live navigation targets.
 [settings]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/mod.rs#L275-L283
 [partition]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/mod.rs#L1036-L1064
 [join]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs#L351-L387
-[public-context]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
-[context-default]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/src/lib.rs#L369-L411
+[public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
+[context-default]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/src/lib.rs#L369-L411

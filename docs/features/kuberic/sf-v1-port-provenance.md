@@ -252,7 +252,7 @@ and adjacent tests, with actual manager/session/queue/carrier seams.
 
 ### Public target-origin copy-context qualification
 
-Kuberic `d624d40dff2a36d424faa237f5f62082a943bffe` adds a bounded
+Kuberic `45749d3744b43095be9bc9ec3fb4abf20633a537` adds a bounded
 **production-source-derived Rust witness**, not a translated native test.
 The native pin above remains
 `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`: target-context acquisition and
@@ -643,10 +643,10 @@ Rust destination, transformation, retained notice, third-party origin and actual
 execution/review status. Do not omit applicable notices, blindly copy unrelated
 umbrella notices, or infer all-distribution legal certification from this register.
 
-[public-context-provider]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/src/lib.rs#L165-L427
-[public-context-harness]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/kuberic-runtime/tests/classic_v1_production.rs#L534-L972
-[public-context]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
-[public-context-wrapper]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/kuberic-runtime/tests/classic_v1_production.rs#L45-L46
-[public-context-controls]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/src/lib.rs#L717-L903
-[public-context-ksf]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/kuberic-runtime/src/testing/public_v1_conformance.rs#L905-L918
-[public-context-ci]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/.github/workflows/CI.yml#L102-L163
+[public-context-provider]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/src/lib.rs#L165-L427
+[public-context-harness]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/kuberic-runtime/tests/classic_v1_production.rs#L534-L972
+[public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
+[public-context-wrapper]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/kuberic-runtime/tests/classic_v1_production.rs#L45-L46
+[public-context-controls]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/src/lib.rs#L717-L903
+[public-context-ksf]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/kuberic-runtime/src/testing/public_v1_conformance.rs#L905-L918
+[public-context-ci]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/.github/workflows/CI.yml#L102-L163

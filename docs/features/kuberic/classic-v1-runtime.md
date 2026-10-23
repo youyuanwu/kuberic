@@ -577,5 +577,5 @@ production-readiness support from the selected Rust journeys.
 [rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
 [local-fault-entry]: ../../../kuberic-runtime/src/replicator/v1/replica_manager.rs#L793-L1045
 [pending-native-wait]: ../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625
-[public-context]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
-[context-default]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/src/lib.rs#L369-L411
+[public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
+[context-default]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/src/lib.rs#L369-L411

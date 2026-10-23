@@ -200,7 +200,7 @@ certification. Actual wire old-version rejection is not native wire compatibilit
 ### Public target-origin copy context
 
 The [shared external-provider scenario][public-context] at
-`d624d40dff2a36d424faa237f5f62082a943bffe` actually passed locally both as an
+`45749d3744b43095be9bc9ec3fb4abf20633a537` actually passed locally both as an
 independent fixture test and through `classic_v1_production`. It consumes
 `[b"target/context", empty, b"target/trailer"]` through EOF at the real nonzero
 pre-Build committed boundary; the source advertises different bytes and never
@@ -597,6 +597,6 @@ fencing, with sustained containerd pause/resume in failover; see
 Do not run this tier to validate a Markdown edit or confuse it with native SF
 hosted differential, deployment-security certification or production readiness.
 
-[public-context]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
-[public-context-ksf]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/kuberic-runtime/src/testing/public_v1_conformance.rs#L905-L918
-[public-context-ci]: https://github.com/youyuanwu/kuberic/blob/d624d40dff2a36d424faa237f5f62082a943bffe/.github/workflows/CI.yml#L102-L163
+[public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
+[public-context-ksf]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/kuberic-runtime/src/testing/public_v1_conformance.rs#L905-L918
+[public-context-ci]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/.github/workflows/CI.yml#L102-L163
