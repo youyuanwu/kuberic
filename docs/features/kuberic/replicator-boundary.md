@@ -1,5 +1,11 @@
 # Replicator Boundary
 
+**CURRENT integration contract.** The
+[SF-shaped ordinary-engine target](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+and [runtime replacement roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **PROPOSED / NOT IMPLEMENTED**. Do not remove the current companion from a
+controller-integrated engine based on a documentation-only redesign.
+
 Kuberic hosts built-in and application-owned Replicators through the same
 Service Fabric-shaped public interfaces.
 
@@ -20,6 +26,10 @@ core differences, unverified qualification and deferred capability work.
 
 The protected method sets are unchanged. Applications receive no agent store,
 authority setter, Kubernetes client, or private lifecycle capability.
+Companion attachment is optional for an interface bundle, but current hosted
+controller Build rejects a creation without native runtime control
+([host:891–927](../../../kuberic-runtime/src/host/hosting.rs#L891-L927)).
+This is not ordinary-interface-only SF extension alignment.
 
 ## Sole Built-In Path
 
@@ -123,8 +133,11 @@ bundle cannot discard pending cleanup ownership. `NativeRuntimeControl`, its
 TCP/queue diagnostics and host/store setters remain private. Wrapping a built-in
 bundle is not an independent native-engine implementation.
 
-The companion is a **Kuberic local authority adaptation**, not a new method on
-SF's Replicator, PrimaryReplicator or StateProvider. Its responsibilities are:
+The companion is a **current Kuberic extension-boundary divergence**, not a new
+method on SF's Replicator, PrimaryReplicator or StateProvider. Calling it a local
+adaptation does not establish that its mandatory controller integration is
+necessary. The proposed target removes it with replacement host/engine safety
+owners; the responsibilities below remain required **today**:
 
 | Contract | Required meaning |
 |---|---|
@@ -192,7 +205,7 @@ Both engines use the [same retained coordinator](../../../kuberic-runtime/src/re
 Adapters provide actual ingress/drain effects and optional diagnostics, not
 engine-selected authority policy. Current production returned-failure retry
 proof remains Never; unsafe or undeclared callback failures require containment.
-See the [message/state mapping and limits](engine-neutral-hosting.md).
+See the [current message/state mapping and limits](engine-neutral-hosting.md#current--delivered-bounded-hosting).
 
 Source anchors: [attachment](../../../kuberic-runtime/src/replicator/mod.rs#L596),
 [read-only context:935–960](../../../kuberic-runtime/src/replicator/mod.rs#L935-L960),

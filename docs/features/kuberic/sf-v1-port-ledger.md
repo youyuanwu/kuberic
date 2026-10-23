@@ -1,5 +1,11 @@
 # SF V1: Current Source and Evidence Ledger
 
+**CURRENT evidence, not redesign delivery.** The
+[ordinary extension-boundary target](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+is **PROPOSED / NOT IMPLEMENTED**; its
+[future roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+preserves the independent qualifications recorded here.
+
 The separately scoped [common hosting port](engine-neutral-hosting.md) is
 implemented through `91a2a93c3c7cf9477adb3a0d27e674b99f741a8a`.
 It supersedes older host-identity/combined-observation and outer-Close outcomes

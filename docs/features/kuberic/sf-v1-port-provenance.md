@@ -1,5 +1,12 @@
 # SF V1 Source Provenance and Notices
 
+The [hosting redesign source/decision map](engine-neutral-hosting.md#source-confirmed-extension-boundary-difference)
+adds FM/RA/host/engine boundary research at the same native pin. Its target is
+**PROPOSED / NOT IMPLEMENTED**; no native executable evidence or additional
+behavioral run is claimed by that documentation work. Historical source paths
+below remain at their original pins; active provider/contract fixtures now live
+in [`kuberic-public-v1-tests`](../../../kuberic-public-v1-tests/Cargo.toml).
+
 ## Selected upstream and license
 
 Selected production algorithms, message contracts and test expectations derive

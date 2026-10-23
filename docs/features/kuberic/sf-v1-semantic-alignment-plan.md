@@ -1,8 +1,10 @@
-# SF V1: Pending Alignment and Qualification
+# SF V1: Hosting Redesign Roadmap and Remaining Qualification
 
-This is a current work queue, not a delivery-phase checklist. Host-alignment
-baseline: Kuberic `69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; native SF
-`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
+This is the **single active future runtime roadmap**, not a delivery-phase
+checklist. The hosting redesign is **PROPOSED / NOT IMPLEMENTED**; its current
+research baseline is Kuberic `b37009f8af7a7b2ed91f58f4889ed74e06013861`;
+native SF is `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
+Older bounded access/host evidence retains its explicit pins below.
 Read [current semantics](classic-v1-runtime.md) first and use the
 [disposition ledger](sf-v1-port-ledger.md) to interpret historical SF IDs.
 Completing P6 and replacing an old engine do not prove that no core defect remains.
@@ -10,6 +12,78 @@ Completing P6 and replacing an old engine do not prove that no core defect remai
 Priorities below order **future separately authorized work**. “Verified difference” means
 source-confirmed divergence, not a dynamically reproduced data-loss defect;
 “unverified” means missing claim-specific qualification, not demonstrated failure.
+
+## Hosting redesign roadmap — NOT IMPLEMENTED
+
+The [target owner/message/state contract](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+removes the mandatory custom companion and controller-to-target exact-grant
+boundary, rather than renaming it. Native source confirms the ordinary interface/
+host/engine separation; generic peer identity publication, durable agent stages,
+engine-session retirement and Rust Close-after-Abort settlement are explicit
+local **design choices**, not native public APIs.
+
+**All M milestones below are NOT IMPLEMENTED and require separate runtime
+authorization.** This workflow delivers reviewed design/docs only. No runtime
+defect is presumed, no phase is promoted into execution, and no native
+executable equivalence is claimed. M1–M3 replace the earlier R1–R5 cutover
+plan with a clean-break implementation for fresh deployments. Independent
+SF-11/mode/PG/P7/security obligations below remain open/deferred, not erased.
+
+| Milestone / dependency | Future deliverable | Completion gate |
+|---|---|---|
+| **M1 — NOT IMPLEMENTED: host/controller contract**. No predecessor. | Replace controller goals, local-agent stages, host action/remote-operation state and **production** goal→PrepareIdle→Build routing. Define one new matched host/control/CRD format and DiscoveryPending→AchievedScope publication. Keep RA/FUP responsibilities inside existing components, not new services or parallel authority ledgers. | Independent ordinary bundle with **no companion/diagnostics**; real production dispatch; mutual discovery while multi-replica recovery is held, with copy/serving closed; safe failed-preparation withdrawal. Stale goals/epochs/instances reject; lost responses retain calls; held callbacks and scope withdrawal obey Abort→Close joining. Protected method sets unchanged. |
+| **M2 — NOT IMPLEMENTED: built-in and PostgreSQL integration**. M1. | Replace grant-based copy with engine-owned authenticated sessions and ordinary lifecycle joining. Built-in retains stream/context/quorum semantics; independent PG retains backup/WAL/lineage/slots, physical SQL fencing and its durable metadata responsibilities. Delete superseded companion/grant/carrier paths as their consumers move, not in a later compatibility phase. | Both engines through M1 production routing, with real PG and no built-in wrapper. Built-in: nonempty target context/empty items/EOF, copy+replication ACK boundaries, duplicate StartCopy and stale process/storage/history/endpoint/epoch/ACK rejection. Both: delayed establishment after retirement, lost target cancellation while source stays Primary, pre-effect/await races, quarantine, no late successor install and actual joins. PG additionally proves receive+replay/checkpoint, live replay without mutation, slot retirement, SQL/pre-auth socket fencing and sticky join failure. |
+| **M3 — NOT IMPLEMENTED: recovery and failure qualification**. M2. | Complete and qualify goal/stage reconciliation for renewal, replacement, failover and handoff using only the replacement path. Verify same-format crash recovery, clean deployment and complete legacy-path removal. | Source/target/controller restart at selection/effect/receipt gaps; target reopen invalidates old Ready; remove-before-Build tombstone and failed-Build ambiguity; held multi-replica discovery with copy/access closed until AchievedScope. PC/CC/catch-up/promotion/demotion, actual KV/SQLite/PG access, acknowledged-prefix/history preservation, retained joins, protected API/package proof and incompatible-format rejection **before mutation**. |
+
+### Fresh-deployment contract and removal order
+
+Current formats remain [protocol 13 / host schema 14](classic-v1-runtime.md#production-policies-and-security).
+The replacement supports **fresh deployments only**, with matching binaries
+and newly provisioned compatible metadata/application storage. Allocate the
+replacement format versions during M1; do not reinterpret current payloads.
+Reject incompatible stores, commands and retained CRD intents before mutation.
+There is **no** old-state import, in-place upgrade, rolling/mixed-version mode,
+downgrade reader or reverse migration. Do not build converters or software
+rollback machinery.
+
+Never automatically delete, reset or reinitialize existing application data or
+PGDATA to make it fit. Encountering earlier-format deployment state is an
+explicit unsupported-deployment error, not permission to clear storage.
+Provision fresh resources rather than reuse a live deployment's storage.
+This is a version-transition policy, **not a restart strategy**: matching-format
+deployments must still recover their existing metadata and application data,
+including interrupted transactions, uncertain operations and acknowledged state.
+
+Removal ordering is property-based: inventory each old grant/journal/carrier/
+coordinator assertion → qualify replacement at host or actual engine owner →
+delete its old path/fields/fixtures as consumers move. Do not
+drop stale/late/cancel/join negatives simply because their old API disappears.
+No deployed legacy fallback is supported. Milestones are development checkpoints,
+not separately deployable modes; intermediate commits need not support the old
+stack. M3 verifies that no superseded production path remains, rather than
+introducing a final cutover subsystem.
+Host goal/outcome/ambiguity durability remains; target ingress journals do not
+become engine requirements. Same-live-host Ready reuse requires both endpoints'
+process/creation/storage and scope unchanged, with target publication rechecked
+before voting. Source Remove never certifies remote receiver drainage.
+
+### Validation entry points and qualification limits
+
+[Concrete current selectors](testing.md#hosting-redesign-baselines-and-future-acceptance)
+map M1–M3 to existing host, built-in, controller, public workspace and real PG
+baseline witnesses. They are source-inspected baselines, **not tests of this
+unimplemented redesign**. List the exact live selection before future authorized
+execution; add missing race/crash/fresh-deployment cases at replacement owners rather
+than inventing evidence or hard-coding test totals.
+
+PG metadata removal stays separately deferred behind its
+[field-by-field reconstruction gate](../postgres/stateless-metadata-prerequisites.md).
+The old generic fresh-floor/KSF prescription is superseded, not imported into
+this roadmap; existing native catch-up predicates and PG All/capability fallback
+remain. No marked-successor PG WriteQuorum, orphan self-fencing, MySQL
+qualification, production security or native differential evidence is supplied.
+Downstream engines must independently qualify the
+[ordinary target integration obligations](engine-neutral-hosting.md#migration-and-unresolved-proof-risks).
 
 ## Delivered — Native-style engine-neutral hosting
 
@@ -29,6 +103,9 @@ never creates a new grant or an engine idle observation.
 This closes the bounded structural hosting queue item, not wholesale Hosting2,
 RA/FM, P7/security/settings, arbitrary failed-Build recovery, native executable
 equivalence, downstream MySQL qualification or production certification.
+It does not close the newly distinguished **ordinary extension-boundary**
+divergence. Merged #199/#200/#201 are completed baselines, not missing roadmap
+phases. M1–M3 replace the affected project direction, not their acceptance record.
 
 ## Selected-host Close and access disposition
 
@@ -107,10 +184,13 @@ and representations remain unchanged.
 
 Remaining claim-specific obligations are not presumed defects or implied runs:
 
-- Downstream MySQL must attach the supported companion and requalify its own
+- **Current route:** downstream MySQL would need the supported companion and
+  must requalify its own
   source/target Build, native lineage/progress, later admission and actual access
   fencing with exact process/storage/history/attempt bindings. Its unpublished
   fixtures and externally reported seven-completion trace were not reproduced.
+  **Proposed route:** M1–M3 remove that companion requirement; native transfer/
+  lineage/access/terminal obligations remain, with no downstream evidence claim.
 - Native SF executable/differential validation, arbitrary failed custom-Build
   reformation and production deployment remain outside the bounded upstream
   witness. Failed/interrupted custom work may require explicit terminal cleanup

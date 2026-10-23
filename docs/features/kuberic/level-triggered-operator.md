@@ -5,6 +5,10 @@
 The `operator.kuberic.io/v1alpha1` stack is the only Kuberic operator path.
 It is experimental and intended for development and CI. Images are not
 published and no production activation procedure is provided.
+This page describes **CURRENT** behavior. The
+[controller/local-agent/host redesign](engine-neutral-hosting.md#controller-to-host-messages-and-action-selection)
+and [M1–M3 runtime roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **NOT IMPLEMENTED**; no Kubernetes resource/control behavior changes here.
 
 ## Architecture
 
@@ -69,7 +73,7 @@ cannot skip this resource gate. Once resources exist, Public V1 reports can be
 accepted and persisted.
 
 Initialization dispatches `InitializeAgentStore` to each exact fresh
-Pod/PVC/process identity. The controller accepts schema-12 established reports,
+Pod/PVC/process identity. The controller accepts schema-14 established reports,
 initializes one shared history, and originates the first topology containing
 the desired `spec.replicas` members.
 
@@ -130,7 +134,7 @@ that ownership.
 
 ## Commands and Reports
 
-The controller and runtime use Public V1 protocol version 11. Production
+The controller and runtime use Public V1 protocol version 13. Production
 commands are:
 
 - initialization;

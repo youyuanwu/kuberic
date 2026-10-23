@@ -12,7 +12,7 @@ controller and owned-cluster validation harness.
 The production control loop initializes fresh agents, originates exact
 topology authority, renews restarted process sessions, builds and admits
 same-cardinality replacements, and performs delayed failover from observation.
-Committed application state remains provider-owned; agent schema 13 stores
+Committed application state remains provider-owned; agent schema 14 stores
 history and lifecycle authority.
 
 The sole default Replicator now composes the source-guided Service Fabric classic
@@ -25,6 +25,7 @@ separate; KVStore2 and SQLite own durable commit and client publication.
 kuberic-runtime/           Application/replicator API, host, protocol, control
 kuberic-controller/        CRDs, reconciliation policy and Kubernetes controller
 kuberic-level-tests/       Unpublished in-process application and owned KinD journeys
+kuberic-public-v1-tests/   Unpublished helper-free public provider/contract fixtures
 
 examples/kvstore2/         Level-triggered conformance application
 examples/sqlite/           SQLite Public V1 application
@@ -152,7 +153,8 @@ the isolated development/CI assets above.
 
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
 - [Classic V1 current semantics](docs/features/kuberic/classic-v1-runtime.md)
-- [SF V1 pending alignment and qualification](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
+- [SF hosting target design — PROPOSED, not implemented](docs/features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+- [Future runtime roadmap and remaining qualification](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
 - [SF V1 current evidence/dispositions](docs/features/kuberic/sf-v1-port-ledger.md) and [source provenance/notices](docs/features/kuberic/sf-v1-port-provenance.md)
 - [V2 transactional Replicator design](docs/features/kuberic/v2-transactional-replicator-design.md)
 - [Replicator ownership boundary](docs/features/kuberic/replicator-boundary.md)

@@ -8,7 +8,8 @@ separates early assignment, native quorum completion, durable frame commitment,
 WAL publication and client success. Secondary durability precedes parameterless
 ACK; pending native progress is not a SQL visibility grant.
 
-The selected wire/agent formats are protocol 12 / schema 13. Old formats reject
+The selected wire/agent formats are protocol 13 / schema 14
+([current format authority](../kuberic/classic-v1-runtime.md#production-policies-and-security)). Old formats reject
 without migration or silent reset. Close drains accepted queued transactions;
 intentional Abort cancellation remains distinct from worker, storage, reporter
 and publication failures. The old `src/barrier.rs` receipt bridge is removed.
@@ -45,8 +46,10 @@ under `examples/sqlite/src/commit_barrier`. Its opt-in
 `testing` feature uses runtime's isolated fixture API, not private capabilities.
 
 This is an experimental source example, not a deployed-data upgrade.
-Use fresh Public V1 provider state with protocol 11 / agent schema 12. Prior
-provider or agent state rejects unchanged; there is no import path.
+This historical baseline used protocol 11 / agent schema 12; it is **not**
+the current setup instruction. Use the current format authority linked above
+and fresh provider state. Prior provider or agent state rejects unchanged;
+there is no import path.
 SQLite-specific images, manifests, published
 deployment assets, and live-cluster validation remain separate distribution work.
 
