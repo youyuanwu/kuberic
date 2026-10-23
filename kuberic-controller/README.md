@@ -71,8 +71,15 @@ Status-only reads avoid agent RPCs. Operation dispatch/report paths observe
 only the exact target; ordinary reconciliation retains the broader observation
 needed for topology and failover decisions.
 
-Protocol version 11 is the only production command/report path. Old and
+Protocol version 13 is the only production command/report path. Old and
 partial controller state rejects before planning or mutation.
+See the [current format authority](../docs/features/kuberic/classic-v1-runtime.md#production-policies-and-security).
+
+The [proposed controller/agent/host responsibility split](../docs/features/kuberic/engine-neutral-hosting.md#controller-to-host-messages-and-action-selection)
+and [future runtime roadmap](../docs/features/kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **NOT IMPLEMENTED**. Current dispatch still installs exact target Build
+authority before source Build; the redesign replaces, rather than renames,
+that extension boundary.
 
 ## Deployment
 

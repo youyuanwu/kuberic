@@ -1,5 +1,11 @@
 # PostgreSQL: Native Replication on Kuberic Public V1
 
+**CURRENT implementation.** The
+[ordinary-engine host target](../kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+and [R3 PostgreSQL migration](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **PROPOSED / NOT IMPLEMENTED**. This design/docs delivery changes no
+PostgreSQL runtime, on-disk format or qualification result.
+
 The `postgres-replicated` package supplies an independent native engine for the
 level-triggered Public V1 runtime and its supported custom-controller route.
 Bounded local qualification includes actual controller-driven formation and
@@ -7,7 +13,7 @@ native database evidence. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
-The [engine-neutral host](../kuberic/engine-neutral-hosting.md) uses one retained
+The [current engine-neutral host](../kuberic/engine-neutral-hosting.md#current--delivered-bounded-hosting) uses one retained
 authority/lifetime coordinator for this independent allocation and built-in V1.
 Host-installed configuration, exact host remote Build state and optional native
 idle observations are separate facts. PostgreSQL's `built_idle` query still
@@ -23,13 +29,11 @@ Prior unsupported agent/provider formats reject unchanged; there is no import,
 mixed-version or rolling mode implied by custom-controller integration.
 
 The current implementation uses a separate checksummed PostgreSQL metadata
-store. Its removal is blocked on the application-neutral reconfiguration work
-in
-[PostgreSQL Stateless Metadata: Service Fabric Prerequisites](stateless-metadata-prerequisites.md).
-The earlier
-[PostgreSQL Restart-Stateless Metadata](stateless-metadata.md) proposal is
-retained as historical design research and must be rewritten after those
-prerequisites are complete.
+store. It remains retained in the hosting redesign. Removal is separately
+deferred behind the [complete metadata-disposition gate](stateless-metadata-prerequisites.md),
+not an assumption that three generic changes make it safe.
+The earlier [restart-stateless proposal](stateless-metadata.md) is superseded
+historical research, not an active implementation prescription.
 
 ## Architecture and Authority
 
@@ -54,7 +58,10 @@ capabilities remain private. The production factory attaches its own
 bundle. The separate
 [companion contract](../kuberic/replicator-boundary.md#custom-controller-integration)
 adds exact inbound copy authority, coherent idle observations and owned drainage
-without adding methods to the protected native traits.
+without adding methods to the protected native traits. Although attachment is
+optional for a bundle, current controller Build requires it. This is a real
+extra boundary beyond SF's ordinary custom-replicator integration, not justified
+merely by describing it as local.
 
 PostgreSQL uses the same common lifecycle owner as the built-in engine but does
 not register the built-in replication/copy data plane. Delayed native callback
@@ -411,6 +418,13 @@ Shared regressions, partition validation and guard commands are in the
 
 ## Limitations and Future Work
 
+- Hosting migration R3 removes the companion and controller-attempt grant
+  coupling only after R1 production routing and R2 reference-contract coverage.
+  PG then owns authenticated engine Active/Retired transfer sessions, target
+  quarantine and ordinary Close-after-Abort joins; backup/WAL/lineage/replay,
+  SQL fences, slot/process ownership and metadata remain PG responsibilities.
+  Production controller recovery/upgrade qualification follows in R4/R5, not
+  from current formation tests. See the [single roadmap](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented).
 - Images, distribution and deployment assets remain future work. No PostgreSQL
   Kubernetes/container dependency, manifest or live test is part of this port.
 - Physical-slot lifecycle is implemented, but WAL-retention limits

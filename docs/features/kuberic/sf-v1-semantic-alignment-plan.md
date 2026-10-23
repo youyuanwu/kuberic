@@ -1,8 +1,10 @@
-# SF V1: Pending Alignment and Qualification
+# SF V1: Hosting Redesign Roadmap and Remaining Qualification
 
-This is a current work queue, not a delivery-phase checklist. Host-alignment
-baseline: Kuberic `69b1cfe3c85d296463da0def3e80eaca0ddcd0a7`; native SF
-`3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
+This is the **single active future runtime roadmap**, not a delivery-phase
+checklist. The hosting redesign is **PROPOSED / NOT IMPLEMENTED**; its current
+research baseline is Kuberic `b37009f8af7a7b2ed91f58f4889ed74e06013861`;
+native SF is `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
+Older bounded access/host evidence retains its explicit pins below.
 Read [current semantics](classic-v1-runtime.md) first and use the
 [disposition ledger](sf-v1-port-ledger.md) to interpret historical SF IDs.
 Completing P6 and replacing an old engine do not prove that no core defect remains.
@@ -10,6 +12,90 @@ Completing P6 and replacing an old engine do not prove that no core defect remai
 Priorities below order **future separately authorized work**. “Verified difference” means
 source-confirmed divergence, not a dynamically reproduced data-loss defect;
 “unverified” means missing claim-specific qualification, not demonstrated failure.
+
+## Hosting redesign roadmap — NOT IMPLEMENTED
+
+The [target owner/message/state contract](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+removes the mandatory custom companion and controller-to-target exact-grant
+boundary, rather than renaming it. Native source confirms the ordinary interface/
+host/engine separation; generic peer identity publication, durable agent stages,
+engine-session retirement and Rust Close-after-Abort settlement are explicit
+local **design choices**, not native public APIs.
+
+**All R phases below are NOT IMPLEMENTED and require separate runtime
+authorization.** This workflow delivers reviewed design/docs only. No runtime
+defect is presumed, no phase is promoted into execution, and no native
+executable equivalence is claimed. R1–R5 order structural migration; independent
+SF-11/mode/PG/P7/security obligations below remain open/deferred, not erased.
+
+| Phase / dependency | Future deliverable | Completion gate |
+|---|---|---|
+| **R1 — NOT IMPLEMENTED: contracts and dispatch seam**. No predecessor. | Define versioned controller goals, local-agent achieved stages, host remote operations/compatibility, peer-scope publication and ordinary lifecycle settlement. Include **production** goal→PrepareIdle→Build routing now, before engine E2E gates. Keep old deployed behavior until full cutover; qualify new routing only in isolated new-format environments, not a test-only bypass. | Generic independent ordinary bundle with **no companion/diagnostics**; coherent Open endpoint before peer recovery; stale goal/epoch/instance rejection; response-drop retention; held callback and Abort→Close joining; scope withdrawal closes old creation before replacement acknowledgement. Protected method sets unchanged. |
+| **R2 — NOT IMPLEMENTED: built-in engine migration**. R1. | Source host remote table and engine Active/Retired sessions; carrier/target establishment without controller-attempt grant fields. Fold real facade/transport/provider joining into ordinary lifecycle; preserve stream/copy/quorum semantics. | Actual built-in controller dispatch through R1 production seam; nonempty target context/empty items/EOF; copy+replication ACK boundary; stale process/storage/history/endpoint/epoch/ACK; duplicate StartCopy; Remove and held-provider races; delayed first handshake after retirement; lost cancellation while source stays Primary; scope invalidation between resolution and effect; no late install into successor and actual terminal joins. |
+| **R3 — NOT IMPLEMENTED: independent PostgreSQL migration**. R1,R2 reference contract. | Factory returns only its own ordinary bundle; generic peer discovery plus PG-native Active/Retired handshake and engine transfer IDs; retained backup/WAL/cache/slot/lineage/SQL fence and Close-after-Abort owners. Preserve PG durable metadata initially. | **Real PostgreSQL**, R1 production controller route, no built-in wrapper: backup, same-lineage receive+replay/checkpoint, live replay without mutation, delayed/pre-effect invalidation, source retirement, lost target cancellation/quarantine, slot retirement, retained SQL/pre-auth sockets rejected after physical fence, sticky actual join failure. Recheck generation around irreversible helpers; host drain is not PG process death. |
+| **R4 — NOT IMPLEMENTED: reconciliation and recovery integration**. R2,R3. | Adopt goal/stage/action selection throughout controller/agent renewal, replacement, failover and handoff; prove cutover readiness. Old target-grant choreography retires only at R5. | Source/target/controller restart at selection/effect/receipt gaps; live source + restarted target + lost reply cannot reuse old Ready; remove-before-Build tombstone; failed Build stays ambiguous until settlement; fresh endpoint before peer-dependent recovery; PC/CC/catch-up/promotion/demotion and actual KV/SQLite/PG access; acknowledged-prefix/history preservation. |
+| **R5 — NOT IMPLEMENTED: removal and maintenance cutover**. R4. | Delete companion/attachment/accessors, install/revoke commands, target grant store/receipts, controller-attempt carrier fields and old coordinator receiver policy/readers **after replacement coverage**. Version host/control/CRD payloads together, qualify upgrade/rollback and update current docs. | Protected API method-set guard, independent packaged ordinary-engine proof, replacement property coverage, prior-format rejection before mutation, interrupted maintenance upgrade/import/recovery and rollback-boundary rehearsal. No mixed old/new fleet, stale CRD replay or defaulted authority. |
+
+### Compatibility, restart and removal order
+
+Current formats remain [protocol 13 / host schema 14](classic-v1-runtime.md#production-policies-and-security).
+Do not repurpose them: allocate concrete replacement versions during R1
+implementation, advance host schema/control protocol/CRD canonical payload
+version together at R5, and explicitly reject old stores, commands and retained
+CRD intents. No automatic in-place conversion or rolling old/new compatibility.
+Unchanged protected method sets do **not** imply binary/data/control compatibility.
+
+Maintenance sequence:
+
+1. Stop admission and serving on all participants, settle host/engine/application
+   operations and verify managed process/PG/helper containment. Unresolved
+   ambiguity blocks the upgrade; API unreachability is not containment.
+2. Back up application/PGDATA and matching controller/agent/PG metadata. Preserve
+   lineage and acknowledged-prefix carriers. Install complete matching new
+   binaries and formats; never run half-migrated controller/engines.
+3. Reconcile new generic authority only through a reviewed identity/data import
+   proof. If unavailable, use fresh storage and verified copy; **never silently
+   erase or reinitialize existing PGDATA**. Keep all access closed during proof.
+4. Reopen real endpoints with fresh process/creation identities, recover native
+   role/configuration/quorum evidence and validate before serving. Predecessor
+   in-flight Build is uncertain, not replayable success.
+5. Backup rollback is allowed **only before opening new serving/acknowledged
+   writes**, with every participant fenced. Opening serving is the point of no
+   return. Thereafter default to closed forward repair; a downgrade requires a
+   separately reviewed reverse migration preserving every acknowledged new
+   suffix and PG lineage/control evidence. Merely stopping writers does not
+   make old-backup restoration safe.
+
+Rehearse interruption before/after every irreversible upgrade step, pre-serving
+rollback, and rejection of rollback after an acknowledged new-format write.
+No production-release or lossless-upgrade claim until those gates pass.
+
+Removal ordering is property-based: inventory each old grant/journal/carrier/
+coordinator assertion → qualify replacement at host or actual engine owner →
+cut over complete production route → delete old path/fields/fixtures. Do not
+drop stale/late/cancel/join negatives simply because their old API disappears.
+Host goal/outcome/ambiguity durability remains; target ingress journals do not
+become engine requirements. Same-live-host Ready reuse requires both endpoints'
+process/creation/storage and scope unchanged, with target publication rechecked
+before voting. Source Remove never certifies remote receiver drainage.
+
+### Validation entry points and qualification limits
+
+[Concrete current selectors](testing.md#hosting-redesign-baselines-and-future-acceptance)
+map R1–R5 to existing host, built-in, controller, public workspace and real PG
+baseline witnesses. They are source-inspected baselines, **not tests of this
+unimplemented redesign**. List the exact live selection before future authorized
+execution; add missing race/crash/upgrade cases at replacement owners rather
+than inventing evidence or hard-coding test totals.
+
+PG metadata removal stays separately deferred behind its
+[field-by-field reconstruction gate](../postgres/stateless-metadata-prerequisites.md).
+The old generic fresh-floor/KSF prescription is superseded, not imported into
+this roadmap; existing native catch-up predicates and PG All/capability fallback
+remain. No marked-successor PG WriteQuorum, orphan self-fencing, MySQL
+qualification, production security or native differential evidence is supplied.
+Downstream engines must independently qualify the
+[ordinary target integration obligations](engine-neutral-hosting.md#migration-and-unresolved-proof-risks).
 
 ## Delivered — Native-style engine-neutral hosting
 
@@ -29,6 +115,9 @@ never creates a new grant or an engine idle observation.
 This closes the bounded structural hosting queue item, not wholesale Hosting2,
 RA/FM, P7/security/settings, arbitrary failed-Build recovery, native executable
 equivalence, downstream MySQL qualification or production certification.
+It does not close the newly distinguished **ordinary extension-boundary**
+divergence. Merged #199/#200/#201 are completed baselines, not missing roadmap
+phases. R1–R5 replace the affected project direction, not their acceptance record.
 
 ## Selected-host Close and access disposition
 
@@ -107,10 +196,13 @@ and representations remain unchanged.
 
 Remaining claim-specific obligations are not presumed defects or implied runs:
 
-- Downstream MySQL must attach the supported companion and requalify its own
+- **Current route:** downstream MySQL would need the supported companion and
+  must requalify its own
   source/target Build, native lineage/progress, later admission and actual access
   fencing with exact process/storage/history/attempt bindings. Its unpublished
   fixtures and externally reported seven-completion trace were not reproduced.
+  **Proposed route:** R1–R5 remove that companion requirement; native transfer/
+  lineage/access/terminal obligations remain, with no downstream evidence claim.
 - Native SF executable/differential validation, arbitrary failed custom-Build
   reformation and production deployment remain outside the bounded upstream
   witness. Failed/interrupted custom work may require explicit terminal cleanup

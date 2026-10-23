@@ -7,6 +7,9 @@ constructed by the sole built-in factory
 Use [current semantics](classic-v1-runtime.md) for the authoritative behavior,
 [ownership boundary](replicator-boundary.md) for integration responsibilities,
 and [pending work](sf-v1-semantic-alignment-plan.md) for remaining alignment.
+The [ordinary-engine hosting redesign](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+is **PROPOSED / NOT IMPLEMENTED**. Process-local queues do not imply removable
+agent authority or PostgreSQL metadata; those have separate recovery owners.
 
 ## Ownership
 
@@ -24,7 +27,7 @@ Native queues are not a recovered application write journal.
 
 ## Deployment and recovery constraints
 
-The selected format constants are public protocol12 / agent schema13
+The selected format constants are public protocol 13 / agent schema 14
 ([protocol:13](../../../kuberic-runtime/src/protocol/public_operations.rs#L13),
 [schema:19–21](../../../kuberic-runtime/src/host/state.rs#L19-L21)).
 This reference does not promise old-state migration, mixed-version enrollment

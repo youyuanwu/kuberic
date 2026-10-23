@@ -1,6 +1,10 @@
 # Classic V1: Current Semantics
 
-The [engine-neutral hosting contract](engine-neutral-hosting.md) supersedes
+**CURRENT behavior.** The [proposed ordinary-engine boundary](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+and [future runtime roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **NOT IMPLEMENTED** and do not change the contracts on this page.
+
+The [current engine-neutral hosting contract](engine-neutral-hosting.md#current--delivered-bounded-hosting) supersedes
 older host-only anchors below for common admission, retained authority,
 observation separation and public terminal outcomes. Its implementation is
 anchored through `91a2a93c3c7cf9477adb3a0d27e674b99f741a8a`; older queue/

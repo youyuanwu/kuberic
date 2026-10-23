@@ -24,6 +24,7 @@ document; older studies used `build/service-fabric/` (depth-1 clone).
 ## Related Kuberic Documents
 
 - [Kuberic classic V1 current semantics](../../features/kuberic/classic-v1-runtime.md)
+- [SF hosting target boundary — PROPOSED / NOT IMPLEMENTED](../../features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
 - [Current evidence and finding dispositions](../../features/kuberic/sf-v1-port-ledger.md)
 - [Pending alignment and qualification](../../features/kuberic/sf-v1-semantic-alignment-plan.md)
 - [Stateless Default Replicator](../../features/kuberic/stateless-default-replicator.md)

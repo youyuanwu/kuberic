@@ -38,12 +38,17 @@ are unchanged. Assignment and stream APIs intentionally change.
 An independent native engine can additionally attach
 `replicator::CustomReplicatorControl` with
 `ReplicatorInterfaces::with_custom_control(&context, owner)` during factory
-creation. This optional **local control-plane companion**, not an SF interface,
+creation. This attachable **local control-plane companion**, not an SF interface,
 supports exact inbound Build authority, configuration-bound idle observations
 and owned drainage. Factory-context Build lookup/validation is read-only and
 creation-bound; it does not expose an agent store or authority setter.
 See the [custom-engine contract](../docs/features/kuberic/replicator-boundary.md#custom-controller-integration)
 and its evidence limits.
+Attachment is optional for a bundle, but **current controller-driven Build
+requires it**; ordinary custom traits alone do not integrate that path
+([host check:891–927](src/host/hosting.rs#L891-L927)).
+The [proposed ordinary-engine redesign](../docs/features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+removes this extra boundary; it is **NOT IMPLEMENTED**.
 
 ## Built-In Replicator
 
@@ -65,7 +70,7 @@ at most one provider writer.
 
 ## Durable Ownership
 
-- agent schema 13: identity, history, lifecycle/operation authority, terminal
+- agent schema 14: identity, history, lifecycle/operation authority, terminal
   completion;
 - provider: application bytes, progress, retained operations, copy state;
 - Replicator memory: queues, peers, ACKs, copy/replication tasks.
@@ -73,7 +78,7 @@ at most one provider writer.
 Old schemas and supported prior provider formats reject without mutation.
 There is no migration or compatibility reader.
 
-Process restart reconstructs native process-local queues from schema-13 authority
+Process restart reconstructs native process-local queues from schema-14 authority
 and provider state. A cold secondary requires real copy even when it retains
 application data. The host reserves a real opaque creation identity before
 Open; attachment consumes that same identity. The controller can capture the
@@ -85,7 +90,7 @@ advanced.
 
 ## Public V1 Protocol
 
-Protocol version 12 is the only built-in identity. Serialized public values use
+Protocol version 13 is the only built-in identity. Serialized public values use
 the `identity` field. Prior identities and old report/command branches are rejected.
 
 The bounded tonic carrier authenticates with the host's agent bearer credential.
