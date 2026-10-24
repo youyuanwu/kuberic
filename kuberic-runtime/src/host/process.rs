@@ -243,10 +243,10 @@ impl ReplicaHandle {
         })?;
         let handle = self.clone();
         let (completed, result) = tokio::sync::oneshot::channel();
-        preview.registry.own_control_task(async move {
+        preview.registry.try_own_control_task(async move {
             let outcome = handle.execute_public_v1_owned(intent).await;
             let _ = completed.send(outcome);
-        });
+        })?;
         result.await.map_err(|error| {
             crate::host::HostError::CommandRejected(format!(
                 "owned public testing execution stopped before replying: {error}"

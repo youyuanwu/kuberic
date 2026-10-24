@@ -517,6 +517,7 @@ impl AgentStore for SqliteStore {
             .map_err(|message| crate::host::HostError::CommandRejected(message.into()))?;
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
+            super::ordinary_goal::validate_acknowledgement(&state, acknowledgement)?;
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("ordinary goal store unavailable".into())
             })?;
@@ -526,27 +527,9 @@ impl AgentStore for SqliteStore {
                 .ok_or_else(|| {
                     crate::host::HostError::CommandRejected("unknown ordinary goal".into())
                 })?;
-            if record.intent != goal.intent()
-                || !matches!(
-                    record.stage,
-                    PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-                )
-                || record.disposition.is_none()
-                || (record.lifecycle.in_flight.is_some()
-                    && record.disposition == Some(PublicOperationDisposition::Succeeded))
-            {
-                return Err(crate::host::HostError::CommandRejected(
-                    "ordinary goal is changed, uncertain, or unsettled".into(),
-                ));
-            }
             let ordinary = record.ordinary.as_mut().ok_or_else(|| {
                 crate::host::HostError::Corrupt("ordinary goal lacks frozen actions".into())
             })?;
-            if acknowledgement.logically_retired && !ordinary.logically_retired {
-                return Err(crate::host::HostError::CommandRejected(
-                    "controller acknowledgement cannot invent local idle retirement".into(),
-                ));
-            }
             ordinary.accepted = true;
             ordinary.host_settled = record.stage == PublicOperationStage::Completed;
             if let Some(remote) = goal.remote() {

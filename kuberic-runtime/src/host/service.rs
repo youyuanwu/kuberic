@@ -787,10 +787,10 @@ where
         let (completed, result) = tokio::sync::oneshot::channel();
         // Access-fence release and projection publication belong to the accepted
         // execution, not to the lifetime of the RPC waiting for its reply.
-        registry.own_control_task(async move {
+        registry.try_own_control_task(async move {
             let outcome = service.execute_public_intent_owned(intent).await;
             let _ = completed.send(outcome);
-        });
+        })?;
         result.await.map_err(|error| {
             crate::host::HostError::CommandRejected(format!(
                 "owned public execution stopped before replying: {error}"
@@ -919,10 +919,10 @@ where
         })?;
         let service = self.clone();
         let (completed, result) = tokio::sync::oneshot::channel();
-        registry.own_control_task(async move {
+        registry.try_own_control_task(async move {
             let outcome = service.execute_session_renewal_owned(command).await;
             let _ = completed.send(outcome);
-        });
+        })?;
         result.await.map_err(|error| {
             crate::host::HostError::CommandRejected(format!(
                 "owned session renewal stopped before replying: {error}"

@@ -757,3 +757,37 @@ pub(crate) fn remote_observations(
         })
         .collect()
 }
+
+pub(crate) fn validate_acknowledgement(
+    state: &AgentState,
+    acknowledgement: &ReplicaGoalAcknowledgement,
+) -> Result<()> {
+    let goal = &acknowledgement.goal;
+    goal.validate().map_err(reject)?;
+    let record = state
+        .public_v1_operation_state
+        .as_ref()
+        .and_then(|preview| preview.operations.get(&goal.operation_id))
+        .ok_or_else(|| reject("unknown ordinary goal"))?;
+    if record.intent != goal.intent()
+        || !matches!(
+            record.stage,
+            PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+        )
+        || record.disposition.is_none()
+        || (record.lifecycle.in_flight.is_some()
+            && record.disposition == Some(PublicOperationDisposition::Succeeded))
+    {
+        return Err(reject("ordinary goal is changed, uncertain, or unsettled"));
+    }
+    let ordinary = record
+        .ordinary
+        .as_ref()
+        .ok_or_else(|| HostError::Corrupt("ordinary goal lacks frozen actions".into()))?;
+    if acknowledgement.logically_retired && !ordinary.logically_retired {
+        return Err(reject(
+            "controller acknowledgement cannot invent local idle retirement",
+        ));
+    }
+    Ok(())
+}

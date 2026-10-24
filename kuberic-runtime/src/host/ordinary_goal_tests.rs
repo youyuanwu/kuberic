@@ -32,11 +32,14 @@ struct Probe {
     block_close: AtomicBool,
     close_gate: Semaphore,
     close_entered: Semaphore,
+    close_returned: Semaphore,
     block_application_close: AtomicBool,
     application_close_gate: Semaphore,
     application_close_entered: Semaphore,
+    application_close_returned: Semaphore,
     fail_close: AtomicBool,
     block_build: AtomicBool,
+    panic_build: AtomicBool,
     build_gate: Semaphore,
     build_entered: Semaphore,
     build_calls: AtomicUsize,
@@ -77,11 +80,14 @@ impl Probe {
             block_close: AtomicBool::new(false),
             close_gate: Semaphore::new(0),
             close_entered: Semaphore::new(0),
+            close_returned: Semaphore::new(0),
             block_application_close: AtomicBool::new(false),
             application_close_gate: Semaphore::new(0),
             application_close_entered: Semaphore::new(0),
+            application_close_returned: Semaphore::new(0),
             fail_close: AtomicBool::new(false),
             block_build: AtomicBool::new(false),
+            panic_build: AtomicBool::new(false),
             build_gate: Semaphore::new(0),
             build_entered: Semaphore::new(0),
             build_calls: AtomicUsize::new(0),
@@ -205,6 +211,7 @@ impl StatefulServiceReplica for Application {
                 .unwrap()
                 .forget();
         }
+        self.0.application_close_returned.add_permits(1);
         Ok(())
     }
     fn abort(&self) {}
@@ -244,6 +251,7 @@ impl Replicator for Probe {
         }
         self.listener.lock().unwrap().take();
         self.factory_listener.lock().unwrap().take();
+        self.close_returned.add_permits(1);
         if self.fail_close.load(Ordering::Acquire) {
             return Err(RuntimeError::Application("ordinary Close failed".into()));
         }
@@ -316,6 +324,10 @@ impl PrimaryReplicator for Probe {
         if self.block_build.load(Ordering::Acquire) {
             self.build_gate.acquire().await.unwrap().forget();
         }
+        assert!(
+            !self.panic_build.load(Ordering::Acquire),
+            "injected ordinary Build owner panic"
+        );
         Ok(())
     }
     async fn remove_replica(&self, _: ReplicaId) -> crate::Result<()> {
@@ -2455,4 +2467,535 @@ async fn ordinary_goal_remove_tombstones_survive_reopen_and_budget_requires_safe
     assert_eq!(source.probe.build_calls.load(Ordering::Acquire), 0);
     source.finish().await;
     target.finish().await;
+}
+
+#[cfg(feature = "testing")]
+async fn cut_entered(entered: &tokio::sync::Notify) {
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn ordinary_goal_cancelled_join_observer_keeps_held_build_and_sticky_failure_owned() {
+    for panic_build in [false, true] {
+        let (source, target, selection) = remote_pair().await;
+        source.probe.block_build.store(true, Ordering::Release);
+        source
+            .probe
+            .panic_build
+            .store(panic_build, Ordering::Release);
+        source.probe.block_close.store(true, Ordering::Release);
+        source
+            .probe
+            .block_application_close
+            .store(true, Ordering::Release);
+        let mut build = source.goal.clone();
+        build.operation_id = OperationId::new("cancelled-join-build");
+        build.revision = 2;
+        build.desired = ReplicaGoalKind::Build {
+            remote: Box::new(selection),
+        };
+        source.submit(&build).await.unwrap();
+        entered(&source.probe.build_entered).await;
+        let registry = source.service.registry.get().unwrap().clone();
+        let operation = registry
+            .operation_for_validation(&build.operation_id)
+            .await
+            .unwrap();
+        let joining = Arc::new(tokio::sync::Notify::new());
+        operation.notify_ordinary_join(joining.clone());
+
+        let before = source.store.load_state().await.unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            source
+                .service
+                .acknowledge_ordinary_goal(proto::ReplicaGoalRequest {
+                    protocol_version: ORDINARY_ACTION_FORMAT,
+                    canonical_json: serde_json::to_vec(&ReplicaGoalAcknowledgement {
+                        goal: build.clone(),
+                        logically_retired: false,
+                    })
+                    .unwrap(),
+                }),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.message().contains("unsettled"), "{error}");
+        assert_eq!(source.store.load_state().await.unwrap(), before);
+
+        // Exercise the shared join primitive even though premature RPC
+        // acknowledgements now reject before reaching it.
+        let observer_registry = registry.clone();
+        let id = build.operation_id.clone();
+        let observer = tokio::spawn(async move { observer_registry.join_ordinary_goal(&id).await });
+        cut_entered(&joining).await;
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+
+        let mut abort = source.goal.clone();
+        abort.operation_id = OperationId::new("abort-cancelled-join");
+        abort.revision = 3;
+        abort.desired = ReplicaGoalKind::Abort;
+        source.submit(&abort).await.unwrap();
+        entered(&source.probe.aborted).await;
+        entered(&source.probe.close_entered).await;
+        source.probe.close_gate.add_permits(1);
+        entered(&source.probe.close_returned).await;
+        entered(&source.probe.application_close_entered).await;
+        source.probe.application_close_gate.add_permits(1);
+        entered(&source.probe.application_close_returned).await;
+        cut_entered(&joining).await;
+        assert_eq!(source.runtime.provider_writer_lease_count(), 1);
+        let snapshot = source.snapshot().await;
+        assert!(snapshot.publication.is_none());
+        assert!(snapshot.withdrawn);
+        assert!(snapshot.goals.iter().any(|observation| {
+            observation.goal == abort && observation.status != ReplicaGoalStatus::Achieved
+        }));
+        source.probe.build_gate.add_permits(1);
+
+        if panic_build {
+            source.failed(&abort).await;
+            let first = registry
+                .join_ordinary_goal(&build.operation_id)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                first.contains("injected ordinary Build owner panic"),
+                "{first}"
+            );
+            assert_eq!(
+                registry
+                    .join_ordinary_goal(&build.operation_id)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                first
+            );
+            for _ in 0..2 {
+                let error = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    source.runtime.shutdown_and_drain(),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert!(error.to_string().contains("ordinary callback"), "{error}");
+                assert_eq!(source.runtime.provider_writer_lease_count(), 1);
+            }
+            source.shutdown.send_replace(true);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), source.server)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+        } else {
+            source.achieved(&abort).await;
+            assert_eq!(source.runtime.provider_writer_lease_count(), 0);
+            assert_eq!(source.probe.build_calls.load(Ordering::Acquire), 1);
+            assert_eq!(source.probe.close_calls.load(Ordering::Acquire), 1);
+            assert_eq!(source.probe.remove_calls.load(Ordering::Acquire), 0);
+            source.finish().await;
+        }
+        target.finish().await;
+    }
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn ordinary_goal_lost_acknowledgement_after_join_entry_cannot_settle_build_early() {
+    use crate::host::operation::RegistryTestCut;
+
+    let (source, target, selection) = remote_pair().await;
+    source.probe.block_build.store(true, Ordering::Release);
+    source.probe.block_close.store(true, Ordering::Release);
+    source
+        .probe
+        .block_application_close
+        .store(true, Ordering::Release);
+    let mut build = source.goal.clone();
+    build.operation_id = OperationId::new("lost-ack-build");
+    build.revision = 2;
+    build.desired = ReplicaGoalKind::Build {
+        remote: Box::new(selection),
+    };
+    source.submit(&build).await.unwrap();
+    entered(&source.probe.build_entered).await;
+    let registry = source.service.registry.get().unwrap().clone();
+    let operation = registry
+        .operation_for_validation(&build.operation_id)
+        .await
+        .unwrap();
+    let root_return = Arc::new(RegistryTestCut::default());
+    operation.set_ordinary_return_cut(root_return.clone());
+    let joining = Arc::new(tokio::sync::Notify::new());
+    operation.notify_ordinary_join(joining.clone());
+    source.probe.build_gate.add_permits(1);
+    cut_entered(&root_return.entered).await;
+    source.achieved(&build).await;
+
+    let acknowledgement = ReplicaGoalAcknowledgement {
+        goal: build.clone(),
+        logically_retired: true,
+    };
+    let before = source.store.load_state().await.unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        source
+            .service
+            .acknowledge_ordinary_goal(proto::ReplicaGoalRequest {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                canonical_json: serde_json::to_vec(&acknowledgement).unwrap(),
+            }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.message().contains("cannot invent"), "{error}");
+    assert_eq!(source.store.load_state().await.unwrap(), before);
+
+    let service = source.service.clone();
+    let request = proto::ReplicaGoalRequest {
+        protocol_version: ORDINARY_ACTION_FORMAT,
+        canonical_json: serde_json::to_vec(&ReplicaGoalAcknowledgement {
+            logically_retired: false,
+            ..acknowledgement
+        })
+        .unwrap(),
+    };
+    // Drop the server's actual acknowledgement future, not merely the network
+    // client: it has entered the retained root join after durable completion.
+    let observer = tokio::spawn(async move { service.acknowledge_ordinary_goal(request).await });
+    cut_entered(&joining).await;
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    assert!(
+        !source
+            .store
+            .load_state()
+            .await
+            .unwrap()
+            .public_v1_operation_state
+            .unwrap()
+            .operations[&build.operation_id]
+            .ordinary
+            .as_ref()
+            .unwrap()
+            .accepted
+    );
+    let mut abort = source.goal.clone();
+    abort.operation_id = OperationId::new("abort-lost-ack");
+    abort.revision = 3;
+    abort.desired = ReplicaGoalKind::Abort;
+    source.submit(&abort).await.unwrap();
+    entered(&source.probe.close_entered).await;
+    source.probe.close_gate.add_permits(1);
+    entered(&source.probe.close_returned).await;
+    entered(&source.probe.application_close_entered).await;
+    source.probe.application_close_gate.add_permits(1);
+    entered(&source.probe.application_close_returned).await;
+    cut_entered(&joining).await;
+    assert_eq!(source.runtime.provider_writer_lease_count(), 1);
+    let pending = source.snapshot().await;
+    assert!(pending.publication.is_none());
+    assert!(pending.goals.iter().any(|observation| {
+        observation.goal == abort && observation.status != ReplicaGoalStatus::Achieved
+    }));
+    root_return.release.notify_one();
+    source.achieved(&abort).await;
+    assert_eq!(source.runtime.provider_writer_lease_count(), 0);
+    assert_eq!(source.probe.build_calls.load(Ordering::Acquire), 1);
+    assert_eq!(source.probe.close_calls.load(Ordering::Acquire), 1);
+    assert_eq!(source.probe.remove_calls.load(Ordering::Acquire), 0);
+    source.finish().await;
+    target.finish().await;
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn ordinary_goal_shutdown_releases_admission_before_joining_lost_rpc_dispatcher() {
+    use crate::host::operation::RegistryTestCut;
+
+    for fail_close in [false, true] {
+        let fixture = Fixture::new(1, false).await;
+        fixture.submit(&fixture.goal).await.unwrap();
+        fixture.achieved(&fixture.goal).await;
+        let configuration_calls = fixture.probe.configuration_calls.load(Ordering::Acquire);
+        fixture
+            .probe
+            .fail_close
+            .store(fail_close, Ordering::Release);
+        fixture.probe.block_close.store(true, Ordering::Release);
+        fixture
+            .probe
+            .block_application_close
+            .store(true, Ordering::Release);
+        let registry = fixture.service.registry.get().unwrap().clone();
+        let mut goal = fixture.goal.clone();
+        goal.operation_id = OperationId::new("shutdown-racing-dispatch");
+        goal.revision = 2;
+        goal.desired = ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::Primary,
+            catch_up: None,
+        };
+        let admission = Arc::new(RegistryTestCut::default());
+        registry.set_admission_cut(goal.operation_id.clone(), admission.clone());
+        let shutdown = Arc::new(RegistryTestCut::default());
+        registry.set_shutdown_cut(shutdown.clone());
+        let mut client =
+            proto::agent_control_client::AgentControlClient::connect(fixture.address.clone())
+                .await
+                .unwrap();
+        let request = auth(proto::ReplicaGoalRequest {
+            protocol_version: ORDINARY_ACTION_FORMAT,
+            canonical_json: serde_json::to_vec(&goal).unwrap(),
+        });
+        let observer = tokio::spawn(async move { client.submit_goal(request).await });
+        cut_entered(&admission.entered).await;
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        let runtime = fixture
+            .service
+            .operation_runtime
+            .lock()
+            .await
+            .take()
+            .unwrap();
+        let stopping = tokio::spawn(async move { runtime.shutdown().await });
+        cut_entered(&shutdown.entered).await;
+        assert!(registry.is_fenced());
+        let before = fixture.store.load_state().await.unwrap();
+        let mut late = goal.clone();
+        late.operation_id = OperationId::new("post-shutdown-dispatch");
+        late.revision = 3;
+        let error = fixture
+            .service
+            .submit_ordinary_goal(proto::ReplicaGoalRequest {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                canonical_json: serde_json::to_vec(&late).unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("shutting down"), "{error}");
+        admission.release.notify_one();
+        shutdown.release.notify_one();
+        entered(&fixture.probe.close_entered).await;
+        fixture.probe.close_gate.add_permits(1);
+        entered(&fixture.probe.close_returned).await;
+        entered(&fixture.probe.application_close_entered).await;
+        assert!(!stopping.is_finished());
+        assert_eq!(fixture.runtime.provider_writer_lease_count(), 1);
+        fixture.probe.application_close_gate.add_permits(1);
+        entered(&fixture.probe.application_close_returned).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), stopping)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture.store.load_state().await.unwrap(), before);
+        assert_eq!(
+            fixture.probe.configuration_calls.load(Ordering::Acquire),
+            configuration_calls
+        );
+        assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 1);
+        if fail_close {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ordinary Close failed")
+            );
+            for _ in 0..2 {
+                assert!(
+                    fixture
+                        .runtime
+                        .shutdown_and_drain()
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("ordinary Close failed")
+                );
+                assert_eq!(fixture.runtime.provider_writer_lease_count(), 1);
+            }
+        } else {
+            result.unwrap();
+            fixture.runtime.shutdown_and_drain().await.unwrap();
+            assert_eq!(fixture.runtime.provider_writer_lease_count(), 0);
+        }
+        assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 1);
+        fixture.shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), fixture.server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn ordinary_goal_stale_terminal_after_preflight_rejects_without_fencing_revision_or_epoch() {
+    use crate::host::operation::RegistryTestCut;
+
+    for stale_epoch in [false, true] {
+        let fixture = Fixture::new(1, false).await;
+        fixture.submit(&fixture.goal).await.unwrap();
+        fixture.achieved(&fixture.goal).await;
+        let registry = fixture.service.registry.get().unwrap().clone();
+        let mut terminal = fixture.goal.clone();
+        terminal.operation_id = OperationId::new("stale-preflight-terminal");
+        terminal.revision = if stale_epoch { 5 } else { 3 };
+        terminal.desired = ReplicaGoalKind::Abort;
+        let admission = Arc::new(RegistryTestCut::default());
+        registry.set_admission_cut(terminal.operation_id.clone(), admission.clone());
+        let service = fixture.service.clone();
+        let request = proto::ReplicaGoalRequest {
+            protocol_version: ORDINARY_ACTION_FORMAT,
+            canonical_json: serde_json::to_vec(&terminal).unwrap(),
+        };
+        let observer = tokio::spawn(async move { service.submit_ordinary_goal(request).await });
+        cut_entered(&admission.entered).await;
+        let mut newer = fixture.goal.clone();
+        newer.operation_id = OperationId::new("accepted-after-terminal-preflight");
+        newer.revision = 4;
+        newer.desired = ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::Primary,
+            catch_up: None,
+        };
+        if stale_epoch {
+            newer.scope.epoch = Epoch::new(0, 2);
+            let current = &newer.scope.configuration.current;
+            newer.scope.configuration.current = ConfigurationDescriptor::new(
+                newer.scope.epoch,
+                current.primary_id,
+                current.members.clone(),
+                current.write_quorum,
+            );
+        }
+        fixture.submit(&newer).await.unwrap();
+        fixture.achieved(&newer).await;
+        let before = fixture.store.load_state().await.unwrap();
+        let snapshot = fixture.snapshot().await;
+        let configuration_calls = fixture.probe.configuration_calls.load(Ordering::Acquire);
+        admission.release.notify_one();
+        let error = tokio::time::timeout(Duration::from_secs(10), observer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.message().contains("revision or epoch is stale"),
+            "{error}"
+        );
+        assert_eq!(fixture.store.load_state().await.unwrap(), before);
+        assert_eq!(fixture.snapshot().await, snapshot);
+        assert!(!registry.is_fenced());
+        assert!(!fixture.runtime.ordinary_withdrawn());
+        assert_eq!(fixture.probe.aborts.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture.probe.configuration_calls.load(Ordering::Acquire),
+            configuration_calls
+        );
+        assert!(
+            registry
+                .operation_for_validation(&terminal.operation_id)
+                .await
+                .is_none()
+        );
+        newer.operation_id = OperationId::new("valid-after-rejected-terminal");
+        newer.revision = 6;
+        fixture.submit(&newer).await.unwrap();
+        fixture.achieved(&newer).await;
+        assert_eq!(
+            fixture.probe.configuration_calls.load(Ordering::Acquire),
+            configuration_calls + 1
+        );
+        fixture.finish().await;
+    }
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn ordinary_goal_shutdown_joins_completion_and_terminal_owners_registered_during_drain() {
+    use crate::host::operation::RegistryTestCut;
+
+    let fixture = Fixture::new(1, false).await;
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.achieved(&fixture.goal).await;
+    fixture
+        .probe
+        .block_configuration
+        .store(true, Ordering::Release);
+    fixture.probe.block_close.store(true, Ordering::Release);
+    fixture
+        .probe
+        .block_application_close
+        .store(true, Ordering::Release);
+    let registry = fixture.service.registry.get().unwrap().clone();
+    let mut goal = fixture.goal.clone();
+    goal.operation_id = OperationId::new("late-completion-registration");
+    goal.revision = 2;
+    goal.desired = ReplicaGoalKind::Reconfigure {
+        role: ReplicaRole::Primary,
+        catch_up: None,
+    };
+    let completion = Arc::new(RegistryTestCut::default());
+    registry.set_completion_cut(goal.operation_id.clone(), completion.clone());
+    let drain = Arc::new(RegistryTestCut::default());
+    registry.set_drain_cut(drain.clone());
+    let service = fixture.service.clone();
+    let request = proto::ReplicaGoalRequest {
+        protocol_version: ORDINARY_ACTION_FORMAT,
+        canonical_json: serde_json::to_vec(&goal).unwrap(),
+    };
+    let observer = tokio::spawn(async move { service.submit_ordinary_goal(request).await });
+    cut_entered(&completion.entered).await;
+    entered(&fixture.probe.configuration_entered).await;
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    let runtime = fixture
+        .service
+        .operation_runtime
+        .lock()
+        .await
+        .take()
+        .unwrap();
+    let stopping = tokio::spawn(async move { runtime.shutdown().await });
+    entered(&fixture.probe.close_entered).await;
+    fixture.probe.configuration_gate.add_permits(1);
+    cut_entered(&drain.entered).await;
+    // The initial drain snapshot already contains the dispatcher. Its retained
+    // completion, and that completion's terminal recovery, do not exist yet.
+    completion.release.notify_one();
+    drain.release.notify_one();
+    assert!(!stopping.is_finished());
+    assert_eq!(fixture.runtime.provider_writer_lease_count(), 1);
+    fixture.probe.close_gate.add_permits(1);
+    entered(&fixture.probe.close_returned).await;
+    entered(&fixture.probe.application_close_entered).await;
+    assert!(!stopping.is_finished());
+    fixture.probe.application_close_gate.add_permits(1);
+    entered(&fixture.probe.application_close_returned).await;
+    tokio::time::timeout(Duration::from_secs(10), stopping)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(registry.owners_drained().await);
+    assert_eq!(fixture.runtime.provider_writer_lease_count(), 0);
+    assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 1);
+    fixture.runtime.shutdown_and_drain().await.unwrap();
+    fixture.shutdown.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(10), fixture.server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

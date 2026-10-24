@@ -125,10 +125,12 @@ impl<S: AgentStore + 'static> AgentService<S> {
             .ok_or_else(|| Status::unavailable("ordinary operation owner unavailable"))?;
         let service = self.clone();
         let (completed, result) = tokio::sync::oneshot::channel();
-        registry.own_control_task(async move {
-            let outcome = service.submit_ordinary_goal_owned(goal).await;
-            let _ = completed.send(outcome);
-        });
+        registry
+            .try_own_control_task(async move {
+                let outcome = service.submit_ordinary_goal_owned(goal).await;
+                let _ = completed.send(outcome);
+            })
+            .map_err(status_from_agent)?;
         result
             .await
             .map_err(|_| Status::unavailable("retained goal dispatch owner was lost"))?
@@ -197,6 +199,10 @@ impl<S: AgentStore + 'static> AgentService<S> {
             )
             .await
             .map_err(status_from_agent)?;
+        #[cfg(all(test, feature = "testing"))]
+        registry
+            .pause_completion_registration(&goal.operation_id)
+            .await;
         let service = self.clone();
         // The RPC owns no ordinary future. Completion, failed preparation and
         // withdrawal are retained even when every response observer disappears.
@@ -280,6 +286,8 @@ impl<S: AgentStore + 'static> AgentService<S> {
         let acknowledgement: ReplicaGoalAcknowledgement = decode(&request.canonical_json)?;
         self.validate_goal_target(&acknowledgement.goal).await?;
         let state = self.store.load_state().await.map_err(status_from_agent)?;
+        crate::host::ordinary_goal::validate_acknowledgement(&state, &acknowledgement)
+            .map_err(status_from_agent)?;
         let succeeded = state
             .public_v1_operation_state
             .as_ref()
