@@ -370,6 +370,11 @@ impl SqliteService {
 #[async_trait]
 impl StatefulServiceReplica for SqliteService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        if context.partition.ordinary_hosting() {
+            return Err(RuntimeError::ControlPlane(
+                "built-in ordinary hosting integration is unavailable until M2".into(),
+            ));
+        }
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);
         }

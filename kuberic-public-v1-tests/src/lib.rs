@@ -613,6 +613,11 @@ impl ExternalService {
 #[async_trait]
 impl StatefulServiceReplica for ExternalService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        if context.partition.ordinary_hosting() {
+            return Err(RuntimeError::ControlPlane(
+                "built-in ordinary hosting integration is unavailable until M2".into(),
+            ));
+        }
         if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }

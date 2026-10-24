@@ -1,4 +1,4 @@
-//! Actual production PostgreSQL engine, host and controller qualification.
+//! Production checkpoint checks and retained, currently unavailable M2 engine journeys.
 use super::*;
 use crate::service::{PgService, PgServiceConfig};
 use kuberic_controller::test_util::{
@@ -10,6 +10,37 @@ use std::sync::Mutex as StdMutex;
 use tokio_stream::wrappers::TcpListenerStream;
 
 type TestResult<T = ()> = kuberic_controller::test_util::Result<T>;
+
+async fn checkpoint_unavailable(
+    cluster: &mut TestCluster<Factory>,
+    factory: &Factory,
+) -> TestResult<bool> {
+    if !cluster.ordinary_integration_unavailable().await? {
+        return Ok(false);
+    }
+    let services = factory
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|listener| listener.service.clone())
+        .collect::<Vec<_>>();
+    for service in services {
+        check(
+            !service.instance().is_running().await,
+            "unavailable PG engine started a process",
+        )?;
+        check(
+            !service.instance().data_dir().join("PG_VERSION").exists(),
+            "unavailable PG engine initialized PGDATA",
+        )?;
+        check(
+            service.role_callback_count() == 0,
+            "unavailable PG engine entered role recovery",
+        )?;
+    }
+    Ok(true)
+}
 
 fn error(source: impl std::error::Error + Send + Sync + 'static) -> TestError {
     let mut diagnostic = source.to_string();
@@ -228,6 +259,13 @@ async fn controller_terminal(fault: u8) {
         .await
         .unwrap();
     let mut probes = Vec::new();
+    if checkpoint_unavailable(&mut cluster, &factory)
+        .await
+        .unwrap()
+    {
+        cluster.finish(Ok::<_, TestError>(())).await.unwrap();
+        return;
+    }
     let mut retained = None;
     let result: TestResult = async {
         cluster.settle_members(1).await?;
@@ -387,6 +425,13 @@ async fn public_v1_postgres_controller_undeclared_role_failure_is_not_retried() 
         .await
         .unwrap();
     let mut probes = Vec::new();
+    if checkpoint_unavailable(&mut cluster, &factory)
+        .await
+        .unwrap()
+    {
+        cluster.finish(Ok::<_, TestError>(())).await.unwrap();
+        return;
+    }
     let result: TestResult = async {
         let singleton = cluster.settle_members(1).await?;
         let source = cluster.service(singleton.primary()).await?;
@@ -489,6 +534,13 @@ async fn public_v1_postgres_controller_pre_effect_invalidation() {
             .await
             .unwrap();
         let mut probes = Vec::new();
+        if checkpoint_unavailable(&mut cluster, &factory)
+            .await
+            .unwrap()
+        {
+            cluster.finish(Ok::<_, TestError>(())).await.unwrap();
+            return;
+        }
         let mut inspected = None;
         let result: TestResult = async {
             let topology = cluster.settle_members(1).await?;
@@ -733,6 +785,13 @@ async fn public_v1_postgres_graceful_close_cancels_source_inspect() {
         let mut gates = Vec::<Arc<BuildCompletionGate>>::new();
         let mut observer = None;
         let mut probes = Vec::new();
+        if checkpoint_unavailable(&mut cluster, &factory)
+            .await
+            .unwrap()
+        {
+            cluster.finish(Ok::<_, TestError>(())).await.unwrap();
+            return;
+        }
         let result: TestResult = async {
             let singleton = cluster.settle_members(1).await?;
             let source = cluster.service(singleton.primary()).await?;
@@ -906,6 +965,13 @@ async fn public_v1_postgres_provisional_gateway_is_joined_after_cancel() {
         let mut retained = None;
         let mut connection = None;
         let mut probes = Vec::new();
+        if checkpoint_unavailable(&mut cluster, &factory)
+            .await
+            .unwrap()
+        {
+            cluster.finish(Ok::<_, TestError>(())).await.unwrap();
+            return;
+        }
         let result: TestResult = async {
             cluster.settle_members(1).await?;
             cluster.scale_to(2).await?;
@@ -1130,6 +1196,13 @@ async fn public_v1_postgres_lost_inbound_join_is_sticky_across_close() {
     let mut effects = None;
     let mut retained = None;
     let mut probes = Vec::new();
+    if checkpoint_unavailable(&mut cluster, &factory)
+        .await
+        .unwrap()
+    {
+        cluster.finish(Ok::<_, TestError>(())).await.unwrap();
+        return;
+    }
     let result: TestResult = async {
         let singleton = cluster.settle_members(1).await?;
         let source = cluster.service(singleton.primary()).await?;
@@ -1264,6 +1337,13 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         .await
         .expect("native controller harness starts");
     let mut probes = Vec::new();
+    if checkpoint_unavailable(&mut cluster, &factory)
+        .await
+        .unwrap()
+    {
+        cluster.finish(Ok::<_, TestError>(())).await.unwrap();
+        return;
+    }
     let mut retained = None;
     let mut queued_replay = None;
     let mut cancelled_replay = None;

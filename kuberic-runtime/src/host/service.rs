@@ -408,9 +408,30 @@ impl proto::agent_control_server::AgentControl for InitializationService {
         request: Request<proto::ReplicaSnapshotRequest>,
     ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
         self.authorize(&request)?;
-        Err(Status::failed_precondition(
-            "agent store is not initialized",
-        ))
+        let query = request.into_inner();
+        let target = query
+            .target
+            .ok_or_else(|| Status::invalid_argument("missing snapshot target"))?;
+        self.validate_status_target(&proto::GetAgentStatusRequest {
+            protocol_version: query.protocol_version,
+            resource_uid: query.resource_uid,
+            replica_id: target.replica_id,
+            expected_instance_id: target.instance_id,
+        })?;
+        if !query.expected_process_session_id.is_empty()
+            && query.expected_process_session_id != self.session.id().as_str()
+        {
+            return Err(Status::failed_precondition("snapshot process changed"));
+        }
+        let fresh = crate::control::normalize_uninitialized_agent_status_report(self.report())
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(Response::new(proto::ReplicaSnapshotResponse {
+            protocol_version: crate::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+            canonical_json: serde_json::to_vec(
+                &crate::protocol::public_operations::ReplicaAgentQueryResult::Uninitialized(fresh),
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+        }))
     }
     async fn acknowledge_goal(
         &self,
@@ -1235,7 +1256,15 @@ where
     ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
         self.authorize(&request)?;
         self.validate_snapshot_request(request.get_ref()).await?;
-        Ok(Response::new(self.ordinary_snapshot_response().await?))
+        Ok(Response::new(proto::ReplicaSnapshotResponse {
+            protocol_version: crate::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+            canonical_json: serde_json::to_vec(
+                &crate::protocol::public_operations::ReplicaAgentQueryResult::Initialized(
+                    Box::new(self.ordinary_snapshot().await?),
+                ),
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+        }))
     }
     async fn acknowledge_goal(
         &self,

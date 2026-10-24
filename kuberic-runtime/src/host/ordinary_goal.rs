@@ -664,6 +664,31 @@ pub(crate) fn snapshot(
     let remote_operations = remote_observations(state, publication.as_ref());
     ReplicaAgentSnapshot {
         format: ORDINARY_ACTION_FORMAT,
+        identity: state
+            .public_v1_operation_state
+            .as_ref()
+            .unwrap()
+            .identity
+            .clone(),
+        history: state
+            .public_v1_operation_state
+            .as_ref()
+            .unwrap()
+            .history
+            .clone()
+            .unwrap(),
+        storage: state
+            .public_v1_operation_state
+            .as_ref()
+            .unwrap()
+            .storage_incarnation
+            .clone()
+            .unwrap(),
+        open_mode: state.application_open_mode(),
+        read_status: AccessStatus::NotPrimary,
+        write_status: AccessStatus::NotPrimary,
+        withdrawn,
+        provider_writer_held: false,
         process_session_id: process,
         creation_id: creation,
         publication,

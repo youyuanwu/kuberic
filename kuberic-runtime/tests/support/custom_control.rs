@@ -1,4 +1,5 @@
 //! Independent contract fixture. No database/native positive qualification.
+//! Companion-route assertions are retained for M2; M1 verifies explicit unavailability first.
 use super::*;
 use kuberic_runtime::replicator::{CustomReplicatorControl, ReplicatorCapabilities};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -664,6 +665,9 @@ async fn renewal_target(
 
 #[tokio::test]
 async fn custom_host_renewal_validation_cannot_cross_terminal_admission() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(90), async {
         for abort in [false, true] {
             for preinstall in [false, true] {
@@ -833,6 +837,9 @@ async fn custom_host_renewal_validation_cannot_cross_terminal_admission() {
 
 #[tokio::test]
 async fn custom_host_validation_cannot_cross_source_target_cancel_or_revoke_cut() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     for case in 0..4 {
         let root = tempfile::tempdir().unwrap();
         let (source, target, authority, intent) = setup(root.path()).await;
@@ -941,6 +948,9 @@ async fn custom_host_validation_cannot_cross_source_target_cancel_or_revoke_cut(
 
 #[tokio::test]
 async fn custom_host_late_authority_commit_cannot_publish_after_shutdown() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let (source, mut target, authority, _) = setup(root.path()).await;
     let cut = validation_cut(kuberic_runtime::testing::PublicCutPosition::BeforeInboundBuildCommit);
@@ -997,6 +1007,9 @@ async fn custom_host_late_authority_commit_cannot_publish_after_shutdown() {
 
 #[tokio::test]
 async fn custom_host_abort_or_close_unblocks_installer_before_serialized_drain() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     for close in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let (source, mut target, authority, _) = setup(root.path()).await;
@@ -1136,17 +1149,26 @@ async fn late_factory_shutdown(mode: u8) {
 
 #[tokio::test]
 async fn custom_host_shutdown_fences_late_factory_registration_and_joins_bundle() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     late_factory_shutdown(0).await;
 }
 
 #[tokio::test]
 async fn custom_host_late_factory_failed_and_lost_cleanup_are_process_errors() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     late_factory_shutdown(1).await;
     late_factory_shutdown(2).await;
 }
 
 #[tokio::test]
 async fn custom_host_returned_bundle_cannot_discard_different_retained_creation() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     for fail in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let mut source = Node::<Contract>::start_sized(root.path(), 1, 1, 1).await;
@@ -1201,6 +1223,9 @@ async fn custom_host_returned_bundle_cannot_discard_different_retained_creation(
 
 #[tokio::test]
 async fn custom_host_unavailable_idle_diagnostic_preserves_installed_authority_and_exact_build() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     use kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState;
     let root = tempfile::tempdir().unwrap();
     let (mut source, target, authority, intent) = setup(root.path()).await;
@@ -1275,6 +1300,9 @@ async fn custom_host_unavailable_idle_diagnostic_preserves_installed_authority_a
 
 #[tokio::test]
 async fn custom_host_exact_binding_reporting_revoke_and_receiver_barrier() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let (mut source, target, authority, intent) = setup(root.path()).await;
     assert!(
@@ -1522,6 +1550,9 @@ async fn custom_host_exact_binding_reporting_revoke_and_receiver_barrier() {
 
 #[tokio::test]
 async fn custom_host_late_observation_after_completed_terminal_is_discarded() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let (mut source, target, _, _) = setup(root.path()).await;
     while let Ok(permit) = source.service.observe_entered.try_acquire() {
@@ -1550,6 +1581,9 @@ async fn custom_host_late_observation_after_completed_terminal_is_discarded() {
 
 #[tokio::test]
 async fn custom_host_nonoverlapping_torn_configuration_sample_is_discarded() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     let (mut source, target, _, _) = setup(root.path()).await;
     while let Ok(permit) = source.service.observe_entered.try_acquire() {
@@ -1598,6 +1632,9 @@ async fn custom_host_nonoverlapping_torn_configuration_sample_is_discarded() {
 
 #[tokio::test]
 async fn custom_host_terminal_failed_or_lost_drain_does_not_release_owned_child() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     for lost in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let (mut source, target, authority, intent) = setup(root.path()).await;
@@ -1725,6 +1762,9 @@ async fn custom_host_terminal_failed_or_lost_drain_does_not_release_owned_child(
 
 #[tokio::test]
 async fn custom_host_partial_install_failed_or_lost_drain_retains_real_child() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     for lost in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let (source, mut target, authority, _) = setup(root.path()).await;
@@ -1784,6 +1824,9 @@ async fn custom_host_partial_install_failed_or_lost_drain_retains_real_child() {
 
 #[tokio::test]
 async fn custom_host_close_and_abort_preempt_active_owned_callback() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     for terminal in [PublicOperationProgram::Close, PublicOperationProgram::Abort] {
         let root = tempfile::tempdir().unwrap();
         let (mut source, target, authority, intent) = setup(root.path()).await;

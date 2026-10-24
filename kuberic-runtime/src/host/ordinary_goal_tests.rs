@@ -550,7 +550,12 @@ impl Fixture {
             .await
             .unwrap()
             .into_inner();
-        serde_json::from_slice(&reply.canonical_json).unwrap()
+        let ReplicaAgentQueryResult::Initialized(snapshot) =
+            serde_json::from_slice(&reply.canonical_json).unwrap()
+        else {
+            panic!("initialized snapshot expected")
+        };
+        *snapshot
     }
 
     async fn achieved(&self, goal: &ReplicaGoal) -> ReplicaAgentSnapshot {

@@ -167,6 +167,7 @@ impl RemoteReplicaSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", tag = "kind", deny_unknown_fields)]
+#[schemars(with = "ReplicaGoalKindSchema")]
 pub enum ReplicaGoalKind {
     Discover,
     Prepare {
@@ -174,6 +175,7 @@ pub enum ReplicaGoalKind {
     },
     Reconfigure {
         role: ReplicaRole,
+        #[serde(rename = "catchUp")]
         catch_up: Option<PublicCatchUpMode>,
     },
     Build {
@@ -186,9 +188,33 @@ pub enum ReplicaGoalKind {
     Abort,
 }
 
+#[derive(JsonSchema)]
+#[schemars(rename_all = "camelCase", deny_unknown_fields)]
+#[allow(dead_code)]
+struct ReplicaGoalKindSchema {
+    kind: ReplicaGoalKindTag,
+    role: Option<ReplicaRole>,
+    catch_up: Option<PublicCatchUpMode>,
+    remote: Option<Box<RemoteReplicaSelection>>,
+}
+
+#[derive(JsonSchema)]
+#[schemars(rename_all = "camelCase")]
+#[allow(dead_code)]
+enum ReplicaGoalKindTag {
+    Discover,
+    Prepare,
+    Reconfigure,
+    Build,
+    Remove,
+    Close,
+    Abort,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaGoal {
+    #[schemars(range(min = 15, max = 15))]
     pub format: u32,
     pub identity: PublicV1Identity,
     pub operation_id: OperationId,
@@ -322,6 +348,7 @@ impl ReplicaGoal {
         }
     }
 
+    #[cfg(feature = "host")]
     pub(crate) fn role(&self) -> Option<ReplicaRole> {
         match self.desired {
             ReplicaGoalKind::Prepare { role, .. } | ReplicaGoalKind::Reconfigure { role, .. } => {
@@ -331,6 +358,7 @@ impl ReplicaGoal {
         }
     }
 
+    #[cfg(feature = "host")]
     pub(crate) fn remote(&self) -> Option<&RemoteReplicaSelection> {
         match &self.desired {
             ReplicaGoalKind::Build { remote } | ReplicaGoalKind::Remove { remote } => Some(remote),
@@ -340,6 +368,7 @@ impl ReplicaGoal {
 }
 
 impl PublicOperationIntent {
+    #[cfg(feature = "host")]
     pub(crate) fn goal(&self) -> Option<&ReplicaGoal> {
         match self.program.as_ref()? {
             PublicOperationProgram::AgentGoal(goal) => Some(goal),
@@ -349,11 +378,30 @@ impl PublicOperationIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", content = "message", deny_unknown_fields)]
+#[schemars(with = "ReplicaGoalStatusSchema")]
 pub enum ReplicaGoalStatus {
     Pending,
     Achieved,
     Failed(String),
     Uncertain(String),
+}
+
+#[derive(JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[allow(dead_code)]
+struct ReplicaGoalStatusSchema {
+    state: ReplicaGoalStatusTag,
+    message: Option<String>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+enum ReplicaGoalStatusTag {
+    Pending,
+    Achieved,
+    Failed,
+    Uncertain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -369,6 +417,14 @@ pub struct ReplicaGoalObservation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaAgentSnapshot {
     pub format: u32,
+    pub identity: PublicV1Identity,
+    pub history: HistoryContext,
+    pub storage: ReplicaStorageIncarnationContext,
+    pub open_mode: OpenMode,
+    pub read_status: AccessStatus,
+    pub write_status: AccessStatus,
+    pub withdrawn: bool,
+    pub provider_writer_held: bool,
     pub process_session_id: ProcessSessionId,
     pub creation_id: ReplicatorCreationId,
     pub publication: Option<ReplicaPublication>,
@@ -376,6 +432,13 @@ pub struct ReplicaAgentSnapshot {
     pub remote_operations: Vec<RemoteReplicaObservation>,
     pub progress: ProgressQueryResult,
     pub capability: ProgressQueryResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", content = "snapshot", deny_unknown_fields)]
+pub enum ReplicaAgentQueryResult {
+    Uninitialized(crate::protocol::observation::UninitializedAgentObservation),
+    Initialized(Box<ReplicaAgentSnapshot>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

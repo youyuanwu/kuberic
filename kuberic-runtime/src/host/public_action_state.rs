@@ -197,12 +197,40 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
                         // not an achieved primary engine configuration stage.
                         && current.current.primary_id == state.identity.local_identity.replica_id
                         && incoming.current.primary_id == state.identity.local_identity.replica_id
+                        && !ordinary_ready_expansion(state, intent, current, &incoming)
                 })
         })
     {
         return Err(HostError::CommandRejected(
             "joint reconfiguration cannot regress completed current-only installation".into(),
         ));
+    }
+
+    fn ordinary_ready_expansion(
+        state: &crate::host::state::AgentState,
+        intent: &crate::protocol::public_operations::PublicOperationIntent,
+        installed: &crate::protocol::public_operations::PublicConfiguration,
+        incoming: &crate::protocol::public_operations::PublicConfiguration,
+    ) -> bool {
+        use crate::protocol::public_operations::ReplicaGoalKind;
+        let Some(goal) = intent.goal() else {
+            return false;
+        };
+        matches!(
+            goal.desired,
+            ReplicaGoalKind::Reconfigure {
+                role: crate::protocol::types::ReplicaRole::Primary,
+                ..
+            }
+        ) && incoming.previous.as_ref() == Some(&installed.current)
+            && incoming.current.members.len() > installed.current.members.len()
+            && installed
+                .current
+                .members
+                .iter()
+                .all(|member| incoming.current.members.contains(member))
+            && super::ordinary_goal::admission_ready(state, goal)
+                .is_ok_and(|ready| !ready.is_empty())
     }
     if let Some(P::Swap {
         starting,

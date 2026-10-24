@@ -29,9 +29,42 @@ use super::{
     transport::Network,
 };
 
+#[cfg(test)]
+#[path = "ordinary_tests.rs"]
+mod ordinary_tests;
+
 const NAMESPACE: &str = "in-process";
 const NAME: &str = "sample";
 const TIMEOUT: Duration = Duration::from_secs(150);
+
+struct HarnessResolver {
+    api: TestApi,
+    dns: KubernetesDnsResolver,
+}
+
+impl kuberic_runtime::host::ReplicaEndpointResolver for HarnessResolver {
+    fn control_endpoint(
+        &self,
+        identity: &kuberic_runtime::protocol::types::ReplicaIdentity,
+    ) -> String {
+        self.api
+            .snapshot(Kind::Pod)
+            .into_iter()
+            .find(|pod| pod["metadata"]["uid"].as_str() == Some(identity.instance_id.as_str()))
+            .and_then(|pod| {
+                pod["metadata"]["annotations"][CONTROL_ADDRESS_ANNOTATION]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| self.dns.control_endpoint(identity))
+    }
+    fn replication_endpoint(
+        &self,
+        identity: &kuberic_runtime::protocol::types::ReplicaIdentity,
+    ) -> String {
+        self.dns.replication_endpoint(identity)
+    }
+}
 
 pub(super) fn storage_parent() -> Result<PathBuf> {
     let current = std::env::current_dir()?;
@@ -162,6 +195,66 @@ pub(super) struct Harness<F: ApplicationFactory> {
 }
 
 impl<F: ApplicationFactory> Harness<F> {
+    pub(super) async fn ordinary_integration_unavailable(&mut self) -> Result<bool> {
+        use kuberic_runtime::protocol::public_operations::{ReplicaGoalKind, ReplicaGoalStatus};
+        loop {
+            let api = KubeClusterApi::new(
+                self.api.client(),
+                Arc::new(GrpcAgentApi::new(pod::RPC_DEADLINE)),
+                "local-test-token",
+                self.namespace.clone(),
+            )?;
+            let raw =
+                crate::cluster_api::ClusterApi::observe(&api, &self.namespace, &self.name).await?;
+            let snapshots = raw
+                .agents
+                .values()
+                .filter_map(|agent| match agent {
+                    crate::observation::RawAgentObservation::ReplicaSnapshot(snapshot) => {
+                        Some(snapshot.as_ref())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let unsupported = |message: &str| {
+                message.contains("built-in ordinary hosting integration is unavailable until M2")
+                    || message
+                        .contains("PostgreSQL ordinary hosted integration is unavailable until M2")
+            };
+            for snapshot in &snapshots {
+                for observation in &snapshot.goals {
+                    if let ReplicaGoalStatus::Failed(message) = &observation.status {
+                        ensure!(
+                            unsupported(message),
+                            "unexpected ordinary engine failure: {message}"
+                        );
+                    }
+                }
+            }
+            if snapshots.len() == raw.set.spec.replicas as usize
+                && snapshots.iter().all(|snapshot| snapshot.goals.iter().any(|observation|
+                    matches!(&observation.status, ReplicaGoalStatus::Failed(message) if unsupported(message))))
+            {
+                ensure!(snapshots.iter().all(|snapshot| snapshot.publication.is_none()
+                    && !snapshot.provider_writer_held
+                    && snapshot.read_status != AccessStatus::Granted
+                    && snapshot.write_status != AccessStatus::Granted
+                    && snapshot.remote_operations.is_empty()), "unsupported engine produced authority or transfer effects");
+                eprintln!("M2 engine integration explicitly unavailable before ordinary engine effects; downstream engine properties are not qualified at this checkpoint");
+                return Ok(true);
+            }
+            if snapshots.iter().any(|snapshot| {
+                snapshot.goals.iter().any(|observation| {
+                    matches!(observation.goal.desired, ReplicaGoalKind::Prepare { .. })
+                        && observation.status == ReplicaGoalStatus::Achieved
+                })
+            }) {
+                return Ok(false);
+            }
+            self.step().await?;
+        }
+    }
+
     pub(super) async fn new(
         factory: F,
         namespace: String,
@@ -182,6 +275,8 @@ impl<F: ApplicationFactory> Harness<F> {
         let set = KubericSet::new(
             &name,
             KubericSetSpec {
+                hosting_format:
+                    kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
                 replicas: initial_replicas,
                 image: image.clone(),
                 failover_delay_seconds: 1,
@@ -1114,10 +1209,10 @@ async fn supervise<F: ApplicationFactory>(
         })?;
         application.validate(&app_path)?;
         let service = application.service;
-        let resolver = Arc::new(KubernetesDnsResolver::new(
-            config.resource_uid.clone(),
-            namespace,
-        ));
+        let resolver = Arc::new(HarnessResolver {
+            api: api.clone(),
+            dns: KubernetesDnsResolver::new(config.resource_uid.clone(), namespace),
+        });
         let data_root = config.data_root.clone();
         let (startup_shutdown, receiver) = watch::channel(false);
         let routed_uid = uid.clone();
@@ -1542,6 +1637,15 @@ pub struct OperationDispatch {
 }
 
 impl<F: ApplicationFactory> TestCluster<F> {
+    /// Verifies the exact M1 fail-closed engine-support result over production
+    /// transport. A true result is not qualification of downstream engine properties.
+    pub async fn ordinary_integration_unavailable(&mut self) -> super::Result<bool> {
+        self.driving()?;
+        self.core
+            .ordinary_integration_unavailable()
+            .await
+            .map_err(TestError::from)
+    }
     pub fn builder(factory: F) -> ClusterBuilder<F> {
         ClusterBuilder {
             factory,
@@ -2647,8 +2751,17 @@ mod readiness_lifecycle_tests {
             .start()
             .await?;
         let result: Result<()> = async {
-            let topology = cluster.settle().await?;
-            let primary = topology.primary().clone();
+            let primary = if cluster.ordinary_integration_unavailable().await? {
+                cluster
+                    .observe()
+                    .await?
+                    .replicas()
+                    .next()
+                    .context("host missing")?
+                    .clone()
+            } else {
+                cluster.settle().await?.primary().clone()
+            };
             let supervisor = cluster.core.supervisor.clone();
             let (started_tx, started) = tokio::sync::oneshot::channel();
             let (release, released) = tokio::sync::oneshot::channel();
@@ -2750,6 +2863,9 @@ mod readiness_lifecycle_tests {
             .start()
             .await?;
         let result: Result<()> = async {
+            if cluster.ordinary_integration_unavailable().await? {
+                return Ok(());
+            }
             let topology = cluster.settle().await?;
             cluster
                 .submit_switchover(topology.secondaries().next().unwrap())
@@ -2850,6 +2966,9 @@ mod readiness_lifecycle_tests {
         )
         .await?;
         let result = async {
+            if core.ordinary_integration_unavailable().await? {
+                return Ok(());
+            }
             core.ready()
                 .await
                 .context("initial readiness convergence")?;

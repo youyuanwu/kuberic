@@ -29,6 +29,17 @@ impl<S: AgentStore + 'static> AgentService<S> {
         &self,
     ) -> std::result::Result<ReplicaAgentSnapshot, Status> {
         let state = self.store.load_state().await.map_err(status_from_agent)?;
+        if !state
+            .public_v1_operation_state
+            .as_ref()
+            .is_some_and(|preview| {
+                preview.history.is_some() && preview.storage_incarnation.is_some()
+            })
+        {
+            return Err(Status::failed_precondition(
+                "snapshot requires initialized exact history/storage",
+            ));
+        }
         let creation = self
             .runtime
             .replacement_replicator_creation_id()
@@ -39,6 +50,10 @@ impl<S: AgentStore + 'static> AgentService<S> {
             creation,
             self.runtime.ordinary_withdrawn(),
         );
+        let (_, _, _, read, write, _, _) = self.runtime.diagnostic_projection().await;
+        snapshot.read_status = read;
+        snapshot.write_status = write;
+        snapshot.provider_writer_held = self.runtime.provider_writer_lease_count() != 0;
         for remote in &mut snapshot.remote_operations {
             if remote.state == RemoteReplicaState::Ready
                 && self.validate_remote_peer(&remote.selection).await.is_err()
@@ -69,7 +84,8 @@ impl<S: AgentStore + 'static> AgentService<S> {
             || target.replica_id != state.identity.local_identity.replica_id.value()
             || target.instance_id != state.identity.local_identity.instance_id.as_str()
             || target.agent_generation != state.identity.local_identity.agent_generation.as_str()
-            || request.expected_process_session_id != self.session.id().as_str()
+            || (!request.expected_process_session_id.is_empty()
+                && request.expected_process_session_id != self.session.id().as_str())
         {
             return Err(Status::failed_precondition(
                 "snapshot targets another process or replica",
