@@ -337,15 +337,6 @@ impl SecondaryHandle {
         self.query_progress(false)
     }
 
-    /// Non-mutating availability for routine host telemetry. The protected
-    /// native query below deliberately retains its NotReady/fault side effect.
-    pub(super) fn progress_query_readiness(&self) -> Result<bool, SecondaryError> {
-        let root = self.root()?;
-        let state = root.state.lock().unwrap();
-        Root::admit(&state)?;
-        Ok(!state.copy.is_copy_in_progress() && root.replication.lock().unwrap().queue().is_some())
-    }
-
     pub(super) fn catchup_capability(&self) -> Result<Lsn, SecondaryError> {
         self.query_progress(true)
     }

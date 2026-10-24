@@ -7,13 +7,25 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use futures::future::BoxFuture;
 
 use crate::protocol::types::{ProcessSessionId, ReplicatorCreationId};
-use crate::replicator::ReplicatorCreation;
+use crate::replicator::{ReplicatorCreation, ReplicatorCreationReservation};
 
 /// The actual built-in physical dial being redirected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestingTcpRouteKind {
     Replication,
     Build,
+    EngineReserve,
+    EngineActivate,
+    EngineConfirm,
+    EngineComplete,
+    EngineRetire,
+    ConfirmReceived,
+    BeforeDispatch,
+    BeforeCredit,
+    AfterContext,
+    BuildResult,
+    BeforeDelivery,
+    RetireResponse,
 }
 
 type Route = Arc<
@@ -27,6 +39,8 @@ struct Registration {
     generation: Arc<()>,
     evidence: Option<(ProcessSessionId, Weak<ReplicatorCreation>)>,
     driver_loss: Option<Arc<dyn Fn() -> BoxFuture<'static, std::io::Result<()>> + Send + Sync>>,
+    native: Option<(ProcessSessionId, ReplicatorCreationReservation)>,
+    inspect: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
 }
 
 fn routes() -> &'static Mutex<BTreeMap<String, Registration>> {
@@ -51,12 +65,47 @@ pub(in crate::replicator) fn before_attachment(
         .map(|registration| {
             registration.evidence = None;
             registration.driver_loss = None;
+            registration.native = None;
+            registration.inspect = None;
             registration.generation = Arc::new(());
             AttachmentRoute {
                 instance: instance.to_owned(),
                 session: session.clone(),
                 generation: Arc::downgrade(&registration.generation),
             }
+        })
+}
+
+pub(in crate::replicator) fn retain_inspection(
+    instance: &str,
+    inspect: impl Fn() -> serde_json::Value + Send + Sync + 'static,
+) {
+    if let Some(registration) = routes().lock().unwrap().get_mut(instance) {
+        registration.inspect = Some(Arc::new(inspect));
+    }
+}
+
+pub(in crate::replicator) fn retain_native_transport(
+    instance: &str,
+    session: ProcessSessionId,
+    reservation: ReplicatorCreationReservation,
+) {
+    if let Some(registration) = routes().lock().unwrap().get_mut(instance) {
+        registration.native = Some((session, reservation));
+    }
+}
+
+pub(in crate::replicator) fn has_native_transport(
+    route: &AttachmentRoute,
+    reservation: ReplicatorCreationReservation,
+) -> bool {
+    routes()
+        .lock()
+        .unwrap()
+        .get(&route.instance)
+        .is_some_and(|registration| {
+            Weak::ptr_eq(&route.generation, &Arc::downgrade(&registration.generation))
+                && registration.native.as_ref() == Some(&(route.session.clone(), reservation))
         })
 }
 
@@ -126,6 +175,8 @@ impl TestingTcpRoute {
                 generation: Arc::new(()),
                 evidence: None,
                 driver_loss: None,
+                native: None,
+                inspect: None,
             },
         );
         Ok(Self { instance })
@@ -179,6 +230,17 @@ impl TestingTcpRoute {
                 .and_then(|registration| registration.driver_loss.clone())
                 .ok_or_else(|| std::io::Error::other("exact live V1 driver unavailable"))?;
         loss().await
+    }
+
+    /// Read-only diagnostics of the concrete test-owned transport; never admission.
+    pub fn inspect_native(&self) -> std::io::Result<serde_json::Value> {
+        let inspect = routes()
+            .lock()
+            .unwrap()
+            .get(&self.instance)
+            .and_then(|registration| registration.inspect.clone())
+            .ok_or_else(|| std::io::Error::other("native transport unavailable"))?;
+        Ok(inspect())
     }
 }
 
@@ -619,7 +681,6 @@ mod tests {
             ) -> Result<()> {
                 unreachable!()
             }
-            fn release_provider_writer(&self) {}
             async fn report_load(&self, _: Vec<LoadMetric>) -> Result<()> {
                 unreachable!()
             }

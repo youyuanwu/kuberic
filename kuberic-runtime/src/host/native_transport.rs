@@ -5,14 +5,13 @@
 //! journal before handing a message to a native owner.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::protocol::public_operations::{
     PublicConfiguration, PublicInboundBuildAuthority, PublicOperationProgram,
 };
 use crate::protocol::types::{
     ConfigurationId, Epoch, HistoryContext, ProcessSessionId, ReplicaIdentity,
-    ReplicaStorageIncarnationContext, ResourceUid,
+    ReplicaStorageIncarnationContext,
 };
 use crate::{Result, RuntimeError};
 
@@ -104,33 +103,6 @@ impl NativeEndpoint {
         }
         Ok(())
     }
-
-    /// Stable per exact process/storage endpoint, never a conversion of the
-    /// native logical session's integer incarnation.
-    pub(crate) fn incarnation(&self) -> Result<[u8; 16]> {
-        self.validate()?;
-        let bytes = serde_json::to_vec(self)
-            .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        Ok(guid(b"kuberic-classic-v1-endpoint", &bytes))
-    }
-}
-
-pub(crate) fn partition(resource: &ResourceUid) -> [u8; 16] {
-    guid(
-        b"kuberic-classic-v1-partition",
-        resource.as_str().as_bytes(),
-    )
-}
-
-fn guid(domain: &[u8], bytes: &[u8]) -> [u8; 16] {
-    let mut digest = Sha256::new();
-    digest.update((domain.len() as u64).to_be_bytes());
-    digest.update(domain);
-    digest.update(bytes);
-    let hash = digest.finalize();
-    let mut result = [0; 16];
-    result.copy_from_slice(&hash[..16]);
-    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,7 +347,7 @@ mod tests {
     use crate::protocol::types::{
         AgentGeneration, ConfigurationDescriptor, ConfigurationMember, OperationId, PodUid,
         PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaInstanceId, ReplicaRole,
-        ReplicaStorageIdentity, StorageGeneration, derive_bootstrap_history,
+        ReplicaStorageIdentity, ResourceUid, StorageGeneration, derive_bootstrap_history,
         derive_history_initialization_id,
     };
 

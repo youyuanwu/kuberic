@@ -505,6 +505,7 @@ async fn restarted_primary_has_no_old_suffix_and_explicit_build_restores_replica
             },
             provider.clone(),
             BuildCallbacks {
+                fence: None,
                 replication: restarted.owner.config.primary.send.clone(),
                 copy: Arc::new(move |action| {
                     if let CopySendAction::Operation { operation, is_last } = action {

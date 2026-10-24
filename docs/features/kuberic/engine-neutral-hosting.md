@@ -2,10 +2,12 @@
 
 **CURRENT:** [ordinary hosting M1](ordinary-hosting-m1.md) implements generic
 controller goals, local stages, host actions/remote state, discovery and retained
-ordinary joining through the real production path. **M2 engine-session integration
-and M3 comprehensive qualification remain NOT IMPLEMENTED.** Built-in/KV/SQLite/
-PostgreSQL ordinary production Open explicitly rejects until M2; this checkpoint
-is not deployable with those engines. The [project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap)
+ordinary joining through the real production path. **M2 is in progress; M3
+comprehensive qualification remains NOT IMPLEMENTED.** The built-in default
+factory now owns authenticated sessions and retained ordinary Close; its
+[bounded engine tests](testing.md#built-in-m2-engine-slice) use real ordinary
+goals. KV/SQLite/external-provider/PG consumer integration remains unavailable.
+This checkpoint is not a deployable application stack. The [project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap)
 is the single remaining implementation queue.
 
 ## CURRENT — delivered bounded hosting

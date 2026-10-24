@@ -236,7 +236,9 @@ impl SecondaryHandle {
                 }
                 return self.report_ingress_fault(SecondaryError::Fault(body.reason.clone()));
             }
-            Body::ReplicationAck(_) | Body::CopyContextOperation(_) => {
+            Body::ReplicationAck(_)
+            | Body::CopyContextOperation(_)
+            | Body::EngineSessionControl(_) => {
                 return dropped(DropReason::Role);
             }
         }

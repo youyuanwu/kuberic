@@ -10,11 +10,39 @@ was run for the selected-host changes. Read
 does and does not establish.
 
 **Current checkpoint:** [ordinary hosting M1](ordinary-hosting-m1.md) is
-implemented. Built-in/KV/SQLite/PostgreSQL production integration is explicitly
-unavailable until M2. Changed old production journey names check exact
+implemented. M2's built-in engine factory/session/lifetime slice is available
+through ordinary goals; KV/SQLite/external-provider/PostgreSQL application
+integration remains unavailable. Changed old production journey names check exact
 unavailability; their historical copy/failover/terminal clauses do not execute.
 Do not report those green wrappers as M2 acceptance. Actual engine/component
 negatives and the new ordinary host/production journeys are distinct selections.
+
+## Built-in M2 engine slice
+
+`classic_v1_production`'s `m2_builtin_` cases use authenticated semantic goals,
+real default-factory source/target engines and native carrier/provider/ACK owners.
+They cover target context and empty items versus EOF, copy and voting-replication
+ACKs, bounded burst confirmation and synchronous duplicate rejection, retired
+first establishment, lost cancellation/replies, effect/await/delivery/credit
+fences, retained quarantine, identity-qualified stale ACK rejection, bounded
+creation-lifetime tombstones and Abort → actual Close joins. Multi-secondary
+cases exercise fresh and subsequent joint/current admission, actual voting
+ACKs and all-member catch-up with unchanged exact sessions. Target Retire
+holds session-qualified queued/in-flight ACK joins across lost RPC observers;
+clean cancellation grants no native credit and actual ACK-owner failure stays
+sticky. Physical dial and
+retained-task cuts are testing-only; diagnostics never authorize work.
+
+```sh
+cargo nextest list -p kuberic-runtime --all-features --profile ordinary \
+  --test classic_v1_production -E 'test(/^m2_builtin_/)'
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test classic_v1_production -E 'test(/^m2_builtin_/)' --no-tests fail
+```
+
+Private `service_adapter` repair fixtures remain component evidence, not ordinary
+host acceptance. These bounded in-process engine tests do not qualify the
+unconverted application services, PostgreSQL, live clusters or M3 recovery.
 
 ## Recording Evidence
 

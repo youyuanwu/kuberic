@@ -578,9 +578,20 @@ impl PrimaryHandle {
         provider: Arc<dyn StateProvider>,
         callbacks: BuildCallbacks,
     ) -> Result<BuildIdleHandle, PrimaryError> {
+        self.begin_build_with_cut(config, provider, callbacks, || {})
+    }
+
+    pub(super) fn begin_build_with_cut(
+        &self,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        acquired: impl FnOnce(),
+    ) -> Result<BuildIdleHandle, PrimaryError> {
         let root = self.root()?;
         let (handle, pending, start, _activity) = {
             let mut state = root.state.lock().unwrap();
+            acquired();
             Root::check_open(&state)?;
             root.check_route(&config.route)?;
             let route = config.route.clone();

@@ -268,6 +268,9 @@ pub(super) fn validate_shape(
         | Body::CopyContextAck(_)
         | Body::RequestAck(_)
         | Body::InduceFault(_) => {}
+        Body::EngineSessionControl(_) => {
+            return Err(ProtocolError::Shape("engine control on native data stream"));
+        }
     }
     Ok(())
 }
@@ -814,6 +817,15 @@ pub(super) async fn connect_with_metadata(
     channel: tonic::transport::Channel,
     metadata: tonic::metadata::MetadataMap,
 ) -> Result<ClientDriver, Terminal> {
+    connect_authenticated(binding, channel, metadata, None).await
+}
+
+pub(super) async fn connect_authenticated(
+    binding: Binding,
+    channel: tonic::transport::Channel,
+    metadata: tonic::metadata::MetadataMap,
+    expected_authorization: Option<String>,
+) -> Result<ClientDriver, Terminal> {
     let binding = Arc::new(binding);
     let limit = binding.shared.limits.max_wire_bytes;
     let mut client = wire::carrier_client::CarrierClient::new(channel)
@@ -831,6 +843,18 @@ pub(super) async fn connect_with_metadata(
     *request.metadata_mut() = metadata;
     match client.exchange(request).await {
         Ok(response) => {
+            if expected_authorization.as_deref().is_some_and(|expected| {
+                response
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    != Some(expected)
+            }) {
+                return Err(binding.finish(Terminal::Rpc {
+                    code: tonic::Code::Unauthenticated,
+                    message: "unauthenticated engine response".into(),
+                }));
+            }
             driver.0.incoming = Box::pin(response.into_inner());
             Ok(driver)
         }

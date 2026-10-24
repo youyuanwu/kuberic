@@ -673,18 +673,6 @@ impl ReplicatorInterfaces {
         error
     }
 
-    pub(crate) fn with_native_runtime_control(
-        self,
-        control: Arc<dyn NativeRuntimeControl>,
-    ) -> Self {
-        *self
-            .creation
-            .native_runtime_control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control);
-        self
-    }
-
     pub fn secondary(
         replicator: Arc<dyn Replicator>,
         state_replicator: Option<Arc<dyn StateReplicator>>,
@@ -939,10 +927,6 @@ impl ReplicatorFactoryContext {
             .await
     }
 
-    pub(crate) fn release_provider_writer(&self) {
-        self.access.release_provider_writer();
-    }
-
     pub(crate) async fn native_credentials(&self) -> Result<Arc<str>> {
         self.access.native_credentials().await
     }
@@ -955,13 +939,6 @@ impl ReplicatorFactoryContext {
         crate::host::native_transport::NativeEndpoint,
     )> {
         self.access.native_local_endpoint(address).await
-    }
-
-    pub(crate) async fn validate_native_binding(
-        &self,
-        binding: &crate::host::native_transport::NativeBinding,
-    ) -> Result<()> {
-        self.access.validate_native_binding(binding).await
     }
 
     pub(crate) fn native_write_status(&self) -> AccessStatus {
@@ -1089,13 +1066,6 @@ pub(crate) trait PartitionAccessView: Send + Sync {
         Err(RuntimeError::AuthorityNotAdmitted)
     }
 
-    async fn validate_native_binding(
-        &self,
-        _binding: &crate::host::native_transport::NativeBinding,
-    ) -> Result<()> {
-        Err(RuntimeError::AuthorityNotAdmitted)
-    }
-
     async fn native_outbound_build_authority(
         &self,
         _build: &OperationId,
@@ -1112,8 +1082,6 @@ pub(crate) trait PartitionAccessView: Send + Sync {
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()>;
-
-    fn release_provider_writer(&self);
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()>;
 
@@ -1293,16 +1261,19 @@ impl StatefulServicePartition {
         }
         attachment.disarm();
         #[cfg(feature = "testing")]
-        if let Some(control) = attachment.native_runtime_control(RuntimeHostToken::new())
-            && let Some(route) = testing_route.filter(|_| {
-                control.testing_tcp_binding()
-                    == Some((
-                        self.context.identity.clone(),
-                        self.context.process_session_id.clone(),
-                        reservation,
-                    ))
-            })
-        {
+        if let Some(route) = testing_route.filter(|route| {
+            testing_transport::has_native_transport(route, reservation)
+                || attachment
+                    .native_runtime_control(RuntimeHostToken::new())
+                    .is_some_and(|control| {
+                        control.testing_tcp_binding()
+                            == Some((
+                                self.context.identity.clone(),
+                                self.context.process_session_id.clone(),
+                                reservation,
+                            ))
+                    })
+        }) {
             testing_transport::acknowledge(route, &interfaces.creation);
         }
         Ok(interfaces)
@@ -1327,11 +1298,6 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         validate_public_v1_factories(PUBLIC_V1_FACTORIES)?;
-        if context.ordinary_hosting() {
-            return Err(RuntimeError::ControlPlane(
-                "built-in ordinary hosting integration is unavailable until M2".into(),
-            ));
-        }
         v1::create_production(context, state_provider, settings).await
     }
 }

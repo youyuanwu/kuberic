@@ -2074,37 +2074,6 @@ impl PartitionAccessView for HostAccessView {
         ))
     }
 
-    async fn validate_native_binding(
-        &self,
-        binding: &crate::host::native_transport::NativeBinding,
-    ) -> Result<()> {
-        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        if host.closed.load(Ordering::Acquire)
-            || host.aborted.load(Ordering::Acquire)
-            || host.replacement_fault_fenced.load(Ordering::Acquire)
-        {
-            return Err(RuntimeError::Closed);
-        }
-        let state = self
-            .bridge()
-            .await?
-            .store
-            .load_state()
-            .await
-            .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        binding.validate_for_state(
-            &state,
-            &host
-                .replica_session
-                .get()
-                .ok_or(RuntimeError::AuthorityNotAdmitted)?
-                .1,
-            host.native_address
-                .get()
-                .ok_or(RuntimeError::AuthorityNotAdmitted)?,
-        )
-    }
-
     async fn native_outbound_build_authority(
         &self,
         build: &OperationId,
@@ -2188,16 +2157,6 @@ impl PartitionAccessView for HostAccessView {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         Ok(())
-    }
-
-    fn release_provider_writer(&self) {
-        if let Some(host) = self.host.upgrade()
-            && let Some(registered) = host.registered.get()
-        {
-            registered
-                .provider_writer_lease_consumed
-                .store(false, Ordering::Release);
-        }
     }
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {

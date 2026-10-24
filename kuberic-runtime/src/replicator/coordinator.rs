@@ -517,7 +517,6 @@ mod tests {
             *self.durable.lock().unwrap() = Some(a.clone());
             Ok(())
         }
-        fn release_provider_writer(&self) {}
         async fn report_load(&self, _: Vec<LoadMetric>) -> Result<()> {
             Ok(())
         }

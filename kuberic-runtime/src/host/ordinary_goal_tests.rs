@@ -398,7 +398,11 @@ impl Fixture {
     async fn with_policy(id: i64, block_role: bool, policy: EffectivePolicy) -> Self {
         let root = tempfile::Builder::new()
             .prefix(".ordinary-host-")
-            .tempdir_in(std::env::current_dir().unwrap())
+            .tempdir_in(
+                std::env::var_os("TMPDIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap()),
+            )
             .unwrap();
         let uid = ResourceUid::new("ordinary-resource");
         let local = replica(id);
@@ -1122,21 +1126,26 @@ async fn ordinary_goal_reopen_preserves_selected_call_frozen_prefix_and_rejects_
 }
 
 #[tokio::test]
-async fn ordinary_goal_builtin_factory_is_unavailable_before_engine_or_listener_effects() {
+async fn ordinary_goal_builtin_factory_opens_actual_engine_listener_and_writer() {
     let fixture = Fixture::new(1, false).await;
     fixture
         .probe
         .use_default_factory
         .store(true, Ordering::Release);
     fixture.submit(&fixture.goal).await.unwrap();
-    entered(&fixture.probe.application_close_entered).await;
-    let snapshot = fixture.snapshot().await;
-    assert!(snapshot.publication.is_none());
-    assert!(
-        matches!(&snapshot.goals[0].status, ReplicaGoalStatus::Failed(error)
-        if error.contains("unavailable until M2"))
-    );
-    assert_eq!(fixture.runtime.provider_writer_lease_count(), 0);
+    let snapshot = fixture.achieved(&fixture.goal).await;
+    let publication = snapshot.publication.unwrap();
+    assert_eq!(publication.stage, ReplicaPublicationStage::AchievedScope);
+    assert_eq!(publication.role, ReplicaRole::Primary);
+    tokio::net::TcpStream::connect(
+        publication
+            .replication_address
+            .trim_start_matches("http://")
+            .trim_end_matches('/'),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fixture.runtime.provider_writer_lease_count(), 1);
     assert_eq!(fixture.probe.open_calls.load(Ordering::Acquire), 0);
     assert!(fixture.probe.listener.lock().unwrap().is_none());
     assert!(
@@ -2111,7 +2120,11 @@ async fn ordinary_goal_matching_crash_image_opens_fresh_process_but_never_replay
     entered(&source.probe.build_entered).await;
     let root = tempfile::Builder::new()
         .prefix(".ordinary-crash-image-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir_in(
+            std::env::var_os("TMPDIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap()),
+        )
         .unwrap();
     let database = root.path().join("agent.sqlite3");
     // The selected Build is held after its committed selection, with no open

@@ -933,8 +933,7 @@ async fn production_ordinary_held_build_lost_reply_recreation_exact_ready_then_s
 }
 
 #[tokio::test]
-async fn production_ordinary_builtin_factory_reports_exact_m2_unavailable_before_engine_or_listener_effects()
- {
+async fn production_ordinary_builtin_factory_opens_real_native_endpoints_without_grants() {
     let (mut harness, applications, transport) = start(false, 2, false).await;
     until(&mut harness, || {
         applications.engines.lock().unwrap().len() == 2
@@ -943,40 +942,39 @@ async fn production_ordinary_builtin_factory_reports_exact_m2_unavailable_before
     for engine in applications.engines.lock().unwrap().values() {
         engine.default_factory.store(true, Ordering::Release);
     }
-    let unavailable = tokio::time::timeout(Duration::from_secs(10), async {
+    let opened = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             harness.step().await.unwrap();
-            let set = harness.set().await.unwrap();
-            let failures = set
-                .status
-                .iter()
-                .flat_map(|status| &status.replica_goals)
-                .filter_map(
-                    |entry| match entry.outcome.as_ref().map(|outcome| &outcome.status) {
-                        Some(ReplicaGoalStatus::Failed(message)) => Some(message),
-                        _ => None,
-                    },
-                )
-                .collect::<Vec<_>>();
-            if !failures.is_empty() {
-                assert!(
-                    failures.iter().all(|message| message
-                        .contains("built-in ordinary hosting integration is unavailable until M2")),
-                    "{failures:?}"
-                );
+            let observed = observe(&harness, transport.clone()).await;
+            let snapshots = peers(&observed);
+            if snapshots.len() == 2
+                && snapshots.iter().all(|snapshot| {
+                    snapshot.publication.as_ref().is_some_and(|publication| {
+                        publication.stage == ReplicaPublicationStage::AchievedScope
+                    })
+                })
+            {
                 break;
             }
         }
     })
     .await;
     assert!(
-        unavailable.is_ok(),
+        opened.is_ok(),
         "support did not settle: {:?}",
         harness.last_error
     );
     for snapshot in peers(&observe(&harness, transport.clone()).await) {
-        assert!(snapshot.publication.is_none());
-        assert!(!snapshot.provider_writer_held);
+        let publication = snapshot.publication.unwrap();
+        tokio::net::TcpStream::connect(
+            publication
+                .replication_address
+                .trim_start_matches("http://")
+                .trim_end_matches('/'),
+        )
+        .await
+        .unwrap();
+        assert!(snapshot.provider_writer_held);
         assert_ne!(snapshot.read_status, AccessStatus::Granted);
         assert_ne!(snapshot.write_status, AccessStatus::Granted);
     }

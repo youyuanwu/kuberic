@@ -182,6 +182,84 @@ mod native_wire {
     tonic::include_proto!("kuberic.sf.v1");
 }
 
+#[path = "support/m2_builtin.rs"]
+mod m2_builtin;
+
+#[tokio::test]
+async fn m2_builtin_target_context_and_ack_boundaries() {
+    m2_builtin::context_and_ack_boundaries().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_exact_session_replay_and_retirement() {
+    m2_builtin::exact_replay_and_retirement().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_delayed_first_establishment_after_retirement() {
+    m2_builtin::delayed_first_establishment().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_lost_target_cancel_quarantines_receiver() {
+    m2_builtin::lost_cancel().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_effect_fences_and_retained_provider_join() {
+    m2_builtin::effect_fences().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_crossed_identity_and_stale_ack() {
+    m2_builtin::crossed_identity().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_abort_close_retains_all_joins() {
+    m2_builtin::retained_joins().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_burst_ack_is_bounded_and_duplicates_reject_synchronously() {
+    m2_builtin::burst_ack(false).await;
+}
+
+#[tokio::test]
+async fn m2_builtin_retirement_joins_queued_ack_work_without_credit() {
+    m2_builtin::burst_ack(true).await;
+}
+
+#[tokio::test]
+async fn m2_builtin_creation_tombstones_are_bounded_without_forgetting() {
+    m2_builtin::tombstone_bounds().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_pending_scope_cannot_publish_final_copy_credit() {
+    m2_builtin::pending_final_credit().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_lost_retire_response_retains_actual_terminal_owner() {
+    m2_builtin::lost_retire_response().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_multi_secondary_joint_current_preserves_exact_sessions() {
+    m2_builtin::multi_secondary().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_target_retire_joins_actual_ack_before_reply() {
+    m2_builtin::target_retire_ack(false).await;
+}
+
+#[tokio::test]
+async fn m2_builtin_target_retire_retains_actual_ack_failure() {
+    m2_builtin::target_retire_ack(true).await;
+}
+
 fn authorized<T>(message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
     request.metadata_mut().insert(
@@ -673,6 +751,16 @@ impl<A: Sample> Node<A> {
     }
 
     async fn start_sized(root: &Path, id: i64, revision: u64, replicas: u32) -> Self {
+        Self::start_resolved(root, id, revision, replicas, Arc::new(Resolver)).await
+    }
+
+    async fn start_resolved<R: ReplicaEndpointResolver + 'static>(
+        root: &Path,
+        id: i64,
+        revision: u64,
+        replicas: u32,
+        resolver: Arc<R>,
+    ) -> Self {
         let resource = ResourceUid::new("classic-v1-public-journey");
         let preview = PublicV1Identity::new(1);
         let identity = identity_for(&resource, id);
@@ -697,7 +785,7 @@ impl<A: Sample> Node<A> {
             } else {
                 ApplicationStorageState::Established
             },
-            Arc::new(Resolver),
+            resolver,
         )
         .with_application_storage_paths(std::collections::BTreeMap::from([(
             "application".into(),
