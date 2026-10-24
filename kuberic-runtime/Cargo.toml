@@ -40,7 +40,7 @@ tonic-prost-build.workspace = true
 # Repository-only cross-crate proofs; Cargo omits unversioned dev paths on publication.
 k8s-openapi.workspace = true
 kube.workspace = true
-kuberic-controller = { path = "../kuberic-controller", features = ["runtime-test-bridge"] }
+kuberic-controller = { path = "../kuberic-controller", features = ["runtime-test-bridge", "test-util"] }
 kuberic-public-v1-tests = { path = "../kuberic-public-v1-tests" }
 kvstore2 = { path = "../examples/kvstore2", features = ["testing"] }
 sqlite-replicated = { path = "../examples/sqlite", features = ["testing"] }

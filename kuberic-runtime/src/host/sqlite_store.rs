@@ -810,6 +810,12 @@ impl AgentStore for SqliteStore {
                 });
             }
 
+            if intent.goal().is_some()
+                && preview.terminal
+                && !super::ordinary_goal::terminal_for_process(preview, &intent.process_session_id)
+            {
+                preview.terminal = false;
+            }
             let mut exact_blockers = std::collections::BTreeSet::new();
             if !intent.class.is_terminal()
                 && preview

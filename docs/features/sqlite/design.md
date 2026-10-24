@@ -1,10 +1,13 @@
 # SQLite: Replicated SQLite on Kuberic Public V1
 
-**M1 checkpoint:** [ordinary hosting](../kuberic/ordinary-hosting-m1.md) uses
-matched format 15. SQLite production Open explicitly rejects before initialization/
-committer effects until M2 built-in session integration. The component storage/
-publication behavior below remains; old production journey names now check
-unavailability rather than executing their later copy/restart clauses.
+**M2 application slice, under qualification:** [ordinary hosting](../kuberic/ordinary-hosting-m1.md)
+uses matched format 15 at this development checkpoint. SQLite production Open
+now uses the ordinary built-in engine. Copy installation/finalization precedes
+its apply ACK, and ordinary application Close joins the committer, SQL worker,
+fault reporter and copy/replication consumers. Expected intentional cancellation
+is observed only after the actual worker join; real join/publication failures
+remain errors. Bounded application tests are separate from enabled historical
+restart/replacement/handoff bodies and do not certify M3.
 
 ## Selected classic V1 companion
 

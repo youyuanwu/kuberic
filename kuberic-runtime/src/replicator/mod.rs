@@ -1137,6 +1137,10 @@ pub struct StatefulServicePartition {
 }
 
 impl StatefulServicePartition {
+    pub(crate) fn record_creation_cleanup_failure(&self, error: String) {
+        self.registration.record_creation_cleanup_failure(error);
+    }
+
     pub fn ordinary_hosting(&self) -> bool {
         self.context.ordinary_hosting()
     }

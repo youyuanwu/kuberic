@@ -551,7 +551,11 @@ impl ExternalService {
                 let receive = async move {
                     let mut installed = false;
                     let mut eof = false;
-                    while let Some(operation) = stream.get_operation().await? {
+                    while let Some(operation) = match stream.get_operation().await {
+                        Ok(operation) => operation,
+                        Err(RuntimeError::Closed) => return Ok(()),
+                        Err(error) => return Err(error),
+                    } {
                         if !operation.end_of_stream {
                             if let Err(error) = store.install(&operation.data) {
                                 stream.report_fault(error.to_string())?;
@@ -560,19 +564,23 @@ impl ExternalService {
                             }
                             installed = true;
                         } else {
+                            if !installed {
+                                let error = failure("copy EOF without service snapshot");
+                                stream.report_fault(error.to_string())?;
+                                partition.report_fault(FaultType::Transient).await?;
+                                return Err(error);
+                            }
                             eof = true;
+                            copying.store(false, Ordering::Release);
+                            copy_done.notify_waiters();
+                            copied.send_replace(true);
                         }
                         operation.acknowledge()?;
                     }
                     if eof {
-                        if !installed {
-                            return Err(failure("copy EOF without service snapshot"));
-                        }
-                        copying.store(false, Ordering::Release);
-                        copy_done.notify_waiters();
-                        copied.send_replace(true);
+                        return Ok(());
                     }
-                    Ok(())
+                    Err(failure("copy receiver ended before native EOF"))
                 };
                 tokio::select! {
                     biased;
@@ -588,7 +596,11 @@ impl ExternalService {
                 if !*finished.borrow() && finished.wait_for(|copied| *copied).await.is_err() {
                     return Ok(());
                 }
-                while let Some(operation) = stream.get_operation().await? {
+                while let Some(operation) = match stream.get_operation().await {
+                    Ok(operation) => operation,
+                    Err(RuntimeError::Closed) => return Ok(()),
+                    Err(error) => return Err(error),
+                } {
                     if !operation.end_of_stream
                         && let Err(error) = store.commit(operation.lsn, operation.data.clone())
                     {
@@ -613,11 +625,6 @@ impl ExternalService {
 #[async_trait]
 impl StatefulServiceReplica for ExternalService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
-        if context.partition.ordinary_hosting() {
-            return Err(RuntimeError::ControlPlane(
-                "built-in ordinary hosting integration is unavailable until M2".into(),
-            ));
-        }
         if self.closed.load(Ordering::Acquire) {
             return Err(RuntimeError::Closed);
         }
@@ -675,7 +682,9 @@ impl StatefulServiceReplica for ExternalService {
             }
         }
         match role {
-            ReplicaRole::IdleSecondary => self.secondary(true).await?,
+            ReplicaRole::IdleSecondary if previous != ReplicaRole::IdleSecondary => {
+                self.secondary(true).await?
+            }
             ReplicaRole::ActiveSecondary if previous == ReplicaRole::Primary => {
                 self.secondary(false).await?
             }

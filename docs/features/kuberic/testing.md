@@ -11,11 +11,12 @@ does and does not establish.
 
 **Current checkpoint:** [ordinary hosting M1](ordinary-hosting-m1.md) is
 implemented. M2's built-in engine factory/session/lifetime slice is available
-through ordinary goals; KV/SQLite/external-provider/PostgreSQL application
-integration remains unavailable. Changed old production journey names check exact
-unavailability; their historical copy/failover/terminal clauses do not execute.
-Do not report those green wrappers as M2 acceptance. Actual engine/component
-negatives and the new ordinary host/production journeys are distinct selections.
+through ordinary goals. The in-progress application slice connects KV, SQLite
+and the standalone external provider; PostgreSQL remains outstanding.
+Built-in historical bodies are enabled rather than returning an unavailable
+success. Their broader recovery/handoff results are not bounded M2 acceptance.
+Actual engine/component negatives, application witnesses and production
+controller journeys remain distinct selections.
 
 ## Built-in M2 engine slice
 
@@ -41,8 +42,42 @@ cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
 ```
 
 Private `service_adapter` repair fixtures remain component evidence, not ordinary
-host acceptance. These bounded in-process engine tests do not qualify the
-unconverted application services, PostgreSQL, live clusters or M3 recovery.
+host acceptance. These bounded in-process engine tests alone do not qualify
+application services, PostgreSQL, live clusters or M3 recovery.
+
+## Built-in M2 application slice
+
+`classic_v1_production`'s `m2_application_` cases execute real KV, SQLite and
+external-provider Open/copy/access and acknowledged-data reopen. They also hold
+actual application consumers and a retained SQLite blocking SQL worker through
+ordinary Abort/Close, retain a failed consumer join, and reject incompatible
+goals before application or authoritative-command mutation. The separate role
+receipt witness checks actual persisted application callback bytes on reopen.
+
+The standalone `kuberic-public-v1-tests` package must also run without workspace
+feature unification. Its ordinary copy-context body checks target-origin
+nonempty/empty/nonempty items, EOF and a meaningful durable copied snapshot,
+not context bytes mistaken for application data.
+
+Production-controller witnesses include
+`production_ordinary_builtin_copies_actual_application_bytes_before_admission`
+and the level suite's `in_process::journeys::actual_v1_` selection. They use
+canonical ordinary snapshots and real copied bytes, not required idle diagnostics,
+installed grants or callback-program dispatch.
+
+```sh
+cargo nextest list -p kuberic-runtime --all-features --profile ordinary \
+  --test classic_v1_production -E 'test(/^m2_builtin_/) or test(/^m2_application_/)'
+cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
+  --test classic_v1_production -E 'test(/^m2_builtin_/) or test(/^m2_application_/)' --no-tests fail
+cargo nextest list -p kuberic-public-v1-tests --all-targets --profile ordinary
+cargo nextest run -p kuberic-public-v1-tests --all-targets --profile ordinary --no-tests fail
+```
+
+Full historical replacement, promotion, data-loss and renewal bodies remain
+enabled diagnostic journeys. Record their actual failing clause and unexecuted
+remainder separately; neither a red aggregate nor an unsupported old fixture is
+a passing M2 witness. Independent phase review and later M2 work remain required.
 
 ## Recording Evidence
 

@@ -13,9 +13,8 @@ use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, PodStatus, Secret};
 use kube::{Api, ResourceExt, api::PostParams};
 use kuberic_runtime::host::{KubernetesDnsResolver, ReplicaHost, RunningReplica};
 use kuberic_runtime::protocol::public_operations::{
-    ProcessSessionRenewalRequired, PublicOperationIntent, PublicOperationProgram,
-    PublicV1AcceptedOperationCompletion, PublicV1AgentReport, PublicV1OperationCompletion,
-    PublicV1OperationResult,
+    PublicOperationIntent, PublicOperationProgram, PublicV1AgentReport, ReplicaAgentSnapshot,
+    ReplicaGoal, ReplicaGoalKind, ReplicaGoalStatus, ReplicaPublicationStage,
 };
 use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
 use tokio::sync::{Mutex, watch};
@@ -81,12 +80,6 @@ pub(super) fn storage_parent() -> Result<PathBuf> {
                 .join("target")
         });
     Ok(target.join("kuberic-test-storage"))
-}
-
-#[derive(Clone)]
-pub(super) struct ConfigurationEvidence {
-    pub operations: BTreeMap<String, (PublicOperationIntent, PublicV1OperationCompletion)>,
-    renewals: Vec<ProcessSessionRenewalRequired>,
 }
 
 struct Hosted<F: ApplicationFactory> {
@@ -184,7 +177,6 @@ pub(super) struct Harness<F: ApplicationFactory> {
     fatal_failure: Option<super::error::RetainedFailure>,
     cleaned: bool,
     network: Network,
-    renewals: std::sync::Mutex<BTreeMap<String, ProcessSessionRenewalRequired>>,
     last_reports: std::sync::Mutex<BTreeMap<String, PublicV1AgentReport>>,
     namespace: String,
     name: String,
@@ -195,6 +187,112 @@ pub(super) struct Harness<F: ApplicationFactory> {
 }
 
 impl<F: ApplicationFactory> Harness<F> {
+    pub(super) async fn ordinary_snapshots(&self) -> Result<Vec<ReplicaAgentSnapshot>> {
+        use crate::cluster_api::ClusterApi;
+        let api = KubeClusterApi::new(
+            self.api.client(),
+            Arc::new(GrpcAgentApi::new(pod::RPC_DEADLINE)),
+            "local-test-token",
+            self.namespace.clone(),
+        )?;
+        Ok(api
+            .observe(&self.namespace, &self.name)
+            .await?
+            .agents
+            .into_values()
+            .filter_map(|agent| match agent {
+                crate::observation::RawAgentObservation::ReplicaSnapshot(snapshot) => {
+                    Some(*snapshot)
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    pub(super) fn ordinary_settled(
+        status: &KubericSetStatus,
+        snapshots: &[ReplicaAgentSnapshot],
+        expected: usize,
+    ) -> bool {
+        let Some(topology) = &status.public_v1_topology else {
+            return false;
+        };
+        let Ok(configuration) = topology.configuration() else {
+            return false;
+        };
+        let Some(accepted) = status
+            .public_v1_authority
+            .as_ref()
+            .and_then(|authority| authority.authority().ok())
+        else {
+            return false;
+        };
+        if status.public_v1_operation.is_some()
+            || status.public_v1_transition.is_some()
+            || status.public_v1_replacement.is_some()
+            || status.public_v1_session_renewal.is_some()
+            || topology.pending_switchover.is_some()
+            || topology.sessions.len() != expected
+            || configuration.members.len() != expected
+            || status.replica_goals.iter().any(|entry| {
+                entry.validate().is_err()
+                    || entry
+                        .outcome
+                        .as_ref()
+                        .is_none_or(|outcome| outcome.status != ReplicaGoalStatus::Achieved)
+            })
+        {
+            return false;
+        }
+        if snapshots.iter().any(|snapshot| {
+            !topology
+                .sessions
+                .iter()
+                .any(|session| session.storage_incarnation == snapshot.storage)
+                && (snapshot.read_status == AccessStatus::Granted
+                    || snapshot.write_status == AccessStatus::Granted
+                    || snapshot.publication.as_ref().is_some_and(|publication| {
+                        matches!(
+                            publication.role,
+                            ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                        )
+                    }))
+        }) {
+            return false;
+        }
+        topology.sessions.iter().all(|session| {
+            snapshots.iter().any(|snapshot| {
+                snapshot.identity == accepted.identity
+                    && snapshot.history == accepted.history
+                    && snapshot.storage == session.storage_incarnation
+                    && snapshot.process_session_id == session.process_session_id
+                    && snapshot.creation_id == session.replicator_creation_id
+                    && !snapshot.withdrawn
+                    && snapshot.publication.as_ref().is_some_and(|publication| {
+                        publication.stage == ReplicaPublicationStage::AchievedScope
+                            && publication.role == session.role
+                            && publication.scope.configuration.current == configuration
+                            && publication.scope.configuration.previous.is_none()
+                            && status.replica_goals.iter().any(|entry| {
+                                entry.goal.scope == publication.scope
+                                    && matches!(
+                                        entry.goal.desired,
+                                        ReplicaGoalKind::Reconfigure { .. }
+                                    )
+                                    && snapshot.goals.iter().any(|observation| {
+                                        observation.goal == entry.goal
+                                            && observation.status == ReplicaGoalStatus::Achieved
+                                    })
+                            })
+                    })
+                    && (snapshot.read_status == AccessStatus::Granted)
+                        == (session.role == ReplicaRole::Primary)
+                    && (snapshot.write_status == AccessStatus::Granted)
+                        == (session.role == ReplicaRole::Primary)
+            })
+        })
+    }
+
     pub(super) async fn ordinary_integration_unavailable(&mut self) -> Result<bool> {
         use kuberic_runtime::protocol::public_operations::{ReplicaGoalKind, ReplicaGoalStatus};
         loop {
@@ -217,9 +315,7 @@ impl<F: ApplicationFactory> Harness<F> {
                 })
                 .collect::<Vec<_>>();
             let unsupported = |message: &str| {
-                message.contains("built-in ordinary hosting integration is unavailable until M2")
-                    || message
-                        .contains("PostgreSQL ordinary hosted integration is unavailable until M2")
+                message.contains("PostgreSQL ordinary hosted integration is unavailable until M2")
             };
             for snapshot in &snapshots {
                 for observation in &snapshot.goals {
@@ -335,7 +431,6 @@ impl<F: ApplicationFactory> Harness<F> {
             fatal_failure: None,
             cleaned: false,
             network,
-            renewals: std::sync::Mutex::new(BTreeMap::new()),
             last_reports: std::sync::Mutex::new(BTreeMap::new()),
             namespace,
             name,
@@ -369,17 +464,6 @@ impl<F: ApplicationFactory> Harness<F> {
         let set = Api::<KubericSet>::namespaced(self.api.client(), &self.namespace)
             .get(&self.name)
             .await?;
-        if let Some(renewal) = set
-            .status
-            .as_ref()
-            .and_then(|s| s.public_v1_session_renewal.as_ref())
-        {
-            let required = renewal.renewal().map_err(anyhow::Error::msg)?.required;
-            self.renewals
-                .lock()
-                .unwrap()
-                .insert(required.operation_id.to_string(), required);
-        }
         Ok(set)
     }
 
@@ -479,7 +563,13 @@ impl<F: ApplicationFactory> Harness<F> {
             Ok(action) => (action.requeue_after, true),
             Err(error) => {
                 self.reconcile_errors += 1;
-                self.last_error = Some(error.to_string());
+                let detail = error.to_string();
+                if self.last_error.as_ref() != Some(&detail)
+                    && detail.contains("planned primary replacement is unavailable")
+                {
+                    eprintln!("ordinary controller diagnostic boundary: {detail}");
+                }
+                self.last_error = Some(detail);
                 (Duration::from_millis(20), false)
             }
         };
@@ -548,49 +638,24 @@ impl<F: ApplicationFactory> Harness<F> {
         loop {
             self.check().await?;
             let set = self.set().await?;
-            if let Some(status) = set.status.as_ref()
-                && status.public_v1_operation.is_none()
-                && status.public_v1_transition.is_none()
-                && status.public_v1_replacement.is_none()
-                && status.public_v1_session_renewal.is_none()
-                && let Some(topology) = status.public_v1_topology.as_ref()
-            {
-                let configuration = topology.configuration().map_err(anyhow::Error::msg)?;
-                if configuration.members.len() == expected {
-                    ensure!(
-                        !configuration.members.iter().any(|member| isolated
+            if let Some(status) = set.status.as_ref() {
+                let snapshots = self
+                    .ordinary_snapshots()
+                    .await?
+                    .into_iter()
+                    .filter(|snapshot| {
+                        !isolated
                             .iter()
-                            .any(|uid| member.identity.instance_id.as_str() == uid)),
-                        "isolated host remains admitted"
-                    );
-                    let uids = self
-                        .live_uids()
-                        .await
-                        .into_iter()
-                        .filter(|uid| !isolated.contains(uid))
-                        .collect::<Vec<_>>();
-                    let mut reports = Vec::new();
-                    let mut complete = true;
-                    for uid in &uids {
-                        match self.report_uid(uid).await {
-                            Ok(report) => reports.push(report),
-                            Err(error) => {
-                                self.last_error = Some(format!("readiness observation: {error:#}"));
-                                complete = false;
-                            }
-                        }
-                    }
-                    if complete
-                        && Self::observations_complete(&uids, &reports)
-                        && Self::settled(status, &reports, expected)
-                        && Self::configurations_settled(
-                            status,
-                            &reports,
-                            &self.configuration_evidence(&reports).await?,
-                        )
-                    {
-                        return Ok(configuration.primary_id.value());
-                    }
+                            .any(|uid| snapshot.storage.replica.instance_id.as_str() == uid)
+                    })
+                    .collect::<Vec<_>>();
+                if Self::ordinary_settled(status, &snapshots, expected) {
+                    return Ok(status
+                        .public_v1_topology
+                        .as_ref()
+                        .unwrap()
+                        .primary_id
+                        .value());
                 }
             }
             self.step().await?;
@@ -653,182 +718,6 @@ impl<F: ApplicationFactory> Harness<F> {
             .context("host missing")
     }
 
-    pub fn observations_complete(uids: &[String], reports: &[PublicV1AgentReport]) -> bool {
-        uids.iter().all(|uid| {
-            reports
-                .iter()
-                .any(|report| report.replica.instance_id.as_str() == uid)
-        })
-    }
-
-    pub async fn configuration_evidence(
-        &self,
-        reports: &[PublicV1AgentReport],
-    ) -> Result<ConfigurationEvidence> {
-        let handles = self
-            .supervisor
-            .lock()
-            .await
-            .hosts
-            .iter()
-            .filter_map(|(uid, host)| {
-                host.running
-                    .as_ref()
-                    .map(|running| (uid.clone(), running.handle()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut evidence = BTreeMap::new();
-        for report in reports {
-            let Some(handle) = handles.get(report.replica.instance_id.as_str()) else {
-                continue;
-            };
-            let mut completions = report
-                .completed_operations
-                .iter()
-                .filter(|completion| {
-                    completion.process_session_id == report.process_session_id
-                        && completion.result == PublicV1OperationResult::Succeeded
-                })
-                .collect::<Vec<_>>();
-            completions.sort_by_key(|completion| std::cmp::Reverse(completion.revision));
-            for completion in completions {
-                let Some(intent) = tokio::time::timeout_at(
-                    self.deadline,
-                    handle.public_v1_operation_intent(&completion.operation_id),
-                )
-                .await??
-                else {
-                    continue;
-                };
-                if matches!(
-                    intent.program,
-                    Some(
-                        PublicOperationProgram::Configuration(_)
-                            | PublicOperationProgram::CatchUp { .. }
-                            | PublicOperationProgram::Swap { .. }
-                    )
-                ) {
-                    evidence.insert(
-                        report.replica.instance_id.to_string(),
-                        (intent, completion.clone()),
-                    );
-                    break;
-                }
-            }
-        }
-        Ok(ConfigurationEvidence {
-            operations: evidence,
-            renewals: self.renewals.lock().unwrap().values().cloned().collect(),
-        })
-    }
-
-    pub fn configurations_settled(
-        status: &KubericSetStatus,
-        reports: &[PublicV1AgentReport],
-        evidence: &ConfigurationEvidence,
-    ) -> bool {
-        let Some(topology) = &status.public_v1_topology else {
-            return false;
-        };
-        if !Self::settled(status, reports, topology.member_count as usize) {
-            return false;
-        }
-        let Ok(configuration) = topology.configuration() else {
-            return false;
-        };
-        let Some(authority) = &status.public_v1_authority else {
-            return false;
-        };
-        let Ok(accepted) = authority.authority() else {
-            return false;
-        };
-        topology.sessions.iter().all(|session| {
-            let Some((intent, completion)) = evidence
-                .operations
-                .get(session.identity.instance_id.as_str())
-            else {
-                return false;
-            };
-            if intent.validate().is_err()
-                || intent.process_session_id != session.process_session_id
-                || intent.operation_id != completion.operation_id
-                || intent.revision != completion.revision
-                || intent.input_digest != completion.input_digest
-                || completion.process_session_id != session.process_session_id
-                || completion.history != accepted.history
-                || completion.storage_incarnation != session.storage_incarnation
-            {
-                return false;
-            }
-            let public = match &intent.program {
-                Some(
-                    PublicOperationProgram::Configuration(public)
-                    | PublicOperationProgram::CatchUp {
-                        configuration: public,
-                        ..
-                    },
-                ) => public,
-                Some(PublicOperationProgram::Swap { refreshed, .. }) => refreshed,
-                _ => return false,
-            };
-            let authorized = accepted.completed_operations.contains(
-                &PublicV1AcceptedOperationCompletion::from_completion(completion),
-            ) || evidence.renewals.iter().any(|required| {
-                required.history == accepted.history
-                    && required.fresh_configuration == configuration
-                    && (intent.operation_id.to_string()
-                        == format!(
-                            "{}-configuration-{}",
-                            required.operation_id, session.identity.replica_id
-                        )
-                        || (session.role == ReplicaRole::Primary
-                            && matches!(
-                                intent.program,
-                                Some(PublicOperationProgram::CatchUp {
-                                    mode: kuberic_runtime::protocol::public_operations::
-                                        PublicCatchUpMode::All,
-                                    ..
-                                })
-                            )
-                            && intent.operation_id
-                                == crate::public_v1_reconciliation::renewal_settlement_id(
-                                    &required.operation_id,
-                                    session.identity.replica_id,
-                                    intent.revision,
-                                    intent.program.as_ref().expect("CatchUp checked"),
-                                )))
-                    && required
-                        .replacement
-                        .iter()
-                        .chain(required.surviving_sessions.iter())
-                        .any(|endpoint| {
-                            let mut authorized = endpoint.clone();
-                            authorized.role = session.role;
-                            authorized == *session
-                        })
-            });
-            authorized
-                && public.current == configuration
-                && public.previous.is_none()
-                && public.validate().is_ok()
-                && public.replicas.iter().all(|peer| {
-                    topology.sessions.iter().any(|admitted| {
-                        peer.identity == admitted.identity
-                            && peer.process_session_id == admitted.process_session_id
-                            && peer.storage_incarnation.as_ref()
-                                == Some(&admitted.storage_incarnation)
-                            && peer.role == admitted.role
-                    }) && reports.iter().any(|report| {
-                        report.replica == peer.identity
-                            && report.replication_address.as_ref().is_some_and(|address| {
-                                address.trim_end_matches('/')
-                                    == peer.replication_address.trim_end_matches('/')
-                            })
-                    })
-                })
-        })
-    }
-
     pub async fn report_uid(&self, uid: &str) -> Result<PublicV1AgentReport> {
         let set = self.set().await?;
         let pod = self
@@ -879,81 +768,6 @@ impl<F: ApplicationFactory> Harness<F> {
             reports.pop_first();
         }
         Ok(report)
-    }
-
-    pub(super) fn settled(
-        status: &KubericSetStatus,
-        reports: &[PublicV1AgentReport],
-        expected: usize,
-    ) -> bool {
-        if status.public_v1_operation.is_some()
-            || status.public_v1_transition.is_some()
-            || status.public_v1_replacement.is_some()
-            || status.public_v1_session_renewal.is_some()
-        {
-            return false;
-        }
-        let Some(topology) = &status.public_v1_topology else {
-            return false;
-        };
-        if topology.pending_switchover.is_some() {
-            return false;
-        }
-        let Ok(configuration) = topology.configuration() else {
-            return false;
-        };
-        let Some(authority) = &status.public_v1_authority else {
-            return false;
-        };
-        let Ok(accepted) = authority.authority() else {
-            return false;
-        };
-        if configuration.members.len() != expected {
-            return false;
-        }
-        for session in &topology.sessions {
-            let Some(report) = reports
-                .iter()
-                .find(|report| report.replica == session.identity)
-            else {
-                return false;
-            };
-            if report.identity != accepted.identity
-                || report.history != accepted.history
-                || report.resource_uid != accepted.history.resource_uid
-                || report.storage_incarnation != session.storage_incarnation
-                || report.process_session_id != session.process_session_id
-                || report.replicator_creation_id != session.replicator_creation_id
-                || !report.has_current_open_endpoint()
-                || report.role != session.role
-                || (session.role == ReplicaRole::Primary
-                    && report.read_status != AccessStatus::Granted)
-                || (session.role == ReplicaRole::ActiveSecondary
-                    && report.read_status != AccessStatus::NotPrimary)
-                || (report.write_status == AccessStatus::Granted)
-                    != (session.role == ReplicaRole::Primary)
-                || report.progress.current().is_none()
-                || !report.completed_operations.iter().any(|completion| {
-                    completion.process_session_id == session.process_session_id
-                        && completion.storage_incarnation == session.storage_incarnation
-                        && completion.history == accepted.history
-                        && completion.current_configuration_id.as_ref()
-                            == Some(&configuration.configuration_id)
-                        && completion.result == PublicV1OperationResult::Succeeded
-                })
-            {
-                return false;
-            }
-        }
-        !reports.iter().any(|report| {
-            !topology
-                .sessions
-                .iter()
-                .any(|session| session.identity == report.replica)
-                && (report.role != ReplicaRole::None
-                    || report.read_status == AccessStatus::Granted
-                    || report.write_status == AccessStatus::Granted)
-        })
     }
 
     pub async fn stop(&self, uid: &str) -> Result<()> {
@@ -1461,6 +1275,7 @@ pub struct Observation {
     set: KubericSet,
     resources: Vec<ResourceObservation>,
     reports: Vec<(ReplicaRef, PublicV1AgentReport)>,
+    snapshots: Vec<(ReplicaRef, ReplicaAgentSnapshot)>,
     reconcile_errors: usize,
     credentials_consistent: bool,
     failures: Vec<ObservationFailure>,
@@ -1473,7 +1288,7 @@ impl Observation {
         &self.resources
     }
     pub fn replicas(&self) -> impl Iterator<Item = &ReplicaRef> {
-        self.reports.iter().map(|(reference, _)| reference)
+        self.snapshots.iter().map(|(reference, _)| reference)
     }
     pub fn reports(&self) -> impl Iterator<Item = (&ReplicaRef, &PublicV1AgentReport)> {
         self.reports
@@ -1483,8 +1298,29 @@ impl Observation {
     pub fn report(&self, reference: &ReplicaRef) -> Option<&PublicV1AgentReport> {
         self.reports
             .iter()
-            .find(|(candidate, _)| candidate == reference)
+            .find(|(candidate, _)| {
+                candidate.cluster == reference.cluster
+                    && candidate.storage == reference.storage
+                    && candidate.session == reference.session
+                    && candidate.creation == reference.creation
+            })
             .map(|(_, report)| report)
+    }
+    pub fn snapshots(&self) -> impl Iterator<Item = (&ReplicaRef, &ReplicaAgentSnapshot)> {
+        self.snapshots
+            .iter()
+            .map(|(reference, snapshot)| (reference, snapshot))
+    }
+    pub fn snapshot(&self, reference: &ReplicaRef) -> Option<&ReplicaAgentSnapshot> {
+        self.snapshots
+            .iter()
+            .find(|(candidate, _)| {
+                candidate.cluster == reference.cluster
+                    && candidate.storage == reference.storage
+                    && candidate.session == reference.session
+                    && candidate.creation == reference.creation
+            })
+            .map(|(_, snapshot)| snapshot)
     }
     pub fn reconcile_errors(&self) -> usize {
         self.reconcile_errors
@@ -1637,8 +1473,8 @@ pub struct OperationDispatch {
 }
 
 impl<F: ApplicationFactory> TestCluster<F> {
-    /// Verifies the exact M1 fail-closed engine-support result over production
-    /// transport. A true result is not qualification of downstream engine properties.
+    /// Historical independent-PG checkpoint observation, pending its engine conversion.
+    /// Built-in consumers must use ordinary snapshots and actual copy/admission.
     pub async fn ordinary_integration_unavailable(&mut self) -> super::Result<bool> {
         self.driving()?;
         self.core
@@ -1707,7 +1543,17 @@ impl<F: ApplicationFactory> TestCluster<F> {
             .await
             .map_err(anyhow::Error::from)?
             .map_err(anyhow::Error::from)?;
-        if self.reference(&report) != *reference {
+        if !self
+            .core
+            .ordinary_snapshots()
+            .await?
+            .iter()
+            .any(|snapshot| {
+                snapshot.storage == reference.storage
+                    && snapshot.process_session_id == reference.session
+                    && snapshot.creation_id == reference.creation
+            })
+        {
             return Err(TestError::new(
                 ErrorKind::InvalidReference,
                 "replica incarnation/session is obsolete",
@@ -1802,40 +1648,26 @@ impl<F: ApplicationFactory> TestCluster<F> {
             .as_ref()
             .context("topology missing")
             .map_err(TestError::from)?;
-        let reports = observation
-            .reports
+        let snapshots = observation
+            .snapshots
             .iter()
-            .map(|(_, report)| report.clone())
+            .map(|(_, snapshot)| snapshot.clone())
             .collect::<Vec<_>>();
         let expected = topology.sessions.len();
-        if !Harness::<F>::settled(status, &reports, expected)
-            || !Harness::<F>::configurations_settled(
-                status,
-                &reports,
-                &self.core.configuration_evidence(&reports).await?,
-            )
-            || topology.sessions.iter().any(|session| {
-                !observation.reports.iter().any(|(_, report)| {
-                    report.replica == session.identity
-                        && report.process_session_id == session.process_session_id
-                        && report.replicator_creation_id == session.replicator_creation_id
-                        && report.storage_incarnation == session.storage_incarnation
-                })
-            })
-        {
+        if !Harness::<F>::ordinary_settled(status, &snapshots, expected) {
             return Err(TestError::new(
                 ErrorKind::Fatal,
                 "ready topology changed or lost exact admitted observations",
             ));
         }
         let members = observation
-            .reports
+            .snapshots
             .iter()
-            .filter(|(_, report)| {
+            .filter(|(_, snapshot)| {
                 topology
                     .sessions
                     .iter()
-                    .any(|session| session.identity == report.replica)
+                    .any(|session| session.identity == snapshot.storage.replica)
             })
             .map(|(reference, _)| reference.clone())
             .collect::<Vec<_>>();
@@ -1853,6 +1685,25 @@ impl<F: ApplicationFactory> TestCluster<F> {
         let service = self.core.service_uid(reference.instance_id()).await?;
         self.check().await?;
         Ok(service)
+    }
+
+    /// Optional concrete transport diagnostics, never readiness or admission evidence.
+    pub async fn native_transport_observation(
+        &self,
+        reference: &ReplicaRef,
+    ) -> super::Result<serde_json::Value> {
+        if reference.cluster != self.nonce {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "reference belongs to another cluster",
+            ));
+        }
+        let supervisor = self.core.supervisor.lock().await;
+        let host = supervisor
+            .hosts
+            .get(reference.instance_id())
+            .context("native host missing")?;
+        host._route.inspect_native().map_err(TestError::from)
     }
     pub async fn application_root(&self, reference: &ReplicaRef) -> super::Result<PathBuf> {
         self.validate(reference).await?;
@@ -1884,6 +1735,27 @@ impl<F: ApplicationFactory> TestCluster<F> {
     pub async fn observe(&mut self) -> super::Result<Observation> {
         self.check().await?;
         let set = self.core.set().await?;
+        let snapshots = self
+            .core
+            .ordinary_snapshots()
+            .await?
+            .into_iter()
+            .map(|snapshot| {
+                let reference = ReplicaRef {
+                    cluster: self.nonce,
+                    resource_uid: snapshot.history.resource_uid.to_string(),
+                    identity: snapshot.storage.replica.clone(),
+                    storage: snapshot.storage.clone(),
+                    session: snapshot.process_session_id.clone(),
+                    creation: snapshot.creation_id.clone(),
+                    replication_address: snapshot
+                        .publication
+                        .as_ref()
+                        .map(|publication| publication.replication_address.clone()),
+                };
+                (reference, snapshot)
+            })
+            .collect();
         let mut reports = Vec::new();
         let mut failures = Vec::new();
         let live = self.core.live_uids().await;
@@ -1961,6 +1833,7 @@ impl<F: ApplicationFactory> TestCluster<F> {
             set,
             resources,
             reports,
+            snapshots,
             failures,
             reconcile_errors: self.core.reconcile_errors,
             credentials_consistent,
@@ -1971,6 +1844,64 @@ impl<F: ApplicationFactory> TestCluster<F> {
         self.driving()?;
         self.core.step().await?;
         self.check().await
+    }
+
+    /// Retain a terminal semantic goal for dispatch by the production Reconciler.
+    pub async fn retain_ordinary_terminal(
+        &mut self,
+        replica: &ReplicaRef,
+        kind: kuberic_runtime::protocol::public_operations::PublicV1CallKind,
+    ) -> super::Result<ReplicaGoal> {
+        use kuberic_runtime::protocol::public_operations::PublicV1CallKind;
+        self.driving()?;
+        self.validate(replica).await?;
+        self.core.cancel_controller_call();
+        let snapshot = self
+            .observe()
+            .await?
+            .snapshot(replica)
+            .cloned()
+            .context("ordinary snapshot missing")?;
+        let mut set = self.core.set().await?;
+        let status = set.status.as_mut().context("ordinary status missing")?;
+        let revision = status
+            .replica_goals
+            .iter()
+            .map(|entry| entry.goal.revision)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let goal = ReplicaGoal {
+            format: kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+            identity: snapshot.identity,
+            operation_id: kuberic_runtime::protocol::types::OperationId::new(format!(
+                "terminal-{}",
+                uuid::Uuid::new_v4()
+            )),
+            revision,
+            scope: snapshot
+                .publication
+                .context("terminal target unpublished")?
+                .scope,
+            desired: match kind {
+                PublicV1CallKind::Close => ReplicaGoalKind::Close,
+                PublicV1CallKind::Abort => ReplicaGoalKind::Abort,
+                _ => {
+                    return Err(TestError::new(
+                        ErrorKind::InvalidConfiguration,
+                        "ordinary terminal requires Close or Abort",
+                    ));
+                }
+            },
+        };
+        status
+            .replica_goals
+            .push(crate::crd::RetainedReplicaGoal::new(goal.clone()).map_err(anyhow::Error::msg)?);
+        Api::<KubericSet>::namespaced(self.core.api.client(), &self.core.namespace)
+            .replace_status(&self.core.name, &PostParams::default(), &set)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(goal)
     }
     pub async fn drive<T, E>(
         &mut self,
@@ -2751,17 +2682,7 @@ mod readiness_lifecycle_tests {
             .start()
             .await?;
         let result: Result<()> = async {
-            let primary = if cluster.ordinary_integration_unavailable().await? {
-                cluster
-                    .observe()
-                    .await?
-                    .replicas()
-                    .next()
-                    .context("host missing")?
-                    .clone()
-            } else {
-                cluster.settle().await?.primary().clone()
-            };
+            let primary = cluster.settle().await?.primary().clone();
             let supervisor = cluster.core.supervisor.clone();
             let (started_tx, started) = tokio::sync::oneshot::channel();
             let (release, released) = tokio::sync::oneshot::channel();
@@ -2863,9 +2784,6 @@ mod readiness_lifecycle_tests {
             .start()
             .await?;
         let result: Result<()> = async {
-            if cluster.ordinary_integration_unavailable().await? {
-                return Ok(());
-            }
             let topology = cluster.settle().await?;
             cluster
                 .submit_switchover(topology.secondaries().next().unwrap())
@@ -2966,9 +2884,6 @@ mod readiness_lifecycle_tests {
         )
         .await?;
         let result = async {
-            if core.ordinary_integration_unavailable().await? {
-                return Ok(());
-            }
             core.ready()
                 .await
                 .context("initial readiness convergence")?;
@@ -3030,17 +2945,20 @@ mod readiness_lifecycle_tests {
                 .await
                 .context("renewed-session readiness convergence")?;
             let status = core.set().await?.status.context("status missing")?;
-            let mut reports = Vec::new();
-            for id in 1..=3 {
-                reports.push(core.report(id).await?);
-            }
-            assert!(Harness::<EmptyFactory>::settled(&status, &reports, 3));
+            let snapshots = core.ordinary_snapshots().await?;
+            assert!(Harness::<EmptyFactory>::ordinary_settled(
+                &status, &snapshots, 3
+            ));
             let mut altered = status.clone();
             altered.public_v1_replacement = Some(pending_replacement);
-            assert!(!Harness::<EmptyFactory>::settled(&altered, &reports, 3));
+            assert!(!Harness::<EmptyFactory>::ordinary_settled(
+                &altered, &snapshots, 3
+            ));
             altered = status;
             altered.public_v1_session_renewal = Some(pending_renewal);
-            assert!(!Harness::<EmptyFactory>::settled(&altered, &reports, 3));
+            assert!(!Harness::<EmptyFactory>::ordinary_settled(
+                &altered, &snapshots, 3
+            ));
             Ok(())
         }
         .await;

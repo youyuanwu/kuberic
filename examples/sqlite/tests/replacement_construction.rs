@@ -1,27 +1,32 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use kuberic_runtime::RuntimeError;
+use kuberic_runtime::control::proto as control;
 use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
     RunningReplica,
 };
 use kuberic_runtime::protocol::public_operations::*;
 use kuberic_runtime::protocol::types::*;
-use kuberic_runtime::testing::sqlite_store::SqliteStore;
-use kuberic_runtime::testing::state::{SCHEMA_VERSION, StorageIdentity};
 use sqlite_replicated::SqlitePersistence;
 use sqlite_replicated::proto;
 use sqlite_replicated::proto::sqlite_store_server::SqliteStore as _;
 use sqlite_replicated::server::SqliteServer;
 use sqlite_replicated::service::SqliteService;
 
-struct Resolver;
+#[derive(Default)]
+struct Resolver(Mutex<std::collections::BTreeMap<ReplicaId, String>>);
 
 impl ReplicaEndpointResolver for Resolver {
-    fn control_endpoint(&self, _: &ReplicaIdentity) -> String {
-        "http://127.0.0.1:1".into()
+    fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&identity.replica_id)
+            .cloned()
+            .unwrap_or_default()
     }
     fn replication_endpoint(&self, _: &ReplicaIdentity) -> String {
         "http://127.0.0.1:1".into()
@@ -36,6 +41,23 @@ struct Node {
     history: HistoryContext,
     preview: PublicV1Identity,
     revision: u64,
+    address: String,
+    scope: Option<ReplicaScope>,
+    last_build: Option<ReplicaGoal>,
+}
+
+fn authorized<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer sqlite-construction-token".parse().unwrap(),
+    );
+    request
+}
+
+fn current_scope() -> &'static Mutex<Option<ReplicaConfigurationScope>> {
+    static CURRENT: OnceLock<Mutex<Option<ReplicaConfigurationScope>>> = OnceLock::new();
+    CURRENT.get_or_init(Default::default)
 }
 
 impl Node {
@@ -43,43 +65,27 @@ impl Node {
         let resource = ResourceUid::new("sqlite-native-construction");
         let preview = PublicV1Identity::new(1);
         let name = root.file_name().unwrap().to_str().unwrap();
+        let pod = PodUid::new(format!("{name}-pod"));
+        let pvc = PvcUid::new(format!("{name}-pvc"));
+        let initialization = derive_initialization_id(&resource, ReplicaId::new(id), &pod, &pvc);
         let identity = ReplicaIdentity {
             replica_id: ReplicaId::new(id),
             instance_id: ReplicaInstanceId::new(format!("{name}-pod")),
-            agent_generation: AgentGeneration::new(format!("{name}-agent")),
+            agent_generation: derive_agent_generation(&initialization),
         };
-        let pod = PodUid::new(format!("{name}-pod"));
-        let pvc = PvcUid::new(format!("{name}-pvc"));
         let application = root.join("application");
         let fresh = SqlitePersistence::is_fresh_empty(&application).unwrap();
         let paths = std::collections::BTreeMap::from([("application".into(), application.clone())]);
-        if !SqliteStore::metadata_database_path(root).exists() {
-            drop(
-                SqliteStore::create_public_v1_with_application_paths(
-                    SqliteStore::metadata_database_path(root),
-                    preview.clone(),
-                    StorageIdentity {
-                        schema_version: SCHEMA_VERSION,
-                        resource_uid: resource.clone(),
-                        pod_uid: pod.clone(),
-                        pvc_uid: pvc.clone(),
-                        initialization_id: InitializationId::new(format!("{name}-initialization")),
-                        local_identity: identity.clone(),
-                        effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
-                    },
-                    paths.clone(),
-                )
-                .unwrap(),
-            );
-        }
         let service =
             Arc::new(SqliteService::deferred(application, "http://127.0.0.1:0".into()).unwrap());
-        let running = ReplicaHost::new(
+        static RESOLVER: OnceLock<Arc<Resolver>> = OnceLock::new();
+        let resolver = RESOLVER.get_or_init(Default::default).clone();
+        let host = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource.clone(),
                 replica_id: identity.replica_id,
-                pod_uid: pod,
-                pvc_uid: pvc,
+                pod_uid: pod.clone(),
+                pvc_uid: pvc.clone(),
                 data_root: root.to_path_buf(),
                 replication_address: "127.0.0.1:0".parse().unwrap(),
                 bearer_token: "sqlite-construction-token".into(),
@@ -92,126 +98,248 @@ impl Node {
             } else {
                 ApplicationStorageState::Established
             },
-            Arc::new(Resolver),
+            resolver.clone(),
         )
-        .with_application_storage_paths(paths)
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
-        .await
-        .unwrap();
-        let generation = PublicProtocolGeneration::new(1);
-        let initialization = derive_history_initialization_id(&resource, generation);
-        let history = derive_bootstrap_history(&resource, generation, &initialization);
-        let storage = ReplicaStorageIncarnationContext {
-            replica: identity.clone(),
-            storage: ReplicaStorageIdentity::Persistent {
-                pod_uid: PodUid::new(format!("{name}-pod")),
-                pvc_uid: PvcUid::new(format!("{name}-pvc")),
-            },
-            storage_generation: StorageGeneration::new(format!("{name}-storage")),
+        .with_application_storage_paths(paths);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        resolver
+            .0
+            .lock()
+            .unwrap()
+            .insert(identity.replica_id, address.clone());
+        let startup = tokio::spawn(host.start(listener));
+        let mut client = loop {
+            match control::agent_control_client::AgentControlClient::connect(address.clone()).await
+            {
+                Ok(client) => break client,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
         };
-        if revision == 0 {
-            running
-                .handle()
-                .initialize_public_v1_history(&initialization, &history, &storage)
+        let status = client
+            .get_status(authorized(control::GetAgentStatusRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: resource.to_string(),
+                replica_id: id,
+                expected_instance_id: identity.instance_id.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        if status.storage_state == control::AgentStorageState::Uninitialized as i32 {
+            let members = (1..=id)
+                .map(|member| ConfigurationMember {
+                    identity: if member == id {
+                        identity.clone()
+                    } else {
+                        ReplicaIdentity {
+                            replica_id: ReplicaId::new(member),
+                            instance_id: ReplicaInstanceId::new(format!("bootstrap-{member}")),
+                            agent_generation: AgentGeneration::new(format!("bootstrap-{member}")),
+                        }
+                    },
+                    role: if member == 1 {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect();
+            client
+                .execute(authorized(control::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: resource.to_string(),
+                    target: Some(identity.clone().into()),
+                    expected_process_session_id: status.process_session_id,
+                    command: Some(
+                        control::execute_command_request::Command::InitializeAgentStore(
+                            control::InitializeAgentStoreCommand {
+                                initialization_id: initialization.to_string(),
+                                resource_uid: resource.to_string(),
+                                local_replica_id: id,
+                                expected_instance_id: identity.instance_id.to_string(),
+                                expected_pod_uid: pod.to_string(),
+                                expected_pvc_uid: pvc.to_string(),
+                                assigned_agent_generation: identity.agent_generation.to_string(),
+                                effective_policy: Some(
+                                    EffectivePolicy::fixed(id as u32, 30).unwrap().into(),
+                                ),
+                                bootstrap_configuration: Some(
+                                    ConfigurationDescriptor::new(
+                                        Epoch::new(0, 1),
+                                        ReplicaId::new(1),
+                                        members,
+                                        id as u32 / 2 + 1,
+                                    )
+                                    .into(),
+                                ),
+                                provisioning: None,
+                            },
+                        ),
+                    ),
+                }))
                 .await
                 .unwrap();
         }
+        let running = startup.await.unwrap().unwrap();
+        let response = client
+            .get_snapshot(authorized(control::ReplicaSnapshotRequest {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                resource_uid: resource.to_string(),
+                target: Some(identity.clone().into()),
+                expected_process_session_id: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ReplicaAgentQueryResult::Initialized(snapshot) =
+            serde_json::from_slice(&response.canonical_json).unwrap()
+        else {
+            panic!("initialized snapshot required")
+        };
         Self {
             running,
             service,
             identity,
-            storage,
-            history,
+            storage: snapshot.storage,
+            history: snapshot.history,
             preview,
             revision,
+            address,
+            scope: None,
+            last_build: None,
         }
     }
 
-    async fn command(&mut self, program: PublicOperationProgram) {
-        let label = format!("{program:?}");
-        if !matches!(
-            program,
-            PublicOperationProgram::Build(_) | PublicOperationProgram::Remove(_)
-        ) {
-            self.revision += 1;
-        }
-        let handle = self.running.handle();
-        let class = match &program {
-            PublicOperationProgram::Build(input) => PublicOperationClass::Build {
-                target: input.replica.replica_id,
-            },
-            PublicOperationProgram::Remove(input) => PublicOperationClass::Remove {
-                target: input.replica.replica_id,
-            },
-            PublicOperationProgram::Close => PublicOperationClass::Close,
-            PublicOperationProgram::Abort => PublicOperationClass::Abort,
-            _ => PublicOperationClass::Authority,
+    async fn snapshot(&self) -> ReplicaAgentSnapshot {
+        let mut client =
+            control::agent_control_client::AgentControlClient::connect(self.address.clone())
+                .await
+                .unwrap();
+        let response = client
+            .get_snapshot(authorized(control::ReplicaSnapshotRequest {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                resource_uid: self.history.resource_uid.to_string(),
+                target: Some(self.identity.clone().into()),
+                expected_process_session_id: self.running.handle().process_session_id().to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ReplicaAgentQueryResult::Initialized(snapshot) =
+            serde_json::from_slice(&response.canonical_json).unwrap()
+        else {
+            panic!("ordinary snapshot required")
         };
-        let operation_id = match &program {
-            PublicOperationProgram::Build(input) => input.attempt.clone(),
-            PublicOperationProgram::Remove(input) => {
-                OperationId::new(format!("remove-{}", input.attempt))
-            }
-            _ => OperationId::new(format!(
-                "{}-{}-{}",
-                self.identity.instance_id,
-                handle.process_session_id(),
-                self.revision
+        *snapshot
+    }
+
+    async fn goal(
+        &mut self,
+        desired: ReplicaGoalKind,
+        configuration: ReplicaConfigurationScope,
+    ) -> ReplicaGoal {
+        let snapshot = self.snapshot().await;
+        self.revision = self.revision.max(
+            snapshot
+                .goals
+                .iter()
+                .map(|entry| entry.goal.revision)
+                .max()
+                .unwrap_or(0),
+        ) + 1;
+        let goal = ReplicaGoal {
+            format: ORDINARY_ACTION_FORMAT,
+            identity: self.preview.clone(),
+            operation_id: OperationId::new(format!(
+                "ordinary-{}-{}-{}",
+                self.identity.instance_id, snapshot.process_session_id, self.revision
             )),
+            revision: self.revision,
+            scope: ReplicaScope {
+                history: self.history.clone(),
+                storage: self.storage.clone(),
+                process_session_id: snapshot.process_session_id,
+                creation_id: snapshot.creation_id,
+                epoch: configuration.current.epoch,
+                configuration,
+            },
+            desired,
         };
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            handle.execute_public_v1(PublicOperationIntent {
-                identity: self.preview.clone(),
-                operation_id,
-                revision: self.revision,
-                process_session_id: handle.process_session_id(),
-                class,
-                input_digest: program.digest(),
-                replay_disposition: program.replay_disposition(),
-                lifecycle: None,
-                program: Some(program),
-            }),
-        )
+        let mut client =
+            control::agent_control_client::AgentControlClient::connect(self.address.clone())
+                .await
+                .unwrap();
+        client
+            .submit_goal(authorized(control::ReplicaGoalRequest {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                canonical_json: serde_json::to_vec(&goal).unwrap(),
+            }))
+            .await
+            .unwrap_or_else(|error| panic!("{goal:?}: {error}"));
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = self.snapshot().await;
+                if let Some(entry) = snapshot.goals.iter().find(|entry| entry.goal == goal)
+                    && entry.status != ReplicaGoalStatus::Pending
+                {
+                    assert_eq!(entry.status, ReplicaGoalStatus::Achieved, "{goal:?}");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .unwrap()
-        .unwrap_or_else(|error| panic!("{}: {label}: {error}", self.identity.instance_id));
+        .expect("ordinary application goal settles");
+        self.scope = Some(goal.scope.clone());
+        if matches!(
+            goal.desired,
+            ReplicaGoalKind::Prepare {
+                role: ReplicaRole::Primary
+            } | ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                ..
+            }
+        ) {
+            *current_scope().lock().unwrap() = Some(goal.scope.configuration.clone());
+        }
+        goal
     }
 
     async fn open(&mut self, role: ReplicaRole, epoch: Epoch) {
-        let existing = self
-            .running
-            .handle()
-            .public_v1_report()
-            .await
-            .unwrap()
-            .open_mode
-            == kuberic_runtime::application::OpenMode::Existing;
-        self.command(PublicOperationProgram::Open {
-            replica: self.identity.clone(),
-            existing,
-        })
-        .await;
-        self.command(PublicOperationProgram::Role { epoch, role })
+        let configuration = if role == ReplicaRole::Primary {
+            ReplicaConfigurationScope {
+                current: ConfigurationDescriptor::new(
+                    epoch,
+                    self.identity.replica_id,
+                    vec![ConfigurationMember {
+                        identity: self.identity.clone(),
+                        role,
+                    }],
+                    1,
+                ),
+                previous: None,
+                replicas: Vec::new(),
+            }
+        } else {
+            current_scope().lock().unwrap().clone().unwrap()
+        };
+        self.goal(ReplicaGoalKind::Prepare { role }, configuration)
             .await;
-        if role == ReplicaRole::Primary {
-            self.command(PublicOperationProgram::Epoch { epoch }).await;
-        }
     }
 
-    async fn descriptor(&self, role: ReplicaRole) -> PublicReplicaDescriptor {
-        let report = self.running.handle().public_v1_report().await.unwrap();
-        PublicReplicaDescriptor {
+    async fn descriptor(&self, role: ReplicaRole) -> ReplicaPeerDescription {
+        let publication = self.snapshot().await.publication.unwrap();
+        ReplicaPeerDescription {
             is_up: true,
             is_ready: true,
-            build_id: OperationId::default(),
             identity: self.identity.clone(),
-            replication_address: report.replication_address.unwrap(),
-            process_session_id: report.process_session_id,
-            storage_incarnation: Some(self.storage.clone()),
+            replication_address: publication.replication_address,
+            process_session_id: publication.scope.process_session_id,
+            storage_incarnation: self.storage.clone(),
             role,
-            current_progress: report.progress.current().unwrap(),
-            catch_up_capability: report.progress.capability().unwrap(),
+            current_progress: 0,
+            catch_up_capability: 0,
             must_catchup: false,
         }
     }
@@ -226,11 +354,17 @@ impl Node {
             }],
             1,
         );
-        self.command(PublicOperationProgram::Configuration(PublicConfiguration {
-            current: current.clone(),
-            previous: None,
-            replicas: Vec::new(),
-        }))
+        self.goal(
+            ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                catch_up: Some(PublicCatchUpMode::WriteQuorum),
+            },
+            ReplicaConfigurationScope {
+                current: current.clone(),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        )
         .await;
         current
     }
@@ -240,69 +374,25 @@ impl Node {
         target: &mut Self,
         epoch: Epoch,
         current: &ConfigurationDescriptor,
-    ) -> PublicBuildInput {
-        let source_session = self.running.handle().process_session_id();
-        let source_address = self
-            .running
-            .handle()
-            .public_v1_report()
-            .await
-            .unwrap()
-            .replication_address
-            .unwrap();
-        let report = target.running.handle().public_v1_report().await.unwrap();
-        let attempt = OperationId::new(format!(
-            "copy-{}-{}",
-            target.identity.instance_id,
-            self.revision + 1
-        ));
-        let build = PublicBuildInput {
-            attempt: attempt.clone(),
-            epoch,
-            source_address: source_address.clone(),
-            current_configuration_id: Some(current.configuration_id.clone()),
-            replica: target.identity.clone(),
-            target_storage: target.storage.clone(),
-            process_session_id: report.process_session_id.clone(),
-            replication_address: report.replication_address.clone().unwrap(),
-            history: Some(self.history.clone()),
-        };
-        let revision = self.revision;
-        target
-            .running
-            .handle()
-            .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
-                operation_id: attempt.clone(),
-                operation_revision: revision,
-                attempt: PublicBuildAttemptReference {
-                    resource_uid: self.history.resource_uid.clone(),
-                    epoch,
-                    build_id: attempt,
-                    source: self.identity.clone(),
-                    source_storage: self.storage.clone(),
-                    source_session,
-                    target: target.identity.clone(),
-                    target_storage: target.storage.clone(),
-                    target_session: report.process_session_id,
+    ) -> ReplicaGoal {
+        let source = self.snapshot().await.publication.unwrap();
+        let target_publication = target.snapshot().await.publication.unwrap();
+        assert_eq!(source.scope.epoch, epoch);
+        assert_eq!(&source.scope.configuration.current, current);
+        let build = self
+            .goal(
+                ReplicaGoalKind::Build {
+                    remote: Box::new(RemoteReplicaSelection {
+                        source: source.clone(),
+                        target: target_publication,
+                        target_control_address: target.address.clone(),
+                        generation: 1,
+                    }),
                 },
-                history: self.history.clone(),
-                current_configuration_id: current.configuration_id.clone(),
-                source_address,
-                target_address: report.replication_address.unwrap(),
-            })
-            .await
-            .unwrap();
-        self.command(PublicOperationProgram::Build(build.clone()))
+                source.scope.configuration,
+            )
             .await;
-        target
-            .command(PublicOperationProgram::Role {
-                epoch,
-                role: ReplicaRole::ActiveSecondary,
-            })
-            .await;
-        target
-            .command(PublicOperationProgram::Epoch { epoch })
-            .await;
+        self.last_build = Some(build.clone());
         build
     }
 
@@ -322,42 +412,83 @@ impl Node {
             ],
             2,
         );
-        target
-            .command(PublicOperationProgram::Configuration(PublicConfiguration {
-                current: current.clone(),
-                previous: None,
-                replicas: vec![self.descriptor(ReplicaRole::Primary).await],
-            }))
+        if let Some(build) = self.last_build.take() {
+            let mut client =
+                control::agent_control_client::AgentControlClient::connect(self.address.clone())
+                    .await
+                    .unwrap();
+            client
+                .acknowledge_goal(authorized(control::ReplicaGoalRequest {
+                    protocol_version: ORDINARY_ACTION_FORMAT,
+                    canonical_json: serde_json::to_vec(&ReplicaGoalAcknowledgement {
+                        goal: build,
+                        logically_retired: false,
+                    })
+                    .unwrap(),
+                }))
+                .await
+                .unwrap();
+        }
+        let previous = self.scope.as_ref().unwrap().configuration.current.clone();
+        let source_peer = self.descriptor(ReplicaRole::Primary).await;
+        let target_peer = target.descriptor(ReplicaRole::ActiveSecondary).await;
+        for previous in [Some(previous), None] {
+            self.goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: previous.is_none().then_some(PublicCatchUpMode::WriteQuorum),
+                },
+                ReplicaConfigurationScope {
+                    current: current.clone(),
+                    previous: previous.clone(),
+                    replicas: vec![target_peer.clone()],
+                },
+            )
             .await;
-        self.command(PublicOperationProgram::Configuration(PublicConfiguration {
-            current: current.clone(),
-            previous: None,
-            replicas: vec![target.descriptor(ReplicaRole::ActiveSecondary).await],
-        }))
-        .await;
+            target
+                .goal(
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        catch_up: None,
+                    },
+                    ReplicaConfigurationScope {
+                        current: current.clone(),
+                        previous,
+                        replicas: vec![source_peer.clone()],
+                    },
+                )
+                .await;
+        }
         current
     }
 
     async fn close(mut self) {
-        self.command(PublicOperationProgram::Close).await;
+        self.goal(
+            ReplicaGoalKind::Close,
+            self.scope.as_ref().unwrap().configuration.clone(),
+        )
+        .await;
         self.running.shutdown();
         self.running.wait().await.unwrap();
         self.service.shutdown_and_drain().await.unwrap();
     }
 
-    async fn stop(mut self) -> (u64, RuntimeError) {
+    async fn stop(mut self) -> (u64, Option<RuntimeError>) {
         self.running.shutdown();
         self.running.wait().await.unwrap();
-        let diagnostic = self.service.shutdown_and_drain().await.unwrap_err();
+        let diagnostic = self.service.shutdown_and_drain().await.err();
         (self.revision, diagnostic)
     }
 }
 
 fn root() -> tempfile::TempDir {
-    std::fs::create_dir_all(std::env::current_dir().unwrap().join("target")).unwrap();
     tempfile::Builder::new()
         .prefix("sqlite-native-")
-        .tempdir_in(std::env::current_dir().unwrap().join("target"))
+        .tempdir_in(
+            std::env::var_os("TMPDIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap().join("target")),
+        )
         .unwrap()
 }
 
@@ -435,9 +566,12 @@ async fn sqlite_native_copy_waits_for_service_commit_and_copy_eof_before_activat
                 .committed_lsn,
             baseline
         );
-        let report = source.running.handle().public_v1_report().await.unwrap();
+        let report = source.snapshot().await;
         assert_eq!(report.read_status, AccessStatus::Granted);
-        assert!(report.progress.current().unwrap() > baseline);
+        assert!(matches!(
+            report.progress,
+            ProgressQueryResult::NotQueried(_)
+        ));
         let mut replacement = Node::start(&root.path().join("replacement"), 3, 0).await;
         replacement.open(ReplicaRole::IdleSecondary, epoch).await;
         source.service.copy_snapshot_gate().arm();
@@ -489,9 +623,7 @@ async fn sqlite_native_copy_waits_for_service_commit_and_copy_eof_before_activat
             "stable native secondary reads remain NotPrimary"
         );
         assert_eq!(values(&server).await.unwrap(), ["acknowledged", "isolated"]);
-        source.close().await;
-        target.close().await;
-        replacement.close().await;
+        tokio::join!(source.close(), target.close(), replacement.close());
     })
     .await
     .expect("bounded native SQLite copy/local commitment journey");
@@ -515,15 +647,9 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
         let old_service = retired.service.clone();
         let old_session = retired.running.handle().process_session_id();
         let (retired_revision, diagnostic) = retired.stop().await;
-        assert!(
-            matches!(diagnostic, RuntimeError::OperationCancelled),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
         let (source_revision, diagnostic) = source.stop().await;
-        assert!(
-            matches!(diagnostic, RuntimeError::OperationCancelled),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
         let mut source = Node::start(&source_root, 1, source_revision).await;
         let mut retired = Node::start(&retired_root, 2, retired_revision).await;
         assert_ne!(retired.running.handle().process_session_id(), old_session);
@@ -549,11 +675,14 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
                 .is_err()
         );
         let (_, diagnostic) = retired.stop().await;
-        assert!(
-            matches!(diagnostic, RuntimeError::OperationCancelled),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
+        let (source_revision, diagnostic) = source.stop().await;
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
+        let mut source = Node::start(&source_root, 1, source_revision).await;
+        let epoch = Epoch::new(0, 3);
+        source.open(ReplicaRole::Primary, epoch).await;
         let single = source.single(epoch).await;
+        let server = SqliteServer::new(source.service.clone());
         let mut replacement = Node::start(&root.path().join("fresh-replacement"), 2, 0).await;
         assert_ne!(replacement.identity, old_service_identity(&retired_root, 2));
         replacement.open(ReplicaRole::IdleSecondary, epoch).await;
@@ -584,8 +713,7 @@ async fn sqlite_fresh_restart_build_and_corrective_empty_replacement() {
             .await
             .is_err()
         );
-        source.close().await;
-        replacement.close().await;
+        tokio::join!(source.close(), replacement.close());
     })
     .await
     .expect("bounded restart and fresh storage replacement journey");
@@ -596,7 +724,12 @@ fn old_service_identity(root: &Path, id: i64) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(id),
         instance_id: ReplicaInstanceId::new(format!("{name}-pod")),
-        agent_generation: AgentGeneration::new(format!("{name}-agent")),
+        agent_generation: derive_agent_generation(&derive_initialization_id(
+            &ResourceUid::new("sqlite-native-construction"),
+            ReplicaId::new(id),
+            &PodUid::new(format!("{name}-pod")),
+            &PvcUid::new(format!("{name}-pvc")),
+        )),
     }
 }
 
@@ -618,15 +751,9 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
         let acknowledged = baseline(&source).await;
         let old_service = source.service.clone();
         let (ar, diagnostic) = source.stop().await;
-        assert!(
-            matches!(diagnostic, RuntimeError::OperationCancelled),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
         let (br, diagnostic) = target.stop().await;
-        assert!(
-            matches!(diagnostic, RuntimeError::OperationCancelled),
-            "{diagnostic}"
-        );
+        assert!(diagnostic.is_none(), "{diagnostic:?}");
         let mut source = Node::start(&a, 1, ar).await;
         let mut target = Node::start(&b, 2, br).await;
         let epoch = Epoch::new(0, 2);
@@ -651,23 +778,46 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             acknowledged
         );
         let epoch = Epoch::new(0, 3);
+        let promoted = ConfigurationDescriptor::new(
+            epoch,
+            target.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: target.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+            ],
+            2,
+        );
         source
-            .command(PublicOperationProgram::Role {
-                epoch,
-                role: ReplicaRole::ActiveSecondary,
-            })
-            .await;
-        source
-            .command(PublicOperationProgram::Epoch { epoch })
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::ActiveSecondary,
+                    catch_up: None,
+                },
+                ReplicaConfigurationScope {
+                    current: promoted.clone(),
+                    previous: None,
+                    replicas: vec![target.descriptor(ReplicaRole::Primary).await],
+                },
+            )
             .await;
         target
-            .command(PublicOperationProgram::Role {
-                epoch,
-                role: ReplicaRole::Primary,
-            })
-            .await;
-        target
-            .command(PublicOperationProgram::Epoch { epoch })
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: None,
+                },
+                ReplicaConfigurationScope {
+                    current: promoted,
+                    previous: None,
+                    replicas: vec![source.descriptor(ReplicaRole::ActiveSecondary).await],
+                },
+            )
             .await;
         let current = target.pair(&mut source, epoch).await;
         assert_eq!(
@@ -681,14 +831,17 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
             AccessStatus::ReconfigurationPending
         );
         target
-            .command(PublicOperationProgram::CatchUp {
-                configuration: PublicConfiguration {
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                ReplicaConfigurationScope {
                     current,
                     previous: None,
                     replicas: vec![source.descriptor(ReplicaRole::ActiveSecondary).await],
                 },
-                mode: PublicCatchUpMode::All,
-            })
+            )
             .await;
         let server = SqliteServer::new(target.service.clone());
         let promoted = write(&server, "INSERT INTO data VALUES(2,'promoted')")
@@ -743,8 +896,8 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 .is_err()
         );
         let (_, diagnostic) = target.stop().await;
-        let RuntimeError::Application(diagnostic) = diagnostic else {
-            panic!("publication failure lost its application diagnostic: {diagnostic}");
+        let Some(RuntimeError::Application(diagnostic)) = diagnostic else {
+            panic!("publication failure lost its application diagnostic: {diagnostic:?}");
         };
         assert!(
             diagnostic.contains("injected SQLite service cut"),

@@ -151,7 +151,7 @@ impl EngineService {
 }
 
 #[derive(Default)]
-struct ResolverMap(Mutex<BTreeMap<ReplicaId, String>>);
+pub(super) struct ResolverMap(pub(super) Mutex<BTreeMap<ReplicaId, String>>);
 impl ReplicaEndpointResolver for ResolverMap {
     fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
         self.0
@@ -250,7 +250,7 @@ async fn until(mut check: impl FnMut() -> bool) {
     .unwrap();
 }
 
-async fn snapshot(node: &Node<EngineService>) -> ReplicaAgentSnapshot {
+pub(super) async fn snapshot<A: Sample>(node: &Node<A>) -> ReplicaAgentSnapshot {
     let mut client =
         proto::agent_control_client::AgentControlClient::connect(node.control_address.clone())
             .await
@@ -273,8 +273,8 @@ async fn snapshot(node: &Node<EngineService>) -> ReplicaAgentSnapshot {
     *snapshot
 }
 
-async fn submit(
-    node: &Node<EngineService>,
+pub(super) async fn submit<A: Sample>(
+    node: &Node<A>,
     goal: &ReplicaGoal,
 ) -> std::result::Result<(), tonic::Status> {
     let mut client =
@@ -290,7 +290,7 @@ async fn submit(
         .map(|_| ())
 }
 
-async fn settled(node: &Node<EngineService>, goal: &ReplicaGoal) -> ReplicaGoalStatus {
+pub(super) async fn settled<A: Sample>(node: &Node<A>, goal: &ReplicaGoal) -> ReplicaGoalStatus {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let snapshot = snapshot(node).await;

@@ -1118,7 +1118,21 @@ impl PodRuntime {
             }
         }
         let state = self.host.state.read().await;
-        let role = state.projection.role;
+        let role = if self.host.ordinary_contract.load(Ordering::Acquire) {
+            observation_state
+                .as_ref()
+                .and_then(|stored| {
+                    crate::host::ordinary_goal::publication(
+                        stored,
+                        &process_session_id,
+                        &replicator_creation_id,
+                        self.host.ordinary_withdrawn.load(Ordering::Acquire),
+                    )
+                })
+                .map_or(ReplicaRole::None, |publication| publication.role)
+        } else {
+            state.projection.role
+        };
         let (read_status, write_status) = self
             .host
             .selected_status()
@@ -2040,16 +2054,16 @@ impl PartitionAccessView for HostAccessView {
             .public_v1_operation_state
             .as_ref()
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        if preview.terminal
-            && !crate::host::operation::contained_transient_reopen(
-                &state,
-                &host
-                    .replica_session
-                    .get()
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?
-                    .1,
-            )
-        {
+        let process = &host
+            .replica_session
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?
+            .1;
+        if if host.ordinary_contract.load(Ordering::Acquire) {
+            crate::host::ordinary_goal::terminal_for_process(preview, process)
+        } else {
+            preview.terminal && !crate::host::operation::contained_transient_reopen(&state, process)
+        } {
             return Err(RuntimeError::Closed);
         }
         let endpoint = crate::host::native_transport::NativeEndpoint {

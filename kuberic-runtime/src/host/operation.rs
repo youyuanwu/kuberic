@@ -2332,10 +2332,13 @@ impl PartitionOperationRegistry {
         }) {
             self.fence();
         }
-        if durable
-            .public_v1_operation_state
-            .is_some_and(|preview| preview.terminal)
-        {
+        if durable.public_v1_operation_state.is_some_and(|preview| {
+            preview.terminal
+                && crate::host::ordinary_goal::terminal_for_process(
+                    &preview,
+                    &self.process_session_id,
+                )
+        }) {
             // A contained predecessor fault can remain in a replacement's
             // journal. Only this process's terminal records close it forever.
             self.fence_session_renewal();
@@ -2576,6 +2579,13 @@ fn ordinary_relation(
     completed: bool,
 ) -> AdmissionRelation {
     use AdmissionRelation::*;
+    if existing.process_session_id != incoming.process_session_id {
+        return if completed {
+            Coexist
+        } else {
+            Reject("predecessor ordinary creation remains unresolved")
+        };
+    }
     if existing.class.is_terminal() {
         return Reject("ordinary creation already has an immutable terminal owner");
     }

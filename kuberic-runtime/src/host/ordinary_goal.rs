@@ -258,10 +258,11 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
         };
     }
     if goal.class().is_terminal()
-        && preview
-            .operations
-            .values()
-            .any(|record| record.intent.goal().is_some() && record.intent.class.is_terminal())
+        && preview.operations.values().any(|record| {
+            record.intent.goal().is_some()
+                && record.intent.process_session_id == goal.scope.process_session_id
+                && record.intent.class.is_terminal()
+        })
     {
         return Err(reject(
             "terminal creation already has an immutable goal owner",
@@ -283,7 +284,9 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
             {
                 continue;
             }
-            if previous.class().is_terminal() || preview.terminal {
+            if previous.class().is_terminal()
+                || terminal_for_process(preview, &goal.scope.process_session_id)
+            {
                 return Err(reject(
                     "withdrawn creation requires contained process replacement",
                 ));
@@ -470,6 +473,40 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
     Ok(())
 }
 
+pub(crate) fn terminal_for_process(
+    preview: &PublicV1OperationState,
+    process: &ProcessSessionId,
+) -> bool {
+    if !preview.terminal {
+        return false;
+    }
+    let terminals = preview
+        .operations
+        .values()
+        .filter(|record| record.intent.class.is_terminal())
+        .collect::<Vec<_>>();
+    // An older clean Close cannot clear a later preparation or join failure.
+    let settled_boundary = terminals
+        .iter()
+        .map(|record| record.intent.revision)
+        .max()
+        .unwrap_or(0);
+    terminals.is_empty()
+        || preview.operations.values().any(|record| {
+            record.intent.revision > settled_boundary
+                && (record.stage != PublicOperationStage::Completed
+                    || record.disposition != Some(PublicOperationDisposition::Succeeded)
+                    || record.lifecycle.in_flight.is_some())
+        })
+        || terminals.iter().any(|record| {
+            record.intent.goal().is_none()
+                || &record.intent.process_session_id == process
+                || record.stage != PublicOperationStage::Completed
+                || record.disposition != Some(PublicOperationDisposition::Succeeded)
+                || record.lifecycle.in_flight.is_some()
+        })
+}
+
 pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryGoalRecord> {
     if let Some(existing) = state
         .public_v1_operation_state
@@ -562,7 +599,7 @@ pub(crate) fn publication(
     withdrawn: bool,
 ) -> Option<ReplicaPublication> {
     let preview = state.public_v1_operation_state.as_ref()?;
-    if withdrawn || preview.terminal {
+    if withdrawn || terminal_for_process(preview, process) {
         return None;
     }
     let mut records = preview

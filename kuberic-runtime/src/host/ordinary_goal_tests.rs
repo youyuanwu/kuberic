@@ -55,6 +55,7 @@ struct Probe {
     factory_gate: Semaphore,
     factory_entered: Semaphore,
     factory_listener: StdMutex<Option<TcpListener>>,
+    replacement_return: StdMutex<Option<Arc<Probe>>>,
 }
 
 impl Probe {
@@ -103,6 +104,7 @@ impl Probe {
             factory_gate: Semaphore::new(0),
             factory_entered: Semaphore::new(0),
             factory_listener: StdMutex::new(None),
+            replacement_return: StdMutex::new(None),
         })
     }
 }
@@ -194,7 +196,13 @@ impl StatefulServiceReplica for Application {
                 }),
             )
             .await?;
-        Ok(interfaces.replicator())
+        let replacement = self.0.replacement_return.lock().unwrap().clone();
+        if let Some(replacement) = replacement {
+            replacement.open().await?;
+            Ok(replacement)
+        } else {
+            Ok(interfaces.replicator())
+        }
     }
     async fn change_role(&self, _: ReplicaRole) -> crate::Result<RoleChange> {
         Ok(RoleChange {
@@ -1751,12 +1759,99 @@ async fn ordinary_goal_primary_activation_requires_current_only_successful_catch
 }
 
 #[tokio::test]
+async fn m2_ordinary_creation_cleanup_is_retained_for_a_different_returned_control() {
+    let fixture = Fixture::new(1, false).await;
+    let replacement = Probe::new();
+    replacement.block_close.store(true, Ordering::Release);
+    fixture.probe.block_close.store(true, Ordering::Release);
+    *fixture.probe.replacement_return.lock().unwrap() = Some(replacement.clone());
+    fixture.submit(&fixture.goal).await.unwrap();
+    entered(&replacement.close_entered).await;
+    let address = replacement
+        .listener
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let pending = fixture.snapshot().await;
+    assert!(pending.publication.is_none() && pending.provider_writer_held);
+    assert_ne!(pending.read_status, AccessStatus::Granted);
+    assert_ne!(pending.write_status, AccessStatus::Granted);
+    replacement.close_gate.add_permits(1);
+    entered(&fixture.probe.close_entered).await;
+    assert!(fixture.snapshot().await.provider_writer_held);
+    fixture.probe.close_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fixture.snapshot().await.provider_writer_held {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let settled = fixture.snapshot().await;
+    assert!(settled.withdrawn && settled.publication.is_none());
+    assert!(
+        settled.goals.iter().any(|entry| entry.goal == fixture.goal
+            && matches!(entry.status, ReplicaGoalStatus::Failed(_)))
+    );
+    assert_eq!(replacement.close_calls.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 1);
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn m2_ordinary_creation_cleanup_failure_of_different_returned_control_is_sticky() {
+    let fixture = Fixture::new(1, false).await;
+    let replacement = Probe::new();
+    replacement.fail_close.store(true, Ordering::Release);
+    *fixture.probe.replacement_return.lock().unwrap() = Some(replacement.clone());
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.failed(&fixture.goal).await;
+    for _ in 0..2 {
+        let error = fixture.runtime.shutdown_and_drain().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different returned Replicator Close failed"),
+            "{error}"
+        );
+    }
+    let snapshot = fixture.snapshot().await;
+    assert!(snapshot.withdrawn && snapshot.publication.is_none() && snapshot.provider_writer_held);
+    assert_eq!(replacement.close_calls.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 1);
+    fixture.shutdown.send_replace(true);
+    let _ = fixture.server.await.unwrap();
+}
+
+#[tokio::test]
 async fn ordinary_goal_build_does_not_replace_serving_primary_access_owner() {
     let (source, target, mut selection) = remote_pair().await;
     let catch_up = catch_up_goal(&source, 2);
     source.submit(&catch_up).await.unwrap();
     selection.source = source.achieved(&catch_up).await.publication.unwrap();
     assert_access(&source, AccessStatus::Granted).await;
+    let mut control =
+        proto::agent_control_client::AgentControlClient::connect(source.address.clone())
+            .await
+            .unwrap();
+    let response = control
+        .get_status(auth(proto::GetAgentStatusRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let report = crate::control::normalize_public_v1_agent_status_report(response).unwrap();
+    assert_eq!(report.role, ReplicaRole::Primary);
+    assert_eq!(report.progress.role, PublicProgressRole::Primary);
+    assert!(matches!(
+        report.progress.current_progress,
+        ProgressQueryResult::NotQueried(_)
+    ));
+    assert_eq!(report.write_status, AccessStatus::Granted);
+    assert_eq!(source.probe.progress_calls.load(Ordering::Acquire), 0);
     let mut build = source.goal.clone();
     build.operation_id = OperationId::new("serving-build");
     build.revision = 3;

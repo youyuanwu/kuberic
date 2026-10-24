@@ -3,10 +3,13 @@
 **IMPLEMENTED: generic host/controller contract.** This is a development
 checkpoint, **not a deployable default-engine stack**. M2's built-in V1 factory
 now opens through ordinary hosting with engine-owned authenticated sessions and
-retained native/transport Close. KVStore2, SQLite, the external provider example
-and PostgreSQL still reject ordinary application integration before Open effects;
-their consumer conversion remains M2 work. See the bounded
-[built-in selection](testing.md#built-in-m2-engine-slice), not the historical wrappers.
+retained native/transport Close. The in-progress M2 application slice connects
+KVStore2, SQLite and the external provider to that route, including durable copy,
+separate admission/access and ordinary application joins. PostgreSQL integration
+remains outstanding. See the bounded
+[engine](testing.md#built-in-m2-engine-slice) and
+[application selections](testing.md#built-in-m2-application-slice), not a claim
+that the complete M2 milestone or historical recovery journeys are qualified.
 Comprehensive recovery/failover qualification is **M3, not implemented**.
 See the [roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
 

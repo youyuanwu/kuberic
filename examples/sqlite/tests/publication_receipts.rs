@@ -197,18 +197,15 @@ impl Fixture {
     async fn stop(mut self, expected: Option<&str>) {
         self.running.shutdown();
         self.running.wait().await.unwrap();
-        let diagnostic = self.service.shutdown_and_drain().await.unwrap_err();
+        let diagnostic = self.service.shutdown_and_drain().await;
         match expected {
-            None => assert!(matches!(
-                diagnostic,
-                kuberic_runtime::RuntimeError::OperationCancelled
-            )),
+            None => diagnostic.unwrap(),
             Some(message) => assert!(
                 matches!(
                     diagnostic,
-                    kuberic_runtime::RuntimeError::Application(ref reason) if reason.contains(message)
+                    Err(kuberic_runtime::RuntimeError::Application(ref reason)) if reason.contains(message)
                 ),
-                "{diagnostic}"
+                "{diagnostic:?}"
             ),
         }
         drop(self.server);

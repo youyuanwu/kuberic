@@ -46,6 +46,56 @@ struct Engine {
     trace: StdMutex<Vec<&'static str>>,
 }
 
+#[tokio::test]
+async fn production_ordinary_builtin_copies_actual_application_bytes_before_admission() {
+    let mut harness = Harness::new(
+        super::super::tests::EmptyFactory,
+        NAMESPACE.into(),
+        NAME.into(),
+        "ordinary-builtin".into(),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        3,
+    )
+    .await
+    .unwrap();
+    let result = async {
+        assert_eq!(harness.ready_members(3).await?, 1);
+        let snapshots = harness.ordinary_snapshots().await?;
+        assert_eq!(snapshots.len(), 3);
+        for snapshot in snapshots {
+            let publication = snapshot.publication.unwrap();
+            assert_eq!(publication.stage, ReplicaPublicationStage::AchievedScope);
+            assert!(publication.scope.configuration.previous.is_none());
+            assert_eq!(publication.scope.configuration.current.members.len(), 3);
+            let id = snapshot.storage.replica.replica_id.value();
+            if id != 1 {
+                let root = harness
+                    .data_root(snapshot.storage.replica.instance_id.as_str())
+                    .await?;
+                assert_eq!(
+                    std::fs::read(root.join("application/copied-state"))?,
+                    b"empty-provider-v1"
+                );
+                assert_ne!(snapshot.read_status, AccessStatus::Granted);
+                assert_ne!(snapshot.write_status, AccessStatus::Granted);
+            } else {
+                assert_eq!(snapshot.write_status, AccessStatus::Granted);
+                assert_eq!(snapshot.remote_operations.len(), 2);
+                assert!(
+                    snapshot
+                        .remote_operations
+                        .iter()
+                        .all(|remote| remote.accepted)
+                );
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    harness.finish(result).await.unwrap();
+}
+
 impl Engine {
     fn new(root: PathBuf, held: bool) -> Arc<Self> {
         Arc::new(Self {
