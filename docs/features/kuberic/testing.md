@@ -445,7 +445,7 @@ power-loss or production-certification result is implied. See
 
 Targeted runs for the host-alignment revision exercise the real selected
 `ReplicaHost` and default public factory. The
-[stage witnesses](../../../kuberic-runtime/tests/support/staged_access.rs#L144-L2159)
+[stage witnesses](../../../kuberic-runtime/tests/support/staged_access.rs)
 hold actual executor/callback boundaries and attempt committed service reads
 and raw sequence assignment, not only a private selector. They cover joint/
 current-only same-primary, missing C/P, split/recipe promotion, current-only/
@@ -456,9 +456,12 @@ repromotion after completed/interrupted demotion, including superseded
 promotion/secondary-role/Swap reservations and nonactivating configuration.
 Native role/epoch is reconciled only for compatible lineage; fresh role/
 configuration/catch-up/activation still controls serving access.
-The split-promotion observer-drop witness crosses authenticated control RPC;
-other testing-handle entries are selected-host evidence, not all RPC-ingress
-qualification.
+At M1 these are selected-engine component witnesses entered through the testing
+handle, including split-promotion observer cancellation. The legacy callback-
+program RPC has a separate rejection/no-mutation witness; it is not a supported
+production entry. Production ordinary-goal transport and retained response
+ownership are qualified by the [M1 regressions](#ordinary-hosting-m1), not these
+legacy component programs.
 
 [Close witnesses](../../../kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505)
 observe child failure, durable diagnostic, outer outcome, Abort and retained
