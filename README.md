@@ -9,15 +9,16 @@ level-triggered stack provides the Public V1 replication, copy, history,
 session, fencing, and lifecycle contracts plus an experimental namespace-bound
 controller and owned-cluster validation harness.
 
-The production control loop initializes fresh agents, originates exact
-topology authority, renews restarted process sessions, builds and admits
-same-cardinality replacements, and performs delayed failover from observation.
-Committed application state remains provider-owned; agent schema 14 stores
-history and lifecycle authority.
+The production control loop now uses the [ordinary hosting M1 contract](docs/features/kuberic/ordinary-hosting-m1.md):
+format-15 semantic replica goals, early peer discovery, retained ordinary calls,
+and exact Build outcomes before separate admission. Application state remains
+provider-owned. This is a development checkpoint, not a deployable default-engine
+stack: built-in/KV/SQLite/PostgreSQL production integration is explicitly
+unavailable until M2; comprehensive recovery/failover qualification is M3.
 
-The sole default Replicator now composes the source-guided Service Fabric classic
-V1 owners. Assignment, quorum completion and service-local commitment are
-separate; KVStore2 and SQLite own durable commit and client publication.
+The retained default Replicator composes source-guided Service Fabric classic V1
+owners for component/M2 work. Assignment, quorum completion and service-local
+commitment remain separate; no M2 engine-session completion is claimed.
 
 ## Repository
 
@@ -61,7 +62,8 @@ cargo check --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --doc --workspace --all-features
-just nextest-test
+cargo nextest list --workspace --all-features --profile ordinary
+cargo nextest run --workspace --all-features --profile ordinary
 ```
 
 PostgreSQL validation requires compatible host-local PostgreSQL binaries and an
@@ -92,36 +94,24 @@ application/provider tests execute from archive partitions.
 
 ## Experimental Kubernetes Validation
 
-The retained controller and KVStore2 Dockerfiles are development/CI assets.
-They are not published release images.
-
-```bash
-export KIND_CLUSTER_NAME=kuberic-level-dev
-mkdir -p target/kuberic-level-dev
-export KUBECONFIG="$PWD/target/kuberic-level-dev/kubeconfig"
-export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
-export KUBERIC_AGENT_BEARER_TOKEN=local-level-triggered-token
-
-just create-kind-cluster
-just level-triggered-images
-just level-triggered-install
-just level-triggered-kind-test bootstrap replacement failover
-just delete-kind-cluster
-```
-
-Use nondefault owned cluster coordinates. The recipes verify the exact
-cluster/context/kubeconfig tuple before every mutation and deletion.
+The retained controller and KVStore2 Dockerfiles/owned-cluster recipes are
+development assets, not published release images. Their old default-engine
+bootstrap/replacement/failover scenarios are **not supported or newly qualified
+at M1**. Wait for M2 engine integration before treating them as deployment
+instructions. Generic M1 acceptance uses real agent transport with an in-process
+Kubernetes storage boundary; it does not claim live-cluster validation.
 
 ## Applications
 
 ### KVStore2
 
-The conformance application exercises the complete level-triggered controller,
+The retained pre-M1 conformance application exercised the level-triggered controller,
 agent and runtime path through an HTTP key/value API. Its retained isolated
 live scenarios cover fresh bootstrap with process-session renewal,
 same-cardinality replacement with preserved data, and sustained-outage
 failover with old-primary fencing; the broader behavioral matrix runs in the
-cluster-free runtime/provider tiers.
+cluster-free runtime/provider tiers. Ordinary production Open now rejects
+explicitly until M2; these historical journeys are not current formation proof.
 
 ### SQLite
 
@@ -129,6 +119,7 @@ cluster-free runtime/provider tiers.
 committed snapshots and retained catch-up through Public V1. Fresh replacement
 storage is required; prior provider state is rejected unchanged. See the
 [SQLite design](docs/features/sqlite/design.md).
+Ordinary production integration is unavailable until M2.
 
 ### PostgreSQL
 
@@ -138,6 +129,8 @@ promotion while Kuberic owns generic authority and lifecycle choreography.
 It uses the Public V1 lifecycle and owns rejection of its prior provider
 formats. See the
 [PostgreSQL design](docs/features/postgres/design.md).
+Ordinary production integration is unavailable until M2; native component
+qualification does not imply replacement-session support.
 
 ## Distribution Status
 
@@ -152,8 +145,9 @@ the isolated development/CI assets above.
 ## Documentation
 
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
-- [Classic V1 current semantics](docs/features/kuberic/classic-v1-runtime.md)
-- [SF hosting target design — PROPOSED, not implemented](docs/features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+- [Ordinary hosting M1 — implemented contract and checkpoint limits](docs/features/kuberic/ordinary-hosting-m1.md)
+- [Classic V1 component semantics and pre-M1 evidence](docs/features/kuberic/classic-v1-runtime.md)
+- [SF hosting target — M1 delivered, M2/M3 proposed](docs/features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
 - [Future runtime roadmap and remaining qualification](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
 - [SF V1 current evidence/dispositions](docs/features/kuberic/sf-v1-port-ledger.md) and [source provenance/notices](docs/features/kuberic/sf-v1-port-provenance.md)
 - [V2 transactional Replicator design](docs/features/kuberic/v2-transactional-replicator-design.md)

@@ -1,10 +1,15 @@
 # Classic V1: Current Semantics
 
-**CURRENT behavior.** The [proposed ordinary-engine boundary](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
-and [future runtime roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
-are **NOT IMPLEMENTED** and do not change the contracts on this page.
+**Component semantics and historical production evidence.**
+[Ordinary hosting M1](ordinary-hosting-m1.md) is now the current host/controller
+contract with matched format 15. Built-in/KV/SQLite/PostgreSQL production
+integration is explicitly unavailable until M2; old production journey names
+assert support rejection, not their historical later positive clauses.
+The component algorithms and explicitly pinned pre-M1 evidence below remain;
+do not interpret their grant/companion/renewal/failover descriptions as the new
+production route. [M2/M3 remain proposed](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
 
-The [current engine-neutral hosting contract](engine-neutral-hosting.md#current--delivered-bounded-hosting) supersedes
+The [pre-M1 engine-neutral hosting contract](engine-neutral-hosting.md#current--delivered-bounded-hosting) superseded
 older host-only anchors below for common admission, retained authority,
 observation separation and public terminal outcomes. Its implementation is
 anchored through `91a2a93c3c7cf9477adb3a0d27e674b99f741a8a`; older queue/
@@ -413,6 +418,11 @@ and [fresh provenance predicate](../../../kuberic-controller/src/evaluator/publi
 | Abort | Retained cleanup owns grant cancellation/gateway drain ([PG:500–516][pg-abort], [tests:940–1050][pg-abort-test]) | Existing process/socket/listener observations without prior Close/Drop are not synchronous arbitrary-work join or production latency guarantees. |
 
 ## Production policies and security
+
+**Format-15 checkpoint:** the production host/control/CRD format is now 15
+([fresh-deployment contract](ordinary-hosting-m1.md#fresh-deployment-format)).
+The protocol-13/schema-14 and carrier policies below describe the retained
+pre-M1 engine baseline, not a supported old deployment or M2 integration.
 
 These are **selected fixed policies**, not complete native public defaults or
 settings parity ([production:40–66][policies], [121–190][production-policy]):

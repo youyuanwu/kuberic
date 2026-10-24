@@ -1,5 +1,11 @@
 # SQLite: Replicated SQLite on Kuberic Public V1
 
+**M1 checkpoint:** [ordinary hosting](../kuberic/ordinary-hosting-m1.md) uses
+matched format 15. SQLite production Open explicitly rejects before initialization/
+committer effects until M2 built-in session integration. The component storage/
+publication behavior below remains; old production journey names now check
+unavailability rather than executing their later copy/restart clauses.
+
 ## Selected classic V1 companion
 
 The application now selects `src/v1.rs` for retained SQL/WAL publication and uses
@@ -8,7 +14,7 @@ separates early assignment, native quorum completion, durable frame commitment,
 WAL publication and client success. Secondary durability precedes parameterless
 ACK; pending native progress is not a SQL visibility grant.
 
-The selected wire/agent formats are protocol 13 / schema 14
+The pre-M1 wire/agent formats were protocol 13 / schema 14
 ([current format authority](../kuberic/classic-v1-runtime.md#production-policies-and-security)). Old formats reject
 without migration or silent reset. Close drains accepted queued transactions;
 intentional Abort cancellation remains distinct from worker, storage, reporter

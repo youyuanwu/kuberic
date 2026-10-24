@@ -9,6 +9,13 @@ was run for the selected-host changes. Read
 [source/test provenance](sf-v1-port-provenance.md) for what each evidence class
 does and does not establish.
 
+**Current checkpoint:** [ordinary hosting M1](ordinary-hosting-m1.md) is
+implemented. Built-in/KV/SQLite/PostgreSQL production integration is explicitly
+unavailable until M2. Changed old production journey names check exact
+unavailability; their historical copy/failover/terminal clauses do not execute.
+Do not report those green wrappers as M2 acceptance. Actual engine/component
+negatives and the new ordinary host/production journeys are distinct selections.
+
 ## Recording Evidence
 
 For a qualification claim, record the selected revision, environment, exact
@@ -23,7 +30,57 @@ Use the live inventory rather than fixed test totals. A successful local run
 does not erase the [remaining claim-specific gaps](sf-v1-semantic-alignment-plan.md#p2--focused-qualification-not-presumed-defects)
 or verify a different mode, fault scope, power-loss boundary or deployment.
 
+## Ordinary hosting M1
+
+Actual M1 production and host selections were executed with an independent
+ordinary factory, real listeners, authenticated agent transport and locally
+retained callbacks. Production uses an in-process Kubernetes storage model with
+generated structural-schema status pruning, not a live API server.
+
+```sh
+cargo nextest list -p kuberic-controller --all-features --profile ordinary \
+  -E 'test(/production_ordinary_/)'
+cargo nextest run -p kuberic-controller --all-features --profile ordinary \
+  -E 'test(/production_ordinary_/)'
+cargo nextest list -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(/ordinary_goal/)'
+cargo nextest run -p kuberic-runtime --lib --all-features --profile ordinary \
+  -E 'test(/ordinary_goal/)'
+```
+
+They cover held multi-replica recovery/progress and mutual discovery under closed
+copy/voting/serving, Open/receipt gaps, retained/lost responses, nonempty fixture
+copy and exact Ready before separate admission, stale/two-ended publication,
+failed preparation, actual engine/service/host joins and provider-writer fencing,
+negative generations/bounds and same-format interrupted-call uncertainty.
+The crash-image fixture does not claim process-kill or power-loss proof.
+
+Validation also executed workspace format/check/strict clippy/build/doctests,
+controller/native-component/host regressions, generated CRD, protected method/
+source/API/privacy/package gates, normal-feature external package and authorized
+PostgreSQL smoke. Each nextest selection was live-listed first. No full PG,
+destructive `just nextest-test`, shared-target deletion, old-state import/data
+reset, native executable or KinD run was used.
+
+Real native/component algorithms remain separately exercised with
+`-p kuberic-runtime --lib --all-features --profile ordinary -E 'test(/^replicator::/)'`;
+list before run. Routine PG smoke runs real native cases alongside explicitly
+unsupported hosted-controller cases: a passing smoke is not M2 replacement-session
+or current production SQL/copy acceptance. Remaining M2/M3 work is in the
+[roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
+
+Task-owned executable build/scratch storage can be selected with
+`CARGO_TARGET_DIR` and `TMPDIR`; do not delete shared outputs to make room.
+The M1 execution used owned `/dev/shm` directories on a Linux host where that
+mount was executable, plus disabled incremental/debug output. This is resource
+placement, not permission/trust bypass. Use short owned PG scratch paths and
+retain exact command/environment/revision/outcome evidence.
+
 ## Engine-neutral hosting
+
+**Pre-M1 evidence and reproduction context.** The native/component properties
+below remain relevant, but their old production grant/controller witnesses are
+not current M2 positives. Use the M1 selections above for the replacement path.
 
 The [bounded hosting map](engine-neutral-hosting.md) distinguishes host
 installation, exact remote Build state and optional actual engine observations.
@@ -93,11 +150,12 @@ explicit decision, not routine smoke.
 
 The [target boundary](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
 and [M1–M3 roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
-are **NOT IMPLEMENTED**. Commands below select **existing baseline** evidence
+are now split: **M1 is implemented; M2/M3 are NOT IMPLEMENTED**.
+Commands below identify **historical baseline** evidence
 at `b37009f8af7a7b2ed91f58f4889ed74e06013861`; they were source-inspected, not
-run for this design/docs delivery. A passing current grant/coordinator test
-cannot qualify its future replacement. No runtime/PG/build is required for a
-Markdown change.
+run for the prior design/docs delivery. A passing grant/coordinator component
+test cannot qualify replacement engine sessions. Old production selectors may
+now execute support-unavailable checks rather than their historical clauses.
 
 Before a later authorized run, use the identical package/features/profile/
 expression with `cargo nextest list` instead of `run`, inspect a nonempty
@@ -515,6 +573,12 @@ native binary oracle.
 
 ## PostgreSQL
 
+**M1 support limit:** current hosted-controller journey names assert exact M2
+unavailability before PG initialization; later historical SQL/backup/containment
+clauses are not executed. Native engine cases in the authorized smoke still
+execute. The detailed positive evidence below is pinned pre-M1 context, not
+new production integration acceptance.
+
 Routine separately authorized reproduction:
 
 ```bash
@@ -533,12 +597,12 @@ PG implementation/regressions are
 [`public_v1.rs`](../../../examples/postgres/src/public_v1.rs),
 [`public_v1_tests.rs`](../../../examples/postgres/src/public_v1_tests.rs) and
 [`public_v1_p6_tests.rs`](../../../examples/postgres/src/public_v1_p6_tests.rs).
-The independent
+The pre-M1 independent
 [`public_controller_tests.rs`](../../../examples/postgres/src/public_controller_tests.rs)
-uses production PgService, native PostgreSQL processes/RPCs and real controller
-dispatch. It is not a raw built-in bundle wrapper or a direct native-only Build
-fixture. Its selected names cover formation, delayed source/target invalidation
-and cleanup failure; the smoke catalog includes them.
+used production PgService, native PostgreSQL processes/RPCs and real controller
+dispatch. The current selected wrappers assert exact M2 unavailability before
+PG effects; their later formation/invalidation/cleanup bodies do not execute.
+They are included in smoke alongside genuinely executed native component cases.
 The `_p6` filename identifies existing tests, not today's roadmap cursor.
 Evidence distinguishes live-status drain, idle/slot retirement, orderly
 terminal progress, marked-successor WriteQuorum rejection, ordinary unmarked
@@ -549,6 +613,11 @@ Do not infer native differential, arbitrary survivor election, WAL-growth SLA
 or power-loss proof from these process/file observations.
 
 ### Custom-native controller reproduction and limits
+
+The commands remain the authorized current smoke entry points. Detailed positive
+controller evidence in the following paragraphs is pinned **pre-M1 history**,
+not execution of the current unavailable wrappers. Do not count those later
+clauses as current SQL/backup/terminal integration proof.
 
 Keep both scratch roots owned by the checkout, inventory the live selector,
 then run the authorized smoke entry point:
@@ -638,7 +707,11 @@ doctests run separately. Inventory counts are computed, not fixed here.
 
 ## Owned KinD Scenarios
 
-Only an explicitly owned disposable cluster may run live scenarios:
+**Unsupported retained assets at M1.** The default-engine Open gate means the
+bootstrap/replacement/failover recipe below is not a working current validation
+path; no KinD acceptance ran for M1. Wait for M2 and its separately qualified
+deployment before using it as reproduction. Its historical ownership rules
+still require an explicitly owned disposable cluster:
 
 ```bash
 export KIND_CLUSTER_NAME=kuberic-level-dev
@@ -656,8 +729,8 @@ just delete-kind-cluster
 ```
 
 The [ownership recipes:138–210](../../../justfile#L138-L210) require an explicit
-receipt and reject default/shared cluster coordinates. Bootstrap/replacement/
-failover inspect real deployment resources, authority, data and stale-writer
+receipt and reject default/shared cluster coordinates. The pre-M1 bootstrap/replacement/
+failover scenarios inspected real deployment resources, authority, data and stale-writer
 fencing, with sustained containerd pause/resume in failover; see
 [live tests](../../../kuberic-level-tests/tests).
 Do not run this tier to validate a Markdown edit or confuse it with native SF
