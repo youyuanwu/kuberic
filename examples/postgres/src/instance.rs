@@ -1318,6 +1318,7 @@ impl PgInstanceManager {
                     "fast",
                     "-R",
                     "-w",
+                    "--no-clean",
                 ]),
                 Some((std::time::Duration::from_secs(60), "public pg_basebackup")),
             )

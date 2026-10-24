@@ -1,15 +1,11 @@
 # PostgreSQL: Native Replication on Kuberic Public V1
 
-**M1 checkpoint:** the [generic ordinary host/controller](../kuberic/ordinary-hosting-m1.md)
-is implemented. **M2 is partial:** PG now owns its authenticated endpoint,
-private session protocol and retained ordinary terminal lifetime; native
-session/effect binding and fresh ordinary admission remain unfinished.
-PgService still rejects ordinary production Open before PostgreSQL/
-listener/application initialization. Existing hosted-controller journey names
-assert exact M2 unavailability; their later SQL/backup/terminal clauses do not
-execute. Real native component smoke cases still run, not replacement-session
-acceptance. The engine architecture and explicitly historical positive
-controller evidence below do not establish current production integration.
+**Hosting M2 integration:** PostgreSQL owns its authenticated ordinary endpoint,
+two-ended native transfer sessions and retained terminal lifetime through the
+[ordinary host/controller](../kuberic/ordinary-hosting-m1.md). Controller fixtures
+exercise real backup, WAL replay, native membership and separately gated SQL;
+an unavailable response is not a positive witness. This bounded integration is
+not completion of the entire M2 workflow or comprehensive M3 recovery policy.
 
 The `postgres-replicated` package supplies an independent native engine for the
 level-triggered Public V1 runtime and its pre-M1 custom-controller route.
@@ -26,9 +22,9 @@ means completed native copy, unlike V1 membership that can appear during copy;
 neither grants voting or SQL access. Production callback repeatability remains
 conservative in that baseline. Pinned pre-M1 controller-dispatched hosted terminal cases retained child
 Close failure after successful cleanup and reject lost native joins, alongside
-the real backup/replay/SQL-fencing formation witnesses. At M1 the current
-generic host contract is [ordinary hosting](../kuberic/ordinary-hosting-m1.md);
-current PG hosted test wrappers prove only explicit integration unavailability.
+the real backup/replay/SQL-fencing formation witnesses. The current generic contract is
+[ordinary hosting](../kuberic/ordinary-hosting-m1.md), with engine-owned transfer
+authority rather than the historical controller-installed grant.
 
 Use the current protocol/schema declared by the
 [runtime guide](../kuberic/classic-v1-runtime.md#production-policies-and-security).
@@ -72,8 +68,7 @@ without adding methods to the protected native traits. Although attachment is
 optional for a bundle, pre-M1 controller Build required it. This was a real
 extra boundary beyond SF's ordinary custom-replicator integration, not justified
 merely by describing it as local. Current M1 production never uses this route;
-PG Open rejects until M2 native effect/admission integration. The current PG
-factory no longer attaches that companion or supplies a callback-ownership
+The current PG factory no longer attaches that companion or supplies a callback-ownership
 policy: ordinary `Abort` fences admission and ordinary `Close` retains cleanup.
 
 PG's ordinary replicator Open binds the actual configured data listener before
@@ -84,8 +79,8 @@ storage, process, creation, endpoint, history and epoch. Target reservation
 precedes source Active confirmation; retirement and confirmation share a local
 gate, retained tombstones are bounded, and unresolved remote ownership remains
 quarantined. Session-control completion is not native copy completion, Ready,
-voter admission or SQL permission. The native transfer/handover connection to
-this session owner remains the next M2 slice.
+voter admission or SQL permission. The same retained session owns native
+copy-to-peer handover and the bounded joint-to-current continuation below.
 
 PostgreSQL uses the same common lifecycle owner as the built-in engine but does
 not register the built-in replication/copy data plane. Delayed native callback
@@ -162,30 +157,28 @@ managed lifetime; there is no independent orphan self-fencing mechanism.
 
 ## Native Build and Catch-Up
 
-**Pre-M1 retained engine/component protocol and historical controller route.**
-The current M1 controller never dispatches target grant installation, and PG
-ordinary production Open rejects pending M2. The native safety mechanisms in
-this subsection are retained consumers, not current production acceptance.
+Hosted Build authority is the PG-private session nonce/generation and its two
+achieved origins, not a controller operation, descriptor Build ID or installed
+host grant. The target reserves its single native receiver before source Active
+confirmation. Source confirmation and retirement linearize under the same local
+session gate; no network await holds that gate. Native inbound work remains
+owned independently of RPC observers.
 
-The pre-M1 controller installed exact inbound authority before source dispatch.
-PostgreSQL's hosted native Build envelope carries that full authority: both
-replica/storage/process endpoints, history, epoch, configuration and operation/
-Build attempt. The creation-bound source context resolves only its accepted
-running Build. Target installation alone is not source liveness; native source
-inspection independently validates the source journal and grant.
-
-The selected native owner revalidates around gateway creation, destructive
-backup/receiver work, asynchronous completion cuts and publication. Native
+The native owner revalidates around gateway creation, backup/receiver work,
+asynchronous completion cuts and publication. Native
 `pg_basebackup`, compatible system/timeline history, receive **and replay** at
 the captured source boundary, and a checkpoint establish its actual completion.
 Its exact process-local completion cache also revalidates durable/physical
-history and live source/target authority; it is not a durable generic-agent
-database receipt or permission to reopen revoked ingress.
+history and fresh source Active confirmation. Cache observers never acquire
+transfer mutation or process-cleanup ownership. Backup uses `--no-clean`:
+failure does not automatically remove partially written PGDATA, and existing
+history rejects before another physical installation. Ordinary paths never
+clear, reset or reinitialize retained data.
 
 Target preflight and cached source-inspection reads observe captured work
 cancellation without acquiring process cleanup authority. Graceful Close can
 interrupt those reads before its final durable observation and lifetime join.
-Source slot retirement revalidates the hosted attempt before each new mutating
+Source slot retirement revalidates the exact session before each new mutating
 SQL retry; this does not roll back an already-issued SQL statement.
 
 PGDATA helpers, native gateways and their retained join owners remain
@@ -197,16 +190,50 @@ Terminal and periodic paths transfer every gateway to retained drain ownership
 before awaiting any exit. Each completed drain outcome is shared immediately,
 so dropping a Close while another exit is pending loses neither the remaining
 gateways nor an already-observed failure.
-Revocation removes copy ingress, not copied data or voter
-membership. A different uncertain receiver attempt requires containment/process
-replacement, not an in-place metadata reset. Failed/interrupted custom callbacks
+Source Remove retires local ownership; it does not certify target containment.
+Exact remote retirement is retried and unresolved ownership remains quarantined.
+A different uncertain receiver requires actual settlement, not an in-place
+metadata reset. A source still being Primary is not Active confirmation.
+Copied data and native durable metadata are retained. Failed callbacks
 can remain `ContainmentPending` until explicit terminal cleanup; this bounded
 route does not promise arbitrary failed-Build automatic reformation.
 
+Source joint configuration installs and reads back its local exact native
+policy without awaiting target ActiveSecondary. A retained membership worker
+uses the completed copy's same reservation, nonce, gateway, slot and ACK name
+after actual target Role/Epoch callbacks. It joins the old owned receiver before
+handover, preserving lineage and data. Compatible same-role/epoch callbacks do
+not blanket-drain transport.
+
+Only the exact joint `(P,C)` to current-only `(None,C)` edge retains continuation
+for unchanged C, primary, identities, history and epoch. The bounded monotonic
+phase lives in the existing session owner. Its achieved origins allow only
+that existing session to progress while either latest publication is
+DiscoveryPending; pending never creates fresh transfer authority or serving
+permission. The worker need not observe the fleeting joint publication.
+Current-only policy is compiled/read back for C using the same session-qualified
+ACK names. Actual exact-session catch-up precedes the host receipt; SQL remains
+separately gated by achieved ordinary scope and native readiness.
+
+Missing, withdrawn, incompatible, uncertain, retired or quarantined ownership
+invalidates continuation. A delayed joint request cannot downgrade current-only
+permission. Native gateway validation waits for the owned physical SQL-access
+fence/restart to settle before checking history, rather than misclassifying its
+temporary stopped run as incompatible history. This preserves the session,
+not an old process-generation capability.
+
+Ordinary Abort synchronously closes effect admission and cancels session work.
+Authenticated retirement/cancellation-only ingress remains until two-ended settlement;
+fresh Build/Inspect/Peer admission is closed. Close joins that endpoint as well
+as actual native/Rust descendants, retaining sticky failures across observers.
+Physical SQL/admin/pre-authentication fencing precedes remote settlement waits.
+The endpoint drains terminal RPC replies before physically fencing idle or
+pre-handshake coordination sockets. A locally failed join can still cancel the
+peer, but cannot advertise local settlement or release its quarantined owner.
+
 Successful built-idle ownership and last installed native membership are
-separate from live transport/readiness. Same-history epoch advancement can
-drain transport while retaining the exact predecessor for joint catch-up;
-completed copy authority is not reused as a current grant. Secondary host
+separate from live transport/readiness. Incompatible history/epoch advancement drains transport and cannot revive
+retired sessions. Secondary host
 configuration authority precedes primary native Peer admission and supplies
 neither a primary-only callback nor serving access.
 
@@ -217,12 +244,11 @@ exception changes neither retained election nor native progress semantics.
 `WriteQuorum` with marked successors remains explicitly unsupported; ordinary
 unmarked waits and `All` retain their qualified native behavior.
 
-Selected implementation: [factory:294–311](../../../examples/postgres/src/service.rs#L294-L311),
-[companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641),
-[retained drainage:701–800](../../../examples/postgres/src/public_v1.rs#L701-L800),
-[Close joins:1273–1323](../../../examples/postgres/src/public_v1.rs#L1273-L1323),
-[Build/replay:2365–2698](../../../examples/postgres/src/public_v1.rs#L2365-L2698)
-and [native/controller qualification:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412).
+Selected implementation: [ordinary factory](../../../examples/postgres/src/service.rs),
+[session and membership owners](../../../examples/postgres/src/public_session.rs),
+[native transfer and terminal joins](../../../examples/postgres/src/public_v1.rs),
+[physical-only gateway](../../../examples/postgres/src/public_transport.rs) and
+[production-controller witnesses](../../../examples/postgres/src/public_controller_tests.rs).
 
 Physical replication slots belong to exact incarnations, not quorum votes.
 Slots reserve WAL before build and survive internal reconnection/restart.
@@ -347,9 +373,9 @@ TTL-based forgetting. Exhausted budgets fail closed.
 
 ## Local Usage and Configuration
 
-The command shape below is retained reference, **not a working M1 deployment
-recipe**: ordinary production Open currently returns the explicit M2 integration
-error before PostgreSQL effects. Do not bypass that gate or erase PGDATA.
+The command shape below is bounded local integration reference, not a packaged
+production deployment recipe. Never erase PGDATA to bypass an admission or
+retained-history rejection.
 
 Run as an unprivileged Linux account with compatible local PostgreSQL server and
 client binaries (`initdb`, `postgres`, `pg_ctl`, `pg_basebackup`, `pg_rewind`,
@@ -397,9 +423,9 @@ just nextest-postgres-smoke
 
 The smoke inventory validates the live catalog before PostgreSQL starts.
 The recipe builds the owned command binary, then runs real selected native
-cases and exact hosted-controller **M2 unavailable** checks serially in one
-package-only pass. The hosted cases do not execute their later positive
-backup/SQL/terminal clauses. Selectors and
+cases and actual ordinary production-controller native witnesses serially in one
+package-only pass. Required PG-N cases include pending joint/current continuity,
+retired-owner rejection, lost cancellation and matching-format reopen. Selectors and
 evidence limits are in the [testing guide](../kuberic/testing.md#custom-native-controller-reproduction-and-limits);
 do not copy test totals or historical removed selectors.
 Public V1 fixtures use
@@ -416,9 +442,11 @@ exact joint/current-only admission, live native replay, source/target
 invalidation, synchronous SQL/replay and completed native fencing. Owned short
 socket-path aliases identify the same declared backing storage, not a different
 storage incarnation. Administrative standby queries prove replay only, never
-ordinary secondary-read authorization. The current wrapper instead verifies
-no PG startup/initdb/role effect before explicit support rejection; it is not
-evidence that those historical positives ran now.
+ordinary secondary-read authorization. Current controller fixtures use the production Reconciler and ordinary
+publications, without target-role/configuration shortcuts or host grants.
+The pending-continuation witness holds real WAL replay and source catch-up,
+then proves native quorum before its achieved receipt and separately holds
+the target current-role receipt before final SQL admission.
 
 Hosted native retries share one retained exact attempt, while waiting/cache
 observers remain outside mutation cleanup. Captured cancellation and coherent

@@ -9,6 +9,80 @@ use kuberic_runtime::protocol::types::{
     ReplicaStorageIncarnationContext, ReplicatorCreationId, StorageGeneration,
 };
 
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn m2_pg_matching_format_reopen_preserves_data() {
+    let directory = OracleDataDir::new();
+    let root = directory.path().join("matching");
+    let source = Replica::new(root.clone(), 320).await;
+    source.singleton(1).await;
+    let (sql, connection) = source.driver.instance.connect_application().await.unwrap();
+    sql.batch_execute(
+        "CREATE TABLE m2_reopen(id integer primary key, value text);
+        INSERT INTO m2_reopen VALUES (1, 'acknowledged-matching-format')",
+    )
+    .await
+    .unwrap();
+    drop(sql);
+    connection.await.unwrap();
+    let acknowledged = source.driver.current_progress().await.unwrap();
+    source.driver.public_close().await.unwrap();
+    let identity = source.driver.durable.snapshot().await.identity;
+    drop(source);
+    let metadata = std::fs::read(root.join("a/state-v2.json")).unwrap();
+    let clock = std::fs::read(root.join("a/process-generation-v2")).unwrap();
+    let control = std::fs::read(root.join("d/global/pg_control")).unwrap();
+    let version = std::fs::read(root.join("d/PG_VERSION")).unwrap();
+    let mut incompatible = identity.clone();
+    incompatible.resource_uid = ResourceUid::new("different-resource");
+    assert!(
+        PgDurableStore::open(root.join("a"), incompatible, StorageMode::Established)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(root.join("a/state-v2.json")).unwrap(),
+        metadata
+    );
+    assert_eq!(
+        std::fs::read(root.join("a/process-generation-v2")).unwrap(),
+        clock
+    );
+    assert_eq!(
+        std::fs::read(root.join("d/global/pg_control")).unwrap(),
+        control
+    );
+    assert_eq!(std::fs::read(root.join("d/PG_VERSION")).unwrap(), version);
+    let reopened =
+        Replica::new_incarnation(root, 320, "public-320", "reopened-process", find_pg_bin()).await;
+    assert_eq!(reopened.driver.durable.snapshot().await.identity, identity);
+    assert!(
+        reopened
+            .driver
+            .durable
+            .snapshot()
+            .await
+            .policy_certified_lsn
+            >= acknowledged
+    );
+    reopened.singleton(1).await;
+    let (sql, connection) = reopened
+        .driver
+        .instance
+        .connect_application()
+        .await
+        .unwrap();
+    assert_eq!(
+        sql.query_one("SELECT value FROM m2_reopen WHERE id = 1", &[])
+            .await
+            .unwrap()
+            .get::<_, &str>(0),
+        "acknowledged-matching-format"
+    );
+    drop(sql);
+    connection.await.unwrap();
+    reopened.driver.public_close().await.unwrap();
+}
+
 fn publication(
     replica: &Replica,
     role: ReplicaRole,
@@ -212,6 +286,7 @@ async fn m2_pg_exact_session_replay_and_retirement() {
                 stale.target.scope.storage.storage_generation =
                     StorageGeneration::new("other-storage")
             }
+
             4 => stale.source.scope.process_session_id = ProcessSessionId::new("other-process"),
             5 => stale.target.replication_address = "http://127.0.0.1:1".into(),
             6 => stale.target.scope.history.history_id = HistoryId::new("other-history"),

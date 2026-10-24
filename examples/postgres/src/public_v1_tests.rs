@@ -57,10 +57,10 @@ fn public_v1_process_fence_rejects_same_epoch_session_and_address_substitution()
         })
         .unwrap();
     let binding = TransportBinding::Build(BuildBinding {
-        authority: None,
+        session: None,
         resource_uid: ResourceUid::new("authority-test"),
         epoch,
-        build_id: OperationId::new("build"),
+        fixture_session: OperationId::new("build"),
         source: test_endpoint(
             source,
             "source-session",
@@ -125,6 +125,7 @@ fn public_v1_secondary_admits_joint_then_current_only_authority() {
         })
         .unwrap();
     let joint = PeerBinding {
+        session: None,
         epoch,
         previous_configuration_id: Some(ConfigurationId::new("cfg-8")),
         current_configuration_id: ConfigurationId::new("cfg-9"),
@@ -172,10 +173,10 @@ impl BindingFactory {
     fn build(&self, source: &Replica, target: &Replica, id: &str) -> BuildBinding {
         let context = source.driver.public_owner().fence.context().unwrap();
         BuildBinding {
-            authority: None,
+            session: None,
             resource_uid: ResourceUid::new("postgres-public-oracle"),
             epoch: context.epoch,
-            build_id: OperationId::new(id),
+            fixture_session: OperationId::new(id),
             source: NativeEndpoint {
                 replica: source.identity.clone(),
                 process_session_id: source.session.clone(),
@@ -199,6 +200,7 @@ impl BindingFactory {
         previous: Option<&ConfigurationDescriptor>,
     ) -> PeerBinding {
         PeerBinding {
+            session: None,
             epoch: current.epoch,
             current_configuration_id: current.configuration_id.clone(),
             previous_configuration_id: previous
@@ -288,6 +290,7 @@ impl Replica {
         drop(listener);
         let identity = native_identity(id, incarnation);
         let resource = ResourceUid::new("postgres-public-oracle");
+        let established = root.join("a/state-v2.json").exists();
         let durable = Arc::new(
             PgDurableStore::open(
                 root.join("a"),
@@ -295,7 +298,11 @@ impl Replica {
                     resource_uid: resource,
                     replica: identity.clone(),
                 },
-                StorageMode::Fresh,
+                if established {
+                    StorageMode::Established
+                } else {
+                    StorageMode::Fresh
+                },
             )
             .await
             .unwrap(),
@@ -318,7 +325,7 @@ impl Replica {
                     bearer_token: "pg-native-fixture-coordination".into(),
                     listen_address: None,
                 },
-                true,
+                !established,
             )
             .await,
         );
@@ -370,6 +377,7 @@ impl Replica {
 
     async fn singleton(&self, epoch: i64) {
         self.change_role(epoch, ReplicaRole::Primary).await;
+        self.epoch(epoch).await;
         self.driver
             .public_application_role(ReplicaRole::Primary)
             .await
@@ -415,7 +423,7 @@ async fn production_factory_returns_no_parallel_state_replicator() {
 fn build_replica(binding: &BuildBinding) -> ReplicaInformation {
     let target = &binding.target;
     let mut replica = ReplicaInformation::idle_build(
-        binding.build_id.clone(),
+        binding.fixture_session.clone(),
         target.replica.clone(),
         target.replication_address.clone(),
     );
@@ -974,113 +982,7 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         // Deliberately no Close or Drop on the source before all observations.
         std::hint::black_box(&source.driver);
         source.driver.public_close().await.unwrap();
-        let hosted = production_service(directory.path().join("abort-host"), 113).await;
-        // Negative host fixture: a genuinely accepted source Build owns its
-        // grant while its unresponsive target cannot complete. It is not a
-        // controller/native transfer positive witness.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
-        let stop_peer = CancellationToken::new();
-        let stopped = stop_peer.clone();
-        let peer = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            stopped.cancelled().await;
-            drop(socket);
-        });
-        let handle = hosted.running.handle();
-        let report = handle.public_v1_report().await.unwrap();
-        let target_identity = native_identity(114, "abort-unused");
-        let program = PublicOperationProgram::Build(
-            kuberic_runtime::protocol::public_operations::PublicBuildInput {
-                attempt: OperationId::new("service-abort"),
-                source_address: report.replication_address.clone().unwrap(),
-                epoch: Epoch::new(0, 1),
-                current_configuration_id: Some(
-                    report
-                        .configuration
-                        .as_ref()
-                        .unwrap()
-                        .voting
-                        .current
-                        .configuration_id
-                        .clone(),
-                ),
-                replica: target_identity.clone(),
-                target_storage:
-                    kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext {
-                        replica: target_identity.clone(),
-                        storage:
-                            kuberic_runtime::protocol::types::ReplicaStorageIdentity::Volatile {
-                                identity: "negative-unresponsive-target".into(),
-                            },
-                        storage_generation:
-                            kuberic_runtime::protocol::types::StorageGeneration::new(
-                                "negative-target",
-                            ),
-                    },
-                process_session_id: ProcessSessionId::new("unused"),
-                replication_address: address,
-                history: Some(report.history),
-            },
-        );
-        let mut intent = host_intent(
-            &hosted.preview,
-            handle.process_session_id(),
-            report
-                .completed_operations
-                .iter()
-                .map(|completion| completion.revision)
-                .max()
-                .unwrap(),
-            "service-abort",
-            program,
-        );
-        intent.class = PublicOperationClass::Build {
-            target: target_identity.replica_id,
-        };
-        let mut build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
-        let credential = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if build.is_finished() {
-                    panic!(
-                        "negative hosted source Build ended before creating its grant: {:?}",
-                        (&mut build).await
-                    );
-                }
-                if let Some(grant) = hosted
-                    .driver
-                    .public_owner()
-                    .state
-                    .lock()
-                    .await
-                    .grants
-                    .last()
-                {
-                    break grant.credential.clone();
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
-            .await
-            .unwrap();
-        let process = ProcessProbe::postgres(hosted.driver.instance.data_dir());
-        kuberic_runtime::StatefulServiceReplica::abort(hosted.service.as_ref());
-        assert_abort_reclaimed(&hosted.driver, process, &credential, vec![preauth]).await;
-        stop_peer.cancel();
-        peer.await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_secs(5), build)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
-        // Objects remain retained until after service Abort's independent observations.
-        std::hint::black_box(&hosted.service);
-        hosted.shutdown().await;
+        controller::source_service_abort_reclaims_native_work().await;
         let failing = Replica::new(directory.path().join("join-failure"), 115).await;
         failing.singleton(1).await;
         let mut credentials = Vec::new();
@@ -1239,7 +1141,7 @@ async fn run_stale_completion_scenario() {
             .await
             .outbound_builds
             .iter()
-            .all(|progress| progress.request.authority.build_id != old.build_id)
+            .all(|progress| progress.request.authority.build_id != old.fixture_session)
     );
     source.change_role(2, ReplicaRole::Primary).await;
     source.epoch(2).await;
@@ -1288,7 +1190,6 @@ struct ProductionService {
     driver: Arc<PgReplicator>,
     store_path: std::path::PathBuf,
     preview: kuberic_runtime::protocol::public_operations::PublicV1Identity,
-    service: Arc<crate::service::PgService>,
 }
 
 impl ProductionService {
@@ -1475,7 +1376,6 @@ async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionServ
         driver,
         store_path,
         preview,
-        service,
     }
 }
 
@@ -2067,7 +1967,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
             .binding
             .clone();
         let mut conflict = completed_binding.clone();
-        conflict.build_id = OperationId::new("conflicting-build");
+        conflict.fixture_session = OperationId::new("conflicting-build");
         target
             .driver
             .public_owner()
@@ -2187,6 +2087,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
         drop(BuildGrantGuard {
             active: cancelled_active,
             armed: true,
+            session: None,
         });
         closed(&mut cancelled_socket).await;
         assert!(source.driver.instance.is_running().await);

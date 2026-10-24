@@ -2087,7 +2087,17 @@ impl PrimaryReplicator for PgReplicator {
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
         if self.is_public_v1() {
-            return self.public_configuration(current, Some(previous)).await;
+            let empty_previous = previous.replicas.is_empty()
+                && previous.configuration
+                    == ConfigurationDescriptor::new(
+                        current.configuration.epoch,
+                        current.configuration.primary_id,
+                        Vec::new(),
+                        0,
+                    );
+            return self
+                .public_configuration(current, (!empty_previous).then_some(previous))
+                .await;
         }
         self.install_configuration_pair(current, Some(previous.configuration))
             .await

@@ -15,6 +15,7 @@ use kuberic_runtime::Result;
 
 pub(super) struct PgEndpoint {
     pub(super) cancellation: CancellationToken,
+    sockets_cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     sockets: Arc<AtomicUsize>,
     requests: Arc<crate::data_service::RequestTracker>,
@@ -24,6 +25,7 @@ pub(super) struct PgEndpoint {
 impl Drop for PgEndpoint {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.sockets_cancel.cancel();
     }
 }
 
@@ -106,7 +108,8 @@ impl PgEndpoint {
         let sockets = Arc::new(AtomicUsize::new(0));
         let live = sockets.clone();
         let stopped = cancellation.clone();
-        let accept = cancellation.clone();
+        let sockets_cancel = CancellationToken::new();
+        let accept = sockets_cancel.clone();
         let incoming =
             tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |stream| {
                 stream.map(|stream| {
@@ -130,6 +133,7 @@ impl PgEndpoint {
         });
         Ok(Self {
             cancellation,
+            sockets_cancel,
             task: Some(task),
             sockets,
             requests,
@@ -140,16 +144,23 @@ impl PgEndpoint {
     pub(super) async fn join(&mut self) -> Result<()> {
         self.cancellation.cancel();
         if self.result.is_none() {
-            let result = self
-                .task
-                .as_mut()
-                .expect("retained endpoint")
-                .await
+            // Flush terminal RPC replies before fencing idle/pre-auth sockets.
+            let task = self.task.as_mut().expect("retained endpoint");
+            let joined =
+                match tokio::time::timeout(std::time::Duration::from_secs(2), &mut *task).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        self.sockets_cancel.cancel();
+                        task.await
+                    }
+                };
+            let result = joined
                 .map_err(|error| error.to_string())
                 .and_then(|result| result.map_err(|error| error.to_string()));
             self.task.take();
             self.result = Some(result);
         }
+        self.sockets_cancel.cancel();
         let result = self
             .result
             .as_ref()

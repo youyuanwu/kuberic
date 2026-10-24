@@ -12,7 +12,9 @@ does and does not establish.
 **Current checkpoint:** [ordinary hosting M1](ordinary-hosting-m1.md) is
 implemented. M2's built-in engine factory/session/lifetime slice is available
 through ordinary goals. The in-progress application slice connects KV, SQLite
-and the standalone external provider; PostgreSQL remains outstanding.
+and the standalone external provider. The PostgreSQL slice connects independent
+native sessions, effects and fresh admission through the same production goals;
+the complete M2 workflow and M3 qualification remain separate.
 Built-in historical bodies are enabled rather than returning an unavailable
 success. Their broader recovery/handoff results are not bounded M2 acceptance.
 Actual engine/component negatives, application witnesses and production
@@ -127,9 +129,10 @@ reset, native executable or KinD run was used.
 
 Real native/component algorithms remain separately exercised with
 `-p kuberic-runtime --lib --all-features --profile ordinary -E 'test(/^replicator::/)'`;
-list before run. Routine PG smoke runs real native cases alongside explicitly
-unsupported hosted-controller cases: a passing smoke is not M2 replacement-session
-or current production SQL/copy acceptance. Remaining M2/M3 work is in the
+list before run. Routine PG smoke includes actual ordinary native/controller
+witnesses, not unavailable-success wrappers. Historical direct/native recovery
+diagnostics remain selected separately from replacement-session acceptance.
+Remaining M2/M3 work is in the
 [roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
 
 Task-owned executable build/scratch storage can be selected with
@@ -639,11 +642,13 @@ native binary oracle.
 
 ## PostgreSQL
 
-**M1 support limit:** current hosted-controller journey names assert exact M2
-unavailability before PG initialization; later historical SQL/backup/containment
-clauses are not executed. Native engine cases in the authorized smoke still
-execute. The detailed positive evidence below is pinned pre-M1 context, not
-new production integration acceptance.
+The current hosted-controller witnesses execute the independent PG native path
+through production ordinary goals. Required M2 selection includes real
+backup/WAL/lineage, receive plus replay and checkpoint, nonmutating replay,
+native session retirement/quarantine, current-only policy/catch-up and separate
+primary SQL admission. No unavailable response is positive evidence. Exact
+source hashes, inventories and executed run results determine acceptance;
+the historical details below do not substitute for a current execution.
 
 Routine separately authorized reproduction:
 
@@ -663,12 +668,11 @@ PG implementation/regressions are
 [`public_v1.rs`](../../../examples/postgres/src/public_v1.rs),
 [`public_v1_tests.rs`](../../../examples/postgres/src/public_v1_tests.rs) and
 [`public_v1_p6_tests.rs`](../../../examples/postgres/src/public_v1_p6_tests.rs).
-The pre-M1 independent
+The independent
 [`public_controller_tests.rs`](../../../examples/postgres/src/public_controller_tests.rs)
-used production PgService, native PostgreSQL processes/RPCs and real controller
-dispatch. The current selected wrappers assert exact M2 unavailability before
-PG effects; their later formation/invalidation/cleanup bodies do not execute.
-They are included in smoke alongside genuinely executed native component cases.
+uses production PgService, native PostgreSQL processes/RPCs and the real
+ordinary Reconciler. It does not install host transfer grants or manually
+advance target role/configuration to break admission ordering.
 The `_p6` filename identifies existing tests, not today's roadmap cursor.
 Evidence distinguishes live-status drain, idle/slot retirement, orderly
 terminal progress, marked-successor WriteQuorum rejection, ordinary unmarked
@@ -680,10 +684,23 @@ or power-loss proof from these process/file observations.
 
 ### Custom-native controller reproduction and limits
 
-The commands remain the authorized current smoke entry points. Detailed positive
-controller evidence in the following paragraphs is pinned **pre-M1 history**,
-not execution of the current unavailable wrappers. Do not count those later
-clauses as current SQL/backup/terminal integration proof.
+The commands remain the authorized current smoke entry points. The current
+required witnesses include:
+
+- `m2_pg_ordinary_fresh_admission` and `m2_pg_native_copy_boundaries`;
+- `m2_pg_joint_to_current_retains_native_session_while_pending`, including
+  actual WAL replay and WriteQuorum before the held source receipt, a held
+  target current-role receipt and a worker that misses the joint publication;
+- `m2_pg_incompatible_or_retired_session_cannot_continue_while_pending`,
+  delayed first establishment, lost target cancellation and retained actual joins;
+- exact-session cache/ACK/slot fencing and matching-format acknowledged-data
+  reopen without reset.
+
+The PG-N catalog keeps these in routine smoke along with the enabled native
+regressions. Longer direct/native failover, switchover and replacement bodies
+remain diagnostics; they do not establish full M3 controller policy. Ordinary
+stable-secondary SQL is still denied by the generic host. Administrative
+standby reads establish native data/replay only, not client access.
 
 Keep both scratch roots owned by the checkout, inventory the live selector,
 then run the authorized smoke entry point:
@@ -698,7 +715,13 @@ cargo nextest list -p postgres-replicated --all-features --profile postgres -E "
 just nextest-postgres-smoke
 ```
 
-The actual controller witness observes successful fresh Open and explicit
+### Historical pre-M1 controller/component evidence
+
+The following paragraphs retain the earlier evidence boundary. They describe
+historical source owners and observations, not a passed run of today's source.
+Current results must name the live witness and its actual execution.
+
+The historical controller witness observes successful fresh Open and explicit
 unknown-history sentinels before first Role; nonempty SQL before scaling;
 real source/target backup, lineage, receive/replay and built-idle state; separate
 role/epoch, exact joint catch-up and current-only admission; then synchronous
