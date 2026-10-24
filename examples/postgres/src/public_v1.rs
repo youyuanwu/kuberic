@@ -408,6 +408,8 @@ pub(super) struct PublicPg {
     #[cfg(all(test, feature = "testing"))]
     native_boundary: std::sync::atomic::AtomicI64,
     #[cfg(all(test, feature = "testing"))]
+    continuation_reads: std::sync::atomic::AtomicU64,
+    #[cfg(all(test, feature = "testing"))]
     retirement_unavailable: std::sync::atomic::AtomicBool,
 }
 
@@ -498,6 +500,8 @@ impl PublicPg {
             native_cuts: std::sync::Mutex::new(BTreeMap::new()),
             #[cfg(all(test, feature = "testing"))]
             native_boundary: std::sync::atomic::AtomicI64::new(-1),
+            #[cfg(all(test, feature = "testing"))]
+            continuation_reads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(all(test, feature = "testing"))]
             retirement_unavailable: std::sync::atomic::AtomicBool::new(false),
         }
@@ -968,6 +972,8 @@ impl PgReplicator {
                     driver.abort();
                     break;
                 }
+                #[cfg(all(test, feature = "testing"))]
+                driver.native_cut("membership-tick-returned").await;
                 if invalid && let Err(error) = driver.public_revoke().await {
                     tracing::error!(%error, "public PostgreSQL owner drainage failed");
                     driver.abort();
@@ -2241,6 +2247,10 @@ impl PgReplicator {
         let previous_descriptor = previous
             .as_ref()
             .map(|configuration| configuration.configuration.clone());
+        #[cfg(all(test, feature = "testing"))]
+        if previous.is_none() && !current.replicas.is_empty() {
+            self.native_cut("source-current-before-policy").await;
+        }
         let context = self.public_owner().fence.context()?;
         {
             let state = self.public_owner().state.lock().await;

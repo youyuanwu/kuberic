@@ -204,6 +204,9 @@ uses the completed copy's same reservation, nonce, gateway, slot and ACK name
 after actual target Role/Epoch callbacks. It joins the old owned receiver before
 handover, preserving lineage and data. Compatible same-role/epoch callbacks do
 not blanket-drain transport.
+The worker is registered only after receiver, session generation and lifecycle
+admission are revalidated under the same gate that seals retirement's joins.
+Retirement includes that actual child; cancellation alone is not settlement.
 
 Only the exact joint `(P,C)` to current-only `(None,C)` edge retains continuation
 for unchanged C, primary, identities, history and epoch. The bounded monotonic
@@ -447,6 +450,14 @@ publications, without target-role/configuration shortcuts or host grants.
 The pending-continuation witness holds real WAL replay and source catch-up,
 then proves native quorum before its achieved receipt and separately holds
 the target current-role receipt before final SQL admission.
+It retains the late-worker ordering; a separate already-live-joint ordering
+captures the actual WAL receiver/sender, gateway task and physical slot before
+current-only policy. Live-publication fault cases retain the original session
+ID and change newest discovery prerequisites, rather than only substituting
+another immutable ID. They require native fencing and retained actual joins.
+Pre-effect, checkpoint and source-final-credit invalidation cases check the
+released native owner and retained ordinary Build outcome before teardown,
+including absent stale Ready/credit and no late receiver installation.
 
 Hosted native retries share one retained exact attempt, while waiting/cache
 observers remain outside mutation cleanup. Captured cancellation and coherent

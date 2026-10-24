@@ -336,6 +336,16 @@ impl PgReplicator {
             .collect()
     }
 
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn pg_membership_worker(
+        &self,
+        id: &PgSessionId,
+    ) -> Option<crate::owned_task::PgTask> {
+        self.public_owner().sessions.gate.lock().unwrap().entries[&id.nonce]
+            .membership_worker
+            .clone()
+    }
+
     pub(super) fn pg_native_inbound(
         &self,
         id: &PgSessionId,
@@ -393,6 +403,13 @@ impl PgReplicator {
                 state.receiver = None;
                 state.receiver_boundary = None;
                 state.access = None;
+                if state
+                    .built
+                    .as_ref()
+                    .is_some_and(|built| built.binding.session.as_deref() == Some(id))
+                {
+                    state.built = None;
+                }
             }
         } else {
             let mut state = self.public_owner().state.lock().await;
@@ -823,6 +840,17 @@ impl PgReplicator {
         } else {
             (&peer, &local)
         };
+        #[cfg(all(test, feature = "testing"))]
+        let publications = self
+            .public_owner()
+            .session_publications
+            .lock()
+            .unwrap()
+            .clone();
+        #[cfg(all(test, feature = "testing"))]
+        let (source, target) = publications
+            .as_ref()
+            .map_or((source, target), |(source, target)| (source, target));
         if self.pg_native_membership(id)?.is_none()
             && source_local
             && source.scope.configuration.previous.as_ref()
@@ -843,6 +871,10 @@ impl PgReplicator {
             let entry = &sessions.entries[&id.nonce];
             (entry.source_generation, entry.target_generation)
         };
+        #[cfg(all(test, feature = "testing"))]
+        self.public_owner()
+            .continuation_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         for (observed, origin) in [(source, &id.source), (target, &id.target)] {
             let source_endpoint = origin == &id.source;
             let current_seen = if source_endpoint {
@@ -931,26 +963,60 @@ impl PgReplicator {
         {
             return Ok(());
         }
-        let id = {
+        let candidate = {
             let sessions = self.public_owner().sessions.gate.lock().unwrap();
             sessions.receiver.and_then(|nonce| {
                 let entry = &sessions.entries[&nonce];
                 (entry.stage == SessionStage::Completed
                     && entry.native_copy_complete
+                    && entry.membership_worker.is_none()
                     && !entry.cancellation.is_cancelled())
-                .then(|| entry.id.clone())
+                .then(|| (entry.id.clone(), entry.effect_generation))
             })
         };
-        let Some(id) = id else {
+        let Some((id, generation)) = candidate else {
             return Ok(());
         };
-        let context = self.public_owner().fence.context()?;
-        if context.role != ReplicaRole::ActiveSecondary || context.epoch != id.target.scope.epoch {
+        let selected_context = self.public_owner().fence.context()?;
+        if selected_context.role != ReplicaRole::ActiveSecondary
+            || selected_context.epoch != id.target.scope.epoch
+        {
             return Ok(());
         }
+        #[cfg(all(test, feature = "testing"))]
+        self.native_cut("membership-registration").await;
         let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
-        let entry = sessions.entries.get_mut(&id.nonce).unwrap();
-        if entry.membership_worker.is_some() {
+        let context = self.public_owner().fence.context()?;
+        if sessions.fenced
+            || sessions.blocked
+            || sessions.receiver != Some(id.nonce)
+            || self.cancellation.is_cancelled()
+            || self
+                .public_owner()
+                .closing
+                .load(std::sync::atomic::Ordering::Acquire)
+            || context.identity != id.target.scope.storage.replica
+            || context != selected_context
+            || context.role != ReplicaRole::ActiveSecondary
+            || context.epoch != id.target.scope.epoch
+            || self.public_owner().fence.local.process_session_id
+                != id.target.scope.process_session_id
+            || self.public_owner().fence.local.replication_address != id.target.replication_address
+        {
+            return Ok(());
+        }
+        let Some(entry) = sessions.entries.get_mut(&id.nonce) else {
+            return Ok(());
+        };
+        if entry.id != id
+            || entry.effect_generation != generation
+            || entry.stage != SessionStage::Completed
+            || !entry.native_copy_complete
+            || entry.cancellation.is_cancelled()
+            || entry.retirement.is_some()
+            || entry.remote_retirement.is_some()
+            || entry.membership_worker.is_some()
+        {
             return Ok(());
         }
         let cancellation = entry.cancellation.clone();
@@ -990,6 +1056,8 @@ impl PgReplicator {
                     _ = tokio::time::sleep(Duration::from_millis(20)) => {},
                 }
             }
+            #[cfg(all(test, feature = "testing"))]
+            driver.native_cut("membership-worker-exit").await;
         });
         let task = crate::owned_task::PgTask::new(task);
         entry.joins.push(task.clone());

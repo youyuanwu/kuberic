@@ -691,10 +691,23 @@ required witnesses include:
 - `m2_pg_joint_to_current_retains_native_session_while_pending`, including
   actual WAL replay and WriteQuorum before the held source receipt, a held
   target current-role receipt and a worker that misses the joint publication;
+- `m2_pg_already_live_joint_receiver_survives_pending_current`, capturing an
+  already-running joint Peer receiver before current-only installation and
+  checking actual native receiver/sender, gateway-task, slot and ACK continuity;
 - `m2_pg_incompatible_or_retired_session_cannot_continue_while_pending`,
   delayed first establishment, lost target cancellation and retained actual joins;
+- the `m2_pg_live_publication_*` cases, changing
+  newest publication identity/configuration facts through test discovery faults
+  while preserving the actual live session ID and owner, with native fencing,
+  absent quorum/admission credit and a held real driver join for each fault;
+- `m2_pg_membership_registration_retirement_orders_and_sticky_join`, covering
+  both registration/retirement orderings and held/lost actual membership joins;
 - exact-session cache/ACK/slot fencing and matching-format acknowledged-data
   reopen without reset.
+
+Invalidation witnesses await the released retained ordinary Build and native
+owner before teardown. Source Primary, Remove success and local slot retirement
+are not target containment or stale-completion evidence.
 
 The PG-N catalog keeps these in routine smoke along with the enabled native
 regressions. Longer direct/native failover, switchover and replacement bodies

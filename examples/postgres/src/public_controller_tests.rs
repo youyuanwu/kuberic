@@ -2,10 +2,11 @@
 use super::*;
 use crate::service::{PgService, PgServiceConfig};
 use kuberic_controller::test_util::{
-    ApplicationFactory, CreatedApplication, ErrorKind, ReplicaContext, TestCluster, TestError,
+    ApplicationFactory, CreatedApplication, ErrorKind, ReplicaContext, ReplicaRef, TestCluster,
+    TestError,
 };
 use kuberic_runtime::protocol::public_operations::{
-    ReplicaGoalKind, ReplicaGoalStatus, ReplicaPublicationStage,
+    RemoteReplicaState, ReplicaGoal, ReplicaGoalKind, ReplicaGoalStatus, ReplicaPublicationStage,
 };
 use std::sync::Mutex as StdMutex;
 
@@ -256,6 +257,89 @@ enum CopyCut {
     LostCancel,
 }
 
+async fn rejected_copy(
+    cluster: &mut TestCluster<Factory>,
+    ordinary: (&ReplicaRef, &ReplicaRef, &ReplicaGoal),
+    native: (&PgReplicator, &PgReplicator, &session::PgSessionId),
+    native_rejected: bool,
+) -> TestResult {
+    let (source_ref, target_ref, goal) = ordinary;
+    let (source, target, id) = native;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let observation = cluster.observe().await?;
+            let snapshot = observation.snapshot(source_ref).ok_or_else(|| {
+                TestError::new(ErrorKind::Application, "retained source journal missing")
+            })?;
+            if let Some(result) = snapshot.goals.iter().find(|entry| entry.goal == *goal)
+                && result.status != ReplicaGoalStatus::Pending
+            {
+                check(
+                    matches!(result.status, ReplicaGoalStatus::Failed(_)),
+                    &format!("released ordinary Build was not rejected: {result:?}"),
+                )?;
+                for reference in [source_ref, target_ref] {
+                    let snapshot = observation.snapshot(reference).unwrap();
+                    check(
+                        !snapshot.remote_operations.iter().any(|operation| {
+                            operation.selection.target == id.target
+                                && operation.state == RemoteReplicaState::Ready
+                        }),
+                        "released stale Build published ordinary Ready",
+                    )?;
+                    check(
+                        snapshot.publication.as_ref().is_none_or(|publication| {
+                            publication.scope.configuration.current
+                                == id.source.scope.configuration.current
+                        }),
+                        "failed copy installed a successor configuration",
+                    )?;
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, TestError>(())
+    })
+    .await
+    .map_err(error)??;
+    if let Some(owner) = target.pg_native_inbounds().into_iter().next() {
+        check(
+            owner.wait().await.is_err() == native_rejected,
+            "released native owner's result did not match the actual invalidation cut",
+        )?;
+        target
+            .public_join_inbound_owner(&owner)
+            .await
+            .map_err(error)?;
+    }
+    source.pg_retire_session(id).await.map_err(error)?;
+    check(
+        !source
+            .public_owner()
+            .state
+            .lock()
+            .await
+            .built_idle
+            .contains_key(&target_ref.identity().replica_id)
+            && target.public_owner().state.lock().await.built.is_none()
+            && target.public_owner().state.lock().await.receiver.is_none()
+            && !target.pg_session_ownership(id).1
+            && !target.instance.is_running().await,
+        "released invalidated work retained stale credit or installed a late receiver",
+    )?;
+    check(
+        target
+            .pg_session_request(session::SessionRequest {
+                session: id.clone(),
+                action: session::SessionAction::Reserve,
+            })
+            .await
+            .is_err(),
+        "retired copy revived its receiver after the released result",
+    )
+}
+
 async fn formation(cut: CopyCut, fail_cleanup: bool) {
     let factory = Factory::default();
     let mut cluster = cluster(&factory).await;
@@ -282,6 +366,15 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
         let target = cluster.service(&target_ref).await?;
         let source_driver = source.native_driver();
         let target_driver = target.native_driver();
+        let build_goal = observation
+            .snapshot(topology.primary())
+            .unwrap()
+            .goals
+            .iter()
+            .find(|entry| matches!(entry.goal.desired, ReplicaGoalKind::Build { .. }))
+            .ok_or_else(|| TestError::new(ErrorKind::Application, "retained Build goal missing"))?
+            .goal
+            .clone();
         let id = source_driver
             .pg_session_ids_for_target(target_ref.identity().replica_id)
             .into_iter()
@@ -297,14 +390,28 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
         let checkpoint = target_driver.pause_public_build_completion();
         let _release_target = ReleaseGate(target_effect.clone());
         let _release_checkpoint = ReleaseGate(checkpoint.clone());
+        let pre_effect_metadata = target_driver.durable.snapshot().await.generation;
         if cut == CopyCut::SourcePreEffect {
             source_driver
                 .remove_replica(target_ref.identity().replica_id)
                 .await
                 .map_err(error)?;
             source_effect.release.notify_one();
+            rejected_copy(
+                &mut cluster,
+                (topology.primary(), &target_ref, &build_goal),
+                (source_driver, target_driver, &id),
+                true,
+            )
+            .await?;
             check(
-                !target.instance().data_dir().join("PG_VERSION").exists(),
+                !target.instance().data_dir().join("PG_VERSION").exists()
+                    && target_driver.durable.snapshot().await.generation == pre_effect_metadata
+                    && target_driver
+                        .public_owner()
+                        .effect_starts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        == 0,
                 "retired pre-effect source started a backup",
             )?;
             check(
@@ -418,6 +525,23 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
                 "source local retirement retained an obsolete exact native slot",
             )?;
             target_effect.release.notify_one();
+            rejected_copy(
+                &mut cluster,
+                (topology.primary(), &target_ref, &build_goal),
+                (source_driver, target_driver, &id),
+                true,
+            )
+            .await?;
+            check(
+                !target.instance().data_dir().join("PG_VERSION").exists()
+                    && target_driver.durable.snapshot().await.generation == pre_effect_metadata
+                    && target_driver
+                        .public_owner()
+                        .effect_starts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        == 0,
+                "released target pre-effect callback mutated PGDATA or metadata",
+            )?;
             check(
                 source_driver
                     .public_owner()
@@ -571,11 +695,58 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
             return Ok(());
         }
         if cut == CopyCut::Checkpoint {
+            let exit = target.instance().hold_next_driver_exit();
+            let _release_exit = ReleaseNotify(&exit.release);
+            let (admin, admin_driver) = target.instance().connect().await.map_err(error)?;
+            admin.simple_query("SELECT 1").await.map_err(error)?;
+            let owner = target_driver
+                .pg_native_inbounds()
+                .into_iter()
+                .next()
+                .unwrap();
             source_driver
                 .remove_replica(target_ref.identity().replica_id)
                 .await
                 .map_err(error)?;
             checkpoint.release.notify_one();
+            exit.entered.notified().await;
+            check(
+                target_driver.pg_session_ownership(&id).1
+                    && matches!(
+                        target_driver.pg_session_ownership(&id).0,
+                        session::SessionStage::Retiring | session::SessionStage::Quarantined
+                    )
+                    && tokio::time::timeout(Duration::from_millis(100), owner.wait())
+                        .await
+                        .is_err(),
+                "issued checkpoint effect escaped its actual held native cleanup",
+            )?;
+            let mut successor = id.clone();
+            successor.nonce[0] ^= 1;
+            check(
+                target_driver
+                    .pg_session_request(session::SessionRequest {
+                        session: successor,
+                        action: session::SessionAction::Reserve,
+                    })
+                    .await
+                    .is_err(),
+                "held checkpoint cleanup admitted a successor receiver",
+            )?;
+            exit.release.notify_one();
+            admin_driver.await.map_err(error)?;
+            drop(admin);
+            rejected_copy(
+                &mut cluster,
+                (topology.primary(), &target_ref, &build_goal),
+                (source_driver, target_driver, &id),
+                true,
+            )
+            .await?;
+            check(
+                target.instance().data_dir().join("PG_VERSION").exists(),
+                "invalidated checkpoint cleanup erased issued native effects",
+            )?;
             check(
                 source_driver
                     .public_owner()
@@ -690,7 +861,21 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
                 .await
                 .map_err(error)?;
             source_credit.release.notify_one();
-            eprintln!("native {cut:?}: releasing actual Build to ordinary admission");
+            rejected_copy(
+                &mut cluster,
+                (topology.primary(), &target_ref, &build_goal),
+                (source_driver, target_driver, &id),
+                false,
+            )
+            .await?;
+            check(
+                target_driver
+                    .public_request(Request::Build(binding.clone()))
+                    .await
+                    .is_err()
+                    && target.instance().data_dir().join("PG_VERSION").exists(),
+                "released source final-credit callback replayed stale target completion",
+            )?;
             return Ok(());
         }
         source_credit.release.notify_one();
@@ -1312,9 +1497,98 @@ async fn m2_pg_scope_withdrawal_waits_for_actual_settlement() {
     finished(cluster.finish(result).await);
 }
 
-#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[serial_test::serial]
-async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
+async fn peer_receiver(
+    driver: &PgReplicator,
+    id: &session::PgSessionId,
+    joint: bool,
+) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if driver
+                .public_owner()
+                .state
+                .lock()
+                .await
+                .receiver
+                .as_ref()
+                .is_some_and(|binding| {
+                    matches!(binding, TransportBinding::Peer(peer)
+                        if peer.previous_configuration_id.is_some() == joint
+                            && peer.session.as_deref() == Some(id))
+                })
+            {
+                return Ok::<_, TestError>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(error)?
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NativeContinuity {
+    receiver_generation: u64,
+    receiver_pid: i32,
+    sender_pid: i32,
+    gateway: tokio::task::Id,
+    slot_inode: u64,
+}
+
+async fn native_continuity(
+    source: &PgService,
+    target: &PgService,
+    id: &session::PgSessionId,
+) -> TestResult<NativeContinuity> {
+    use std::os::unix::fs::MetadataExt;
+    let driver = source.native_driver();
+    let (gateway, ack) = {
+        let state = driver.public_owner().state.lock().await;
+        let grant = state
+            .grants
+            .iter()
+            .find(|grant| grant.binding.session() == Some(id))
+            .unwrap();
+        (
+            grant.gateway.task_abort_handle().id(),
+            grant.credential.name.clone(),
+        )
+    };
+    let slot = crate::native::replication_slot_name(&id.target.scope.storage.replica);
+    let (sql, connection) = source.instance().connect().await.map_err(error)?;
+    let row = sql
+        .query_one(
+            "SELECT r.pid FROM pg_stat_replication r JOIN pg_replication_slots s
+             ON s.active_pid = r.pid WHERE s.slot_name = $1 AND r.application_name = $2",
+            &[&slot, &ack],
+        )
+        .await
+        .map_err(error)?;
+    let sender_pid = row.get(0);
+    drop(sql);
+    connection.await.map_err(error)?;
+    let (sql, connection) = target.instance().connect().await.map_err(error)?;
+    let row = sql
+        .query_one(
+            "SELECT pid FROM pg_stat_wal_receiver WHERE status = 'streaming'",
+            &[],
+        )
+        .await
+        .map_err(error)?;
+    let receiver_pid = row.get(0);
+    drop(sql);
+    connection.await.map_err(error)?;
+    Ok(NativeContinuity {
+        receiver_generation: target.instance().generation_id(),
+        receiver_pid,
+        sender_pid,
+        gateway,
+        slot_inode: std::fs::metadata(source.instance().data_dir().join("pg_replslot").join(slot))?
+            .ino(),
+    })
+}
+
+async fn pending_continuity(already_joint: bool) {
     let factory = Factory::default();
     let mut cluster = cluster(&factory).await;
     let result: TestResult = async {
@@ -1326,6 +1600,9 @@ async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
         let copied = driver.pause_public_build_completion();
         let current_policy = driver.pause_native_cut("source-current-policy");
         let current_receipt = driver.pause_native_cut("source-current-receipt");
+        let before_policy = already_joint
+            .then(|| driver.pause_native_cut("source-current-before-policy"));
+        let _release_before = before_policy.as_ref().map(|gate| ReleaseGate(gate.clone()));
         let _release_effect = ReleaseGate(effect.clone());
         let _release_copied = ReleaseGate(copied.clone());
         let _release_policy = ReleaseGate(current_policy.clone());
@@ -1342,9 +1619,10 @@ async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
             })?;
         let target = cluster.service(&target_ref).await?;
         let target_driver = target.native_driver();
-        let first_observation = target_driver.pause_native_cut("membership-first-observation");
+        let first_observation = (!already_joint)
+            .then(|| target_driver.pause_native_cut("membership-first-observation"));
         let target_role = target_driver.pause_native_cut("target-current-role");
-        let _release_first = ReleaseGate(first_observation.clone());
+        let _release_first = first_observation.as_ref().map(|gate| ReleaseGate(gate.clone()));
         let _release_role = ReleaseGate(target_role.clone());
         effect.release.notify_one();
         gate(&mut cluster, &copied).await?;
@@ -1370,16 +1648,31 @@ async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
             )
         };
         copied.release.notify_one();
+        let joint_native = if let Some(before_policy) = &before_policy {
+            gate(&mut cluster, before_policy).await?;
+            cluster.probe(peer_receiver(target_driver, &id, true)).await?;
+            let native = native_continuity(&source, &target, &id).await?;
+            check(
+                target_driver.pg_membership_worker(&id).is_some()
+                    && !driver.pg_native_membership(&id).map_err(error)?.unwrap().current_only,
+                "live joint receiver was not owned before current-only installation",
+            )?;
+            eprintln!("already-live joint native receiver: {native:?}");
+            before_policy.release.notify_one();
+            Some(native)
+        } else {
+            None
+        };
         gate(&mut cluster, &current_policy).await?;
-        eprintln!(
-            "pending native: current-only policy installed before worker's first joint observation"
-        );
-        cluster
-            .probe(async {
-                first_observation.entered.notified().await;
-                Ok::<_, TestError>(())
-            })
-            .await?;
+        if let Some(first_observation) = &first_observation {
+            eprintln!("pending native: current-only policy installed before worker's first joint observation");
+            cluster
+                .probe(async {
+                    first_observation.entered.notified().await;
+                    Ok::<_, TestError>(())
+                })
+                .await?;
+        }
         let source_publication = driver
             .public_owner()
             .host
@@ -1404,40 +1697,23 @@ async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
                 == ReplicaRole::ActiveSecondary,
             "ordinary target role callback never ran",
         )?;
-        check(
-            matches!(
-                target_driver.public_owner().state.lock().await.receiver,
-                Some(TransportBinding::Build(_))
-            ),
-            "worker saw joint before the scheduler cut",
-        )?;
-        first_observation.release.notify_one();
-        cluster
-            .probe(async {
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    loop {
-                        if target_driver
-                            .public_owner()
-                            .state
-                            .lock()
-                            .await
-                            .receiver
-                            .as_ref()
-                            .is_some_and(|binding| {
-                                matches!(binding, TransportBinding::Peer(peer)
-                            if peer.previous_configuration_id.is_none()
-                                && peer.session.as_deref() == Some(&id))
-                            })
-                        {
-                            return Ok::<_, TestError>(());
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .map_err(error)?
-            })
-            .await?;
+        if let Some(first_observation) = &first_observation {
+            check(
+                matches!(
+                    target_driver.public_owner().state.lock().await.receiver,
+                    Some(TransportBinding::Build(_))
+                ),
+                "worker saw joint before the scheduler cut",
+            )?;
+            first_observation.release.notify_one();
+        }
+        cluster.probe(peer_receiver(target_driver, &id, false)).await?;
+        if let Some(joint_native) = &joint_native {
+            check(
+                native_continuity(&source, &target, &id).await? == *joint_native,
+                "joint-to-current changed the actual WAL receiver/gateway/slot/ACK backend",
+            )?;
+        }
         eprintln!("pending native: exact retained copy-to-peer handover joined");
         let receiver_generation = target.instance().generation_id();
         let (target_sql, target_connection) = administrative_database(&target).await?;
@@ -1639,6 +1915,12 @@ async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
             target.instance().generation_id() == receiver_generation,
             "compatible pending current callback restarted the native receiver",
         )?;
+        if let Some(joint_native) = &joint_native {
+            check(
+                native_continuity(&source, &target, &id).await? == *joint_native,
+                "pending callbacks/WAL replaced the live joint native owners",
+            )?;
+        }
         target_role.release.notify_one();
         let topology = cluster.settle_members(2).await?;
         let observed = cluster.observe().await?;
@@ -1716,6 +1998,508 @@ async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
     .await;
     finished(cluster.finish(result).await);
 }
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m2_pg_joint_to_current_retains_native_session_while_pending() {
+    pending_continuity(false).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m2_pg_already_live_joint_receiver_survives_pending_current() {
+    pending_continuity(true).await;
+}
+
+async fn membership_registration(retirement_first: bool, lost_join: bool) {
+    let factory = Factory::default();
+    let mut cluster = cluster(&factory).await;
+    let result: TestResult = async {
+        let topology = cluster.settle_members(1).await?;
+        let source = cluster.service(topology.primary()).await?;
+        seed(&source).await?;
+        let driver = source.native_driver();
+        let effect = driver.pause_public_build_effects();
+        let copied = driver.pause_public_build_completion();
+        let current = driver.pause_native_cut("source-current-before-policy");
+        let _release_effect = ReleaseGate(effect.clone());
+        let _release_copied = ReleaseGate(copied.clone());
+        let _release_current = ReleaseGate(current.clone());
+        cluster.scale_to(2).await?;
+        gate(&mut cluster, &effect).await?;
+        let observation = cluster.observe().await?;
+        let reference = observation
+            .replicas()
+            .find(|reference| reference.identity() != topology.primary().identity())
+            .cloned()
+            .unwrap();
+        let target = cluster.service(&reference).await?;
+        let target_driver = target.native_driver();
+        let registration = target_driver.pause_native_cut("membership-registration");
+        let _release_registration = ReleaseGate(registration.clone());
+        effect.release.notify_one();
+        gate(&mut cluster, &copied).await?;
+        let id = driver
+            .pg_session_ids_for_target(reference.identity().replica_id)
+            .into_iter()
+            .next()
+            .unwrap();
+        copied.release.notify_one();
+        gate(&mut cluster, &registration).await?;
+        check(
+            target_driver.pg_membership_worker(&id).is_none()
+                && target_driver.pg_session_ownership(&id).1,
+            "registration cut did not precede the actual child spawn",
+        )?;
+        let returned = target_driver.pause_native_cut("membership-tick-returned");
+        let _release_returned = ReleaseGate(returned.clone());
+        if retirement_first {
+            driver.pg_retire_session(&id).await.map_err(error)?;
+            check(
+                !target_driver.pg_session_ownership(&id).1,
+                "retirement did not join the actual native inbound owner",
+            )?;
+            let inbound = target_driver
+                .pg_native_inbounds()
+                .into_iter()
+                .next()
+                .unwrap();
+            target_driver
+                .public_join_inbound_owner(&inbound)
+                .await
+                .map_err(error)?;
+            registration.release.notify_one();
+            cluster
+                .probe(async {
+                    returned.entered.notified().await;
+                    Ok::<_, TestError>(())
+                })
+                .await?;
+            check(
+                target_driver.pg_membership_worker(&id).is_none()
+                    && target_driver.pg_session_ownership(&id).0 == session::SessionStage::Retired
+                    && !target.instance().is_running().await,
+                "a membership child was appended after retirement sealed its joins",
+            )?;
+            returned.release.notify_one();
+        } else {
+            let first = target_driver.pause_native_cut("membership-first-observation");
+            let exit = target_driver.pause_native_cut("membership-worker-exit");
+            let _release_first = ReleaseGate(first.clone());
+            let _release_exit = ReleaseGate(exit.clone());
+            registration.release.notify_one();
+            cluster
+                .probe(async {
+                    returned.entered.notified().await;
+                    first.entered.notified().await;
+                    Ok::<_, TestError>(())
+                })
+                .await?;
+            let worker = target_driver.pg_membership_worker(&id).ok_or_else(|| {
+                TestError::new(ErrorKind::Application, "real membership child missing")
+            })?;
+            returned.release.notify_one();
+            driver.pg_remove_native_session(&id).await.map_err(error)?;
+            cluster
+                .probe(async {
+                    exit.entered.notified().await;
+                    Ok::<_, TestError>(())
+                })
+                .await?;
+            let retiring = driver.clone();
+            let retired = id.clone();
+            let mut observer =
+                tokio::spawn(async move { retiring.pg_retire_session(&retired).await });
+            check(
+                tokio::time::timeout(Duration::from_millis(100), &mut observer)
+                    .await
+                    .is_err()
+                    && target_driver.pg_session_ownership(&id).1
+                    && !worker.settled_successfully(),
+                "retirement acknowledged containment before its real membership child joined",
+            )?;
+            observer.abort();
+            let _ = observer.await;
+            let mut successor = id.clone();
+            successor.nonce[0] ^= 1;
+            check(
+                target_driver
+                    .pg_session_request(session::SessionRequest {
+                        session: successor,
+                        action: session::SessionAction::Reserve,
+                    })
+                    .await
+                    .is_err(),
+                "held membership child released the reserved receiver",
+            )?;
+            if lost_join {
+                worker.lose().await;
+                exit.release.notify_one();
+                check(
+                    driver.pg_retire_session(&id).await.is_err()
+                        && target_driver.pg_session_ownership(&id).1
+                        && target_driver.pg_session_ownership(&id).0
+                            == session::SessionStage::Quarantined,
+                    "lost membership join fabricated retirement or released quarantine",
+                )?;
+                let first = target_driver.public_close().await.unwrap_err().to_string();
+                let second = target_driver.public_close().await.unwrap_err().to_string();
+                check(
+                    first == second && !target_driver.public_closed(),
+                    "lost membership join was not sticky across Close",
+                )?;
+            } else {
+                exit.release.notify_one();
+                worker.clone().await.map_err(error)?;
+                driver.pg_retire_session(&id).await.map_err(error)?;
+                check(
+                    worker.settled_successfully()
+                        && !target_driver.pg_session_ownership(&id).1
+                        && !target.instance().is_running().await,
+                    "retirement did not observe the real registered child's successful join",
+                )?;
+            }
+        }
+        check(
+            target.instance().data_dir().join("PG_VERSION").exists(),
+            "membership retirement reset copied PGDATA",
+        )?;
+        current.release.notify_one();
+        Ok(())
+    }
+    .await;
+    let passed = result.is_ok();
+    let outcome = cluster.finish(result).await;
+    assert!(
+        passed,
+        "membership registration witness failed: {outcome:?}"
+    );
+    if lost_join {
+        assert!(
+            outcome.is_err(),
+            "lost actual child join became successful teardown"
+        );
+    } else {
+        finished(outcome);
+    }
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m2_pg_membership_registration_retirement_orders_and_sticky_join() {
+    membership_registration(true, false).await;
+    membership_registration(false, false).await;
+    membership_registration(false, true).await;
+}
+
+async fn incompatible_live_publication(endpoint: &str, dimension: &str) {
+    let factory = Factory::default();
+    let mut cluster = cluster(&factory).await;
+    let result: TestResult = async {
+        let topology = cluster.settle_members(1).await?;
+        let source = cluster.service(topology.primary()).await?;
+        seed(&source).await?;
+        let driver = source.native_driver();
+        let effect = driver.pause_public_build_effects();
+        let copied = driver.pause_public_build_completion();
+        let before_policy = driver.pause_native_cut("source-current-before-policy");
+        let current = driver.pause_native_cut("source-current-policy");
+        let _release_effect = ReleaseGate(effect.clone());
+        let _release_copied = ReleaseGate(copied.clone());
+        let _release_before = ReleaseGate(before_policy.clone());
+        let _release_current = ReleaseGate(current.clone());
+        cluster.scale_to(2).await?;
+        gate(&mut cluster, &effect).await?;
+        let observation = cluster.observe().await?;
+        let reference = observation
+            .replicas()
+            .find(|reference| reference.identity() != topology.primary().identity())
+            .cloned()
+            .unwrap();
+        let target = cluster.service(&reference).await?;
+        let target_driver = target.native_driver();
+        effect.release.notify_one();
+        gate(&mut cluster, &copied).await?;
+        let id = driver.pg_session_ids_for_target(reference.identity().replica_id)
+            .into_iter().next().unwrap();
+        copied.release.notify_one();
+        gate(&mut cluster, &before_policy).await?;
+        cluster.probe(peer_receiver(target_driver, &id, true)).await?;
+        let native = native_continuity(&source, &target, &id).await?;
+        let worker = target_driver.pg_membership_worker(&id).unwrap();
+        let delayed = target_driver.pause_native_cut("membership-first-observation");
+        let _release_delayed = ReleaseGate(delayed.clone());
+        cluster.probe(async {
+            delayed.entered.notified().await;
+            Ok::<_, TestError>(())
+        }).await?;
+        before_policy.release.notify_one();
+        gate(&mut cluster, &current).await?;
+        let observed = cluster.observe().await?;
+        let current_goal = observed.snapshot(topology.primary()).unwrap().goals.iter()
+            .find(|entry| entry.status == ReplicaGoalStatus::Pending
+                && matches!(entry.goal.desired, ReplicaGoalKind::Reconfigure { .. })
+                && entry.goal.scope.configuration.previous.is_none())
+            .ok_or_else(|| TestError::new(ErrorKind::Application, "pending current goal missing"))?
+            .goal.clone();
+        let host_publication = |driver: Arc<PgReplicator>| async move {
+            driver.public_owner().host.get().unwrap().local_publication()
+                .await.map_err(error)?.ok_or_else(|| {
+                    TestError::new(ErrorKind::Application, "live publication missing before fault")
+                })
+        };
+        let source_publication = host_publication(driver.clone()).await?;
+        let target_publication = host_publication(target_driver.clone()).await?;
+        check(
+            source_publication.stage == ReplicaPublicationStage::DiscoveryPending
+                && source_publication.scope.configuration.previous.is_none()
+                && target_driver.pg_session_ownership(&id).0 == session::SessionStage::Completed,
+            "live incompatibility did not start from an established pending continuation",
+        )?;
+        let pgdata = std::fs::read(target.instance().data_dir().join("PG_VERSION"))?;
+        let before_reads = target_driver.public_owner().continuation_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut encoded = serde_json::json!({
+            "source": source_publication,
+            "target": target_publication,
+        });
+        let publication = &mut encoded[endpoint];
+        let original_publication = publication.clone();
+        match dimension {
+            "replica" => publication["scope"]["storage"]["replica"]["instanceId"] = serde_json::json!("changed-replica"),
+            "creationId" | "processSessionId" => publication["scope"][dimension] = serde_json::json!("changed-identity"),
+            "storage" => publication["scope"]["storage"]["storageGeneration"] = serde_json::json!("changed-storage"),
+            "history" => publication["scope"]["history"]["historyId"] = serde_json::json!("changed-history"),
+            "epoch" => publication["scope"]["epoch"]["configurationNumber"] = serde_json::json!(2),
+            "replicationAddress" => publication[dimension] = serde_json::json!("http://127.0.0.1:1"),
+            "generation" => publication[dimension] = serde_json::json!(0),
+            "role" => publication[dimension] = serde_json::json!("idleSecondary"),
+            "configurationId" => publication["scope"]["configuration"]["current"][dimension] = serde_json::json!("changed-C"),
+            "configurationEpoch" => publication["scope"]["configuration"]["current"]["epoch"]["configurationNumber"] = serde_json::json!(2),
+            "members" => publication["scope"]["configuration"]["current"]["members"][0]["instanceId"] = serde_json::json!("changed-member"),
+            "writeQuorum" => publication["scope"]["configuration"]["current"][dimension] = serde_json::json!(1),
+            "primaryId" => {
+                for member in publication["scope"]["configuration"]["current"]["members"]
+                    .as_array_mut().unwrap()
+                {
+                    member["role"] = if member["replicaId"] == serde_json::json!(id.source.scope.storage.replica.replica_id) {
+                        serde_json::json!("activeSecondary")
+                    } else {
+                        serde_json::json!("primary")
+                    };
+                }
+            }
+            "previous" => publication["scope"]["configuration"][dimension] = serde_json::to_value(&id.source.scope.configuration.current).map_err(error)?,
+            "replicas" => publication["scope"]["configuration"][dimension] = serde_json::json!([]),
+            _ => unreachable!("unregistered publication dimension"),
+        }
+        check(
+            *publication != original_publication,
+            "publication fault was a no-op",
+        )?;
+        let source_fault = serde_json::from_value(encoded["source"].clone()).map_err(error)?;
+        let target_fault = serde_json::from_value(encoded["target"].clone()).map_err(error)?;
+        let exit = target.instance().hold_next_driver_exit();
+        let _release_exit = ReleaseNotify(&exit.release);
+        let (admin, admin_driver) = target.instance().connect().await.map_err(error)?;
+        admin.simple_query("SELECT 1").await.map_err(error)?;
+        *target_driver.public_owner().session_publications.lock().unwrap() =
+            Some((source_fault, target_fault));
+        delayed.release.notify_one();
+        cluster.probe(async {
+            tokio::time::timeout(Duration::from_secs(20), exit.entered.notified()).await.map_err(error)?;
+            Ok::<_, TestError>(())
+        }).await?;
+        check(
+            target_driver.public_owner().continuation_reads.load(std::sync::atomic::Ordering::SeqCst) > before_reads
+                && target_driver.pg_session_ownership(&id).0 == session::SessionStage::Quarantined
+                && target_driver.pg_session_ownership(&id).1
+                && target.instance().generation_id() == native.receiver_generation
+                && !target.instance().is_running().await
+                && admin.simple_query("SELECT 1").await.is_err()
+                && !worker.settled_successfully(),
+            "newest incompatible publication bypassed the same-session predicates/native fence/retained join",
+        )?;
+        // An old publication returning cannot revive the cancelled live owner.
+        *target_driver.public_owner().session_publications.lock().unwrap() = None;
+        check(
+            target_driver.pg_session_request(session::SessionRequest {
+                session: id.clone(),
+                action: session::SessionAction::Complete,
+            }).await.is_err()
+                && target_driver.pg_native_membership_tick().await.is_ok()
+                && target.instance().connect_application().await.is_err(),
+            "restored discovery revived quarantined native continuation or completion credit",
+        )?;
+        let mut successor = id.clone();
+        successor.nonce[0] ^= 1;
+        check(
+            target_driver.pg_session_request(session::SessionRequest {
+                session: successor,
+                action: session::SessionAction::Reserve,
+            }).await.is_err(),
+            "incompatible live publication released an unsettled receiver for a successor",
+        )?;
+        let (sql, connection) = administrative_database(&source).await?;
+        sql.batch_execute(
+            "SET synchronous_commit = local;
+             INSERT INTO m2_native_admission VALUES (4, 'not-acked-after-incompatibility')",
+        ).await.map_err(error)?;
+        check(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(200),
+                    PrimaryReplicator::wait_for_catch_up_quorum(
+                        driver.as_ref(), ReplicaSetQuorumMode::WriteQuorum,
+                    )
+                ).await,
+                Ok(Ok(()))
+            ),
+            "incompatible continuation received stale native quorum credit",
+        )?;
+        check(
+            source.instance().connect_application().await.is_err()
+                && !driver.pg_native_membership(&id).map_err(error)?.unwrap().achieved,
+            "native failure became current ordinary SQL/admission credit",
+        )?;
+        driver.pg_remove_native_session(&id).await.map_err(error)?;
+        let retiring = driver.clone();
+        let retired = id.clone();
+        let mut join = tokio::spawn(async move { retiring.pg_retire_session(&retired).await });
+        check(
+            tokio::time::timeout(Duration::from_millis(100), &mut join).await.is_err()
+                && target_driver.pg_session_ownership(&id).1,
+            "two-ended retirement bypassed the actual held incompatible-worker join",
+        )?;
+        exit.release.notify_one();
+        admin_driver.await.map_err(error)?;
+        drop(admin);
+        join.await.map_err(error)?.map_err(error)?;
+        worker.clone().await.map_err(error)?;
+        check(
+            worker.settled_successfully()
+                && !target_driver.pg_session_ownership(&id).1
+                && target_driver.pg_membership_worker(&id).is_some()
+                && !target.instance().is_running().await
+                && std::fs::read(target.instance().data_dir().join("PG_VERSION"))? == pgdata,
+            "incompatible retained owner did not actually join without PGDATA reset",
+        )?;
+        drop(sql);
+        connection.await.map_err(error)?;
+        current.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let observed = cluster.observe().await?;
+                let snapshot = observed.snapshot(topology.primary()).unwrap();
+                if let Some(outcome) = snapshot.goals.iter().find(|entry| entry.goal == current_goal)
+                    && outcome.status != ReplicaGoalStatus::Pending
+                {
+                    check(matches!(outcome.status, ReplicaGoalStatus::Failed(_)),
+                        "incompatible same-session continuation credited the released ordinary current goal")?;
+                    check(snapshot.publication.is_none(),
+                        "failed continuation published a late current-only achieved scope")?;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<_, TestError>(())
+        }).await.map_err(error)??;
+        eprintln!("same-session live publication fenced and joined: {endpoint}.{dimension}");
+        Ok(())
+    }.await;
+    finished(cluster.finish(result).await);
+}
+
+macro_rules! live_publication_case {
+    ($name:ident, $dimension:literal, $($endpoint:literal),+) => {
+        #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+        #[serial_test::serial]
+        async fn $name() {
+            $(incompatible_live_publication($endpoint, $dimension).await;)+
+        }
+    };
+}
+
+live_publication_case!(
+    m2_pg_live_publication_replica,
+    "replica",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_creation,
+    "creationId",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_process,
+    "processSessionId",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_storage,
+    "storage",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_history,
+    "history",
+    "source",
+    "target"
+);
+live_publication_case!(m2_pg_live_publication_epoch, "epoch", "source", "target");
+live_publication_case!(
+    m2_pg_live_publication_endpoint,
+    "replicationAddress",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_generation,
+    "generation",
+    "source",
+    "target"
+);
+live_publication_case!(m2_pg_live_publication_role, "role", "source", "target");
+live_publication_case!(
+    m2_pg_live_publication_configuration,
+    "configurationId",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_members,
+    "members",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_write_quorum,
+    "writeQuorum",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_primary,
+    "primaryId",
+    "source",
+    "target"
+);
+live_publication_case!(
+    m2_pg_live_publication_replica_set,
+    "replicas",
+    "source",
+    "target"
+);
+live_publication_case!(m2_pg_live_publication_previous, "previous", "source");
+live_publication_case!(
+    m2_pg_live_publication_configuration_epoch,
+    "configurationEpoch",
+    "source",
+    "target"
+);
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[serial_test::serial]
@@ -1838,14 +2622,14 @@ async fn m2_pg_incompatible_or_retired_session_cannot_continue_while_pending() {
                 "epoch" => changed[dimension]["configurationNumber"] = serde_json::json!(2),
                 _ => changed[dimension] = serde_json::json!("changed-C"),
             }
-            if let Ok(changed) = serde_json::from_value::<ConfigurationDescriptor>(changed) {
-                check(
-                    driver
-                        .pg_install_membership(&id, &changed, None, true)
-                        .is_err(),
-                    "current-only continuation accepted a changed C descriptor",
-                )?;
-            }
+            let changed =
+                serde_json::from_value::<ConfigurationDescriptor>(changed).map_err(error)?;
+            check(
+                driver
+                    .pg_install_membership(&id, &changed, None, true)
+                    .is_err(),
+                "current-only continuation accepted a changed C descriptor",
+            )?;
         }
         check(
             driver
