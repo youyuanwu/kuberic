@@ -891,6 +891,7 @@ where
             self.config.replication_address,
         ));
         runtime.configure_native_transport(Arc::from(self.config.bearer_token.as_str()))?;
+        runtime.configure_discovery_resolver(self._resolver.clone())?;
         let agent = AgentService::new(
             store.clone(),
             runtime.clone(),

@@ -33,11 +33,18 @@ mod terminal;
 pub(crate) use program::{operation_instructions, repeatable, replayable};
 pub(crate) use terminal::recover as recover_terminal;
 
+pub(crate) fn record_instructions(record: &PublicOperationRecord) -> Vec<PublicInstruction> {
+    record.ordinary.as_ref().map_or_else(
+        || operation_instructions(&record.intent),
+        |ordinary| ordinary.actions.clone(),
+    )
+}
+
 pub(crate) fn instruction_selected(
     record: &super::state::PublicOperationRecord,
     selected: super::state::PublicInstruction,
 ) -> bool {
-    operation_instructions(&record.intent)
+    record_instructions(record)
         .iter()
         .position(|instruction| *instruction == selected)
         .is_some_and(|index| {
@@ -122,6 +129,9 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) native_observer_callbacks: bool,
     pub(crate) retry_proof: PublicCallbackRetryProof,
     pub(crate) terminal_drain: TerminalDrain,
+    pub(crate) peer_credentials: Option<Arc<str>>,
+    pub(crate) ordinary: bool,
+    pub(crate) abort_creation: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) terminal_cleanup: Option<Arc<terminal::TerminalCleanup>>,
     pub(crate) access_factory: Option<AccessFactory>,
     pub(crate) access_owner: Option<Arc<super::hosting::AccessOwner>>,
@@ -252,9 +262,18 @@ impl PublicLifecycleCallbacks {
     pub(crate) fn abort_once(&self) {
         let mut aborted = self.aborted.lock().expect("preview abort lock");
         if !*aborted {
+            if self.ordinary {
+                let _ = (self.revoke_access)();
+            }
             *aborted = true;
-            self.replicator.abort();
-            self.application.abort();
+            if self.ordinary
+                && let Some(abort) = &self.abort_creation
+            {
+                abort();
+            } else {
+                self.replicator.abort();
+                self.application.abort();
+            }
         }
     }
 
@@ -359,6 +378,12 @@ pub(crate) async fn launch_bound_attempt<T>(
         .map_err(|message| HostError::CommandRejected(message.into()))?;
     callbacks.validate_intent_capabilities(&intent)?;
     callbacks.aborted = registry.abort_guard();
+    if intent.goal().is_some() {
+        callbacks.ordinary = true;
+        callbacks.native_role_epoch = None;
+        callbacks.native_observer_callbacks = false;
+        callbacks.preempt_retained_owner = intent.class.is_terminal();
+    }
     callbacks.retry_proof = callbacks.retry_proof.for_attempt();
     if intent.class.is_terminal()
         || intent
@@ -391,7 +416,12 @@ pub(crate) async fn launch_bound_attempt<T>(
     if !matches!(
         intent.program,
         Some(PublicOperationProgram::Progress { .. } | PublicOperationProgram::Build(_))
-    ) && matches!(
+    ) && !intent.goal().is_some_and(|goal| {
+        matches!(
+            goal.desired,
+            crate::protocol::public_operations::ReplicaGoalKind::Build { .. }
+        )
+    }) && matches!(
         operation.snapshot().stage,
         PublicOperationStage::Ready | PublicOperationStage::WaitingForContainment
     ) && let Some(factory) = &callbacks.access_factory
@@ -414,7 +444,15 @@ pub(crate) async fn launch_bound_attempt<T>(
             && registry.has_uncontained_predecessors(&operation).await
         {
             callbacks.abort_once();
-            if let Err(error) = (callbacks.terminal_drain)().await {
+            if intent.goal().is_some() {
+                let drain = callbacks.terminal_drain.clone();
+                let operation = operation.clone();
+                registry.own_terminal_task(async move {
+                    if let Err(error) = drain().await {
+                        operation.record_containment_failure(&HostError::from(error));
+                    }
+                });
+            } else if let Err(error) = (callbacks.terminal_drain)().await {
                 // The owner retains the same outcome for the terminal
                 // instruction/cleanup path; containment is not Close success.
                 tracing::warn!(%error, "terminal preemption retained a child failure");
@@ -925,7 +963,8 @@ pub(crate) struct PublicV1ReportProjection {
     pub(crate) observation_alive: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
-fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind> {
+fn public_v1_call_kind(record: &PublicOperationRecord) -> Result<PublicV1CallKind> {
+    let intent = &record.intent;
     if let Some(lifecycle) = &intent.lifecycle {
         return Ok(match lifecycle.recipe {
             PublicLifecycleRecipe::InitialPrimary => PublicV1CallKind::InitialPrimary,
@@ -934,6 +973,31 @@ fn public_v1_call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKin
         });
     }
     match intent.program.as_ref() {
+        Some(PublicOperationProgram::AgentGoal(goal)) => Ok(match goal.desired {
+            crate::protocol::public_operations::ReplicaGoalKind::Discover => PublicV1CallKind::Open,
+            crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. } => {
+                if record
+                    .ordinary
+                    .as_ref()
+                    .is_some_and(|ordinary| ordinary.already_open)
+                {
+                    PublicV1CallKind::Role
+                } else {
+                    PublicV1CallKind::Open
+                }
+            }
+            crate::protocol::public_operations::ReplicaGoalKind::Reconfigure { .. } => {
+                PublicV1CallKind::Configuration
+            }
+            crate::protocol::public_operations::ReplicaGoalKind::Build { .. } => {
+                PublicV1CallKind::Build
+            }
+            crate::protocol::public_operations::ReplicaGoalKind::Remove { .. } => {
+                PublicV1CallKind::Remove
+            }
+            crate::protocol::public_operations::ReplicaGoalKind::Close => PublicV1CallKind::Close,
+            crate::protocol::public_operations::ReplicaGoalKind::Abort => PublicV1CallKind::Abort,
+        }),
         Some(PublicOperationProgram::Open { .. }) => Ok(PublicV1CallKind::Open),
         Some(PublicOperationProgram::Role { .. }) => Ok(PublicV1CallKind::Role),
         Some(PublicOperationProgram::Epoch { .. }) => Ok(PublicV1CallKind::Epoch),
@@ -1001,6 +1065,10 @@ fn public_v1_completion_authority(
         ));
     };
     Ok(match program {
+        PublicOperationProgram::AgentGoal(goal) => {
+            let (previous, current) = configuration_ids(&goal.scope.configuration.ordinary());
+            (previous, current, None, None)
+        }
         PublicOperationProgram::Configuration(configuration) => {
             let (previous, current) = configuration_ids(configuration);
             (previous, current, None, None)
@@ -1081,7 +1149,7 @@ pub(crate) fn installed_configuration_from_record(
 pub(crate) fn achieved_configuration_from_record(
     record: &PublicOperationRecord,
 ) -> Option<PublicConfiguration> {
-    operation_instructions(&record.intent)
+    record_instructions(record)
         .into_iter()
         .zip(&record.lifecycle.outcomes)
         .filter(|(instruction, outcome)| {
@@ -1129,19 +1197,17 @@ pub(crate) fn configuration_observation_safe(
             && super::public_action_state::current_scope(preview, process, record)
             && (record.intent.revision > installed.intent.revision
                 || record.stage != PublicOperationStage::Completed)
-            && operation_instructions(&record.intent)
-                .into_iter()
-                .any(|instruction| {
-                    configuration_instruction(instruction)
-                        || matches!(
-                            instruction,
-                            PublicInstruction::ReplicatorRole
-                                | PublicInstruction::ReplicatorPrimary
-                                | PublicInstruction::Epoch
-                                | PublicInstruction::ProgramEpoch
-                                | PublicInstruction::DataLoss
-                        )
-                })
+            && record_instructions(record).into_iter().any(|instruction| {
+                configuration_instruction(instruction)
+                    || matches!(
+                        instruction,
+                        PublicInstruction::ReplicatorRole
+                            | PublicInstruction::ReplicatorPrimary
+                            | PublicInstruction::Epoch
+                            | PublicInstruction::ProgramEpoch
+                            | PublicInstruction::DataLoss
+                    )
+            })
     })
 }
 
@@ -1222,7 +1288,7 @@ pub(crate) async fn public_v1_report(
             Ok(PublicV1OperationCompletion {
                 operation_id: record.intent.operation_id.clone(),
                 revision: record.intent.revision,
-                call_kind: public_v1_call_kind(&record.intent)?,
+                call_kind: public_v1_call_kind(record)?,
                 process_session_id: record.intent.process_session_id.clone(),
                 input_digest: record.intent.input_digest.clone(),
                 replay_disposition: record.intent.replay_disposition,
@@ -1452,6 +1518,10 @@ pub(crate) fn completed_configuration(record: &PublicOperationRecord) -> bool {
 pub(crate) fn complete(record: &PublicOperationRecord) -> bool {
     (record.intent.lifecycle.is_none() && record.intent.program.is_none()) || {
         record.lifecycle.in_flight.is_none()
-            && record.lifecycle.outcomes.len() == operation_instructions(&record.intent).len()
+            && record.lifecycle.outcomes.len()
+                == record.ordinary.as_ref().map_or_else(
+                    || operation_instructions(&record.intent).len(),
+                    |ordinary| ordinary.actions.len(),
+                )
     }
 }

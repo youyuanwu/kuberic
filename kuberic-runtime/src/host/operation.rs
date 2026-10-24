@@ -33,6 +33,7 @@ pub(crate) struct PartitionOperation {
     record: watch::Sender<PublicOperationRecord>,
     failure: watch::Sender<Option<String>>,
     task: Mutex<Option<JoinHandle<Result<()>>>>,
+    ordinary_join: Mutex<()>,
     lifecycle: Mutex<()>,
     containment: Mutex<CallbackContainment>,
     coordination_active: std::sync::atomic::AtomicBool,
@@ -62,6 +63,7 @@ impl PartitionOperation {
             record,
             failure,
             task: Mutex::new(None),
+            ordinary_join: Mutex::new(()),
             lifecycle: Mutex::new(()),
             containment: Mutex::new(CallbackContainment::RootTask),
             coordination_active: std::sync::atomic::AtomicBool::new(false),
@@ -175,7 +177,7 @@ impl PartitionOperation {
             !matches!(
                 self.intent().program,
                 Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
-            ),
+            ) && !(self.intent().goal().is_some() && self.intent().class.is_terminal()),
             |witness| *witness.borrow(),
         )
     }
@@ -420,6 +422,22 @@ impl PartitionOperation {
     }
 
     pub(crate) async fn cancel_root(&self) -> Result<PublicOperationRecord> {
+        if self.intent().goal().is_some() {
+            self.invalidate_access();
+            // Cancellation withdraws authority, not ownership of an accepted
+            // ordinary future. Abort/Close is the creation owner's barrier.
+            self.join_ordinary_root().await?;
+            let _lifecycle = self.lifecycle.lock().await;
+            let current = self.snapshot();
+            if matches!(
+                current.stage,
+                PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
+            ) {
+                return Ok(current);
+            }
+
+            return self.persist_cancellation(current, None).await;
+        }
         let task = {
             let _lifecycle = self.lifecycle.lock().await;
             let current = self.snapshot();
@@ -488,6 +506,30 @@ impl PartitionOperation {
         }
 
         self.persist_cancellation(current, task_failure).await
+    }
+
+    async fn join_ordinary_root(&self) -> Result<()> {
+        let _join = self.ordinary_join.lock().await;
+        if let Some(task) = self.task.lock().await.take() {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.record_failure(&error);
+                    return Err(error);
+                }
+                Err(error) => {
+                    let error = HostError::CommandRejected(format!(
+                        "ordinary callback owner join failed: {error}"
+                    ));
+                    self.record_failure(&error);
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(error) = self.failure.borrow().clone() {
+            return Err(HostError::CommandRejected(error));
+        }
+        Ok(())
     }
 
     async fn persist_cancellation(
@@ -567,7 +609,7 @@ impl PartitionOperation {
                 if !canonical_failure {
                     return None;
                 }
-                super::public_lifecycle::program::operation_instructions(&record.intent)
+                super::public_lifecycle::record_instructions(&record)
                     .get(record.lifecycle.outcomes.len().checked_sub(1)?)
                     .copied()
             })
@@ -1519,6 +1561,36 @@ impl PartitionOperationRegistry {
             .push(tokio::spawn(future));
     }
 
+    pub(crate) async fn join_ordinary_roots(&self) -> Result<()> {
+        let operations = self
+            .state
+            .lock()
+            .await
+            .operations
+            .values()
+            .filter(|operation| {
+                operation.intent().goal().is_some() && !operation.intent().class.is_terminal()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for operation in operations {
+            operation.join_ordinary_root().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn join_ordinary_goal(&self, id: &OperationId) -> Result<()> {
+        let operation = self
+            .state
+            .lock()
+            .await
+            .operations
+            .get(id)
+            .cloned()
+            .ok_or_else(|| HostError::CommandRejected("ordinary goal owner unavailable".into()))?;
+        operation.join_ordinary_root().await
+    }
+
     pub(crate) async fn admit(
         self: &Arc<Self>,
         intent: PublicOperationIntent,
@@ -1692,6 +1764,16 @@ impl PartitionOperationRegistry {
         };
         for operation in existing {
             let record = operation.snapshot();
+            if intent.goal().is_some_and(|goal| {
+                matches!(
+                    goal.desired,
+                    crate::protocol::public_operations::ReplicaGoalKind::Discover
+                        | crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
+                ) && record.intent.goal().is_some()
+                    && record.intent.process_session_id != intent.process_session_id
+            }) {
+                continue;
+            }
             if record.superseded_by.is_some()
                 || matches!(
                     record.disposition,
@@ -1710,7 +1792,13 @@ impl PartitionOperationRegistry {
             {
                 continue;
             }
-            let relation = if renewal
+            let relation = if record.intent.goal().is_some() && intent.goal().is_some() {
+                ordinary_relation(
+                    &record.intent,
+                    &intent,
+                    record.stage == PublicOperationStage::Completed,
+                )
+            } else if renewal
                 .as_ref()
                 .is_some_and(|renewal| is_contained_predecessor_fault(renewal, &record, &intent))
             {
@@ -1928,10 +2016,13 @@ impl PartitionOperationRegistry {
             {
                 recovered.push(record);
             }
-            if matches!(
+            if (matches!(
                 operation.intent().program,
                 Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
-            ) && operation.snapshot().stage == PublicOperationStage::ContainmentPending
+            ) || (operation.intent().goal().is_some()
+                && operation.intent().class.is_terminal()
+                && operation.intent().process_session_id == self.process_session_id))
+                && operation.snapshot().stage == PublicOperationStage::ContainmentPending
                 && let Some(callbacks) = self.terminal_recovery.get()
             {
                 crate::host::public_lifecycle::recover_terminal(self, &operation, callbacks()?)
@@ -1949,10 +2040,6 @@ impl PartitionOperationRegistry {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
         let controls = std::mem::take(&mut *self.control_tasks.lock().expect("control task lock"));
-        for task in controls {
-            task.abort();
-            let _ = task.await;
-        }
         let admission = self.admission.lock().await;
         let mut first_error = None;
         let operations = self
@@ -1963,6 +2050,21 @@ impl PartitionOperationRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let ordinary = operations
+            .iter()
+            .any(|operation| operation.intent().goal().is_some());
+        if ordinary && let Some(callbacks) = self.terminal_recovery.get() {
+            let mut callbacks = callbacks()?;
+            callbacks.aborted = self.abort_guard();
+            (callbacks.revoke_access)()?;
+            callbacks.abort_once();
+            let drain = callbacks.terminal_drain.clone();
+            self.own_terminal_task(async move {
+                if let Err(error) = drain().await {
+                    tracing::warn!(%error, "ordinary shutdown remains uncontained");
+                }
+            });
+        }
         for operation in operations {
             if !matches!(
                 operation.snapshot().stage,
@@ -1970,6 +2072,20 @@ impl PartitionOperationRegistry {
             ) && let Err(error) = operation.cancel_root().await
             {
                 first_error.get_or_insert(error);
+            }
+        }
+        for task in controls {
+            if !ordinary {
+                task.abort();
+            }
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!(
+                        "retained control owner join failed: {error}"
+                    ))
+                });
             }
         }
         let terminals =
@@ -2044,6 +2160,15 @@ impl PartitionOperationRegistry {
             self.fence_session_renewal();
         }
         let mut state = self.state.lock().await;
+        let durable_ids = records
+            .iter()
+            .map(|record| record.intent.operation_id.clone())
+            .collect::<BTreeSet<_>>();
+        state.operations.retain(|id, operation| {
+            operation.intent().goal().is_none()
+                || durable_ids.contains(id)
+                || operation.snapshot().stage != PublicOperationStage::Completed
+        });
         for record in records {
             state
                 .operations
@@ -2261,6 +2386,45 @@ fn retained_relation(
             Reject("operation revision does not match retained authority")
         }
         _ => Coexist,
+    }
+}
+
+fn ordinary_relation(
+    existing: &PublicOperationIntent,
+    incoming: &PublicOperationIntent,
+    completed: bool,
+) -> AdmissionRelation {
+    use AdmissionRelation::*;
+    if existing.class.is_terminal() {
+        return Reject("ordinary creation already has an immutable terminal owner");
+    }
+    if incoming.class.is_terminal() {
+        return if completed { Coexist } else { Supersede };
+    }
+    if incoming.revision <= existing.revision {
+        return Reject("ordinary goal revision is not newer");
+    }
+    if completed {
+        return Coexist;
+    }
+    match (&existing.class, &incoming.class) {
+        (
+            PublicOperationClass::Build { target: left },
+            PublicOperationClass::Build { target: right },
+        )
+        | (
+            PublicOperationClass::Remove { target: left },
+            PublicOperationClass::Remove { target: right },
+        )
+        | (
+            PublicOperationClass::Build { target: left },
+            PublicOperationClass::Remove { target: right },
+        )
+        | (
+            PublicOperationClass::Remove { target: left },
+            PublicOperationClass::Build { target: right },
+        ) if left != right => Coexist,
+        _ => Reject("unresolved ordinary action requires completion or whole-creation withdrawal"),
     }
 }
 

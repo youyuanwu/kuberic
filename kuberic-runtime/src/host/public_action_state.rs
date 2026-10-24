@@ -17,6 +17,7 @@ fn epoch(intent: &PublicOperationIntent) -> Option<Epoch> {
         .as_ref()
         .map(|input| input.epoch)
         .or_else(|| match intent.program.as_ref()? {
+            P::AgentGoal(goal) => Some(goal.scope.epoch),
             P::Role { epoch, .. } | P::Epoch { epoch } | P::Swap { epoch, .. } => Some(*epoch),
             P::Configuration(c)
             | P::CatchUp {
@@ -32,7 +33,7 @@ fn epoch(intent: &PublicOperationIntent) -> Option<Epoch> {
 }
 
 fn achieved_role(record: &PublicOperationRecord, application: bool) -> Option<ReplicaRole> {
-    let instructions = public_lifecycle::program::operation_instructions(&record.intent);
+    let instructions = public_lifecycle::record_instructions(record);
     instructions
         .iter()
         .zip(&record.lifecycle.outcomes)
@@ -51,6 +52,7 @@ fn achieved_role(record: &PublicOperationRecord, application: bool) -> Option<Re
                 return Some(ReplicaRole::Primary);
             }
             match record.intent.program.as_ref()? {
+                P::AgentGoal(goal) => goal.role(),
                 P::Role { role, .. } => Some(*role),
                 P::Swap { handoff, .. } => Some(*handoff),
                 _ => None,
@@ -78,7 +80,8 @@ pub(crate) fn configuration_at(
     let mut configuration = if let Some(input) = &intent.lifecycle {
         input.configuration()
     } else {
-        public_lifecycle::program::configuration(intent.program.as_ref()?, instruction).clone()
+        let program = public_lifecycle::program::selected_program(intent, instruction)?;
+        public_lifecycle::program::configuration(&program, instruction).clone()
     };
     if instruction == I::CurrentConfiguration
         || (instruction == I::CatchUp
@@ -134,6 +137,9 @@ pub(crate) fn current_scope(
 /// Runs under the durable store transaction on both fresh admission and retry.
 /// Exact completed replay remains immutable and is not new authority.
 pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Result<()> {
+    if let Some(goal) = intent.goal() {
+        super::ordinary_goal::validate_admission(state, goal)?;
+    }
     if !intent.identity.is_public_v1() || intent.class.is_terminal() {
         return Ok(());
     }

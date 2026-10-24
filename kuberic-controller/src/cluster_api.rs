@@ -4697,6 +4697,11 @@ impl ClusterApi for InMemoryClusterApi {
                 PublicOperationProgram, PublicV1CallKind,
             };
             match intent.program.as_ref() {
+                Some(PublicOperationProgram::AgentGoal(_)) => {
+                    Err(ControllerError::InvalidAgentEvidence(
+                        "semantic goals require the M1 goal transport".into(),
+                    ))
+                }
                 Some(PublicOperationProgram::Open { .. }) => {
                     Ok((PublicV1CallKind::Open, None, None, None, None))
                 }

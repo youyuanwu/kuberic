@@ -1287,7 +1287,7 @@ async fn schema13_current_cancelled_and_partial_records_reject_without_changing_
                     &binding
                 ),
                 Err(HostError::SchemaMismatch {
-                    expected: 14,
+                    expected: 15,
                     observed: 13
                 })
             ),

@@ -4,8 +4,10 @@
 //! establish canonical [`crate::protocol`] authority before callers use them.
 
 pub mod convert;
+mod discovery;
 mod scale_down;
 mod scale_up;
+pub(crate) use discovery::resolve_replica_publication;
 
 pub mod proto {
     tonic::include_proto!("kuberic.level.v1");
