@@ -1,5 +1,15 @@
 # Downstream In-Process Application Tests
 
+**M1 checkpoint:** production reconciliation now requires format-15 semantic
+goals and an ordinary-compatible factory. Built-in/KV/SQLite/PG/external-provider
+integration explicitly rejects until M2. Historical formation/failover/copy
+journeys described below now check exact unavailability where that route moved;
+their later clauses do not execute. The [ordinary M1 witness](ordinary-hosting-m1.md#verification-and-limits)
+instead runs the real reconciler/agent transport with an independent ordinary
+factory, early discovery, retained lifetimes and separate admission.
+The reusable adapter/package boundary remains, but the older counter/provider
+example is not a supported current production engine.
+
 Enable the controller's optional `test-util` feature in development
 dependencies to run a production reconciler and real hosted application
 replicas without Kubernetes:
@@ -101,7 +111,7 @@ automatically.
 
 ## Fault and Transfer Tests
 
-The harness supports the built-in persisted Public V1 profile and bounded
+The pre-M1 harness supported the built-in persisted Public V1 profile and bounded
 custom-native formation through the
 [custom companion](replicator-boundary.md#custom-controller-integration).
 PostgreSQL's [production-engine fixture](../../../examples/postgres/src/public_controller_tests.rs)

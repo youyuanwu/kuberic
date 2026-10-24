@@ -20,10 +20,14 @@ use kuberic_runtime::protocol::command::{
 };
 use kuberic_runtime::protocol::observation::ReplicaObservationKey;
 use kuberic_runtime::protocol::public_operations::{
-    CanonicalReplicaRebuildRequired, PublicBuildAttemptReference, PublicConfiguration,
-    PublicInboundBuildAuthority, PublicOperationClass, PublicOperationIntent,
-    PublicOperationProgram, PublicReplicaDescriptor, PublicV1AcceptedStatus, PublicV1AgentReport,
-    PublicV1OperationCompletion, PublicV1OperationResult, PublicV1SessionRenewalStatus,
+    CanonicalReplicaRebuildRequired, PublicConfiguration, PublicOperationClass,
+    PublicOperationIntent, PublicOperationProgram, PublicReplicaDescriptor, PublicV1AcceptedStatus,
+    PublicV1AgentReport, PublicV1OperationCompletion, PublicV1OperationResult,
+    PublicV1SessionRenewalStatus,
+};
+#[cfg(test)]
+use kuberic_runtime::protocol::public_operations::{
+    PublicBuildAttemptReference, PublicInboundBuildAuthority,
 };
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, PodUid,
@@ -70,33 +74,16 @@ pub enum EffectRecord {
     Execute(ProtocolCommand),
 }
 
-async fn revoke_inbound_build_authority<A>(
-    api: &KubeClusterApi<A>,
-    observation: &RawObservation,
-    expected: &PublicV1AcceptedTransitionStatus,
-    command: &ProtocolCommand,
+async fn reject_legacy_containment<A>(
+    _api: &KubeClusterApi<A>,
+    _observation: &RawObservation,
+    _expected: &PublicV1AcceptedTransitionStatus,
+    _command: &ProtocolCommand,
 ) -> std::result::Result<(), String>
 where
     A: AgentApi + 'static,
 {
-    let ProtocolCommand::PublicV1Operation(operation) = command else {
-        return Ok(());
-    };
-    let Some(PublicOperationProgram::Build(build)) = operation.intent.program.as_ref() else {
-        return Ok(());
-    };
-    let authority = inbound_build_authority(expected, operation, build)?;
-    api.execute_command(
-        observation,
-        &ProtocolCommand::PublicV1History(Box::new(
-            kuberic_runtime::protocol::command::PublicV1HistoryCommand::
-                RevokeInboundBuildAuthority {
-                    authority: Box::new(authority),
-                },
-        )),
-    )
-    .await
-    .map_err(|error| error.to_string())
+    Err("legacy production grant containment is unavailable; withdraw the ordinary creation".into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +94,39 @@ pub enum AgentRpcError {
 
 #[async_trait]
 pub trait AgentApi: Send + Sync {
+    async fn get_snapshot(
+        &self,
+        _endpoint: &str,
+        _token: &str,
+        _request: proto::ReplicaSnapshotRequest,
+    ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
+        Err(AgentRpcError::Invalid(
+            "semantic snapshots are unsupported".into(),
+        ))
+    }
+
+    async fn submit_goal(
+        &self,
+        _endpoint: &str,
+        _token: &str,
+        _request: proto::ReplicaGoalRequest,
+    ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
+        Err(AgentRpcError::Invalid(
+            "semantic goals are unsupported".into(),
+        ))
+    }
+
+    async fn acknowledge_goal(
+        &self,
+        _endpoint: &str,
+        _token: &str,
+        _request: proto::ReplicaGoalRequest,
+    ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
+        Err(AgentRpcError::Invalid(
+            "semantic acknowledgements are unsupported".into(),
+        ))
+    }
+
     async fn get_status(
         &self,
         endpoint: &str,
@@ -124,6 +144,14 @@ pub trait AgentApi: Send + Sync {
 
 #[async_trait]
 pub trait ClusterApi: Send + Sync {
+    async fn reconcile_replica_goals(
+        &self,
+        _observation: &RawObservation,
+    ) -> Result<Option<crate::reconciler::ReconcileAction>> {
+        Err(ControllerError::Effect(
+            "ordinary production reconciliation is unsupported".into(),
+        ))
+    }
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation>;
 
     async fn ensure_replica_scaffolding(
@@ -190,10 +218,73 @@ impl GrpcAgentApi {
     pub fn new(deadline: Duration) -> Self {
         Self { deadline }
     }
+
+    async fn client(
+        &self,
+        endpoint: &str,
+    ) -> std::result::Result<
+        proto::agent_control_client::AgentControlClient<tonic::transport::Channel>,
+        AgentRpcError,
+    > {
+        tokio::time::timeout(
+            self.deadline,
+            proto::agent_control_client::AgentControlClient::connect(endpoint.to_owned()),
+        )
+        .await
+        .map_err(|_| AgentRpcError::Unavailable("agent connection timed out".into()))?
+        .map_err(|error| AgentRpcError::Unavailable(error.to_string()))
+    }
 }
 
 #[async_trait]
 impl AgentApi for GrpcAgentApi {
+    async fn get_snapshot(
+        &self,
+        endpoint: &str,
+        token: &str,
+        request: proto::ReplicaSnapshotRequest,
+    ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
+        let mut client = self.client(endpoint).await?;
+        let mut request = tonic::Request::new(request);
+        add_bearer_token(&mut request, token)?;
+        tokio::time::timeout(self.deadline, client.get_snapshot(request))
+            .await
+            .map_err(|_| AgentRpcError::Unavailable("GetSnapshot timed out".into()))?
+            .map(|response| response.into_inner())
+            .map_err(classify_status)
+    }
+
+    async fn submit_goal(
+        &self,
+        endpoint: &str,
+        token: &str,
+        request: proto::ReplicaGoalRequest,
+    ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
+        let mut client = self.client(endpoint).await?;
+        let mut request = tonic::Request::new(request);
+        add_bearer_token(&mut request, token)?;
+        tokio::time::timeout(self.deadline, client.submit_goal(request))
+            .await
+            .map_err(|_| AgentRpcError::Unavailable("SubmitGoal reply lost or timed out".into()))?
+            .map(|response| response.into_inner())
+            .map_err(classify_status)
+    }
+
+    async fn acknowledge_goal(
+        &self,
+        endpoint: &str,
+        token: &str,
+        request: proto::ReplicaGoalRequest,
+    ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
+        let mut client = self.client(endpoint).await?;
+        let mut request = tonic::Request::new(request);
+        add_bearer_token(&mut request, token)?;
+        tokio::time::timeout(self.deadline, client.acknowledge_goal(request))
+            .await
+            .map_err(|_| AgentRpcError::Unavailable("AcknowledgeGoal timed out".into()))?
+            .map(|response| response.into_inner())
+            .map_err(classify_status)
+    }
     async fn get_status(
         &self,
         endpoint: &str,
@@ -278,8 +369,8 @@ fn classify_execute_status(status: tonic::Status) -> AgentRpcError {
 
 pub struct KubeClusterApi<A> {
     client: Client,
-    agents: Arc<A>,
-    bearer_token: Arc<str>,
+    pub(crate) agents: Arc<A>,
+    pub(crate) bearer_token: Arc<str>,
     installation_namespace: Arc<str>,
 }
 
@@ -347,10 +438,19 @@ impl<A> ClusterApi for KubeClusterApi<A>
 where
     A: AgentApi + 'static,
 {
+    async fn reconcile_replica_goals(
+        &self,
+        observation: &RawObservation,
+    ) -> Result<Option<crate::reconciler::ReconcileAction>> {
+        self.reconcile_ordinary(observation).await.map(Some)
+    }
+
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation> {
         self.require_installation_namespace(namespace)?;
         let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), namespace);
         let set = sets.get(name).await.map_err(map_kube_observation_error)?;
+        set.validate_ordinary_hosting()
+            .map_err(ControllerError::InvalidAgentEvidence)?;
         let uid = set
             .uid()
             .ok_or_else(|| ControllerError::Observation("KubericSet has no UID".to_string()))?;
@@ -689,6 +789,11 @@ where
         observation: &RawObservation,
         command: &ProtocolCommand,
     ) -> Result<()> {
+        if !matches!(command, ProtocolCommand::InitializeAgentStore(_)) {
+            return Err(ControllerError::Effect(
+                "legacy production engine commands are unavailable; submit semantic goals".into(),
+            ));
+        }
         let (target, replica_id) = command_target(command);
         let pod = observation
             .pods
@@ -818,6 +923,9 @@ fn observed_process_session(
         {
             Ok(report.process_session_id.to_string())
         }
+        Some(RawAgentObservation::ReplicaSnapshot(snapshot)) => {
+            Ok(snapshot.process_session_id.to_string())
+        }
 
         _ => Err(ControllerError::ObservationStale),
     }
@@ -843,39 +951,68 @@ where
                 message: "Pod has no control address while the agent starts".to_string(),
             };
         };
-        let request = proto::GetAgentStatusRequest {
-            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+        let initialization = derive_initialization_id(
+            resource_uid,
+            replica_id,
+            &PodUid::new(&instance_id),
+            &PvcUid::new(
+                pod.spec
+                    .as_ref()
+                    .and_then(|spec| spec.containers.first())
+                    .and_then(|container| container.env.as_ref())
+                    .and_then(|env| env.iter().find(|entry| entry.name == "KUBERIC_PVC_UID"))
+                    .and_then(|entry| entry.value.clone())
+                    .unwrap_or_default(),
+            ),
+        );
+        let request = proto::ReplicaSnapshotRequest {
+            protocol_version: kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
             resource_uid: resource_uid.to_string(),
-            replica_id: replica_id.value(),
-            expected_instance_id: instance_id.clone(),
+            target: Some(
+                ReplicaIdentity {
+                    replica_id,
+                    instance_id: ReplicaInstanceId::new(&instance_id),
+                    agent_generation: derive_agent_generation(&initialization),
+                }
+                .into(),
+            ),
+            expected_process_session_id: String::new(),
         };
         match self
             .agents
-            .get_status(&endpoint, &self.bearer_token, request)
+            .get_snapshot(&endpoint, &self.bearer_token, request)
             .await
         {
-            Ok(report) if report.public_v1.is_none() => {
-                match kuberic_runtime::control::normalize_uninitialized_agent_status_report(report)
-                {
-                    Ok(report)
+            Ok(response) => {
+                use kuberic_runtime::protocol::public_operations::*;
+                if response.protocol_version != ORDINARY_ACTION_FORMAT {
+                    return RawAgentObservation::Invalid {
+                        message: "incompatible snapshot format".into(),
+                    };
+                }
+                match serde_json::from_slice::<ReplicaAgentQueryResult>(&response.canonical_json) {
+                    Ok(ReplicaAgentQueryResult::Uninitialized(report))
                         if report.resource_uid == *resource_uid
                             && report.replica_id == replica_id
                             && report.pod_uid.as_str() == instance_id =>
                     {
                         RawAgentObservation::Uninitialized(report)
                     }
+                    Ok(ReplicaAgentQueryResult::Initialized(snapshot))
+                        if snapshot.format == ORDINARY_ACTION_FORMAT
+                            && snapshot.identity.is_public_v1()
+                            && snapshot.storage.validate().is_ok()
+                            && snapshot.history.resource_uid == *resource_uid
+                            && snapshot.storage.replica.replica_id == replica_id
+                            && snapshot.storage.replica.instance_id.as_str() == instance_id
+                            && !snapshot.process_session_id.is_empty()
+                            && !snapshot.creation_id.is_empty() =>
+                    {
+                        RawAgentObservation::ReplicaSnapshot(snapshot)
+                    }
                     Ok(_) => RawAgentObservation::Invalid {
-                        message: "fresh agent status differs from observed resource identity"
-                            .to_string(),
+                        message: "snapshot differs from exact resource/Pod/storage identity".into(),
                     },
-                    Err(error) => RawAgentObservation::Invalid {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Ok(report) => {
-                match kuberic_runtime::control::normalize_public_v1_agent_status_report(report) {
-                    Ok(report) => RawAgentObservation::PublicV1Report(Box::new(report)),
                     Err(error) => RawAgentObservation::Invalid {
                         message: error.to_string(),
                     },
@@ -1534,7 +1671,7 @@ async fn patch_public_v1_write_service(
         .map_err(map_kube_effect_error)
 }
 
-fn agent_endpoint(pod: &Pod) -> Option<String> {
+pub(crate) fn agent_endpoint(pod: &Pod) -> Option<String> {
     pod.annotations()
         .get(CONTROL_ADDRESS_ANNOTATION)
         .cloned()
@@ -1627,7 +1764,7 @@ fn map_kube_status_error(error: kube::Error) -> ControllerError {
     }
 }
 
-fn map_agent_effect_error(error: AgentRpcError) -> ControllerError {
+pub(crate) fn map_agent_effect_error(error: AgentRpcError) -> ControllerError {
     match error {
         AgentRpcError::Unavailable(message) => ControllerError::AgentUnavailable(message),
         AgentRpcError::Invalid(message) => ControllerError::InvalidAgentEvidence(message),
@@ -1822,7 +1959,7 @@ where
         Ok(observation)
     }
 
-    async fn replace_public_v1_status(
+    pub(crate) async fn replace_public_v1_status(
         &self,
         observation: &RawObservation,
         status: KubericSetStatus,
@@ -1836,6 +1973,7 @@ where
         let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), &namespace);
         let mut set = observation.set.clone();
         set.status = Some(status);
+        set.validate_ordinary_hosting()?;
         sets.replace_status(&set.name_any(), &PostParams::default(), &set)
             .await
             .map(|_| ())
@@ -1942,6 +2080,7 @@ pub(crate) fn replica_storage_incarnation_remains(
                 }
         }
         RawAgentObservation::PublicV1Report(report) => report.storage_incarnation == *target,
+        RawAgentObservation::ReplicaSnapshot(snapshot) => snapshot.storage == *target,
     });
     if exact_agent_remains {
         return true;
@@ -2289,6 +2428,7 @@ fn renewal_public_configuration(
     Ok(configuration)
 }
 
+#[cfg(test)]
 fn renewal_configuration_commands(
     authority: &PublicV1AcceptedStatus,
     renewal: &PublicV1SessionRenewalStatus,
@@ -2371,6 +2511,7 @@ fn renewal_configuration_commands(
     Ok(commands)
 }
 
+#[cfg(test)]
 fn renewal_completed_copy_revoke(
     renewal: &PublicV1SessionRenewalStatus,
     replicas: &[PublicV1TopologyReplica],
@@ -2466,6 +2607,7 @@ fn renewal_completed_copy_revoke(
     ))))
 }
 
+#[cfg(any(test, feature = "runtime-test-bridge"))]
 fn renewal_native_command(
     authority: &PublicV1AcceptedStatus,
     renewal: &PublicV1SessionRenewalStatus,
@@ -2695,50 +2837,6 @@ fn accepted_public_v1_renewal(
         .transpose()
 }
 
-fn inbound_build_authority(
-    expected: &PublicV1AcceptedTransitionStatus,
-    operation: &kuberic_runtime::protocol::command::PublicV1OperationCommand,
-    build: &kuberic_runtime::protocol::public_operations::PublicBuildInput,
-) -> std::result::Result<PublicInboundBuildAuthority, String> {
-    let target = expected
-        .intent
-        .target
-        .as_ref()
-        .ok_or_else(|| "public-v1 build lacks accepted target authority".to_string())?;
-    if target.storage_incarnation != build.target_storage
-        || build.replica != build.target_storage.replica
-        || build.history.as_ref() != Some(&expected.intent.history)
-        || expected.intent.current_configuration_id.is_none()
-    {
-        return Err("public-v1 build changed target, history, or configuration".into());
-    }
-    let authority = PublicInboundBuildAuthority {
-        operation_id: expected.intent.operation_id.clone(),
-        operation_revision: expected.intent.revision,
-        attempt: PublicBuildAttemptReference {
-            resource_uid: expected.intent.history.resource_uid.clone(),
-            epoch: build.epoch,
-            build_id: build.attempt.clone(),
-            source: operation.target.clone(),
-            source_storage: expected.intent.source.storage_incarnation.clone(),
-            source_session: operation.intent.process_session_id.clone(),
-            target: build.replica.clone(),
-            target_storage: build.target_storage.clone(),
-            target_session: build.process_session_id.clone(),
-        },
-        history: expected.intent.history.clone(),
-        source_address: build.source_address.clone(),
-        current_configuration_id: expected
-            .intent
-            .current_configuration_id
-            .clone()
-            .expect("checked current configuration"),
-        target_address: build.replication_address.clone(),
-    };
-    authority.validate().map_err(str::to_owned)?;
-    Ok(authority)
-}
-
 #[async_trait]
 impl<A> PublicV1HistoryApi for KubeClusterApi<A>
 where
@@ -2948,7 +3046,7 @@ where
         expected: &PublicV1SessionRenewalStatus,
         command: &ProtocolCommand,
     ) -> std::result::Result<(), String> {
-        let mut observation = self.observe_public_v1_scope(scope).await?;
+        let observation = self.observe_public_v1_scope(scope).await?;
         if accepted_public_v1_renewal(observation.set.status.as_ref())?.as_ref() != Some(expected) {
             return Err("stale public-v1 session-renewal dispatch".into());
         }
@@ -2967,78 +3065,7 @@ where
                 InstallFreshConfiguration { .. }
         );
         if installs_configuration {
-            let authority = accepted_public_v1_status(observation.set.status.as_ref())?
-                .ok_or_else(|| "session renewal lacks accepted public-v1 authority".to_string())?;
-            loop {
-                let replicas = renewal_topology_replicas(&observation, expected)?;
-                // Reobserve retained completion on every invocation. A lost
-                // Build response or controller recreation cannot skip revoke.
-                if let Some(revoke) = renewal_completed_copy_revoke(expected, &replicas)? {
-                    self.execute_command(&observation, &revoke)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                let Some(preparation) = renewal_native_command(&authority, expected, &replicas)?
-                else {
-                    break;
-                };
-                if let ProtocolCommand::PublicV1Operation(operation) = &preparation
-                    && let Some(PublicOperationProgram::Build(build)) =
-                        operation.intent.program.as_ref()
-                {
-                    let source = replicas
-                        .iter()
-                        .find(|replica| replica.report.replica == operation.target)
-                        .ok_or("native renewal copy lost its source")?;
-                    let authority = PublicInboundBuildAuthority {
-                        operation_id: operation.intent.operation_id.clone(),
-                        operation_revision: operation.intent.revision,
-                        attempt: PublicBuildAttemptReference {
-                            resource_uid: scope.resource_uid.clone(),
-                            epoch: build.epoch,
-                            build_id: build.attempt.clone(),
-                            source: operation.target.clone(),
-                            source_storage: source.report.storage_incarnation.clone(),
-                            source_session: operation.intent.process_session_id.clone(),
-                            target: build.replica.clone(),
-                            target_storage: build.target_storage.clone(),
-                            target_session: build.process_session_id.clone(),
-                        },
-                        history: expected.required.history.clone(),
-                        source_address: build.source_address.clone(),
-                        current_configuration_id: build
-                            .current_configuration_id
-                            .clone()
-                            .ok_or("native renewal copy lacks installed configuration")?,
-                        target_address: build.replication_address.clone(),
-                    };
-                    self.execute_command(
-                        &observation,
-                        &ProtocolCommand::PublicV1History(Box::new(
-                            kuberic_runtime::protocol::command::PublicV1HistoryCommand::InstallInboundBuildAuthority {
-                                authority: Box::new(authority),
-                            },
-                        )),
-                    ).await.map_err(|error| error.to_string())?;
-                }
-                self.execute_command(&observation, &preparation)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                observation = self.observe_public_v1_scope(scope).await?;
-                if accepted_public_v1_renewal(observation.set.status.as_ref())?.as_ref()
-                    != Some(expected)
-                {
-                    return Err("native renewal preparation lost its captured authority".into());
-                }
-            }
-            let replicas = renewal_topology_replicas(&observation, expected)?;
-            for configuration_command in
-                renewal_configuration_commands(&authority, expected, &replicas)?
-            {
-                self.execute_command(&observation, &configuration_command)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+            return Err("legacy production session renewal is unavailable; ordinary recovery requires fresh scope and evidence".into());
         }
         if !installs_configuration {
             self.execute_command(&observation, command)
@@ -3256,7 +3283,7 @@ where
         if normalized_transition(&observation)?.as_ref() != Some(expected) {
             return Err("stale public-v1 containment authority".into());
         }
-        revoke_inbound_build_authority(self, &observation, expected, command).await
+        reject_legacy_containment(self, &observation, expected, command).await
     }
 
     async fn supersede_public_v1_operation(
@@ -3271,7 +3298,7 @@ where
         }) {
             return Err("stale public-v1 operation supersession".into());
         }
-        revoke_inbound_build_authority(self, &observation, expected, command).await?;
+        reject_legacy_containment(self, &observation, expected, command).await?;
         let mut status = observation.set.status.clone().unwrap_or_default();
         status.public_v1_transition = None;
         status.public_v1_operation = None;
@@ -3330,22 +3357,6 @@ where
         };
         if normalized_transition(&observation)?.as_ref() != Some(expected) {
             return Err("stale public-v1 operation dispatch".into());
-        }
-        if let ProtocolCommand::PublicV1Operation(operation) = command
-            && let Some(PublicOperationProgram::Build(build)) = operation.intent.program.as_ref()
-        {
-            let authority = inbound_build_authority(expected, operation, build)?;
-            self.execute_command(
-                &observation,
-                &ProtocolCommand::PublicV1History(Box::new(
-                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::
-                        InstallInboundBuildAuthority {
-                            authority: Box::new(authority),
-                        },
-                )),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
         }
         self.execute_command(&observation, command)
             .await
@@ -3453,45 +3464,6 @@ where
         if completion.result != PublicV1OperationResult::Succeeded {
             return Err("public-v1 acceptance requires successful completion".into());
         }
-        let observation = self.observe_public_v1_status_scope(scope).await?;
-        if let Some(operation) = observation
-            .set
-            .status
-            .as_ref()
-            .and_then(|status| status.public_v1_operation.as_ref())
-            .map(PublicV1OperationStatus::command)
-            .transpose()?
-            && let Some(PublicOperationProgram::Build(build)) = operation.intent.program.as_ref()
-        {
-            if expected.intent.consumer
-                == crate::evaluator::public_v1_evidence::PublicV1EvidenceConsumer::RepairReplacement
-            {
-                let replacement = observation
-                    .set
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.public_v1_replacement.as_ref())
-                    .ok_or_else(|| "replacement build lacks durable authority".to_string())?;
-                if replacement.replacement.as_ref() != Some(&build.target_storage) {
-                    return Err("replacement build target differs from durable authority".into());
-                }
-            }
-            let authority = inbound_build_authority(expected, &operation, build)?;
-            let target_observation = self
-                .observe_public_v1_target_scope(scope, &build.replica)
-                .await?;
-            self.execute_command(
-                &target_observation,
-                &ProtocolCommand::PublicV1History(Box::new(
-                    kuberic_runtime::protocol::command::PublicV1HistoryCommand::
-                        RevokeInboundBuildAuthority {
-                            authority: Box::new(authority),
-                        },
-                )),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        }
         self.complete_public_v1_transition(scope, expected).await
     }
 
@@ -3531,7 +3503,7 @@ where
             {
                 return Err("ordinary recovery peer changed before source retirement".into());
             }
-            revoke_inbound_build_authority(
+            reject_legacy_containment(
                 self,
                 &observation,
                 expected,
@@ -3624,7 +3596,7 @@ where
                 if let Some(command) = command
                     && target_pod_present
                 {
-                    revoke_inbound_build_authority(
+                    reject_legacy_containment(
                         self,
                         &observation,
                         expected,
@@ -3764,6 +3736,12 @@ impl InMemoryClusterApi {
 #[async_trait]
 #[cfg(feature = "runtime-test-bridge")]
 impl ClusterApi for InMemoryClusterApi {
+    async fn reconcile_replica_goals(
+        &self,
+        _: &RawObservation,
+    ) -> Result<Option<crate::reconciler::ReconcileAction>> {
+        Ok(None)
+    }
     async fn observe(&self, _namespace: &str, _name: &str) -> Result<RawObservation> {
         let delay = {
             let mut state = self.state.lock().await;
@@ -4697,6 +4675,11 @@ impl ClusterApi for InMemoryClusterApi {
                 PublicOperationProgram, PublicV1CallKind,
             };
             match intent.program.as_ref() {
+                Some(PublicOperationProgram::AgentGoal(_)) => {
+                    Err(ControllerError::InvalidAgentEvidence(
+                        "semantic goals require the M1 goal transport".into(),
+                    ))
+                }
                 Some(PublicOperationProgram::Open { .. }) => {
                     Ok((PublicV1CallKind::Open, None, None, None, None))
                 }
@@ -5860,6 +5843,7 @@ mod corrective_replacement_tests {
         let mut set = KubericSet::new(
             "sample",
             KubericSetSpec {
+                hosting_format: 15,
                 replicas: 1,
                 image: "example".into(),
                 failover_delay_seconds: 30,
@@ -6776,6 +6760,7 @@ mod tests {
         let mut set = KubericSet::new(
             "sample",
             crate::crd::KubericSetSpec {
+                hosting_format: 15,
                 replicas: 3,
                 image: "example".into(),
                 failover_delay_seconds: 10,
@@ -7143,6 +7128,7 @@ mod tests {
         let mut set = KubericSet::new(
             "sample",
             crate::crd::KubericSetSpec {
+                hosting_format: 15,
                 replicas: replicas.len() as u32,
                 image: "example".into(),
                 failover_delay_seconds: 10,

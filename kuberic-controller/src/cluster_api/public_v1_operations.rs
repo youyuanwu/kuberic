@@ -1153,6 +1153,7 @@ pub(crate) fn operation_matches_transition(
         );
     };
     let (call, previous, current, mode, specific) = match program {
+        PublicOperationProgram::AgentGoal(_) => return false,
         PublicOperationProgram::Open { .. } => (PublicV1CallKind::Open, None, None, None, None),
         PublicOperationProgram::Role { .. } => (PublicV1CallKind::Role, None, None, None, None),
         PublicOperationProgram::Epoch { .. } => (PublicV1CallKind::Epoch, None, None, None, None),
@@ -1221,6 +1222,7 @@ fn intent_history_matches(intent: &PublicOperationIntent, data_loss_number: i64)
     let epoch_matches =
         |epoch: kuberic_runtime::protocol::types::Epoch| epoch.data_loss_number == data_loss_number;
     match intent.program.as_ref() {
+        Some(PublicOperationProgram::AgentGoal(_)) => false,
         Some(PublicOperationProgram::Role { epoch, .. })
         | Some(PublicOperationProgram::Epoch { epoch }) => epoch_matches(*epoch),
         Some(PublicOperationProgram::Configuration(configuration))

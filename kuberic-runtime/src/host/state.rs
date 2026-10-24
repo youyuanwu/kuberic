@@ -18,7 +18,7 @@ use crate::protocol::types::{
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_V1_PHASE6_SCHEMA_VERSION: u32 = 11;
-pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 14;
+pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +67,8 @@ pub(crate) enum PublicOperationContainment {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublicOperationRecord {
     pub(crate) intent: PublicOperationIntent,
+    #[serde(default)]
+    pub(crate) ordinary: Option<OrdinaryGoalRecord>,
     pub(crate) attempt: u64,
     pub(crate) attempt_results: BTreeMap<u64, PublicOperationAttemptResult>,
     pub(crate) retry_failure: Option<PublicCallbackFailure>,
@@ -84,6 +86,18 @@ pub(crate) struct PublicOperationRecord {
     pub(crate) blockers: BTreeSet<OperationId>,
     #[serde(default)]
     pub(crate) lifecycle: PublicLifecycleRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OrdinaryGoalRecord {
+    pub(crate) action_format: u32,
+    pub(crate) actions: Vec<PublicInstruction>,
+    pub(crate) open_existing: Option<bool>,
+    pub(crate) already_open: bool,
+    pub(crate) accepted: bool,
+    pub(crate) logically_retired: bool,
+    pub(crate) host_settled: bool,
+    pub(crate) ready_admissions: Vec<crate::protocol::public_operations::RemoteReplicaSelection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +230,7 @@ pub(crate) struct PublicV1OperationState {
     #[serde(default)]
     pub(crate) binding: Option<PublicV1LifecycleBinding>,
     pub(crate) operations: BTreeMap<OperationId, PublicOperationRecord>,
+    pub(crate) remote_watermarks: BTreeMap<String, (crate::protocol::types::Epoch, u64)>,
     #[serde(default)]
     pub(crate) history_barriers: BTreeMap<OperationId, HistoryAdmissionBarrier>,
     #[serde(default)]
@@ -413,6 +428,7 @@ impl PublicV1OperationState {
             identity,
             binding,
             operations: BTreeMap::new(),
+            remote_watermarks: BTreeMap::new(),
             history_barriers: BTreeMap::new(),
             history_initialization_id: None,
             history: None,

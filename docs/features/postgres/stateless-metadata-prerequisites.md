@@ -5,6 +5,10 @@
 owners. The [single project roadmap](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
 owns generic host/agent/controller migration; this is a **separate removal gate**,
 not another competing generic implementation plan.
+Generic [M1](../kuberic/ordinary-hosting-m1.md) is implemented; PostgreSQL
+replacement sessions/ordinary lifecycle integration remain M2, and production
+Open is explicitly unavailable at this checkpoint. Neither M1 nor green
+unsupported-controller smoke wrappers satisfy any field-removal row below.
 
 ## Superseded prerequisites
 

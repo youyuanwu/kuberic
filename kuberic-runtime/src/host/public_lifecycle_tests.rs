@@ -315,6 +315,9 @@ impl Fixture {
         let replication = Arc::new(Replication(probe.clone()));
         let drain_probe = probe.clone();
         let callbacks = PublicLifecycleCallbacks {
+            peer_credentials: None,
+            ordinary: false,
+            abort_creation: None,
             access_factory: None,
             access_owner: None,
             application: Arc::new(Application(probe.clone(), replication.clone())),

@@ -140,7 +140,7 @@ fn availability_is_required_canonical_evidence_for_every_configuration_input() {
             intent,
         };
         let request = proto::ExecuteCommandRequest {
-            protocol_version: 13,
+            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
             resource_uid: "resource-1".into(),
             target: Some(identity().into()),
             expected_process_session_id: "session-1".into(),
@@ -251,7 +251,7 @@ fn availability_is_required_canonical_evidence_for_every_configuration_input() {
     let required = schema.as_value()["required"].as_array().unwrap();
     assert!(required.iter().any(|field| field == "isUp"));
     assert!(required.iter().any(|field| field == "isReady"));
-    assert_eq!(PUBLIC_V1_PROTOCOL_VERSION, 13);
+    assert_eq!(PUBLIC_V1_PROTOCOL_VERSION, 15);
     assert!(
         !PublicV1Identity {
             protocol_version: 12,

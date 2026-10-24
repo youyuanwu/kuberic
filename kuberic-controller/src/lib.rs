@@ -21,6 +21,7 @@ mod error;
 pub mod evaluator;
 pub mod executor;
 pub mod observation;
+mod ordinary_reconciliation;
 #[cfg(feature = "runtime-test-bridge")]
 mod public_v1_normalize;
 mod public_v1_reconciliation;

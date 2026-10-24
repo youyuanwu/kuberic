@@ -374,6 +374,9 @@ impl AccessOwner {
                 access.status = Some(DENIED);
             } else {
                 match record.intent.program.as_ref() {
+                    Some(P::AgentGoal(goal)) if goal.role() == Some(ReplicaRole::Primary) => {
+                        access.begin_promotion();
+                    }
                     Some(P::Role {
                         role: ReplicaRole::Primary,
                         ..
@@ -505,7 +508,9 @@ impl AccessOwner {
 
     pub(crate) fn callback_succeeded(&self, instruction: I) {
         self.update(|access, intent| {
-            access.callback_succeeded(instruction, intent.program.as_ref())
+            let selected =
+                super::super::public_lifecycle::program::selected_program(intent, instruction);
+            access.callback_succeeded(instruction, selected.as_ref())
         });
     }
 
@@ -588,7 +593,7 @@ impl AccessOwner {
             .upgrade()
             .ok_or_else(|| crate::host::HostError::CommandRejected("access owner lost".into()))?;
         let current = operation.snapshot();
-        let instructions = crate::host::public_lifecycle::operation_instructions(&failed.intent);
+        let instructions = crate::host::public_lifecycle::record_instructions(failed);
         let retained = current.attempt_results.get(&failed.attempt);
         let durable = state
             .public_v1_operation_state
@@ -660,9 +665,11 @@ impl AccessOwner {
             .zip(preview.storage_incarnation.clone())
             .map(|(history, storage)| (history, storage, registered.identity));
         self.update(|access, intent| {
+            let selected =
+                super::super::public_lifecycle::program::selected_program(intent, instruction);
             access.context = context;
             access.minimum = state.identity.effective_policy.write_quorum as usize;
-            let role = match intent.program.as_ref() {
+            let role = match selected.as_ref() {
                 Some(P::Role { role, .. }) => *role,
                 Some(P::Swap { handoff, .. }) => *handoff,
                 _ => ReplicaRole::Primary,
@@ -671,7 +678,7 @@ impl AccessOwner {
                 I::ReplicatorRole | I::ReplicatorPrimary => {
                     access.replicator_role = Some(role);
                     access.epoch = intent.lifecycle.as_ref().map(|input| input.epoch).or(
-                        match intent.program.as_ref() {
+                        match selected.as_ref() {
                             Some(P::Role { epoch, .. } | P::Swap { epoch, .. }) => Some(*epoch),
                             _ => None,
                         },
@@ -680,7 +687,7 @@ impl AccessOwner {
                 I::ApplicationRole | I::ApplicationPrimary => access.application_role = Some(role),
                 I::ProgramEpoch | I::Epoch => {
                     access.epoch = intent.lifecycle.as_ref().map(|input| input.epoch).or(
-                        match intent.program.as_ref() {
+                        match selected.as_ref() {
                             Some(P::Epoch { epoch } | P::Swap { epoch, .. }) => Some(*epoch),
                             _ => None,
                         },
@@ -788,6 +795,22 @@ pub(super) fn complete(host: &Arc<RuntimeHost>, operation: &Arc<PartitionOperati
         return;
     }
     let activates = match record.intent.program.as_ref() {
+        Some(P::AgentGoal(goal)) => {
+            matches!(
+                goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(_),
+                }
+            ) && goal.scope.configuration.previous.is_none()
+                && access.caught_up
+                && record.ordinary.as_ref().is_some_and(|ordinary| {
+                    ordinary.actions
+                        == super::super::public_lifecycle::operation_instructions(&record.intent)
+                        && record.lifecycle.outcomes.len() == ordinary.actions.len()
+                        && record.lifecycle.in_flight.is_none()
+                })
+        }
         Some(P::Configuration(configuration)) => {
             (!access.promotion || access.caught_up) && configuration.previous.is_none()
         }

@@ -202,12 +202,16 @@ public-path documented impl crate::replicator::ReplicaInformation::fn new (build
 public-path documented impl crate::replicator::ReplicaInformation::fn validate_public_progress (& self) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorCapabilities::const fn conservative () -> Self
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn outbound_build_authority (& self , build : & OperationId ,) -> Result < PublicInboundBuildAuthority >
+public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn discover_peer (& self , query : & crate :: protocol :: public_operations :: ReplicaDiscoveryQuery ,) -> Result < Option < crate :: protocol :: public_operations :: ReplicaPublication > >
+public-path documented impl crate::replicator::ReplicatorFactoryContext::fn ordinary_hosting (& self) -> bool
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn read_status (& self) -> Result < AccessStatus >
+public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn local_publication (& self ,) -> Result < Option < crate :: protocol :: public_operations :: ReplicaPublication > >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn report_fault (& self , fault : FaultType) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn report_load (& self , metrics : Vec < LoadMetric >) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn validate_build_authority (& self , authority : & PublicInboundBuildAuthority ,) -> Result < () >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::async fn write_status (& self) -> Result < AccessStatus >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::fn identity (& self) -> Result < ReplicaIdentity >
+public-path documented impl crate::replicator::ReplicatorFactoryContext::fn creation_id (& self) -> Result < crate :: protocol :: types :: ReplicatorCreationId >
 public-path documented impl crate::replicator::ReplicatorFactoryContext::fn partition_information (& self) -> PartitionInformation
 public-path documented impl crate::replicator::ReplicatorFactoryContext::fn process_session_id (& self) -> Result < ProcessSessionId >
 public-path documented impl crate::replicator::ReplicatorInterfaces::fn capabilities (& self) -> ReplicatorCapabilities
@@ -224,6 +228,7 @@ public-path documented impl crate::replicator::StatefulServicePartition::async f
 public-path documented impl crate::replicator::StatefulServicePartition::async fn report_fault (& self , fault : FaultType) -> Result < () >
 public-path documented impl crate::replicator::StatefulServicePartition::async fn report_load (& self , metrics : Vec < LoadMetric >) -> Result < () >
 public-path documented impl crate::replicator::StatefulServicePartition::fn get_partition_information (& self) -> PartitionInformation
+public-path documented impl crate::replicator::StatefulServicePartition::fn ordinary_hosting (& self) -> bool
 public-path documented impl crate::replicator::StatefulServicePartition::fn get_read_status_now (& self) -> AccessStatus
 public-path documented impl crate::replicator::StatefulServicePartition::fn get_write_status_now (& self) -> AccessStatus
 public-path documented impl crate::replicator::StatefulServicePartition::fn with_factory (& self , factory : Arc < dyn ReplicatorFactory >) -> Self

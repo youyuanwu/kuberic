@@ -101,8 +101,12 @@ page:control/proto/struct.PublicV1ReplicaRebuildRequired.html
 page:control/proto/struct.PublicV1ServiceLocation.html
 page:control/proto/struct.PublicV1StorageIncarnation.html
 page:control/proto/struct.ReplicaCleanupIdentity.html
+page:control/proto/struct.ReplicaDiscoveryRequest.html
+page:control/proto/struct.ReplicaGoalRequest.html
 page:control/proto/struct.ReplicaIdentity.html
 page:control/proto/struct.ReplicaRetirementReport.html
+page:control/proto/struct.ReplicaSnapshotRequest.html
+page:control/proto/struct.ReplicaSnapshotResponse.html
 page:control/proto/struct.RetireReplicaCommand.html
 page:control/proto/struct.ScaleUpCleanup.html
 page:control/proto/struct.ScaleUpConfigurationEvidence.html

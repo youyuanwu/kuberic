@@ -159,6 +159,7 @@ struct HostState {
 struct RuntimeHost {
     replica_session: OnceLock<(crate::protocol::types::ResourceUid, ProcessSessionId)>,
     native_credentials: OnceLock<Arc<str>>,
+    discovery_resolver: OnceLock<Arc<dyn super::transport::ReplicaEndpointResolver>>,
     native_address: OnceLock<String>,
     native_lifecycle: StdMutex<Option<crate::replicator::v1::LifecycleObservation>>,
     identity: ReplicaIdentity,
@@ -173,6 +174,12 @@ struct RuntimeHost {
     closed: AtomicBool,
     replacement_fault_fenced: AtomicBool,
     replacement_authority_fenced: AtomicBool,
+    ordinary_contract: AtomicBool,
+    ordinary_withdrawn: AtomicBool,
+    ordinary_creation_cleanup_failure: StdMutex<Option<String>>,
+    ordinary_cleanup: tokio::sync::OnceCell<
+        tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+    >,
     selected_access: StdMutex<selected_access::SelectedAccess>,
     #[cfg(feature = "testing")]
     public_operation_cut: StdMutex<Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>>,
@@ -184,6 +191,7 @@ impl RuntimeHost {
     fn creation_live(&self, identity: ReplicatorCreationIdentity) -> bool {
         !self.closed.load(Ordering::Acquire)
             && !self.aborted.load(Ordering::Acquire)
+            && !self.ordinary_withdrawn.load(Ordering::Acquire)
             && !self.replacement_fault_fenced.load(Ordering::Acquire)
             && !matches!(
                 *self.native_lifecycle.lock().unwrap(),
@@ -194,10 +202,11 @@ impl RuntimeHost {
             )
             && self.registered.get().is_some_and(|registered| {
                 registered.identity == identity
-                    && registered
-                        .native_runtime_control
-                        .as_ref()
-                        .is_some_and(|control| control.build_authority_open())
+                    && (registered.native_runtime_control.is_none()
+                        || registered
+                            .native_runtime_control
+                            .as_ref()
+                            .is_some_and(|control| control.build_authority_open()))
             })
     }
 
@@ -363,6 +372,10 @@ impl PodRuntime {
                 closed: AtomicBool::new(false),
                 replacement_fault_fenced: AtomicBool::new(false),
                 replacement_authority_fenced: AtomicBool::new(false),
+                ordinary_contract: AtomicBool::new(false),
+                ordinary_withdrawn: AtomicBool::new(false),
+                ordinary_cleanup: tokio::sync::OnceCell::new(),
+                ordinary_creation_cleanup_failure: StdMutex::new(None),
                 selected_access: StdMutex::new(selected_access::SelectedAccess::default()),
                 #[cfg(feature = "testing")]
                 public_operation_cut: StdMutex::new(None),
@@ -370,6 +383,7 @@ impl PodRuntime {
                 replacement_fault_bridge: Mutex::new(None),
                 replica_session: OnceLock::new(),
                 native_credentials: OnceLock::new(),
+                discovery_resolver: OnceLock::new(),
                 native_address: OnceLock::new(),
                 native_lifecycle: StdMutex::new(None),
             }),
@@ -384,6 +398,24 @@ impl PodRuntime {
             .native_credentials
             .set(bearer_token)
             .map_err(|_| RuntimeError::AuthorityNotAdmitted)
+    }
+
+    pub(crate) fn configure_discovery_resolver(
+        &self,
+        resolver: Arc<dyn super::transport::ReplicaEndpointResolver>,
+    ) -> Result<()> {
+        self.host
+            .discovery_resolver
+            .set(resolver)
+            .map_err(|_| RuntimeError::AuthorityNotAdmitted)
+    }
+
+    pub(crate) fn peer_control_endpoint(&self, identity: &ReplicaIdentity) -> Result<String> {
+        self.host
+            .discovery_resolver
+            .get()
+            .map(|resolver| resolver.control_endpoint(identity))
+            .ok_or(RuntimeError::AuthorityNotAdmitted)
     }
 
     pub(crate) async fn public_open_context(&self, mode: OpenMode) -> OpenContext {
@@ -401,7 +433,8 @@ impl PodRuntime {
             }),
             self.host.public_v1_binding.clone(),
             self.host.public_v1_replication_address,
-        );
+        )
+        .with_ordinary_contract(self.host.ordinary_contract.load(Ordering::Acquire));
         OpenContext {
             identity: self.host.identity.clone(),
             mode,
@@ -439,6 +472,12 @@ impl PodRuntime {
                 Ok(Some((observation, native.selected_epoch())))
             });
         let drain_host = Arc::downgrade(&self.host);
+        let abort_host = Arc::downgrade(&self.host);
+        let abort_creation: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(host) = abort_host.upgrade() {
+                host.abort();
+            }
+        });
         let revoke_host = Arc::downgrade(&self.host);
         let revoke_access: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
             let host = revoke_host.upgrade().ok_or(RuntimeError::Closed)?;
@@ -446,12 +485,18 @@ impl PodRuntime {
             host.selected_access.lock().unwrap().revoke();
             host.replacement_authority_fenced
                 .store(true, Ordering::Release);
+            if host.ordinary_contract.load(Ordering::Acquire) {
+                host.ordinary_withdrawn.store(true, Ordering::Release);
+            }
             Ok(())
         });
         let terminal_drain: crate::host::public_lifecycle::TerminalDrain = Arc::new(move || {
             let host = drain_host.upgrade();
             Box::pin(async move {
                 let host = host.ok_or(RuntimeError::Closed)?;
+                if host.ordinary_contract.load(Ordering::Acquire) {
+                    return host.settle_ordinary().await;
+                }
                 if let Some(runtime) = host
                     .registered
                     .get()
@@ -489,6 +534,9 @@ impl PodRuntime {
                 ),
                 retry_proof: Default::default(),
                 terminal_drain,
+                peer_credentials: self.host.native_credentials.get().cloned(),
+                ordinary: self.host.ordinary_contract.load(Ordering::Acquire),
+                abort_creation: Some(abort_creation),
                 terminal_cleanup: None,
                 access_factory: Some(access_factory),
                 access_owner: None,
@@ -551,6 +599,9 @@ impl PodRuntime {
             native_observer_callbacks: false,
             retry_proof: Default::default(),
             terminal_drain,
+            peer_credentials: self.host.native_credentials.get().cloned(),
+            ordinary: self.host.ordinary_contract.load(Ordering::Acquire),
+            abort_creation: Some(abort_creation),
             terminal_cleanup: None,
             access_factory: Some(access_factory),
             access_owner: None,
@@ -665,6 +716,17 @@ impl PodRuntime {
                 configuration = Some(installed);
             }
             match record.intent.program.as_ref() {
+                Some(PublicOperationProgram::AgentGoal(goal)) => {
+                    if record.stage == PublicOperationStage::Completed
+                        && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                        && let Some(selected) = goal.role()
+                    {
+                        open = true;
+                        role = Some((goal.scope.epoch, selected));
+                        epoch = Some(goal.scope.epoch);
+                        configuration = Some(goal.scope.configuration.ordinary());
+                    }
+                }
                 Some(PublicOperationProgram::Open { .. }) => open = true,
                 Some(PublicOperationProgram::Role {
                     epoch: role_epoch,
@@ -749,6 +811,12 @@ impl PodRuntime {
             role = Some((renewal.required.renewal_epoch, member.role));
         }
         let (current_progress, catch_up_capability) = match self.host.registered.get() {
+            _ if self.host.ordinary_contract.load(Ordering::Acquire) => {
+                let pending = crate::protocol::public_operations::ProgressQueryResult::NotQueried(
+                    "ordinary hosting report does not sample callbacks".into(),
+                );
+                (pending.clone(), pending)
+            }
             _ if crate::host::native_transport::recovery_observations_pending(&persisted) => {
                 let pending = crate::protocol::public_operations::ProgressQueryResult::NotQueried(
                     "native observations belong to an unresolved recovery history".into(),
@@ -962,6 +1030,12 @@ impl PodRuntime {
             None => return Err(RuntimeError::AuthorityNotAdmitted),
         };
         let (current_progress, catch_up_capability) = match self.host.registered.get() {
+            _ if self.host.ordinary_contract.load(Ordering::Acquire) => {
+                let pending = crate::protocol::public_operations::ProgressQueryResult::NotQueried(
+                    "ordinary hosting report does not sample callbacks".into(),
+                );
+                (pending.clone(), pending)
+            }
             _ if observation_state
                 .as_ref()
                 .is_some_and(crate::host::native_transport::recovery_observations_pending) =>
@@ -979,11 +1053,12 @@ impl PodRuntime {
         };
         let mut engine_idle = None;
         let mut observation_alive = None;
-        if let Some(runtime) = self
-            .host
-            .registered
-            .get()
-            .and_then(|registered| registered.native_runtime_control.as_ref())
+        if !self.host.ordinary_contract.load(Ordering::Acquire)
+            && let Some(runtime) = self
+                .host
+                .registered
+                .get()
+                .and_then(|registered| registered.native_runtime_control.as_ref())
         {
             {
                 let alive_runtime = runtime.clone();
@@ -1216,6 +1291,9 @@ impl PodRuntime {
 
     pub(crate) async fn shutdown_and_drain(&self) -> Result<()> {
         self.abort();
+        if self.host.ordinary_contract.load(Ordering::Acquire) {
+            return self.host.clone().settle_ordinary().await;
+        }
         let control = self
             .host
             .registered
@@ -1239,6 +1317,76 @@ impl PodRuntime {
 }
 
 impl RuntimeHost {
+    async fn settle_ordinary(self: Arc<Self>) -> Result<()> {
+        let mut result = self
+            .ordinary_cleanup
+            .get_or_init(|| async {
+                let (result, receiver) = tokio::sync::watch::channel(None);
+                let host = self.clone();
+                tokio::spawn(async move {
+                    let mut failures = Vec::new();
+                    if let Some(registered) = host.registered.get()
+                        && let Err(error) = registered.control.close().await
+                    {
+                        host.abort();
+                        failures.push(format!("Replicator Close failed: {error}"));
+                    }
+                    if let Err(error) = host.application.close().await {
+                        host.abort();
+                        failures.push(format!("Application Close failed: {error}"));
+                    }
+                    let registry = host
+                        .replacement_fault_bridge
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|bridge| bridge.registry.clone());
+                    if let Some(registry) = registry {
+                        if let Err(error) = registry.join_ordinary_roots().await {
+                            failures
+                                .push(format!("retained ordinary callback join failed: {error}"));
+                        }
+                    } else {
+                        failures.push("ordinary operation join owner unavailable".into());
+                    }
+                    // A late factory child never entered `registered`. Its Close
+                    // outcome is known only after its retained creation root joins.
+                    if let Some(error) = host
+                        .ordinary_creation_cleanup_failure
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                    {
+                        failures.push(format!(
+                            "unregistered ordinary creation Close failed: {error}"
+                        ));
+                    }
+                    if failures.is_empty() {
+                        if let Some(registered) = host.registered.get() {
+                            registered
+                                .provider_writer_lease_consumed
+                                .store(false, Ordering::Release);
+                        }
+                        host.closed.store(true, Ordering::Release);
+                        result.send_replace(Some(Ok(())));
+                    } else {
+                        result.send_replace(Some(Err(failures.join("; "))));
+                    }
+                });
+                receiver
+            })
+            .await
+            .clone();
+        loop {
+            if let Some(result) = result.borrow().clone() {
+                return result.map_err(RuntimeError::Application);
+            }
+            result.changed().await.map_err(|_| {
+                RuntimeError::Application("ordinary lifecycle join owner was lost".into())
+            })?;
+        }
+    }
+
     fn abort(&self) {
         if self.closed.load(Ordering::Acquire) || self.aborted.swap(true, Ordering::AcqRel) {
             return;
@@ -1250,13 +1398,48 @@ impl RuntimeHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(registered) = self.registered.get() {
-            registered
-                .provider_writer_lease_consumed
-                .store(false, Ordering::Release);
+            if !self.ordinary_contract.load(Ordering::Acquire) {
+                registered
+                    .provider_writer_lease_consumed
+                    .store(false, Ordering::Release);
+            }
             registered.abort();
         }
         drop(creation);
         self.application.abort();
+    }
+}
+
+impl PodRuntime {
+    pub(crate) fn is_ordinary_contract(&self) -> bool {
+        self.host.ordinary_contract.load(Ordering::Acquire)
+    }
+    pub(crate) fn enable_ordinary_contract(&self) -> Result<()> {
+        if self.host.registered.get().is_some()
+            && !self.host.ordinary_contract.load(Ordering::Acquire)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.host.ordinary_contract.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn ordinary_withdrawn(&self) -> bool {
+        self.host.ordinary_withdrawn.load(Ordering::Acquire)
+            || self.host.aborted.load(Ordering::Acquire)
+            || self.host.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn withdraw_ordinary(&self) {
+        {
+            let _admission = self.host.write_admission.lock().unwrap();
+            self.host.ordinary_withdrawn.store(true, Ordering::Release);
+            self.host.selected_access.lock().unwrap().revoke();
+            self.host
+                .replacement_authority_fenced
+                .store(true, Ordering::Release);
+        }
+        self.abort();
     }
 }
 
@@ -1355,6 +1538,49 @@ impl ReplacementFaultBridge {
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
+    async fn local_publication(
+        &self,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<Option<crate::protocol::public_operations::ReplicaPublication>> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let identity = reservation.identity(RuntimeHostToken::new());
+        let current = host.registered.get().map_or_else(
+            || host.replicator_creation.lock().is_ok_and(|creation| {
+                matches!(&*creation, ReplicatorCreationState::Reserved { identity: current, .. } if *current == identity)
+            }),
+            |registered| registered.identity == identity,
+        );
+        if !current {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let bridge = host
+            .replacement_fault_bridge
+            .lock()
+            .await
+            .clone()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let state = bridge
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        Ok(super::ordinary_goal::publication(
+            &state,
+            &bridge.process_session,
+            &identity.to_public_id(),
+            host.ordinary_withdrawn.load(Ordering::Acquire)
+                || host.aborted.load(Ordering::Acquire)
+                || host.closed.load(Ordering::Acquire),
+        ))
+    }
+
+    fn peer_control_endpoint(&self, identity: &ReplicaIdentity) -> Result<String> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        host.discovery_resolver
+            .get()
+            .map(|resolver| resolver.control_endpoint(identity))
+            .ok_or(RuntimeError::AuthorityNotAdmitted)
+    }
     async fn revoke_exact_inbound_build_authority(
         &self,
         authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
@@ -2036,14 +2262,27 @@ impl HostAccessView {
 
 #[async_trait]
 impl ReplicatorRegistration for RuntimeHost {
+    fn record_creation_cleanup_failure(&self, error: String) {
+        self.ordinary_creation_cleanup_failure
+            .lock()
+            .unwrap()
+            .get_or_insert(error);
+    }
+
     fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
-        if self.closed.load(Ordering::Acquire) || self.aborted.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire)
+            || self.aborted.load(Ordering::Acquire)
+            || self.ordinary_withdrawn.load(Ordering::Acquire)
+        {
             return Err(RuntimeError::Closed);
         }
         let mut creation = self.replicator_creation.lock().map_err(|_| {
             RuntimeError::Application("replicator creation state was poisoned".into())
         })?;
-        if self.closed.load(Ordering::Acquire) || self.aborted.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire)
+            || self.aborted.load(Ordering::Acquire)
+            || self.ordinary_withdrawn.load(Ordering::Acquire)
+        {
             return Err(RuntimeError::Closed);
         }
         if self.pending_control.lock().unwrap().is_some() {
@@ -2093,7 +2332,10 @@ impl ReplicatorRegistration for RuntimeHost {
         let mut creation = self.replicator_creation.lock().map_err(|_| {
             RuntimeError::Application("replicator creation state was poisoned".into())
         })?;
-        if self.closed.load(Ordering::Acquire) || self.aborted.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire)
+            || self.aborted.load(Ordering::Acquire)
+            || self.ordinary_withdrawn.load(Ordering::Acquire)
+        {
             return Err(RuntimeError::Closed);
         }
         let ReplicatorCreationState::Reserved {
@@ -2291,6 +2533,7 @@ mod tests {
         preview.operations.insert(
             intent.operation_id.clone(),
             PublicOperationRecord {
+                ordinary: None,
                 intent,
                 attempt: 1,
                 attempt_results: Default::default(),

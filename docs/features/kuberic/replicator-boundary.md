@@ -1,10 +1,13 @@
 # Replicator Boundary
 
-**CURRENT integration contract.** The
-[SF-shaped ordinary-engine target](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
-and [runtime replacement roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
-are **PROPOSED / NOT IMPLEMENTED**. Do not remove the current companion from a
-controller-integrated engine based on a documentation-only redesign.
+**CURRENT ordinary integration:** [M1](ordinary-hosting-m1.md) uses a coherent
+ordinary factory bundle with read-only generic peer discovery, no mandatory
+companion/diagnostics, retained ordinary Close after Abort and exact host
+goals/receipts. Protected replication/provider method sets are unchanged.
+Built-in/KV/SQLite/PostgreSQL production integration explicitly rejects pending
+M2. The legacy companion/grant APIs described below remain for engine/component
+consumers awaiting M2, not a production fallback. They must not be removed from
+those consumers by simply deleting their fences.
 
 Kuberic hosts built-in and application-owned Replicators through the same
 Service Fabric-shaped public interfaces.
@@ -26,10 +29,10 @@ core differences, unverified qualification and deferred capability work.
 
 The protected method sets are unchanged. Applications receive no agent store,
 authority setter, Kubernetes client, or private lifecycle capability.
-Companion attachment is optional for an interface bundle, but current hosted
-controller Build rejects a creation without native runtime control
-([host:891–927](../../../kuberic-runtime/src/host/hosting.rs#L891-L927)).
-This is not ordinary-interface-only SF extension alignment.
+In the historical pre-M1 route, companion attachment was optional for an
+interface bundle, but hosted controller Build rejected a creation without native runtime control
+([pinned host:891–927](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/hosting.rs#L891-L927)).
+M1 replaces that production dependency, not the actual M2 native transfer rules.
 
 ## Sole Built-In Path
 
@@ -125,6 +128,11 @@ They do not receive a compatibility adapter for the removed built-in engine.
 
 ### Custom controller integration
 
+**Historical engine/component contract, not the M1 production route.** Use
+[ordinary M1](ordinary-hosting-m1.md) for new generic integration. The target
+M2 consumer replacement must qualify native sessions/effects/joins before
+deleting these remaining APIs and fixtures; PG metadata removal stays separate.
+
 An independent factory attaches its own `CustomReplicatorControl` through
 `ReplicatorInterfaces::with_custom_control(&context, owner)` while holding its
 one-shot factory context. Return that same coherent creation. Attachment and
@@ -194,24 +202,26 @@ journaled **secondary host configuration** may precede primary native peer
 admission: it is control authority, not a nonexistent secondary
 PrimaryReplicator callback, native peer completion, or serving access.
 
-PostgreSQL supplies an actual independent
-[native controller witness](../../../examples/postgres/src/public_controller_tests.rs).
+PostgreSQL supplied a pinned pre-M1 independent
+[native controller witness](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/public_controller_tests.rs).
+Current hosted wrappers check only M2 unavailability.
 The external runtime contract fixture is contract/negative evidence only.
 Unpublished downstream MySQL fixtures and the externally reported
 seven-completion trace are not reproduced by either fixture; downstream engines
 must requalify their own native transfer, lineage, replay, admission and fencing.
 
-Both engines use the [same retained coordinator](../../../kuberic-runtime/src/replicator/coordinator.rs#L1).
+Both retained engine/component consumers use the [same coordinator](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/coordinator.rs#L1).
 Adapters provide actual ingress/drain effects and optional diagnostics, not
-engine-selected authority policy. Current production returned-failure retry
-proof remains Never; unsafe or undeclared callback failures require containment.
-See the [current message/state mapping and limits](engine-neutral-hosting.md#current--delivered-bounded-hosting).
+engine-selected authority policy. Pre-M1 production returned-failure retry
+proof was Never; unsafe or undeclared callback failures required containment.
+See the [historical message/state mapping and limits](engine-neutral-hosting.md#current--delivered-bounded-hosting).
 
-Source anchors: [attachment](../../../kuberic-runtime/src/replicator/mod.rs#L596),
-[read-only context:935–960](../../../kuberic-runtime/src/replicator/mod.rs#L935-L960),
-[local validation:1365–1558](../../../kuberic-runtime/src/host/hosting.rs#L1365-L1558),
-[retained actions](../../../kuberic-runtime/src/replicator/coordinator.rs#L173),
-and [configuration evidence](../../../kuberic-runtime/src/host/public_lifecycle.rs#L1044).
-The [PG companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641)
-and [controller cases:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412)
+Immutable pre-M1 source anchors:
+[attachment](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/mod.rs#L596),
+[legacy Build validation:938–951](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/mod.rs#L938-L951),
+[local validation:1365–1558](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/hosting.rs#L1365-L1558),
+[retained actions](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/coordinator.rs#L173),
+and [configuration evidence](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/public_lifecycle.rs#L1044).
+The [PG companion:547–641](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/public_v1.rs#L547-L641)
+and [controller cases:185–1412](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/public_controller_tests.rs#L185-L1412)
 are concrete engine/qualification references, not new native SF interfaces.
