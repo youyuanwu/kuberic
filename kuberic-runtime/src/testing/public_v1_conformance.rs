@@ -493,10 +493,14 @@ fn runtime_service_sources_are_manifest_bound(sources: &ProductionSources<'_>) -
             &control,
             "proto::replica_peer_server::ReplicaPeerServer::new(service)",
         ) == 1
-        && occurrences(&data, ".add_service(") == 1
+        && occurrences(&data, ".add_service(") == 2
         && occurrences(
             &data,
             ".add_service(PUBLIC_V1_DATA_SERVICES.carrier(service))",
+        ) == 2
+        && occurrences(
+            &data,
+            "#[cfg(test)]pub(super)fntest_listen(self:&Arc<Self>,listener:TcpListener)",
         ) == 1
         && occurrences(&data, "wire::carrier_server::CarrierServer::new(service)") == 1
 }
@@ -531,14 +535,13 @@ fn factory_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
             "implReplicatorforProduction{",
             "implPrimaryReplicatorforProduction{",
             "implStateReplicatorforProduction{",
-            "implcrate::replicator::coordinator::EffectsforProduction{",
-            "crate::replicator::coordinator::Control::new(owner.context.clone(),owner.clone())",
-            "owner.context.access.retain_creation_control(",
             "Ok(ReplicatorInterfaces::primary(",
-            ".with_native_runtime_control(control)",
+            ".with_effective_replication_address(local.address)",
         ]
         .into_iter()
         .all(|binding| occurrences(&production, binding) == 1)
+        && !production.contains("coordinator::")
+        && !production.contains("with_native_runtime_control")
 }
 
 fn controller_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
@@ -806,13 +809,13 @@ fn replacement_ownership_gate() {
         ..production_sources()
     });
     let alternate_composition = NATIVE_PRODUCTION_SOURCE.replacen(
-        ".with_native_runtime_control(control)",
-        ".with_alternate_runtime_control(control)",
+        ".with_effective_replication_address(local.address)",
+        ".with_alternate_replication_address(local.address)",
         1,
     );
     assert_ne!(
         alternate_composition, NATIVE_PRODUCTION_SOURCE,
-        "composition mutation must alter the actual common coordinator attachment"
+        "composition mutation must alter the actual ordinary endpoint registration"
     );
     let alternate_native_composition = discover_inventory(&ProductionSources {
         native_production_source: &alternate_composition,

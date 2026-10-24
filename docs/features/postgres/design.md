@@ -1,8 +1,10 @@
 # PostgreSQL: Native Replication on Kuberic Public V1
 
 **M1 checkpoint:** the [generic ordinary host/controller](../kuberic/ordinary-hosting-m1.md)
-is implemented, but **M2 PostgreSQL session/lifecycle integration is NOT
-IMPLEMENTED**. PgService rejects ordinary production Open before PostgreSQL/
+is implemented. **M2 is partial:** PG now owns its authenticated endpoint,
+private session protocol and retained ordinary terminal lifetime; native
+session/effect binding and fresh ordinary admission remain unfinished.
+PgService still rejects ordinary production Open before PostgreSQL/
 listener/application initialization. Existing hosted-controller journey names
 assert exact M2 unavailability; their later SQL/backup/terminal clauses do not
 execute. Real native component smoke cases still run, not replacement-session
@@ -61,7 +63,7 @@ driver hierarchy.
 The agent delivers exact incarnation, session, endpoint, role and frozen progress
 descriptions through `ReplicaInformation` / `ReplicaSetConfiguration` and the
 existing configuration/build/catch-up callbacks. Authority stores and mutation
-capabilities remain private. The retained pre-M1 factory attaches its own
+capabilities remain private. The historical pre-M1 factory attached its own
 `CustomReplicatorControl` to the same creation; it does not borrow a built-in
 bundle. The separate
 [companion contract](../kuberic/replicator-boundary.md#custom-controller-integration)
@@ -70,7 +72,20 @@ without adding methods to the protected native traits. Although attachment is
 optional for a bundle, pre-M1 controller Build required it. This was a real
 extra boundary beyond SF's ordinary custom-replicator integration, not justified
 merely by describing it as local. Current M1 production never uses this route;
-PG Open rejects until M2 native session/ordinary lifecycle integration.
+PG Open rejects until M2 native effect/admission integration. The current PG
+factory no longer attaches that companion or supplies a callback-ownership
+policy: ordinary `Abort` fences admission and ordinary `Close` retains cleanup.
+
+PG's ordinary replicator Open binds the actual configured data listener before
+role recovery. `PublicV1` checks the configured PG coordination credential
+before decoding or dispatching; outbound requests carry it too. Private
+nonce/generation sessions bind both complete achieved publications, including
+storage, process, creation, endpoint, history and epoch. Target reservation
+precedes source Active confirmation; retirement and confirmation share a local
+gate, retained tombstones are bounded, and unresolved remote ownership remains
+quarantined. Session-control completion is not native copy completion, Ready,
+voter admission or SQL permission. The native transfer/handover connection to
+this session owner remains the next M2 slice.
 
 PostgreSQL uses the same common lifecycle owner as the built-in engine but does
 not register the built-in replication/copy data plane. Delayed native callback

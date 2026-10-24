@@ -15,6 +15,8 @@ use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+#[path = "public_endpoint.rs"]
+mod public_endpoint;
 #[path = "public_transport.rs"]
 mod public_transport;
 #[path = "public_v1.rs"]
@@ -93,7 +95,7 @@ struct PgConfiguration {
 
 pub struct PgReplicator {
     public_v1: std::sync::OnceLock<public_v1::PublicPg>,
-    fault_owner: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    fault_owner: std::sync::Mutex<Vec<crate::owned_task::PgTask>>,
     instance: Arc<PgInstanceManager>,
     durable: Arc<PgDurableStore>,
     observer: PgNativeObserver,
@@ -195,7 +197,7 @@ impl PgReplicator {
     ) -> Self {
         Self {
             public_v1: std::sync::OnceLock::new(),
-            fault_owner: Mutex::new(None),
+            fault_owner: std::sync::Mutex::new(Vec::new()),
             observer: PgNativeObserver::with_store(instance.clone(), durable.clone()).await,
             instance,
             durable,
@@ -1250,6 +1252,9 @@ impl PgReplicator {
     }
 
     fn abort(&self) {
+        if self.is_public_v1() {
+            self.public_abort();
+        }
         self.cancellation.cancel();
         if self.public_closed() {
             return;

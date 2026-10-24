@@ -52,7 +52,7 @@ impl NativeCredential {
 
 pub(super) struct NativeGateway {
     cancellation: CancellationToken,
-    task: Option<JoinHandle<()>>,
+    task: Option<JoinHandle<Result<()>>>,
     #[cfg(all(test, feature = "testing"))]
     exit_gate: Arc<std::sync::Mutex<Option<Arc<GatewayExitGate>>>>,
 }
@@ -104,13 +104,19 @@ impl NativeGateway {
         let exiting = exit_gate.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
+            let mut failures = Vec::new();
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             loop {
                 tokio::select! {
                     biased;
                     _ = stopped.cancelled() => break,
                     _ = tick.tick() => if !valid().await { break; },
-                    _ = connections.join_next(), if !connections.is_empty() => {},
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = joined {
+                            failures.push(error.to_string());
+                            break;
+                        }
+                    },
                     accepted = listener.accept() => {
                         let Ok((client, _)) = accepted else { break; };
                         if connections.len() >= 4 || !valid().await {
@@ -130,7 +136,13 @@ impl NativeGateway {
             // Dropping a listener alone does not fence already-open WAL senders.
             drop(listener);
             connections.abort_all();
-            while connections.join_next().await.is_some() {}
+            while let Some(result) = connections.join_next().await {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    failures.push(error.to_string());
+                }
+            }
             #[cfg(all(test, feature = "testing"))]
             {
                 let gate = exiting.lock().unwrap().take();
@@ -138,6 +150,11 @@ impl NativeGateway {
                     gate.entered.notify_one();
                     gate.release.notified().await;
                 }
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(application_error(failures.join("; ")))
             }
         });
         Ok((
@@ -174,7 +191,7 @@ impl NativeGateway {
     pub async fn drain(mut self) -> Result<()> {
         self.cancellation.cancel();
         if let Some(task) = self.task.take() {
-            task.await.map_err(application_error)?;
+            task.await.map_err(application_error)??;
         }
         Ok(())
     }

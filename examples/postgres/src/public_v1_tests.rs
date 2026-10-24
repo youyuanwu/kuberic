@@ -1,6 +1,8 @@
 use super::*;
 #[path = "public_controller_tests.rs"]
 mod controller;
+#[path = "m2_pg_tests.rs"]
+mod m2;
 #[path = "public_v1_p6_tests.rs"]
 pub(crate) mod p6;
 use crate::durable::{PgDurableIdentity, StorageMode};
@@ -222,7 +224,6 @@ struct Replica {
     identity: ReplicaIdentity,
     address: String,
     session: ProcessSessionId,
-    server: tokio::task::JoinHandle<()>,
     root: std::path::PathBuf,
 }
 
@@ -247,7 +248,7 @@ impl OracleDataDir {
                 }
             });
         let path = base.join(format!("kpv1-{}-{sequence}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&base).unwrap();
         std::fs::create_dir(&path).unwrap();
         Self { path }
     }
@@ -284,6 +285,7 @@ impl Replica {
     ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
         let identity = native_identity(id, incarnation);
         let resource = ResourceUid::new("postgres-public-oracle");
         let durable = Arc::new(
@@ -313,7 +315,8 @@ impl Replica {
                 CancellationToken::new(),
                 crate::data_service::PgCoordination {
                     local_endpoint: address.clone(),
-                    bearer_token: String::new(),
+                    bearer_token: "pg-native-fixture-coordination".into(),
+                    listen_address: None,
                 },
                 true,
             )
@@ -330,24 +333,18 @@ impl Replica {
                 ))
                 .is_ok()
         );
+        driver
+            .public_owner()
+            .driver
+            .set(Arc::downgrade(&driver))
+            .unwrap();
         driver.start_public_owner();
         Replicator::open(driver.as_ref()).await.unwrap();
-        let service = TestService(driver.clone());
-        let server = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(
-                    crate::proto::pg_data_service_server::PgDataServiceServer::new(service),
-                )
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
         Self {
             driver,
             identity,
             address,
             session,
-            server,
             root,
         }
     }
@@ -399,7 +396,6 @@ impl Replica {
 impl Drop for Replica {
     fn drop(&mut self) {
         self.driver.abort();
-        self.server.abort();
     }
 }
 
@@ -413,47 +409,7 @@ async fn production_factory_returns_no_parallel_state_replicator() {
     assert!(interfaces.primary_replicator().is_some());
     let control: Arc<dyn Replicator> = replica.driver.clone();
     assert!(Arc::ptr_eq(&interfaces.replicator(), &control));
-}
-
-struct TestService(Arc<PgReplicator>);
-
-#[tonic::async_trait]
-impl crate::proto::pg_data_service_server::PgDataService for TestService {
-    async fn public_v1(
-        &self,
-        request: tonic::Request<crate::proto::RecoveryRequest>,
-    ) -> std::result::Result<tonic::Response<crate::proto::RecoveryResponse>, tonic::Status> {
-        let request =
-            decode(&request.into_inner().envelope_json).map_err(tonic::Status::invalid_argument)?;
-        let response = self
-            .0
-            .public_request(request)
-            .await
-            .map_err(|e| tonic::Status::failed_precondition(e.to_string()))?;
-        Ok(tonic::Response::new(crate::proto::RecoveryResponse {
-            envelope_json: encode(&response).unwrap(),
-        }))
-    }
-    async fn build(
-        &self,
-        _: tonic::Request<crate::proto::NativeBuildRequest>,
-    ) -> std::result::Result<tonic::Response<crate::proto::NativeBuildResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("legacy"))
-    }
-    async fn inspect_source(
-        &self,
-        _: tonic::Request<crate::proto::NativeBuildRequest>,
-    ) -> std::result::Result<tonic::Response<crate::proto::NativeSourceResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("legacy"))
-    }
-    async fn recover(
-        &self,
-        _: tonic::Request<crate::proto::RecoveryRequest>,
-    ) -> std::result::Result<tonic::Response<crate::proto::RecoveryResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("legacy"))
-    }
+    Replicator::close(replica.driver.as_ref()).await.unwrap();
 }
 
 fn build_replica(binding: &BuildBinding) -> ReplicaInformation {
@@ -1017,6 +973,7 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         target.driver.public_close().await.unwrap();
         // Deliberately no Close or Drop on the source before all observations.
         std::hint::black_box(&source.driver);
+        source.driver.public_close().await.unwrap();
         let hosted = production_service(directory.path().join("abort-host"), 113).await;
         // Negative host fixture: a genuinely accepted source Build owns its
         // grant while its unresponsive target cannot complete. It is not a
@@ -1415,7 +1372,10 @@ async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionServ
         )
         .unwrap(),
     );
-    let service = Arc::new(crate::service::PgService::deferred(service_config.clone()));
+    let service = Arc::new(
+        crate::service::PgService::deferred(service_config.clone())
+            .with_coordination_token("pg-production-native-fixture-coordination".into()),
+    );
     let running = kuberic_runtime::host::ReplicaHost::new(
         kuberic_runtime::host::ReplicaProcessConfig {
             resource_uid: resource_uid.clone(),

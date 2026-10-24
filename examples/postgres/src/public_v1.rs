@@ -1,22 +1,23 @@
-//! Dormant Public V1 PostgreSQL owner. No report poll drives this lifecycle.
+//! PostgreSQL Public V1 native and ordinary lifetime owners.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use kuberic_runtime::protocol::public_operations::{
-    LocalProviderRebuildRequired, ProviderReplicaIdentity, PublicConfiguration,
-    PublicInboundBuildAuthority, RemoteBuildTargetRebuildRequired, ReplicaRebuildReason,
-    ReplicaRebuildRequired,
+    LocalProviderRebuildRequired, ProviderReplicaIdentity, PublicInboundBuildAuthority,
+    RemoteBuildTargetRebuildRequired, ReplicaRebuildReason, ReplicaRebuildRequired,
 };
 use kuberic_runtime::protocol::types::{ConfigurationId, ProcessSessionId, ResourceUid};
-use kuberic_runtime::replicator::{
-    CallbackOwnership, CustomReplicatorControl, ReplicatorFactoryContext, ReplicatorSettings,
-};
+use kuberic_runtime::replicator::{ReplicatorFactoryContext, ReplicatorSettings};
 use serde::{Deserialize, Serialize};
 
 use super::public_transport::{NativeCredential, NativeGateway};
 use super::*;
+
+#[path = "public_session.rs"]
+mod session;
+use session::{PgSessions, SessionReply, SessionRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LifecycleContext {
@@ -294,6 +295,29 @@ struct InboundJoin {
     result: Option<std::result::Result<(), String>>,
 }
 
+#[derive(Clone)]
+struct CloseOwner {
+    result: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+    task: crate::owned_task::PgTask,
+}
+
+impl CloseOwner {
+    async fn wait(self, lost: &'static str) -> Result<()> {
+        let mut observed = self.result;
+        loop {
+            let result = observed.borrow().clone();
+            if let Some(result) = result {
+                self.task.await.map_err(application_error)?;
+                return result.map_err(application_error);
+            }
+            if observed.changed().await.is_err() {
+                self.task.await.map_err(application_error)?;
+                return Err(application_error(lost));
+            }
+        }
+    }
+}
+
 impl InboundOwner {
     async fn wait(&self) -> Result<BuildCompletion> {
         #[cfg(all(test, feature = "testing"))]
@@ -322,6 +346,24 @@ impl InboundOwner {
 }
 
 pub(super) struct PublicPg {
+    sessions: PgSessions,
+    #[cfg(all(test, feature = "testing"))]
+    session_confirmation_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
+    #[cfg(all(test, feature = "testing"))]
+    session_retirement_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
+    #[cfg(all(test, feature = "testing"))]
+    role_gate: std::sync::Mutex<Option<Arc<BuildCompletionGate>>>,
+    #[cfg(all(test, feature = "testing"))]
+    session_publications: std::sync::Mutex<
+        Option<(
+            kuberic_runtime::protocol::public_operations::ReplicaPublication,
+            kuberic_runtime::protocol::public_operations::ReplicaPublication,
+        )>,
+    >,
+    driver: std::sync::OnceLock<Weak<PgReplicator>>,
+    endpoint: std::sync::Mutex<Option<Arc<Mutex<super::public_endpoint::PgEndpoint>>>>,
+    endpoint_cancel: CancellationToken,
+    close_owner: std::sync::Mutex<Option<CloseOwner>>,
     host: std::sync::OnceLock<ReplicatorFactoryContext>,
     inbound: std::sync::Mutex<Option<PublicInboundBuildAuthority>>,
     cleanup_error: std::sync::Mutex<Option<String>>,
@@ -382,6 +424,19 @@ impl PublicPg {
         replication_address: String,
     ) -> Self {
         Self {
+            sessions: PgSessions::default(),
+            #[cfg(all(test, feature = "testing"))]
+            session_confirmation_gate: std::sync::Mutex::new(None),
+            #[cfg(all(test, feature = "testing"))]
+            session_retirement_gate: std::sync::Mutex::new(None),
+            #[cfg(all(test, feature = "testing"))]
+            role_gate: std::sync::Mutex::new(None),
+            #[cfg(all(test, feature = "testing"))]
+            session_publications: std::sync::Mutex::new(None),
+            driver: std::sync::OnceLock::new(),
+            endpoint: std::sync::Mutex::new(None),
+            endpoint_cancel: CancellationToken::new(),
+            close_owner: std::sync::Mutex::new(None),
             host: std::sync::OnceLock::new(),
             inbound: std::sync::Mutex::new(None),
             cleanup_error: std::sync::Mutex::new(None),
@@ -405,7 +460,6 @@ impl PublicPg {
                 built: None,
                 receiver_boundary: None,
                 marked_catchup: false,
-                installed: None,
                 built_idle: BTreeMap::new(),
             }),
             work: std::sync::Mutex::new(CancellationToken::new()),
@@ -480,7 +534,6 @@ struct PublicState {
     built: Option<BuildCompletion>,
     receiver_boundary: Option<i64>,
     marked_catchup: bool,
-    installed: Option<InstalledMembership>,
     built_idle: BTreeMap<ReplicaId, BuildBinding>,
 }
 
@@ -492,12 +545,6 @@ struct Grant {
     session: ProcessSessionId,
     lineage: PgLineage,
     boundary: i64,
-}
-
-struct InstalledMembership {
-    current: ConfigurationDescriptor,
-    previous: Option<ConfigurationDescriptor>,
-    peers: BTreeMap<ReplicaIdentity, ReplicaInformation>,
 }
 
 struct BuildGrantGuard {
@@ -524,6 +571,7 @@ pub(crate) struct BuildCompletion {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(crate) enum Request {
+    Session(Box<SessionRequest>),
     Inspect(TransportBinding),
     Build(BuildBinding),
     Peer(PeerBinding),
@@ -532,6 +580,7 @@ pub(crate) enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", deny_unknown_fields)]
 pub(crate) enum Response {
+    Session(Box<SessionReply>),
     Source {
         binding: TransportBinding,
         credential: NativeCredential,
@@ -543,43 +592,9 @@ pub(crate) enum Response {
     Rebuild(ReplicaRebuildRequired),
 }
 
-#[async_trait]
-impl CustomReplicatorControl for PgReplicator {
-    fn callback_ownership(&self) -> CallbackOwnership {
-        CallbackOwnership::ObjectOwnedOnInterruption
-    }
-    async fn install_inbound_build_authority(
-        &self,
-        authority: &PublicInboundBuildAuthority,
-    ) -> Result<()> {
-        if self.cancellation.is_cancelled()
-            || self
-                .public_owner()
-                .closing
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(RuntimeError::Closed);
-        }
-        let public = self.public_owner();
-        public
-            .host
-            .get()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?
-            .validate_build_authority(authority)
-            .await?;
-        let context = public.fence.context()?;
-        if context.role != ReplicaRole::IdleSecondary || context.epoch != authority.attempt.epoch {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        let mut inbound = public.inbound.lock().unwrap();
-        if inbound.as_ref().is_some_and(|old| old != authority) {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        *inbound = Some(authority.clone());
-        Ok(())
-    }
-
-    async fn revoke_inbound_build_authority(
+impl PgReplicator {
+    #[cfg(all(test, feature = "testing"))]
+    async fn retire_legacy_inbound_for_fixture(
         &self,
         authority: &PublicInboundBuildAuthority,
     ) -> Result<()> {
@@ -603,42 +618,6 @@ impl CustomReplicatorControl for PgReplicator {
             self.instance.stop().await.map_err(application_error)?;
         }
         Ok(())
-    }
-
-    async fn idle_replicas(&self, configuration: &PublicConfiguration) -> Result<Vec<ReplicaId>> {
-        let state = self.public_owner().state.lock().await;
-        if !state.opened || self.cancellation.is_cancelled() {
-            return Err(RuntimeError::Closed);
-        }
-        if state.role == ReplicaRole::Primary {
-            let peers = configuration
-                .replicas
-                .iter()
-                .cloned()
-                .map(ReplicaInformation::from)
-                .map(|replica| (replica.identity.clone(), replica))
-                .collect::<BTreeMap<_, _>>();
-            if state.installed.as_ref().is_none_or(|installed| {
-                installed.current != configuration.current
-                    || installed.previous != configuration.previous
-                    || installed.peers != peers
-            }) {
-                return Err(RuntimeError::ReconfigurationPending);
-            }
-            return Ok(state.built_idle.keys().copied().collect());
-        }
-        // The secondary's completed host configuration precedes the primary's
-        // native Peer RPC. It has no source-owned idle peers to report.
-        if state.built_idle.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Err(RuntimeError::ReconfigurationPending)
-        }
-    }
-
-    async fn shutdown_and_drain(&self) -> Result<()> {
-        *self.public_owner().inbound.lock().unwrap() = None;
-        self.public_close().await
     }
 }
 
@@ -722,8 +701,20 @@ impl PgReplicator {
         }
         Ok(())
     }
-    pub(crate) async fn retain_fault_owner(&self, task: tokio::task::JoinHandle<()>) {
-        *self.fault_owner.lock().await = Some(task);
+    pub(crate) fn retain_fault_owner(&self, task: tokio::task::JoinHandle<()>) {
+        self.fault_owner
+            .lock()
+            .unwrap()
+            .push(crate::owned_task::PgTask::new(task));
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    fn fault_owners_joined(&self) -> bool {
+        self.fault_owner
+            .lock()
+            .unwrap()
+            .iter()
+            .all(crate::owned_task::PgTask::settled_successfully)
     }
     fn public_retain_gateway_drain(&self, gateway: NativeGateway) -> DrainOwner {
         let owner = Arc::new(Mutex::new(GatewayJoin {
@@ -862,6 +853,10 @@ impl PgReplicator {
                 settings.replication_address,
             ))
             .map_err(|_| application_error("PostgreSQL construction is immutable"))?;
+        self.public_owner()
+            .driver
+            .set(Arc::downgrade(self))
+            .map_err(|_| application_error("PostgreSQL lifetime already bound"))?;
         self.start_public_owner();
         Ok(())
     }
@@ -1080,6 +1075,36 @@ impl PgReplicator {
             .bind_generation_store(&self.durable)
             .await
             .map_err(application_error)?;
+        let address = match self.coordination.listen_address {
+            Some(address) => address,
+            None => self
+                .coordination
+                .local_endpoint
+                .strip_prefix("http://")
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?
+                .parse()
+                .map_err(application_error)?,
+        };
+        let endpoint = super::public_endpoint::PgEndpoint::bind(
+            address,
+            self.public_owner()
+                .driver
+                .get()
+                .cloned()
+                .ok_or(RuntimeError::Closed)?,
+            self.coordination.bearer_token.clone(),
+            self.public_owner().endpoint_cancel.clone(),
+        )
+        .await?;
+        *self.public_owner().endpoint.lock().unwrap() = Some(Arc::new(Mutex::new(endpoint)));
+        if self
+            .public_owner()
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.cancellation.is_cancelled()
+        {
+            return Err(RuntimeError::Closed);
+        }
         state.opened = true;
         Ok(())
     }
@@ -1187,6 +1212,13 @@ impl PgReplicator {
 
     async fn public_reconcile_access(&self) -> Result<bool> {
         let mut state = self.public_owner().state.lock().await;
+        if self
+            .public_owner()
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(false);
+        }
         let Ok(context) = self.public_owner().fence.context() else {
             return Ok(false);
         };
@@ -1273,7 +1305,60 @@ impl PgReplicator {
         Ok(true)
     }
 
+    pub(super) fn public_abort(&self) {
+        let public = self.public_owner();
+        public
+            .closing
+            .store(true, std::sync::atomic::Ordering::Release);
+        public.sessions.fence();
+        public.endpoint_cancel.cancel();
+        public.cancel();
+    }
+
     pub(super) async fn public_close(&self) -> Result<()> {
+        self.public_abort();
+        let owner = {
+            let mut owner = self.public_owner().close_owner.lock().unwrap();
+            if let Some(result) = owner.as_ref() {
+                result.clone()
+            } else {
+                let driver = self
+                    .public_owner()
+                    .driver
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or(RuntimeError::Closed)?;
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                let task = tokio::spawn(async move {
+                    let result = driver
+                        .public_close_owned()
+                        .await
+                        .map_err(|error| error.to_string());
+                    sender.send_replace(Some(result));
+                });
+                let operation = CloseOwner {
+                    result: receiver,
+                    task: crate::owned_task::PgTask::new(task),
+                };
+                *owner = Some(operation.clone());
+                operation
+            }
+        };
+        let mut result = owner.result;
+        loop {
+            let completed = result.borrow().clone();
+            if let Some(result) = completed {
+                owner.task.await.map_err(application_error)?;
+                return result.map_err(application_error);
+            }
+            if result.changed().await.is_err() {
+                owner.task.await.map_err(application_error)?;
+                return Err(application_error("lost PostgreSQL Close owner"));
+            }
+        }
+    }
+
+    async fn public_close_owned(&self) -> Result<()> {
         let _close = self.public_owner().close_serial.lock().await;
         if self.public_closed() {
             return Ok(());
@@ -1289,6 +1374,9 @@ impl PgReplicator {
         if let Err(error) = self.public_revoke().await {
             failures.push(error.to_string());
         }
+        if let Err(error) = self.pg_join_sessions().await {
+            failures.push(error.to_string());
+        }
         self.public_owner().state.lock().await.opened = false;
         self.cancellation.cancel();
         let mut owner = self.public_owner().owner.lock().await;
@@ -1300,16 +1388,22 @@ impl PgReplicator {
             failures.push(error);
         }
         owner.take();
-        let mut reporter = self.fault_owner.lock().await;
-        if let Some(task) = reporter.as_mut()
-            && let Err(error) = task.await
-        {
-            let error = error.to_string();
-            *self.public_owner().cleanup_error.lock().unwrap() = Some(error.clone());
-            failures.push(error);
+        let reporters = self.fault_owner.lock().unwrap().clone();
+        for task in reporters {
+            if let Err(error) = task.await {
+                failures.push(error.to_string());
+            }
         }
-        reporter.take();
         if let Err(error) = self.public_join_gateway_drains().await {
+            failures.push(error.to_string());
+        }
+        if let Err(error) = self.instance.join_tasks().await {
+            failures.push(error.to_string());
+        }
+        let endpoint = self.public_owner().endpoint.lock().unwrap().clone();
+        if let Some(endpoint) = endpoint
+            && let Err(error) = endpoint.lock().await.join().await
+        {
             failures.push(error.to_string());
         }
         if let Some(error) = self.public_owner().cleanup_error.lock().unwrap().as_ref() {
@@ -1495,18 +1589,28 @@ impl PgReplicator {
 
     pub(super) async fn public_change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
         let context = self.public_owner().fence.context()?;
+        if context.role != role || context.epoch != epoch {
+            self.public_owner().sessions.invalidate();
+        }
         if epoch < context.epoch || epoch < self.public_owner().state.lock().await.role_epoch {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         self.public_owner().cancel();
         let _serial = self.public_owner().inbound_serial.lock().await;
         self.public_owned(async {
+            #[cfg(all(test, feature = "testing"))]
+            {
+                let gate = self.public_owner().role_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
             let mut state = self.public_owner().state.lock().await;
             if !state.opened {
                 return Err(RuntimeError::Closed);
             }
             self.public_drain(&mut state).await?;
-            state.installed = None;
             state.built_idle.clear();
             let durable = self.public_validate_history().await?;
             let initial_primary =
@@ -1565,12 +1669,16 @@ impl PgReplicator {
                 context.previous_configuration_id = None;
                 context.current_configuration_id = None;
             })?;
+            self.public_owner().sessions.resume();
             Ok(())
         })
         .await
     }
 
     pub(super) async fn public_update_epoch(&self, epoch: Epoch) -> Result<()> {
+        if self.public_owner().fence.context()?.epoch != epoch {
+            self.public_owner().sessions.invalidate();
+        }
         if self
             .public_owner()
             .closing
@@ -1592,7 +1700,6 @@ impl PgReplicator {
         if epoch != state.role_epoch {
             self.public_drain(&mut state).await?;
             if epoch.data_loss_number != state.role_epoch.data_loss_number {
-                state.installed = None;
                 state.built_idle.clear();
             }
         }
@@ -1603,6 +1710,7 @@ impl PgReplicator {
             context.previous_configuration_id = None;
             context.current_configuration_id = None;
         })?;
+        self.public_owner().sessions.resume();
         Ok(())
     }
 
@@ -2116,11 +2224,6 @@ impl PgReplicator {
         }
         let mut state = self.public_owner().state.lock().await;
         self.public_check_configuration(&state, &self.public_owner().fence.context()?)?;
-        state.installed = Some(InstalledMembership {
-            current: current.configuration.clone(),
-            previous: state.previous.clone(),
-            peers: replicas,
-        });
         let voters = current
             .configuration
             .members
@@ -2311,13 +2414,24 @@ impl PgReplicator {
     }
 
     async fn public_rpc(&self, endpoint: &str, request: &Request) -> Result<Response> {
-        let request = tonic::Request::new(crate::proto::RecoveryRequest {
+        let retirement = matches!(request, Request::Session(request)
+            if request.action == session::SessionAction::Retire);
+        let mut request = tonic::Request::new(crate::proto::RecoveryRequest {
             envelope_json: encode(request).map_err(application_error)?,
         });
+        if self.coordination.bearer_token.is_empty() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", self.coordination.bearer_token)
+                .parse()
+                .map_err(application_error)?,
+        );
         let response = tokio::select! {
             biased;
-            _ = self.cancellation.cancelled() => return Err(RuntimeError::Closed),
-            response = tokio::time::timeout(Duration::from_secs(120), async {
+            _ = self.cancellation.cancelled(), if !retirement => return Err(RuntimeError::Closed),
+            response = tokio::time::timeout(Duration::from_secs(if retirement { 5 } else { 120 }), async {
             let mut client = crate::proto::pg_data_service_client::PgDataServiceClient::connect(
                 endpoint.to_owned(),
             )
@@ -2366,6 +2480,14 @@ impl PgReplicator {
     }
 
     pub(super) async fn public_build(&self, replica: ReplicaInformation) -> Result<()> {
+        if self
+            .public_owner()
+            .host
+            .get()
+            .is_some_and(ReplicatorFactoryContext::ordinary_hosting)
+        {
+            self.pg_prepare_build_session(&replica).await?;
+        }
         let cancellation = self.public_owner().work.lock().unwrap().clone();
         self.public_attempt_live(&cancellation)?;
         replica.validate_public_progress()?;
@@ -2763,16 +2885,23 @@ impl PgReplicator {
     }
 
     pub(crate) async fn public_request(self: &Arc<Self>, request: Request) -> Result<Response> {
+        let retirement = matches!(&request, Request::Session(request)
+            if request.action == session::SessionAction::Retire);
         if !self.is_public_v1()
-            || self.cancellation.is_cancelled()
-            || self
-                .public_owner()
-                .closing
-                .load(std::sync::atomic::Ordering::Acquire)
+            || (!retirement
+                && (self.cancellation.is_cancelled()
+                    || self
+                        .public_owner()
+                        .closing
+                        .load(std::sync::atomic::Ordering::Acquire)))
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         match request {
+            Request::Session(request) => self
+                .pg_session_request(*request)
+                .await
+                .map(|reply| Response::Session(Box::new(reply))),
             Request::Inspect(binding) => {
                 self.public_validate_transport(&binding).await?;
                 let context = self.public_owner().fence.validate_binding(&binding)?;

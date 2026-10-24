@@ -7,7 +7,6 @@ use kuberic_controller::test_util::{
 };
 use kuberic_runtime::protocol::public_operations::PublicV1CallKind;
 use std::sync::Mutex as StdMutex;
-use tokio_stream::wrappers::TcpListenerStream;
 
 type TestResult<T = ()> = kuberic_controller::test_util::Result<T>;
 
@@ -65,8 +64,6 @@ fn check(condition: bool, message: &str) -> TestResult {
 
 struct Listener {
     service: Arc<PgService>,
-    cancel: CancellationToken,
-    task: tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>,
     address: std::net::SocketAddr,
     alias: std::path::PathBuf,
 }
@@ -79,6 +76,7 @@ impl ApplicationFactory for Factory {
     async fn create(&self, context: ReplicaContext) -> TestResult<CreatedApplication<PgService>> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
+        drop(listener);
         // PostgreSQL's Unix socket path is bounded by sockaddr_un. The harness
         // retains long incarnation paths; this owned alias names the same
         // declared backing storage, not a different storage incarnation.
@@ -117,24 +115,12 @@ impl ApplicationFactory for Factory {
             config.application_root.clone(),
             context.application_root().join("d"),
         ];
-        let service = Arc::new(PgService::deferred(config));
-        let cancel = CancellationToken::new();
-        let stopped = cancel.clone();
-        let native = crate::data_service::PgDataServiceImpl::new(service.clone(), String::new())
-            .into_server();
-        let task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(native)
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    stopped.cancelled_owned(),
-                )
-                .await
-        });
+        let service = Arc::new(
+            PgService::deferred(config)
+                .with_coordination_token("pg-controller-fixture-coordination".into()),
+        );
         self.0.lock().unwrap().push(Listener {
             service: service.clone(),
-            cancel,
-            task,
             address,
             alias,
         });
@@ -149,19 +135,11 @@ impl ApplicationFactory for Factory {
                 .map(|index| listeners.remove(index))
         };
         let mut failures = Vec::new();
-        if let Some(listener) = &listener {
-            listener.cancel.cancel();
-        }
         if let Err(source) = kuberic_runtime::StatefulServiceReplica::close(service.as_ref()).await
         {
             failures.push(source.to_string());
         }
         if let Some(listener) = listener {
-            match listener.task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(source)) => failures.push(source.to_string()),
-                Err(source) => failures.push(source.to_string()),
-            }
             if tokio::net::TcpStream::connect(listener.address)
                 .await
                 .is_ok()
@@ -182,7 +160,7 @@ impl ApplicationFactory for Factory {
 
 async fn application_connection(
     service: &PgService,
-) -> TestResult<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
+) -> TestResult<(tokio_postgres::Client, crate::owned_task::PgTask)> {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             match service.instance().connect_application().await {
@@ -765,7 +743,7 @@ async fn public_v1_postgres_graceful_close_observes_acknowledged_tail() {
     assert!(final_state.postgres_stopped && final_state.external_access_closed);
     process.assert_reaped();
     assert!(hosted.driver.public_owner().owner.lock().await.is_none());
-    assert!(hosted.driver.fault_owner.lock().await.is_none());
+    assert!(hosted.driver.fault_owners_joined());
     hosted.shutdown().await;
 }
 
@@ -1132,11 +1110,7 @@ async fn public_v1_postgres_provisional_gateway_is_joined_after_cancel() {
         );
         if fail_join {
             assert!(Replicator::close(driver.as_ref()).await.is_err());
-            assert!(
-                CustomReplicatorControl::shutdown_and_drain(driver.as_ref())
-                    .await
-                    .is_err()
-            );
+            assert!(Replicator::close(driver.as_ref()).await.is_err());
         }
         assert!(
             tokio::net::TcpStream::connect(gateway.address)
@@ -1175,7 +1149,7 @@ async fn public_v1_postgres_provisional_gateway_is_joined_after_cancel() {
                 .await
                 .is_none()
         );
-        assert!(source.native_driver().fault_owner.lock().await.is_none());
+        assert!(source.native_driver().fault_owners_joined());
         for probe in probes {
             probe.assert_gone().await;
         }
@@ -1257,8 +1231,7 @@ async fn public_v1_postgres_lost_inbound_join_is_sticky_across_close() {
         // native terminal paths must retain the same consumed join failure.
         let first = Replicator::close(target.native_driver().as_ref()).await;
         let second = Replicator::close(target.native_driver().as_ref()).await;
-        let third =
-            CustomReplicatorControl::shutdown_and_drain(target.native_driver().as_ref()).await;
+        let third = Replicator::close(target.native_driver().as_ref()).await;
         let first = first
             .err()
             .ok_or_else(|| {
@@ -1290,7 +1263,7 @@ async fn public_v1_postgres_lost_inbound_join_is_sticky_across_close() {
                 .lock()
                 .await
                 .is_none()
-                && target.native_driver().fault_owner.lock().await.is_none(),
+                && target.native_driver().fault_owners_joined(),
             "inbound failure skipped remaining native owners",
         )?;
         Ok(())
@@ -1320,7 +1293,7 @@ async fn public_v1_postgres_lost_inbound_join_is_sticky_across_close() {
             .await
             .is_none()
     );
-    assert!(target.native_driver().fault_owner.lock().await.is_none());
+    assert!(target.native_driver().fault_owners_joined());
     for probe in probes {
         probe.assert_gone().await;
     }
@@ -1472,7 +1445,7 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
         let mut stale=live.clone();
         stale.operation_revision=stale.operation_revision.saturating_sub(1);
         stale.operation_id=kuberic_runtime::protocol::types::OperationId::new("stale-native-revoke");
-        CustomReplicatorControl::revoke_inbound_build_authority(target.native_driver().as_ref(),&stale).await.map_err(error)?;
+        target.native_driver().retire_legacy_inbound_for_fixture(&stale).await.map_err(error)?;
         target.native_driver().public_owner().host.get().unwrap().validate_build_authority(live).await.map_err(error)?;
         check(target.native_driver().public_owner().inbound.lock().unwrap().as_ref()==Some(live),
             "stale native revoke cancelled a different exact receiver owner")?;
@@ -1691,7 +1664,7 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             "old copy authority was admitted after later role/epoch/configuration ownership")?;
         // Component-negative late old callback against the real admitted native
         // successor. Actual install/revoke/admission above used the controller.
-        CustomReplicatorControl::revoke_inbound_build_authority(target.native_driver().as_ref(),authority).await.map_err(error)?;
+        target.native_driver().retire_legacy_inbound_for_fixture(authority).await.map_err(error)?;
         check(target.native_driver().public_owner().state.lock().await.receiver==successor_receiver
             && target.instance().generation_id()==successor_generation
             && target.native_driver().durable.snapshot().await.generation==successor_metadata,
@@ -1755,7 +1728,7 @@ async fn run(fail_cleanup: bool, invalidate_source: Option<bool>) {
             "periodic native owner was not joined after cleanup error"
         );
         assert!(
-            source.native_driver().fault_owner.lock().await.is_none(),
+            source.native_driver().fault_owners_joined(),
             "fault reporter was not joined after cleanup error"
         );
         let drains = source
