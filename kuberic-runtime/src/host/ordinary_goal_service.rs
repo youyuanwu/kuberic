@@ -94,7 +94,7 @@ impl<S: AgentStore + 'static> AgentService<S> {
         Ok(())
     }
 
-    async fn validate_goal_target(&self, goal: &ReplicaGoal) -> std::result::Result<(), Status> {
+    fn validate_goal_creation(&self, goal: &ReplicaGoal) -> std::result::Result<(), Status> {
         goal.validate().map_err(Status::invalid_argument)?;
         if &goal.scope.process_session_id != self.session.id()
             || goal.scope.creation_id
@@ -107,6 +107,11 @@ impl<S: AgentStore + 'static> AgentService<S> {
                 "goal targets a stale process or creation",
             ));
         }
+        Ok(())
+    }
+
+    async fn validate_goal_target(&self, goal: &ReplicaGoal) -> std::result::Result<(), Status> {
+        self.validate_goal_creation(goal)?;
         let state = self.store.load_state().await.map_err(status_from_agent)?;
         crate::host::ordinary_goal::validate_admission(&state, goal).map_err(status_from_agent)
     }
@@ -284,7 +289,7 @@ impl<S: AgentStore + 'static> AgentService<S> {
     ) -> std::result::Result<proto::ReplicaSnapshotResponse, Status> {
         version(request.protocol_version)?;
         let acknowledgement: ReplicaGoalAcknowledgement = decode(&request.canonical_json)?;
-        self.validate_goal_target(&acknowledgement.goal).await?;
+        self.validate_goal_creation(&acknowledgement.goal)?;
         let state = self.store.load_state().await.map_err(status_from_agent)?;
         crate::host::ordinary_goal::validate_acknowledgement(&state, &acknowledgement)
             .map_err(status_from_agent)?;

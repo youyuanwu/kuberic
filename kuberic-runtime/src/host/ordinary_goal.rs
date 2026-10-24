@@ -198,7 +198,10 @@ pub(crate) fn validate_frozen_admissions(
     Ok(())
 }
 
-pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Result<()> {
+fn validate_goal_identity<'a>(
+    state: &'a AgentState,
+    goal: &ReplicaGoal,
+) -> Result<&'a PublicV1OperationState> {
     goal.validate().map_err(reject)?;
     let preview = state
         .public_v1_operation_state
@@ -211,6 +214,10 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
     {
         return Err(reject("goal changed exact host history or storage"));
     }
+    Ok(preview)
+}
+
+fn validate_remote_selection(preview: &PublicV1OperationState, goal: &ReplicaGoal) -> Result<()> {
     if let Some(remote) = goal.remote() {
         let key = remote_key(remote);
         if preview
@@ -235,6 +242,12 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
             ));
         }
     }
+    Ok(())
+}
+
+pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Result<()> {
+    let preview = validate_goal_identity(state, goal)?;
+    validate_remote_selection(preview, goal)?;
     if let Some(existing) = preview.operations.get(&goal.operation_id) {
         return if existing.intent == goal.intent() {
             Ok(())
@@ -763,11 +776,10 @@ pub(crate) fn validate_acknowledgement(
     acknowledgement: &ReplicaGoalAcknowledgement,
 ) -> Result<()> {
     let goal = &acknowledgement.goal;
-    goal.validate().map_err(reject)?;
-    let record = state
-        .public_v1_operation_state
-        .as_ref()
-        .and_then(|preview| preview.operations.get(&goal.operation_id))
+    let preview = validate_goal_identity(state, goal)?;
+    let record = preview
+        .operations
+        .get(&goal.operation_id)
         .ok_or_else(|| reject("unknown ordinary goal"))?;
     if record.intent != goal.intent()
         || !matches!(
@@ -779,6 +791,11 @@ pub(crate) fn validate_acknowledgement(
             && record.disposition == Some(PublicOperationDisposition::Succeeded))
     {
         return Err(reject("ordinary goal is changed, uncertain, or unsettled"));
+    }
+    // A retained Remove result acknowledges local retirement, not a new remote
+    // selection. Its own accepted watermark must not hide that exact result.
+    if matches!(goal.desired, ReplicaGoalKind::Build { .. }) {
+        validate_remote_selection(preview, goal)?;
     }
     let ordinary = record
         .ordinary

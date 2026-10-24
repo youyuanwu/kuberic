@@ -837,6 +837,75 @@ async fn ordinary_goal_build_is_retained_exact_two_ended_and_remove_is_local_onl
     assert_eq!(source.probe.remove_calls.load(Ordering::Acquire), 1);
     assert_eq!(target.probe.close_calls.load(Ordering::Acquire), 0);
     assert!(target.snapshot().await.publication.is_some());
+    source.acknowledge(&remove).await;
+    let accepted = source.store.load_state().await.unwrap();
+    let watermark = accepted
+        .public_v1_operation_state
+        .as_ref()
+        .unwrap()
+        .remote_watermarks
+        .get(&crate::host::ordinary_goal::remote_key(&selection))
+        .copied();
+    assert_eq!(watermark, Some((remove.scope.epoch, selection.generation)));
+    let accepted_snapshot = source.snapshot().await;
+    let target_snapshot = target.snapshot().await;
+    assert!(target_snapshot.provider_writer_held);
+    assert_eq!(
+        source.runtime.provider_writer_lease_count(),
+        1,
+        "local retirement is not creation containment"
+    );
+    source.acknowledge(&remove).await;
+    assert_eq!(source.store.load_state().await.unwrap(), accepted);
+    assert_eq!(source.snapshot().await, accepted_snapshot);
+    assert_eq!(target.snapshot().await, target_snapshot);
+    assert!(
+        accepted_snapshot
+            .remote_operations
+            .iter()
+            .all(|remote| remote.state == RemoteReplicaState::Dropped)
+    );
+    assert_eq!(source.probe.remove_calls.load(Ordering::Acquire), 1);
+    assert_eq!(source.probe.build_calls.load(Ordering::Acquire), 1);
+    assert_eq!(source.probe.aborts.load(Ordering::Acquire), 0);
+    assert_eq!(target.probe.aborts.load(Ordering::Acquire), 0);
+    assert_eq!(target.probe.close_calls.load(Ordering::Acquire), 0);
+    for case in [
+        "creation", "process", "revision", "unknown", "storage", "build",
+    ] {
+        let mut invalid = remove.clone();
+        match case {
+            "creation" => {
+                invalid.scope.creation_id = ReplicatorCreationId::new("stale-ack-creation")
+            }
+            "process" => {
+                invalid.scope.process_session_id = ProcessSessionId::new("stale-ack-process")
+            }
+            "revision" => invalid.revision += 1,
+            "unknown" => invalid.operation_id = OperationId::new("unknown-remove"),
+            "storage" => invalid.scope.storage = target.goal.scope.storage.clone(),
+            "build" => invalid = build.clone(),
+            _ => unreachable!(),
+        }
+        assert!(
+            source
+                .service
+                .acknowledge_ordinary_goal(proto::ReplicaGoalRequest {
+                    protocol_version: ORDINARY_ACTION_FORMAT,
+                    canonical_json: serde_json::to_vec(&ReplicaGoalAcknowledgement {
+                        goal: invalid,
+                        logically_retired: false,
+                    })
+                    .unwrap(),
+                })
+                .await
+                .is_err(),
+            "invalid {case} acknowledgement was accepted"
+        );
+        assert_eq!(source.store.load_state().await.unwrap(), accepted);
+    }
+    assert!(source.submit(&remove).await.is_err());
+    assert!(source.submit(&build).await.is_err());
     let mut delayed = build.clone();
     delayed.operation_id = OperationId::new("delayed-build");
     delayed.revision = 4;

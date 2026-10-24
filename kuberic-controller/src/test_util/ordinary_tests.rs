@@ -461,6 +461,9 @@ impl ApplicationFactory for Applications {
 struct ObservedTransport {
     grpc: GrpcAgentApi,
     lost_build_reply: AtomicBool,
+    lose_remove_ack_reply: AtomicBool,
+    lost_remove_ack: StdMutex<Option<(ReplicaGoalAcknowledgement, ReplicaAgentSnapshot)>>,
+    remove_acknowledgements: AtomicUsize,
     build_submissions: AtomicUsize,
     forbidden: AtomicUsize,
     snapshots: AtomicUsize,
@@ -512,7 +515,23 @@ impl AgentApi for ObservedTransport {
         token: &str,
         request: proto::ReplicaGoalRequest,
     ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
-        self.grpc.acknowledge_goal(endpoint, token, request).await
+        let acknowledgement: ReplicaGoalAcknowledgement =
+            serde_json::from_slice(&request.canonical_json).unwrap();
+        let remove = matches!(acknowledgement.goal.desired, ReplicaGoalKind::Remove { .. });
+        if remove {
+            self.remove_acknowledgements.fetch_add(1, Ordering::AcqRel);
+        }
+        let response = self.grpc.acknowledge_goal(endpoint, token, request).await?;
+        if remove && self.lose_remove_ack_reply.swap(false, Ordering::AcqRel) {
+            *self.lost_remove_ack.lock().unwrap() = Some((
+                acknowledgement,
+                serde_json::from_slice(&response.canonical_json).unwrap(),
+            ));
+            return Err(AgentRpcError::Unavailable(
+                "injected lost successful Remove acknowledgement reply".into(),
+            ));
+        }
+        Ok(response)
     }
     async fn get_status(
         &self,
@@ -583,6 +602,9 @@ async fn start(
     let transport = Arc::new(ObservedTransport {
         grpc: GrpcAgentApi::new(Duration::from_secs(3)),
         lost_build_reply: AtomicBool::new(lost_reply),
+        lose_remove_ack_reply: AtomicBool::new(false),
+        lost_remove_ack: StdMutex::new(None),
+        remove_acknowledgements: AtomicUsize::new(0),
         build_submissions: AtomicUsize::new(0),
         forbidden: AtomicUsize::new(0),
         snapshots: AtomicUsize::new(0),
@@ -1317,6 +1339,211 @@ async fn production_ordinary_ready_remove_is_local_retirement_not_target_drainag
         std::fs::read(target.root.join("copied-state")).unwrap(),
         b"ordinary-engine-state"
     );
+    close(harness, &applications).await;
+}
+
+#[tokio::test]
+async fn production_ordinary_lost_successful_remove_ack_recreation_persists_exact_result_then_joins_target()
+ {
+    let (mut harness, applications, transport) = start(false, 2, false).await;
+    until(&mut harness, || {
+        applications
+            .engines
+            .lock()
+            .unwrap()
+            .get(&1)
+            .is_some_and(|engine| engine.builds.load(Ordering::Acquire) == 1)
+    })
+    .await;
+    let source = applications.engine(1);
+    let target = applications.engine(2);
+    source.build_release.add_permits(1);
+    wait_ready(&harness, transport.clone(), false).await;
+    harness.step().await.unwrap();
+    wait_ready(&harness, transport.clone(), true).await;
+    target.close_hold.store(true, Ordering::Release);
+    target.service_close_hold.store(true, Ordering::Release);
+    transport
+        .lose_remove_ack_reply
+        .store(true, Ordering::Release);
+    scale(&harness, 1).await;
+    until(&mut harness, || {
+        transport.lost_remove_ack.lock().unwrap().is_some()
+    })
+    .await;
+    assert!(
+        harness
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("injected lost successful Remove acknowledgement reply")
+    );
+    let (acknowledgement, accepted) = transport.lost_remove_ack.lock().unwrap().clone().unwrap();
+    assert!(!acknowledgement.logically_retired);
+    let exact_outcome = accepted
+        .goals
+        .iter()
+        .find(|observation| observation.goal == acknowledgement.goal)
+        .unwrap()
+        .clone();
+    assert_eq!(exact_outcome.status, ReplicaGoalStatus::Achieved);
+    let ReplicaGoalKind::Remove { remote: selection } = &acknowledgement.goal.desired else {
+        unreachable!()
+    };
+    assert!(accepted.remote_operations.iter().any(|remote| {
+        remote.operation_id == acknowledgement.goal.operation_id
+            && remote.selection == **selection
+            && remote.accepted
+            && remote.state == RemoteReplicaState::Dropped
+    }));
+    let pending = harness
+        .set()
+        .await
+        .unwrap()
+        .status
+        .unwrap()
+        .replica_goals
+        .into_iter()
+        .find(|entry| entry.goal == acknowledgement.goal)
+        .unwrap();
+    assert!(
+        pending.outcome.is_none(),
+        "lost reply was persisted as success"
+    );
+    assert_eq!(transport.remove_acknowledgements.load(Ordering::Acquire), 1);
+    assert_eq!(source.removes.load(Ordering::Acquire), 1);
+    let before_target = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 2)
+        .unwrap();
+    assert!(
+        before_target.provider_writer_held
+            && !before_target.withdrawn
+            && before_target.publication.is_some()
+    );
+    assert_eq!(target.aborts.load(Ordering::Acquire), 0);
+    assert_eq!(target.closes.load(Ordering::Acquire), 0);
+
+    harness.recreate_controller().unwrap();
+    harness.reconciler = production(&harness.api, transport.clone());
+    assert!(
+        harness
+            .set()
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .replica_goals
+            .contains(&pending)
+    );
+    until(&mut harness, || target.closes.load(Ordering::Acquire) > 0).await;
+    pump(&mut harness, 2).await;
+    let raw = observe(&harness, transport.clone()).await;
+    let status = raw.set.status.as_ref().unwrap();
+    let persisted = status
+        .replica_goals
+        .iter()
+        .find(|entry| entry.goal == pending.goal)
+        .unwrap();
+    assert_eq!(persisted.digest, pending.digest);
+    assert_eq!(persisted.outcome.as_ref(), Some(&exact_outcome));
+    assert_eq!(transport.remove_acknowledgements.load(Ordering::Acquire), 2);
+    assert_eq!(source.removes.load(Ordering::Acquire), 1);
+    assert_eq!(source.builds.load(Ordering::Acquire), 1);
+    assert_eq!(source.aborts.load(Ordering::Acquire), 0);
+    let settlement = status
+        .replica_goals
+        .iter()
+        .find(|entry| {
+            entry.goal.scope.storage == before_target.storage
+                && matches!(entry.goal.desired, ReplicaGoalKind::Abort)
+        })
+        .unwrap()
+        .clone();
+    assert!(settlement.outcome.is_none());
+    let snapshots = peers(&raw);
+    let source_snapshot = snapshots
+        .iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 1)
+        .unwrap();
+    assert_eq!(
+        source_snapshot.remote_operations,
+        accepted.remote_operations
+    );
+    let target_snapshot = snapshots
+        .iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 2)
+        .unwrap();
+    assert!(
+        target_snapshot.provider_writer_held
+            && target_snapshot.withdrawn
+            && target_snapshot.publication.is_none()
+            && target_snapshot.read_status != AccessStatus::Granted
+            && target_snapshot.write_status != AccessStatus::Granted
+    );
+    assert_eq!(target.aborts.load(Ordering::Acquire), 1);
+    assert!(!target.engine_joined.load(Ordering::Acquire));
+    assert!(!target.service_joined.load(Ordering::Acquire));
+    target.close_release.add_permits(1);
+    wait(async || {
+        target.engine_joined.load(Ordering::Acquire)
+            && target.service_closes.load(Ordering::Acquire) == 1
+    })
+    .await;
+    pump(&mut harness, 2).await;
+    let target_snapshot = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 2)
+        .unwrap();
+    assert!(target_snapshot.provider_writer_held && target_snapshot.publication.is_none());
+    assert!(!target.service_joined.load(Ordering::Acquire));
+    assert!(
+        harness
+            .set()
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .replica_goals
+            .contains(&settlement)
+    );
+    target.service_close_release.add_permits(1);
+    wait(async || target.service_joined.load(Ordering::Acquire)).await;
+    wait(async || {
+        peers(&observe(&harness, transport.clone()).await)
+            .iter()
+            .any(|peer| peer.storage == before_target.storage && !peer.provider_writer_held)
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            harness.step().await.unwrap();
+            if harness
+                .set()
+                .await
+                .unwrap()
+                .status
+                .unwrap()
+                .replica_goals
+                .iter()
+                .any(|entry| {
+                    entry.goal == settlement.goal
+                        && entry
+                            .outcome
+                            .as_ref()
+                            .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+                })
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(target.closes.load(Ordering::Acquire), 1);
+    assert_eq!(target.service_closes.load(Ordering::Acquire), 1);
+    assert_eq!(source.removes.load(Ordering::Acquire), 1);
+    assert_eq!(transport.forbidden.load(Ordering::Acquire), 0);
     close(harness, &applications).await;
 }
 

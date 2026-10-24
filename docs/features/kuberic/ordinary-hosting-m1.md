@@ -89,6 +89,10 @@ Ready removal on a still valid Open/Primary source calls ordinary Remove and
 retires **local** idle ownership only. It is not proof of target receiver
 drainage. InBuild cancellation uses a whole-creation Abort goal, never Remove
 on an aborted allocation; target settlement is separate.
+Acknowledging the exact retained settled Remove result is retryable after its
+negative watermark is committed, including a lost reply or later controller
+status conflict. It never repeats Remove or proves target containment.
+Selection and Build replay remain fenced by tombstones and rejection watermarks.
 
 Remote selections are bounded per creation/target. Settled terminal results may
 compact only below a durable rejection watermark, after acceptance, retirement
