@@ -1252,11 +1252,7 @@ async fn control_at(
         .map(|_| ())
 }
 
-async fn exchange_at(
-    destination_binding: &serde_json::Value,
-    binding: serde_json::Value,
-    command: &str,
-) -> std::result::Result<Option<native_wire::Envelope>, tonic::Status> {
+fn control_frame(binding: &serde_json::Value, command: &str) -> native_wire::Envelope {
     use native_wire::{Endpoint, EngineSessionControl, Envelope, envelope::Body};
     use sha2::{Digest, Sha256};
     fn endpoint(publication: &serde_json::Value) -> Endpoint {
@@ -1311,7 +1307,6 @@ async fn exchange_at(
     };
     let source = endpoint(&binding[from]);
     let destination = endpoint(&binding[to]);
-    let native_body = command == "Ack" || command.starts_with("Body");
     let epoch = native_wire::Epoch {
         data_loss: binding["source"]["scope"]["epoch"]["dataLossNumber"]
             .as_i64()
@@ -1385,16 +1380,29 @@ async fn exchange_at(
             .into(),
         }),
     };
-    let frame = Envelope {
+    Envelope {
         version: 1,
         message_id: uuid::Uuid::new_v4().to_string(),
         source: Some(source),
         destination: Some(destination),
         sender_address: binding[from]["replicationAddress"].as_str().unwrap().into(),
         body: Some(body),
+    }
+}
+
+async fn exchange_at(
+    destination_binding: &serde_json::Value,
+    binding: serde_json::Value,
+    command: &str,
+) -> std::result::Result<Option<native_wire::Envelope>, tonic::Status> {
+    let frame = control_frame(&binding, command);
+    let to = if command == "Confirm" {
+        "source"
+    } else {
+        "target"
     };
     let mut request = authorized(futures::stream::iter([frame]));
-    if !native_body {
+    if command != "Ack" && !command.starts_with("Body") {
         request
             .metadata_mut()
             .insert("kuberic-engine-control", "1".parse().unwrap());
@@ -1526,40 +1534,272 @@ pub(super) async fn bound_body_epochs() {
         "BodyReplicationOriginal",
     ] {
         let pair = Pair::new().await;
+        let replication = command.starts_with("BodyReplication");
+        if command == "BodyStart" {
+            // Sessions are active, but the real source has not connected/sent StartCopy.
+            pair.source_hook.hold(Cut::Build);
+        } else if command == "BodyCopy" {
+            // Legitimate StartCopy/context run; no legitimate copy data can arrive.
+            pair.source.service.copy_release.forget_permits(1);
+        }
         let build = pair.build().await;
-        pair.copy().await;
-        assert_eq!(
-            settled(&pair.source, &build).await,
-            ReplicaGoalStatus::Achieved
-        );
+        if command == "BodyStart" {
+            entered(&pair.source_hook.entered).await;
+        } else if command == "BodyCopy" {
+            entered(&pair.source.service.copy_entered).await;
+        } else {
+            let copied = pair.copy().await;
+            *pair.target.service.items.lock().unwrap() = copied
+                .into_iter()
+                .filter(|operation| !operation.end_of_stream)
+                .map(|operation| operation.data)
+                .collect();
+            assert_eq!(
+                settled(&pair.source, &build).await,
+                ReplicaGoalStatus::Achieved
+            );
+            pair.admit(&build).await;
+        }
+        let mut copy = pair.target.service.state().copy_operations().unwrap();
+        let mut operations = pair
+            .target
+            .service
+            .state()
+            .replication_operations()
+            .unwrap();
+        if replication {
+            let write = pair
+                .source
+                .service
+                .state()
+                .begin_replicate(Bytes::from_static(b"admitted-prefix"))
+                .unwrap();
+            let completion = tokio::spawn(write.completion);
+            let operation = next(&mut operations).await;
+            assert_eq!(operation.data, Bytes::from_static(b"admitted-prefix"));
+            pair.target
+                .service
+                .items
+                .lock()
+                .unwrap()
+                .push(operation.data.clone());
+            operation.acknowledge().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), completion)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
         let binding = pair.binding();
-        let before = pair.target_route.inspect_native().unwrap()["nativeCredits"].clone();
-        let sessions = pair.target_route.inspect_native().unwrap()["sessions"].clone();
-        let delivery = exchange_at(&pair.binding(), binding, command).await;
-        let observed = pair.target_route.inspect_native().unwrap();
-        if let Ok(Some(reply)) = &delivery {
-            let Some(native_wire::envelope::Body::ReplicationAck(ack)) = &reply.body else {
-                panic!("{command}: unexpected body reply: {reply:?}");
+        let (sender, incoming) = tokio::sync::mpsc::channel(1);
+        let mut request = authorized(tokio_stream::wrappers::ReceiverStream::new(incoming));
+        request.metadata_mut().insert_bin(
+            "kuberic-engine-session-bin",
+            tonic::metadata::MetadataValue::from_bytes(&serde_json::to_vec(&binding).unwrap()),
+        );
+        let mut client = native_wire::carrier_client::CarrierClient::connect(
+            binding["target"]["replicationAddress"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+        let mut response = client.exchange(request).await.unwrap().into_inner();
+        let epochs = if command == "BodyReplicationOriginal" {
+            vec![(0, 2), (1, 1)]
+        } else {
+            vec![(0, 0), (0, 2), (1, 1)]
+        };
+        for (data_loss, configuration) in epochs {
+            let mut frame = control_frame(&binding, command);
+            let epoch = native_wire::Epoch {
+                data_loss,
+                configuration,
             };
+            match frame.body.as_mut().unwrap() {
+                native_wire::envelope::Body::StartCopy(body) => body.epoch = Some(epoch),
+                native_wire::envelope::Body::CopyOperation(body) => body.epoch = Some(epoch),
+                native_wire::envelope::Body::ReplicationOperation(body) => {
+                    body.metadata.as_mut().unwrap().sequence = 2;
+                    body.first_sequence = 2;
+                    body.last_sequence = 2;
+                    body.last_in_batch = 2;
+                    if command == "BodyReplicationSending" {
+                        body.sending_epoch = Some(epoch);
+                    } else {
+                        body.original_epoch = Some(epoch);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let id = frame.message_id.clone();
+            let before = pair.target_route.inspect_native().unwrap();
+            assert_eq!(before["receivers"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                before["receivers"][0]["replication"].is_null(),
+                command == "BodyStart"
+            );
+            if replication {
+                assert_eq!(
+                    snapshot(&pair.target).await.publication.unwrap().role,
+                    ReplicaRole::ActiveSecondary
+                );
+                assert_eq!(before["receivers"][0]["replication"]["received"], 1);
+                assert_eq!(before["receivers"][0]["replication"]["applied"], 1);
+            } else {
+                assert_eq!(before["receivers"][0]["copy"]["received"], 0);
+                assert_eq!(before["receivers"][0]["copy"]["applied"], 0);
+                if command == "BodyCopy" {
+                    assert_eq!(before["receivers"][0]["replication"]["received"], 0);
+                    assert_eq!(before["receivers"][0]["replication"]["applied"], 0);
+                }
+            }
+            let source_data = pair.source.service.items.lock().unwrap().clone();
+            let target_data = pair.target.service.items.lock().unwrap().clone();
+            let context = pair.target.service.context_calls.load(Ordering::Acquire);
+            let acquisitions = pair.source.service.acquisitions.load(Ordering::Acquire);
+            assert_eq!(context, usize::from(command != "BodyStart"));
+            assert_eq!(acquisitions, usize::from(command != "BodyStart"));
+            let progress = if replication {
+                Some(
+                    pair.target
+                        .service
+                        .control()
+                        .current_progress()
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            sender.send(frame).await.unwrap();
+            // Correlate the real retained ingress task, not RPC EOF or ACK credit.
+            until(|| {
+                pair.target_route.inspect_native().unwrap()["ingressObservations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry[0] == id)
+            })
+            .await;
+            let observed = pair.target_route.inspect_native().unwrap();
+            assert_eq!(
+                observed["receivers"], before["receivers"],
+                "{command}: native receive/apply mutation"
+            );
+            let (no_replication, no_copy) = tokio::join!(
+                tokio::time::timeout(Duration::from_millis(50), operations.get_operation()),
+                tokio::time::timeout(Duration::from_millis(50), copy.get_operation()),
+            );
             assert!(
-                ack.replication_applied <= 0,
-                "{command}: stale body earned an applied ACK: {ack:?}"
+                no_replication.is_err(),
+                "{command}: unexpected replication delivery"
+            );
+            if replication {
+                assert!(
+                    matches!(no_copy, Ok(Ok(None))),
+                    "{command}: closed copy receiver changed"
+                );
+            } else {
+                assert!(no_copy.is_err(), "{command}: unexpected copy delivery");
+            }
+            assert_eq!(*pair.source.service.items.lock().unwrap(), source_data);
+            assert_eq!(*pair.target.service.items.lock().unwrap(), target_data);
+            assert_eq!(
+                pair.target.service.context_calls.load(Ordering::Acquire),
+                context
+            );
+            assert_eq!(
+                pair.source.service.acquisitions.load(Ordering::Acquire),
+                acquisitions
+            );
+            if let Some(progress) = progress {
+                assert_eq!(
+                    pair.target
+                        .service
+                        .control()
+                        .current_progress()
+                        .await
+                        .unwrap(),
+                    progress
+                );
+            }
+            assert_eq!(
+                observed["nativeCredits"], before["nativeCredits"],
+                "{command}: stale body earned credit"
+            );
+            assert_eq!(
+                observed["sessions"], before["sessions"],
+                "{command}: changed session ownership"
+            );
+            let observation = observed["ingressObservations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry[0] == id)
+                .unwrap();
+            assert_eq!(
+                observation[1], "epochRejected",
+                "{command}: validator did not reject before dispatch"
+            );
+            let no_credit = async {
+                while let Some(reply) = response.message().await.unwrap() {
+                    if let Some(native_wire::envelope::Body::ReplicationAck(ack)) = reply.body {
+                        let receiver = &before["receivers"][0];
+                        assert!(
+                            ack.replication_received
+                                <= receiver["replication"]["received"].as_i64().unwrap_or(-1)
+                        );
+                        assert!(
+                            ack.replication_applied
+                                <= receiver["replication"]["applied"].as_i64().unwrap_or(-1)
+                        );
+                        assert!(
+                            ack.copy_received
+                                <= receiver["copy"]["received"].as_i64().unwrap_or(-1)
+                        );
+                        assert!(
+                            ack.copy_applied <= receiver["copy"]["applied"].as_i64().unwrap_or(-1)
+                        );
+                        assert_eq!(ack.error, 0);
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(50), no_credit).await;
+            assert!(
+                !sender.is_closed(),
+                "{command}: input closed before assertions"
+            );
+            let after = pair.target_route.inspect_native().unwrap();
+            assert_eq!(after["receivers"], before["receivers"]);
+            assert_eq!(after["nativeCredits"], before["nativeCredits"]);
+            println!(
+                "{command} epoch=({data_loss},{configuration}) frame={id}: observed epochRejected; real receivers/data/ACK credit unchanged before teardown"
             );
         }
-        assert_eq!(
-            observed["nativeCredits"], before,
-            "{command}: stale body earned credit"
-        );
-        assert_eq!(
-            observed["sessions"], sessions,
-            "{command}: rejected body changed session ownership"
-        );
+        drop(sender);
+        drop(response);
+        pair.source_hook.open();
+        pair.source.service.copy_release.add_permits(1);
+        if !replication {
+            let copied = pair.copy().await;
+            let data: Vec<_> = copied
+                .into_iter()
+                .filter(|operation| !operation.end_of_stream)
+                .map(|operation| operation.data)
+                .collect();
+            assert_eq!(data, *pair.source.service.items.lock().unwrap());
+            *pair.target.service.items.lock().unwrap() = data;
+        }
         assert_eq!(pair.target.service.context_calls.load(Ordering::Acquire), 1);
         assert_eq!(pair.source.service.acquisitions.load(Ordering::Acquire), 1);
-        assert_eq!(
-            settled(&pair.source, &build).await,
-            ReplicaGoalStatus::Achieved
-        );
+        if !replication {
+            assert_eq!(
+                settled(&pair.source, &build).await,
+                ReplicaGoalStatus::Achieved
+            );
+        }
         pair.finish().await;
     }
 }

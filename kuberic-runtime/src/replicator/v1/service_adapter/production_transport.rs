@@ -277,6 +277,8 @@ pub(super) struct Transport {
     ack_settlements: Mutex<BTreeMap<String, Arc<AckSettlement>>>,
     #[cfg(feature = "testing")]
     native_credits: AtomicI64,
+    #[cfg(feature = "testing")]
+    ingress_observations: Mutex<std::collections::VecDeque<(String, String)>>,
     #[cfg(test)]
     test_publications: Mutex<Vec<ReplicaPublication>>,
 }
@@ -343,6 +345,8 @@ impl Transport {
             ack_settlements: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testing")]
             native_credits: AtomicI64::new(0),
+            #[cfg(feature = "testing")]
+            ingress_observations: Mutex::new(std::collections::VecDeque::new()),
             #[cfg(test)]
             test_publications: Mutex::new(Vec::new()),
         });
@@ -375,6 +379,8 @@ impl Transport {
                         "ackPending": owner.ack_settlements.lock().unwrap().values()
                             .map(|settlement| settlement.tasks.len()).sum::<usize>(),
                         "nativeCredits": owner.native_credits.load(Ordering::Acquire),
+                        "ingressObservations": *owner.ingress_observations.lock().unwrap(),
+                        "receivers": owner.registry.inspect_receivers(),
                         "lifecycle": owner.selected_lifecycle(),
                     })
                 },
@@ -1298,6 +1304,8 @@ impl Transport {
                     }
                     if let Err(error) = validate_message_epochs(binding.epoch(), &envelope) {
                         tracing::warn!(%error, "unauthorized native frame epoch rejected");
+                        #[cfg(feature = "testing")]
+                        self.observe_ingress(&envelope, "epochRejected".into());
                         continue;
                     }
                     let dispatched = match self
@@ -1307,6 +1315,8 @@ impl Transport {
                         Ok(dispatched) => dispatched,
                         Err(_) => continue,
                     };
+                    #[cfg(feature = "testing")]
+                    self.observe_ingress(&envelope, format!("{dispatched:?}"));
                     match dispatched {
                         Err(IngressError::Primary(PrimaryError::UnknownSession(replica)))
                             if matches!(
@@ -1329,6 +1339,16 @@ impl Transport {
                 None => return Ok(()),
             }
         }
+    }
+
+    #[cfg(feature = "testing")]
+    fn observe_ingress(&self, envelope: &wire::Envelope, outcome: String) {
+        let mut observations = self.ingress_observations.lock().unwrap();
+        // Bounded, read-only evidence from this actual owner's completed ingress.
+        if observations.len() == 64 {
+            observations.pop_front();
+        }
+        observations.push_back((envelope.message_id.clone(), outcome));
     }
 
     #[cfg(feature = "testing")]
@@ -1381,6 +1401,8 @@ impl Transport {
             ack_settlements: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testing")]
             native_credits: AtomicI64::new(0),
+            #[cfg(feature = "testing")]
+            ingress_observations: Mutex::new(std::collections::VecDeque::new()),
             test_publications: Mutex::new(test_publications),
         })
     }

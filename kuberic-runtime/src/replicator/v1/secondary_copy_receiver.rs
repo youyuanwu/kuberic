@@ -212,7 +212,7 @@ impl SecondaryCopyReceiver {
         self.dispatch.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn queue(&self) -> Option<&OperationQueue> {
         self.queue.as_ref()
     }

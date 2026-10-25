@@ -98,6 +98,19 @@ pub(super) struct MessageRegistration {
 }
 
 impl MessageRegistry {
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_receivers(&self) -> Vec<serde_json::Value> {
+        self.processors
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|ingress| match &*ingress.target.lock().unwrap() {
+                Target::Secondary(secondary) => Some(secondary.inspect_receiver()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(super) fn register(
         &self,
         ingress: MessageIngress,

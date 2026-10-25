@@ -333,6 +333,41 @@ impl SecondaryHandle {
         self.0.upgrade().ok_or(SecondaryError::OwnerDropped)
     }
 
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_receiver(&self) -> serde_json::Value {
+        let Ok(root) = self.root() else {
+            return serde_json::Value::Null;
+        };
+        let state = root.state.lock().unwrap();
+        let replication = root.replication.lock().unwrap();
+        let queue = |queue: Option<&super::operation_queue::OperationQueue>| {
+            queue.map(|queue| {
+                let progress = queue.progress();
+                serde_json::json!({
+                    "received": progress.commit_head - 1,
+                    "applied": progress.complete_head - 1,
+                    "tail": progress.tail,
+                    "retained": progress.retained_head,
+                    "operations": queue.operation_count(),
+                    "bytes": queue.total_bytes(),
+                })
+            })
+        };
+        serde_json::json!({
+            "phase": format!("{:?}", state.phase),
+            "fault": state.fault.as_ref().map(ToString::to_string),
+            "replication": queue(replication.queue()),
+            "copy": queue(state.copy.queue()),
+            "copyInProgress": state.copy.is_copy_in_progress(),
+            "copyAllReceived": state.copy.all_operations_received(),
+            "copyEpoch": replication.copy_epoch(),
+            "minimumSendingEpoch": replication.minimum_sending_epoch(),
+            "contextRequested": state.context_requested,
+            "replicationDispatch": format!("{:?}", root.replication_dispatch.snapshot()),
+            "copyDispatch": format!("{:?}", root.copy_dispatch.snapshot()),
+        })
+    }
+
     pub(super) fn current_progress(&self) -> Result<Lsn, SecondaryError> {
         self.query_progress(false)
     }

@@ -36,6 +36,16 @@ clean cancellation grants no native credit and actual ACK-owner failure stays
 sticky. Physical dial and
 retained-task cuts are testing-only; diagnostics never authorize work.
 
+The bound body-epoch witness keeps authenticated carrier input live and
+correlates each injected frame with the actual retained ingress task's rejection.
+Before teardown it polls the real copy/replication streams and compares native
+receive/apply queues, application bytes, provider acquisitions and ACK credit.
+StartCopy is tested before initialization, copy after legitimate StartCopy, and
+replication after actual copy, joint/current admission and an acknowledged
+replication prefix. Read-only, bounded ingress/receiver diagnostics are private
+to the concrete testing owner; neither RPC EOF nor unchanged ACK credit alone
+establishes no delivery.
+
 ```sh
 cargo nextest list -p kuberic-runtime --all-features --profile ordinary \
   --test classic_v1_production -E 'test(/^m2_builtin_/)'
