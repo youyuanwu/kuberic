@@ -239,9 +239,13 @@ configuration authority precedes primary native Peer admission and supplies
 neither a primary-only callback nor serving access.
 
 An empty uninitialized native history reports the unknown sentinel, not a
-fabricated zero. Initial singleton authority requires exact successful New-Open
-provenance and both explicit sentinel query results; this local initialization
-exception changes neither retained election nor native progress semantics.
+fabricated zero. This native/direct progress semantic does not require ordinary
+bootstrap to query it: ordinary snapshots report progress and capability as
+`NotQueried`. Initial singleton formation uses successful New-Open provenance
+and the actual native initial-Primary guard requiring uninitialized durable
+history and the initializing flag. Ordinary receipts, achieved-scope and
+admission checks still apply; the historical native/direct sentinel-query
+evidence below is not a current ordinary bootstrap prerequisite.
 `WriteQuorum` with marked successors remains explicitly unsupported; ordinary
 unmarked waits and `All` retain their qualified native behavior.
 
