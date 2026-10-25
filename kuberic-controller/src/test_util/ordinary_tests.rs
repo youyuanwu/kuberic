@@ -426,7 +426,6 @@ impl PrimaryReplicator for Engine {
         Ok(())
     }
     async fn build_replica(&self, replica: ReplicaInformation) -> kuberic_runtime::Result<()> {
-        assert!(replica.build_id.is_empty());
         assert_eq!(replica.current_progress, INVALID_LSN);
         self.builds.fetch_add(1, Ordering::AcqRel);
         self.trace.lock().unwrap().push("build-enter");

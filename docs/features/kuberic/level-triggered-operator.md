@@ -7,18 +7,18 @@ It is experimental and intended for development and CI. Images are not
 published and no production activation procedure is provided.
 **Current:** [ordinary hosting M1](ordinary-hosting-m1.md) replaces production
 callback-program/grant dispatch with canonical per-replica goals, callback-free
-snapshots and authenticated discovery. All host/control/CRD formats are 15;
-fresh resources require `spec.hostingFormat: 15`. Incompatible retained commands
+snapshots and authenticated discovery. All host/control/CRD formats are 16;
+fresh resources require `spec.hostingFormat: 16`. Incompatible retained commands
 and missing/mixed formats reject before mutation. There is no migration/data reset.
 
 Each peer opens and publishes DiscoveryPending before peer-dependent recovery;
 PrepareIdle precedes ordinary source Build, exact Ready acknowledgement and
 separate admission. Old process publication is invalid after restart; interrupted
-work stays uncertain. Default V1/KV/SQLite/PG production integration is explicitly
-unavailable until M2. Automatic contraction/primary replacement/history election
-remain unavailable or pending; comprehensive recovery is M3. This is **not a
-deployable default-engine stack**. Generic acceptance is in-process Kubernetes
-storage plus real agent gRPC, not current KinD qualification.
+work stays uncertain. Default V1/KV/SQLite and independent PG use ordinary
+engine-owned sessions and actual joining. Automatic contraction/primary
+replacement/history election remain unavailable or pending; comprehensive
+recovery is M3. Compatible deployment inputs are not live qualification:
+the bounded evidence uses in-process Kubernetes storage and real agent gRPC.
 
 ## Historical pre-M1 operator baseline
 

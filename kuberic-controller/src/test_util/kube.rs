@@ -970,7 +970,7 @@ mod tests {
         let sets: Api<KubericSet> = Api::default_namespaced(server.client());
         let object = serde_json::from_value(json!({
             "apiVersion": "operator.kuberic.io/v1alpha1", "kind": "KubericSet",
-            "metadata": {"name": "demo"}, "spec": {"hostingFormat": 15, "replicas": 3, "image": "kvstore2"}
+            "metadata": {"name": "demo"}, "spec": {"hostingFormat": kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT, "replicas": 3, "image": "kvstore2"}
         }))
         .unwrap();
         serde_json::to_value(sets.create(&PostParams::default(), &object).await.unwrap()).unwrap()

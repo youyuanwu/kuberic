@@ -4,9 +4,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::public_operations::{
-    PublicInboundBuildAuthority, PublicOperationIntent, PublicSessionEpochBarrierStage,
-    PublicSessionRenewalStage, PublicV1AcceptedStatus, PublicV1Identity,
-    PublicV1SessionRenewalStatus,
+    PublicOperationIntent, PublicSessionEpochBarrierStage, PublicSessionRenewalStage,
+    PublicV1AcceptedStatus, PublicV1Identity, PublicV1SessionRenewalStatus,
 };
 use crate::protocol::types::{
     AgentGeneration, BuildAuthority, ConfigurationDescriptor, EffectivePolicy, Epoch,
@@ -175,12 +174,6 @@ pub enum PublicV1HistoryCommand {
     Recover {
         accepted: PublicV1AcceptedStatus,
         intent: Box<PublicOperationIntent>,
-    },
-    InstallInboundBuildAuthority {
-        authority: Box<PublicInboundBuildAuthority>,
-    },
-    RevokeInboundBuildAuthority {
-        authority: Box<PublicInboundBuildAuthority>,
     },
     SessionRenewal {
         command: Box<PublicV1SessionRenewalCommand>,
@@ -377,8 +370,6 @@ impl PublicV1HistoryCommand {
                     return Err("public-v1 recovery command differs from accepted authority");
                 }
             }
-            Self::InstallInboundBuildAuthority { authority }
-            | Self::RevokeInboundBuildAuthority { authority } => authority.validate()?,
             Self::SessionRenewal { command } => command.validate()?,
         }
         Ok(())
@@ -387,8 +378,6 @@ impl PublicV1HistoryCommand {
     pub fn accepted(&self) -> Option<&PublicV1AcceptedStatus> {
         match self {
             Self::Initialize { accepted, .. } | Self::Recover { accepted, .. } => Some(accepted),
-            Self::InstallInboundBuildAuthority { .. }
-            | Self::RevokeInboundBuildAuthority { .. } => None,
             Self::SessionRenewal { .. } => None,
         }
     }
@@ -404,8 +393,6 @@ impl PublicV1HistoryCommand {
                     .provisional_primary
                     .replica
             }
-            Self::InstallInboundBuildAuthority { authority }
-            | Self::RevokeInboundBuildAuthority { authority } => &authority.attempt.target,
             Self::SessionRenewal { command } => command.target(),
         }
     }
@@ -415,8 +402,6 @@ impl PublicV1HistoryCommand {
             Self::Initialize { accepted, .. } | Self::Recover { accepted, .. } => {
                 &accepted.history.resource_uid
             }
-            Self::InstallInboundBuildAuthority { authority }
-            | Self::RevokeInboundBuildAuthority { authority } => &authority.history.resource_uid,
             Self::SessionRenewal { command } => &command.accepted().required.resource_uid,
         }
     }
@@ -436,10 +421,7 @@ impl PublicV1HistoryCommand {
                 &accepted.history,
                 storage,
             )),
-            Self::Recover { .. }
-            | Self::InstallInboundBuildAuthority { .. }
-            | Self::RevokeInboundBuildAuthority { .. }
-            | Self::SessionRenewal { .. } => None,
+            Self::Recover { .. } | Self::SessionRenewal { .. } => None,
         }
     }
 }

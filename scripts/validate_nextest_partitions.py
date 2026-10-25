@@ -113,6 +113,7 @@ SOURCE_TESTS = {
     )
     for name in [
         "crdgen_preserves_public_v1_only_typed_status",
+        "shipped_sample_matches_ordinary_hosting_format",
         "deployment_sources_installation_namespace_from_metadata_namespace_only",
         "deployment_prevents_concurrent_controller_reconciliation",
         "production_inventory_contains_only_public_v1_controller_surfaces",
@@ -189,6 +190,7 @@ POSTGRES_CATALOG = {
     "PG-R08": postgres_test("tests::public_v1_postgres_orderly_progress"),
     "PG-R09": postgres_test("tests::public_v1_postgres_marked_catchup"),
     "PG-R10": postgres_test("tests::public_v1_postgres_secondary_readiness"),
+    "PG-R11": postgres_test("durable::tests::m2_pg_native_build_selection_preserves_durable_authority_without_host_descriptor_ids"),
     "PG-N01": postgres_test("tests::public_v1_postgres_basebackup_cancellation_and_retry"),
     "PG-N02": postgres_test("tests::public_v1_postgres_stale_completion_cannot_mutate_successor"),
     "PG-N03": postgres_test("tests::public_v1_postgres_production_factory_and_fault_boundary"),

@@ -133,6 +133,11 @@ impl KvService {
     }
 
     #[cfg(feature = "testing")]
+    pub fn fail_next_persist(&self) {
+        self.persistence().fail_next_persist_for_test();
+    }
+
+    #[cfg(feature = "testing")]
     pub fn pause_next_commit(&self) -> Result<crate::v1_test_bridge::CommitGate> {
         Ok(self.committer()?.pause_next_commit())
     }

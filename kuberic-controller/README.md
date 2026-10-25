@@ -24,7 +24,7 @@ factory/lifecycle ownership, typed faults, package checks and evidence limits.
 
 Each reconcile:
 
-1. validates required format-15 spec/retained state and observes namespaced resources;
+1. validates required format-16 spec/retained state and observes namespaced resources;
 2. obtains callback-free exact agent snapshots;
 3. converges missing support/replica resources;
 4. retains semantic replica goals and accepts exact achieved outcomes;
@@ -64,23 +64,24 @@ Status-only reads avoid agent RPCs. Operation dispatch/report paths observe
 only the exact target; ordinary reconciliation retains the broader observation
 needed for topology and failover decisions.
 
-Host/control/CRD format 15 is required, including `spec.hostingFormat: 15`.
+Host/control/CRD format 16 is required, including `spec.hostingFormat: 16`.
 Old/missing/mixed formats and retained command/renewal/replacement state reject
 before mutation; there is no converter or data reset. Fresh-only deployment
 policy does not remove matching-format restart/SQLite rollback recovery.
 
 The [M1 controller/agent/host split](../docs/features/kuberic/ordinary-hosting-m1.md)
 is implemented without target engine grant dispatch or mandatory companion/
-diagnostics. Built-in/KV/SQLite/PostgreSQL production integration is explicitly
-unavailable pending M2; comprehensive recovery qualification remains M3.
+diagnostics. Built-in/KV/SQLite and independent PostgreSQL use ordinary native
+engine integration; comprehensive recovery qualification remains M3.
 
 ## Deployment
 
 Assets are under `deploy/`. They are development/CI assets, not published
 release targets.
 
-The retained default-engine cluster recipes are not supported M1 deployment
-instructions. M1 acceptance uses an independent ordinary factory and real agent
+The shipped sample and generated CRD use format 16. Live qualification requires
+an owned cluster and matching images; compatible assets alone are not live evidence.
+Historical M1 acceptance used an independent ordinary factory and real agent
 transport against an in-process Kubernetes storage model, not live KinD.
 
 There is no migration, compatibility mode, Kubernetes cutover Lease, image

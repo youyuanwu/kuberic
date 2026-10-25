@@ -713,11 +713,11 @@ pub fn validate_replacement_ownership_inventory(
     {
         return reject("service", &inventory.services);
     }
-    if inventory.host_attachments.len() != 4
+    if inventory.host_attachments.len() != 3
         || !inventory.host_attachments.iter().all(|name| {
             matches!(
                 name.as_str(),
-                "PrimaryReplicator" | "Replicator" | "StateProvider" | "NativeRuntimeControl"
+                "PrimaryReplicator" | "Replicator" | "StateProvider"
             )
         })
     {
@@ -862,9 +862,9 @@ const GATES: [Gate; 16] = [
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
             "replicator::v1::role::tests::initial_primary_queries_provider_before_epoch_and_requires_configuration",
-            "native_build_callback_receives_invalid_progress_and_exact_frozen_idle_target",
+            "host::service::ordinary_goal_tests::ordinary_goal_build_is_retained_exact_two_ended_and_remove_is_local_only",
             "retained_secondary_promotion_preserves_acknowledged_bytes_and_replaces_service_location",
-            "sf10_quiet_snapshot_build_activates_without_writes_or_fabricated_progress",
+            "m2_builtin_multi_secondary_joint_current_preserves_exact_sessions",
         ],
         expected: "primary role completes before primary configuration",
         eligibility: contract_gate,
@@ -875,7 +875,7 @@ const GATES: [Gate; 16] = [
         owner: "recovery",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "hosted_public_v1_authorized_data_loss_preserves_effective_outcomes_and_history_scope",
+            "helper_free_recovery_scopes_changed_unchanged_and_failed_observations",
         ],
         expected: "logical authorization distinguishes every callback outcome",
         eligibility: contract_gate,
@@ -886,7 +886,7 @@ const GATES: [Gate; 16] = [
         owner: "lifecycle",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "native_same_role_secondary_epoch_fences_predecessor_binding_and_sending_epoch",
+            "m2_builtin_crossed_identity_and_stale_ack",
             "public_v1_peer_withdrawal_advances_epoch_without_role_replay",
         ],
         expected: "same-role epoch renewal fences predecessor traffic",
@@ -898,9 +898,9 @@ const GATES: [Gate; 16] = [
         owner: "configuration",
         postgres_scenarios: &["public_v1_postgres_primary_lifecycle_and_joint_configuration"],
         replacement_scenarios: &[
-            "sf10_quiet_snapshot_build_activates_without_writes_or_fabricated_progress",
-            "three_replica_native_quorum_ignores_hung_minority_and_rejects_secondary_origin",
-            "native_configuration_dispatch_rejects_self_idle_and_nonmember_descriptors",
+            "m2_builtin_target_context_and_ack_boundaries",
+            "m2_builtin_multi_secondary_joint_current_preserves_exact_sessions",
+            "replicator::v1::service_adapter::tests::facade::exact_binding_and_configuration_failures_do_not_start_providers_or_mutate_owners",
         ],
         expected: "configuration contains only exact ready remote peers",
         eligibility: contract_gate,
@@ -911,10 +911,10 @@ const GATES: [Gate; 16] = [
         owner: "build",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "native_build_callback_receives_invalid_progress_and_exact_frozen_idle_target",
-            "hosted_operation_stream_copy_and_eof_wait_for_service_owned_snapshot_ack",
-            "successor_inbound_build_retires_native_receiver_instead_of_resetting_metadata",
-            "native_build_binding_pins_frozen_source_address_even_when_source_is_unreachable",
+            "host::service::ordinary_goal_tests::ordinary_goal_build_is_retained_exact_two_ended_and_remove_is_local_only",
+            "m2_builtin_target_context_and_ack_boundaries",
+            "m2_builtin_lost_target_cancel_quarantines_receiver",
+            "m2_builtin_crossed_identity_and_stale_ack",
             "public_build_consumes_target_context_and_installs_nonempty_snapshot",
         ],
         expected: "build target is idle, outside PC/CC, and has invalid progress",
@@ -926,11 +926,11 @@ const GATES: [Gate; 16] = [
         owner: "build",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "native_remove_cancels_session_without_late_install_and_close_drains_retained_provider",
-            "hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline",
-            "hosted_sf06_close_waits_for_synchronous_service_effect_even_if_observer_is_dropped",
-            "hosted_operation_stream_close_and_abort_drain_with_dequeued_or_unconsumed_work",
-            "exact_idle_removal_does_not_reauthorize_retired_service_work",
+            "m2_builtin_effect_fences_and_retained_provider_join",
+            "m2_builtin_abort_close_retains_all_joins",
+            "m2_application_sqlite_abort_close_retains_actual_sql_worker",
+            "m2_application_scope_withdrawal_waits_for_actual_kv_consumer_close",
+            "m2_builtin_exact_session_replay_and_retirement",
         ],
         expected: "Remove cancels the exact idle session without late install; retained callbacks drain under Close/Abort ownership",
         eligibility: contract_gate,
@@ -942,6 +942,9 @@ const GATES: [Gate; 16] = [
         postgres_scenarios: &[],
         replacement_scenarios: &[
             "native_swap_freezes_specific_quorum_and_conservative_all_fallback_inputs",
+            "host::public_lifecycle::tests::sf06_swap_retains_primary_through_catchup_then_pairs_actual_roles",
+            "replicator::v1::replica_manager::tests::multiple_must_catchup_replicas_must_reach_advancing_current_quorum_not_saved_b",
+            "replicator::v1::replica_manager::tests::all_wait_tracks_live_writes_and_completed_wait_does_not_reopen",
         ],
         expected: "specific quorum and fallback are captured replay inputs",
         eligibility: contract_gate,
@@ -956,11 +959,12 @@ const GATES: [Gate; 16] = [
             "native_query_outcome_matrix_survives_rpc_persistence_and_controller_eligibility",
             "native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_build",
             "native_query_rejoin_matrix_distinguishes_source_capability_from_target_current",
-            "native_query_outcomes_remain_independent_through_host_wire_and_controller_eligibility",
-            "hosted_public_v1_authorized_data_loss_preserves_effective_outcomes_and_history_scope",
-            "read_fencing::sf_d02_native_quorum_progress_is_not_a_service_commit_or_caller_cancellation_oracle",
-            "read_fencing::sf11_acknowledged_prefix_6_through_10_survives_ambiguous_11_without_history_fabrication",
-            "production_carrier_rejects_crossed_process_storage_history_epoch_and_endpoint",
+            "public_v1_evidence_report_is_structurally_public_only",
+            "helper_free_recovery_scopes_changed_unchanged_and_failed_observations",
+            "sf01_primary_local_commit_hides_speculation_after_native_completion",
+            "sf01_dropped_client_retains_service_owned_commit_and_observation",
+            "sf11_acknowledged_prefix_6_through_10_survives_ambiguous_11_without_history_fabrication",
+            "m2_builtin_crossed_identity_and_stale_ack",
         ],
         expected: "numeric progress is comparable only inside one history",
         eligibility: contract_gate,
@@ -982,7 +986,9 @@ const GATES: [Gate; 16] = [
         owner: "transport",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "public_v1_open_owns_one_registration_listener_and_writer_and_close_failure_is_retained",
+            "host::service::ordinary_goal_tests::ordinary_goal_builtin_factory_opens_actual_engine_listener_and_writer",
+            "m2_builtin_abort_close_retains_all_joins",
+            "m2_application_sqlite_close_joins_actual_consumers_and_retains_failure",
         ],
         expected: "public endpoint lifetime follows Replicator lifecycle",
         eligibility: replacement_ownership_gate,
@@ -1005,9 +1011,9 @@ const GATES: [Gate; 16] = [
         owner: "operation",
         postgres_scenarios: &["public_v1_postgres_build_cancellation_and_retirement"],
         replacement_scenarios: &[
-            "hosted_sf06_close_waits_for_synchronous_service_effect_even_if_observer_is_dropped",
-            "successor_copy_requires_replacement_without_exposing_held_service_install",
-            "hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline",
+            "m2_application_sqlite_abort_close_retains_actual_sql_worker",
+            "m2_builtin_lost_target_cancel_quarantines_receiver",
+            "m2_builtin_abort_close_retains_all_joins",
         ],
         expected: "supersession contains callback roots and descendants",
         eligibility: contract_gate,
@@ -1021,9 +1027,9 @@ const GATES: [Gate; 16] = [
             "native_transient_fault_restarts_same_storage_under_exact_session_renewal",
             "native_controller_unreachable_survivor_fences_until_exact_return_or_explicit_retirement",
             "primary_commit_failure_contains_the_ambiguous_native_quorum_success",
-            "successor_copy_requires_replacement_without_exposing_held_service_install",
-            "service_rejects_corrupt_copy_and_conflicting_retained_history_before_ack",
-            "retained_service_state_reopens_without_replaying_interrupted_application_children",
+            "m2_builtin_lost_target_cancel_quarantines_receiver",
+            "m2_application_copy_failures_preserve_retained_bytes_and_never_ack",
+            "m2_application_kv_ordinary_copy_access_and_matching_format_reopen",
         ],
         expected: "fault closes access and targets one exact incarnation",
         eligibility: contract_gate,
@@ -1034,9 +1040,9 @@ const GATES: [Gate; 16] = [
         owner: "close",
         postgres_scenarios: &["public_v1_postgres_contained_close"],
         replacement_scenarios: &[
-            "public_v1_open_owns_one_registration_listener_and_writer_and_close_failure_is_retained",
-            "hung_native_build_is_drained_by_successor_close_without_a_fake_rpc_deadline",
-            "terminal_close_restarts_fenced_without_replaying_application_open",
+            "host::service::ordinary_goal_tests::ordinary_goal_builtin_factory_opens_actual_engine_listener_and_writer",
+            "m2_builtin_abort_close_retains_all_joins",
+            "host::service::ordinary_goal_tests::ordinary_goal_terminal_ids_reject_before_mutation_and_exact_retries_reopen",
         ],
         expected: "contained child Close failure preserves diagnostics after successful outer cleanup",
         eligibility: contract_gate,
@@ -1052,11 +1058,11 @@ const GATES: [Gate; 16] = [
             "in_process::journeys::failover_recreation_after_durable_promotion_consumes_completion_once",
             "in_process::journeys::switchover_recreation_after_catch_up_resumes_accepted_handoff",
             "in_process::journeys::switchover_recreation_after_durable_handoff_resumes_promotion",
-            "public_v1_open_owns_one_registration_listener_and_writer_and_close_failure_is_retained",
-            "exact_idle_removal_does_not_reauthorize_retired_service_work",
-            "terminal_close_restarts_fenced_without_replaying_application_open",
+            "host::service::ordinary_goal_tests::ordinary_goal_builtin_factory_opens_actual_engine_listener_and_writer",
+            "m2_builtin_exact_session_replay_and_retirement",
+            "host::service::ordinary_goal_tests::ordinary_goal_terminal_ids_reject_before_mutation_and_exact_retries_reopen",
             "public_v1_replacement_schema_failed_build_containment_survives_reopen",
-            "public_v1_replacement_schema_rebuild_then_cancellation_survives_reopen",
+            "host::service::ordinary_goal_tests::m2_ordinary_rebuild_error_preserves_exact_goal_wire_and_reopen",
             "public_v1_history_data_loss_attempt_renews_higher_epoch",
             "public_v1_data_loss_renewal_requires_exact_replay_capability",
             "public_v1_replacement_schema_build_ambiguity_requires_retirement",
@@ -1070,13 +1076,12 @@ const GATES: [Gate; 16] = [
         owner: "cutover",
         postgres_scenarios: &[],
         replacement_scenarios: &[
-            "three_replica_native_quorum_ignores_hung_minority_and_rejects_secondary_origin",
-            "production_carrier_rejects_crossed_process_storage_history_epoch_and_endpoint",
-            "native_carrier_bad_payload_and_wrong_sender_cannot_publish_service_progress",
-            "native_replication_body_epochs_cannot_escape_a_valid_admitted_binding",
-            "native_build_start_and_copy_body_epochs_are_checked_before_receiver_mutation",
-            "native_build_binding_pins_frozen_source_address_even_when_source_is_unreachable",
-            "successor_inbound_build_retires_native_receiver_instead_of_resetting_metadata",
+            "m2_builtin_multi_secondary_joint_current_preserves_exact_sessions",
+            "m2_builtin_crossed_identity_and_stale_ack",
+            "m2_application_copy_failures_preserve_retained_bytes_and_never_ack",
+            "m2_builtin_bound_ingress_rejects_body_epochs_before_native_mutation",
+            "replicator::v1::transport::tests::malformed_presence_version_batch_and_full_route_are_rejected_not_delivered",
+            "m2_builtin_exact_session_replay_and_retirement",
         ],
         expected: "current artifact inventories and rejects legacy continuation owners",
         eligibility: replacement_ownership_gate,
@@ -1092,6 +1097,7 @@ fn workspace_root() -> PathBuf {
 
 const NATIVE_PARTITION: &str = "native-controller";
 const NATIVE_PACKAGES: &[&str] = &[
+    "kvstore2",
     "kuberic-runtime",
     "kuberic-controller",
     "kuberic-public-v1-tests",

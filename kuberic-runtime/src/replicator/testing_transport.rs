@@ -488,10 +488,8 @@ mod tests {
     mod attachment {
         use super::*;
         use crate::application::{OperationDataStream, StateProvider};
-        use crate::host::store::PublicInboundBuildAdmission;
         use crate::protocol::public_operations::{
-            PublicInboundBuildAuthority, PublicV1Identity, PublicV1LifecycleBinding,
-            StatePersistence,
+            PublicV1Identity, PublicV1LifecycleBinding, StatePersistence,
         };
         use crate::protocol::types::{
             AccessStatus, AgentGeneration, FaultType, LoadMetric, PartitionId,
@@ -499,10 +497,10 @@ mod tests {
             ReplicaStorageIncarnationContext, ResourceUid,
         };
         use crate::replicator::{
-            DefaultReplicatorFactory, NativeRuntimeControl, PartitionAccessView,
-            ReplicatorAttachment, ReplicatorCreationReservation, ReplicatorFactory,
-            ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
-            ReplicatorSettings, StatefulServicePartition,
+            DefaultReplicatorFactory, PartitionAccessView, ReplicatorAttachment,
+            ReplicatorCreationReservation, ReplicatorFactory, ReplicatorFactoryContext,
+            ReplicatorInterfaces, ReplicatorRegistration, ReplicatorSettings,
+            StatefulServicePartition,
         };
         use crate::{Result, RuntimeError};
 
@@ -517,8 +515,7 @@ mod tests {
         #[derive(Default)]
         struct Creation {
             reserved: Option<ReplicatorCreationReservation>,
-            pending: Option<Arc<dyn NativeRuntimeControl>>,
-            retained: Vec<Arc<dyn NativeRuntimeControl>>,
+            retained: Vec<Arc<dyn crate::replicator::Replicator>>,
         }
 
         impl Fixture {
@@ -526,11 +523,11 @@ mod tests {
                 let owners = {
                     let mut creation = self.creation.lock().unwrap();
                     assert!(creation.reserved.is_none());
-                    assert!(creation.pending.is_none());
                     std::mem::take(&mut creation.retained)
                 };
                 for owner in owners {
-                    owner.shutdown_and_drain().await.unwrap();
+                    owner.abort();
+                    owner.close().await.unwrap();
                 }
             }
         }
@@ -543,7 +540,7 @@ mod tests {
 
             fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
                 let mut creation = self.creation.lock().unwrap();
-                if creation.reserved.is_some() || creation.pending.is_some() {
+                if creation.reserved.is_some() {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
                 let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
@@ -554,9 +551,6 @@ mod tests {
                 let mut creation = self.creation.lock().unwrap();
                 assert_eq!(creation.reserved, Some(reservation));
                 creation.reserved = None;
-                if let Some(owner) = creation.pending.take() {
-                    creation.retained.push(owner);
-                }
             }
             async fn register_interfaces(
                 &self,
@@ -578,9 +572,9 @@ mod tests {
                     Err(RuntimeError::Closed)
                 } else {
                     creation.reserved = None;
-                    if let Some(owner) = creation.pending.take() {
-                        creation.retained.push(owner);
-                    }
+                    creation
+                        .retained
+                        .push(attachment.replicator(RuntimeHostToken::new()));
                     Ok(())
                 }
             }
@@ -588,19 +582,6 @@ mod tests {
 
         #[async_trait]
         impl PartitionAccessView for Fixture {
-            fn retain_creation_control(
-                &self,
-                reservation: ReplicatorCreationReservation,
-                owner: Arc<dyn NativeRuntimeControl>,
-            ) -> Result<()> {
-                let mut creation = self.creation.lock().unwrap();
-                if creation.reserved != Some(reservation) || creation.pending.is_some() {
-                    return Err(RuntimeError::AuthorityNotAdmitted);
-                }
-                creation.pending = Some(owner);
-                Ok(())
-            }
-
             fn native_write_admission(&self) -> Result<Arc<Mutex<()>>> {
                 Ok(self.write_admission.clone())
             }
@@ -667,18 +648,6 @@ mod tests {
                 unreachable!()
             }
             async fn write_status(&self) -> Result<AccessStatus> {
-                unreachable!()
-            }
-            async fn classify_replacement_inbound_build_authority(
-                &self,
-                _: &PublicInboundBuildAuthority,
-            ) -> Result<PublicInboundBuildAdmission> {
-                unreachable!()
-            }
-            async fn install_replacement_inbound_build_authority(
-                &self,
-                _: &PublicInboundBuildAuthority,
-            ) -> Result<()> {
                 unreachable!()
             }
             async fn report_load(&self, _: Vec<LoadMetric>) -> Result<()> {

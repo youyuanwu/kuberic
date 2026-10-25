@@ -41,7 +41,8 @@ SF-11/mode/PG/P7/security obligations below remain open/deferred, not erased.
 
 ### Fresh-deployment contract and removal order
 
-Current host/control/CRD formats are [matched format 15](ordinary-hosting-m1.md#fresh-deployment-format);
+Current host/control/CRD inputs use matched format 16; the
+[M1 format-15 checkpoint](ordinary-hosting-m1.md#fresh-deployment-format) is historical.
 protocol 13 / schema 14 are the historical baseline, not supported deployment input.
 The replacement supports **fresh deployments only**, with matching binaries
 and newly provisioned compatible metadata/application storage. Allocate the

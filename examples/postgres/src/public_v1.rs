@@ -2009,7 +2009,21 @@ impl PgReplicator {
             resource_uid: durable.identity.resource_uid,
             epoch: state.role_epoch,
             #[cfg(all(test, feature = "testing"))]
-            fixture_session: replica.build_id.clone(),
+            fixture_session: {
+                use sha2::{Digest, Sha256};
+                OperationId::new(format!(
+                    "pg-native-{:x}",
+                    bytes::Bytes::copy_from_slice(&Sha256::digest(
+                        serde_json::to_vec(&(
+                            &self.public_process_session(),
+                            &replica.identity,
+                            &replica.process_session_id,
+                            durable.generation,
+                        ))
+                        .map_err(application_error)?
+                    ))
+                ))
+            },
             source: NativeEndpoint {
                 replica: durable.identity.replica,
                 process_session_id: self.public_process_session(),
@@ -2809,6 +2823,21 @@ impl PgReplicator {
         self.public_attempt_live(&cancellation)?;
         replica.validate_public_progress()?;
         let build = self.public_build_binding(&replica).await?;
+        self.public_build_owned(build, cancellation).await
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) async fn public_build_native(&self, build: BuildBinding) -> Result<()> {
+        let cancellation = self.public_owner().work.lock().unwrap().clone();
+        self.public_build_owned(build, cancellation).await
+    }
+
+    async fn public_build_owned(
+        &self,
+        build: BuildBinding,
+        cancellation: CancellationToken,
+    ) -> Result<()> {
+        self.public_attempt_live(&cancellation)?;
         let binding = TransportBinding::Build(build.clone());
         self.public_validate_attempt(&binding, &cancellation)
             .await?;

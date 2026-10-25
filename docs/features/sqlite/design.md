@@ -1,7 +1,7 @@
 # SQLite: Replicated SQLite on Kuberic Public V1
 
 **M2 application slice, under qualification:** [ordinary hosting](../kuberic/ordinary-hosting-m1.md)
-uses matched format 15 at this development checkpoint. SQLite production Open
+uses matched format 16 at this development checkpoint. SQLite production Open
 now uses the ordinary built-in engine. Copy installation/finalization precedes
 its apply ACK, and ordinary application Close joins the committer, SQL worker,
 fault reporter and copy/replication consumers. Expected intentional cancellation
@@ -9,7 +9,7 @@ is observed only after the actual worker join; real join/publication failures
 remain errors. Bounded application tests are separate from enabled historical
 restart/replacement/handoff bodies and do not certify M3.
 
-## Selected classic V1 companion
+## Selected classic V1 application path
 
 The application now selects `src/v1.rs` for retained SQL/WAL publication and uses
 the no-store default factory. The [classic V1 runtime](../kuberic/classic-v1-runtime.md)

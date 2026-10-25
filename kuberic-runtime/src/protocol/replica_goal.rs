@@ -1,6 +1,6 @@
 use super::*;
 
-pub const ORDINARY_ACTION_FORMAT: u32 = 15;
+pub const ORDINARY_ACTION_FORMAT: u32 = 16;
 pub const MAX_REMOTE_SELECTIONS: usize = 256;
 pub const MAX_REMOTE_GENERATIONS: usize = 64;
 
@@ -36,7 +36,6 @@ impl ReplicaConfigurationScope {
                 .replicas
                 .iter()
                 .map(|peer| PublicReplicaDescriptor {
-                    build_id: OperationId::default(),
                     identity: peer.identity.clone(),
                     replication_address: peer.replication_address.clone(),
                     process_session_id: peer.process_session_id.clone(),
@@ -214,7 +213,7 @@ enum ReplicaGoalKindTag {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaGoal {
-    #[schemars(range(min = 15, max = 15))]
+    #[schemars(range(min = 16, max = 16))]
     pub format: u32,
     pub identity: PublicV1Identity,
     pub operation_id: OperationId,

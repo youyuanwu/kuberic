@@ -8,7 +8,7 @@ an unavailable response is not a positive witness. This bounded integration is
 not completion of the entire M2 workflow or comprehensive M3 recovery policy.
 
 The `postgres-replicated` package supplies an independent native engine for the
-level-triggered Public V1 runtime and its pre-M1 custom-controller route.
+level-triggered Public V1 runtime. The pre-M1 custom-controller route is historical.
 Bounded local qualification includes actual controller-driven formation and
 native database evidence. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
@@ -30,11 +30,12 @@ Use the current protocol/schema declared by the
 [runtime guide](../kuberic/classic-v1-runtime.md#production-policies-and-security).
 Prior unsupported agent/provider formats reject unchanged; there is no import,
 mixed-version or rolling mode implied by custom-controller integration.
-Current host/control/CRD input is matched format 15, not the historical
+Current host/control/CRD input is matched format 16, not the historical
 protocol-13/schema-14 deployment. No PG metadata removal or PGDATA conversion/
 reset is authorized by that host-format change.
 
-The current implementation uses a separate checksummed PostgreSQL metadata
+The host-format change does not change the independent PG durable schema or
+its native BuildAuthority/slot identities. The current implementation uses a separate checksummed PostgreSQL metadata
 store. It remains retained in the hosting redesign. Removal is separately
 deferred behind the [complete metadata-disposition gate](stateless-metadata-prerequisites.md),
 not an assumption that three generic changes make it safe.
@@ -61,13 +62,8 @@ descriptions through `ReplicaInformation` / `ReplicaSetConfiguration` and the
 existing configuration/build/catch-up callbacks. Authority stores and mutation
 capabilities remain private. The historical pre-M1 factory attached its own
 `CustomReplicatorControl` to the same creation; it does not borrow a built-in
-bundle. The separate
-[companion contract](../kuberic/replicator-boundary.md#custom-controller-integration)
-adds exact inbound copy authority, coherent idle observations and owned drainage
-without adding methods to the protected native traits. Although attachment is
-optional for a bundle, pre-M1 controller Build required it. This was a real
-extra boundary beyond SF's ordinary custom-replicator integration, not justified
-merely by describing it as local. Current M1 production never uses this route;
+bundle. The [removed companion contract](../kuberic/replicator-boundary.md#historical-companion-contract-removed)
+was a pre-M1 integration requirement, not an ordinary native interface.
 The current PG factory no longer attaches that companion or supplies a callback-ownership
 policy: ordinary `Abort` fences admission and ordinary `Close` retains cleanup.
 

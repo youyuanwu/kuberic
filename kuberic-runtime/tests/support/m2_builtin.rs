@@ -613,7 +613,8 @@ pub(super) async fn context_and_ack_boundaries() {
     );
     first.acknowledge().unwrap();
     assert!(first.clone().acknowledge().is_err());
-    let empty = next(&mut stream).await;
+    let mut second_handle = pair.target.service.state().copy_operations().unwrap();
+    let empty = next(&mut second_handle).await;
     assert!(empty.data.is_empty() && !empty.end_of_stream);
     empty.acknowledge().unwrap();
     let eof = next(&mut stream).await;
@@ -673,12 +674,241 @@ pub(super) async fn context_and_ack_boundaries() {
         .unwrap()
         .unwrap();
     assert!(operation.clone().acknowledge().is_err());
+    let mut repeated = pair
+        .target
+        .service
+        .state()
+        .replication_operations()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), repeated.get_operation())
+            .await
+            .is_err(),
+        "a fresh stream handle replayed already acknowledged work"
+    );
     assert_ne!(
         snapshot(&pair.target).await.write_status,
         AccessStatus::Granted
     );
     assert!(pair.target_route.inspect_native().unwrap()["failure"].is_null());
     pair.finish().await;
+}
+
+async fn rejected_application_copy<A: Sample>(
+    source: Node<A>,
+    target: Node<ExternalService>,
+    source_root: &Path,
+    target_root: &Path,
+    source_route: TestingTcpRoute,
+    target_route: TestingTcpRoute,
+    expected: &str,
+) {
+    let bytes = std::fs::read(target_root.join("application/state.json")).unwrap();
+    let source_snapshot = snapshot(&source).await;
+    let target_snapshot = snapshot(&target).await;
+    let publication = source_snapshot.publication.unwrap();
+    let build = ReplicaGoal {
+        format: ORDINARY_ACTION_FORMAT,
+        identity: source.preview.clone(),
+        operation_id: OperationId::new("rejected-real-application-copy"),
+        revision: source_snapshot
+            .goals
+            .iter()
+            .map(|entry| entry.goal.revision)
+            .max()
+            .unwrap()
+            + 1,
+        scope: publication.scope.clone(),
+        desired: ReplicaGoalKind::Build {
+            remote: Box::new(RemoteReplicaSelection {
+                source: publication,
+                target: target_snapshot.publication.unwrap(),
+                target_control_address: target.control_address.clone(),
+                generation: 1,
+            }),
+        },
+    };
+    submit(&source, &build).await.unwrap();
+    let rejected = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if snapshot(&target).await.publication.is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if let Err(error) = rejected {
+        let source_snapshot = snapshot(&source).await;
+        let target_snapshot = snapshot(&target).await;
+        panic!(
+            "application copy rejection did not withdraw: {error}; source={source_snapshot:?}; target={target_snapshot:?}; source-native={}; target-native={}",
+            source_route.inspect_native().unwrap(),
+            target_route.inspect_native().unwrap(),
+        );
+    }
+    assert_eq!(
+        std::fs::read(target_root.join("application/state.json")).unwrap(),
+        bytes
+    );
+    let fenced = snapshot(&target).await;
+    assert!(fenced.publication.is_none() && fenced.provider_writer_held);
+    assert_ne!(fenced.read_status, AccessStatus::Granted);
+    assert_ne!(fenced.write_status, AccessStatus::Granted);
+    assert!(
+        snapshot(&source)
+            .await
+            .remote_operations
+            .iter()
+            .all(|remote| remote.state != RemoteReplicaState::Ready)
+    );
+    let mut successor = target_snapshot.goals.last().unwrap().goal.clone();
+    successor.operation_id = OperationId::new("forbidden-receiver-reuse");
+    successor.revision += 1;
+    assert!(submit(&target, &successor).await.is_err());
+    assert!(
+        target
+            .service
+            .begin_write(Bytes::from_static(b"late"))
+            .await
+            .is_err()
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(error) = target.service.stream_failure().await {
+                assert!(error.contains(expected), "{error}");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual failed consumer outcome remains owned before Abort");
+    let target_service = target.service.clone();
+    let target_handle = target.running.handle();
+    let error = target
+        .stop()
+        .await
+        .expect("failed application Close must remain negative")
+        .to_string();
+    assert!(error.contains(expected), "{error}");
+    assert_eq!(target_handle.public_v1_provider_writer_count(), 1);
+    assert_eq!(target_route.inspect_native().unwrap()["tasks"], 0);
+    let repeated = target_service
+        .shutdown_and_drain()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(repeated.contains(expected), "{repeated}");
+    assert_eq!(
+        std::fs::read(target_root.join("application/state.json")).unwrap(),
+        bytes
+    );
+    let source_handle = source.running.handle();
+    assert!(source.stop().await.is_none());
+    assert_eq!(source_handle.public_v1_provider_writer_count(), 0);
+    assert_eq!(source_route.inspect_native().unwrap()["tasks"], 0);
+    let store = kuberic_runtime::testing::sqlite_store::SqliteStore::open_public_v1(
+        kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(source_root),
+        &build.identity,
+    )
+    .unwrap();
+    let record = store
+        .public_v1_operation_snapshot(&build.operation_id)
+        .await
+        .unwrap();
+    use kuberic_runtime::testing::sqlite_store::PublicV1OperationSnapshotDisposition as D;
+    assert!(
+        matches!(
+            record.disposition,
+            Some(D::Failed(_) | D::Cancelled | D::Ambiguous(_))
+        ),
+        "application failure became a successful Build receipt: {record:?}"
+    );
+}
+
+pub(super) async fn application_copy_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let source_root = root.path().join("source");
+    let target_root = root.path().join("target");
+    let mut source = Node::<EngineService>::start(&source_root, 1, 0).await;
+    let mut target = Node::<ExternalService>::start(&target_root, 2, 0).await;
+    let source_route = Hook::new().register(source.identity.instance_id.to_string());
+    let target_route = Hook::new().register(target.identity.instance_id.to_string());
+    source.open(ReplicaRole::Primary, Epoch::new(0, 1)).await;
+    target
+        .open(ReplicaRole::IdleSecondary, Epoch::new(0, 1))
+        .await;
+    rejected_application_copy(
+        source,
+        target,
+        &source_root,
+        &target_root,
+        source_route,
+        target_route,
+        "expected value",
+    )
+    .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let source_root = root.path().join("source");
+    let target_root = root.path().join("target");
+    let mut predecessor =
+        Node::<ExternalService>::start(&root.path().join("predecessor"), 1, 0).await;
+    let mut retained = Node::<ExternalService>::start(&target_root, 2, 0).await;
+    predecessor
+        .open(ReplicaRole::Primary, Epoch::new(0, 1))
+        .await;
+    let singleton = predecessor.single(Epoch::new(0, 1)).await;
+    retained
+        .open(ReplicaRole::IdleSecondary, Epoch::new(0, 1))
+        .await;
+    predecessor
+        .build(&mut retained, Epoch::new(0, 1), &singleton)
+        .await;
+    predecessor
+        .service
+        .begin_write(Bytes::from_static(b"retained-target"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert_eq!(
+        ExternalService::read_persisted_snapshot(&target_root.join("application"))
+            .unwrap()
+            .values,
+        vec![Bytes::from_static(b"retained-target")],
+    );
+    predecessor.close().await;
+    retained.close().await;
+    let mut source = Node::<ExternalService>::start_sized(&source_root, 1, 0, 1).await;
+    let mut target = Node::<ExternalService>::start(&target_root, 2, 0).await;
+    let source_route = Hook::new().register(source.identity.instance_id.to_string());
+    let target_route = Hook::new().register(target.identity.instance_id.to_string());
+    source.open(ReplicaRole::Primary, Epoch::new(0, 1)).await;
+    source.single(Epoch::new(0, 1)).await;
+    source
+        .service
+        .begin_write(Bytes::from_static(b"source-prefix"))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    target
+        .open(ReplicaRole::IdleSecondary, Epoch::new(0, 1))
+        .await;
+    rejected_application_copy(
+        source,
+        target,
+        &source_root,
+        &target_root,
+        source_route,
+        target_route,
+        "copy conflicts with acknowledged service prefix",
+    )
+    .await;
 }
 
 pub(super) async fn exact_replay_and_retirement() {
@@ -698,7 +928,6 @@ pub(super) async fn exact_replay_and_retirement() {
     assert_eq!(pair.binding(), binding);
     control(&pair, binding.clone(), "Reserve").await.unwrap();
     let mut information = ReplicaInformation::idle_build(
-        OperationId::default(),
         pair.target.identity.clone(),
         binding["target"]["replicationAddress"]
             .as_str()
@@ -1018,6 +1247,16 @@ async fn control_at(
     binding: serde_json::Value,
     command: &str,
 ) -> std::result::Result<(), tonic::Status> {
+    exchange_at(destination_binding, binding, command)
+        .await
+        .map(|_| ())
+}
+
+async fn exchange_at(
+    destination_binding: &serde_json::Value,
+    binding: serde_json::Value,
+    command: &str,
+) -> std::result::Result<Option<native_wire::Envelope>, tonic::Status> {
     use native_wire::{Endpoint, EngineSessionControl, Envelope, envelope::Body};
     use sha2::{Digest, Sha256};
     fn endpoint(publication: &serde_json::Value) -> Endpoint {
@@ -1072,32 +1311,90 @@ async fn control_at(
     };
     let source = endpoint(&binding[from]);
     let destination = endpoint(&binding[to]);
+    let native_body = command == "Ack" || command.starts_with("Body");
+    let epoch = native_wire::Epoch {
+        data_loss: binding["source"]["scope"]["epoch"]["dataLossNumber"]
+            .as_i64()
+            .unwrap(),
+        configuration: binding["source"]["scope"]["epoch"]["configurationNumber"]
+            .as_i64()
+            .unwrap(),
+    };
+    let stale = native_wire::Epoch {
+        configuration: epoch.configuration - 1,
+        ..epoch
+    };
+    let metadata = Some(native_wire::Metadata {
+        sequence: 1,
+        operation_type: 1,
+        atomic_group: -1,
+    });
+    let body = match command {
+        "Ack" => Body::ReplicationAck(native_wire::ReplicationAck {
+            replication_received: 999,
+            replication_applied: 999,
+            copy_received: 999,
+            copy_applied: 999,
+            error: 0,
+        }),
+        "BodyStart" => Body::StartCopy(native_wire::StartCopy {
+            epoch: Some(stale),
+            replica: destination.replica,
+            replication_start: 1,
+        }),
+        "BodyCopy" => Body::CopyOperation(native_wire::CopyOperation {
+            epoch: Some(stale),
+            metadata,
+            replica: destination.replica,
+            is_last: false,
+            buffers: Some(native_wire::Buffers {
+                segments: vec![Bytes::from_static(b"stale-copy")],
+            }),
+        }),
+        "BodyReplicationSending" | "BodyReplicationOriginal" => {
+            Body::ReplicationOperation(native_wire::ReplicationOperation {
+                metadata,
+                original_epoch: Some(if command == "BodyReplicationOriginal" {
+                    native_wire::Epoch {
+                        configuration: epoch.configuration + 1,
+                        ..epoch
+                    }
+                } else {
+                    epoch
+                }),
+                sending_epoch: Some(if command == "BodyReplicationSending" {
+                    stale
+                } else {
+                    epoch
+                }),
+                buffers: Some(native_wire::Buffers {
+                    segments: vec![Bytes::from_static(b"stale-replication")],
+                }),
+                first_sequence: 1,
+                last_sequence: 1,
+                last_in_batch: 1,
+                buffer_counts: vec![1],
+                completed_hint: 0,
+            })
+        }
+        _ => Body::EngineSessionControl(EngineSessionControl {
+            canonical_json: serde_json::to_vec(
+                &serde_json::json!({"binding": binding, "command": command}),
+            )
+            .unwrap()
+            .into(),
+        }),
+    };
     let frame = Envelope {
         version: 1,
         message_id: uuid::Uuid::new_v4().to_string(),
         source: Some(source),
         destination: Some(destination),
         sender_address: binding[from]["replicationAddress"].as_str().unwrap().into(),
-        body: Some(if command == "Ack" {
-            Body::ReplicationAck(native_wire::ReplicationAck {
-                replication_received: 999,
-                replication_applied: 999,
-                copy_received: 999,
-                copy_applied: 999,
-                error: 0,
-            })
-        } else {
-            Body::EngineSessionControl(EngineSessionControl {
-                canonical_json: serde_json::to_vec(
-                    &serde_json::json!({"binding": binding, "command": command}),
-                )
-                .unwrap()
-                .into(),
-            })
-        }),
+        body: Some(body),
     };
     let mut request = authorized(futures::stream::iter([frame]));
-    if command != "Ack" {
+    if !native_body {
         request
             .metadata_mut()
             .insert("kuberic-engine-control", "1".parse().unwrap());
@@ -1114,8 +1411,7 @@ async fn control_at(
         .await
         .unwrap();
     let mut response = client.exchange(request).await?.into_inner();
-    response.message().await?;
-    Ok(())
+    response.message().await
 }
 
 pub(super) async fn crossed_identity() {
@@ -1220,6 +1516,52 @@ pub(super) async fn crossed_identity() {
     assert!(pair.target_route.inspect_native().unwrap()["failure"].is_null());
     assert_eq!(pair.source.service.acquisitions.load(Ordering::SeqCst), 1);
     pair.finish().await;
+}
+
+pub(super) async fn bound_body_epochs() {
+    for command in [
+        "BodyStart",
+        "BodyCopy",
+        "BodyReplicationSending",
+        "BodyReplicationOriginal",
+    ] {
+        let pair = Pair::new().await;
+        let build = pair.build().await;
+        pair.copy().await;
+        assert_eq!(
+            settled(&pair.source, &build).await,
+            ReplicaGoalStatus::Achieved
+        );
+        let binding = pair.binding();
+        let before = pair.target_route.inspect_native().unwrap()["nativeCredits"].clone();
+        let sessions = pair.target_route.inspect_native().unwrap()["sessions"].clone();
+        let delivery = exchange_at(&pair.binding(), binding, command).await;
+        let observed = pair.target_route.inspect_native().unwrap();
+        if let Ok(Some(reply)) = &delivery {
+            let Some(native_wire::envelope::Body::ReplicationAck(ack)) = &reply.body else {
+                panic!("{command}: unexpected body reply: {reply:?}");
+            };
+            assert!(
+                ack.replication_applied <= 0,
+                "{command}: stale body earned an applied ACK: {ack:?}"
+            );
+        }
+        assert_eq!(
+            observed["nativeCredits"], before,
+            "{command}: stale body earned credit"
+        );
+        assert_eq!(
+            observed["sessions"], sessions,
+            "{command}: rejected body changed session ownership"
+        );
+        assert_eq!(pair.target.service.context_calls.load(Ordering::Acquire), 1);
+        assert_eq!(pair.source.service.acquisitions.load(Ordering::Acquire), 1);
+        assert_eq!(
+            settled(&pair.source, &build).await,
+            ReplicaGoalStatus::Achieved
+        );
+        pair.finish().await;
+    }
 }
 
 pub(super) async fn retained_joins() {
@@ -1835,11 +2177,8 @@ async fn multi_secondary_case(progressive: bool) {
         );
     }
     // Reject a real native membership callback with crossed peer identity.
-    let mut wrong = ReplicaInformation::idle_build(
-        OperationId::default(),
-        extra.identity.clone(),
-        "http://127.0.0.1:1".into(),
-    );
+    let mut wrong =
+        ReplicaInformation::idle_build(extra.identity.clone(), "http://127.0.0.1:1".into());
     wrong.process_session_id = extra.session.clone();
     wrong.storage_incarnation = Some(extra.storage.clone());
     wrong.role = ReplicaRole::ActiveSecondary;
@@ -1868,7 +2207,6 @@ async fn multi_secondary_case(progressive: bool) {
         .replicas
         .iter()
         .map(|peer| ReplicaInformation {
-            build_id: OperationId::default(),
             identity: peer.identity.clone(),
             replication_address: peer.replication_address.clone(),
             process_session_id: peer.process_session_id.clone(),

@@ -1475,12 +1475,22 @@ async fn sf01_primary_local_commit_isolation_and_abort_never_late_grants_success
             "speculative data leaked through the committed service view"
         );
         let during = harness.report(primary).await?;
+        let mut durably_applied_peers = 0;
+        for id in 1..=3 {
+            if id != primary
+                && harness.service(id).await?.persistence().get("sf01-visible").as_deref()
+                    == Some("uncommitted")
+            {
+                durably_applied_peers += 1;
+            }
+        }
+        ensure!(durably_applied_peers >= 1, "the actual native completion had no durably applied quorum peer");
         ensure!(
             during.process_session_id == before.process_session_id
                 && during.replicator_creation_id == before.replicator_creation_id
-                && during.progress.current() == Some(2)
+                && during.progress.current().is_none()
                 && during.read_status == AccessStatus::Granted,
-            "native completion/access must remain distinct from service-local commitment"
+            "the actual post-native-completion gate and peer apply must remain distinct from service-local commitment; the ordinary report must not sample progress callbacks"
         );
         eprintln!("SF-01: physical isolation and explicit owner stop");
         let isolation = harness.isolate_uids(&isolated).await?;

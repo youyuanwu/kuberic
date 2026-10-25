@@ -422,11 +422,8 @@ async fn production_factory_returns_no_parallel_state_replicator() {
 
 fn build_replica(binding: &BuildBinding) -> ReplicaInformation {
     let target = &binding.target;
-    let mut replica = ReplicaInformation::idle_build(
-        binding.fixture_session.clone(),
-        target.replica.clone(),
-        target.replication_address.clone(),
-    );
+    let mut replica =
+        ReplicaInformation::idle_build(target.replica.clone(), target.replication_address.clone());
     replica.process_session_id = target.process_session_id.clone();
     replica
 }
@@ -593,7 +590,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         let build = BindingFactory::new().build(&source, &idle, "selected-idle");
         source
             .driver
-            .build_replica(build_replica(&build))
+            .public_build_native(build.clone())
             .await
             .unwrap();
         let credential = source
@@ -631,7 +628,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         let binding = BindingFactory::new().build(&source, &cancelled_idle, "cancel-remove");
         source
             .driver
-            .build_replica(build_replica(&binding))
+            .public_build_native(binding.clone())
             .await
             .unwrap();
         let gate = {
@@ -707,11 +704,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
                 },
             );
             let slot = crate::native::replication_slot_name(&identity);
-            let mut replica = ReplicaInformation::idle_build(
-                OperationId::new(slot.clone()),
-                identity,
-                "http://127.0.0.1:1".into(),
-            );
+            let mut replica = ReplicaInformation::idle_build(identity, "http://127.0.0.1:1".into());
             replica.process_session_id = ProcessSessionId::new("unpublished-session");
             let driver = source.driver.clone();
             let task = tokio::spawn(async move { driver.build_replica(replica).await });
@@ -754,11 +747,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         for incarnation in 0..=budget {
             let identity = native_identity(104, &format!("failed-{incarnation}"));
             let slot = crate::native::replication_slot_name(&identity);
-            let mut replica = ReplicaInformation::idle_build(
-                OperationId::new(format!("failed-{incarnation}")),
-                identity,
-                "http://127.0.0.1:1".into(),
-            );
+            let mut replica = ReplicaInformation::idle_build(identity, "http://127.0.0.1:1".into());
             replica.process_session_id =
                 ProcessSessionId::new(format!("failed-session-{incarnation}"));
             assert!(source.driver.build_replica(replica).await.is_err());
@@ -878,7 +867,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         let binding = BindingFactory::new().build(&source, &replacement, "replacement-build");
         source
             .driver
-            .build_replica(build_replica(&binding))
+            .public_build_native(binding.clone())
             .await
             .unwrap();
         assert!(replacement.driver.current_progress().await.unwrap() > 0);
@@ -955,7 +944,7 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         let binding = BindingFactory::new().build(&source, &target, "abort-grant");
         source
             .driver
-            .build_replica(build_replica(&binding))
+            .public_build_native(binding.clone())
             .await
             .unwrap();
         let credential = source.driver.public_owner().state.lock().await.grants[0]
@@ -1069,8 +1058,8 @@ async fn run_basebackup_cancellation_and_retry() {
     target.role(1, ReplicaRole::IdleSecondary).await;
     let binding = BindingFactory::new().build(&source, &target, "cancel-real-basebackup");
     let driver = source.driver.clone();
-    let replica = build_replica(&binding);
-    let build = tokio::spawn(async move { driver.build_replica(replica).await });
+    let request = binding.clone();
+    let build = tokio::spawn(async move { driver.public_build_native(request).await });
     let pid = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(pid) = std::fs::read_to_string(&marker)
@@ -1090,7 +1079,7 @@ async fn run_basebackup_cancellation_and_retry() {
     std::fs::remove_file(&gate).unwrap();
     source
         .driver
-        .build_replica(build_replica(&binding))
+        .public_build_native(binding.clone())
         .await
         .unwrap();
     assert!(target.driver.current_progress().await.unwrap() > 0);
@@ -1117,8 +1106,8 @@ async fn run_stale_completion_scenario() {
     let old = bindings.build(&source, &target, "stale-completion");
     let gate = target.driver.pause_public_build_completion();
     let driver = source.driver.clone();
-    let replica = build_replica(&old);
-    let build = tokio::spawn(async move { driver.build_replica(replica).await });
+    let request = old.clone();
+    let build = tokio::spawn(async move { driver.public_build_native(request).await });
     tokio::time::timeout(Duration::from_secs(90), gate.entered.notified())
         .await
         .expect("build did not reach delayed completion");
@@ -1157,7 +1146,7 @@ async fn run_stale_completion_scenario() {
     let retry = bindings.build(&source, &successor_target, "successor-completion");
     source
         .driver
-        .build_replica(build_replica(&retry))
+        .public_build_native(retry.clone())
         .await
         .unwrap();
     assert!(successor_target.driver.current_progress().await.unwrap() > 0);
@@ -1484,7 +1473,7 @@ async fn build_and_admit(primary: &Replica, secondary: &Replica, epoch: i64, ope
     let build = bindings.build(primary, secondary, operation);
     primary
         .driver
-        .build_replica(build_replica(&build))
+        .public_build_native(build.clone())
         .await
         .unwrap();
     secondary.role(epoch, ReplicaRole::ActiveSecondary).await;
@@ -1872,7 +1861,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
     assert!(source.driver.build_replica(invalid).await.is_err());
     source
         .driver
-        .build_replica(build_replica(&build))
+        .public_build_native(build.clone())
         .await
         .unwrap();
     let mut substituted_source_session = build.clone();
@@ -1981,7 +1970,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
         let before = target.persisted();
         let error = source
             .driver
-            .build_replica(build_replica(&build))
+            .public_build_native(build.clone())
             .await
             .unwrap_err();
         match error {
@@ -2026,7 +2015,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
             .unwrap();
         let error = source
             .driver
-            .build_replica(build_replica(&build))
+            .public_build_native(build.clone())
             .await
             .unwrap_err();
         match error {

@@ -1,5 +1,14 @@
 #[tokio::test]
 async fn m2_application_reopen_role_address_waits_for_actual_callback_receipt() {
+    ordinary_reopen_role_address_scenario().await;
+}
+
+#[tokio::test]
+async fn m2_application_copy_failures_preserve_retained_bytes_and_never_ack() {
+    m2_builtin::application_copy_failures().await;
+}
+
+async fn ordinary_reopen_role_address_scenario() {
     fn recorded(root: &Path, goal: &ReplicaGoal) -> serde_json::Value {
         let path =
             kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(root);

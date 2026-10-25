@@ -308,21 +308,6 @@ message PublicV1CapturedOperationIdentity {
   string detecting_session = 7;
 }
 
-message PublicV1BuildAttemptReference {
-  string resource_uid = 1;
-  Epoch epoch = 2;
-  string build_id = 3;
-  ReplicaIdentity source = 4;
-  reserved 5;
-  string source_session = 6;
-  ReplicaIdentity target = 7;
-  reserved 8;
-  string target_session = 9;
-  reserved 10;
-  PublicV1StorageIncarnation source_storage = 11;
-  PublicV1StorageIncarnation target_storage = 12;
-}
-
 message PublicV1ReplicaRebuildRequired {
   PublicV1RebuildKind kind = 1;
   PublicV1RebuildReason reason = 2;
@@ -330,7 +315,8 @@ message PublicV1ReplicaRebuildRequired {
   ReplicaIdentity provider_replica = 4;
   ReplicaIdentity local_replica = 5;
   string local_storage = 6;
-  PublicV1BuildAttemptReference build = 7;
+  reserved 7;
+  optional string goal_json = 8;
 }
 
 message PublicV1OperationCompletion {

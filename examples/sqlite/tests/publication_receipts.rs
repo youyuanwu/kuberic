@@ -6,8 +6,9 @@ use kuberic_runtime::host::{
     RunningReplica,
 };
 use kuberic_runtime::protocol::public_operations::{
-    PublicConfiguration, PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
-    PublicV1Identity,
+    ORDINARY_ACTION_FORMAT, PublicCatchUpMode, PublicV1Identity, ReplicaAgentQueryResult,
+    ReplicaAgentSnapshot, ReplicaConfigurationScope, ReplicaGoal, ReplicaGoalKind,
+    ReplicaGoalStatus, ReplicaScope,
 };
 use kuberic_runtime::protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
@@ -90,6 +91,8 @@ impl Fixture {
                 .unwrap(),
         );
         let server = SqliteServer::new(service.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_address = format!("http://{}", listener.local_addr().unwrap());
         let running = ReplicaHost::new(
             ReplicaProcessConfig {
                 resource_uid: resource_uid.clone(),
@@ -106,7 +109,7 @@ impl Fixture {
             ApplicationStorageState::FreshEmpty,
             Arc::new(Resolver),
         )
-        .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+        .start(listener)
         .await
         .unwrap();
         let handle = running.handle();
@@ -127,52 +130,91 @@ impl Fixture {
             }],
             1,
         );
-        for (revision, name, program) in [
-            (
-                1,
-                format!("{name}-open"),
-                PublicOperationProgram::Open {
-                    replica: identity.clone(),
-                    existing: true,
+        let mut client =
+            kuberic_runtime::control::proto::agent_control_client::AgentControlClient::connect(
+                control_address,
+            )
+            .await
+            .unwrap();
+        let response = client
+            .get_snapshot(authorized(
+                kuberic_runtime::control::proto::ReplicaSnapshotRequest {
+                    protocol_version: ORDINARY_ACTION_FORMAT,
+                    resource_uid: resource_uid.to_string(),
+                    target: Some(identity.into()),
+                    expected_process_session_id: handle.process_session_id().to_string(),
                 },
-            ),
-            (
-                2,
-                format!("{name}-role"),
-                PublicOperationProgram::Role {
-                    epoch,
-                    role: ReplicaRole::Primary,
-                },
-            ),
-            (
-                3,
-                format!("{name}-epoch"),
-                PublicOperationProgram::Epoch { epoch },
-            ),
-            (
-                4,
-                format!("{name}-configuration"),
-                PublicOperationProgram::Configuration(PublicConfiguration {
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let ReplicaAgentQueryResult::Initialized(snapshot) =
+            serde_json::from_slice(&response.canonical_json).unwrap()
+        else {
+            panic!("ordinary publication fixture snapshot required")
+        };
+        let goal = ReplicaGoal {
+            format: ORDINARY_ACTION_FORMAT,
+            identity: preview,
+            operation_id: kuberic_runtime::protocol::types::OperationId::new(format!(
+                "{name}-prepare"
+            )),
+            revision: 1,
+            scope: ReplicaScope {
+                history: snapshot.history,
+                storage: snapshot.storage,
+                process_session_id: snapshot.process_session_id,
+                creation_id: snapshot.creation_id,
+                epoch,
+                configuration: ReplicaConfigurationScope {
                     current: configuration,
                     previous: None,
                     replicas: Vec::new(),
-                }),
-            ),
+                },
+            },
+            desired: ReplicaGoalKind::Prepare {
+                role: ReplicaRole::Primary,
+            },
+        };
+        for goal in [
+            goal.clone(),
+            ReplicaGoal {
+                operation_id: kuberic_runtime::protocol::types::OperationId::new(format!(
+                    "{name}-admit"
+                )),
+                revision: 2,
+                desired: ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                },
+                ..goal
+            },
         ] {
-            handle
-                .execute_public_v1(PublicOperationIntent {
-                    identity: preview.clone(),
-                    operation_id: kuberic_runtime::protocol::types::OperationId::new(&name),
-                    revision,
-                    process_session_id: handle.process_session_id(),
-                    class: PublicOperationClass::Authority,
-                    input_digest: program.digest(),
-                    replay_disposition: program.replay_disposition(),
-                    lifecycle: None,
-                    program: Some(program),
-                })
-                .await
-                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let response = client
+                        .submit_goal(authorized(
+                            kuberic_runtime::control::proto::ReplicaGoalRequest {
+                                protocol_version: ORDINARY_ACTION_FORMAT,
+                                canonical_json: serde_json::to_vec(&goal).unwrap(),
+                            },
+                        ))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    let snapshot: ReplicaAgentSnapshot =
+                        serde_json::from_slice(&response.canonical_json).unwrap();
+                    if let Some(entry) = snapshot.goals.iter().find(|entry| entry.goal == goal)
+                        && entry.status != ReplicaGoalStatus::Pending
+                    {
+                        assert_eq!(entry.status, ReplicaGoalStatus::Achieved);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         }
 
         Self {
@@ -196,7 +238,16 @@ impl Fixture {
 
     async fn stop(mut self, expected: Option<&str>) {
         self.running.shutdown();
-        self.running.wait().await.unwrap();
+        let actual_close = self.running.wait().await;
+        match expected {
+            None => actual_close.unwrap(),
+            Some(message) => assert!(
+                actual_close
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains(message)),
+                "actual host Close hid publication failure: {actual_close:?}"
+            ),
+        }
         let diagnostic = self.service.shutdown_and_drain().await;
         match expected {
             None => diagnostic.unwrap(),
@@ -214,6 +265,14 @@ impl Fixture {
         drop(self.running);
         std::fs::remove_dir_all(self.root).unwrap();
     }
+}
+
+fn authorized<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request
+        .metadata_mut()
+        .insert("authorization", "Bearer unused".parse().unwrap());
+    request
 }
 
 fn address() -> std::net::SocketAddr {

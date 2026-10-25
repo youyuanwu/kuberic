@@ -18,7 +18,7 @@ use crate::protocol::types::{
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_V1_PHASE6_SCHEMA_VERSION: u32 = 11;
-pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 15;
+pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -224,7 +224,7 @@ pub(crate) struct HistoryAdmissionBarrier {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PublicV1OperationState {
     pub(crate) identity: PublicV1Identity,
     #[serde(default)]
@@ -257,14 +257,6 @@ pub(crate) struct PublicV1OperationState {
     pub(crate) build_records: BTreeMap<OperationId, PublicV1BuildRecord>,
     #[serde(default)]
     pub(crate) absent_builds: BTreeSet<OperationId>,
-    #[serde(default)]
-    pub(crate) current_inbound_build_authority:
-        Option<crate::protocol::public_operations::PublicInboundBuildAuthority>,
-    #[serde(default)]
-    pub(crate) inbound_build_generation: u64,
-    #[serde(default)]
-    pub(crate) terminal_inbound_build_receipts:
-        BTreeMap<OperationId, crate::protocol::public_operations::PublicInboundBuildReceipt>,
     #[serde(default)]
     pub(crate) retired_storage_incarnations: Vec<ReplicaStorageIncarnationContext>,
     #[serde(default)]
@@ -441,9 +433,6 @@ impl PublicV1OperationState {
             active_builds: BTreeMap::new(),
             build_records: BTreeMap::new(),
             absent_builds: BTreeSet::new(),
-            current_inbound_build_authority: None,
-            inbound_build_generation: 0,
-            terminal_inbound_build_receipts: BTreeMap::new(),
             retired_storage_incarnations: Vec::new(),
             writes_revoked: false,
             terminal: false,

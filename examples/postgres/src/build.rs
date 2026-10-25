@@ -12,6 +12,24 @@ pub const MAX_ENVELOPE_BYTES: usize = 65536;
 pub const MAX_BUILDS: usize = 16;
 const MAX_HISTORY: usize = 64;
 
+pub(crate) fn native_build_selected(
+    request: &PgBuildRequest,
+    configuration: &kuberic_runtime::replicator::ReplicaSetConfiguration,
+) -> bool {
+    configuration.configuration == request.authority.current_configuration
+        && configuration.replicas.iter().any(|replica| {
+            replica.identity == request.authority.source
+                && replica.process_session_id == request.source_session
+                && replica.role == kuberic_runtime::protocol::types::ReplicaRole::Primary
+        })
+        && configuration.replicas.iter().any(|replica| {
+            replica.identity == request.authority.target
+                && replica.process_session_id == request.target_session
+                && replica.role == kuberic_runtime::protocol::types::ReplicaRole::IdleSecondary
+                && replica.current_progress == request.authority.replication_boundary_lsn
+        })
+}
+
 #[cfg(feature = "testing")]
 pub struct BuildGate {
     pub stage: PgBuildStage,

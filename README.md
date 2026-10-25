@@ -10,15 +10,15 @@ session, fencing, and lifecycle contracts plus an experimental namespace-bound
 controller and owned-cluster validation harness.
 
 The production control loop now uses the [ordinary hosting M1 contract](docs/features/kuberic/ordinary-hosting-m1.md):
-format-15 semantic replica goals, early peer discovery, retained ordinary calls,
+format-16 semantic replica goals, early peer discovery, retained ordinary calls,
 and exact Build outcomes before separate admission. Application state remains
-provider-owned. This is a development checkpoint, not a deployable default-engine
-stack: built-in/KV/SQLite/PostgreSQL production integration is explicitly
-unavailable until M2; comprehensive recovery/failover qualification is M3.
+provider-owned. Built-in/KV/SQLite and independent PostgreSQL use engine-owned
+authenticated sessions and actual ordinary joining. This remains an experimental
+development checkpoint; comprehensive recovery/failover qualification is M3.
 
 The retained default Replicator composes source-guided Service Fabric classic V1
-owners for component/M2 work. Assignment, quorum completion and service-local
-commitment remain separate; no M2 engine-session completion is claimed.
+owners. Assignment, quorum completion and service-local commitment remain
+separate; bounded integration is not complete M3 or live deployment qualification.
 
 ## Repository
 

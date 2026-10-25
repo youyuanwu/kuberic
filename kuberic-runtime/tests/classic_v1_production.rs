@@ -16,9 +16,7 @@ use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
     RunningReplica,
 };
-use kuberic_runtime::protocol::command::{
-    PublicV1HistoryCommand, PublicV1OperationCommand, PublicV1SessionRenewalCommand,
-};
+use kuberic_runtime::protocol::command::PublicV1OperationCommand;
 use kuberic_runtime::protocol::public_operations::*;
 use kuberic_runtime::protocol::types::*;
 #[allow(
@@ -139,6 +137,11 @@ async fn m2_builtin_effect_fences_and_retained_provider_join() {
 #[tokio::test]
 async fn m2_builtin_crossed_identity_and_stale_ack() {
     m2_builtin::crossed_identity().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_bound_ingress_rejects_body_epochs_before_native_mutation() {
+    m2_builtin::bound_body_epochs().await;
 }
 
 #[tokio::test]
@@ -1114,37 +1117,6 @@ impl<A: Sample> Node<A> {
         }
     }
 
-    fn renewal_request(
-        &self,
-        command: PublicV1SessionRenewalCommand,
-    ) -> proto::ExecuteCommandRequest {
-        proto::ExecuteCommandRequest {
-            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-            resource_uid: self.history.resource_uid.to_string(),
-            target: Some(self.identity.clone().into()),
-            expected_process_session_id: self.session.to_string(),
-            command: Some(proto::execute_command_request::Command::PublicV1History(
-                convert::public_v1_history_command_to_proto(
-                    &PublicV1HistoryCommand::SessionRenewal {
-                        command: Box::new(command),
-                    },
-                )
-                .unwrap(),
-            )),
-        }
-    }
-
-    async fn renewal(&self, command: PublicV1SessionRenewalCommand) {
-        let mut client =
-            proto::agent_control_client::AgentControlClient::connect(self.control_address.clone())
-                .await
-                .unwrap();
-        client
-            .execute(authorized(self.renewal_request(command)))
-            .await
-            .unwrap();
-    }
-
     async fn close(mut self) {
         self.goal(ReplicaGoalKind::Close, self.configuration(Epoch::new(0, 1)))
             .await;
@@ -1511,260 +1483,7 @@ async fn native_query_rejoin_matrix_distinguishes_source_capability_from_target_
 
 #[tokio::test]
 async fn public_factory_primary_process_renewal_retains_exact_role_address_authority() {
-    tokio::time::timeout(Duration::from_secs(90), async {
-            for (fail_replay, demote) in [(false, false), (false, true), (true, false)] {
-            let root = tempfile::tempdir().unwrap();
-            let epoch = Epoch::new(0, 1);
-            let renewed_epoch = Epoch::new(0, 2);
-            let mut predecessor = Node::<RoleAddressKvService>::start_sized(root.path(), 1, 0, 1).await;
-            predecessor.open(ReplicaRole::Primary, epoch).await;
-            predecessor.single(epoch).await;
-            predecessor
-                .service
-                .inner
-                .replicate_put("renewal".into(), "retained".into())
-                .await
-                .unwrap();
-            let old = predecessor.report().await;
-            let old_location = old.service_location.clone().unwrap();
-            assert_eq!(old_location.address, predecessor.service.address);
-            let old_revision = predecessor.revision;
-            predecessor.stop().await;
-
-            let mut replacement =
-                Node::<RoleAddressKvService>::start_sized(root.path(), 1, old_revision, 1).await;
-            let fresh = replacement.report().await;
-            assert_eq!(fresh.storage_incarnation, old.storage_incarnation);
-            assert_eq!(fresh.history, old.history);
-            assert_ne!(fresh.process_session_id, old.process_session_id);
-            assert_ne!(fresh.replicator_creation_id, old.replicator_creation_id);
-            assert_eq!(fresh.role, ReplicaRole::None);
-            assert!(fresh.service_location.is_none());
-            assert!(fresh.completed_operations.is_empty());
-            replacement
-                .goal(ReplicaGoalKind::Discover, replacement.configuration(epoch))
-                .await;
-            let open_revision = replacement.revision;
-            let fresh = replacement.report().await;
-            let endpoint = |report: &PublicV1AgentReport| ProcessSessionEndpoint {
-                identity: report.replica.clone(),
-                storage_incarnation: report.storage_incarnation.clone(),
-                process_session_id: report.process_session_id.clone(),
-                replicator_creation_id: report.replicator_creation_id.clone(),
-                role: report.role,
-            };
-            let configuration = ConfigurationDescriptor::new(
-                renewed_epoch,
-                replacement.identity.replica_id,
-                vec![ConfigurationMember {
-                    identity: replacement.identity.clone(),
-                    role: ReplicaRole::Primary,
-                }],
-                1,
-            );
-            let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
-                operation_id: OperationId::new("real-primary-process-renewal"),
-                reason: ProcessSessionRenewalReason::PrimaryReplacement,
-                resource_uid: old.resource_uid.clone(),
-                history: old.history.clone(),
-                previous_epoch: epoch,
-                renewal_epoch: renewed_epoch,
-                predecessor: endpoint(&old),
-                replacement: Some(endpoint(&fresh)),
-                surviving_sessions: Vec::new(),
-                fresh_configuration: configuration.clone(),
-                predecessor_contained: true,
-                data_loss: None,
-            })
-            .unwrap();
-            required.required.validate_replacement_report(&fresh).unwrap();
-            replacement
-                .renewal(PublicV1SessionRenewalCommand::CloseAccessAndIngress {
-                    accepted: required.clone(),
-                })
-                .await;
-            let pending = required
-                .close_access()
-                .unwrap()
-                .freeze_surviving_set()
-                .unwrap()
-                .begin_epoch_barriers()
-                .unwrap()
-                .finish_epoch_barriers()
-                .unwrap();
-            let replay = PublicV1SessionRenewalCommand::ReplayReplacementRole {
-                accepted: pending,
-                process_session_id: fresh.process_session_id.clone(),
-                epoch: renewed_epoch,
-                role: ReplicaRole::Primary,
-            };
-            replacement.service.block_primary.store(true, Ordering::SeqCst);
-            replacement.service.fail_primary.store(fail_replay, Ordering::SeqCst);
-            let mut client = proto::agent_control_client::AgentControlClient::connect(
-                replacement.control_address.clone(),
-            )
-            .await
-            .unwrap();
-            let request = replacement.renewal_request(replay.clone());
-            let mut waiter = tokio::spawn(async move { client.execute(authorized(request)).await });
-            tokio::select! {
-                () = replacement.service.primary_entered.notified() => {},
-                result = &mut waiter => panic!("role replay returned before application callback: {result:?}"),
-                () = tokio::time::sleep(Duration::from_secs(10)) => panic!("role callback was not entered"),
-            }
-            let in_flight = replacement.report().await;
-            assert_ne!(in_flight.write_status, AccessStatus::Granted);
-            assert!(in_flight.service_location.is_none());
-            let role_intent = in_flight
-                .active_operations
-                .iter()
-                .find(|intent| {
-                    intent.program
-                        == Some(PublicOperationProgram::Role {
-                            epoch: renewed_epoch,
-                            role: ReplicaRole::Primary,
-                        })
-                })
-                .expect("application callback has a durable current-process owner")
-                .clone();
-            assert_eq!(role_intent.process_session_id, fresh.process_session_id);
-            assert_eq!(role_intent.revision, open_revision + 1);
-            assert_ne!(role_intent.operation_id, old_location.operation_id);
-            waiter.abort();
-            assert!(waiter.await.unwrap_err().is_cancelled());
-            replacement.service.primary_release.notify_one();
-            if fail_replay {
-                let mut client = proto::agent_control_client::AgentControlClient::connect(
-                    replacement.control_address.clone()).await.unwrap();
-                let result = tokio::time::timeout(Duration::from_secs(10),
-                    client.execute(authorized(replacement.renewal_request(replay.clone()))))
-                    .await.expect("exact retry observes the retained application failure");
-                assert!(result.unwrap_err().message().contains("replacement application role rejected"));
-                let rejected = replacement.report().await;
-                assert!(!rejected.completed_operations.iter().any(|completion|
-                    completion.operation_id == role_intent.operation_id),
-                    "an engine observer cannot publish application failure as contained completion");
-                assert_ne!(rejected.write_status, AccessStatus::Granted);
-                assert!(rejected.service_location.is_none());
-                assert!(replacement.service.inner.replicate_put("renewal".into(), "rejected".into()).await.is_err());
-                assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
-                let drainage = replacement.stop().await;
-                // Uncertain application failure requires actual Abort/join;
-                // the KV committer retains its expected aborted-work result.
-                assert!(matches!(drainage, Some(kuberic_runtime::RuntimeError::OperationCancelled)),
-                    "{drainage:?}");
-                continue;
-            }
-            let completed = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let report = replacement.report().await;
-                    if let Some(completion) = report.completed_operations.iter().find(|completion| {
-                        completion.operation_id == role_intent.operation_id
-                    }) {
-                        break completion.clone();
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("cancelled RPC leaves role callback and completion owned");
-            assert_eq!(completed.call_kind, PublicV1CallKind::Role);
-            assert_eq!(completed.revision, role_intent.revision);
-            assert_eq!(completed.process_session_id, fresh.process_session_id);
-            assert_eq!(completed.input_digest, role_intent.input_digest);
-            assert_eq!(completed.history, fresh.history);
-            assert_eq!(completed.storage_incarnation, fresh.storage_incarnation);
-            replacement.revision = completed.revision;
-            assert_eq!(completed.result, PublicV1OperationResult::Succeeded);
-            replacement.renewal(replay.clone()).await;
-            assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
-            assert!(replacement.report().await.service_location.is_none());
-            replacement
-                .goal(ReplicaGoalKind::Reconfigure { role: ReplicaRole::Primary, catch_up: Some(PublicCatchUpMode::WriteQuorum) }, ReplicaConfigurationScope {
-                    current: configuration.clone(),
-                    previous: None,
-                    replicas: Vec::new(),
-                })
-                .await;
-            let renewed = replacement.report().await;
-            let location = renewed.service_location.as_ref().unwrap();
-            assert_eq!(renewed.write_status, AccessStatus::Granted);
-            assert_eq!(location.identity, replacement.preview);
-            assert_eq!(location.resource_uid, fresh.resource_uid);
-            assert_eq!(location.replica, fresh.replica);
-            assert_eq!(location.process_session_id, fresh.process_session_id);
-            assert_eq!(location.operation_id, completed.operation_id);
-            assert_eq!(location.revision, completed.revision);
-            assert_eq!(location.epoch, renewed_epoch);
-            assert_eq!(location.address, replacement.service.address);
-            assert_ne!(location.address, old_location.address);
-            renewed.validate().unwrap();
-            assert_eq!(
-                replacement.service.inner.get("renewal").await.unwrap().as_deref(),
-                Some("retained")
-            );
-            replacement
-                .service
-                .inner
-                .replicate_put("renewal".into(), "new-process".into())
-                .await
-                .unwrap();
-            assert_eq!(
-                replacement.service.inner.get("renewal").await.unwrap().as_deref(),
-                Some("new-process")
-            );
-
-            let mut stale_report = renewed.clone();
-            stale_report.service_location = Some(old_location.clone());
-            assert!(stale_report.validate().is_err());
-            let stale_role = PublicOperationProgram::Role {
-                epoch,
-                role: ReplicaRole::Primary,
-            };
-            let failure = replacement
-                .submit_result(PublicV1OperationCommand {
-                    target: replacement.identity.clone(),
-                    intent: PublicOperationIntent {
-                        identity: replacement.preview.clone(),
-                        operation_id: old_location.operation_id,
-                        revision: old_location.revision,
-                        process_session_id: old.process_session_id,
-                        class: PublicOperationClass::Authority,
-                        input_digest: stale_role.digest(),
-                        replay_disposition: stale_role.replay_disposition(),
-                        lifecycle: None,
-                        program: Some(stale_role),
-                    },
-                })
-                .await
-                .unwrap_err();
-            assert_eq!(failure.code(), tonic::Code::InvalidArgument);
-            assert!(failure.message().contains("differs from execute envelope"));
-            assert_eq!(replacement.report().await.service_location, renewed.service_location);
-            assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
-
-            if demote {
-                replacement
-                    .goal(ReplicaGoalKind::Reconfigure { role: ReplicaRole::ActiveSecondary, catch_up: None },
-                        replacement.configuration(Epoch::new(0, 3)))
-                    .await;
-                let demoted = replacement.report().await;
-                assert_eq!(demoted.role, ReplicaRole::ActiveSecondary);
-                assert_ne!(demoted.write_status, AccessStatus::Granted);
-                assert!(demoted.service_location.is_none());
-            }
-            replacement.goal(ReplicaGoalKind::Close, replacement.configuration(renewed_epoch)).await;
-            let closed = replacement.report().await;
-            assert_eq!(closed.role, ReplicaRole::None);
-            assert!(closed.service_location.is_none());
-            assert!(closed.replication_address.is_none());
-            replacement.running.shutdown();
-            replacement.running.wait().await.unwrap();
-            replacement.service.drain().await.unwrap();
-            }
-        })
-        .await
-        .expect("bounded real primary process renewal");
+    ordinary_reopen_role_address_scenario().await;
 }
 
 #[tokio::test]
@@ -2341,82 +2060,68 @@ async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() 
 #[tokio::test]
 async fn helper_free_recovery_scopes_changed_unchanged_and_failed_observations() {
     use bytes::Bytes;
+    fn metadata(root: &Path) -> serde_json::Value {
+        let path =
+            kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(root);
+        let connection =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let json: String = connection
+            .query_row(
+                "SELECT state_json FROM agent_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
     tokio::time::timeout(Duration::from_secs(120), async {
         for outcome in ["unchanged", "changed", "failed"] {
             let root = tempfile::tempdir().unwrap();
             let mut node = Node::<ExternalService>::start_sized(root.path(), 1, 0, 1).await;
-            node.goal(
-                ReplicaGoalKind::Discover,
-                node.configuration(Epoch::new(0, 1)),
-            )
-            .await;
-            let before = node.report().await;
-            let authorization_id = OperationId::new(format!("loss-{outcome}"));
-            let proposed =
-                derive_data_loss_history(&authorization_id, &node.history, 1, &node.storage)
-                    .unwrap();
-            let epoch = Epoch::new(1, 2);
-            let revision = node.revision + 1;
-            let authorization = DataLossAuthorization {
-                authorization_id: authorization_id.clone(),
-                predecessor: node.history.clone(),
-                proposed: proposed.clone(),
-                provisional_primary: node.storage.clone(),
-                reset_scope: ProviderProgressReset::Preserve,
-                replay_disposition: DataLossReplay::ReplaceOnAmbiguity,
-            };
-            let input = PublicLifecycleInput {
-                recipe: PublicLifecycleRecipe::InitialPrimary,
-                replica: node.identity.clone(),
-                epoch,
-                possible_data_loss: PossibleDataLossIntent::Possible,
-                current: ConfigurationDescriptor::new(
-                    epoch,
-                    node.identity.replica_id,
-                    vec![ConfigurationMember {
-                        identity: node.identity.clone(),
-                        role: ReplicaRole::Primary,
-                    }],
-                    1,
-                ),
-                previous: None,
-                replicas: Vec::new(),
-                data_loss_recovery: Some(PublicDataLossRecoveryInput {
-                    authorization,
-                    attempt: DataLossAttempt {
-                        authorization_id,
-                        attempt_id: OperationId::new(format!("recover-{outcome}")),
-                        process: ProcessAttemptContext {
-                            process_session_id: node.session.clone(),
-                            replicator_creation_id: before.replicator_creation_id,
-                            catch_up_specific_quorum: before
-                                .extensions
-                                .catch_up_specific_quorum
-                                .unwrap(),
-                            data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
-                            epoch,
-                            attempt_revision: revision,
-                        },
+            node.open(ReplicaRole::Primary, Epoch::new(0, 1)).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while metadata(root.path())["applicationStorage"]["initializing"] == true {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let before = m2_builtin::snapshot(&node).await;
+            let metadata_before = metadata(root.path());
+            let bytes_before = std::fs::read(root.path().join("application/state.json")).unwrap();
+            let original =
+                ExternalService::read_persisted_snapshot(&root.path().join("application")).unwrap();
+            let program = PublicOperationProgram::Progress { capability: false };
+            let denied = node
+                .submit_result(PublicV1OperationCommand {
+                    target: node.identity.clone(),
+                    intent: PublicOperationIntent {
+                        identity: node.preview.clone(),
+                        operation_id: OperationId::new("unsupported-recovery-callback-program"),
+                        revision: node.revision + 1,
+                        process_session_id: node.session.clone(),
+                        class: PublicOperationClass::Authority,
+                        input_digest: program.digest(),
+                        replay_disposition: program.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(program),
                     },
-                }),
-            };
-            input.validate().unwrap();
-            let command = PublicV1OperationCommand {
-                target: node.identity.clone(),
-                intent: PublicOperationIntent {
-                    identity: node.preview.clone(),
-                    operation_id: OperationId::new(format!("recover-{outcome}")),
-                    revision,
-                    process_session_id: node.session.clone(),
-                    class: PublicOperationClass::Authority,
-                    input_digest: input.digest(),
-                    replay_disposition: PublicOperationReplayDisposition::DataLoss(
-                        DataLossReplay::ReplaceOnAmbiguity,
-                    ),
-                    lifecycle: Some(input),
-                    program: None,
-                },
-            };
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                denied
+                    .message()
+                    .contains("controller callback programs are unavailable")
+            );
+            assert_eq!(m2_builtin::snapshot(&node).await, before);
+            assert_eq!(metadata(root.path()), metadata_before);
+            assert_eq!(
+                std::fs::read(root.path().join("application/state.json")).unwrap(),
+                bytes_before
+            );
+            assert_eq!(node.service.data_loss_calls(), 0);
             let service = node.service.clone();
             service.pause_recovery(match outcome {
                 "unchanged" => None,
@@ -2424,62 +2129,60 @@ async fn helper_free_recovery_scopes_changed_unchanged_and_failed_observations()
                 "failed" => Some(Err("provider recovery failed".into())),
                 _ => unreachable!(),
             });
-            let control = node.control_address.clone();
-            let history = node.history.clone();
-            let identity = node.identity.clone();
-            let mut task = tokio::spawn(async move {
-                let result = node.submit_result(command).await;
-                (node, result)
-            });
+            let native = service.clone();
+            let mut task = tokio::spawn(async move { native.native_data_loss().await });
             tokio::select! {
                 _ = service.recovery_entered() => {}
                 result = &mut task => panic!(
                     "recovery did not reach provider: {:?}",
-                    result.map(|(_, result)| result),
+                    result,
                 ),
             }
-            let pending = report_at(&control, &history.resource_uid, &identity).await;
-            assert_eq!(pending.history, history);
-            assert!(matches!(
-                pending.progress.current_progress,
-                ProgressQueryResult::NotQueried(_)
-            ));
-            assert_eq!(pending.read_status, AccessStatus::NotPrimary);
-            assert_eq!(pending.write_status, AccessStatus::NotPrimary);
+            let pending = m2_builtin::snapshot(&node).await;
+            assert_eq!(pending, before);
+            assert_eq!(pending.read_status, AccessStatus::ReconfigurationPending);
+            assert_eq!(pending.write_status, AccessStatus::ReconfigurationPending);
+            assert_eq!(service.data_loss_calls(), 1);
             service.release_recovery();
-            let (mut node, result) = task.await.unwrap();
-            let report = node.report().await;
+            let result = task.await.unwrap();
+            let observed = m2_builtin::snapshot(&node).await;
+            assert_eq!(observed.history, before.history);
+            assert_eq!(observed.goals, before.goals);
+            assert_ne!(observed.read_status, AccessStatus::Granted);
+            assert_ne!(observed.write_status, AccessStatus::Granted);
+            let persisted =
+                ExternalService::read_persisted_snapshot(&root.path().join("application")).unwrap();
             if outcome == "failed" {
                 assert!(
                     result
                         .unwrap_err()
-                        .message()
+                        .to_string()
                         .contains("provider recovery failed")
                 );
-                assert_eq!(report.history, history);
-                assert!(report.progress.current().is_none());
-                assert_eq!(report.write_status, AccessStatus::NotPrimary);
-                node.stop().await;
+                assert_eq!(persisted, original);
             } else {
-                result.unwrap();
-                assert_eq!(report.history, proposed);
-                assert!(report.has_current_open_endpoint());
-                let restored = if outcome == "changed" { 1 } else { 0 };
-                assert_eq!(report.progress.current(), Some(restored));
+                assert_eq!(result.unwrap(), outcome == "changed");
                 assert_eq!(
-                    report.data_loss_recovery.as_ref().unwrap().stage,
-                    PublicDataLossRecoveryStage::Admitted
+                    persisted.committed_lsn,
+                    if outcome == "changed" { 1 } else { 0 }
                 );
-                let write = node
-                    .service
-                    .begin_write(Bytes::from_static(b"new-history"))
-                    .await
-                    .unwrap();
-                assert_eq!(write.lsn, restored + 1);
-                write.wait().await.unwrap();
-                node.history = proposed;
-                node.close().await;
+                assert_eq!(
+                    persisted.values,
+                    if outcome == "changed" {
+                        vec![Bytes::from_static(b"restored")]
+                    } else {
+                        Vec::new()
+                    }
+                );
             }
+            assert!(
+                service
+                    .begin_write(Bytes::from_static(b"unadmitted-history"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(service.data_loss_calls(), 1);
+            node.close().await;
         }
     })
     .await

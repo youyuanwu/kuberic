@@ -6,8 +6,8 @@ use super::*;
 use crate::protocol::public_operations::*;
 use crate::protocol::types::*;
 use crate::replicator::{
-    PartitionAccessView, PartitionInformation, PrimaryReplicator, PublicInboundBuildAdmission,
-    Replicator, ReplicatorFactoryContext,
+    PartitionAccessView, PartitionInformation, PrimaryReplicator, Replicator,
+    ReplicatorFactoryContext,
 };
 use tokio_stream::wrappers::TcpListenerStream;
 
@@ -45,18 +45,6 @@ impl PartitionAccessView for Access {
             return Ok(None);
         }
         Ok(Some(self.publication.lock().unwrap().clone()))
-    }
-    async fn classify_replacement_inbound_build_authority(
-        &self,
-        _: &PublicInboundBuildAuthority,
-    ) -> crate::Result<PublicInboundBuildAdmission> {
-        Err(RuntimeError::AuthorityNotAdmitted)
-    }
-    async fn install_replacement_inbound_build_authority(
-        &self,
-        _: &PublicInboundBuildAuthority,
-    ) -> crate::Result<()> {
-        Err(RuntimeError::AuthorityNotAdmitted)
     }
     async fn report_load(&self, _: Vec<LoadMetric>) -> crate::Result<()> {
         Ok(())

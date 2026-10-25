@@ -27,8 +27,10 @@ impl Cargo {
             .arg(subcommand)
             .current_dir(directory)
             .env_remove("KUBERIC_WORKSPACE_TESTS")
-            .env("RUSTUP_TOOLCHAIN", &self.toolchain)
-            .env("CARGO_TARGET_DIR", &self.target);
+            .env("RUSTUP_TOOLCHAIN", &self.toolchain);
+        if matches!(subcommand, "check" | "clippy" | "package" | "test") {
+            command.arg("--target-dir").arg(&self.target);
+        }
         if std::env::var_os("CARGO_BUILD_JOBS").is_none() {
             command.env("CARGO_BUILD_JOBS", "2");
         }
@@ -185,26 +187,6 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
         .parent()
         .context("level tests must be inside the workspace")?;
     let toolchain = pinned_toolchain(root)?;
-    // Separate invocations keep test/dev dependencies from enabling runtime hosting.
-    for (package, target) in [
-        ("kuberic-runtime", "--lib"),
-        ("kuberic-controller", "--bins"),
-    ] {
-        checked_output(
-            Command::new("cargo")
-                .args([
-                    "check",
-                    "--locked",
-                    "--offline",
-                    "--no-default-features",
-                    "--package",
-                    package,
-                    target,
-                ])
-                .current_dir(root)
-                .env("RUSTUP_TOOLCHAIN", &toolchain),
-        )?;
-    }
     let output = checked_output(
         Command::new("cargo")
             .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
@@ -214,7 +196,7 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
     let metadata: Metadata = serde_json::from_slice(&output.stdout)?;
     let scratch = tempfile::Builder::new()
         .prefix("kuberic-test-util-consumer-")
-        .tempdir()?;
+        .tempdir_in(&metadata.target_directory)?;
     let scratch_path = scratch.path().canonicalize()?;
     ensure!(
         !scratch_path.starts_with(root.canonicalize()?),
@@ -222,9 +204,23 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
     );
     let cargo = Cargo {
         toolchain,
-        target: metadata.target_directory.join("test-util-consumer"),
+        target: scratch_path.join("target"),
         vendor: scratch_path.join("vendor"),
     };
+    // Separate invocations keep test/dev dependencies from enabling runtime hosting.
+    for (package, target) in [
+        ("kuberic-runtime", "--lib"),
+        ("kuberic-controller", "--bins"),
+    ] {
+        checked_output(cargo.command(root, "check").args([
+            "--locked",
+            "--offline",
+            "--no-default-features",
+            "--package",
+            package,
+            target,
+        ]))?;
+    }
     checked_output(
         cargo
             .command(root, "vendor")
@@ -232,20 +228,15 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
             .arg(&cargo.vendor),
     )?;
     for name in ["kuberic-runtime", "kuberic-controller"] {
-        checked_output(
-            cargo
-                .packaged_command(root, "package")?
-                .args([
-                    "-p",
-                    name,
-                    "--allow-dirty",
-                    "--no-verify",
-                    "--offline",
-                    "--quiet",
-                ])
-                .env("CARGO_TARGET_DIR", &metadata.target_directory),
-        )?;
-        unpack_package(name, &cargo.vendor, &metadata.target_directory)?;
+        checked_output(cargo.packaged_command(root, "package")?.args([
+            "-p",
+            name,
+            "--allow-dirty",
+            "--no-verify",
+            "--offline",
+            "--quiet",
+        ]))?;
+        unpack_package(name, &cargo.vendor, &cargo.target)?;
     }
 
     let fixture = root.join("scripts/fixtures/controller-test-util");

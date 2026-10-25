@@ -8,7 +8,7 @@ use kuberic_runtime::host::{
     public_build_store, public_lifecycle, service, session, sqlite_store, state, store, transport,
 };
 use kuberic_runtime::replicator::{
-    NativeRuntimeControl, PartitionAccessView, Replicator, ReplicatorAttachment,
+    PartitionAccessView, Replicator, ReplicatorAttachment, ReplicatorCreation,
     ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorInterfaces,
     ReplicatorRegistration, StatefulServicePartition, v1,
 };

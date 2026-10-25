@@ -2,12 +2,13 @@
 
 **Component semantics and historical production evidence.**
 [Ordinary hosting M1](ordinary-hosting-m1.md) is now the current host/controller
-contract with matched format 15. Built-in/KV/SQLite/PostgreSQL production
-integration is explicitly unavailable until M2; old production journey names
-assert support rejection, not their historical later positive clauses.
+contract, now using matched format 16. Built-in/KV/SQLite and independent
+PostgreSQL integrate through ordinary engine-owned sessions and joining.
+Bounded witnesses execute actual native/application work; enabled broader
+journeys can still expose the separately scoped M3 policy boundary.
 The component algorithms and explicitly pinned pre-M1 evidence below remain;
 do not interpret their grant/companion/renewal/failover descriptions as the new
-production route. [M2/M3 remain proposed](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
+production route. See the [roadmap and qualification limits](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
 
 The [pre-M1 engine-neutral hosting contract](engine-neutral-hosting.md#current--delivered-bounded-hosting) superseded
 older host-only anchors below for common admission, retained authority,

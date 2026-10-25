@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(any(test, feature = "testing"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -59,7 +61,7 @@ pub struct KvPersistence {
     state: Mutex<PersistedState>,
     #[cfg(feature = "testing")]
     apply_pause: Mutex<Option<ApplyPause>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     fail_next_persist: AtomicBool,
     #[cfg(test)]
     stream_calls: (AtomicU64, AtomicU64),
@@ -116,7 +118,7 @@ impl KvPersistence {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn fail_next_persist_for_test(&self) {
         self.fail_next_persist.store(true, Ordering::SeqCst);
     }
@@ -187,7 +189,7 @@ impl KvPersistence {
             state: Mutex::new(state),
             #[cfg(feature = "testing")]
             apply_pause: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             fail_next_persist: AtomicBool::new(false),
             #[cfg(test)]
             stream_calls: (AtomicU64::new(0), AtomicU64::new(0)),
@@ -411,7 +413,7 @@ impl KvPersistence {
     }
 
     fn persist(&self, state: &PersistedState) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self.fail_next_persist.swap(false, Ordering::SeqCst) {
             return Err(RuntimeError::Application(
                 "injected persistence failure".into(),

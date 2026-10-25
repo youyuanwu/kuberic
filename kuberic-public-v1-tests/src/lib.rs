@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
@@ -16,6 +16,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot, watch};
 use tokio::task::JoinSet;
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "native conformance calls the ordinarily created protected primary"
+)]
+use kuberic_runtime::PrimaryReplicator;
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
 use kuberic_runtime::replicator::{
@@ -169,6 +174,7 @@ struct Provider {
     hold_recovery: AtomicBool,
     recovery_entered: Notify,
     recovery_release: Notify,
+    recovery_calls: AtomicUsize,
     advertised_context: Vec<Bytes>,
     expected_context: Vec<Bytes>,
     context_observations: Mutex<CopyContextObservations>,
@@ -295,6 +301,7 @@ impl StateProvider for Provider {
         }
     }
     async fn on_data_loss(&self) -> Result<bool> {
+        self.recovery_calls.fetch_add(1, Ordering::AcqRel);
         self.recovery_entered.notify_one();
         if self.hold_recovery.load(Ordering::Acquire) {
             self.recovery_release.notified().await;
@@ -333,13 +340,17 @@ struct Tasks {
     failures: Vec<String>,
 }
 impl Tasks {
+    fn record(&mut self, result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.failures.push(error.to_string()),
+            Err(error) => self.failures.push(error.to_string()),
+        }
+    }
+
     async fn drain(&mut self) -> Result<()> {
         while let Some(result) = self.tasks.join_next().await {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => self.failures.push(error.to_string()),
-                Err(error) => self.failures.push(error.to_string()),
-            }
+            self.record(result);
         }
         if self.failures.is_empty() {
             Ok(())
@@ -349,11 +360,16 @@ impl Tasks {
     }
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "native conformance retains the same ordinarily created primary"
+)]
 pub struct ExternalService {
     provider: Arc<Provider>,
     address: String,
     partition: Mutex<Option<StatefulServicePartition>>,
     control: Mutex<Option<Arc<dyn Replicator>>>,
+    primary: Mutex<Option<Arc<dyn PrimaryReplicator>>>,
     replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
     write_gate: Arc<AsyncMutex<()>>,
     writes: AsyncMutex<Tasks>,
@@ -390,6 +406,7 @@ impl ExternalService {
                 hold_recovery: AtomicBool::new(false),
                 recovery_entered: Notify::new(),
                 recovery_release: Notify::new(),
+                recovery_calls: AtomicUsize::new(0),
                 advertised_context,
                 expected_context,
                 context_observations: Mutex::new(CopyContextObservations::default()),
@@ -397,6 +414,7 @@ impl ExternalService {
             address,
             partition: Mutex::new(None),
             control: Mutex::new(None),
+            primary: Mutex::new(None),
             replicator: Mutex::new(None),
             write_gate: Arc::new(AsyncMutex::new(())),
             writes: AsyncMutex::new(Tasks::default()),
@@ -413,6 +431,30 @@ impl ExternalService {
     /// Returns an owned snapshot of observations recorded by provider callbacks.
     pub fn copy_context_observations(&self) -> CopyContextObservations {
         self.provider.context_observations.lock().unwrap().clone()
+    }
+
+    /// Calls the existing native callback without authorizing a host history change.
+    pub async fn native_data_loss(&self) -> Result<bool> {
+        let primary = self
+            .primary
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(RuntimeError::NotOpen)?;
+        primary.on_data_loss().await
+    }
+
+    pub fn data_loss_calls(&self) -> usize {
+        self.provider.recovery_calls.load(Ordering::Acquire)
+    }
+
+    /// Observes completed consumer tasks without stopping or joining live work.
+    pub async fn stream_failure(&self) -> Option<String> {
+        let mut streams = self.streams.lock().await;
+        while let Some(result) = streams.tasks.try_join_next() {
+            streams.record(result);
+        }
+        streams.failures.first().cloned()
     }
 
     /// Reads persisted application state with the normal format/checksum decoder.
@@ -661,6 +703,7 @@ impl StatefulServiceReplica for ExternalService {
             return Err(RuntimeError::Closed);
         }
         *self.replicator.lock().unwrap() = interfaces.state_replicator();
+        *self.primary.lock().unwrap() = interfaces.primary_replicator();
         *self.control.lock().unwrap() = Some(control.clone());
         Ok(control)
     }
@@ -705,6 +748,7 @@ impl StatefulServiceReplica for ExternalService {
         let streams = self.streams.lock().await.drain().await;
         self.partition.lock().unwrap().take();
         self.replicator.lock().unwrap().take();
+        self.primary.lock().unwrap().take();
         self.control.lock().unwrap().take();
         writes.and(streams)
     }

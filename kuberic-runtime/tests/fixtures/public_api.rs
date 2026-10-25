@@ -14,7 +14,7 @@ use kuberic_runtime::host::{
     ReplicaHandle, ReplicaHost, ReplicaProcessConfig, RunningReplica,
 };
 use kuberic_runtime::protocol::public_operations::{
-    ProgressQueryResult, PublicBuildInput, PublicConfiguration, PublicInboundBuildAuthority,
+    ProgressQueryResult, PublicBuildInput, PublicConfiguration,
     PublicOperationIntent, PublicOperationProgram, PublicOperationReplayDisposition,
     PublicProgress, PublicProgressRole, PublicV1AgentReport, PublicV1EngineIdleObservation,
     PublicV1InstalledConfiguration, PublicV1RemoteBuildObservation, PublicV1RemoteBuildState,
@@ -22,7 +22,7 @@ use kuberic_runtime::protocol::public_operations::{
 use kuberic_runtime::protocol::types::{Epoch, OperationId, ReplicaId, ReplicaRole};
 use kuberic_runtime::replicator::stream::{OperationKind, OperationStream, ReceivedOperation};
 use kuberic_runtime::replicator::{
-    CallbackOwnership, CustomReplicatorControl, DefaultReplicatorFactory, PrimaryReplicator,
+    DefaultReplicatorFactory, PrimaryReplicator,
     ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode, Replication, Replicator,
     ReplicatorCapabilities, ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorSettings,
     StateReplicator,
@@ -51,38 +51,6 @@ fn stream_from_concrete(
 }
 
 struct ProtectedContracts;
-
-// Compile-only independent companion: not native/database qualification.
-#[async_trait]
-impl CustomReplicatorControl for ProtectedContracts {
-    fn callback_ownership(&self) -> CallbackOwnership {
-        CallbackOwnership::ObjectOwnedOnInterruption
-    }
-    async fn install_inbound_build_authority(&self, _: &PublicInboundBuildAuthority) -> Result<()> {
-        Err(kuberic_runtime::RuntimeError::AuthorityNotAdmitted)
-    }
-    async fn revoke_inbound_build_authority(&self, _: &PublicInboundBuildAuthority) -> Result<()> {
-        Err(kuberic_runtime::RuntimeError::AuthorityNotAdmitted)
-    }
-    async fn idle_replicas(&self, _: &PublicConfiguration) -> Result<Vec<ReplicaId>> {
-        Err(kuberic_runtime::RuntimeError::ProgressNotReady)
-    }
-    async fn shutdown_and_drain(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-async fn custom_controller_api(
-    context: ReplicatorFactoryContext,
-    build: OperationId,
-) -> Result<()> {
-    let owner = Arc::new(ProtectedContracts);
-    let _bundle =
-        ReplicatorInterfaces::primary(owner.clone(), None, ReplicatorCapabilities::conservative())
-            .with_custom_control(&context, owner)?;
-    let authority = context.outbound_build_authority(&build).await?;
-    context.validate_build_authority(&authority).await
-}
 
 #[async_trait]
 impl Replicator for ProtectedContracts {
@@ -279,14 +247,9 @@ fn remote_build_observation_api(
     }];
 }
 
-fn frozen_build_endpoints_api(
-    build: &PublicBuildInput,
-    authority: &mut PublicInboundBuildAuthority,
-) {
+fn frozen_build_endpoints_api(build: &PublicBuildInput) {
     let _: &String = &build.source_address;
-    authority.source_address = build.source_address.clone();
-    authority.target_address = build.replication_address.clone();
-    let _: &String = &authority.source_address;
+    let _: &String = &build.replication_address;
 }
 
 fn conservative_native_creation_api(

@@ -1,5 +1,5 @@
 use super::{ReplicaRef, ResourceRef};
-use crate::crd::{KubericSet, PublicV1OperationStatus, PublicV1TransitionState};
+use crate::crd::KubericSet;
 use kuberic_runtime::protocol::public_operations::{PublicOperationProgram, PublicV1CallKind};
 use std::{
     collections::BTreeSet,
@@ -139,7 +139,7 @@ impl SwitchoverRequest {
     }
 }
 
-/// Detached evidence of the exact persisted command and frozen transition.
+/// Detached evidence of the exact persisted controller status.
 #[derive(Clone, Debug)]
 pub struct OperationEvidence {
     set: KubericSet,
@@ -150,24 +150,6 @@ impl OperationEvidence {
     }
     pub fn set(&self) -> &KubericSet {
         &self.set
-    }
-    pub fn operation(&self) -> &PublicV1OperationStatus {
-        self.set
-            .status
-            .as_ref()
-            .unwrap()
-            .public_v1_operation
-            .as_ref()
-            .unwrap()
-    }
-    pub fn transition(&self) -> &PublicV1TransitionState {
-        self.set
-            .status
-            .as_ref()
-            .unwrap()
-            .public_v1_transition
-            .as_ref()
-            .unwrap()
     }
 }
 
