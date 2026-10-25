@@ -2163,6 +2163,9 @@ impl<F: ApplicationFactory> TestCluster<F> {
                 "barrier request belongs to another cluster",
             ));
         }
+        if let Some(request) = barrier.request() {
+            self.validate(request.target()).await?;
+        }
         let mut held = self.core.api.arm_typed(&self.core.name, barrier)?;
         let value = loop {
             self.check().await?;
@@ -2176,12 +2179,14 @@ impl<F: ApplicationFactory> TestCluster<F> {
         self.core.cancel_controller_call();
         let owner = uuid::Uuid::new_v4();
         self.paused = Some(owner);
+        let goal = held.goal();
         Ok(Pause {
             cluster: self.nonce,
             owner,
             barrier: Some(held),
             evidence: OperationEvidence::new(
                 serde_json::from_value(value).map_err(anyhow::Error::from)?,
+                goal,
             ),
         })
     }

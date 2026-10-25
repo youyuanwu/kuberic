@@ -44,6 +44,216 @@ impl EmptyApplication {
 struct EmptyState;
 pub(super) struct EmptyFactory;
 
+#[tokio::test]
+async fn ordinary_role_barriers_match_exact_scope_role_stage_and_request() -> Result<()> {
+    let mut cluster = TestCluster::builder(EmptyFactory)
+        .initial_replicas(2)
+        .start()
+        .await?;
+    let result = async {
+        let topology = cluster.settle_members(2).await?;
+        let primary = topology.primary().clone();
+        let secondary = topology.secondaries().next().unwrap().clone();
+        let mut set = cluster.observe().await?.set().clone();
+        let goals = &set.status.as_ref().context("status missing")?.replica_goals;
+        let primary_goal = goals
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Prepare {
+                        role: ReplicaRole::Primary
+                    }
+                )
+            })
+            .context("actual primary Prepare missing")?
+            .clone();
+        let secondary_goal = goals
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        ..
+                    }
+                )
+            })
+            .context("actual secondary role receipt missing")?
+            .clone();
+        let current_primary = goals
+            .iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        ..
+                    }
+                ) && entry.goal.scope.configuration.previous.is_none()
+            })
+            .context("actual current primary configuration missing")?
+            .clone();
+        for stage in [BarrierStage::Intent, BarrierStage::Completion] {
+            let mut entry = primary_goal.clone();
+            if stage == BarrierStage::Intent {
+                entry.outcome = None;
+            }
+            let selected = Barrier::Role {
+                stage,
+                role: ReplicaRole::Primary,
+                participant: Some(primary.clone()),
+            };
+            assert!(selected.matches_goal(&entry, &set));
+            assert!(
+                Barrier::Operation {
+                    stage,
+                    kind: Some(PublicV1CallKind::Role),
+                    participant: Some(primary.clone()),
+                }
+                .matches_goal(&entry, &set)
+            );
+            assert!(
+                !Barrier::Role {
+                    stage,
+                    role: ReplicaRole::IdleSecondary,
+                    participant: Some(primary.clone()),
+                }
+                .matches_goal(&entry, &set)
+            );
+            assert!(
+                !Barrier::Role {
+                    stage,
+                    role: ReplicaRole::Primary,
+                    participant: Some(secondary.clone()),
+                }
+                .matches_goal(&entry, &set)
+            );
+            let mut crossed = entry.clone();
+            crossed.goal.scope.creation_id = ReplicatorCreationId::new("another-creation");
+            crossed.digest = crossed.goal.intent().input_digest;
+            if let Some(outcome) = &mut crossed.outcome {
+                outcome.goal = crossed.goal.clone();
+            }
+            crossed.validate().map_err(anyhow::Error::msg)?;
+            assert!(!selected.matches_goal(&crossed, &set));
+            let mut crossed_storage = entry.clone();
+            crossed_storage.goal.scope.storage.storage_generation =
+                StorageGeneration::new("another-storage");
+            crossed_storage.digest = crossed_storage.goal.intent().input_digest;
+            if let Some(outcome) = &mut crossed_storage.outcome {
+                outcome.goal = crossed_storage.goal.clone();
+            }
+            crossed_storage.validate().map_err(anyhow::Error::msg)?;
+            assert!(!selected.matches_goal(&crossed_storage, &set));
+            let mut invalid = entry.clone();
+            invalid.goal.revision += 1;
+            assert!(!selected.matches_goal(&invalid, &set));
+            let mut another_set = set.clone();
+            another_set.metadata.uid = Some("another-resource".into());
+            assert!(
+                !Barrier::Role {
+                    stage,
+                    role: ReplicaRole::Primary,
+                    participant: None,
+                }
+                .matches_goal(&entry, &another_set)
+            );
+            entry.outcome = if stage == BarrierStage::Intent {
+                primary_goal.outcome.clone()
+            } else {
+                None
+            };
+            assert!(!selected.matches_goal(&entry, &set));
+        }
+        let request = cluster.submit_switchover(&secondary).await?;
+        let spec = cluster.observe().await?.set().spec.switchover.clone();
+        set.status
+            .as_mut()
+            .unwrap()
+            .public_v1_topology
+            .as_mut()
+            .unwrap()
+            .pending_switchover = spec;
+        let mut intent = secondary_goal.clone();
+        intent.outcome = None;
+        let prepare = Barrier::SwitchoverPeerEpoch {
+            request: request.clone(),
+            peer: secondary.clone(),
+        };
+        let configured = Barrier::SwitchoverPeerConfiguration {
+            request: request.clone(),
+            peer: secondary.clone(),
+        };
+        assert!(prepare.matches_goal(&intent, &set));
+        assert!(configured.matches_goal(&secondary_goal, &set));
+
+        // Matching a hypothetical handoff goal does not execute M3 policy.
+        let mut goal = current_primary.goal.clone();
+        let mut members = goal.scope.configuration.current.members.clone();
+        for member in &mut members {
+            member.role = if member.identity == *secondary.identity() {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            };
+        }
+        goal.scope.configuration.current = ConfigurationDescriptor::new(
+            goal.scope.epoch,
+            secondary.identity().replica_id,
+            members,
+            goal.scope.configuration.current.write_quorum,
+        );
+        for replica in &mut goal.scope.configuration.replicas {
+            if replica.identity == *secondary.identity() {
+                replica.role = ReplicaRole::Primary;
+            }
+        }
+        goal.desired = ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::ActiveSecondary,
+            catch_up: None,
+        };
+        let handoff_goal =
+            crate::crd::RetainedReplicaGoal::new(goal).map_err(anyhow::Error::msg)?;
+        let handoff = Barrier::SwitchoverHandoff {
+            request,
+            source: primary,
+            stage: BarrierStage::Intent,
+        };
+        assert!(handoff.matches_goal(&handoff_goal, &set));
+        let mut crossed_peer = handoff_goal.goal.clone();
+        crossed_peer
+            .scope
+            .configuration
+            .replicas
+            .iter_mut()
+            .find(|replica| replica.identity == *secondary.identity())
+            .context("selected target descriptor missing")?
+            .process_session_id = ProcessSessionId::new("another-process");
+        let crossed_peer =
+            crate::crd::RetainedReplicaGoal::new(crossed_peer).map_err(anyhow::Error::msg)?;
+        assert!(!handoff.matches_goal(&crossed_peer, &set));
+        set.status
+            .as_mut()
+            .unwrap()
+            .public_v1_topology
+            .as_mut()
+            .unwrap()
+            .pending_switchover
+            .as_mut()
+            .unwrap()
+            .request_id = "different-request".into();
+        assert!(!prepare.matches_goal(&intent, &set));
+        assert!(!configured.matches_goal(&secondary_goal, &set));
+        assert!(!handoff.matches_goal(&handoff_goal, &set));
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    cluster.finish(result).await?;
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl StateProvider for EmptyState {
     async fn update_epoch(&self, _: Epoch, _: i64) -> kuberic_runtime::Result<()> {

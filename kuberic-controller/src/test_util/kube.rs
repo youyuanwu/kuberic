@@ -127,6 +127,7 @@ struct ArmedBarrier {
     call_kind: Option<&'static str>,
     operation_fragment: Option<String>,
     matcher: Option<super::faults::Barrier>,
+    goal: Arc<Mutex<Option<kuberic_runtime::protocol::public_operations::ReplicaGoal>>>,
 }
 
 /// Both barriers publish the persisted object before waiting, without a store lock.
@@ -135,11 +136,16 @@ struct ArmedBarrier {
 pub(super) struct StatusBarrier {
     entered: oneshot::Receiver<Value>,
     release: Option<oneshot::Sender<()>>,
+    goal: Arc<Mutex<Option<kuberic_runtime::protocol::public_operations::ReplicaGoal>>>,
 }
 
 impl StatusBarrier {
     pub(super) async fn entered(&mut self) -> anyhow::Result<Value> {
         Ok((&mut self.entered).await?)
+    }
+
+    pub(super) fn goal(&self) -> Option<kuberic_runtime::protocol::public_operations::ReplicaGoal> {
+        self.goal.lock().unwrap().clone()
     }
 
     pub(super) fn release(mut self) {
@@ -336,6 +342,7 @@ impl ApiServer {
         anyhow::ensure!(slot.is_none(), "status barrier is already armed");
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
+        let goal = Arc::new(Mutex::new(None));
         *slot = Some(ArmedBarrier {
             key,
             uid,
@@ -344,10 +351,12 @@ impl ApiServer {
             call_kind,
             operation_fragment: operation_fragment.map(str::to_owned),
             matcher: None,
+            goal: goal.clone(),
         });
         Ok(StatusBarrier {
             entered,
             release: Some(release),
+            goal,
         })
     }
 
@@ -888,6 +897,7 @@ fn is_deleting(object: &Value) -> bool {
 fn barrier_matches(barrier: &Option<ArmedBarrier>, key: &Key, object: &Value) -> bool {
     barrier.as_ref().is_some_and(|barrier| {
         &barrier.key == key
+            && barrier.matcher.is_none()
             && object["metadata"]["uid"] == barrier.uid
             && barrier.call_kind.is_none_or(|kind| {
                 object["status"]["publicV1Transition"]["callKind"].as_str() == Some(kind)
@@ -900,10 +910,6 @@ fn barrier_matches(barrier: &Option<ArmedBarrier>, key: &Key, object: &Value) ->
                         .as_str()
                         .is_some_and(|id| id.contains(fragment))
                 })
-            && barrier
-                .matcher
-                .as_ref()
-                .is_none_or(|matcher| matcher.matches(object))
     })
 }
 
@@ -940,11 +946,23 @@ fn ordinary_barrier_matches(
         } else {
             previous.is_none() && entry["outcome"].is_null()
         };
-        changed
-            && barrier.matcher.as_ref().is_none_or(|matcher| {
-                serde_json::from_value(entry.clone())
-                    .is_ok_and(|entry| matcher.matches_goal(&entry))
+        if !changed {
+            return false;
+        }
+        let Ok(entry) = serde_json::from_value::<crate::crd::RetainedReplicaGoal>(entry.clone())
+        else {
+            return false;
+        };
+        if entry.validate().is_err()
+            || barrier.matcher.as_ref().is_some_and(|matcher| {
+                !serde_json::from_value::<crate::crd::KubericSet>(next.clone())
+                    .is_ok_and(|set| matcher.matches_goal(&entry, &set))
             })
+        {
+            return false;
+        }
+        *barrier.goal.lock().unwrap() = Some(entry.goal);
+        true
     })
 }
 

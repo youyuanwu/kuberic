@@ -145,7 +145,18 @@ until cleanup is acknowledged. A group cut supports quorum-loss scenarios
 without concurrent independent tokens.
 
 Typed switchover submission/clear and retained pause/resume controls support
-deterministic intent/completion cuts. While paused, use `probe` for a real
+deterministic ordinary-goal intent/completion cuts. `Barrier::Role` selects an
+exact Prepare/Reconfigure role and optional current participant. Typed barriers
+match canonical goals, not legacy callback-program status. Staged switchover
+selectors bind the retained request and participant at whole role/scope goals;
+they do not certify inner native callback cuts or implement M3 policy.
+
+Intent holds a persisted goal before dispatch. Completion holds a conflicting
+status reply after the actual retained result, before controller acceptance.
+`pause.evidence().goal()` identifies the exact changed goal and its canonical
+digest in that persisted evidence, rather than guessing from completed history.
+Fixtures check the real agent result and separate controller acceptance.
+While paused, use `probe` for a real
 application write, inspect detached observations, update only the requested
 spec, or recreate the controller without releasing the cut. Accepted frozen
 authority remains controller-owned. No raw Kubernetes client, reconciler,

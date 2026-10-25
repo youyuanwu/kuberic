@@ -1,14 +1,16 @@
 use anyhow::{Context, Result, bail, ensure};
 use k8s_openapi::api::core::v1::{Pod, Secret, Service};
 use kube::{Resource, ResourceExt};
-use kuberic_controller::crd::PublicV1OperationStatus;
+use kuberic_controller::crd::RetainedReplicaGoal;
 use kuberic_runtime::protocol::public_operations::{
-    PublicOperationProgram, PublicV1AcceptedOperationCompletion, PublicV1CallKind,
-    PublicV1OperationResult,
+    PublicV1CallKind, ReplicaGoalKind, ReplicaGoalObservation, ReplicaGoalStatus,
 };
+use kuberic_runtime::protocol::types::{ReplicaIdentity, ReplicaRole};
 
 use super::harness::Harness;
-use kuberic_controller::test_util::{Barrier, BarrierStage, ResourceKind as Kind, SupportResource};
+use kuberic_controller::test_util::{
+    Barrier, BarrierStage, OperationEvidence, ResourceKind as Kind, SupportResource,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_v1_nonempty_copy_separates_remote_ready_idle_and_voting() -> Result<()> {
@@ -581,17 +583,22 @@ async fn replacement_then_restart_publishes_exact_retained_storage_session() -> 
         let old = harness.report(2).await?;
         let old_root = harness.data_root(old.replica.instance_id.as_str()).await?;
         let resources = delete_secondary(&mut harness).await?;
-        let _pending_replacement = loop {
-            if let Some(replacement) = harness
-                .set()
-                .await?
-                .status
-                .and_then(|s| s.public_v1_replacement)
-            {
-                break replacement;
-            }
-            harness.step().await?;
-        };
+        eprintln!(
+            "ordinary replacement: old resources selected; awaiting a new-incarnation Build goal"
+        );
+        let replacement_build =
+            loop {
+                let set = harness.set().await?;
+                if let Some(build) = set.status.as_ref().and_then(|status| {
+                    build_for_new_incarnation(&status.replica_goals, &old.replica)
+                }) {
+                    build.validate().map_err(anyhow::Error::msg)?;
+                    break build.clone();
+                }
+                harness.step().await.context(
+                    "ordinary replacement Build selection after retiring the predecessor",
+                )?;
+            };
         harness.ready().await?;
         let replacement = harness.report(2).await?;
         let replacement_root = harness
@@ -609,6 +616,16 @@ async fn replacement_then_restart_publishes_exact_retained_storage_session() -> 
         ensure!(
             old.replica != replacement.replica
                 && old.storage_incarnation != replacement.storage_incarnation
+        );
+        let ReplicaGoalKind::Build { remote } = &replacement_build.goal.desired else {
+            bail!("replacement did not retain an ordinary Build")
+        };
+        ensure!(
+            replacement.replica == remote.target.scope.storage.replica
+                && replacement.storage_incarnation == remote.target.scope.storage
+                && replacement.process_session_id == remote.target.scope.process_session_id
+                && replacement.replicator_creation_id == remote.target.scope.creation_id,
+            "replacement admission differs from the selected Build owner"
         );
         for (kind, name, uid) in resources {
             ensure!(
@@ -676,29 +693,40 @@ async fn replacement_then_restart_publishes_exact_retained_storage_session() -> 
     harness.finish(result).await
 }
 
+fn build_for_new_incarnation<'a>(
+    goals: &'a [RetainedReplicaGoal],
+    predecessor: &ReplicaIdentity,
+) -> Option<&'a RetainedReplicaGoal> {
+    goals.iter().find(|entry| {
+        matches!(&entry.goal.desired, ReplicaGoalKind::Build { remote }
+            if remote.target.scope.storage.replica.replica_id == predecessor.replica_id
+                && remote.target.scope.storage.replica.instance_id != predecessor.instance_id)
+    })
+}
+
 async fn assert_exact_completion(
     harness: &mut Harness,
-    persisted: &serde_json::Value,
-) -> Result<PublicV1AcceptedOperationCompletion> {
-    let accepted: PublicV1OperationStatus =
-        serde_json::from_value(persisted["status"]["publicV1Operation"].clone())?;
-    let command = accepted.command().map_err(anyhow::Error::msg)?;
-    let transition: kuberic_controller::crd::PublicV1TransitionState =
-        serde_json::from_value(persisted["status"]["publicV1Transition"].clone())?;
-    let frozen = transition.transition().map_err(anyhow::Error::msg)?.intent;
-    let report = harness
-        .report_uid(command.target.instance_id.as_str())
-        .await?;
-    ensure!(
-        report.replica == command.target,
-        "completion target changed"
-    );
-    let completions = report
-        .completed_operations
+    persisted: &OperationEvidence,
+) -> Result<ReplicaGoalObservation> {
+    let frozen = persisted
+        .goal()
+        .context("barrier did not capture an exact ordinary goal")?;
+    frozen.validate().map_err(anyhow::Error::msg)?;
+    let observed = harness.cluster.observe().await?;
+    let (_, snapshot) = observed
+        .snapshots()
+        .find(|(_, snapshot)| {
+            snapshot.storage == frozen.goal.scope.storage
+                && snapshot.process_session_id == frozen.goal.scope.process_session_id
+                && snapshot.creation_id == frozen.goal.scope.creation_id
+        })
+        .context("completion owner differs from the persisted goal")?;
+    let completions = snapshot
+        .goals
         .iter()
         .filter(|completion| {
-            completion.operation_id == command.intent.operation_id
-                && completion.revision == command.intent.revision
+            completion.goal.operation_id == frozen.goal.operation_id
+                && completion.goal.revision == frozen.goal.revision
         })
         .collect::<Vec<_>>();
     ensure!(
@@ -707,22 +735,203 @@ async fn assert_exact_completion(
     );
     let completion = completions[0];
     ensure!(
-        completion.process_session_id == command.intent.process_session_id
-            && completion.input_digest == command.intent.input_digest
-            && completion.replay_disposition == command.intent.replay_disposition
-            && completion.call_kind == frozen.call_kind
-            && completion.history == frozen.history
-            && completion.storage_incarnation == frozen.source.storage_incarnation
-            && completion.previous_configuration_id == frozen.previous_configuration_id
-            && completion.current_configuration_id == frozen.current_configuration_id
-            && completion.catch_up_mode == frozen.catch_up_mode
-            && completion.catch_up_specific_quorum == frozen.catch_up_specific_quorum
-            && completion.result == PublicV1OperationResult::Succeeded,
-        "completion differs from the persisted operation"
+        completion.goal == frozen.goal && completion.status == ReplicaGoalStatus::Achieved,
+        "completion differs from the persisted ordinary goal"
     );
-    Ok(PublicV1AcceptedOperationCompletion::from_completion(
-        completion,
-    ))
+    Ok((*completion).clone())
+}
+
+async fn assert_accepted_completion(
+    harness: &mut Harness,
+    persisted: &OperationEvidence,
+) -> Result<ReplicaGoalObservation> {
+    let completion = assert_exact_completion(harness, persisted).await?;
+    let frozen = persisted.goal().context("ordinary goal missing")?;
+    let status = harness.set().await?.status.context("status missing")?;
+    let accepted = status
+        .replica_goals
+        .iter()
+        .filter(|entry| {
+            entry.goal.operation_id == frozen.goal.operation_id
+                && entry.goal.revision == frozen.goal.revision
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches!(accepted.as_slice(), [entry]
+            if entry.goal == frozen.goal
+                && entry.digest == frozen.digest
+                && entry.outcome.as_ref() == Some(&completion)),
+        "the exact ordinary result was not accepted once"
+    );
+    Ok(completion)
+}
+
+async fn assert_unaccepted_goal_boundary(
+    harness: &mut Harness,
+    persisted: &OperationEvidence,
+    stage: BarrierStage,
+) -> Result<()> {
+    let frozen = persisted.goal().context("ordinary boundary goal missing")?;
+    frozen.validate().map_err(anyhow::Error::msg)?;
+    let observed = harness.cluster.observe().await?;
+    let retained = observed
+        .set()
+        .status
+        .as_ref()
+        .context("boundary status missing")?
+        .replica_goals
+        .iter()
+        .find(|entry| entry.goal == frozen.goal)
+        .context("boundary goal was lost")?;
+    ensure!(
+        retained.digest == frozen.digest && retained.outcome.is_none(),
+        "boundary was observed after controller result acceptance"
+    );
+    if stage == BarrierStage::Completion {
+        assert_exact_completion(harness, persisted).await?;
+    } else {
+        let (_, snapshot) = observed
+            .snapshots()
+            .find(|(_, snapshot)| {
+                snapshot.storage == frozen.goal.scope.storage
+                    && snapshot.process_session_id == frozen.goal.scope.process_session_id
+                    && snapshot.creation_id == frozen.goal.scope.creation_id
+            })
+            .context("intent owner missing")?;
+        ensure!(
+            !snapshot.goals.iter().any(|entry| {
+                entry.goal.operation_id == frozen.goal.operation_id
+                    && entry.goal.revision == frozen.goal.revision
+            }),
+            "intent boundary already dispatched its goal"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_primary_role_barriers_retain_exact_goal_across_recreation() -> Result<()> {
+    for stage in [BarrierStage::Intent, BarrierStage::Completion] {
+        let mut harness = Harness::with_members(1).await?;
+        let result = async {
+            let pause = harness
+                .cluster
+                .pause_at(Barrier::Role {
+                    stage,
+                    role: ReplicaRole::Primary,
+                    participant: None,
+                })
+                .await?;
+            let frozen = pause.evidence().clone();
+            ensure!(matches!(
+                frozen.goal().context("role goal missing")?.goal.desired,
+                ReplicaGoalKind::Prepare {
+                    role: ReplicaRole::Primary
+                } | ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    ..
+                }
+            ));
+            assert_unaccepted_goal_boundary(&mut harness, &frozen, stage).await?;
+            harness.recreate_controller().await?;
+            ensure!(harness.set().await?.status == frozen.set().status);
+            harness.cluster.resume(pause).await?;
+            let primary = harness.ready_members(1).await?;
+            assert_accepted_completion(&mut harness, &frozen).await?;
+            let writer = harness.service(primary).await?;
+            harness
+                .cluster
+                .probe(writer.replicate_put("role-boundary".into(), "retained".into()))
+                .await?;
+            ensure!(writer.get("role-boundary").await?.as_deref() == Some("retained"));
+            Ok(())
+        }
+        .await;
+        harness.finish(result).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_build_barriers_select_changed_goal_not_completed_history() -> Result<()> {
+    use kuberic_runtime::engine::DurableState;
+    use kuberic_runtime::protocol::types::ReplicaInstanceId;
+
+    for stage in [BarrierStage::Intent, BarrierStage::Completion] {
+        let mut harness = Harness::with_members(2).await?;
+        let result = async {
+            let primary = harness.ready_members(2).await?;
+            let source = harness.reference(primary).await?;
+            let writer = harness.cluster.service(&source).await?;
+            let baseline = harness
+                .cluster
+                .probe(writer.replicate_put("barrier-prefix".into(), "acknowledged".into()))
+                .await?;
+            harness.cluster.scale_to(3).await?;
+            let pause = harness
+                .cluster
+                .pause_at(Barrier::Operation {
+                    stage,
+                    kind: Some(PublicV1CallKind::Build),
+                    participant: Some(source),
+                })
+                .await?;
+            let frozen = pause.evidence().clone();
+            let selected = frozen.goal().context("changed Build goal missing")?;
+            let ReplicaGoalKind::Build { remote } = &selected.goal.desired else {
+                bail!("Build barrier selected another kind")
+            };
+            ensure!(remote.target.scope.storage.replica.replica_id.value() == 3);
+            let goals = &frozen
+                .set()
+                .status
+                .as_ref()
+                .context("status missing")?
+                .replica_goals;
+            ensure!(
+                goals.iter().any(|entry| {
+                    matches!(&entry.goal.desired, ReplicaGoalKind::Build { remote }
+                    if remote.target.scope.storage.replica.replica_id.value() == 2)
+                        && entry
+                            .outcome
+                            .as_ref()
+                            .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+                }),
+                "fixture lacks completed Build history"
+            );
+            let mut predecessor = remote.target.scope.storage.replica.clone();
+            ensure!(build_for_new_incarnation(goals, &predecessor).is_none());
+            predecessor.instance_id = ReplicaInstanceId::new("previous-instance");
+            ensure!(build_for_new_incarnation(goals, &predecessor) == Some(selected));
+            let target = harness
+                .service_uid(remote.target.scope.storage.replica.instance_id.as_str())
+                .await?;
+            ensure!(
+                target.persistence().durable_progress().await?.applied_lsn
+                    == if stage == BarrierStage::Completion {
+                        baseline
+                    } else {
+                        0
+                    }
+            );
+            assert_unaccepted_goal_boundary(&mut harness, &frozen, stage).await?;
+            harness.recreate_controller().await?;
+            ensure!(harness.set().await?.status == frozen.set().status);
+            harness.cluster.resume(pause).await?;
+            harness.ready_members(3).await?;
+            assert_accepted_completion(&mut harness, &frozen).await?;
+            ensure!(target.persistence().get("barrier-prefix").as_deref() == Some("acknowledged"));
+            harness
+                .cluster
+                .probe(writer.replicate_put("barrier-after".into(), "acknowledged".into()))
+                .await?;
+            ensure!(target.persistence().get("barrier-after").as_deref() == Some("acknowledged"));
+            Ok(())
+        }
+        .await;
+        harness.finish(result).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -858,6 +1067,7 @@ async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> 
         harness.assert_values("replacement", "before").await?;
         let old = harness.report(2).await?;
         let uid = old.replica.instance_id.to_string();
+        let old_root = harness.data_root(&uid).await?;
         let pod: Pod = harness
             .api
             .snapshot(Kind::Pod)
@@ -878,17 +1088,25 @@ async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> 
                 let configuration = topology
                     .configuration()
                     .map_err(|error| anyhow::anyhow!("{error}"))?;
-                if configuration.members.iter().any(|member| {
+                if let Some(member) = configuration.members.iter().find(|member| {
                     member.identity.replica_id.value() == 2
                         && member.identity.instance_id.as_str() != uid
                 }) {
+                    let build = build_for_new_incarnation(&status.replica_goals, &old.replica)
+                        .context("replacement lost its ordinary Build provenance")?;
+                    build.validate().map_err(anyhow::Error::msg)?;
                     ensure!(
-                        status.public_v1_replacement.is_some(),
-                        "cleanup authority cleared before exact absence"
+                        matches!(&build.goal.desired, ReplicaGoalKind::Build { remote }
+                            if remote.target.scope.storage.replica == member.identity),
+                        "replacement topology differs from its selected ordinary Build"
                     );
                     ensure!(
                         harness.api.get(Kind::Pod, &pod.name_any()).is_some(),
                         "held predecessor disappeared"
+                    );
+                    ensure!(
+                        old_root.exists(),
+                        "predecessor storage was erased before exact Pod absence"
                     );
                     break;
                 }
@@ -1680,7 +1898,7 @@ async fn changed_switchover(retarget: bool) -> Result<()> {
                     peer,
                 })
                 .await?;
-            let frozen = serde_json::to_value(pause.evidence().set())?;
+            let frozen = pause.evidence().clone();
             let completed = assert_exact_completion(&mut harness, &frozen).await?;
             let set = harness.set().await?;
             let topology = set
@@ -1739,18 +1957,9 @@ async fn changed_switchover(retarget: bool) -> Result<()> {
                 harness.step().await?;
             }
             ensure!(harness.ready().await? == target);
-            let status = harness.set().await?.status.unwrap();
             ensure!(
-                status
-                    .public_v1_authority
-                    .unwrap()
-                    .authority()
-                    .map_err(anyhow::Error::msg)?
-                    .completed_operations
-                    .iter()
-                    .filter(|entry| **entry == completed)
-                    .count()
-                    == 1
+                assert_accepted_completion(&mut harness, &frozen).await? == completed,
+                "controller acceptance changed the exact retained result"
             );
             reject_write(&old_service, "frozen-stale").await?;
             harness
@@ -1870,7 +2079,7 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
                     },
                 })
                 .await?;
-            let frozen = serde_json::to_value(pause.evidence().set())?;
+            let frozen = pause.evidence().clone();
             ensure!(
                 harness
                     .set()
@@ -1897,11 +2106,13 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
         loop {
             let set = harness.set().await?;
             ensure!(
-                set.status
-                    .as_ref()
-                    .is_none_or(|status| status.public_v1_replacement.is_none()),
-                "switchover requested corrective replacement: {:?}",
-                set.status
+                harness.api.snapshot(Kind::Pod).iter().all(|pod| {
+                    pod["metadata"]["deletionTimestamp"].is_null()
+                        && sessions.iter().any(|(uid, _, _)| {
+                            pod["metadata"]["uid"].as_str() == Some(uid.as_str())
+                        })
+                }),
+                "switchover requested corrective Pod replacement"
             );
             if set
                 .status
@@ -1928,7 +2139,7 @@ async fn switchover(cut: Option<bool>) -> Result<()> {
             .assert_values("switch-after-first-catch-up", "racing-transfer")
             .await?;
         if let Some(frozen) = frozen {
-            assert_exact_completion(&mut harness, &frozen).await?;
+            assert_accepted_completion(&mut harness, &frozen).await?;
         }
         reject_write(&old_service, "switch-stale").await?;
         harness
@@ -2176,76 +2387,59 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
         } else {
             delete_secondary(&mut harness).await?
         };
-        let pause = harness
-            .cluster
-            .pause_at(Barrier::Operation {
-                stage: if completion {
-                    BarrierStage::Completion
-                } else {
-                    BarrierStage::Intent
-                },
-                kind: Some(if failover {
-                    PublicV1CallKind::Role
-                } else {
-                    PublicV1CallKind::Build
-                }),
+        let stage = if completion {
+            BarrierStage::Completion
+        } else {
+            BarrierStage::Intent
+        };
+        let barrier = if failover {
+            Barrier::Role {
+                stage,
+                role: ReplicaRole::Primary,
                 participant,
-            })
-            .await?;
-        let frozen = serde_json::to_value(pause.evidence().set())?;
-        let accepted: PublicV1OperationStatus =
-            serde_json::from_value(frozen["status"]["publicV1Operation"].clone())?;
-        let command = accepted.command().map_err(anyhow::Error::msg)?;
+            }
+        } else {
+            Barrier::Operation {
+                stage,
+                kind: Some(PublicV1CallKind::Build),
+                participant,
+            }
+        };
+        eprintln!("ordinary recreation: awaiting {stage:?} of the selected {} goal",
+            if failover { "Primary role" } else { "new-incarnation Build" });
+        let pause = harness.cluster.pause_at(barrier).await
+            .context("ordinary recreation boundary after predecessor isolation/deletion")?;
+        let frozen = pause.evidence().clone();
+        let accepted = frozen.goal().context("ordinary boundary goal missing")?;
+        accepted.validate().map_err(anyhow::Error::msg)?;
         let source_before = harness
-            .report_uid(command.target.instance_id.as_str())
+            .report_uid(accepted.goal.scope.storage.replica.instance_id.as_str())
             .await?;
         let target =
-            if let Some(PublicOperationProgram::Build(build)) = command.intent.program.as_ref() {
+            if let ReplicaGoalKind::Build { remote } = &accepted.goal.desired {
                 let target = harness
-                    .service_uid(build.replica.instance_id.as_str())
+                    .service_uid(remote.target.scope.storage.replica.instance_id.as_str())
                     .await?;
                 let progress = target.persistence().durable_progress().await?;
                 ensure!(progress.applied_lsn == if completion { baseline_lsn } else { 0 });
-                Some((build.replica.instance_id.to_string(), target))
+                Some((remote.target.scope.storage.replica.instance_id.to_string(), target))
             } else {
                 ensure!(failover, "replacement cut missed real Build");
                 ensure!(
                     matches!(
-                        command.intent.program.as_ref(),
-                        Some(PublicOperationProgram::Role {
-                            role: kuberic_runtime::protocol::types::ReplicaRole::Primary,
+                        accepted.goal.desired,
+                        ReplicaGoalKind::Prepare {
+                            role: ReplicaRole::Primary,
+                        } | ReplicaGoalKind::Reconfigure {
+                            role: ReplicaRole::Primary,
                             ..
-                        })
+                        }
                     ),
                     "failover cut missed the accepted primary promotion"
                 );
                 None
             };
-        if completion {
-            let completed = assert_exact_completion(&mut harness, &frozen).await?;
-            let authority = harness
-                .set()
-                .await?
-                .status
-                .unwrap()
-                .public_v1_authority
-                .unwrap()
-                .authority()
-                .map_err(anyhow::Error::msg)?;
-            ensure!(
-                !authority.completed_operations.contains(&completed),
-                "completion cut occurred after authority advancement"
-            );
-        } else {
-            ensure!(
-                !source_before
-                    .completed_operations
-                    .iter()
-                    .any(|entry| entry.operation_id == command.intent.operation_id
-                        && entry.revision == command.intent.revision),
-                "intent cut already executed"
-            );
-        }
+        assert_unaccepted_goal_boundary(&mut harness, &frozen, stage).await?;
         let topology_before = harness
             .set()
             .await?
@@ -2259,17 +2453,11 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
             .api
             .get(Kind::KubericSet, "sample")
             .context("set missing")?;
-        for field in [
-            "publicV1Operation",
-            "publicV1Transition",
-            "publicV1Authority",
-            "publicV1Replacement",
-        ] {
-            ensure!(
-                persisted["status"][field] == frozen["status"][field],
-                "recreation rewrote persisted {field}"
-            );
-        }
+        let persisted: kuberic_controller::crd::KubericSet = serde_json::from_value(persisted)?;
+        ensure!(
+            persisted.status == frozen.set().status,
+            "recreation rewrote persisted ordinary authority/goals"
+        );
         harness.cluster.resume(pause).await?;
         let settled_primary = if failover {
             harness
@@ -2279,27 +2467,9 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
             harness.ready().await?
         };
         ensure!((settled_primary != primary) == failover);
-        let completed = assert_exact_completion(&mut harness, &frozen).await?;
-        let authority = harness
-            .set()
-            .await?
-            .status
-            .unwrap()
-            .public_v1_authority
-            .unwrap()
-            .authority()
-            .map_err(anyhow::Error::msg)?;
-        ensure!(
-            authority
-                .completed_operations
-                .iter()
-                .filter(|entry| **entry == completed)
-                .count()
-                == 1,
-            "matching completion was not consumed exactly once"
-        );
+        assert_accepted_completion(&mut harness, &frozen).await?;
         let source_after = harness
-            .report_uid(command.target.instance_id.as_str())
+            .report_uid(accepted.goal.scope.storage.replica.instance_id.as_str())
             .await?;
         ensure!(
             source_before.process_session_id == source_after.process_session_id
