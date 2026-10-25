@@ -149,6 +149,18 @@ fn achieved(entry: &RetainedReplicaGoal) -> bool {
         .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
 }
 
+fn current_terminal(snapshot: &ReplicaAgentSnapshot) -> bool {
+    snapshot.goals.iter().any(|observation| {
+        observation.goal.scope.storage == snapshot.storage
+            && observation.goal.scope.process_session_id == snapshot.process_session_id
+            && observation.goal.scope.creation_id == snapshot.creation_id
+            && matches!(
+                observation.goal.desired,
+                ReplicaGoalKind::Abort | ReplicaGoalKind::Close
+            )
+    })
+}
+
 impl<A: AgentApi + 'static> KubeClusterApi<A> {
     async fn persist_goals(
         &self,
@@ -421,14 +433,7 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             } else {
                 // An RPC observer can be lost at any point; the same canonical goal is retried.
                 if matches!(entry.goal.desired, ReplicaGoalKind::Build { .. })
-                    && peers.values().any(|snapshot| {
-                        snapshot.goals.iter().any(|observation| {
-                            matches!(
-                                observation.goal.desired,
-                                ReplicaGoalKind::Abort | ReplicaGoalKind::Close
-                            )
-                        })
-                    })
+                    && peers.values().any(|snapshot| current_terminal(snapshot))
                 {
                     pending = true;
                     continue;
@@ -504,17 +509,7 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 "ordinary M1 planned primary replacement is unavailable; creation withdrawal is required",
             ));
         }
-        if peers.values().any(|peer| {
-            peer.goals.iter().any(|observation| {
-                observation.goal.scope.storage == peer.storage
-                    && observation.goal.scope.process_session_id == peer.process_session_id
-                    && observation.goal.scope.creation_id == peer.creation_id
-                    && matches!(
-                        observation.goal.desired,
-                        ReplicaGoalKind::Close | ReplicaGoalKind::Abort
-                    )
-            })
-        }) {
+        if peers.values().any(|peer| current_terminal(peer)) {
             return Ok(action(ReconcileKind::Waiting));
         }
         let primary_id = current

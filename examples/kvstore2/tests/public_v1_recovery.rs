@@ -19,6 +19,11 @@ async fn m2_retired_recovery_cannot_install_late_copy_or_a_successor() {
 }
 
 #[tokio::test]
+async fn m2_predecessor_close_allows_fresh_build_copy_and_admission() {
+    ordinary_recovery::predecessor_close_fresh_growth().await;
+}
+
+#[tokio::test]
 async fn kvstore2_fresh_restart_build_and_corrective_empty_replacement() {
     ordinary_recovery::fresh_restart_build_and_corrective_empty_replacement().await;
 }

@@ -231,3 +231,15 @@ two-ended Ready, configuration receipts and separate access admission.
 recovery tests preserve acknowledged data, closed recovery access, fresh ongoing
 replication and post-restart quorum writes. This bounded repair does not certify
 the full Phase 6 or M3 election, primary replacement, contraction or handoff matrix.
+
+An achieved predecessor Close remains in retained history after restart, but
+does not veto a fresh idle Build for the admitted new process/creation. Both
+Build submission and later scheduling use the same exact live storage/process/
+creation terminal check. A current owner's Abort or Close still blocks Build,
+including pending, failed or uncertain settlement; no terminal history is
+discarded and exact two-ended Ready and separate voter/access admission remain
+required. Production-controller regressions observe the actual native target
+copy before acceptance, and KV growth checks acknowledged `retained`/`later`
+values plus continuing replication before requesting any replacement. The
+historical scenario's subsequent secondary replacement remains a separate M3
+diagnostic, not a fresh-growth acceptance waiver.

@@ -218,42 +218,8 @@ async fn secondary_restart(retire: bool) {
 pub async fn fresh_restart_build_and_corrective_empty_replacement() {
     let mut fixture = Fixture::start("kv-fresh-restart", 1).await;
     let result = async {
-        fixture.replicas[0]
-            .service
-            .replicate_put("retained".into(), "acknowledged".into())
-            .await
-            .unwrap();
-        let old = fixture.replicas[0].reference.clone();
-        let before = fixture.snapshot(0).await;
-        let close = fixture.terminal(0, PublicV1CallKind::Close).await;
-        assert_eq!(fixture.settled(0, &close).await, ReplicaGoalStatus::Achieved);
-        assert!(!fixture.snapshot(0).await.provider_writer_held);
-        eprintln!("actual singleton acknowledged data and ordinary Close/writer settlement passed; requesting production restart");
-        let current = fixture.cluster.request_restart(&old).await?;
-        assert_eq!(current.storage_incarnation(), old.storage_incarnation());
-        assert_ne!(current.process_session_id(), old.process_session_id());
-        assert_ne!(current.replicator_creation_id(), old.replicator_creation_id());
-        let reopened = fixture.cluster.service(&current).await?;
-        assert_eq!(
-            reopened.persistence().get("retained").as_deref(),
-            Some("acknowledged")
-        );
-        let observation = fixture.cluster.observe().await?;
-        let snapshot = observation.snapshot(&current).unwrap();
-        assert_eq!(snapshot.history, before.history);
-        assert_ne!(snapshot.read_status, AccessStatus::Granted);
-        assert_ne!(snapshot.write_status, AccessStatus::Granted);
-        assert!(reopened.replicate_put("early".into(), "forbidden".into()).await.is_err());
-
-        fixture.cluster.settle_members(1).await?;
-        assert_eq!(reopened.get("retained").await.unwrap().as_deref(), Some("acknowledged"));
-        reopened.replicate_put("later".into(), "acknowledged".into()).await.unwrap();
-        fixture.cluster.scale_to(2).await?;
-        let topology = fixture.cluster.settle_members(2).await?;
-        let secondary = topology.secondaries().next().unwrap().clone();
-        let copied = fixture.cluster.service(&secondary).await?;
-        assert_eq!(copied.persistence().get("retained").as_deref(), Some("acknowledged"));
-        assert_eq!(copied.persistence().get("later").as_deref(), Some("acknowledged"));
+        let secondary = fresh_restart_growth(&mut fixture).await?;
+        eprintln!("actual fresh growth retained/later KV copy and admission passed; requesting M3 secondary replacement");
         fixture.cluster.delete_replica(&secondary).await?;
         let replacement = fixture.cluster.settle_members(2).await?;
         let fresh = replacement.secondaries().next().unwrap().clone();
@@ -265,6 +231,153 @@ pub async fn fresh_restart_build_and_corrective_empty_replacement() {
         Ok::<(), kuberic_controller::test_util::TestError>(())
     }.await;
     fixture.finish(result).await;
+}
+
+#[allow(dead_code, reason = "selected by the KV recovery integration binary")]
+pub async fn predecessor_close_fresh_growth() {
+    let mut fixture = Fixture::start("m2-predecessor-close-growth", 1).await;
+    let result = fresh_restart_growth(&mut fixture).await.map(|_| ());
+    fixture.finish(result).await;
+}
+
+async fn fresh_restart_growth(
+    fixture: &mut Fixture,
+) -> kuberic_controller::test_util::Result<kuberic_controller::test_util::ReplicaRef> {
+    fixture.replicas[0]
+        .service
+        .replicate_put("retained".into(), "acknowledged".into())
+        .await
+        .unwrap();
+    let old = fixture.replicas[0].reference.clone();
+    let before = fixture.snapshot(0).await;
+    let close = fixture.terminal(0, PublicV1CallKind::Close).await;
+    assert_eq!(
+        fixture.settled(0, &close).await,
+        ReplicaGoalStatus::Achieved
+    );
+    assert!(!fixture.snapshot(0).await.provider_writer_held);
+    eprintln!(
+        "actual singleton acknowledged data and ordinary Close/writer settlement passed; requesting production restart"
+    );
+    let current = fixture.cluster.request_restart(&old).await?;
+    assert_eq!(current.storage_incarnation(), old.storage_incarnation());
+    assert_ne!(current.process_session_id(), old.process_session_id());
+    assert_ne!(
+        current.replicator_creation_id(),
+        old.replicator_creation_id()
+    );
+    let reopened = fixture.cluster.service(&current).await?;
+    assert_eq!(
+        reopened.persistence().get("retained").as_deref(),
+        Some("acknowledged")
+    );
+    let observation = fixture.cluster.observe().await?;
+    let snapshot = observation.snapshot(&current).unwrap();
+    assert_eq!(snapshot.history, before.history);
+    assert_ne!(snapshot.read_status, AccessStatus::Granted);
+    assert_ne!(snapshot.write_status, AccessStatus::Granted);
+    assert!(
+        reopened
+            .replicate_put("early".into(), "forbidden".into())
+            .await
+            .is_err()
+    );
+
+    fixture.cluster.settle_members(1).await?;
+    assert_eq!(
+        reopened.get("retained").await.unwrap().as_deref(),
+        Some("acknowledged")
+    );
+    reopened
+        .replicate_put("later".into(), "acknowledged".into())
+        .await
+        .unwrap();
+    fixture.cluster.scale_to(2).await?;
+    let topology = fixture.cluster.settle_members(2).await?;
+    let secondary = topology.secondaries().next().unwrap().clone();
+    let copied = fixture.cluster.service(&secondary).await?;
+    assert_eq!(
+        copied.persistence().get("retained").as_deref(),
+        Some("acknowledged")
+    );
+    assert_eq!(
+        copied.persistence().get("later").as_deref(),
+        Some("acknowledged")
+    );
+    let observation = fixture.cluster.observe().await?;
+    let source = observation.snapshot(&current).unwrap();
+    let target = observation.snapshot(&secondary).unwrap();
+    assert!(
+        source
+            .goals
+            .iter()
+            .any(|entry| { entry.goal == close && entry.status == ReplicaGoalStatus::Achieved })
+    );
+    assert!(
+        observation
+            .set()
+            .status
+            .as_ref()
+            .unwrap()
+            .replica_goals
+            .iter()
+            .any(|entry| {
+                entry.goal == close
+                    && entry
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+            })
+    );
+    assert_eq!(source.write_status, AccessStatus::Granted);
+    assert_ne!(target.read_status, AccessStatus::Granted);
+    assert_ne!(target.write_status, AccessStatus::Granted);
+    let builds = source
+        .remote_operations
+        .iter()
+        .filter(|operation| {
+            operation.selection.target.scope.storage == target.storage
+                && operation.selection.source.scope.process_session_id == source.process_session_id
+                && operation.selection.source.scope.creation_id == source.creation_id
+                && operation.selection.target.scope.process_session_id == target.process_session_id
+                && operation.selection.target.scope.creation_id == target.creation_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(builds.len(), 1);
+    assert!(builds[0].accepted);
+    let retained = observation
+        .set()
+        .status
+        .as_ref()
+        .unwrap()
+        .replica_goals
+        .iter()
+        .find(|entry| entry.goal.operation_id == builds[0].operation_id)
+        .unwrap();
+    assert!(matches!(&retained.goal.desired,
+        kuberic_runtime::protocol::public_operations::ReplicaGoalKind::Build { remote }
+            if **remote == builds[0].selection));
+    assert_eq!(
+        retained.outcome.as_ref().unwrap().status,
+        ReplicaGoalStatus::Achieved
+    );
+    assert!(source.goals.iter().any(|entry| {
+        entry.goal == retained.goal
+            && entry.status == ReplicaGoalStatus::Achieved
+            && entry.receipts > 0
+    }));
+    reopened
+        .replicate_put("after-growth".into(), "acknowledged".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        copied.persistence().get("after-growth").as_deref(),
+        Some("acknowledged")
+    );
+    eprintln!(
+        "actual fresh growth: achieved predecessor Close retained; exact fresh Build accepted, retained/later KV values copied, target admitted with closed access and continuing replication"
+    );
+    Ok(secondary)
 }
 
 pub async fn real_provider_restart_settlement_and_handoff() {
