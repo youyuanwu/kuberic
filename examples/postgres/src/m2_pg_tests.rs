@@ -1,5 +1,6 @@
 use super::super::session::{PgSessionId, SessionAction, SessionRequest, SessionStage};
 use super::*;
+use crate::instance::DriverExitGate;
 use kuberic_runtime::protocol::public_operations::{
     ORDINARY_ACTION_FORMAT, ReplicaConfigurationScope, ReplicaPublication, ReplicaPublicationStage,
     ReplicaScope,
@@ -460,8 +461,13 @@ async fn m2_pg_abort_close_retains_all_joins() {
     )
     .await
     .unwrap();
-    let exit = source.driver.instance.hold_next_driver_exit();
-    let (admin, admin_driver) = source.driver.instance.connect().await.unwrap();
+    let exit = Arc::new(DriverExitGate::default());
+    let (admin, admin_driver) = source
+        .driver
+        .instance
+        .connect_with_driver_exit(exit.clone())
+        .await
+        .unwrap();
     admin.simple_query("CHECKPOINT").await.unwrap();
     let mut preauth = tokio::net::TcpStream::connect((
         source.driver.instance.listen_host(),

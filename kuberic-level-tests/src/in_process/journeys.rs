@@ -805,9 +805,9 @@ async fn contained_restart_renews_session_and_dynamic_endpoints() -> Result<()> 
         harness.write("restart", "before").await?;
         harness.assert_values("restart", "before").await?;
         let before = harness.report(2).await?;
-        let old_endpoint: http::Uri = before
-            .replication_address
-            .as_ref()
+        let before_ref = harness.reference(2).await?;
+        let old_endpoint: http::Uri = before_ref
+            .replication_address()
             .context("pre-restart Open endpoint missing")?
             .parse()?;
         let old_service = harness.service(2).await?;
@@ -834,9 +834,9 @@ async fn contained_restart_renews_session_and_dynamic_endpoints() -> Result<()> 
             before.replicator_creation_id != after.replicator_creation_id,
             "restart reused replicator creation"
         );
-        let new_endpoint: http::Uri = after
-            .replication_address
-            .as_ref()
+        let after_ref = harness.reference(2).await?;
+        let new_endpoint: http::Uri = after_ref
+            .replication_address()
             .context("post-restart Open endpoint missing")?
             .parse()?;
         ensure!(new_endpoint.host() == old_endpoint.host());
@@ -1209,6 +1209,8 @@ async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn controller_recreation_resumes_committed_operation() -> Result<()> {
+    use kuberic_runtime::protocol::public_operations::ReplicaGoalStatus;
+
     let mut harness = Harness::new().await?;
     let result = async {
         let pause = harness
@@ -1219,30 +1221,76 @@ async fn controller_recreation_resumes_committed_operation() -> Result<()> {
                 participant: None,
             })
             .await?;
-        let accepted = serde_json::to_value(pause.evidence().set())?;
-        let command = accepted["status"]["publicV1Operation"].clone();
+        let pending = pause
+            .evidence()
+            .set()
+            .status
+            .as_ref()
+            .context("barrier status missing")?
+            .replica_goals
+            .iter()
+            .filter(|entry| entry.outcome.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
         ensure!(
-            command.is_object(),
-            "barrier did not capture an accepted operation"
+            !pending.is_empty(),
+            "barrier did not capture an accepted ordinary goal"
         );
+        for selected in &pending {
+            selected.validate().map_err(anyhow::Error::msg)?;
+        }
         harness.recreate_controller().await?;
         harness.cluster.resume(pause).await?;
-        harness.refresh().await?;
-        let persisted = harness
-            .api
-            .get(Kind::KubericSet, "sample")
-            .context("set missing")?;
-        ensure!(
-            persisted["status"]["publicV1Operation"] == command,
-            "controller recreation repaired authority"
-        );
+        let persisted = harness.set().await?.status.context("status missing")?;
+        for selected in &pending {
+            let retained = persisted
+                .replica_goals
+                .iter()
+                .find(|entry| entry.goal == selected.goal)
+                .context("controller recreation replaced the accepted goal")?;
+            retained.validate().map_err(anyhow::Error::msg)?;
+            ensure!(
+                retained.digest == selected.digest,
+                "controller recreation changed accepted authority"
+            );
+        }
         harness.write("controller", "resumed").await?;
         harness.assert_values("controller", "resumed").await?;
-        let status = harness.set().await?.status.context("status missing")?;
-        if status.public_v1_operation.is_some() {
-            bail!("accepted operation remains pending");
+        let observed = harness.cluster.observe().await?;
+        let status = observed
+            .set()
+            .status
+            .as_ref()
+            .context("settled status missing")?;
+        for selected in pending {
+            let retained = status
+                .replica_goals
+                .iter()
+                .find(|entry| entry.goal == selected.goal)
+                .context("accepted ordinary goal was lost")?;
+            retained.validate().map_err(anyhow::Error::msg)?;
+            ensure!(retained.digest == selected.digest);
+            ensure!(retained.outcome.as_ref().is_some_and(|outcome| {
+                outcome.goal == selected.goal && outcome.status == ReplicaGoalStatus::Achieved
+            }));
+            let (_, snapshot) = observed
+                .snapshots()
+                .find(|(_, snapshot)| {
+                    snapshot.storage == selected.goal.scope.storage
+                        && snapshot.process_session_id == selected.goal.scope.process_session_id
+                })
+                .context("accepted goal's live owner missing")?;
+            let receipts = snapshot
+                .goals
+                .iter()
+                .filter(|entry| entry.goal.operation_id == selected.goal.operation_id)
+                .collect::<Vec<_>>();
+            ensure!(
+                matches!(receipts.as_slice(), [entry]
+                    if entry.goal == selected.goal && entry.status == ReplicaGoalStatus::Achieved),
+                "accepted goal did not retain one exact successful result"
+            );
         }
-        assert_exact_completion(&mut harness, &accepted).await?;
         Ok(())
     }
     .await;
@@ -1298,9 +1346,12 @@ async fn live_primary_isolation(attempt_isolated_writes: bool) -> Result<()> {
         let committed = service.persistence().durable_progress().await?;
         ensure!(
             committed.applied_lsn == committed.committed_lsn
-                && old.progress.current() == Some(committed.committed_lsn)
+                && matches!(
+                    &old.progress.current_progress,
+                    kuberic_runtime::protocol::public_operations::ProgressQueryResult::NotQueried(_)
+                )
                 && service.get("live-before").await?.as_deref() == Some("acknowledged"),
-            "failover must start with a service-owned committed view and native current observation"
+            "failover requires the service-owned committed view; ordinary reports must not sample progress callbacks"
         );
         let isolation = harness.isolate_uids(std::slice::from_ref(&uid)).await?;
         let promoted = harness.ready_survivors(2, &isolation).await?;

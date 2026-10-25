@@ -55,6 +55,7 @@ pub(crate) struct GenerationFault {
 }
 
 #[cfg(all(test, feature = "testing"))]
+#[derive(Default)]
 pub(crate) struct DriverExitGate {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
@@ -231,8 +232,6 @@ impl Drop for CleanupWaiter {
 /// server process. Each instance keeps its Unix sockets in PGDATA/pg_stat_tmp,
 /// a transient directory excluded by PostgreSQL backup and rewind.
 pub struct PgInstanceManager {
-    #[cfg(all(test, feature = "testing"))]
-    driver_exit: ProcessMutex<Option<Arc<DriverExitGate>>>,
     data_dir: PathBuf,
     pg_bin: PathBuf,
     port: u16,
@@ -340,8 +339,6 @@ impl PgInstanceManager {
             data_dir,
             pg_bin,
             port,
-            #[cfg(all(test, feature = "testing"))]
-            driver_exit: ProcessMutex::new(None),
             current: Arc::new(ProcessMutex::new(Arc::new(ProcessGeneration::new(
                 0,
                 Arc::new(PgTasks::default()),
@@ -1432,6 +1429,17 @@ impl PgInstanceManager {
 
     /// Connect to the local PG instance via UDS.
     pub async fn connect(&self) -> Result<(tokio_postgres::Client, PgTask), PgError> {
+        #[cfg(all(test, feature = "testing"))]
+        let connection = self.connect_owned(None);
+        #[cfg(not(all(test, feature = "testing")))]
+        let connection = self.connect_owned();
+        connection.await
+    }
+
+    async fn connect_owned(
+        &self,
+        #[cfg(all(test, feature = "testing"))] exit_gate: Option<Arc<DriverExitGate>>,
+    ) -> Result<(tokio_postgres::Client, PgTask), PgError> {
         let generation = self.generation();
         let (client, connection) =
             tokio_postgres::connect(&self.connection_string(), tokio_postgres::NoTls)
@@ -1444,8 +1452,6 @@ impl PgInstanceManager {
         let _cleanup = generation.cleanup_lock.lock().unwrap();
         self.complete_generation(&generation, Ok(()))?;
         let shutdown = generation.shutdown.clone();
-        #[cfg(all(test, feature = "testing"))]
-        let gate = self.driver_exit.lock().unwrap().take();
         let handle = tokio::spawn(async move {
             tokio::select! {
                 biased;
@@ -1455,7 +1461,7 @@ impl PgInstanceManager {
                 },
             }
             #[cfg(all(test, feature = "testing"))]
-            if let Some(gate) = gate {
+            if let Some(gate) = exit_gate {
                 gate.entered.notify_one();
                 gate.release.notified().await;
             }
@@ -1499,13 +1505,11 @@ impl PgInstanceManager {
     }
 
     #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn hold_next_driver_exit(&self) -> Arc<DriverExitGate> {
-        let gate = Arc::new(DriverExitGate {
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
-        *self.driver_exit.lock().unwrap() = Some(gate.clone());
-        gate
+    pub(crate) async fn connect_with_driver_exit(
+        &self,
+        gate: Arc<DriverExitGate>,
+    ) -> Result<(tokio_postgres::Client, PgTask), PgError> {
+        self.connect_owned(Some(gate)).await
     }
 
     #[cfg(all(test, feature = "testing"))]

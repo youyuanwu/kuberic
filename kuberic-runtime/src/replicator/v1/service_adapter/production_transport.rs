@@ -31,8 +31,8 @@ use super::super::primary::PrimaryError;
 use super::super::secondary::SecondaryAck;
 use super::super::session::{SendIntent, SendKind};
 use super::super::transport::{
-    Carrier, CarrierLimits, Delivery, ExchangeService, Ingress, Route, SendError,
-    connect_authenticated, wire,
+    Binding as CarrierBinding, Carrier, CarrierLimits, Delivery, ExchangeService, Ingress, Route,
+    SendError, connect_authenticated, wire,
 };
 use super::engine_session::{
     Binding, Control, ControlEnvelope, Endpoint, Fence, Sessions, partition,
@@ -488,6 +488,16 @@ impl Transport {
                 }))
                 .collect::<Vec<_>>()
         )
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_sends(&self, binding: &Binding) -> Option<usize> {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|peer| peer.binding == *binding)
+            .map(|peer| peer.carrier.pending_sends())
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -1257,15 +1267,25 @@ impl Transport {
             }
             Ok(())
         };
-        tokio::time::timeout(Duration::from_secs(5), exchange)
-            .await
-            .map_err(|_| {
-                if retry_connect {
-                    RuntimeError::QueueFull
-                } else {
-                    application("engine session control timed out")
-                }
-            })?
+        let mut stop = self.stop.subscribe();
+        if *stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
+        // A ready wire result wins over simultaneous shutdown; only an
+        // unfinished network wait is cancelled, never a selected failure.
+        tokio::select! {
+            biased;
+            result = tokio::time::timeout(Duration::from_secs(5), exchange) => {
+                result.map_err(|_| {
+                    if retry_connect {
+                        RuntimeError::QueueFull
+                    } else {
+                        application("engine session control timed out")
+                    }
+                })?
+            },
+            _ = stop.wait_for(|stopped| *stopped) => Err(RuntimeError::Closed),
+        }
     }
 
     pub(super) async fn establish(self: &Arc<Self>, binding: &Binding) -> Result<i64> {
@@ -1483,13 +1503,20 @@ impl Transport {
                 Ok(peer)
             }
         })??;
-        if outgoing && !peer.connecting.swap(true, Ordering::AcqRel) {
-            let owner = self.clone();
-            let connection = peer.clone();
-            self.spawn(
-                peer.tasks
-                    .track_future(async move { owner.run_connection(connection).await }),
-            );
+        if outgoing {
+            self.sessions.effect(&binding, || -> Result<()> {
+                if !peer.connecting.swap(true, Ordering::AcqRel) {
+                    // Admit the first native send before returning to Build. Otherwise
+                    // StartCopy races the unpolled connection task and is lost until retry.
+                    let (initial, _) = peer.carrier.bind().map_err(application)?;
+                    let owner = self.clone();
+                    let connection = peer.clone();
+                    self.spawn(peer.tasks.track_future(async move {
+                        owner.run_connection(connection, initial).await
+                    }));
+                }
+                Ok(())
+            })??;
         }
         Ok(peer)
     }
@@ -1659,7 +1686,12 @@ impl Transport {
         });
     }
 
-    async fn run_connection(self: Arc<Self>, peer: Arc<Peer>) -> Result<()> {
+    async fn run_connection(
+        self: Arc<Self>,
+        peer: Arc<Peer>,
+        initial: CarrierBinding,
+    ) -> Result<()> {
+        let mut initial = Some(initial);
         let mut shutdown = self.stop.subscribe();
         loop {
             if *shutdown.borrow() {
@@ -1669,10 +1701,13 @@ impl Transport {
                 peer.carrier.shutdown();
                 return Ok(());
             }
-            let (binding, _) = match peer.carrier.bind() {
-                Ok(binding) => binding,
-                Err(SendError::Closed) => return Ok(()),
-                Err(error) => return Err(application(error)),
+            let binding = match initial.take() {
+                Some(binding) => binding,
+                None => match peer.carrier.bind() {
+                    Ok((binding, _)) => binding,
+                    Err(SendError::Closed) => return Ok(()),
+                    Err(error) => return Err(application(error)),
+                },
             };
             let connected = async {
                 let address = self.address(&peer.binding, None).await?;

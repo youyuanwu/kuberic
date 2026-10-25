@@ -519,6 +519,11 @@ impl Carrier {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn pending_sends(&self) -> usize {
+        self.0.state.lock().unwrap().outgoing.len()
+    }
+
     /// Explicitly stops this carrier; reports queued payloads rather than
     /// claiming a native session drain. Storage lives until handles are dropped.
     pub(super) fn shutdown(&self) -> ShutdownReport {

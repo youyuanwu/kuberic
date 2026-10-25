@@ -251,6 +251,14 @@ After discovery awaits, the captured reservation and source publication must
 still match. Predecessor removal compares the complete binding under the peer
 map lock; a stale recovery cannot take a successor's carrier or ACK owner.
 
+The outgoing carrier's first stream binding and tracked connection child are
+registered under the exact session effect gate before native Build can send
+StartCopy. An unpolled connection owner therefore retains that first frame
+instead of losing it until the sender's retry timer. Retirement still joins
+the actual connection child, including work held in publication validation;
+binding a stream does not bypass authenticated peer admission or grant ACK
+credit.
+
 The controller accepts the exact fresh preparation, then obtains ordinary source
 configuration/catch-up and target reconfiguration outcomes before updating the
 topology session. The source callback validates its retained completed recovery

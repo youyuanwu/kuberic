@@ -95,7 +95,11 @@ struct Hosted<F: ApplicationFactory> {
 }
 
 impl<F: ApplicationFactory> Hosted<F> {
-    async fn stop(mut self) -> Result<()> {
+    async fn stop(self) -> Result<()> {
+        self.stop_with_routes(true).await
+    }
+
+    async fn stop_with_routes(mut self, forget_routes: bool) -> Result<()> {
         self.startup_shutdown.send_replace(true);
         let mut errors = Vec::new();
         if let Some(startup) = self.startup.take() {
@@ -114,7 +118,7 @@ impl<F: ApplicationFactory> Hosted<F> {
         if let Err(error) = self.factory.shutdown_and_drain(self.service.clone()).await {
             errors.push(anyhow::Error::new(error));
         }
-        if let Err(error) = self.network.forget(&self.uid).await {
+        if forget_routes && let Err(error) = self.network.forget(&self.uid).await {
             errors.push(error);
         }
         if errors.is_empty() {
@@ -128,6 +132,29 @@ impl<F: ApplicationFactory> Hosted<F> {
             .into())
         }
     }
+}
+
+async fn finish_host_drains(
+    network: Network,
+    drains: Vec<JoinHandle<Result<()>>>,
+) -> Vec<anyhow::Error> {
+    let mut errors = Vec::new();
+    for drain in drains {
+        match drain.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(error) => errors.push(error.into()),
+        }
+    }
+    if let Err(error) = network.finish().await {
+        errors.push(error);
+    } else if let Err(error) = network.assert_drained().await {
+        errors.push(error);
+    }
+    for error in &errors {
+        network.retain_cleanup_failure(format!("{error:#}")).await;
+    }
+    errors
 }
 
 impl<F: ApplicationFactory> Drop for Hosted<F> {
@@ -761,35 +788,28 @@ impl<F: ApplicationFactory> Harness<F> {
                 }
             }
         }
-        let network = self.network.clone();
-        let mut transport_drain = tokio::spawn(async move { network.finish().await });
-        match tokio::time::timeout_at(teardown, &mut transport_drain).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => errors.push(error),
-            Ok(Err(error)) => errors.push(error.into()),
-            Err(error) => errors.push(error.into()),
-        }
-        let mut drains = {
+        let drains = {
             let mut state = self.supervisor.lock().await;
             state.held_deletions.lock().unwrap().clear();
             let hosts = std::mem::take(&mut state.hosts);
-            state
-                .drains
-                .extend(hosts.into_values().map(|host| tokio::spawn(host.stop())));
+            state.drains.extend(
+                hosts
+                    .into_values()
+                    .map(|host| tokio::spawn(host.stop_with_routes(false))),
+            );
             std::mem::take(&mut state.drains)
         };
-        for drain in &mut drains {
-            match tokio::time::timeout_at(teardown, drain).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => errors.push(error),
-                Ok(Err(error)) => errors.push(error.into()),
-                Err(error) => errors.push(error.into()),
-            }
-            match tokio::time::timeout_at(teardown, self.network.assert_drained()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => errors.push(error),
-                Err(error) => errors.push(error.into()),
-            }
+        let owners = drains
+            .iter()
+            .map(JoinHandle::abort_handle)
+            .collect::<Vec<_>>();
+        // This actual join owner keeps every host and route alive even if the
+        // observer's teardown budget expires. Route destruction is last.
+        let mut cleanup = tokio::spawn(finish_host_drains(self.network.clone(), drains));
+        match tokio::time::timeout_at(teardown, &mut cleanup).await {
+            Ok(Ok(cleanup_errors)) => errors.extend(cleanup_errors),
+            Ok(Err(error)) => errors.push(error.into()),
+            Err(error) => errors.push(error.into()),
         }
         if let Err(error) = self.api.check() {
             errors.push(error);
@@ -805,7 +825,7 @@ impl<F: ApplicationFactory> Harness<F> {
                 scenario_kind
             };
             let agents=self.last_reports.lock().unwrap().values().map(|report|serde_json::json!({"identity":report.replica,"session":report.process_session_id,"creation":report.replicator_creation_id,"storage":report.storage_incarnation,"role":report.role,"read":report.read_status,"write":report.write_status,"progress":report.progress})).collect::<Vec<_>>();
-            let diagnostics = serde_json::json!({"resources":self.diagnostic_snapshot(),"agents":agents,"transportBeforeCleanup":initial_transport,"transport":self.network.diagnostics(),"reconcileErrors":self.reconcile_errors,"lastReconcileError":self.last_error.as_ref().map(|error|error.replace("local-test-token","[redacted]").chars().take(512).collect::<String>()),"retainedStorage":path,"pendingTaskOwners":drains.iter().filter(|task|!task.is_finished()).count()});
+            let diagnostics = serde_json::json!({"resources":self.diagnostic_snapshot(),"agents":agents,"transportBeforeCleanup":initial_transport,"transport":self.network.diagnostics(),"reconcileErrors":self.reconcile_errors,"lastReconcileError":self.last_error.as_ref().map(|error|error.replace("local-test-token","[redacted]").chars().take(512).collect::<String>()),"retainedStorage":path,"pendingTaskOwners":owners.iter().filter(|task|!task.is_finished()).count()});
             Err(super::TestError::combined(
                 kind,
                 format!(
@@ -845,22 +865,21 @@ impl<F: ApplicationFactory> Drop for Harness<F> {
                         task.abort();
                         let _ = task.await;
                     }
-                    let mut transport = tokio::spawn(async move { network.finish().await });
-                    let _ = tokio::time::timeout_at(deadline, &mut transport).await;
                     let drains = {
                         let mut state = state.lock().await;
                         state.held_deletions.lock().unwrap().clear();
                         let hosts = std::mem::take(&mut state.hosts);
-                        state
-                            .drains
-                            .extend(hosts.into_values().map(|host| tokio::spawn(host.stop())));
+                        state.drains.extend(
+                            hosts
+                                .into_values()
+                                .map(|host| tokio::spawn(host.stop_with_routes(false))),
+                        );
                         std::mem::take(&mut state.drains)
                     };
-                    for mut drain in drains {
-                        // Timeout detaches the still-owning drain task; retained
-                        // storage is never certified reclaimed on this path.
-                        let _ = tokio::time::timeout_at(deadline, &mut drain).await;
-                    }
+                    let mut cleanup = tokio::spawn(finish_host_drains(network, drains));
+                    // Timeout detaches the still-owning aggregate, not its
+                    // children/routes; retained storage is not certified reclaimed.
+                    let _ = tokio::time::timeout_at(deadline, &mut cleanup).await;
                 });
             }
         }

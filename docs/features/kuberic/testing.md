@@ -807,6 +807,14 @@ contract; the [design](../../proposal/downstream-in-process-testing.md) explains
 its ownership boundary. Tests own listeners, tasks and storage and must join
 cleanup; a timed-out write remains ambiguous rather than implicit rollback.
 
+Finalization stops and joins the ordinary hosts and application descendants
+before destroying their shared TCP proxies. If the teardown observer times out,
+the retained cleanup task still owns those joins and routes; storage stays
+retained and late failures remain recorded. Native session shutdown explicitly
+cancels its own outstanding control-wire waits without granting ACK credit;
+remote control work remains joined by its remote owner. A transport error that
+actually completes before selected shutdown is still a sticky Close failure.
+
 ## Source-Check Tier
 
 ```bash

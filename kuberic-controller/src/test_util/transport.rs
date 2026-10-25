@@ -686,6 +686,10 @@ impl Network {
         Self::healthy(&state)
     }
 
+    pub(super) async fn retain_cleanup_failure(&self, error: String) {
+        self.0.state.lock().await.fatal.push(error);
+    }
+
     pub async fn assert_drained(&self) -> Result<()> {
         let state = self.0.state.lock().await;
         ensure!(

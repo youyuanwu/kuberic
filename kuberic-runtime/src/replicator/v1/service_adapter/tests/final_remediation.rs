@@ -308,6 +308,136 @@ impl Recovery {
 }
 
 #[tokio::test]
+async fn m2_cleanup_cancels_local_confirmation_without_dropping_remote_control_join() {
+    let recovery = Recovery::new().await;
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    recovery.complete().await;
+    let confirm = Gate::new();
+    let _route = recovery.route(vec![(Cut::ConfirmReceived, confirm.clone())]);
+    let sender = recovery.fresh.acknowledgements();
+    let permit = sender.reserve_owned().await.unwrap();
+    let credited = Arc::new(AtomicBool::new(false));
+    let credit = credited.clone();
+    recovery
+        .fresh
+        .sessions
+        .effect(&recovery.binding, || {
+            recovery.fresh.queue_ack(
+                recovery.binding.clone(),
+                permit,
+                Box::new(move || {
+                    credit.store(true, Ordering::Release);
+                    Ok(())
+                }),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    confirm.entered().await;
+    recovery.target.replicator().abort();
+    tokio::time::timeout(Duration::from_secs(1), recovery.target.replicator().close())
+        .await
+        .expect("selected local shutdown must cancel the network wait")
+        .unwrap();
+    assert!(!credited.load(Ordering::Acquire));
+    assert_eq!(recovery.fresh.cardinality(), 0);
+    assert!(recovery.fresh.check_health().is_err());
+    let source = recovery.source.replicator();
+    source.abort();
+    let close = tokio::spawn(async move { source.close().await });
+    tokio::task::yield_now().await;
+    assert!(
+        !close.is_finished(),
+        "remote control must remain joined by its source owner"
+    );
+    confirm.release.add_permits(1);
+    close.await.unwrap().unwrap();
+    recovery.finish().await;
+}
+
+#[tokio::test]
+async fn m2_cleanup_preserves_confirmation_failure_selected_before_shutdown() {
+    let recovery = Recovery::new().await;
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    recovery.complete().await;
+    let confirm = Gate::new();
+    let _route = recovery.route(vec![(Cut::ConfirmReceived, confirm.clone())]);
+    let permit = recovery
+        .fresh
+        .acknowledgements()
+        .reserve_owned()
+        .await
+        .unwrap();
+    let credited = Arc::new(AtomicBool::new(false));
+    let credit = credited.clone();
+    recovery
+        .fresh
+        .sessions
+        .effect(&recovery.binding, || {
+            recovery.fresh.queue_ack(
+                recovery.binding.clone(),
+                permit,
+                Box::new(move || {
+                    credit.store(true, Ordering::Release);
+                    Ok(())
+                }),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    confirm.entered().await;
+    recovery
+        .pair
+        .source_access
+        .withdrawn
+        .store(true, Ordering::Release);
+    confirm.release.add_permits(1);
+    until(|| {
+        recovery
+            .fresh
+            .inspect_acks()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|owner| owner["failure"].is_string())
+    })
+    .await;
+    assert!(!credited.load(Ordering::Acquire));
+    recovery.target.replicator().abort();
+    let failure = recovery
+        .target
+        .replicator()
+        .close()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("authority"), "{failure}");
+    assert_eq!(
+        recovery
+            .target
+            .replicator()
+            .close()
+            .await
+            .unwrap_err()
+            .to_string(),
+        failure
+    );
+    assert!(recovery.fresh.drain().await.is_err());
+    assert_eq!(recovery.fresh.cardinality(), 0);
+    recovery.source.replicator().abort();
+    recovery.source.replicator().close().await.unwrap();
+    recovery.pair.finish().await;
+}
+
+#[tokio::test]
 async fn m2_recover_overlapping_rpcs_keep_winner_peer_carrier_ack_and_quorum_progress() {
     let recovery = Recovery::new().await;
     let received = Gate::new();

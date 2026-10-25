@@ -71,6 +71,51 @@ impl Pair {
 }
 
 #[tokio::test]
+async fn m2_recover_first_start_copy_is_retained_before_connection_poll_and_joined_on_retirement() {
+    use super::super::super::super::session::SessionIdentity;
+
+    let pair = Pair::new().await;
+    pair.source.sessions.propose(&pair.binding).unwrap();
+    let incarnation = pair.source.establish(&pair.binding).await.unwrap();
+    pair.source_access.validated.forget_permits(usize::MAX);
+    pair.source_access.pause.store(true, Ordering::SeqCst);
+    assert!(pair.source.replication(SendIntent {
+        identity: SessionIdentity {
+            primary_endpoint: pair.binding.primary().address,
+            remote_endpoint: pair.binding.secondary().address,
+            remote_incarnation: incarnation,
+        },
+        kind: SendKind::StartCopy {
+            replication_start: 1,
+            epoch: pair.binding.epoch(),
+        },
+        expires_after: None,
+    }));
+    assert_eq!(
+        pair.source.pending_sends(&pair.binding),
+        Some(1),
+        "the first native StartCopy must be queued before the connection task can poll"
+    );
+    validated(&pair.source_access).await;
+    let source = pair.source.clone();
+    let binding = pair.binding.clone();
+    let join = tokio::spawn(async move { source.join_predecessor(&binding).await });
+    until(|| pair.source.sessions.active(&pair.binding).is_err()).await;
+    assert!(
+        !join.is_finished(),
+        "retirement must join the held connection owner"
+    );
+    pair.source_access.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(pair.source.pending_sends(&pair.binding), None);
+    pair.finish().await;
+}
+
+#[tokio::test]
 async fn m2_recovery_session_rejects_stale_identity_epoch_and_successor_before_effects() {
     let mut pair = Pair::new().await;
     let mut source = pair.binding.source.clone();

@@ -1,5 +1,6 @@
 //! Native PostgreSQL through the production ordinary Reconciler.
 use super::*;
+use crate::instance::DriverExitGate;
 use crate::service::{PgService, PgServiceConfig};
 use kuberic_controller::test_util::{
     ApplicationFactory, CreatedApplication, ErrorKind, ReplicaContext, ReplicaRef, TestCluster,
@@ -630,8 +631,12 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
                 .public_owner()
                 .retirement_unavailable
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let exit = target.instance().hold_next_driver_exit();
-            let (admin, admin_driver) = target.instance().connect().await.map_err(error)?;
+            let exit = Arc::new(DriverExitGate::default());
+            let (admin, admin_driver) = target
+                .instance()
+                .connect_with_driver_exit(exit.clone())
+                .await
+                .map_err(error)?;
             admin.simple_query("SELECT 1").await.map_err(error)?;
             source_driver
                 .remove_replica(target_ref.identity().replica_id)
@@ -695,9 +700,13 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
             return Ok(());
         }
         if cut == CopyCut::Checkpoint {
-            let exit = target.instance().hold_next_driver_exit();
+            let exit = Arc::new(DriverExitGate::default());
             let _release_exit = ReleaseNotify(&exit.release);
-            let (admin, admin_driver) = target.instance().connect().await.map_err(error)?;
+            let (admin, admin_driver) = target
+                .instance()
+                .connect_with_driver_exit(exit.clone())
+                .await
+                .map_err(error)?;
             admin.simple_query("SELECT 1").await.map_err(error)?;
             let owner = target_driver
                 .pg_native_inbounds()
@@ -1396,9 +1405,19 @@ async fn m2_pg_scope_withdrawal_waits_for_actual_settlement() {
         cluster.scale_to(2).await?;
         let topology = cluster.settle_members(2).await?;
         let (sql, sql_driver) = application_connection(&source).await?;
-        let exit = source.instance().hold_next_driver_exit();
+        let exit = Arc::new(DriverExitGate::default());
         let _release = ReleaseNotify(&exit.release);
-        let (admin, admin_driver) = source.instance().connect().await.map_err(error)?;
+        let (unrelated, unrelated_driver) = source.instance().connect().await.map_err(error)?;
+        unrelated.simple_query("SELECT 1").await.map_err(error)?;
+        drop(unrelated);
+        cluster
+            .probe(async { unrelated_driver.await.map_err(error) })
+            .await?;
+        let (admin, admin_driver) = source
+            .instance()
+            .connect_with_driver_exit(exit.clone())
+            .await
+            .map_err(error)?;
         admin.simple_query("SELECT 1").await.map_err(error)?;
         let mut preauth = tokio::net::TcpStream::connect((
             source.instance().listen_host(),
@@ -2537,9 +2556,13 @@ async fn incompatible_live_publication(endpoint: &str, dimension: &str) {
         )?;
         let source_fault = serde_json::from_value(encoded["source"].clone()).map_err(error)?;
         let target_fault = serde_json::from_value(encoded["target"].clone()).map_err(error)?;
-        let exit = target.instance().hold_next_driver_exit();
+        let exit = Arc::new(DriverExitGate::default());
         let _release_exit = ReleaseNotify(&exit.release);
-        let (admin, admin_driver) = target.instance().connect().await.map_err(error)?;
+        let (admin, admin_driver) = target
+            .instance()
+            .connect_with_driver_exit(exit.clone())
+            .await
+            .map_err(error)?;
         admin.simple_query("SELECT 1").await.map_err(error)?;
         *target_driver.public_owner().session_publications.lock().unwrap() =
             Some((source_fault, target_fault));
@@ -2900,8 +2923,12 @@ async fn m2_pg_incompatible_or_retired_session_cannot_continue_while_pending() {
                 && std::fs::read(target.instance().data_dir().join("PG_VERSION"))? == pgdata,
             "incompatible/pending requests mutated copied bytes or metadata",
         )?;
-        let exit = target.instance().hold_next_driver_exit();
-        let (admin, admin_driver) = target.instance().connect().await.map_err(error)?;
+        let exit = Arc::new(DriverExitGate::default());
+        let (admin, admin_driver) = target
+            .instance()
+            .connect_with_driver_exit(exit.clone())
+            .await
+            .map_err(error)?;
         admin.simple_query("SELECT 1").await.map_err(error)?;
         driver.pg_remove_native_session(&id).await.map_err(error)?;
         exit.entered.notified().await;

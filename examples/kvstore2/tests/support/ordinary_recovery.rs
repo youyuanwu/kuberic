@@ -178,7 +178,20 @@ async fn secondary_restart(retire: bool) {
             }
             Ok::<_, kuberic_controller::test_util::TestError>(())
         }).await;
-        transfer.unwrap()?;
+        match transfer {
+            Ok(result) => result?,
+            Err(error) => {
+                let source = fixture.cluster.native_transport_observation(&primary).await;
+                let target = fixture.cluster.native_transport_observation(&fresh).await;
+                eprintln!("recovery stalled source: {source:?}");
+                eprintln!("recovery stalled target: {target:?}");
+                return Err(kuberic_controller::test_util::TestError::with_source(
+                    kuberic_controller::test_util::ErrorKind::Deadline,
+                    "retained-secondary native transfer did not complete after releasing copy",
+                    error,
+                ));
+            }
+        }
         let completed = fixture.cluster.native_transport_observation(&primary).await?;
         assert!(completed["recoveries"].as_array().unwrap().iter()
             .flat_map(|owner| owner.as_array().unwrap()).any(|transfer| {
@@ -399,6 +412,7 @@ pub async fn real_provider_restart_settlement_and_handoff() {
         let reopened = fixture.cluster.service(&current).await?;
         assert_eq!(reopened.persistence().get("handoff").as_deref(), Some("acknowledged"));
         fixture.cluster.settle_members(3).await?;
+        eprintln!("actual retained secondary restart, fresh session, durable data and ordinary readmission passed; requesting M3 handoff");
         let topology = fixture.cluster.switchover(&current).await?;
         assert_eq!(topology.primary().identity(), current.identity());
         assert_eq!(reopened.get("handoff").await.unwrap().as_deref(), Some("acknowledged"));

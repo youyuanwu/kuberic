@@ -47,6 +47,136 @@ struct Engine {
 }
 
 #[tokio::test]
+async fn ordinary_finalization_retains_routes_until_actual_close_and_descendant_joins() {
+    let applications = Applications::new(false);
+    let mut harness = Harness::new(
+        applications.clone(),
+        NAMESPACE.into(),
+        NAME.into(),
+        "ordinary-cleanup-ownership".into(),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        1,
+    )
+    .await
+    .unwrap();
+    harness.ready_members(1).await.unwrap();
+    let snapshot = harness.ordinary_snapshots().await.unwrap().remove(0);
+    let uid = snapshot.storage.replica.instance_id.to_string();
+    let publication = snapshot.publication.unwrap();
+    let network = harness.network.clone();
+    let routed = network
+        .route("cleanup-observer", &uid, &publication.replication_address)
+        .await
+        .unwrap();
+    assert_eq!(request(&routed, 0).await, 1);
+    let engine = applications.engine(1);
+    engine.close_hold.store(true, Ordering::Release);
+    engine.service_close_hold.store(true, Ordering::Release);
+    let finish = tokio::spawn(harness.finish(Ok(())));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.closes.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!finish.is_finished());
+    assert_eq!(
+        network.diagnostics()["closed"],
+        false,
+        "normal finalization cannot destroy routes before ordinary Close joins"
+    );
+    assert_eq!(
+        request(&routed, 0).await,
+        0,
+        "the fenced engine still owns its real socket"
+    );
+    assert!(
+        TestingTcpRoute::register(uid.clone(), |_, endpoint| {
+            Box::pin(async move { Ok(endpoint) })
+        })
+        .is_err()
+    );
+    engine.close_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.service_closes.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!finish.is_finished());
+    assert_eq!(network.diagnostics()["closed"], false);
+    assert!(
+        network
+            .physical_route("cleanup-observer", &publication.replication_address)
+            .await
+            .is_some()
+    );
+    assert!(engine.engine_joined.load(Ordering::Acquire));
+    assert!(!engine.service_joined.load(Ordering::Acquire));
+    engine.service_close_release.add_permits(1);
+    finish.await.unwrap().unwrap();
+    assert!(engine.service_joined.load(Ordering::Acquire));
+    network.assert_drained().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_finalization_timeout_keeps_routes_and_late_close_failure_owned() {
+    let applications = Applications::new(false);
+    let mut harness = Harness::new(
+        applications.clone(),
+        NAMESPACE.into(),
+        NAME.into(),
+        "ordinary-cleanup-timeout".into(),
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        1,
+    )
+    .await
+    .unwrap();
+    harness.ready_members(1).await.unwrap();
+    let snapshot = harness.ordinary_snapshots().await.unwrap().remove(0);
+    let uid = snapshot.storage.replica.instance_id.to_string();
+    let publication = snapshot.publication.unwrap();
+    let network = harness.network.clone();
+    let routed = network
+        .route("cleanup-observer", &uid, &publication.replication_address)
+        .await
+        .unwrap();
+    let engine = applications.engine(1);
+    engine.close_hold.store(true, Ordering::Release);
+    engine.close_failure.store(true, Ordering::Release);
+    let error = harness
+        .finish(Err(anyhow!("original scenario failure")))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("original scenario failure"));
+    assert_eq!(network.diagnostics()["closed"], false);
+    assert_eq!(request(&routed, 0).await, 0);
+    assert!(
+        TestingTcpRoute::register(uid, |_, endpoint| { Box::pin(async move { Ok(endpoint) }) })
+            .is_err()
+    );
+    engine.close_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if network.diagnostics()["closed"] == true {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(engine.engine_joined.load(Ordering::Acquire));
+    assert!(engine.service_joined.load(Ordering::Acquire));
+    let failure = network.assert_drained().await.unwrap_err();
+    assert!(format!("{failure:#}").contains("ordinary fixture Close failed"));
+}
+
+#[tokio::test]
 async fn production_ordinary_builtin_copies_actual_application_bytes_before_admission() {
     let mut harness = Harness::new(
         super::super::tests::EmptyFactory,

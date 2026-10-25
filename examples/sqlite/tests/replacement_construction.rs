@@ -482,14 +482,29 @@ impl Node {
 }
 
 fn root() -> tempfile::TempDir {
+    let parent = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap().join("target"));
+    root_in(&parent)
+}
+
+fn root_in(parent: &std::path::Path) -> tempfile::TempDir {
+    std::fs::create_dir_all(parent).unwrap();
     tempfile::Builder::new()
         .prefix("sqlite-native-")
-        .tempdir_in(
-            std::env::var_os("TMPDIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::env::current_dir().unwrap().join("target")),
-        )
+        .tempdir_in(parent)
         .unwrap()
+}
+
+#[test]
+fn sqlite_fixture_creates_missing_scratch_parent() {
+    let owner = tempfile::tempdir().unwrap();
+    let parent = owner.path().join("missing").join("nested");
+    assert!(!parent.exists());
+    let root = root_in(&parent);
+    assert!(root.path().is_dir());
+    assert_eq!(root.path().parent(), Some(parent.as_path()));
+    assert!(owner.path().is_dir());
 }
 
 async fn write(server: &SqliteServer, sql: &str) -> Result<i64, tonic::Status> {
