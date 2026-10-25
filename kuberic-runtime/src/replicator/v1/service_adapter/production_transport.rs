@@ -491,6 +491,11 @@ impl Transport {
     }
 
     #[cfg(test)]
+    pub(super) fn controls_available(&self) -> usize {
+        self.controls.available_permits()
+    }
+
+    #[cfg(test)]
     pub(super) fn pending_sends(&self, binding: &Binding) -> Option<usize> {
         self.peers
             .lock()
@@ -710,8 +715,8 @@ impl Transport {
             return Ok(());
         }
         let confirmation = async {
-            self.authorize(binding).await?;
-            if self.local == binding.secondary() {
+            let confirmed = self.authorize_publications(binding, false).await?;
+            if self.local == binding.secondary() && !confirmed {
                 self.control(binding, Control::Confirm).await?;
             }
             self.authorize(binding).await
@@ -853,14 +858,18 @@ impl Transport {
     }
 
     pub(super) async fn authorize(&self, binding: &Binding) -> Result<()> {
-        self.authorize_publications(binding, false).await
+        self.authorize_publications(binding, false)
+            .await
+            .map(|_| ())
     }
 
     pub(super) async fn authorize_completion(&self, binding: &Binding) -> Result<()> {
-        self.authorize_publications(binding, true).await
+        self.authorize_publications(binding, true).await.map(|_| ())
     }
 
-    async fn authorize_publications(&self, binding: &Binding, completion: bool) -> Result<()> {
+    // Reports only whether this invocation already obtained source confirmation.
+    // Callers still revalidate publications after the await; this is not a grant.
+    async fn authorize_publications(&self, binding: &Binding, completion: bool) -> Result<bool> {
         self.sessions.active(binding)?;
         let local = self.publication().await?;
         let primary = self.local == binding.primary();
@@ -895,6 +904,7 @@ impl Transport {
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
+        let mut source_confirmed = false;
         for (is_source, now, origin) in [
             (true, source, &binding.source),
             (false, target, &binding.target),
@@ -963,7 +973,11 @@ impl Transport {
                     // private bindings, including pending compatible scopes.
                     // Requiring unrelated receivers to be reachable here
                     // would turn a single-peer outage into lost healthy quorum.
-                    self.control(binding, Control::Confirm).await?;
+                    // A confirmation checks both complete publications.
+                    if !source_confirmed {
+                        self.control(binding, Control::Confirm).await?;
+                        source_confirmed = true;
+                    }
                     true
                 };
                 if !matches {
@@ -1013,13 +1027,14 @@ impl Transport {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
         }
-        self.sessions.active(binding)
+        self.sessions.active(binding)?;
+        Ok(source_confirmed)
     }
 
     pub(super) async fn confirm_effect(&self, binding: &Binding) -> Result<()> {
         let result = async {
-            self.authorize(binding).await?;
-            if self.local == binding.secondary() {
+            let confirmed = self.authorize_publications(binding, false).await?;
+            if self.local == binding.secondary() && !confirmed {
                 self.control(binding, Control::Confirm).await?;
             }
             self.authorize(binding).await
@@ -2030,6 +2045,13 @@ impl wire::carrier_server::Carrier for Listener {
                     .is_some()
             {
                 return Err(Status::permission_denied("crossed engine control"));
+            }
+            // Completion observers can wait for real copy/provider work. Keep
+            // one existing control slot available for its activation and ACKs.
+            if control.command == Control::Recovered && self.0.controls.available_permits() == 0 {
+                return Err(Status::resource_exhausted(
+                    "recovery observation must leave progress capacity",
+                ));
             }
             let (result, mut completed) = watch::channel(None);
             let owner = self.0.clone();

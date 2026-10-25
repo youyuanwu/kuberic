@@ -251,6 +251,13 @@ After discovery awaits, the captured reservation and source publication must
 still match. Predecessor removal compares the complete binding under the peer
 map lock; a stale recovery cannot take a successor's carrier or ACK owner.
 
+Recovery completion observers await that exact retained source result instead
+of treating unfinished work as QueueFull and repeatedly serializing authenticated
+poll requests. Waiting observers remain bounded by the existing control budget,
+with capacity left for activation and ACK progress. After the result settles,
+the source still revalidates the current binding and actual completion; neither
+waiting nor an old successful result grants admission after retirement.
+
 The outgoing carrier's first stream binding and tracked connection child are
 registered under the exact session effect gate before native Build can send
 StartCopy. An unpolled connection owner therefore retains that first frame

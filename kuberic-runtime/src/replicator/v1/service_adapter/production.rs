@@ -366,14 +366,22 @@ impl Production {
         }
         if completed {
             self.transport.sessions.retained_recovery(binding)?;
-            let receiver = self
+            let mut receiver = self
                 .builds
                 .lock()
                 .unwrap()
                 .get(&binding.nonce)
                 .cloned()
                 .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-            let outcome = receiver.borrow().clone().ok_or(RuntimeError::QueueFull)?;
+            let outcome = loop {
+                let outcome = receiver.borrow().clone();
+                if let Some(outcome) = outcome {
+                    break outcome;
+                }
+                receiver.changed().await.map_err(|_| {
+                    RuntimeError::ControlPlane("recovery result owner was lost".into())
+                })?;
+            };
             outcome.map_err(RuntimeError::ControlPlane)?;
             self.transport.authorize(binding).await?;
             return self

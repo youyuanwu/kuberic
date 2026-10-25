@@ -394,6 +394,7 @@ async fn fresh_restart_growth(
 }
 
 pub async fn real_provider_restart_settlement_and_handoff() {
+    let started = std::time::Instant::now();
     let mut fixture = Fixture::start("kv-retained-handoff", 3).await;
     let result = async {
         let primary = fixture.replicas[0].reference.clone();
@@ -404,7 +405,16 @@ pub async fn real_provider_restart_settlement_and_handoff() {
         assert_eq!(target_service.persistence().get("handoff").as_deref(), Some("acknowledged"));
         assert!(target_service.get("handoff").await.is_err());
         eprintln!("actual ordinary KV copy, quorum write and closed secondary access passed; requesting production restart");
-        let current = fixture.cluster.restart(&target).await?;
+        let restart = fixture.cluster.restart(&target).await;
+        if restart.is_err() {
+            for (side, reference) in [("source", &primary), ("target", &target)] {
+                match fixture.cluster.native_transport_observation(reference).await {
+                    Ok(native) => eprintln!("automatic restart {side}: {native}"),
+                    Err(error) => eprintln!("automatic restart {side} observation failed: {error}"),
+                }
+            }
+        }
+        let current = restart?;
         assert!(target_service.get("handoff").await.is_err());
         assert!(target_service.replicate_put("late".into(), "forbidden".into()).await.is_err());
         assert_eq!(current.storage_incarnation(), target.storage_incarnation());
@@ -412,6 +422,7 @@ pub async fn real_provider_restart_settlement_and_handoff() {
         let reopened = fixture.cluster.service(&current).await?;
         assert_eq!(reopened.persistence().get("handoff").as_deref(), Some("acknowledged"));
         fixture.cluster.settle_members(3).await?;
+        eprintln!("automatic restart prefix elapsed: {:?}", started.elapsed());
         eprintln!("actual retained secondary restart, fresh session, durable data and ordinary readmission passed; requesting M3 handoff");
         let topology = fixture.cluster.switchover(&current).await?;
         assert_eq!(topology.primary().identity(), current.identity());

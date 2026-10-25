@@ -438,6 +438,75 @@ async fn m2_cleanup_preserves_confirmation_failure_selected_before_shutdown() {
 }
 
 #[tokio::test]
+async fn m2_recovered_observer_waits_for_the_actual_retained_transfer_result() {
+    let recovery = Recovery::new().await;
+    let discovery = Gate::new();
+    let _route = recovery.route(vec![(Cut::RecoveryDiscovery, discovery.clone())]);
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    discovery.entered().await;
+    {
+        let owner = recovery.pair.source.test_production();
+        let observer = owner.recover_source(&recovery.binding, true);
+        tokio::pin!(observer);
+        assert!(
+            futures::poll!(observer.as_mut()).is_pending(),
+            "pending transfer is retained work to await, not QueueFull to poll over the wire"
+        );
+        discovery.release.add_permits(1);
+        recovery.complete().await;
+        observer.await.unwrap();
+    }
+    recovery.write().await;
+    recovery.finish().await;
+}
+
+#[tokio::test]
+async fn m2_recovered_observers_leave_capacity_for_actual_transfer_progress() {
+    let recovery = Recovery::new().await;
+    let discovery = Gate::new();
+    let _route = recovery.route(vec![(Cut::RecoveryDiscovery, discovery.clone())]);
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    discovery.entered().await;
+    let capacity = recovery.pair.source.controls_available();
+    let mut observers = Vec::new();
+    for _ in 0..capacity {
+        let target = recovery.fresh.clone();
+        let binding = recovery.binding.clone();
+        observers.push(tokio::spawn(async move {
+            target.control(&binding, Control::Recovered).await
+        }));
+    }
+    until(|| recovery.pair.source.controls_available() == 1).await;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        recovery.fresh.control(&recovery.binding, Control::Recover),
+    )
+    .await
+    .expect("waiting observers must not occupy the progress slot")
+    .unwrap();
+    assert_eq!(
+        recovery.pair.source.test_production().inspect()["recoverySpawned"],
+        1
+    );
+    discovery.release.add_permits(1);
+    recovery.complete().await;
+    for observer in observers {
+        observer.await.unwrap().unwrap();
+    }
+    until(|| recovery.pair.source.controls_available() == capacity).await;
+    recovery.write().await;
+    recovery.finish().await;
+}
+
+#[tokio::test]
 async fn m2_recover_overlapping_rpcs_keep_winner_peer_carrier_ack_and_quorum_progress() {
     let recovery = Recovery::new().await;
     let received = Gate::new();
