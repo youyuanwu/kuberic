@@ -188,8 +188,15 @@ Terminal and periodic paths transfer every gateway to retained drain ownership
 before awaiting any exit. Each completed drain outcome is shared immediately,
 so dropping a Close while another exit is pending loses neither the remaining
 gateways nor an already-observed failure.
-Source Remove retires local ownership; it does not certify target containment.
-Exact remote retirement is retried and unresolved ownership remains quarantined.
+Source Remove excludes installed current and previous voters before fencing.
+Idle eligibility and synchronous session retirement share the configuration
+state owner; a configuration resolved before that fence revalidates before
+grant conversion, slots or SQL policy changes. State is released before
+awaiting local cleanup, which may itself need state or lifecycle serialization.
+A lost Remove observer does not lose the retained local or two-ended joins.
+Remove observes local cleanup, not target containment. The retained two-ended
+owner retries exact remote retirement; terminal joins observe both endpoints,
+and unresolved ownership remains quarantined, never revived to Active.
 A different uncertain receiver requires actual settlement, not an in-place
 metadata reset. A source still being Primary is not Active confirmation.
 Copied data and native durable metadata are retained. Failed callbacks
@@ -442,12 +449,17 @@ See [exact source/result boundaries](../kuberic/testing.md#m2-accepted-evidence-
 The recipe builds the owned command binary, then runs real selected native
 cases and actual ordinary production-controller native witnesses serially in one
 package-only pass. Required PG-N cases include pending joint/current continuity,
-retired-owner rejection, lost cancellation and matching-format reopen. Selectors and
+retired-owner rejection, lost cancellation and matching-format reopen. The
+Remove/adoption cases start from completed actual native Build, exercise both
+orders, preserve an installed voter's exact owners and replay-ACK-dependent SQL,
+and join retired owners after a lost observer, including sticky native failure.
+Selectors and
 evidence limits are in the [testing guide](../kuberic/testing.md#custom-native-controller-reproduction-and-limits);
 do not copy test totals or historical removed selectors.
 Public V1 fixtures use
 `KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set. Set it and `TMPDIR` to short,
-previously reserved checkout-owned ignored paths for local validation; do not
+previously reserved owned paths for local validation (`TMPDIR` must be external
+when also running the packaged source gate); do not
 rely on recipe fallback storage or delete shared output. Run the full
 `just nextest-postgres` only when explicitly requested (or in its dedicated
 CI partitions), never as a routine documentation check.

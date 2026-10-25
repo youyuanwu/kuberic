@@ -2351,8 +2351,28 @@ impl PgReplicator {
         }
         // Publish grants before contacting targets: their source inspection is
         // a separate RPC and must not wait on this same lifecycle mutex.
+        #[cfg(all(test, feature = "testing"))]
+        if !bindings.is_empty() {
+            self.native_cut("source-adoption-before-state").await;
+        }
+        let mut state = self.public_owner().state.lock().await;
+        // Remove fences under this same owner. Reject a pre-resolved fenced
+        // peer before acquiring effect cleanup authority (which stops PG).
+        for peer in bindings.values() {
+            if let Some(id) = peer.session.as_deref()
+                && let Err(error) = self.pg_native_membership(id)
+            {
+                drop(state);
+                #[cfg(all(test, feature = "testing"))]
+                self.native_cut("source-adoption-rejected").await;
+                return Err(error);
+            }
+        }
+        #[cfg(all(test, feature = "testing"))]
+        if !bindings.is_empty() {
+            self.native_cut("source-adoption-with-state").await;
+        }
         self.public_owned(async {
-            let mut state = self.public_owner().state.lock().await;
             if !self.public_partition_permits(state.role).await?
                 && self
                     .instance
@@ -2495,6 +2515,7 @@ impl PgReplicator {
             Ok(())
         })
         .await?;
+        drop(state);
         #[cfg(all(test, feature = "testing"))]
         if previous.is_none() && !replicas.is_empty() {
             self.native_cut("source-current-policy").await;
@@ -3358,6 +3379,8 @@ impl PgReplicator {
     }
 
     pub(super) async fn public_remove(&self, replica: ReplicaId) -> Result<()> {
+        #[cfg(all(test, feature = "testing"))]
+        self.native_cut("source-remove-before-state").await;
         let mut state = self.public_owner().state.lock().await;
         if self.cancellation.is_cancelled() || !state.opened {
             return Err(RuntimeError::Closed);
@@ -3380,6 +3403,12 @@ impl PgReplicator {
         }
         let sessions = self.pg_session_ids_for_target(replica);
         if !sessions.is_empty() {
+            // Eligibility and the terminal session fence are atomic with
+            // configuration adoption. Cleanup needs state/serial itself, so
+            // only the synchronous fence is installed while holding state.
+            for id in &sessions {
+                self.pg_retire_native_now(id)?;
+            }
             drop(state);
             for id in sessions {
                 self.pg_remove_native_session(&id).await?;

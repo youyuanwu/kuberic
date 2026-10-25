@@ -2192,6 +2192,244 @@ async fn m2_pg_membership_registration_retirement_orders_and_sticky_join() {
     membership_registration(false, true).await;
 }
 
+async fn remove_adoption(adoption_first: bool, lost_join: bool) {
+    use std::os::unix::fs::MetadataExt;
+
+    let factory = Factory::default();
+    let mut cluster = cluster(&factory).await;
+    let result: TestResult = async {
+        let topology = cluster.settle_members(1).await?;
+        let source = cluster.service(topology.primary()).await?;
+        seed(&source).await?;
+        let driver = source.native_driver();
+        let copied = driver.pause_public_build_completion();
+        let resolved = driver.pause_native_cut("source-adoption-before-state");
+        let _release_copied = ReleaseGate(copied.clone());
+        let _release_resolved = ReleaseGate(resolved.clone());
+        cluster.scale_to(2).await?;
+        gate(&mut cluster, &copied).await?;
+        copied.release.notify_one();
+        gate(&mut cluster, &resolved).await?;
+        let observed = cluster.observe().await?;
+        let reference = observed.replicas()
+            .find(|reference| reference.identity() != topology.primary().identity())
+            .cloned().unwrap();
+        let target = cluster.service(&reference).await?;
+        let target_driver = target.native_driver();
+        let replica = reference.identity().replica_id;
+        let id = driver.pg_session_ids_for_target(replica).into_iter().next().unwrap();
+        let native = native_continuity(&source, &target, &id).await?;
+        let source_generation = source.instance().generation_id();
+        let (configuration, previous, credential) = {
+            let state = driver.public_owner().state.lock().await;
+            check(state.built_idle.get(&replica).is_some_and(|build| build.session.as_deref() == Some(&id)),
+                "race did not start from actual completed idle Build")?;
+            let grant = state.grants.iter().find(|grant| grant.binding.session() == Some(&id)).unwrap();
+            (state.configuration.clone(), state.previous.clone(),
+                (grant.credential.host.clone(), grant.credential.port, grant.credential.name.clone(), grant.session.clone()))
+        };
+        let context = driver.public_owner().fence.context().map_err(error)?;
+        let policy = driver.durable.revalidate().await.map_err(error)?.synchronous;
+        let inbound = target_driver.pg_native_inbounds().into_iter().next().unwrap();
+        if adoption_first {
+            let adopting = driver.pause_native_cut("source-adoption-with-state");
+            let removing = driver.pause_native_cut("source-remove-before-state");
+            let _release_adopting = ReleaseGate(adopting.clone());
+            let _release_removing = ReleaseGate(removing.clone());
+            resolved.release.notify_one();
+            gate(&mut cluster, &adopting).await?;
+            let remove_driver = driver.clone();
+            let mut remove = tokio::spawn(async move { remove_driver.remove_replica(replica).await });
+            removing.entered.notified().await;
+            removing.release.notify_one();
+            check(tokio::time::timeout(Duration::from_millis(100), &mut remove).await.is_err(),
+                "Remove bypassed adoption's native state owner")?;
+            adopting.release.notify_one();
+            cluster.settle_members(2).await?;
+            check(remove.await.map_err(error)?.is_err(), "adopted voter was removed")?;
+            let native = native_continuity(&source, &target, &id).await?;
+            let owners = (driver.pg_session_ownership(&id), target_driver.pg_session_ownership(&id));
+            let membership = driver.pg_native_membership(&id).map_err(error)?;
+            let installed = driver.durable.revalidate().await.map_err(error)?.synchronous;
+            check(driver.remove_replica(replica).await.is_err(), "installed voter accepted Remove")?;
+            check(
+                native_continuity(&source, &target, &id).await? == native
+                    && owners == (driver.pg_session_ownership(&id), target_driver.pg_session_ownership(&id))
+                    && membership == driver.pg_native_membership(&id).map_err(error)?
+                    && installed == driver.durable.revalidate().await.map_err(error)?.synchronous
+                    && Arc::ptr_eq(&inbound, &target_driver.pg_native_inbounds()[0]),
+                "rejected Remove changed native session/gateway/slot/receiver or SQL policy",
+            )?;
+            {
+                let state = driver.public_owner().state.lock().await;
+                let grant = state.grants.iter().find(|grant| grant.binding.session() == Some(&id)).unwrap();
+                check(
+                    matches!(&grant.binding, TransportBinding::Peer(peer) if peer.session.as_deref() == Some(&id))
+                        && (grant.credential.host.clone(), grant.credential.port, grant.credential.name.clone(), grant.session.clone()) == credential,
+                    "adoption or rejected Remove changed nonce/endpoint/ACK owner",
+                )?;
+            }
+            let (target_sql, target_connection) = target.instance().connect().await.map_err(error)?;
+            target_sql.simple_query("SELECT pg_wal_replay_pause()").await.map_err(error)?;
+            let (sql, connection) = application_connection(&source).await?;
+            let mut write = tokio::spawn(async move {
+                let result = sql.batch_execute(
+                    "SET synchronous_commit = remote_apply;
+                     INSERT INTO m2_native_admission VALUES (2, 'remove-survivor')",
+                ).await;
+                drop(sql);
+                connection.await.map_err(error)?;
+                result.map_err(error)
+            });
+            let (admin, admin_connection) = source.instance().connect().await.map_err(error)?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let waiting: bool = admin.query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                         WHERE wait_event = 'SyncRep' AND query LIKE '%remove-survivor%')", &[],
+                    ).await.map_err(error)?.get(0);
+                    if waiting { return Ok::<_, TestError>(()); }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.map_err(error)??;
+            check(tokio::time::timeout(Duration::from_millis(100), &mut write).await.is_err(),
+                "SQL write did not depend on the surviving actual voter's replay ACK")?;
+            target_sql.simple_query("SELECT pg_wal_replay_resume()").await.map_err(error)?;
+            write.await.map_err(error)??;
+            let boundary = source.instance().retained_wal_boundary().await.map_err(error)?;
+            for mode in [ReplicaSetQuorumMode::WriteQuorum, ReplicaSetQuorumMode::All] {
+                PrimaryReplicator::wait_for_catch_up_quorum(driver.as_ref(), mode).await.map_err(error)?;
+            }
+            let evidence = target_driver.observer.snapshot().await.map_err(error)?.evidence.unwrap();
+            check(evidence.received_lsn.is_some_and(|lsn| lsn >= boundary)
+                && evidence.replay_lsn.is_some_and(|lsn| lsn >= boundary),
+                "surviving receiver did not receive AND replay acknowledged WAL")?;
+            let (sql, connection) = administrative_database(&target).await?;
+            let value: String = sql.query_one("SELECT value FROM m2_native_admission WHERE id = 2", &[])
+                .await.map_err(error)?.get(0);
+            check(value == "remove-survivor", "quorum SQL tail missing on surviving voter")?;
+            drop(sql);
+            connection.await.map_err(error)?;
+            drop(admin);
+            admin_connection.await.map_err(error)?;
+            drop(target_sql);
+            target_connection.await.map_err(error)?;
+            check(native_continuity(&source, &target, &id).await? == native,
+                "quorum/catch-up replaced the surviving native owners")?;
+        } else {
+            let cleanup = driver.pause_native_cut("source-retirement-cleanup");
+            let rejected = driver.pause_native_cut("source-adoption-rejected");
+            let _release_cleanup = ReleaseGate(cleanup.clone());
+            let _release_rejected = ReleaseGate(rejected.clone());
+            let remove_driver = driver.clone();
+            let mut observer = tokio::spawn(async move { remove_driver.remove_replica(replica).await });
+            cleanup.entered.notified().await;
+            check(driver.pg_session_ownership(&id).0 == session::SessionStage::Retiring
+                && target_driver.pg_session_ownership(&id).1,
+                "legal Remove reached its first cleanup await without fencing the exact session")?;
+            check(tokio::time::timeout(Duration::from_millis(100), &mut observer).await.is_err(),
+                "Remove returned before actual native cleanup")?;
+            observer.abort();
+            let _ = observer.await;
+            resolved.release.notify_one();
+            rejected.entered.notified().await;
+            // Observe the real native rejection before ordinary callback
+            // failure containment can retire the entire source creation.
+            {
+                let state = driver.public_owner().state.lock().await;
+                check(state.configuration == configuration && state.previous == previous
+                    && state.grants.iter().any(|grant| matches!(&grant.binding,
+                        TransportBinding::Build(build) if build.session.as_deref() == Some(&id))
+                        && grant.gateway.task_abort_handle().id() == native.gateway
+                        && (grant.credential.host.clone(), grant.credential.port, grant.credential.name.clone(), grant.session.clone()) == credential),
+                    "prevalidated adoption installed a fenced session before rejecting")?;
+            }
+            check(driver.public_owner().fence.context().map_err(error)? == context
+                && driver.durable.revalidate().await.map_err(error)?.synchronous == policy
+                && driver.pg_native_membership(&id).is_err()
+                && source.instance().is_running().await
+                && source.instance().generation_id() == source_generation
+                && target.instance().generation_id() == native.receiver_generation
+                && std::fs::metadata(source.instance().data_dir().join("pg_replslot")
+                    .join(crate::native::replication_slot_name(&id.target.scope.storage.replica)))?.ino() == native.slot_inode,
+                "fenced adoption changed source/target native effects or SQL policy")?;
+            if lost_join {
+                target.instance().lose_monitor().await;
+            }
+            cleanup.release.notify_one();
+            driver.remove_replica(replica).await.map_err(error)?;
+            let retired = driver.pg_retire_session(&id).await;
+            if lost_join {
+                check(retired.is_err() && driver.pg_retire_session(&id).await.is_err()
+                    && target_driver.pg_session_ownership(&id).0 == session::SessionStage::Quarantined,
+                    "lost native monitor join fabricated successful removal")?;
+                let first = target_driver.public_close().await.unwrap_err().to_string();
+                let second = target_driver.public_close().await.unwrap_err().to_string();
+                check(first == second && !target_driver.public_closed(),
+                    "lost native join was not sticky after lost Remove observer")?;
+            } else {
+                retired.map_err(error)?;
+                check(driver.pg_session_ownership(&id).0 == session::SessionStage::Retired
+                    && driver.pg_session_ownership(&id).2
+                    && target_driver.pg_session_ownership(&id).0 == session::SessionStage::Retired
+                    && !target_driver.pg_session_ownership(&id).1
+                    && !target.instance().is_running().await,
+                    "reattached Remove did not join both actual native owners")?;
+                let join = inbound.task.lock().await;
+                check(join.task.is_none() && join.result.as_ref().is_some_and(|result| result.is_ok()),
+                    "actual inbound task join was not retained")?;
+                let state = driver.public_owner().state.lock().await;
+                check(state.grants.iter().all(|grant| grant.binding.session() != Some(&id))
+                    && !state.built_idle.contains_key(&replica)
+                    && !source.instance().data_dir().join("pg_replslot")
+                        .join(crate::native::replication_slot_name(&id.target.scope.storage.replica)).exists(),
+                    "removed idle gateway/slot owner survived settlement")?;
+            }
+            check(target.instance().data_dir().join("PG_VERSION").exists()
+                && driver.public_owner().fence.context().map_err(error)?.role == ReplicaRole::Primary,
+                "idle removal reset PGDATA or depended on source role loss")?;
+            rejected.release.notify_one();
+        }
+        Ok(())
+    }.await;
+    let passed = result.is_ok();
+    let outcome = cluster.finish(result).await;
+    assert!(
+        passed,
+        "Remove/adoption witness failed: {outcome:?}; sources: {:?}",
+        outcome.as_ref().err().map(|failure| failure
+            .sources()
+            .map(|source| source.to_string())
+            .collect::<Vec<_>>())
+    );
+    if lost_join {
+        assert!(
+            outcome.is_err(),
+            "lost real native join became successful teardown"
+        );
+    } else {
+        finished(outcome);
+    }
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m2_pg_adoption_remove_keeps_voter_and_quorum() {
+    remove_adoption(true, false).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m2_pg_adoption_remove_retirement_first_rejects_and_joins() {
+    remove_adoption(false, false).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m2_pg_adoption_remove_lost_observer_keeps_sticky_join() {
+    remove_adoption(false, true).await;
+}
+
 async fn incompatible_live_publication(endpoint: &str, dimension: &str) {
     let factory = Factory::default();
     let mut cluster = cluster(&factory).await;

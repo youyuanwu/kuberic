@@ -412,6 +412,8 @@ impl PgReplicator {
                 }
             }
         } else {
+            #[cfg(all(test, feature = "testing"))]
+            self.native_cut("source-retirement-cleanup").await;
             let mut state = self.public_owner().state.lock().await;
             let mut retired = Vec::new();
             let mut index = 0;

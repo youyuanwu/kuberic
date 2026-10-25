@@ -129,6 +129,16 @@ native quorum algorithms are unchanged. These are component proofs with
 controlled publications, not a new ordinary controller or live-image claim.
 Independent implementation re-review and final reviews remain separate gates.
 
+The independent round-2 Sol review subsequently passed the **full** owned
+matching-image bootstrap on `bd9ae6bc12cc1c7fb773884c805d442e73f9cd78`, tree
+`a437a51b7153687cc830f43c357e478a6d070e26`, nextest
+`46c58a7e-cc53-4a2d-9863-6a5d325b5f08`, exit 0. Actual secondary
+reconstruction, renewed exact authority and final quorum write/read executed.
+Sealed source/binary/native-library/OCI/pod custody and owned-cluster cleanup
+bind that pass to **bd9ae6bc**, not the historical `af06768a` image or later
+PG/package-harness changes. It is not a PG race test, a final-review PASS,
+an image pass for a future HEAD or comprehensive M3 qualification.
+
 The retained-member recovery proof requires an unchanged available Primary and
 exact storage/history/epoch/configuration. It executes fresh authenticated
 session establishment, old carrier/effect/ACK joins, full retained-prefix
@@ -165,13 +175,21 @@ delete shared build outputs. The accepted runs used executable task-owned
 `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
 `CARGO_NET_OFFLINE=true`, `RUST_BACKTRACE=0`; PG data used `.paw/m2pg`.
 Record literal paths, versions, source maps, selection, raw streams and exit.
+The packaged-consumer gate separately owns external source/vendor fixtures
+under the inherited `TMPDIR` and an isolated build-cache child beneath Cargo's
+target root. The cache may be checkout-local; the source must not be. Reserve
+an approved external `TMPDIR` before these commands and leave it unchanged.
+Checkout-local `TMPDIR` is rejected before allocation, rather than silently
+changing the environment or weakening the outside-checkout assertion.
 These commands are reproduction guidance, not executions by this phase:
 
 ```bash
 owned="$PWD/target/m2-validation-owned"
 test ! -e "$owned"
-mkdir -p "$owned/build" "$owned/scratch" "$owned/pg"
-export CARGO_TARGET_DIR="$owned/build" TMPDIR="$owned/scratch"
+: "${TMPDIR:?reserve an approved external scratch directory first}"
+test -d "$TMPDIR"
+mkdir -p "$owned/build" "$owned/pg"
+export CARGO_TARGET_DIR="$owned/build"
 export KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$owned/pg"
 export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 export CARGO_NET_OFFLINE=true RUST_BACKTRACE=0
