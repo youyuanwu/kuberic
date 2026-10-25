@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 
 use serde::{Deserialize, Serialize};
@@ -237,8 +237,46 @@ struct State {
     receiver: Option<String>,
 }
 
+#[cfg(all(test, feature = "testing"))]
+#[derive(Clone, Copy)]
+pub(super) enum RemovalCut {
+    GateRequested,
+    Dispatch { replica: i64, applied: i64 },
+}
+
+#[cfg(all(test, feature = "testing"))]
+type RemovalHook = Arc<dyn Fn(RemovalCut) + Send + Sync>;
+
 #[derive(Default)]
-pub(in crate::replicator::v1) struct Sessions(Mutex<State>);
+pub(in crate::replicator::v1) struct Sessions(
+    Mutex<State>,
+    #[cfg(all(test, feature = "testing"))] pub(super) Mutex<Option<RemovalHook>>,
+);
+
+pub(super) struct IdleRemoval<'a> {
+    state: MutexGuard<'a, State>,
+    binding: &'a Binding,
+}
+
+impl IdleRemoval<'_> {
+    pub(super) fn retire(mut self, native_idle: bool) -> Result<()> {
+        if !native_idle
+            && !self
+                .state
+                .entries
+                .get(&self.binding.nonce)
+                .is_some_and(|entry| {
+                    entry.binding == *self.binding
+                        && !self.binding.recovery
+                        && !entry.copy_completed
+                        && matches!(entry.phase, Phase::Proposed | Phase::Active)
+                })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Sessions::retire_locked(&mut self.state, self.binding, || Ok(()))
+    }
+}
 
 #[derive(Clone)]
 pub(in crate::replicator::v1) struct Fence {
@@ -285,6 +323,14 @@ impl Fence {
 }
 
 impl Sessions {
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_cut(&self, cut: RemovalCut) {
+        let hook = self.1.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(cut);
+        }
+    }
+
     pub(super) fn completed(&self, binding: &Binding) -> bool {
         self.0
             .lock()
@@ -626,19 +672,15 @@ impl Sessions {
         Self::retire_locked(&mut state, binding, take)
     }
 
-    pub(super) fn retire_idle(&self, binding: &Binding, native_idle: bool) -> Result<()> {
-        let mut state = self.0.lock().unwrap();
-        if !native_idle
-            && !state.entries.get(&binding.nonce).is_some_and(|entry| {
-                entry.binding == *binding
-                    && !binding.recovery
-                    && !entry.copy_completed
-                    && matches!(entry.phase, Phase::Proposed | Phase::Active)
-            })
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
+    // Acquire before native selection, just like ingress effect admission.
+    // The consuming retirement callback never reacquires the session gate.
+    pub(super) fn idle_removal<'a>(&'a self, binding: &'a Binding) -> IdleRemoval<'a> {
+        #[cfg(all(test, feature = "testing"))]
+        self.removal_cut(RemovalCut::GateRequested);
+        IdleRemoval {
+            state: self.0.lock().unwrap(),
+            binding,
         }
-        Self::retire_locked(&mut state, binding, || Ok(()))
     }
 
     fn retire_locked<T>(

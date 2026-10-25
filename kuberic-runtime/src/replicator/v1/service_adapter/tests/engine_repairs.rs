@@ -6,6 +6,9 @@ use crate::replicator::ReplicatorInterfaces;
 #[cfg(feature = "testing")]
 #[path = "final_remediation.rs"]
 mod final_remediation;
+#[cfg(feature = "testing")]
+#[path = "removal_remediation.rs"]
+mod removal_remediation;
 
 struct Pair {
     source: Arc<Transport>,

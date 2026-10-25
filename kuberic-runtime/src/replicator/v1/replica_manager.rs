@@ -812,7 +812,7 @@ impl ReplicaManager {
 
     #[cfg(test)]
     pub(super) fn remove_idle(&mut self, replica_id: i64) -> Result<ManagerEffects, ManagerError> {
-        self.remove_idle_with(replica_id, |native_idle| {
+        self.remove_idle_with(replica_id, false, |native_idle| {
             native_idle
                 .then_some(())
                 .ok_or(ConfigurationError::IdleNotFound(replica_id).into())
@@ -822,9 +822,19 @@ impl ReplicaManager {
     pub(super) fn remove_idle_with(
         &mut self,
         replica_id: i64,
+        exclude_voters: bool,
         before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
     ) -> Result<ManagerEffects, ManagerError> {
         self.ensure_active()?;
+        if exclude_voters
+            && self.current.iter().chain(self.previous.iter()).any(|set| {
+                set.members
+                    .iter()
+                    .any(|member| member.replica_id == replica_id)
+            })
+        {
+            return Err(ConfigurationError::IdleNotFound(replica_id).into());
+        }
         let Some(index) = self
             .idle
             .iter()
@@ -856,6 +866,19 @@ impl ReplicaManager {
         }
         self.advance(observation, &mut effects);
         Ok(effects)
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_membership(&self, id: i64) -> (bool, bool, bool) {
+        let contains = |set: &Option<ReplicaSet>| {
+            set.as_ref()
+                .is_some_and(|set| set.members.iter().any(|member| member.replica_id == id))
+        };
+        (
+            contains(&self.current),
+            contains(&self.previous),
+            self.has_idle_membership(id),
+        )
     }
     pub(super) fn admit_recovery(
         &mut self,

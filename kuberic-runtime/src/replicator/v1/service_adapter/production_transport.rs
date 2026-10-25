@@ -490,6 +490,14 @@ impl Transport {
         )
     }
 
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_receivers(&self) -> serde_json::Value {
+        serde_json::json!({
+            "receivers": self.registry.inspect_receivers(),
+            "ingress": *self.ingress_observations.lock().unwrap(),
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn test_production(&self) -> Arc<super::production::Production> {
         self.production
@@ -1523,10 +1531,18 @@ impl Transport {
                         self.observe_ingress(&envelope, "epochRejected".into());
                         continue;
                     }
-                    let dispatched = match self
-                        .sessions
-                        .effect(&binding, || self.registry.dispatch(&envelope))
-                    {
+                    let dispatched = match self.sessions.effect(&binding, || {
+                        #[cfg(all(test, feature = "testing"))]
+                        if let Some(wire::envelope::Body::ReplicationAck(ack)) = &envelope.body {
+                            self.sessions.removal_cut(
+                                super::engine_session::RemovalCut::Dispatch {
+                                    replica: envelope.source.as_ref().unwrap().replica,
+                                    applied: ack.replication_applied,
+                                },
+                            );
+                        }
+                        self.registry.dispatch(&envelope)
+                    }) {
                         Ok(dispatched) => dispatched,
                         Err(_) => continue,
                     };

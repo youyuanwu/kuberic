@@ -739,7 +739,7 @@ impl PrimaryHandle {
     }
 
     pub(super) fn remove_idle(&self, id: i64) -> Result<(), PrimaryError> {
-        self.remove_idle_with(id, |native_idle| {
+        self.remove_idle_selected(id, false, |native_idle| {
             native_idle
                 .then_some(())
                 .ok_or(super::replica_manager::ConfigurationError::IdleNotFound(id).into())
@@ -751,13 +751,22 @@ impl PrimaryHandle {
         id: i64,
         before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
     ) -> Result<(), PrimaryError> {
+        self.remove_idle_selected(id, true, before_remove)
+    }
+
+    fn remove_idle_selected(
+        &self,
+        id: i64,
+        exclude_voters: bool,
+        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
+    ) -> Result<(), PrimaryError> {
         let root = self.root()?;
         let (effects, _activity) = {
             let mut state = root.state.lock().unwrap();
             Root::check_open(&state)?;
             let effects = {
                 let mut manager = root.manager.lock().unwrap();
-                let effects = manager.remove_idle_with(id, before_remove)?;
+                let effects = manager.remove_idle_with(id, exclude_voters, before_remove)?;
                 if !manager.contains_session(id) {
                     state.bindings.remove(&id);
                 } else if let Some(binding) = state.bindings.get_mut(&id) {
@@ -769,6 +778,31 @@ impl PrimaryHandle {
         };
         effects.dispatch(root.clock.now())?;
         Ok(())
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_session(&self, id: i64) -> ReplicationSession {
+        self.root().unwrap().state.lock().unwrap().bindings[&id]
+            .session
+            .clone()
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_build(&self, id: i64) -> BuildIdleHandle {
+        match &self.root().unwrap().state.lock().unwrap().bindings[&id].owner {
+            SessionOwner::Build(build) => build.clone(),
+            _ => panic!("actual completed Build owner required"),
+        }
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_membership(&self, id: i64) -> (bool, bool, bool) {
+        self.root()
+            .unwrap()
+            .manager
+            .lock()
+            .unwrap()
+            .removal_membership(id)
     }
 
     fn select(

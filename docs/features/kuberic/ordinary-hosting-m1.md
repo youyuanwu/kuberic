@@ -95,10 +95,13 @@ Ready removal on a still valid Open/Primary source calls ordinary Remove and
 retires **local** idle ownership only. It is not proof of target receiver
 drainage. InBuild cancellation uses a whole-creation Abort goal, never Remove
 on an aborted allocation; target settlement is separate.
-The built-in engine admits idle-only removal under the same native lock as
-configuration adoption, before fencing the session. Remove of an admitted
-voter returns an error without changing either endpoint's session or native
-peer. Legal idle removal still fences synchronously and retains remote
+The built-in engine takes the session effect gate **before** the native
+state/manager locks, matching authenticated ingress. Under those native locks,
+it excludes both current and previous voting membership, even when the peer
+also retains native idle membership, before fencing or removing anything.
+Rejected voter Remove changes neither endpoint's session, native sender/build,
+transport nor ACK owner. Legal idle removal still fences synchronously under
+the same configuration-adoption lock and retains remote
 retirement/join work even if its caller disappears.
 An exact owned transfer still awaiting native Build may also be cancelled,
 but only after the same native lock excludes current/previous voters.

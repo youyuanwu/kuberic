@@ -671,18 +671,15 @@ fn handle(
                 return Ok(Some(Value::Completed));
             }
             Command::RemoveFenced(id, sessions, binding) => {
-                adapter
-                    .owner
-                    .primary()
-                    .map_err(AdapterError::from)?
-                    .remove_idle_with(id, |native_idle| {
-                        sessions
-                            .retire_idle(&binding, native_idle)
-                            .map_err(|error| {
-                                super::super::replica_manager::ManagerError::BuildLifecycle(
-                                    error.to_string(),
-                                )
-                            })
+                let primary = adapter.owner.primary().map_err(AdapterError::from)?;
+                let removal = sessions.idle_removal(&binding);
+                primary
+                    .remove_idle_with(id, move |native_idle| {
+                        removal.retire(native_idle).map_err(|error| {
+                            super::super::replica_manager::ManagerError::BuildLifecycle(
+                                error.to_string(),
+                            )
+                        })
                     })
                     .map_err(AdapterError::from)?;
                 return Ok(Some(Value::Completed));

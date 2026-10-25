@@ -13,8 +13,10 @@ does and does not establish.
 implemented. Bounded M2 implementation acceptance passed for built-in V1,
 KV, SQLite, the standalone external provider and independent PG native sessions,
 effects, admission and actual joins through production ordinary goals.
-Documentation implementation review and actual independent final Sol/Astra
-gates have not run; the complete M2 workflow and exhaustive M3 remain separate.
+Documentation was independently accepted. Round-1 final Sol/Astra reviews and
+the first remediation implementation review required further fixes; independent
+implementation re-review and actual final re-gates remain pending. The complete
+M2 workflow and exhaustive M3 remain separate.
 Built-in historical bodies are enabled rather than returning an unavailable
 success. Their broader recovery/handoff results are not bounded M2 acceptance.
 Actual engine/component negatives, application witnesses and production
@@ -114,7 +116,18 @@ Recover RPCs, copy, carrier/ACK ownership, quorum writes and joins. The ordinary
 `m2_builtin_remove_serializes_with_native_configuration_adoption` witness
 executes both adoption/Remove orderings; the multi-secondary witness rejects
 voter Remove before its real quorum and All catch-up assertions.
-Final independent review remains a separate gate.
+The private `removal_remediation::m2_remove_` regressions additionally execute
+real completed Builds on multithreaded engines. One holds an actual healthy
+peer's ingress inside the session gate while legal idle Remove requests that
+gate on a different OS thread; a joined native progress probe, both requests,
+subsequent quorum/All work and terminal joins must complete. The other installs
+a previous-only voter that still has native idle membership, requires Remove
+to error with exact source/target session, native sender/build, transport and
+ACK owners unchanged, then completes another previous-quorum-dependent write
+and catch-up before actual joins. The supported native PC/idle overlap and
+native quorum algorithms are unchanged. These are component proofs with
+controlled publications, not a new ordinary controller or live-image claim.
+Independent implementation re-review and final reviews remain separate gates.
 
 The retained-member recovery proof requires an unchanged available Primary and
 exact storage/history/epoch/configuration. It executes fresh authenticated

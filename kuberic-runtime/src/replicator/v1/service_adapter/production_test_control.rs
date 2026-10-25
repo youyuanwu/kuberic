@@ -2,6 +2,18 @@
 
 use super::*;
 
+impl Production {
+    #[cfg(feature = "testing")]
+    pub(in crate::replicator::v1::service_adapter) fn removal_primary(
+        &self,
+    ) -> crate::replicator::v1::primary::PrimaryHandle {
+        match self.facade.service().target().unwrap() {
+            super::super::Target::Primary(primary) => primary,
+            _ => panic!("actual primary required"),
+        }
+    }
+}
+
 pub(crate) async fn test_compose(
     context: ReplicatorFactoryContext,
     provider: Arc<dyn StateProvider>,
