@@ -1,15 +1,16 @@
 # Ordinary Hosting M1
 
-**IMPLEMENTED: generic host/controller contract.** This is a development
-checkpoint, **not a deployable default-engine stack**. M2's built-in V1 factory
-now opens through ordinary hosting with engine-owned authenticated sessions and
-retained native/transport Close. The in-progress M2 application slice connects
-KVStore2, SQLite and the external provider to that route, including durable copy,
-separate admission/access and ordinary application joins. PostgreSQL integration
-remains outstanding. See the bounded
+**IMPLEMENTED: generic host/controller contract and bounded M2 integration.**
+Built-in V1, KVStore2, SQLite, the external provider and independent PostgreSQL
+now use ordinary hosting, engine-owned authenticated sessions and retained
+native/transport/application Close. Applicable M2 implementation acceptance
+passed through the independent Phase 6 review; documentation implementation
+review and actual independent final Sol/Astra gates remain pending.
+This is an experimental development checkpoint, not production certification.
+See the bounded
 [engine](testing.md#built-in-m2-engine-slice) and
 [application selections](testing.md#built-in-m2-application-slice), not a claim
-that the complete M2 milestone or historical recovery journeys are qualified.
+that the complete M2 workflow or historical recovery journeys are qualified.
 Comprehensive recovery/failover qualification is **M3, not implemented**.
 See the [roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
 
@@ -29,7 +30,7 @@ status pruning; this is not a live-cluster or native Service Fabric execution.
 | Engine/service | Real endpoint and authenticated native recovery/transfer, application data, effect fencing and ordinary descendant joining |
 
 The [production reconciler](../../../kuberic-controller/src/reconciler.rs#L670)
-uses [ordinary reconciliation](../../../kuberic-controller/src/ordinary_reconciliation.rs#L226).
+uses [ordinary reconciliation](../../../kuberic-controller/src/ordinary_reconciliation.rs#L238).
 It first retains independent Discover/Open goals for eligible peers. Once their
 actual endpoints exist, it retains role/scope preparation, including Prepare
 IdleSecondary on a Build target. It then calls ordinary source Build, accepts
@@ -38,8 +39,8 @@ catch-up for voting/access. It never installs or revokes a target engine grant.
 Fresh metadata provisioning remains an authenticated initialization command;
 legacy callback-program, grant and renewal production dispatch rejects.
 
-The [canonical CRD goal](../../../kuberic-controller/src/crd.rs#L80) replaces
-controller command JSON. The [local operation owner](../../../kuberic-runtime/src/host/ordinary_goal.rs#L177)
+The [canonical CRD goal](../../../kuberic-controller/src/crd.rs) replaces
+controller command JSON. The [local operation owner](../../../kuberic-runtime/src/host/ordinary_goal.rs)
 freezes its ordinary actions and receipts in the existing journal, not a parallel
 readiness ledger. Controller recreation resumes exact retained goals. A task
 does not reappear merely because its durable goal remains.
@@ -116,7 +117,7 @@ use ordinary callbacks; incompatible replacement requires withdrawal:
 3. Acknowledge containment/release the provider writer only after actual required
    success, or independently verified process containment.
 
-[Settlement](../../../kuberic-runtime/src/host/hosting.rs#L1320) retains sticky
+[Settlement](../../../kuberic-runtime/src/host/hosting.rs#L1079) retains sticky
 errors and joins late factory allocations as well as registered children.
 Failed preparation uses the same barrier. A child Close error remains a failed
 public outcome even after other descendants join. Failed/lost/hung joining
@@ -146,7 +147,9 @@ M3 recovery evidence.
 ## Fresh-deployment format
 
 Host schema, control identity/envelopes and required
-`KubericSet.spec.hostingFormat` are **15**. Retained CRD goals/outcomes are
+`KubericSet.spec.hostingFormat` are **16**, including generated CRD, shipped
+sample and fixtures. M1's original format-15 acceptance is historical, not a
+supported reader. Retained CRD goals/outcomes are
 structurally typed and canonically validated. Old/missing/mixed formats and
 legacy retained commands reject before authoritative mutation.
 
@@ -178,25 +181,31 @@ receipt gaps, exact Ready/separate admission, failed preparation, retained
 engine/service/host joins, writer fencing, tombstones/bounds and matching-format
 uncertainty. [Testing](testing.md#ordinary-hosting-m1) records validation scope.
 
-Old built-in/PG/controller journey names now assert exact **M2 unavailable**
-where their production integration was removed. Their later historical property
-clauses do not execute at this checkpoint. A green wrapper is **not** evidence
-of built-in copy, PG SQL/WAL/replay or old failover/terminal behavior. Actual
-native/component and generic host negatives run separately. Remaining legacy
-companion/grant APIs serve those not-yet-moved engine consumers/components;
-they are not a production fallback or required by the ordinary M1 route.
+Actual built-in/application and independent PG witnesses execute copy, ACK,
+native SQL/WAL/replay and real joining. Former unavailable wrappers and
+grant-era fixtures have been converted; shared companion/grant/control fields
+are removed. Their assertions now live at ordinary host or concrete engine
+owners, rather than disappearing with the old API.
+Historical broad bodies remain enabled and red at their actual later limits.
+The [evidence boundary](testing.md#m2-accepted-evidence-and-remaining-boundaries)
+records aggregate infrastructure termination, complete native complements,
+changed-primary handoff and replacement/election diagnostics without crediting
+unexecuted suffixes. Duplicate Discover, incomplete retained-member copy and
+stale predecessor-terminal Build veto were M2 defects and are now repaired,
+not deferred as M3.
 
 Automatic admitted contraction, planned primary replacement and retained-history
 election/reformation are explicitly unavailable or waiting for fresh evidence.
-M2 must move actual built-in/PG consumers, qualify authenticated session retirement/
-effect fencing and ordinary joining, then delete superseded consumer paths.
 M3 must qualify the full crash/failover/replacement matrix.
 PG durable metadata, WAL/backup/slots/lineage and physical SQL/process obligations
 remain; [metadata removal](../postgres/stateless-metadata-prerequisites.md) is
 separately deferred.
 
 Bearer authentication is not TLS or hostile-administrator/orphan protection.
-No native executable differential, live Kubernetes/Kind, power-loss, downstream
+Full owned live bootstrap passed on the exact recovery image source recorded
+in [testing](testing.md#m2-accepted-evidence-and-remaining-boundaries); it predates
+the final terminal-owner controller repair and is not its live qualification.
+No native executable differential, power-loss, downstream
 MySQL, broad settings/security or production-readiness certification is claimed.
 Existing [source provenance and notices](sf-v1-port-provenance.md) remain.
 
@@ -229,8 +238,9 @@ two-ended Ready, configuration receipts and separate access admission.
 `TestCluster::request_restart` observes a real fresh, unadmitted process;
 `restart` additionally settles the configured membership cardinality. Native KV
 recovery tests preserve acknowledged data, closed recovery access, fresh ongoing
-replication and post-restart quorum writes. This bounded repair does not certify
-the full Phase 6 or M3 election, primary replacement, contraction or handoff matrix.
+replication and post-restart quorum writes. This bounded repair is part of
+accepted M2 implementation evidence, not general M3 election, primary
+replacement, contraction or handoff qualification.
 
 An achieved predecessor Close remains in retained history after restart, but
 does not veto a fresh idle Build for the admitted new process/creation. Both

@@ -1,14 +1,15 @@
 # Downstream In-Process Application Tests
 
-**M1 checkpoint:** production reconciliation now requires format-15 semantic
-goals and an ordinary-compatible factory. Built-in/KV/SQLite/PG/external-provider
-integration explicitly rejects until M2. Historical formation/failover/copy
-journeys described below now check exact unavailability where that route moved;
-their later clauses do not execute. The [ordinary M1 witness](ordinary-hosting-m1.md#verification-and-limits)
-instead runs the real reconciler/agent transport with an independent ordinary
-factory, early discovery, retained lifetimes and separate admission.
-The reusable adapter/package boundary remains, but the older counter/provider
-example is not a supported current production engine.
+**Current ordinary M1/M2 integration:** production reconciliation requires
+format-16 semantic goals and an ordinary-compatible factory. Built-in,
+KV/SQLite/external-provider and independent PG witnesses execute actual
+copy/data and joins, not unavailable-success wrappers. The
+[ordinary contract](ordinary-hosting-m1.md#verification-and-limits) uses early
+discovery, retained lifetimes, exact two-ended Ready and separate admission.
+The downstream counter/provider executes bounded ordinary formation and
+healthy-quorum secondary-gap behavior. Broad replacement/election/handoff
+diagnostics remain enabled and unqualified; documentation and final independent
+review gates remain pending. See [actual evidence limits](testing.md#m2-accepted-evidence-and-remaining-boundaries).
 
 Enable the controller's optional `test-util` feature in development
 dependencies to run a production reconciler and real hosted application
@@ -81,9 +82,15 @@ CRD cardinality restriction. Scaling changes only spec intent. Initialization,
 source/target Build and separate admission still run through the real controller.
 `settle()` retains its three-member expectation; use `settle_members` for another
 requested count.
-See [builder:1463–1520](../../../kuberic-controller/src/test_util/cluster.rs#L1463-L1520),
-[singleton settle:1639–1654](../../../kuberic-controller/src/test_util/cluster.rs#L1639-L1654)
-and [spec-only scaling:2077–2089](../../../kuberic-controller/src/test_util/cluster.rs#L2077-L2089).
+See [builder](../../../kuberic-controller/src/test_util/cluster.rs#L1329-L1388),
+[cardinality-aware settle](../../../kuberic-controller/src/test_util/cluster.rs#L1525-L1540)
+and [spec-only scaling](../../../kuberic-controller/src/test_util/cluster.rs#L2069-L2085).
+
+`request_restart` returns the fresh process before admission so tests can observe
+closed access. `restart` additionally settles the configured member cardinality,
+including a singleton; it does not hard-code three members or certify an election.
+Both preserve retained data and require actual old-owner drainage, not reset.
+See [restart stages](../../../kuberic-controller/src/test_util/cluster.rs#L1890-L1938).
 
 `drive` advances reconciliation concurrently with an application future;
 `probe` bounds the future without advancing reconciliation. All helpers share
@@ -111,11 +118,14 @@ automatically.
 
 ## Fault and Transfer Tests
 
-The pre-M1 harness supported the built-in persisted Public V1 profile and bounded
-custom-native formation through the
-[custom companion](replicator-boundary.md#custom-controller-integration).
+The current harness uses ordinary production goals, authenticated discovery,
+exact accepted snapshots and retained results, not companion/grant instructions
+or required idle diagnostics. The pre-M1
+[custom companion](replicator-boundary.md#historical-companion-contract-removed)
+is removed.
 PostgreSQL's [production-engine fixture](../../../examples/postgres/src/public_controller_tests.rs)
-owns its actual native coordination listeners, processes and storage.
+uses production PG ordinary Open to own native coordination listeners, processes
+and storage; there is no second fixture-owned data server.
 Controls cover cooperative restart/stop, controller-owned Pod
 replacement, support-resource repair, planned switchover and real loopback TCP
 isolation. Readiness validates exact accepted/live evidence, access grants,

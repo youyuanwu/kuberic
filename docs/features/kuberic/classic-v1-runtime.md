@@ -6,6 +6,9 @@ contract, now using matched format 16. Built-in/KV/SQLite and independent
 PostgreSQL integrate through ordinary engine-owned sessions and joining.
 Bounded witnesses execute actual native/application work; enabled broader
 journeys can still expose the separately scoped M3 policy boundary.
+Applicable M2 implementation acceptance passed; documentation implementation
+review and actual independent final Sol/Astra gates remain pending. See the
+[exact executed-source and red-gate boundaries](testing.md#m2-accepted-evidence-and-remaining-boundaries).
 The component algorithms and explicitly pinned pre-M1 evidence below remain;
 do not interpret their grant/companion/renewal/failover descriptions as the new
 production route. See the [roadmap and qualification limits](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
@@ -26,7 +29,7 @@ Native comparisons use Service Fabric
 
 Bounded custom-controller formation evidence is separately anchored to Kuberic
 `366b362ce4e1c9fdc6aaf0fe64e6be78931e96a3` and the
-[supported companion contract](replicator-boundary.md#custom-controller-integration).
+[historical companion contract](replicator-boundary.md#historical-companion-contract-removed).
 Current authority/ownership contracts use the linked source and witnesses below.
 The PostgreSQL controller witnesses and runtime negative fixtures do
 not change the older pinned built-in/component evidence below.
@@ -358,13 +361,15 @@ cannot replace a new Build under an old ID
 PostgreSQL uses its own no-provider/no-StateReplicator bundle with conservative
 specific-quorum capability false ([service:246–292][pg-factory]).
 
-The production factory attaches its own creation-bound custom companion, not a
-built-in runtime. It validates exact host authority at native ingress, gateway/
-backup boundaries and completion; source inspection independently validates the
-live source operation. Actual WAL/lineage/replay and database evidence remain
-application-owned. Exact live native replay revalidates retained/physical
-history and returns the matching completion without repeating copy mutation.
-Revoked or stale authority cannot reuse that historical completion as ingress.
+The ordinary production factory returns an independent PG allocation, with no
+built-in wrapper, companion or host-installed target grant. PG Open owns its
+authenticated endpoint before recovery. Its private session nonce/generation
+binds both achieved publications; target reservation precedes source Active
+confirmation, serialized with retirement. Source Primary alone is insufficient.
+Tombstones last for the creation; uncertainty retains quarantine. Native
+effects revalidate around awaits and final confirmation. Backup, WAL/lineage,
+receive plus replay/checkpoint and nonmutating exact replay remain PG-owned.
+Source Remove is not target containment.
 
 Overlapping hosted native requests attach to one retained exact attempt.
 Queued/replay observers never acquire process cleanup authority; the serialized
@@ -378,37 +383,37 @@ durable observation before lifetime cancellation; Abort does not invent that
 observation. Both paths retain exhaustive joins/errors. A completed close is
 idempotent and does not repeat effects against a later storage owner.
 
-The engine retains last successfully installed native membership and actual
-completed built-idle ownership separately from current transport/readiness.
-Normal same-history epoch advancement may drain transport without erasing the
-truthful predecessor needed for joint catch-up; it does not install the next
-configuration or preserve revoked copy authority. Secondary host configuration
-precedes primary native Peer admission and is not itself native peer completion.
+The engine retains native membership and completed built-idle ownership
+separately from live transport/readiness. The exact joint `(P,C)` to current-only
+`(None,C)` continuation preserves the existing nonce, reservation, gateway, slot
+and ACK name for unchanged C/Primary/identity/history/epoch. That session may
+continue while either latest publication is DiscoveryPending; pending cannot
+start fresh transfer or grant SQL. Both late-worker and already-live-joint
+schedules execute. Missing/incompatible/withdrawn/retired/quarantined ownership
+fences effects. Target host configuration is not a primary-only callback or
+native peer admission.
 
-For initial authority only, the controller can select a deterministic singleton
-when every eligible replica has exact successful **New-Open completion
-provenance**, None role, no prior authority/installed state and both explicit
-`Value(INVALID_LSN)` query results. Current report Open mode is not freshness.
-This is local initialization policy, not a retained-history election or a zero
-progress claim; failed/unavailable queries do not qualify.
+Fresh initialization is selected from exact successful New-Open provenance,
+not a raw zero or unknown progress scalar. Ordinary snapshots do not query
+engine progress/capability. Earlier explicit sentinel query evidence is a
+native/direct or pre-M1 fact, not current generic retained-history election.
 
 The [actual controller cases](../../../examples/postgres/src/public_controller_tests.rs)
 qualify nonempty singleton → Build → separate joint/current-only admission,
 live replay and binding rejection, source/target invalidation before delayed
 completion, synchronous SQL/replay and retained-socket rejection after completed
-native fencing. Cleanup errors propagate while real owners are joined. Contract
-stale-revoke callbacks are explicitly negative component checks, not substituted
-controller positives. Automatic reformation after arbitrary failed custom Build,
+native fencing. Cleanup errors propagate while real owners are joined. Historical stale-revoke callbacks are component evidence, not substituted
+current positives. Automatic reformation after arbitrary failed custom Build,
 external MySQL requalification and native executable differential remain outside
 this evidence.
 
-Current source anchors are the
-[PG companion/authority:547–864](../../../examples/postgres/src/public_v1.rs#L547-L864),
-[epoch handling:1570–1604](../../../examples/postgres/src/public_v1.rs#L1570-L1604),
-[Build/replay:2365–2698](../../../examples/postgres/src/public_v1.rs#L2365-L2698),
-[graceful Close:1273–1323](../../../examples/postgres/src/public_v1.rs#L1273-L1323),
-[fresh authority gate:1084–1095,1199–1223](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1084-L1095)
-and [fresh provenance predicate](../../../kuberic-controller/src/evaluator/public_v1_topology.rs#L1199-L1223).
+Current owners are the [ordinary factory](../../../examples/postgres/src/service.rs),
+[authenticated endpoint](../../../examples/postgres/src/public_endpoint.rs),
+[private session/continuation/retirement](../../../examples/postgres/src/public_session.rs),
+[native transfer and retained terminal joins](../../../examples/postgres/src/public_v1.rs)
+and [current PG guide](../postgres/design.md#native-build-and-catch-up).
+The following **pinned pre-M1 component table** retains its original evidence
+and limits; its “grant” vocabulary is not a current public contract:
 
 | Boundary | Current behavior and evidence | Limit |
 |---|---|---|
@@ -420,10 +425,12 @@ and [fresh provenance predicate](../../../kuberic-controller/src/evaluator/publi
 
 ## Production policies and security
 
-**Format-15 checkpoint:** the production host/control/CRD format is now 15
+**Current format:** the production host/control/CRD format is now **16**
 ([fresh-deployment contract](ordinary-hosting-m1.md#fresh-deployment-format)).
 The protocol-13/schema-14 and carrier policies below describe the retained
-pre-M1 engine baseline, not a supported old deployment or M2 integration.
+pre-M1 engine baseline, not supported deployment inputs. M1's format 15 is also
+historical. Matching-format acknowledged-state recovery remains required;
+there is no import/converter/downgrade/mixed-version/reset path.
 
 These are **selected fixed policies**, not complete native public defaults or
 settings parity ([production:40–66][policies], [121–190][production-policy]):
@@ -591,8 +598,8 @@ production-readiness support from the selected Rust journeys.
 [native-send-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/RemoteSession.cpp#L753-L790
 [native-ack-errors]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.cpp#L633-L740
 [rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
-[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
+[rejection-public]: https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
 [local-fault-entry]: ../../../kuberic-runtime/src/replicator/v1/replica_manager.rs#L793-L1045
-[pending-native-wait]: ../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625
+[pending-native-wait]: https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_recovery.rs#L590-L625
 [public-context]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/tests/public_copy_context.rs#L377-L647
 [context-default]: https://github.com/youyuanwu/kuberic/blob/45749d3744b43095be9bc9ec3fb4abf20633a537/scripts/fixtures/classic-v1-provider/src/lib.rs#L369-L411

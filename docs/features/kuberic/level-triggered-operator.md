@@ -17,8 +17,30 @@ separate admission. Old process publication is invalid after restart; interrupte
 work stays uncertain. Default V1/KV/SQLite and independent PG use ordinary
 engine-owned sessions and actual joining. Automatic contraction/primary
 replacement/history election remain unavailable or pending; comprehensive
-recovery is M3. Compatible deployment inputs are not live qualification:
-the bounded evidence uses in-process Kubernetes storage and real agent gRPC.
+recovery is M3. Bounded M2 implementation acceptance passed; documentation
+implementation review and actual independent final Sol/Astra gates are pending.
+
+## Current bounded qualification
+
+Fresh discovery/formation and separate joint/current admission execute through
+the production reconciler. Matching-format singleton and unchanged-Primary
+retained-secondary recovery use fresh authenticated sessions, joined predecessor
+owners and nonregressing acknowledged-data transfer before exact callback
+readmission. A retained predecessor Close cannot veto fresh growth; an exact
+current terminal owner still does. This is not general M3 election or handoff.
+
+Full owned matching-image bootstrap, including actual secondary reconstruction,
+renewed authority and final write/read, passed on recovery source
+`af06768a4e5dbc8ef2a57935e0b12342a2c540eb`. The later terminal-owner controller
+repair `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a` has actual bounded controller/
+KV tests but no newer live image pass. Compatible CRD/sample inputs alone are
+not deployment proof; replacement/failover remain unqualified. See
+[exact evidence and red-gate limits](testing.md#m2-accepted-evidence-and-remaining-boundaries).
+
+Use matching binaries and fresh format-16 resources (`spec.hostingFormat: 16`),
+not the historical resource/command example below. No old-state import,
+converter, downgrade, mixed-version enrollment or automatic reset is supported.
+Matching-format acknowledged-data and uncertain-operation recovery remain required.
 
 ## Historical pre-M1 operator baseline
 

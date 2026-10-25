@@ -10,11 +10,11 @@ was run for the selected-host changes. Read
 does and does not establish.
 
 **Current checkpoint:** [ordinary hosting M1](ordinary-hosting-m1.md) is
-implemented. M2's built-in engine factory/session/lifetime slice is available
-through ordinary goals. The in-progress application slice connects KV, SQLite
-and the standalone external provider. The PostgreSQL slice connects independent
-native sessions, effects and fresh admission through the same production goals;
-the complete M2 workflow and M3 qualification remain separate.
+implemented. Bounded M2 implementation acceptance passed for built-in V1,
+KV, SQLite, the standalone external provider and independent PG native sessions,
+effects, admission and actual joins through production ordinary goals.
+Documentation implementation review and actual independent final Sol/Astra
+gates have not run; the complete M2 workflow and exhaustive M3 remain separate.
 Built-in historical bodies are enabled rather than returning an unavailable
 success. Their broader recovery/handoff results are not bounded M2 acceptance.
 Actual engine/component negatives, application witnesses and production
@@ -89,7 +89,87 @@ cargo nextest run -p kuberic-public-v1-tests --all-targets --profile ordinary --
 Full historical replacement, promotion, data-loss and renewal bodies remain
 enabled diagnostic journeys. Record their actual failing clause and unexecuted
 remainder separately; neither a red aggregate nor an unsupported old fixture is
-a passing M2 witness. Independent phase review and later M2 work remain required.
+a passing M2 witness. Required M2 assertions pass separately, as recorded below;
+final workflow reviews remain required.
+
+## M2 accepted evidence and remaining boundaries
+
+This is the bounded implementation evidence accepted by independent Phase 6
+review, not a new execution by this documentation update or a final M2 review.
+Use the live inventory, never a fixed total. Historical source pins and failed
+attempts retain their original outcomes.
+
+| Source binding | Actual accepted execution / outcome |
+|---|---|
+| Final code `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a`, tree `85a6f280d0fc64a3b691090ad248834fbbb75d78` | Native V01 `75139c85-aeb8-44f4-a29e-156e75f9de94`, ordinary V02 `3806f222-a8aa-4864-bf8b-784edaf97304`, actual application V03 `dc3b866b-08d8-4260-9de6-1a00ff8cf41a`, required source/API/privacy/package V11A `a6a495f8-3fe2-4b95-8a9a-9b063079e0b7`: PASS. Format, scoped runtime/controller/KV all-target/all-feature check and strict scoped clippy, protected whole files and exact partition validation: exit 0. This is not whole-workspace strict-lint or warning-free normal-feature compilation. |
+| Same final code, independent reviewer | Complete bounded controller `1ade72c6-21d1-41e0-b80e-5895886536c5` and real KV growth `2daef79b-0c97-4c4f-8d83-b7bc4152a08e`: PASS. Achieved predecessor Close no longer vetoes the fresh current owner; actual current Abort/Close still vetoes Build regardless of reported status. Real `retained`/`later`/`after-growth` KV data, actual native copy, exact acceptance and separate admission execute. |
+| Recovery code `af06768a4e5dbc8ef2a57935e0b12342a2c540eb`, tree `4b28368fe09373b7eb43a41fef5e8de8186161d5` | Standalone normal-feature provider `a33702d5-224d-4df6-b1f9-9f95d08da25a`, actual level V06 `c7e25722-5318-4ca7-8583-9e7b1939da1d`, oracle `ceef1f3d-8eb1-4a6a-8451-f24ee2ca9da9` and authorized routine PG smoke `7f8131ed-acb2-4e32-b6d5-a842c45b5765`: PASS. Their runtime/PG/host owners are unchanged by the later controller repair; they were not rerun there. No full PG run. |
+| Same recovery code, owned matching runtime-only images | Full bootstrap `d96c32a3-61e0-4d56-aa10-8e19b175254d`: PASS, exit 0, including actual secondary reconstruction, renewed exact authority and final write/read. Source/binary/native-library/OCI/pod/owned-context custody was independently verified. **The image predates the final controller repair; no live pass or image equivalence for `84ff69cf…` is claimed.** |
+
+The retained-member recovery proof requires an unchanged available Primary and
+exact storage/history/epoch/configuration. It executes fresh authenticated
+session establishment, old carrier/effect/ACK joins, full retained-prefix
+context and nonregressing actual provider transfer before exact source
+configuration/catch-up and target callback readmission. Transfer is nonvoting
+before admission. The singleton and subsequent KV growth proof is separate
+from general election/reformation. The duplicate-Discover, incomplete-copy and
+stale-terminal veto defects were M2 bugs, now fixed—not remaining M3 waivers.
+
+Red gates remain enabled and their reached/unexecuted clauses remain explicit:
+
+| Gate / actual outcome | Reached boundary and limit |
+|---|---|
+| V11B unchanged `just nextest-source`, `5dc4b63d-9a5b-4033-83b4-38c56a6ea2ac`, exit **100** | Doctest/Rustdoc stages exit 0. Native child exhausted shared work budget: SIGTERM, child reaped, pipes drained, **no underlying Cargo exit recorded**. This is infrastructure termination, not an M3 test pass. The complete identical-selection native complement supplies missing local-commit/acknowledged-prefix outcomes on its own source; it does not rewrite the aggregate. |
+| V14 final native complement `396d6f7d-c87d-4b8c-a260-b75b43cef69e`, exit **100** | Required native M2 bodies pass. Singleton restart now passes actual fresh growth, then secondary deletion/replacement hits a shared deadline with `observed Kubernetes object changed; a fresh observation is required`. Survivor healing does not settle. Retained-secondary promotion and swap reach explicit planned-primary-replacement rejection. These are distinct diagnostics, not successful replacement/election or blanket “M3” by test name. |
+| Full V05 final application selection `66c95c8d-1428-4cd8-98fd-bd5ebdd0393b`, exit **100** | SQLite changed-primary same-live-creation handoff rejects `incompatible scope requires whole-creation withdrawal`, after actual copy/data/reopen. Its suffix is unexecuted. Required M2 application/recovery cases pass separately. |
+| V11B service ambiguous-commit/abort `72068e1a-eb82-4a38-996e-2cd6000359a2`, exit **100** | Acknowledged prefix, commit isolation and owner stop execute; subsequent heal/recovery fails to settle with observation/CAS diagnostics. No later successful failover credit. |
+| V11B failover-after/at durable promotion `d87d818e-4855-4fd0-9c81-f906dea62809` / `37bb8908-64c8-4044-9227-4d18158ab20b`, exits **100** | Baseline/predecessor isolation and deadline/observation-CAS diagnostics; promotion/completion-once/recreation suffixes receive no credit. |
+| V11B switchover-after-catch-up/durable-handoff `87d19a18-928a-432f-8bfe-1139ef4d7e8b` / `9070e668-bf09-4d0f-914f-7411081a7604`, exits **100** | Explicit planned-primary-replacement rejection; accepted handoff/recreation/promotion suffixes receive no credit. |
+
+No all-source, historical-journey, CI-green, native executable equivalence,
+security/orphan or production-readiness claim follows. Required source/API/
+package assertions are V11A; V11B still executes real nested ordinary/native
+journeys and propagates nonzero results. No positive profile, mapping or CI
+gate was disabled.
+
+### Reproducing the bounded selections
+
+Use repository-pinned Rust/nextest and `protoc`; PG additionally requires
+unprivileged Linux, compatible local binaries, pidfd/subreaper facilities and
+short owned socket paths. Reserve an unused checkout-owned ignored root; never
+delete shared build outputs. The accepted runs used executable task-owned
+`/dev/shm` build/scratch roots with `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+`CARGO_NET_OFFLINE=true`, `RUST_BACKTRACE=0`; PG data used `.paw/m2pg`.
+Record literal paths, versions, source maps, selection, raw streams and exit.
+These commands are reproduction guidance, not executions by this phase:
+
+```bash
+owned="$PWD/target/m2-validation-owned"
+test ! -e "$owned"
+mkdir -p "$owned/build" "$owned/scratch" "$owned/pg"
+export CARGO_TARGET_DIR="$owned/build" TMPDIR="$owned/scratch"
+export KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$owned/pg"
+export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+export CARGO_NET_OFFLINE=true RUST_BACKTRACE=0
+filter='test(/ordinary_goal/) or test(/production_ordinary_/) or test(/m2_ordinary_/)'
+cargo nextest list --offline --locked -p kuberic-runtime -p kuberic-controller \
+  --lib --all-features --profile ordinary -E "$filter"
+cargo nextest run --offline --locked -p kuberic-runtime -p kuberic-controller \
+  --lib --all-features --profile ordinary -E "$filter" --no-tests fail
+source_filter='not (binary_id(=kuberic-runtime::public_v1_conformance) and test(/^public_v1_conformance_executes_/))'
+cargo nextest list --offline --locked --workspace --all-features \
+  --profile source --run-ignored all -E "$source_filter"
+cargo nextest run --offline --locked --workspace --all-features \
+  --profile source --run-ignored all -E "$source_filter" --no-tests fail
+```
+
+Run the [actual engine](#built-in-m2-engine-slice), [application/provider](#built-in-m2-application-slice)
+and [routine PG smoke](#custom-native-controller-reproduction-and-limits)
+selections independently. Inspect each identical live list before execution.
+The V11A subset above is not a replacement for `just nextest-source`, doctests,
+Rustdoc or the exact source/API/privacy binaries. Full PG needs explicit
+authorization. Do not rerun runtime/native/lint suites solely for prose.
 
 ### Ordinary downstream and live boundaries
 
@@ -111,11 +191,11 @@ Ordinary reconfiguration omits an absent `catchUp` selection rather than
 serializing an enum-valued null rejected by the Kubernetes API server. This
 does not alter selected catch-up modes or admission policy.
 
-The owned KinD bootstrap body checks exact three-member sessions and performs
-an actual quorum write/read before controller/process restart diagnostics.
-Its later restart, replacement and failover assertions remain enabled. A
-successful formation prefix is not a passing full historical live journey;
-record the exact later failure and unexecuted suffix. Runtime-only local images
+The owned KinD bootstrap body checks exact three-member sessions, actual
+secondary reconstruction and final quorum write/read; its full accepted pass
+is bound above to the recovery image source. Separate replacement and failover
+bodies remain enabled and unqualified. A formation prefix alone is never a
+passing full live journey. Runtime-only local images
 must contain hash-verified binaries built from the recorded source, with no
 unconfigured nested Rust build. Never appropriate a shared cluster or reset
 retained application data to make an incompatible deployment pass.
@@ -171,7 +251,7 @@ Real native/component algorithms remain separately exercised with
 list before run. Routine PG smoke includes actual ordinary native/controller
 witnesses, not unavailable-success wrappers. Historical direct/native recovery
 diagnostics remain selected separately from replacement-session acceptance.
-Remaining M2/M3 work is in the
+Remaining workflow gates and M3 work are in the
 [roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
 
 Task-owned executable build/scratch storage can be selected with
@@ -183,9 +263,12 @@ retain exact command/environment/revision/outcome evidence.
 
 ## Engine-neutral hosting
 
-**Pre-M1 evidence and reproduction context.** The native/component properties
+**Pinned pre-M1 evidence and reproduction context**, through
+`ce9df4ad85603b935752ed7184d9314a778b6eb5`. The native/component properties
 below remain relevant, but their old production grant/controller witnesses are
-not current M2 positives. Use the M1 selections above for the replacement path.
+not current M2 positives. Legacy-owner commands in this section apply only at
+that historical checkout, not today's removed coordinator/API. Use the
+[current M2 selections](#m2-accepted-evidence-and-remaining-boundaries) instead.
 
 The [bounded hosting map](engine-neutral-hosting.md) distinguishes host
 installation, exact remote Build state and optional actual engine observations.
@@ -196,7 +279,9 @@ On a resource-constrained checkout, use task-owned output rather than deleting
 shared build output. Keep the PostgreSQL scratch parent short for Unix sockets:
 
 ```bash
-owned="$(mktemp -d /tmp/kuberic-hosting-XXXXXXXX)"
+owned="$PWD/target/hosting-validation-owned"
+test ! -e "$owned"
+mkdir -p "$owned"
 export CARGO_TARGET_DIR="$owned/target" TMPDIR="$owned/tmp"
 export KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR="$owned/pg"
 export CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
@@ -253,14 +338,17 @@ explicit decision, not routine smoke.
 
 ## Hosting redesign baselines and future acceptance
 
-The [target boundary](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
-and [M1–M3 roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
-are now split: **M1 is implemented; M2/M3 are NOT IMPLEMENTED**.
-Commands below identify **historical baseline** evidence
+The [current boundary](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+and [single roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap)
+now distinguish delivered M1/bounded M2 implementation from deferred M3 and
+pending final reviews. **The table and commands below are historical design
+inputs only**, not current missing-deliverable or execution instructions.
+They identify baseline evidence
 at `b37009f8af7a7b2ed91f58f4889ed74e06013861`; they were source-inspected, not
 run for the prior design/docs delivery. A passing grant/coordinator component
-test cannot qualify replacement engine sessions. Old production selectors may
-now execute support-unavailable checks rather than their historical clauses.
+test could not qualify replacement engine sessions. M1 unavailable wrappers
+were also not native acceptance; M2 has since converted those consumers and
+executes real bodies. Current results are recorded above, not inferred here.
 
 Before a later authorized run, use the identical package/features/profile/
 expression with `cargo nextest list` instead of `run`, inspect a nonempty
@@ -269,16 +357,17 @@ Discovery can build binaries. Use task-owned output, do not remove shared
 targets, and do not run destructive `just nextest-test` or the full PostgreSQL
 suite as a docs check.
 
-| Future gate | Existing source-inspected baseline | Missing redesign acceptance (not invented test names) |
+| Gate at historical design | Source-inspected baseline (historical layout) | Acceptance requested then; see current evidence above |
 |---|---|---|
-| M1 host authority/operation retention | [optional diagnostics/remote projection:173–294,394–527](../../../kuberic-runtime/src/host/public_lifecycle_retry_tests.rs#L173-L527); [lost host observer:106–266](../../../kuberic-runtime/src/host/service_cancellation_tests.rs#L106-L266) | Ordinary-only generic bundle without companion; compatible/incompatible action table; scope withdrawal/Abort→Close barrier and missing diagnostics; new production routing |
-| M2 engine ingress/lifetime | [carrier/Remove:4407–4611](../../../kuberic-runtime/tests/public_v1_recovery.rs#L4407-L4611); [held provider vs Close/join:351–418](../../../kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs#L351-L418) | Engine Active/Retired sessions without grants; delayed first handshake, lost cancel while Primary remains live, scope/effect race, real target quarantine/join and no late successor install |
-| M2 public context and controller Build | [workspace provider/contract crate](../../../kuberic-public-v1-tests/Cargo.toml), [actual V1 journeys](../../../kuberic-level-tests/src/in_process/journeys.rs) | Same semantics through new production goal/PrepareIdle/Build route; separate voting/access, no controller-attempt carrier fields |
-| M2 real independent PG | [production formation/retained transfer:1257–1570](../../../examples/postgres/src/public_controller_tests.rs#L1257-L1570); [hosted terminal cases:205–378](../../../examples/postgres/src/public_controller_tests.rs#L205-L378) | Ordinary-only factory; native session retirement, lost target cancel/PG helper quarantine, Close-after-Abort settlement, native replay/lineage/SQL fences through new route |
-| M3 same-format restart/recovery | [current session/ambiguity reopen:733–835,1476–1586](../../../kuberic-runtime/tests/public_v1_session_renewal.rs#L733-L1586); [hot rollback-journal recovery:1730–1758](../../../kuberic-runtime/tests/public_v1_session_renewal.rs#L1730-L1758) | Two-ended Ready revalidation after target reopen/lost reply; source/target/controller selection/effect/receipt crashes, acknowledged-prefix/PC/CC/access proof; recover matching-format state without resetting it |
+| M1 host authority/operation retention | [optional diagnostics/remote projection:173–294,394–527](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/src/host/public_lifecycle_retry_tests.rs#L173-L527); [lost host observer:106–266](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/src/host/service_cancellation_tests.rs#L106-L266) | Ordinary-only generic bundle without companion; compatible/incompatible action table; scope withdrawal/Abort→Close barrier and missing diagnostics; new production routing |
+| M2 engine ingress/lifetime | [carrier/Remove:4407–4611](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_recovery.rs#L4407-L4611); [held provider vs Close/join:351–418](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/src/replicator/v1/service_adapter/tests/facade.rs#L351-L418) | Engine Active/Retired sessions without grants; delayed first handshake, lost cancel while Primary remains live, scope/effect race, real target quarantine/join and no late successor install |
+| M2 public context and controller Build | [workspace provider/contract crate](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-public-v1-tests/Cargo.toml), [actual V1 journeys](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-level-tests/src/in_process/journeys.rs) | Same semantics through new production goal/PrepareIdle/Build route; separate voting/access, no controller-attempt carrier fields |
+| M2 real independent PG | [production formation/retained transfer:1257–1570](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/examples/postgres/src/public_controller_tests.rs#L1257-L1570); [hosted terminal cases:205–378](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/examples/postgres/src/public_controller_tests.rs#L205-L378) | Ordinary-only factory; native session retirement, lost target cancel/PG helper quarantine, Close-after-Abort settlement, native replay/lineage/SQL fences through new route |
+| M3 same-format restart/recovery | [session/ambiguity reopen:733–835,1476–1586](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_session_renewal.rs#L733-L1586); [hot rollback-journal recovery:1730–1758](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_session_renewal.rs#L1730-L1758) | Two-ended Ready revalidation after target reopen/lost reply; source/target/controller selection/effect/receipt crashes, acknowledged-prefix/PC/CC/access proof; recover matching-format state without resetting it |
 | M3 clean deployment and removal | Existing [source/API/package commands](#engine-neutral-hosting), schema-rejection selection below | Replacement property coverage before each API deletion; no superseded production path remains; incompatible stores/commands/CRD intents reject before mutation; no old-state import, upgrade/downgrade or automatic data/PGDATA reset |
 
-Focused current selectors:
+Historical selectors (baseline checkout only; removed owners are not available
+on the current source):
 
 ```bash
 # Host facts and response-independent execution (M1 baseline):
@@ -313,9 +402,8 @@ cargo nextest run -p kuberic-runtime --all-features --profile ordinary \
   -E 'binary(=public_v1_session_renewal) and (test(=public_v1_replacement_schema_build_ambiguity_requires_retirement) or test(=public_v1_replacement_schema_failed_build_containment_survives_reopen) or test(=public_v1_replacement_schema_recovers_hot_rollback_journal) or test(=public_v1_replacement_schema_rejects_prior_preview_stores))'
 ```
 
-Current common-coordinator negatives remain useful property inventories:
-`test(/replicator::coordinator::tests::/)` with runtime all-features/ordinary.
-They use controlled effects, not actual PG/kernel cleanup. Remote-state tests
+The old coordinator was removed in M2; its pinned negatives remain a historical
+property inventory, not a current selector. They used controlled effects, not actual PG/kernel cleanup. Remote-state tests
 seed records; facade tests use Rust provider fixtures; PG controller cases use
 real PG plus the common harness, **not Kubernetes**. Direct PG future-drop tests
 are not the hosted response-observer contract. Current failed-Build containment
@@ -402,6 +490,11 @@ host uses every native-shaped policy it models.
 
 ### Public factory, host and application evidence
 
+**Historical component/host reproduction:** names/layout in this subsection
+refer to the pre-M1 evidence pins, not current ordinary production instructions.
+M2 relocated these assertions through actual ordinary consumers and native
+owners; use [current selections/results](#m2-accepted-evidence-and-remaining-boundaries).
+
 The `classic_v1_production` target includes real factory/host/control/listener,
 KV/SQLite-file, external helper-free provider and controller-copy-before-vote
 journeys ([tests:1564–2095](../../../kuberic-runtime/tests/classic_v1_production.rs#L1564-L2095)).
@@ -413,12 +506,12 @@ Important current source names include:
 | Independent query outcomes | `native_query_outcome_matrix_survives_rpc_persistence_and_controller_eligibility` and `native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_build` ([991–1168](../../../kuberic-runtime/tests/classic_v1_production.rs#L991-L1168)); observation snapshots are not agent recovery-journal proof |
 | SQLite publication | `selected_sqlite_real_wal_isolation_publication_failure_and_restart` ([1731–1801](../../../kuberic-runtime/tests/classic_v1_production.rs#L1731-L1801)) |
 | Helper-free provider | `externally_compiled_helper_free_provider_uses_public_factory_host_and_transport` ([1861–1939](../../../kuberic-runtime/tests/classic_v1_production.rs#L1861-L1939)) |
-| Native quorum vs service commit | `read_fencing::sf_d02_native_quorum_progress_is_not_a_service_commit_or_caller_cancellation_oracle` ([16–71](../../../kuberic-runtime/tests/support/read_fencing.rs#L16-L71)) |
-| Receive vs service ACK | `read_fencing::sf_d02_secondary_receive_progress_is_contiguous_but_does_not_replace_service_ack` ([76–139](../../../kuberic-runtime/tests/support/read_fencing.rs#L76-L139)) |
-| Acknowledged prefix | `read_fencing::sf11_acknowledged_prefix_6_through_10_survives_ambiguous_11_without_history_fabrication` ([146–214](../../../kuberic-runtime/tests/support/read_fencing.rs#L146-L214)); not the removed-engine reconciliation fixture |
-| KV trait Close | `sf15_trait_close_retains_cancelled_consumer_drain` ([478–532](../../../examples/kvstore2/tests/read_fencing.rs#L478-L532)) |
+| Native quorum vs service commit | `read_fencing::sf_d02_native_quorum_progress_is_not_a_service_commit_or_caller_cancellation_oracle` ([16–71](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/support/read_fencing.rs#L16-L71)) |
+| Receive vs service ACK | `read_fencing::sf_d02_secondary_receive_progress_is_contiguous_but_does_not_replace_service_ack` ([76–139](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/support/read_fencing.rs#L76-L139)) |
+| Acknowledged prefix | `read_fencing::sf11_acknowledged_prefix_6_through_10_survives_ambiguous_11_without_history_fabrication` ([146–214](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-runtime/tests/support/read_fencing.rs#L146-L214)); not the removed-engine reconciliation fixture |
+| KV trait Close | `sf15_trait_close_retains_cancelled_consumer_drain` ([478–532](https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/kvstore2/tests/read_fencing.rs#L478-L532)) |
 
-For example, current exact progress selectors (not the removed durable-scalar
+For example, historical exact progress selectors (not the removed durable-scalar
 test names) are:
 
 ```bash
@@ -548,9 +641,13 @@ power-loss or production-certification result is implied. See
 
 ### Selected-host Close and staged access
 
+**Historical pre-M1 selected-host qualification.** The following runs and
+baseline-only commands do not assert current production callback-program support.
+Current M2 ordinary lifetime/access evidence is recorded above.
+
 Targeted runs for the host-alignment revision exercise the real selected
 `ReplicaHost` and default public factory. The
-[stage witnesses](../../../kuberic-runtime/tests/support/staged_access.rs)
+[stage witnesses](https://github.com/youyuanwu/kuberic/blob/69b1cfe3c85d296463da0def3e80eaca0ddcd0a7/kuberic-runtime/tests/support/staged_access.rs)
 hold actual executor/callback boundaries and attempt committed service reads
 and raw sequence assignment, not only a private selector. They cover joint/
 current-only same-primary, missing C/P, split/recipe promotion, current-only/
@@ -568,7 +665,7 @@ production entry. Production ordinary-goal transport and retained response
 ownership are qualified by the [M1 regressions](#ordinary-hosting-m1), not these
 legacy component programs.
 
-[Close witnesses](../../../kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505)
+[Close witnesses](https://github.com/youyuanwu/kuberic/blob/aad23335c219a576d69133cee883bbd63e40b68a/kuberic-runtime/tests/public_v1_recovery.rs#L3114-L3505)
 observe child failure, durable diagnostic, outer outcome, Abort and retained
 native/provider joins separately. Explicitly seeded recovery records and unit
 callback/receipt cuts are not process-crash, power-loss or generic application
@@ -604,7 +701,11 @@ broad P7, native differential, power-loss or production-readiness qualification.
 
 ### Scoped rejection-order and local-fault evidence
 
-The current focused actual-owner and public-host vectors passed under the ordinary profile.
+The removed public-host layout below is pinned historical evidence; its
+component/native properties remain, while current ordinary witnesses and their
+exact selectors are listed above. Baseline commands are not current API guidance.
+
+The historical focused actual-owner and public-host vectors passed under the ordinary profile.
 Use the live names, not a fixed total:
 
 ```bash
@@ -619,12 +720,12 @@ observe failed idle C Build and genuine B progress in both orders, preserve
 current/previous/marked/All requirements, and reject new assignment/cached-ready
 catch-up after GetCopyState/EndGetNext faults. Active copy error is a separate
 replication-progress case, not a generic NACK.
-The [public vectors](../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392)
+The [public vectors](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392)
 use actual C-listener configuration denial, exact metadata/status forwarding
 and source retry entry as a consumption barrier. B's service-owned persistence/
 ACK is withheld across real issued work and captured-boundary marked catch-up;
 healthy-first completes native/application work before C is released.
-A [same-native-wait handshake](../../../kuberic-runtime/tests/public_v1_recovery.rs#L590-L625)
+A [same-native-wait handshake](https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_recovery.rs#L590-L625)
 polls the real wait, crosses an ordered same-facade query and checks that
 future Pending before healthy release; rejection-first probes it again after
 source consumption. Wrapper entry or unfinished outer journal work is not
@@ -677,7 +778,11 @@ packaged consumer/feature-boundary and registered conformance checks
 `nextest-build-only` is a compatibility recipe name, not another execution tier.
 Source-sensitive gates need a checkout/build tools even when their binaries
 are included in an archive. Their KSF mapping/existence checks are not a
-native binary oracle.
+native binary oracle. Its execution wrappers launch actual nested ordinary/
+native journeys; the source label does not make them source-only. Required
+M2 V11A passed, while the unchanged V11B aggregate remains exit 100 with the
+infrastructure/complement and later-body limits
+[recorded above](#m2-accepted-evidence-and-remaining-boundaries).
 
 ## PostgreSQL
 
@@ -814,12 +919,14 @@ The failure variant consumes a failed first join, loses that next Close
 observer while the second join is still held, then requires the first error
 to survive actual completion of the second join and consuming finish.
 
-The separate
-[external runtime contract fixture](../../../kuberic-runtime/tests/support/custom_control.rs)
+The separate historical
+[external runtime contract fixture](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/tests/support/custom_control.rs)
 uses an independently attached engine, real host journals/control dispatch and
 owned child tasks, but deliberately has no native database/quorum implementation.
 Its truthful progress-unavailable and unsupported wait results must not be
 called a native positive witness:
+
+Historical baseline-only commands:
 
 ```bash
 cargo test -p kuberic-runtime --features testing --test classic_v1_production custom_host_
@@ -848,11 +955,14 @@ doctests run separately. Inventory counts are computed, not fixed here.
 
 ## Owned KinD Scenarios
 
-**Unsupported retained assets at M1.** The default-engine Open gate means the
-bootstrap/replacement/failover recipe below is not a working current validation
-path; no KinD acceptance ran for M1. Wait for M2 and its separately qualified
-deployment before using it as reproduction. Its historical ownership rules
-still require an explicitly owned disposable cluster:
+**Experimental development assets, not release installation.** M1 had no KinD
+acceptance. M2's full matching-image bootstrap passed on the exact recovery
+source recorded [above](#m2-accepted-evidence-and-remaining-boundaries), including
+secondary reconstruction and final write/read. It predates the last controller
+repair. Replacement/failover are separate unqualified diagnostics; do not infer
+their success or a final-source image pass. Future authorized reproduction
+requires an explicitly owned disposable cluster and matching runtime-only
+binaries/libraries/images, not implicit rebuilding from unrelated cache:
 
 ```bash
 export KIND_CLUSTER_NAME=kuberic-level-dev
@@ -865,7 +975,7 @@ export KUBERIC_AGENT_BEARER_TOKEN=local-level-triggered-token
 just create-kind-cluster
 just level-triggered-images
 just level-triggered-install
-just level-triggered-kind-test bootstrap replacement failover
+just level-triggered-kind-test bootstrap
 just delete-kind-cluster
 ```
 

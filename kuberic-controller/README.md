@@ -41,6 +41,12 @@ joint/current voting admission and catch-up. Local agents choose ordered
 callbacks, not the controller. Interrupted matching-format work stays uncertain;
 automatic retained-history election, contraction and primary replacement are
 explicitly unavailable or waiting, not inferred from stale outcomes.
+Exact Discover is retried rather than duplicated from an old snapshot. Bounded
+unchanged-Primary retained-secondary and singleton restart preserve acknowledged
+data through fresh sessions and callback readmission. Achieved predecessor
+Close history cannot veto a fresh current owner's Build; exact current
+storage/process/creation Abort or Close still vetoes it regardless of status.
+These repairs and actual KV growth do not supply general M3 election/handoff.
 
 ## Configuration
 
@@ -73,6 +79,8 @@ The [M1 controller/agent/host split](../docs/features/kuberic/ordinary-hosting-m
 is implemented without target engine grant dispatch or mandatory companion/
 diagnostics. Built-in/KV/SQLite and independent PostgreSQL use ordinary native
 engine integration; comprehensive recovery qualification remains M3.
+Bounded M2 implementation acceptance passed; documentation implementation
+review and actual independent final Sol/Astra gates have not run.
 
 ## Deployment
 
@@ -83,6 +91,12 @@ The shipped sample and generated CRD use format 16. Live qualification requires
 an owned cluster and matching images; compatible assets alone are not live evidence.
 Historical M1 acceptance used an independent ordinary factory and real agent
 transport against an in-process Kubernetes storage model, not live KinD.
+Full M2 owned bootstrap, secondary reconstruction and final write/read passed
+on recovery image source `af06768a4e5dbc8ef2a57935e0b12342a2c540eb`.
+The later accepted terminal-owner repair at `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a`
+has actual bounded controller/KV tests, not a new matching-image live run.
+See the [source-bound evidence](../docs/features/kuberic/testing.md#m2-accepted-evidence-and-remaining-boundaries);
+replacement/failover and all-source/CI green are not claimed.
 
 There is no migration, compatibility mode, Kubernetes cutover Lease, image
 publication, or production-activation procedure.

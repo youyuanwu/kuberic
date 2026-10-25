@@ -5,7 +5,9 @@ two-ended native transfer sessions and retained terminal lifetime through the
 [ordinary host/controller](../kuberic/ordinary-hosting-m1.md). Controller fixtures
 exercise real backup, WAL replay, native membership and separately gated SQL;
 an unavailable response is not a positive witness. This bounded integration is
-not completion of the entire M2 workflow or comprehensive M3 recovery policy.
+part of accepted bounded M2 implementation evidence, not completion of the
+entire M2 workflow or comprehensive M3 recovery policy. Documentation
+implementation review and actual independent final Sol/Astra gates are pending.
 
 The `postgres-replicated` package supplies an independent native engine for the
 level-triggered Public V1 runtime. The pre-M1 custom-controller route is historical.
@@ -296,6 +298,13 @@ success from a role flag.
 
 ## Scaling, Replacement and Restart
 
+Fresh sequential growth is qualified through ordinary production goals.
+The following broader removal/replacement/restart mechanics describe retained
+native/direct or historical controller behavior, **not current general M3
+orchestration instructions**. Planned primary replacement, automatic contraction
+and retained-history election remain unavailable or waiting in the current
+ordinary controller. No PG live-cluster or comprehensive recovery claim follows.
+
 Sequential scale-up builds/adopts one exact fresh identity at a time. PC/CC
 configuration precedes current-only admission, and candidates stay fenced until
 their selected build completes. Secondary removal closes writes, freezes a
@@ -332,13 +341,14 @@ never exempts a true role/signal mismatch.
 
 Application-only and whole-agent-host restart reconstruct durable state with
 fresh sessions. Accepted standbys wait for validated current source connections.
-On whole-agent restart a persisted custom-replicator grant remains desired, not
-immediately effective: transient access reconciliation keeps the control service
+In the historical pre-M1 whole-agent route, a persisted custom-replicator access
+grant remained desired, not immediately effective: transient access reconciliation keeps the control service
 live and reports access pending while application SQL stays closed. Progress/status
 reconciliation retries that grant only under the restored authority until exact
 peer discovery, native policy readback and acknowledgement availability converge.
 New access/authority fencing supersedes the deferred grant; other startup errors
-remain fatal. The default replication engine's restart behavior is unchanged.
+remain fatal. This historical access-grant reconstruction is not a current
+ordinary retained-history election or general PG restart-qualification claim.
 Lost quorum closes writes without discarding acknowledged data; accepted
 secondary reads remain possible. Restoration requires fresh evidence and native
 policy readback, not old scalar journals.
@@ -421,6 +431,10 @@ just nextest-postgres-smoke
 ```
 
 The smoke inventory validates the live catalog before PostgreSQL starts.
+Accepted routine smoke `7f8131ed-acb2-4e32-b6d5-a842c45b5765` passed on recovery
+source `af06768a4e5dbc8ef2a57935e0b12342a2c540eb`. The subsequent terminal-owner
+controller repair changed no PG/host implementation; it did not rerun PG.
+See [exact source/result boundaries](../kuberic/testing.md#m2-accepted-evidence-and-remaining-boundaries).
 The recipe builds the owned command binary, then runs real selected native
 cases and actual ordinary production-controller native witnesses serially in one
 package-only pass. Required PG-N cases include pending joint/current continuity,
@@ -428,10 +442,11 @@ retired-owner rejection, lost cancellation and matching-format reopen. Selectors
 evidence limits are in the [testing guide](../kuberic/testing.md#custom-native-controller-reproduction-and-limits);
 do not copy test totals or historical removed selectors.
 Public V1 fixtures use
-`KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set; the smoke recipe otherwise uses
-`/dev/shm` when at least 2 GiB is available and falls back to `/tmp`. The
-full target is reserved for the dedicated
-resource-owning validation path or explicit requests.
+`KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set. Set it and `TMPDIR` to short,
+previously reserved checkout-owned ignored paths for local validation; do not
+rely on recipe fallback storage or delete shared output. Run the full
+`just nextest-postgres` only when explicitly requested (or in its dedicated
+CI partitions), never as a routine documentation check.
 
 The pinned pre-M1 controller fixture constructed inert production PgService
 instances and owned their native coordination listeners. Its historical body
@@ -493,12 +508,13 @@ Shared regressions, partition validation and guard commands are in the
 
 - Hosting integration M2 removes the companion and controller-attempt grant
   coupling through M1 production routing, alongside built-in engine qualification.
-  PG then owns authenticated engine Active/Retired transfer sessions, target
+  PG owns authenticated engine Active/Retired transfer sessions, target
   quarantine and ordinary Close-after-Abort joins; backup/WAL/lineage/replay,
   SQL fences, slot/process ownership and metadata remain PG responsibilities.
   M3 qualifies same-format recovery and failures, not old-state upgrades.
   The target supports fresh deployments only and never automatically resets
-  existing PGDATA; current formation tests do not qualify the replacement.
+  existing PGDATA. Bounded ordinary formation, native continuation and terminal
+  qualification do not certify arbitrary replacement/election or metadata removal.
   See the [single roadmap](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented).
 - Images, distribution and deployment assets remain future work. No PostgreSQL
   Kubernetes/container dependency, manifest or live test is part of this port.

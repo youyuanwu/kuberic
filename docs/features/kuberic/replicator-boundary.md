@@ -8,6 +8,8 @@ Built-in/KV/SQLite and independent PostgreSQL use engine-owned sessions through
 this route. Shared companion/grant APIs and descriptor Build IDs are removed.
 Current host/control/CRD inputs require format 16; comprehensive M3 controller
 recovery policy is not supplied by that integration.
+Bounded M2 implementation acceptance passed; documentation implementation
+review and actual final independent Sol/Astra gates remain pending.
 
 Kuberic hosts built-in and application-owned Replicators through the same
 Service Fabric-shaped public interfaces.
@@ -148,11 +150,12 @@ bundle cannot discard pending cleanup ownership. `NativeRuntimeControl`, its
 TCP/queue diagnostics and host/store setters remain private. Wrapping a built-in
 bundle is not an independent native-engine implementation.
 
-The companion is a **current Kuberic extension-boundary divergence**, not a new
+The companion was a **pre-M1 Kuberic extension-boundary divergence**, not a new
 method on SF's Replicator, PrimaryReplicator or StateProvider. Calling it a local
 adaptation does not establish that its mandatory controller integration is
-necessary. The proposed target removes it with replacement host/engine safety
-owners; the responsibilities below remain required **today**:
+necessary. M1/M2 removed it with replacement host/engine safety owners.
+The following table records the old callbacks, not available public methods;
+their stale-effect and lifetime properties remain required at the new owners:
 
 | Contract | Required meaning |
 |---|---|
