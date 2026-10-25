@@ -174,7 +174,7 @@ pub enum ReplicaGoalKind {
     },
     Reconfigure {
         role: ReplicaRole,
-        #[serde(rename = "catchUp")]
+        #[serde(rename = "catchUp", skip_serializing_if = "Option::is_none")]
         catch_up: Option<PublicCatchUpMode>,
     },
     Build {
@@ -472,4 +472,33 @@ pub struct ReplicaDiscoveryQuery {
 pub struct ReplicaGoalAcknowledgement {
     pub goal: ReplicaGoal,
     pub logically_retired: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m2_ordinary_reconfigure_without_catch_up_omits_null_enum() {
+        for catch_up in [
+            None,
+            Some(PublicCatchUpMode::WriteQuorum),
+            Some(PublicCatchUpMode::All),
+        ] {
+            let goal = ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                catch_up,
+            };
+            let json = serde_json::to_value(&goal).unwrap();
+            if catch_up.is_none() {
+                assert!(json.get("catchUp").is_none());
+            } else {
+                assert_eq!(json["catchUp"], serde_json::to_value(catch_up).unwrap());
+            }
+            assert_eq!(
+                serde_json::from_value::<ReplicaGoalKind>(json).unwrap(),
+                goal
+            );
+        }
+    }
 }

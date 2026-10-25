@@ -522,6 +522,11 @@ async fn exact_cross_cluster_stopped_and_observation_references_are_checked() ->
         );
         drop(hold);
         drop(second.hold_deletion(&resource).await?);
+        let service = first.service(a.primary()).await?;
+        let isolation = first.isolate(std::slice::from_ref(a.primary())).await?;
+        assert!(Arc::ptr_eq(&service, &first.service(a.primary()).await?));
+        assert!(first.observe().await?.snapshot(a.primary()).is_none());
+        first.heal(isolation).await?;
         let stopped = a.secondaries().next().unwrap().clone();
         first.stop(&stopped).await?;
         assert_eq!(

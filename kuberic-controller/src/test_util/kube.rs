@@ -306,7 +306,8 @@ impl ApiServer {
         self.arm_matching(name, false, None, None)
     }
 
-    /// Targets the next status write that increases accepted completion count.
+    /// Targets the next status write that records an actual ordinary outcome or
+    /// increases the legacy accepted completion count.
     /// Instead of accepting its status, bump only the stored RV and return 409
     /// after release. The same submitted RV will genuinely remain stale on retry.
     pub(super) fn arm_completion_conflict(&self, name: &str) -> anyhow::Result<StatusBarrier> {
@@ -683,8 +684,14 @@ fn execute(
             if route.status {
                 let completion = completion_count(&incoming) > completion_count(&old);
                 if route.kind == Kind::KubericSet
-                    && completion
-                    && barrier_matches(&store.completion_conflict, &key, &old)
+                    && ((completion && barrier_matches(&store.completion_conflict, &key, &old))
+                        || ordinary_barrier_matches(
+                            &store.completion_conflict,
+                            &key,
+                            &old,
+                            &incoming,
+                            true,
+                        ))
                 {
                     let mut bumped = old;
                     bumped["metadata"]["resourceVersion"] = json!(store.rv());
@@ -702,9 +709,14 @@ fn execute(
                 let newly_pending = !next["status"]["publicV1Operation"].is_null()
                     && next["status"]["publicV1Operation"] != old["status"]["publicV1Operation"];
                 let barrier = if route.kind == Kind::KubericSet
-                    && newly_pending
-                    && barrier_matches(&store.operation_barrier, &key, &next)
-                {
+                    && ((newly_pending && barrier_matches(&store.operation_barrier, &key, &next))
+                        || ordinary_barrier_matches(
+                            &store.operation_barrier,
+                            &key,
+                            &old,
+                            &next,
+                            false,
+                        )) {
                     store.operation_barrier.take()
                 } else {
                     None
@@ -899,6 +911,41 @@ fn completion_count(object: &Value) -> u64 {
     object["status"]["publicV1Authority"]["completedOperationCount"]
         .as_u64()
         .unwrap_or(0)
+}
+
+fn ordinary_barrier_matches(
+    barrier: &Option<ArmedBarrier>,
+    key: &Key,
+    old: &Value,
+    next: &Value,
+    completion: bool,
+) -> bool {
+    let Some(barrier) = barrier.as_ref().filter(|barrier| {
+        &barrier.key == key
+            && next["metadata"]["uid"] == barrier.uid
+            && barrier.call_kind.is_none()
+            && barrier.operation_fragment.is_none()
+    }) else {
+        return false;
+    };
+    let Some(entries) = next["status"]["replicaGoals"].as_array() else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        let previous = old["status"]["replicaGoals"]
+            .as_array()
+            .and_then(|entries| entries.iter().find(|old| old["goal"] == entry["goal"]));
+        let changed = if completion {
+            !entry["outcome"].is_null() && previous.is_some_and(|old| old["outcome"].is_null())
+        } else {
+            previous.is_none() && entry["outcome"].is_null()
+        };
+        changed
+            && barrier.matcher.as_ref().is_none_or(|matcher| {
+                serde_json::from_value(entry.clone())
+                    .is_ok_and(|entry| matcher.matches_goal(&entry))
+            })
+    })
 }
 
 fn apply_patch(

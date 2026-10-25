@@ -118,7 +118,7 @@ private-path hidden variant crate::protocol::public_operations::replica_goal::Re
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Close
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Discover
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Prepare { { role : ReplicaRole , } }
-private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Reconfigure { { role : ReplicaRole , # [serde (rename = "catchUp")] catch_up : Option < PublicCatchUpMode > , } }
+private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Reconfigure { { role : ReplicaRole , # [serde (rename = "catchUp" , skip_serializing_if = "Option::is_none")] catch_up : Option < PublicCatchUpMode > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Remove { { remote : Box < RemoteReplicaSelection > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalStatus::Achieved
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalStatus::Failed((String))

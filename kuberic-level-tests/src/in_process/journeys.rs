@@ -740,9 +740,12 @@ async fn bootstrap_quorum_write_recovers_status_conflict() -> Result<()> {
         harness.assert_values("bootstrap", "committed").await?;
         let mut addresses = std::collections::BTreeSet::new();
         for id in 1..=3 {
-            let report = harness.report(id).await?;
-            let address = report
-                .replication_address
+            let reference = harness.reference(id).await?;
+            let observed = harness.cluster.observe().await?;
+            let address = observed
+                .snapshot(&reference)
+                .and_then(|snapshot| snapshot.publication.as_ref())
+                .map(|publication| publication.replication_address.clone())
                 .context("Open endpoint missing")?;
             let endpoint: http::Uri = address.parse()?;
             ensure!(endpoint.host() == Some("127.0.0.1"));
@@ -757,7 +760,38 @@ async fn bootstrap_quorum_write_recovers_status_conflict() -> Result<()> {
             harness.reconcile_errors > 0,
             "injected conflict was not retried"
         );
-        assert_exact_completion(&mut harness, &persisted).await?;
+        let pending =
+            serde_json::from_value::<kuberic_controller::crd::KubericSet>(persisted.clone())?
+                .status
+                .context("conflict status missing")?
+                .replica_goals
+                .into_iter()
+                .filter(|entry| entry.outcome.is_none())
+                .collect::<Vec<_>>();
+        ensure!(
+            !pending.is_empty(),
+            "conflict lost its pending ordinary goals"
+        );
+        let observed = harness.cluster.observe().await?;
+        for pending in pending {
+            pending.validate().map_err(anyhow::Error::msg)?;
+            let retained = observed
+                .set()
+                .status
+                .as_ref()
+                .context("settled status missing")?
+                .replica_goals
+                .iter()
+                .find(|entry| entry.goal == pending.goal)
+                .context("conflicted ordinary goal was lost")?;
+            retained.validate().map_err(anyhow::Error::msg)?;
+            ensure!(retained.digest == pending.digest);
+            ensure!(retained.outcome.as_ref().is_some_and(|outcome| {
+                outcome.goal == pending.goal
+                    && outcome.status
+                        == kuberic_runtime::protocol::public_operations::ReplicaGoalStatus::Achieved
+            }));
+        }
         Ok(())
     }
     .await;
@@ -1868,37 +1902,55 @@ async fn fresh_build_source_isolation_cuts_the_real_dial() -> Result<()> {
 
 async fn build_transport_cut(source: bool) -> Result<()> {
     use kuberic_runtime::engine::DurableState;
-    let mut harness = Harness::new().await?;
+    use kuberic_runtime::protocol::public_operations::ReplicaGoalKind;
+    let mut harness = Harness::with_members(1).await?;
     let result = async {
-        harness.write("build-cut-before", "acknowledged").await?;
-        delete_secondary(&mut harness).await?;
+        let primary = harness.ready_members(1).await?;
+        let service = harness.service(primary).await?;
+        harness
+            .cluster
+            .probe(service.replicate_put("build-cut-before".into(), "acknowledged".into()))
+            .await?;
+        harness.cluster.scale_to(2).await?;
         let pause = harness
             .cluster
             .pause_at(Barrier::intent(PublicV1CallKind::Build))
             .await?;
         let frozen = serde_json::to_value(pause.evidence().set())?;
-        let accepted: PublicV1OperationStatus =
-            serde_json::from_value(frozen["status"]["publicV1Operation"].clone())?;
-        let command = accepted.command().map_err(anyhow::Error::msg)?;
-        let Some(PublicOperationProgram::Build(build)) = command.intent.program.as_ref() else {
+        let entry = pause
+            .evidence()
+            .set()
+            .status
+            .as_ref()
+            .context("Build intent status missing")?
+            .replica_goals
+            .iter()
+            .rev()
+            .find(|entry| matches!(entry.goal.desired, ReplicaGoalKind::Build { .. }))
+            .context("ordinary Build intent missing")?;
+        entry.validate().map_err(anyhow::Error::msg)?;
+        ensure!(entry.outcome.is_none());
+        let ReplicaGoalKind::Build { remote } = &entry.goal.desired else {
             bail!("selected barrier was not Build");
         };
+        let remote = remote.clone();
+        ensure!(frozen["status"]["publicV1Operation"].is_null());
         let target = harness
-            .service_uid(build.replica.instance_id.as_str())
+            .service_uid(remote.target.scope.storage.replica.instance_id.as_str())
             .await?;
         ensure!(target.persistence().durable_progress().await?.applied_lsn == 0);
         let cut = if source {
-            command.target.instance_id.as_str()
+            remote.source.scope.storage.replica.instance_id.as_str()
         } else {
-            build.replica.instance_id.as_str()
+            remote.target.scope.storage.replica.instance_id.as_str()
         };
         harness.refresh().await?;
         let resource = harness.api.reference(Kind::Pod, cut)?;
         let source_ref = harness
-            .reference_uid(command.target.instance_id.as_str())
+            .reference_uid(remote.source.scope.storage.replica.instance_id.as_str())
             .await?;
         let destination_ref = harness
-            .reference_uid(build.replica.instance_id.as_str())
+            .reference_uid(remote.target.scope.storage.replica.instance_id.as_str())
             .await?;
         let mut isolation = harness.cluster.arm_next_build_dial(&resource).await?;
         harness.cluster.resume(pause).await?;
@@ -1930,9 +1982,9 @@ async fn build_transport_cut(source: bool) -> Result<()> {
         )
         .await??;
         let report = harness
-            .report_uid(build.replica.instance_id.as_str())
+            .report_uid(remote.target.scope.storage.replica.instance_id.as_str())
             .await?;
-        ensure!(report.process_session_id == build.process_session_id);
+        ensure!(report.process_session_id == remote.target.scope.process_session_id);
         ensure!(target.persistence().durable_progress().await?.applied_lsn == 0);
         Ok(())
     }
@@ -1943,11 +1995,29 @@ async fn build_transport_cut(source: bool) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Result<()> {
     for completion in [false, true] {
-        let mut harness = Harness::new().await?;
+        let mut harness = Harness::with_members(2).await?;
         let mut uids = Vec::new();
         let mut addresses = Vec::new();
         let result = async {
-            harness.write("cleanup-before", "acknowledged").await?;
+            let primary = harness.ready_members(2).await?;
+            let service = harness.service(primary).await?;
+            harness
+                .cluster
+                .probe(service.replicate_put("cleanup-before".into(), "acknowledged".into()))
+                .await?;
+            harness.cluster.scale_to(3).await?;
+            let pause = harness
+                .cluster
+                .pause_at(Barrier::Operation {
+                    stage: if completion {
+                        BarrierStage::Completion
+                    } else {
+                        BarrierStage::Intent
+                    },
+                    kind: Some(PublicV1CallKind::Build),
+                    participant: None,
+                })
+                .await?;
             uids = harness.live_uids().await;
             addresses = harness
                 .api
@@ -1960,21 +2030,12 @@ async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Re
                         .map(str::to_owned)
                 })
                 .collect();
-            let service = harness.service(1).await?;
-            harness.submit(2).await?;
-            let pause = harness
-                .cluster
-                .pause_at(Barrier::Operation {
-                    stage: if completion {
-                        BarrierStage::Completion
-                    } else {
-                        BarrierStage::Intent
-                    },
-                    kind: None,
-                    participant: None,
-                })
-                .await?;
-            let uid = harness.report(1).await?.replica.instance_id.to_string();
+            let uid = harness
+                .report(primary)
+                .await?
+                .replica
+                .instance_id
+                .to_string();
             let resource = harness.api.reference(Kind::Pod, &uid)?;
             let _held = harness.cluster.hold_deletion(&resource).await?;
             let _isolation = harness.isolate_uids(std::slice::from_ref(&uid)).await?;

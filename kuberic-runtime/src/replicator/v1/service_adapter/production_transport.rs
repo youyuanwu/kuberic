@@ -757,9 +757,9 @@ impl Transport {
             }
             for peer in &now.scope.configuration.replicas {
                 let endpoint = if peer.identity == binding.primary().identity {
-                    binding.primary()
+                    Some(binding.primary())
                 } else if peer.identity == binding.secondary().identity {
-                    binding.secondary()
+                    Some(binding.secondary())
                 } else if primary {
                     let session = self
                         .sessions
@@ -772,21 +772,24 @@ impl Transport {
                     {
                         return Err(RuntimeError::AuthorityNotAdmitted);
                     }
-                    session.secondary()
+                    Some(session.secondary())
                 } else {
-                    let publication = self
-                        .discover(&peer.identity, &peer.process_session_id, binding.history())
-                        .await?;
-                    if publication.scope.epoch != binding.epoch() {
-                        return Err(RuntimeError::AuthorityNotAdmitted);
-                    }
-                    Endpoint::publication(&publication)
+                    None
                 };
-                if peer.identity != endpoint.identity
-                    || peer.process_session_id != endpoint.process_session_id
-                    || peer.storage_incarnation != endpoint.storage
-                    || peer.replication_address != endpoint.address
-                {
+                let matches = if let Some(endpoint) = endpoint {
+                    peer.identity == endpoint.identity
+                        && peer.process_session_id == endpoint.process_session_id
+                        && peer.storage_incarnation == endpoint.storage
+                        && peer.replication_address == endpoint.address
+                } else {
+                    // The source checks every descriptor against its actual
+                    // private bindings, including pending compatible scopes.
+                    // Requiring unrelated receivers to be reachable here
+                    // would turn a single-peer outage into lost healthy quorum.
+                    self.control(binding, Control::Confirm).await?;
+                    true
+                };
+                if !matches {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
             }

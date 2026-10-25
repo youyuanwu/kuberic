@@ -121,6 +121,38 @@ impl Barrier {
             ),
         }
     }
+
+    pub(super) fn matches_goal(&self, entry: &crate::crd::RetainedReplicaGoal) -> bool {
+        use kuberic_runtime::protocol::public_operations::ReplicaGoalKind;
+
+        let Self::Operation {
+            stage,
+            kind,
+            participant,
+        } = self
+        else {
+            return false;
+        };
+        if (*stage == BarrierStage::Completion) != entry.outcome.is_some()
+            || participant.as_ref().is_some_and(|reference| {
+                !reference.matches_command(
+                    &entry.goal.scope.storage.replica,
+                    &entry.goal.scope.process_session_id,
+                )
+            })
+        {
+            return false;
+        }
+        kind.is_none_or(|kind| {
+            matches!(
+                (&entry.goal.desired, kind),
+                (ReplicaGoalKind::Build { .. }, PublicV1CallKind::Build)
+                    | (ReplicaGoalKind::Remove { .. }, PublicV1CallKind::Remove)
+                    | (ReplicaGoalKind::Close, PublicV1CallKind::Close)
+                    | (ReplicaGoalKind::Abort, PublicV1CallKind::Abort)
+            )
+        })
+    }
 }
 
 /// Identity returned by a spec-only switchover submission.

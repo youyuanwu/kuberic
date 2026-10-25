@@ -659,8 +659,17 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
     let primary = loop {
         let value = set_status(&kubeconfig, &context)?;
         if public_v1_authority_present(&value)
+            && public_v1_topology_idle(&value)
+            && value["status"]["publicV1Topology"]["sessions"]
+                .as_array()
+                .is_some_and(|sessions| sessions.len() == 3)
             && all_replicas_reporting(&kubeconfig, &context)
             && let Some(primary) = public_v1_primary(&kubeconfig, &context)?
+            && (1..=3).all(|replica_id| {
+                replica_diagnostics(&kubeconfig, &context, replica_id).is_ok_and(|report| {
+                    topology_session_matches(&value, replica_id, &report["processSession"])
+                })
+            })
         {
             break primary;
         }
@@ -669,6 +678,22 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         }
         std::thread::sleep(Duration::from_secs(2));
     };
+    ensure!(
+        put_from_replica(
+            &kubeconfig,
+            &context,
+            primary,
+            "bootstrap-prefix",
+            "acknowledged-before-restart",
+        )? == 200,
+        "initial three-member quorum write failed"
+    );
+    ensure!(
+        get_from_replica(&kubeconfig, &context, primary, "bootstrap-prefix")?.trim()
+            == "acknowledged-before-restart",
+        "initial acknowledged bootstrap value was not readable"
+    );
+    eprintln!("M2 live bootstrap: exact three-member sessions and actual quorum write/read passed");
 
     kubectl(
         &kubeconfig,

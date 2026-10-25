@@ -91,6 +91,35 @@ enabled diagnostic journeys. Record their actual failing clause and unexecuted
 remainder separately; neither a red aggregate nor an unsupported old fixture is
 a passing M2 witness. Independent phase review and later M2 work remain required.
 
+### Ordinary downstream and live boundaries
+
+The bootstrap conflict witness holds an actual ordinary-goal outcome status
+write, injects a metadata-only resource-version conflict and checks the exact
+retained goal/digest after retry. Fresh-build transport isolation and teardown
+use actual membership growth and engine dials, not legacy callback programs or
+an unsupported planned handoff. Reference validation reads the local process's
+exact storage/session/creation identity; it does not mistake an isolated RPC
+endpoint for an obsolete reference. Readiness still requires real RPC evidence.
+
+The downstream counter's bounded secondary-gap witness checks unchanged ordinary
+membership, an unavailable secondary observation and an actual healthy-quorum
+write/read. Receiver validation uses authenticated confirmation of the source's
+actual private peer bindings, not reachability of every unrelated receiver.
+The full automatic-restart gap journey remains separately enabled.
+
+Ordinary reconfiguration omits an absent `catchUp` selection rather than
+serializing an enum-valued null rejected by the Kubernetes API server. This
+does not alter selected catch-up modes or admission policy.
+
+The owned KinD bootstrap body checks exact three-member sessions and performs
+an actual quorum write/read before controller/process restart diagnostics.
+Its later restart, replacement and failover assertions remain enabled. A
+successful formation prefix is not a passing full historical live journey;
+record the exact later failure and unexecuted suffix. Runtime-only local images
+must contain hash-verified binaries built from the recorded source, with no
+unconfigured nested Rust build. Never appropriate a shared cluster or reset
+retained application data to make an incompatible deployment pass.
+
 ## Recording Evidence
 
 For a qualification claim, record the selected revision, environment, exact

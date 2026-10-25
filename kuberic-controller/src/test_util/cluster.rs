@@ -1471,16 +1471,17 @@ impl<F: ApplicationFactory> TestCluster<F> {
             .await
             .map_err(anyhow::Error::from)?
             .map_err(anyhow::Error::from)?;
-        if !self
-            .core
-            .ordinary_snapshots()
-            .await?
-            .iter()
-            .any(|snapshot| {
-                snapshot.storage == reference.storage
-                    && snapshot.process_session_id == reference.session
-                    && snapshot.creation_id == reference.creation
-            })
+        let endpoint = tokio::time::timeout_at(
+            self.core.deadline,
+            handle.public_v1_process_endpoint(ReplicaRole::None),
+        )
+        .await
+        .map_err(anyhow::Error::from)?
+        .map_err(anyhow::Error::from)?;
+        if endpoint.identity != reference.identity
+            || endpoint.storage_incarnation != reference.storage
+            || endpoint.process_session_id != reference.session
+            || endpoint.replicator_creation_id != reference.creation
         {
             return Err(TestError::new(
                 ErrorKind::InvalidReference,
@@ -2453,18 +2454,24 @@ mod readiness_lifecycle_tests {
     async fn drive_retains_the_committed_controller_reply_until_the_next_drive() -> Result<()> {
         let mut cluster = TestCluster::builder(EmptyFactory)
             .scenario_timeout(Duration::from_secs(30))
+            .initial_replicas(1)
             .start()
             .await?;
         let result: Result<()> = async {
-            let topology = cluster.settle().await?;
-            cluster
-                .submit_switchover(topology.secondaries().next().unwrap())
-                .await?;
+            cluster.settle_members(1).await?;
+            cluster.scale_to(2).await?;
             let mut barrier = cluster.core.api.arm_operation_barrier(NAME)?;
             let persisted = cluster.drive(barrier.entered()).await?;
-            let operation: crate::crd::PublicV1OperationStatus =
-                serde_json::from_value(persisted["status"]["publicV1Operation"].clone())?;
-            let command = operation.command().map_err(anyhow::Error::msg)?;
+            let persisted: KubericSet = serde_json::from_value(persisted)?;
+            let goal = persisted
+                .status
+                .context("persisted status missing")?
+                .replica_goals
+                .into_iter()
+                .rev()
+                .find(|entry| entry.outcome.is_none())
+                .context("persisted ordinary intent missing")?
+                .goal;
             assert!(
                 cluster.core.controller_call.get_mut().is_some(),
                 "application completion discarded the in-flight controller call"
@@ -2472,15 +2479,13 @@ mod readiness_lifecycle_tests {
             barrier.release();
             cluster.step().await?;
             assert!(cluster.core.controller_call.get_mut().is_none());
-            let report = cluster
-                .core
-                .report_uid(command.target.instance_id.as_str())
-                .await?;
+            let snapshots = cluster.core.ordinary_snapshots().await?;
+            let snapshot = snapshots
+                .iter()
+                .find(|snapshot| snapshot.storage == goal.scope.storage)
+                .context("ordinary participant snapshot missing")?;
             assert!(
-                !report
-                    .completed_operations
-                    .iter()
-                    .any(|completion| completion.operation_id == command.intent.operation_id),
+                !snapshot.goals.iter().any(|entry| entry.goal == goal),
                 "resuming a held status reply started a second reconcile instead"
             );
             Ok(())
@@ -2581,17 +2586,13 @@ mod readiness_lifecycle_tests {
                     },
                 )
                 .await?;
-            let pending_replacement = loop {
-                if let Some(replacement) = core
-                    .set()
-                    .await?
-                    .status
-                    .and_then(|status| status.public_v1_replacement)
-                {
-                    break replacement;
-                }
-                core.step().await?;
-            };
+            core.step().await?;
+            let pending_replacement = core.set().await?.status.context("replacement status missing")?;
+            let pending_snapshots = core.ordinary_snapshots().await?;
+            assert!(!Harness::<EmptyFactory>::ordinary_settled(
+                &pending_replacement, &pending_snapshots, 3
+            ));
+            eprintln!("ordinary readiness: actual initial convergence and deleted-incarnation readiness rejection passed; requesting automatic replacement settlement");
             core.ready()
                 .await
                 .context("replacement readiness convergence")?;
@@ -2602,17 +2603,12 @@ mod readiness_lifecycle_tests {
                 .await
                 .stopped
                 .remove(replacement.replica.instance_id.as_str());
-            let pending_renewal = loop {
-                if let Some(renewal) = core
-                    .set()
-                    .await?
-                    .status
-                    .and_then(|status| status.public_v1_session_renewal)
-                {
-                    break renewal;
-                }
-                core.step().await?;
-            };
+            core.step().await?;
+            let pending_renewal = core.set().await?.status.context("renewal status missing")?;
+            let pending_snapshots = core.ordinary_snapshots().await?;
+            assert!(!Harness::<EmptyFactory>::ordinary_settled(
+                &pending_renewal, &pending_snapshots, 3
+            ));
             core.ready()
                 .await
                 .context("renewed-session readiness convergence")?;
@@ -2621,19 +2617,24 @@ mod readiness_lifecycle_tests {
             assert!(Harness::<EmptyFactory>::ordinary_settled(
                 &status, &snapshots, 3
             ));
-            let mut altered = status.clone();
-            altered.public_v1_replacement = Some(pending_replacement);
             assert!(!Harness::<EmptyFactory>::ordinary_settled(
-                &altered, &snapshots, 3
+                &pending_replacement, &snapshots, 3
             ));
-            altered = status;
-            altered.public_v1_session_renewal = Some(pending_renewal);
             assert!(!Harness::<EmptyFactory>::ordinary_settled(
-                &altered, &snapshots, 3
+                &pending_renewal, &snapshots, 3
             ));
             Ok(())
         }
         .await;
+        if result.is_err() {
+            eprintln!(
+                "ordinary replacement readiness policy: {}",
+                core.last_error
+                    .as_deref()
+                    .unwrap_or("no recorded reconciliation error")
+                    .replace("local-test-token", "[redacted]")
+            );
+        }
         core.finish(result).await
     }
 }

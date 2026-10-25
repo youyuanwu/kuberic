@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, ensure};
-use kuberic_controller::test_util::TestCluster;
+use kuberic_controller::test_util::{ReplicaRef, TestCluster};
 use kuberic_runtime::application::OpenMode;
-use kuberic_runtime::protocol::public_operations::{PublicV1AcceptedResult, PublicV1CallKind};
 use kuberic_runtime::protocol::types::AccessStatus;
 
 use super::CounterFactory;
@@ -122,82 +121,95 @@ async fn own_application_bootstraps_restarts_and_replaces_with_acknowledged_data
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m2_secondary_gap_preserves_ordinary_membership_and_healthy_quorum() -> Result<()> {
+    let mut cluster = cluster().await?;
+    let result = secondary_gap_prefix(&mut cluster).await.map(|_| ());
+    finish(cluster, result).await
+}
+
+async fn secondary_gap_prefix(
+    cluster: &mut TestCluster<CounterFactory>,
+) -> Result<(ReplicaRef, ReplicaRef)> {
+    let topology = cluster.settle().await?;
+    let writer = cluster.service(topology.primary()).await?;
+    cluster
+        .probe(async { Ok::<_, anyhow::Error>(writer.set(83).await?) })
+        .await?;
+    cluster.settle().await?;
+    let before = cluster.observe().await?;
+    let goals = before
+        .set()
+        .status
+        .as_ref()
+        .context("settled ordinary status missing")?
+        .replica_goals
+        .clone();
+    let configuration = before
+        .set()
+        .status
+        .as_ref()
+        .and_then(|status| status.public_v1_topology.clone())
+        .context("settled topology missing")?;
+    let secondary = topology.secondaries().next().unwrap().clone();
+    let isolation = cluster.isolate(std::slice::from_ref(&secondary)).await?;
+    for _ in 0..6 {
+        cluster.step().await?;
+    }
+    let during = cluster.observe().await?;
+    ensure!(
+        during
+            .set()
+            .status
+            .as_ref()
+            .and_then(|status| status.public_v1_topology.as_ref())
+            == Some(&configuration),
+        "a single-secondary transport outage changed admitted membership"
+    );
+    let current = &during
+        .set()
+        .status
+        .as_ref()
+        .context("current ordinary status missing")?
+        .replica_goals;
+    ensure!(
+        *current == goals,
+        "secondary outage changed ordinary authority"
+    );
+    ensure!(during.snapshot(&secondary).is_none());
+    ensure!(
+        during
+            .snapshot(topology.primary())
+            .context("healthy primary snapshot missing")?
+            .write_status
+            == AccessStatus::Granted,
+        "a single-secondary transport outage fenced the healthy primary"
+    );
+    cluster
+        .probe(async {
+            Ok::<_, anyhow::Error>(
+                tokio::time::timeout(std::time::Duration::from_secs(10), writer.set(89))
+                    .await
+                    .context("healthy quorum write during one-secondary gap")??,
+            )
+        })
+        .await?;
+    ensure!(writer.read().await? == 89);
+    for member in topology.members().filter(|member| *member != &secondary) {
+        ensure!(cluster.service(member).await?.committed_value()? == 89);
+    }
+    cluster.heal(isolation).await?;
+    eprintln!(
+        "M2 downstream secondary gap: actual bootstrap/copy, unchanged ordinary membership, unavailable secondary observation and healthy quorum write/read passed"
+    );
+    Ok((topology.primary().clone(), secondary))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secondary_restart_gap_preserves_admitted_topology_and_primary_writes() -> Result<()> {
     let mut cluster = cluster().await?;
     let result = async {
-        let topology = cluster.settle().await?;
-        let writer = cluster.service(topology.primary()).await?;
-        cluster
-            .probe(async { Ok::<_, anyhow::Error>(writer.set(83).await?) })
-            .await?;
-        cluster.settle().await?;
-        let before = cluster.observe().await?;
-        let authority = before
-            .set()
-            .status
-            .as_ref()
-            .and_then(|status| status.public_v1_authority.clone())
-            .context("settled authority missing")?
-            .authority()
-            .map_err(anyhow::Error::msg)?;
-        let configuration = before
-            .set()
-            .status
-            .as_ref()
-            .and_then(|status| status.public_v1_topology.clone())
-            .context("settled topology missing")?;
-        let secondary = topology.secondaries().next().unwrap().clone();
-        let isolation = cluster.isolate(std::slice::from_ref(&secondary)).await?;
-        for _ in 0..6 {
-            cluster.step().await?;
-        }
-        let during = cluster.observe().await?;
-        ensure!(
-            during
-                .set()
-                .status
-                .as_ref()
-                .and_then(|status| status.public_v1_topology.as_ref())
-                == Some(&configuration),
-            "an RPC-only secondary outage changed admitted membership"
-        );
-        let current = during
-            .set()
-            .status
-            .as_ref()
-            .and_then(|status| status.public_v1_authority.as_ref())
-            .context("current authority missing")?
-            .authority()
-            .map_err(anyhow::Error::msg)?;
-        for completion in current.completed_operations.iter().filter(|completion| {
-            !authority
-                .completed_operations
-                .iter()
-                .any(|before| before.operation_id == completion.operation_id)
-        }) {
-            ensure!(
-                completion.result == PublicV1AcceptedResult::Succeeded
-                    && (completion.call_kind == PublicV1CallKind::Progress
-                        || (completion.call_kind == PublicV1CallKind::CatchUp
-                            && completion.current_configuration_id.as_ref()
-                                == Some(&configuration.configuration_id))),
-                "secondary outage authorized {:?}: {}",
-                completion.call_kind,
-                completion.operation_id,
-            );
-        }
-        ensure!(
-            during
-                .report(topology.primary())
-                .context("healthy primary report missing")?
-                .write_status
-                == AccessStatus::Granted,
-            "an RPC-only secondary outage fenced the healthy primary"
-        );
-        cluster
-            .probe(async { Ok::<_, anyhow::Error>(writer.set(89).await?) })
-            .await?;
-        cluster.heal(isolation).await?;
+        let (primary, secondary) = secondary_gap_prefix(&mut cluster).await?;
+        eprintln!("downstream gap: requesting automatic same-storage secondary restart");
         let reopened = cluster
             .restart(&secondary)
             .await
@@ -208,7 +220,7 @@ async fn secondary_restart_gap_preserves_admitted_topology_and_primary_writes() 
             .settle()
             .await
             .context("settle the renewed secondary")?;
-        ensure!(restored.primary() == topology.primary());
+        ensure!(restored.primary() == &primary);
         assert_values(&mut cluster, 3, 89)
             .await
             .context("acknowledged data after secondary renewal")?;
