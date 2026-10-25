@@ -26,6 +26,11 @@ pub enum TestingTcpRouteKind {
     BuildResult,
     BeforeDelivery,
     RetireResponse,
+    RecoveryDiscovery,
+    RecoveryReceived,
+    ConfigurationValidated,
+    ConfigurationAdmitted,
+    RemoveAdmitted,
 }
 
 type Route = Arc<

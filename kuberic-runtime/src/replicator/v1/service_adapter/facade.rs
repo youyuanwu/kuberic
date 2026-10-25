@@ -188,6 +188,11 @@ enum Command {
     Build(ReplicaInformation),
     Recover(ReplicaInformation),
     Remove(i64),
+    RemoveFenced(
+        i64,
+        Arc<engine_session::Sessions>,
+        Box<engine_session::Binding>,
+    ),
 }
 
 struct Request {
@@ -244,6 +249,19 @@ pub(crate) struct Facade {
 }
 
 impl Facade {
+    pub(super) async fn remove_fenced(
+        &self,
+        id: ReplicaId,
+        sessions: Arc<engine_session::Sessions>,
+        binding: engine_session::Binding,
+    ) -> crate::Result<()> {
+        self.completed(Command::RemoveFenced(
+            id.value(),
+            sessions,
+            Box::new(binding),
+        ))
+        .await
+    }
     pub(super) async fn recover(&self, information: ReplicaInformation) -> crate::Result<()> {
         self.completed(Command::Recover(information)).await
     }
@@ -650,6 +668,23 @@ fn handle(
             }
             Command::Remove(id) => {
                 adapter.remove_replica(id)?;
+                return Ok(Some(Value::Completed));
+            }
+            Command::RemoveFenced(id, sessions, binding) => {
+                adapter
+                    .owner
+                    .primary()
+                    .map_err(AdapterError::from)?
+                    .remove_idle_with(id, |native_idle| {
+                        sessions
+                            .retire_idle(&binding, native_idle)
+                            .map_err(|error| {
+                                super::super::replica_manager::ManagerError::BuildLifecycle(
+                                    error.to_string(),
+                                )
+                            })
+                    })
+                    .map_err(AdapterError::from)?;
                 return Ok(Some(Value::Completed));
             }
         }

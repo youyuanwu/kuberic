@@ -101,10 +101,20 @@ attempts retain their original outcomes.
 
 | Source binding | Actual accepted execution / outcome |
 |---|---|
-| Final code `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a`, tree `85a6f280d0fc64a3b691090ad248834fbbb75d78` | Native V01 `75139c85-aeb8-44f4-a29e-156e75f9de94`, ordinary V02 `3806f222-a8aa-4864-bf8b-784edaf97304`, actual application V03 `dc3b866b-08d8-4260-9de6-1a00ff8cf41a`, required source/API/privacy/package V11A `a6a495f8-3fe2-4b95-8a9a-9b063079e0b7`: PASS. Format, scoped runtime/controller/KV all-target/all-feature check and strict scoped clippy, protected whole files and exact partition validation: exit 0. This is not whole-workspace strict-lint or warning-free normal-feature compilation. |
+| Phase 6 code `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a`, tree `85a6f280d0fc64a3b691090ad248834fbbb75d78` | Native V01 `75139c85-aeb8-44f4-a29e-156e75f9de94`, ordinary V02 `3806f222-a8aa-4864-bf8b-784edaf97304`, actual application V03 `dc3b866b-08d8-4260-9de6-1a00ff8cf41a`, required source/API/privacy/package V11A `a6a495f8-3fe2-4b95-8a9a-9b063079e0b7`: PASS. Format, scoped runtime/controller/KV all-target/all-feature check and strict scoped clippy, protected whole files and exact partition validation: exit 0. This is not whole-workspace strict-lint or warning-free normal-feature compilation. |
 | Same final code, independent reviewer | Complete bounded controller `1ade72c6-21d1-41e0-b80e-5895886536c5` and real KV growth `2daef79b-0c97-4c4f-8d83-b7bc4152a08e`: PASS. Achieved predecessor Close no longer vetoes the fresh current owner; actual current Abort/Close still vetoes Build regardless of reported status. Real `retained`/`later`/`after-growth` KV data, actual native copy, exact acceptance and separate admission execute. |
 | Recovery code `af06768a4e5dbc8ef2a57935e0b12342a2c540eb`, tree `4b28368fe09373b7eb43a41fef5e8de8186161d5` | Standalone normal-feature provider `a33702d5-224d-4df6-b1f9-9f95d08da25a`, actual level V06 `c7e25722-5318-4ca7-8583-9e7b1939da1d`, oracle `ceef1f3d-8eb1-4a6a-8451-f24ee2ca9da9` and authorized routine PG smoke `7f8131ed-acb2-4e32-b6d5-a842c45b5765`: PASS. Their runtime/PG/host owners are unchanged by the later controller repair; they were not rerun there. No full PG run. |
 | Same recovery code, owned matching runtime-only images | Full bootstrap `d96c32a3-61e0-4d56-aa10-8e19b175254d`: PASS, exit 0, including actual secondary reconstruction, renewed exact authority and final write/read. Source/binary/native-library/OCI/pod/owned-context custody was independently verified. **The image predates the final controller repair; no live pass or image equivalence for `84ff69cf…` is claimed.** |
+
+These historical runs also predate the final-review built-in engine fixes.
+They are not live-image or current-binary evidence for recovery reservation,
+exact predecessor compare-and-take, or serialized idle Remove. The new
+`final_remediation::m2_recover_` native regressions use actual authenticated
+Recover RPCs, copy, carrier/ACK ownership, quorum writes and joins. The ordinary
+`m2_builtin_remove_serializes_with_native_configuration_adoption` witness
+executes both adoption/Remove orderings; the multi-secondary witness rejects
+voter Remove before its real quorum and All catch-up assertions.
+Final independent review remains a separate gate.
 
 The retained-member recovery proof requires an unchanged available Primary and
 exact storage/history/epoch/configuration. It executes fresh authenticated

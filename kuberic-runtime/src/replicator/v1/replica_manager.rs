@@ -810,14 +810,33 @@ impl ReplicaManager {
         Ok((effects, start))
     }
 
+    #[cfg(test)]
     pub(super) fn remove_idle(&mut self, replica_id: i64) -> Result<ManagerEffects, ManagerError> {
+        self.remove_idle_with(replica_id, |native_idle| {
+            native_idle
+                .then_some(())
+                .ok_or(ConfigurationError::IdleNotFound(replica_id).into())
+        })
+    }
+
+    pub(super) fn remove_idle_with(
+        &mut self,
+        replica_id: i64,
+        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
+    ) -> Result<ManagerEffects, ManagerError> {
         self.ensure_active()?;
         let Some(index) = self
             .idle
             .iter()
             .position(|idle| idle.replica_id == replica_id)
         else {
-            return Err(ConfigurationError::IdleNotFound(replica_id).into());
+            if self.contains_session(replica_id) {
+                return Err(ConfigurationError::IdleNotFound(replica_id).into());
+            }
+            // A production transfer may still be awaiting establishment before
+            // native Build. Its exact source owner must admit that cancellation.
+            before_remove(false)?;
+            return Ok(ManagerEffects::default());
         };
         let mut retained_idle = self.idle.clone();
         let idle = retained_idle.remove(index);
@@ -826,6 +845,7 @@ impl ReplicaManager {
             self.previous.as_ref(),
             &retained_idle,
         )?;
+        before_remove(true)?;
         self.idle = retained_idle;
         let mut effects = ManagerEffects::default();
         if let Some(build) = self.builds.remove(&replica_id) {

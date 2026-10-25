@@ -3,6 +3,10 @@ use super::super::super::production::{test_compose, test_provider};
 use super::*;
 use crate::replicator::ReplicatorInterfaces;
 
+#[cfg(feature = "testing")]
+#[path = "final_remediation.rs"]
+mod final_remediation;
+
 struct Pair {
     source: Arc<Transport>,
     target: Arc<Transport>,

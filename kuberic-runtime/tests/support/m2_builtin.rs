@@ -960,7 +960,7 @@ pub(super) async fn delayed_first_establishment() {
     let build = pair.build().await;
     entered(&pair.source_hook.entered).await;
     let binding = pair.binding();
-    let _ = pair.remove().await;
+    pair.remove().await.unwrap();
     assert_eq!(
         pair.source_route.inspect_native().unwrap()["lifecycle"][1],
         "primary"
@@ -2359,6 +2359,39 @@ async fn multi_secondary_case(progressive: bool) {
         pair.source_route.inspect_native().unwrap()["sessions"]["entries"],
         bindings
     );
+    let source_before_remove = pair.source_route.inspect_native().unwrap();
+    let target_before_remove = pair.target_route.inspect_native().unwrap();
+    let extra_before_remove = extra_route.inspect_native().unwrap();
+    assert!(
+        pair.source
+            .service
+            .primary()
+            .remove_replica(extra.identity.replica_id)
+            .await
+            .is_err(),
+        "idle-only Remove must reject a configured voter"
+    );
+    let source_after_remove = pair.source_route.inspect_native().unwrap();
+    assert_eq!(
+        source_after_remove["sessions"],
+        source_before_remove["sessions"]
+    );
+    assert_eq!(source_after_remove["peers"], source_before_remove["peers"]);
+    assert_eq!(
+        source_after_remove["production"]["peers"],
+        source_before_remove["production"]["peers"]
+    );
+    assert_eq!(
+        pair.target_route.inspect_native().unwrap()["sessions"],
+        target_before_remove["sessions"]
+    );
+    let extra_after_remove = extra_route.inspect_native().unwrap();
+    assert_eq!(
+        extra_after_remove["sessions"],
+        extra_before_remove["sessions"]
+    );
+    assert_eq!(extra_after_remove["peers"], extra_before_remove["peers"]);
+    assert!(extra_after_remove["failure"].is_null());
     let mut left = pair
         .target
         .service
@@ -2489,30 +2522,198 @@ async fn multi_secondary_case(progressive: bool) {
         extra_route.inspect_native().unwrap()["sessions"]["entries"][0]["binding"],
         binding
     );
-    let _ = pair
-        .source
-        .service
-        .primary()
-        .remove_replica(extra.identity.replica_id)
-        .await;
-    assert_eq!(
-        extra_route.inspect_native().unwrap()["sessions"]["entries"][0]["phase"],
-        "Retired"
-    );
-    assert!(
-        control_at(&binding, binding.clone(), "Reserve")
-            .await
-            .is_err()
-    );
-    assert!(
-        control_at(&binding, binding.clone(), "Confirm")
-            .await
-            .is_err()
-    );
     extra.service.control().abort();
     extra.service.control().close().await.unwrap();
     assert_eq!(extra_route.inspect_native().unwrap()["tasks"], 0);
     extra.running.shutdown();
     extra.running.wait().await.unwrap();
     pair.finish().await;
+}
+
+pub(super) async fn idle_remove_lost_observer() {
+    let pair = Pair::new().await;
+    pair.source_hook.hold(Cut::BuildResult);
+    pair.target_hook.hold(Cut::BeforeCredit);
+    let build = pair.build().await;
+    let mut stream = pair.target.service.state().copy_operations().unwrap();
+    let first = next(&mut stream).await;
+    let second = next(&mut stream).await;
+    first.acknowledge().unwrap();
+    entered(&pair.target_hook.entered).await;
+    second.acknowledge().unwrap();
+    let primary = pair.source.service.primary();
+    let remove = tokio::spawn(async move { primary.remove_replica(ReplicaId::new(2)).await });
+    until(|| {
+        pair.target_route.inspect_native().unwrap()["sessions"]["entries"][0]["phase"] == "Retiring"
+    })
+    .await;
+    assert!(!remove.is_finished());
+    remove.abort();
+    assert!(remove.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        pair.source_route.inspect_native().unwrap()["sessions"]["entries"][0]["phase"],
+        "Retiring"
+    );
+    assert_eq!(pair.target_route.inspect_native().unwrap()["ackPending"], 2);
+    assert_eq!(
+        pair.target_route.inspect_native().unwrap()["nativeCredits"],
+        0
+    );
+    assert!(first.acknowledge().is_err());
+    pair.target_hook.open();
+    until(|| {
+        pair.source_route.inspect_native().unwrap()["sessions"]["entries"][0]["phase"] == "Retired"
+    })
+    .await;
+    assert_eq!(
+        pair.target_route.inspect_native().unwrap()["sessions"]["entries"][0]["phase"],
+        "Retired"
+    );
+    assert_eq!(pair.target_route.inspect_native().unwrap()["ackPending"], 0);
+    assert_eq!(
+        pair.target_route.inspect_native().unwrap()["nativeCredits"],
+        0
+    );
+    pair.source_hook.open();
+    assert!(matches!(
+        settled(&pair.source, &build).await,
+        ReplicaGoalStatus::Failed(_) | ReplicaGoalStatus::Uncertain(_)
+    ));
+    pair.finish().await;
+}
+
+pub(super) async fn remove_adoption_orderings() {
+    for adoption_first in [false, true] {
+        let pair = Pair::new().await;
+        let build = pair.build().await;
+        pair.copy().await;
+        assert_eq!(
+            settled(&pair.source, &build).await,
+            ReplicaGoalStatus::Achieved
+        );
+        let binding = pair.binding();
+        let target = snapshot(&pair.target).await.publication.unwrap();
+        let configuration = ReplicaSetConfiguration {
+            configuration: ConfigurationDescriptor::new(
+                pair.source_goal.scope.epoch,
+                pair.source.identity.replica_id,
+                vec![
+                    ConfigurationMember {
+                        identity: pair.source.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: pair.target.identity.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                    },
+                ],
+                2,
+            ),
+            replicas: vec![ReplicaInformation {
+                identity: pair.target.identity.clone(),
+                process_session_id: pair.target.session.clone(),
+                replication_address: target.replication_address,
+                storage_incarnation: Some(pair.target.storage.clone()),
+                role: ReplicaRole::ActiveSecondary,
+                current_progress: 0,
+                catch_up_capability: 0,
+                must_catchup: false,
+            }],
+        };
+        pair.source_hook.hold(if adoption_first {
+            Cut::ConfigurationAdmitted
+        } else {
+            Cut::ConfigurationValidated
+        });
+        let primary = pair.source.service.primary();
+        let previous = ReplicaSetConfiguration {
+            configuration: pair.source_goal.scope.configuration.current.clone(),
+            replicas: Vec::new(),
+        };
+        let adoption = tokio::spawn(async move {
+            primary
+                .update_catch_up_replica_set_configuration(configuration, previous)
+                .await
+        });
+        entered(&pair.source_hook.entered).await;
+        let source = pair.source_route.inspect_native().unwrap();
+        let target = pair.target_route.inspect_native().unwrap();
+        if adoption_first {
+            assert!(pair.remove().await.is_err());
+            let after = pair.source_route.inspect_native().unwrap();
+            assert_eq!(after["sessions"], source["sessions"]);
+            assert_eq!(after["peers"], source["peers"]);
+            assert_eq!(after["production"]["peers"], source["production"]["peers"]);
+            assert_eq!(
+                pair.target_route.inspect_native().unwrap()["sessions"],
+                target["sessions"]
+            );
+            pair.source_hook.open();
+            adoption.await.unwrap().unwrap();
+        } else {
+            pair.source_hook.hold(Cut::RemoveAdmitted);
+            let primary = pair.source.service.primary();
+            let remove =
+                tokio::spawn(async move { primary.remove_replica(ReplicaId::new(2)).await });
+            entered(&pair.source_hook.entered).await;
+            // Native removal fenced this peer, but metadata and the remote
+            // receiver are deliberately still present. Release the older
+            // configuration waiter first; actor-side resolution must reject it.
+            assert_eq!(
+                pair.source_route.inspect_native().unwrap()["production"]["peers"],
+                source["production"]["peers"]
+            );
+            assert_eq!(
+                pair.target_route.inspect_native().unwrap()["sessions"],
+                target["sessions"]
+            );
+            pair.source_hook.release.add_permits(1);
+            assert!(adoption.await.unwrap().is_err());
+            assert!(!remove.is_finished());
+            pair.source_hook.open();
+            remove.await.unwrap().unwrap();
+            assert_eq!(
+                pair.target_route.inspect_native().unwrap()["sessions"]["entries"][0]["phase"],
+                "Retired"
+            );
+            assert!(
+                control_at(&binding, binding.clone(), "Confirm")
+                    .await
+                    .is_err()
+            );
+        }
+        if adoption_first {
+            pair.admit(&build).await;
+            let mut operations = pair
+                .target
+                .service
+                .state()
+                .replication_operations()
+                .unwrap();
+            let write = pair
+                .source
+                .service
+                .state()
+                .begin_replicate(Bytes::from_static(b"after-rejected-remove"))
+                .unwrap();
+            let completion = tokio::spawn(write.completion);
+            let operation = next(&mut operations).await;
+            assert_eq!(operation.data, Bytes::from_static(b"after-rejected-remove"));
+            assert_eq!(operation.lsn, write.lsn);
+            assert!(!completion.is_finished());
+            operation.acknowledge().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), completion)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            pair.source
+                .service
+                .primary()
+                .wait_for_catch_up_quorum(ReplicaSetQuorumMode::All)
+                .await
+                .unwrap();
+        }
+        pair.finish().await;
+    }
 }

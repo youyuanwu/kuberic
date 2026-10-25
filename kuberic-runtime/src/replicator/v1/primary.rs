@@ -739,13 +739,25 @@ impl PrimaryHandle {
     }
 
     pub(super) fn remove_idle(&self, id: i64) -> Result<(), PrimaryError> {
+        self.remove_idle_with(id, |native_idle| {
+            native_idle
+                .then_some(())
+                .ok_or(super::replica_manager::ConfigurationError::IdleNotFound(id).into())
+        })
+    }
+
+    pub(super) fn remove_idle_with(
+        &self,
+        id: i64,
+        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
+    ) -> Result<(), PrimaryError> {
         let root = self.root()?;
         let (effects, _activity) = {
             let mut state = root.state.lock().unwrap();
             Root::check_open(&state)?;
             let effects = {
                 let mut manager = root.manager.lock().unwrap();
-                let effects = manager.remove_idle(id)?;
+                let effects = manager.remove_idle_with(id, before_remove)?;
                 if !manager.contains_session(id) {
                     state.bindings.remove(&id);
                 } else if let Some(binding) = state.bindings.get_mut(&id) {

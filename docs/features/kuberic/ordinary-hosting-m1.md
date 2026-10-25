@@ -95,6 +95,16 @@ Ready removal on a still valid Open/Primary source calls ordinary Remove and
 retires **local** idle ownership only. It is not proof of target receiver
 drainage. InBuild cancellation uses a whole-creation Abort goal, never Remove
 on an aborted allocation; target settlement is separate.
+The built-in engine admits idle-only removal under the same native lock as
+configuration adoption, before fencing the session. Remove of an admitted
+voter returns an error without changing either endpoint's session or native
+peer. Legal idle removal still fences synchronously and retains remote
+retirement/join work even if its caller disappears.
+An exact owned transfer still awaiting native Build may also be cancelled,
+but only after the same native lock excludes current/previous voters.
+The facade rechecks the peer's effect fence while selecting configuration
+inside its native command actor, so an already validated queued callback
+cannot readopt a legally removed peer while its metadata is still retained.
 Acknowledging the exact retained settled Remove result is retryable after its
 negative watermark is committed, including a lost reply or later controller
 status conflict. It never repeats Remove or proves target containment.
@@ -228,6 +238,15 @@ snapshot; the application committer durably installs it before opening the
 replication consumer. Incomplete, corrupt or conflicting inputs fail closed,
 without resetting application data. Retirement retains uncertainty and receiver
 reservation; late copy cannot install into a successor.
+
+Before spawning recovery work, the source reserves an exact attempt in its
+existing creation-bounded session owner. Only one nonce may replace a given
+target/predecessor; exact duplicates attach to its retained immutable result.
+Pending and failed attempts consume that budget too. Exhaustion rejects before
+allocating results or spawning work, without TTL-forgetting uncertainty.
+After discovery awaits, the captured reservation and source publication must
+still match. Predecessor removal compares the complete binding under the peer
+map lock; a stale recovery cannot take a successor's carrier or ACK owner.
 
 The controller accepts the exact fresh preparation, then obtains ordinary source
 configuration/catch-up and target reconfiguration outcomes before updating the

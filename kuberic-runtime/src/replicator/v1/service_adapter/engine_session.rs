@@ -213,6 +213,7 @@ pub(super) struct ControlEnvelope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Proposed,
+    Recovering,
     Reserved,
     Active,
     Completed,
@@ -225,6 +226,8 @@ struct Entry {
     phase: Phase,
     admitted: Arc<AtomicBool>,
     copy_completed: bool,
+    predecessor: Option<String>,
+    proposed: bool,
 }
 
 #[derive(Default)]
@@ -308,6 +311,7 @@ impl Sessions {
         let state = self.0.lock().unwrap();
         serde_json::json!({
             "closed": state.closed,
+            "capacity": MAX_SESSIONS,
             "receiver": state.receiver,
             "entries": state.entries.values().map(|entry| serde_json::json!({
                 "binding": entry.binding,
@@ -348,6 +352,8 @@ impl Sessions {
                 phase,
                 admitted: Arc::new(AtomicBool::new(false)),
                 copy_completed: false,
+                predecessor: None,
+                proposed: true,
             },
         );
         if receiver {
@@ -395,40 +401,125 @@ impl Sessions {
                 phase: Phase::Proposed,
                 admitted: Arc::new(AtomicBool::new(false)),
                 copy_completed: false,
+                predecessor: None,
+                proposed: true,
             },
         );
         Ok(binding)
     }
 
-    pub(super) fn recovery_proposal(&self, old: &Binding, binding: Binding) -> Result<Binding> {
+    pub(super) fn reserve_recovery(&self, binding: &Binding) -> Result<Binding> {
         binding.validate()?;
         let mut state = self.0.lock().unwrap();
-        if !binding.recovery
-            || state.closed
-            || state.entries.len() >= MAX_SESSIONS
-            || !state
-                .entries
-                .get(&old.nonce)
-                .is_some_and(|entry| entry.binding == *old && entry.phase == Phase::Retiring)
-            || state.entries.contains_key(&binding.nonce)
+        if !binding.recovery || state.closed {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if let Some(entry) = state.entries.get(&binding.nonce) {
+            return entry
+                .predecessor
+                .as_ref()
+                .filter(|_| entry.binding == *binding)
+                .and_then(|nonce| state.entries.get(nonce))
+                .map(|entry| entry.binding.clone())
+                .ok_or(RuntimeError::AuthorityNotAdmitted);
+        }
+        let old = state
+            .entries
+            .values()
+            .find(|entry| {
+                entry.binding.secondary().identity.replica_id
+                    == binding.secondary().identity.replica_id
+                    && entry.copy_completed
+                    && matches!(entry.phase, Phase::Completed | Phase::Retiring)
+            })
+            .map(|entry| entry.binding.clone())
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let endpoint = old.secondary();
+        if state.entries.len() >= MAX_SESSIONS
+            || old.primary() != binding.primary()
+            || old.history() != binding.history()
+            || old.epoch() != binding.epoch()
+            || endpoint.storage != binding.secondary().storage
+            || endpoint.process_session_id == binding.secondary().process_session_id
+            || endpoint.creation_id == binding.secondary().creation_id
+            || !binding
+                .source
+                .scope
+                .configuration
+                .replicas
+                .iter()
+                .any(|peer| {
+                    peer.identity == endpoint.identity
+                        && peer.process_session_id == endpoint.process_session_id
+                        && peer.replication_address == endpoint.address
+                        && peer.storage_incarnation == endpoint.storage
+                })
             || state.entries.values().any(|entry| {
                 entry.binding.nonce != old.nonce
-                    && entry.binding.secondary().identity == binding.secondary().identity
+                    && entry.binding.secondary().identity.replica_id
+                        == binding.secondary().identity.replica_id
                     && entry.phase != Phase::Retired
             })
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        state.entries.get_mut(&old.nonce).unwrap().phase = Phase::Retired;
+        // This bounded entry owns both the retained result and the only worker
+        // allowed to replace this predecessor. Failed attempts are not evicted.
         state.entries.insert(
             binding.nonce.clone(),
             Entry {
                 binding: binding.clone(),
-                phase: Phase::Proposed,
+                phase: Phase::Recovering,
                 admitted: Arc::new(AtomicBool::new(false)),
                 copy_completed: false,
+                predecessor: Some(old.nonce.clone()),
+                proposed: false,
             },
         );
+        Ok(old)
+    }
+
+    pub(super) fn retained_recovery(&self, binding: &Binding) -> Result<()> {
+        let state = self.0.lock().unwrap();
+        state
+            .entries
+            .get(&binding.nonce)
+            .filter(|entry| entry.binding == *binding && entry.predecessor.is_some())
+            .map(|_| ())
+            .ok_or(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    fn pending_recovery(state: &State, old: &Binding, binding: &Binding) -> Result<()> {
+        if state.closed
+            || !state.entries.get(&binding.nonce).is_some_and(|entry| {
+                entry.binding == *binding
+                    && entry.phase == Phase::Recovering
+                    && entry.predecessor.as_ref() == Some(&old.nonce)
+            })
+            || !state.entries.get(&old.nonce).is_some_and(|entry| {
+                entry.binding == *old
+                    && entry.copy_completed
+                    && matches!(entry.phase, Phase::Completed | Phase::Retiring)
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+
+    pub(super) fn recovery_pending(&self, old: &Binding, binding: &Binding) -> Result<()> {
+        Self::pending_recovery(&self.0.lock().unwrap(), old, binding)
+    }
+
+    pub(super) fn recovery_proposal(&self, old: &Binding, binding: Binding) -> Result<Binding> {
+        let mut state = self.0.lock().unwrap();
+        Self::pending_recovery(&state, old, &binding)?;
+        if state.entries.get(&old.nonce).unwrap().phase != Phase::Retiring {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        state.entries.get_mut(&old.nonce).unwrap().phase = Phase::Retired;
+        state.entries.get_mut(&binding.nonce).unwrap().phase = Phase::Proposed;
+        state.entries.get_mut(&binding.nonce).unwrap().proposed = true;
         Ok(binding)
     }
 
@@ -508,6 +599,7 @@ impl Sessions {
             .find(|entry| {
                 entry.binding.secondary().identity.replica_id.value() == replica
                     && entry.phase != Phase::Retired
+                    && entry.proposed
             })
             .map(|entry| entry.binding.clone())
     }
@@ -522,32 +614,68 @@ impl Sessions {
     }
 
     pub(super) fn retire(&self, binding: &Binding) -> Result<()> {
+        self.retire_with(binding, || Ok(()))
+    }
+
+    pub(super) fn retire_with<T>(
+        &self,
+        binding: &Binding,
+        take: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let mut state = self.0.lock().unwrap();
+        Self::retire_locked(&mut state, binding, take)
+    }
+
+    pub(super) fn retire_idle(&self, binding: &Binding, native_idle: bool) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if !native_idle
+            && !state.entries.get(&binding.nonce).is_some_and(|entry| {
+                entry.binding == *binding
+                    && !binding.recovery
+                    && !entry.copy_completed
+                    && matches!(entry.phase, Phase::Proposed | Phase::Active)
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Self::retire_locked(&mut state, binding, || Ok(()))
+    }
+
+    fn retire_locked<T>(
+        state: &mut State,
+        binding: &Binding,
+        take: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if state
+            .entries
+            .get(&binding.nonce)
+            .is_some_and(|entry| entry.binding != *binding)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         if !state.entries.contains_key(&binding.nonce) {
             if state.entries.len() >= MAX_SESSIONS {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
             binding.validate()?;
-            state.entries.insert(
-                binding.nonce.clone(),
-                Entry {
-                    binding: binding.clone(),
-                    phase: Phase::Retiring,
-                    admitted: Arc::new(AtomicBool::new(false)),
-                    copy_completed: false,
-                },
-            );
         }
+        let taken = take()?;
         let entry = state
             .entries
-            .get_mut(&binding.nonce)
-            .filter(|entry| entry.binding == *binding)
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            .entry(binding.nonce.clone())
+            .or_insert_with(|| Entry {
+                binding: binding.clone(),
+                phase: Phase::Retiring,
+                admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: false,
+                predecessor: None,
+                proposed: true,
+            });
         if entry.phase != Phase::Retired {
             entry.phase = Phase::Retiring;
         }
         entry.admitted.store(false, Ordering::Release);
-        Ok(())
+        Ok(taken)
     }
 
     /// Only an actual target join permits this transition, never an RPC timeout.

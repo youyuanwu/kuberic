@@ -372,6 +372,10 @@ impl Transport {
                         return serde_json::Value::Null;
                     };
                     serde_json::json!({
+                        "production": owner.production.lock().unwrap().as_ref()
+                            .and_then(Weak::upgrade).map(|owner| owner.inspect()),
+                        "peers": owner.inspect_peers(),
+                        "ackOwners": owner.inspect_acks(),
                         "sessions": owner.sessions.inspect(),
                         "tasks": owner.cardinality(),
                         "failure": *owner.failure.lock().unwrap(),
@@ -452,17 +456,63 @@ impl Transport {
         *self.production.lock().unwrap() = Some(Arc::downgrade(production));
     }
 
-    pub(super) async fn join_predecessor(&self, binding: &Binding) -> Result<()> {
-        self.sessions.retire(binding)?;
-        let peer = self
-            .peers
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_peers(&self) -> serde_json::Value {
+        serde_json::json!(
+            self.peers
+                .lock()
+                .unwrap()
+                .values()
+                .map(|peer| serde_json::json!({
+                    "binding": peer.binding,
+                    "incarnation": peer.incarnation,
+                    "owner": Arc::as_ptr(peer) as usize,
+                    "current": peer.current.load(Ordering::Acquire),
+                }))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_acks(&self) -> serde_json::Value {
+        serde_json::json!(
+            self.ack_settlements
+                .lock()
+                .unwrap()
+                .values()
+                .map(|owner| serde_json::json!({
+                    "binding": owner.binding,
+                    "owner": Arc::as_ptr(owner) as usize,
+                    "closed": owner.tasks.is_closed(),
+                    "failure": *owner.failure.lock().unwrap(),
+                }))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_production(&self) -> Arc<super::production::Production> {
+        self.production
             .lock()
             .unwrap()
-            .remove(&binding.secondary().identity.replica_id.value());
-        if let Some(peer) = peer {
-            if peer.binding != *binding {
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .unwrap()
+    }
+
+    pub(super) async fn join_predecessor(&self, binding: &Binding) -> Result<()> {
+        let peer = self.sessions.retire_with(binding, || {
+            let mut peers = self.peers.lock().unwrap();
+            let replica = binding.secondary().identity.replica_id.value();
+            if peers
+                .get(&replica)
+                .is_some_and(|peer| peer.binding != *binding)
+            {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
+            Ok(peers.remove(&replica))
+        })?;
+        if let Some(peer) = peer {
             peer.current.store(false, Ordering::Release);
             peer.carrier.shutdown();
             peer.tasks.close();
@@ -1233,6 +1283,14 @@ impl Transport {
         }
         match control.command {
             Control::Recover | Control::Recovered if primary && binding.recovery => {
+                #[cfg(feature = "testing")]
+                if control.command == Control::Recover {
+                    self.test_cut(
+                        crate::replicator::TestingTcpRouteKind::RecoveryReceived,
+                        binding,
+                    )
+                    .await?;
+                }
                 let owner = self
                     .production
                     .lock()

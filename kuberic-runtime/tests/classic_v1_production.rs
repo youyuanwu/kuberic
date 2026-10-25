@@ -120,6 +120,16 @@ async fn m2_builtin_exact_session_replay_and_retirement() {
 }
 
 #[tokio::test]
+async fn m2_builtin_remove_serializes_with_native_configuration_adoption() {
+    m2_builtin::remove_adoption_orderings().await;
+}
+
+#[tokio::test]
+async fn m2_builtin_legal_idle_remove_retains_join_after_observer_loss() {
+    m2_builtin::idle_remove_lost_observer().await;
+}
+
+#[tokio::test]
 async fn m2_builtin_delayed_first_establishment_after_retirement() {
     m2_builtin::delayed_first_establishment().await;
 }

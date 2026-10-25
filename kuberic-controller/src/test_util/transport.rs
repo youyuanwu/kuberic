@@ -526,6 +526,11 @@ impl Network {
                 | TestingTcpRouteKind::BuildResult
                 | TestingTcpRouteKind::BeforeDelivery
                 | TestingTcpRouteKind::RetireResponse
+                | TestingTcpRouteKind::RecoveryDiscovery
+                | TestingTcpRouteKind::RecoveryReceived
+                | TestingTcpRouteKind::ConfigurationValidated
+                | TestingTcpRouteKind::ConfigurationAdmitted
+                | TestingTcpRouteKind::RemoveAdmitted
         ) {
             return Ok(endpoint.to_owned());
         }
@@ -722,6 +727,11 @@ mod tests {
             TestingTcpRouteKind::BuildResult,
             TestingTcpRouteKind::BeforeDelivery,
             TestingTcpRouteKind::RetireResponse,
+            TestingTcpRouteKind::RecoveryDiscovery,
+            TestingTcpRouteKind::RecoveryReceived,
+            TestingTcpRouteKind::ConfigurationValidated,
+            TestingTcpRouteKind::ConfigurationAdmitted,
+            TestingTcpRouteKind::RemoveAdmitted,
         ] {
             assert_eq!(
                 network

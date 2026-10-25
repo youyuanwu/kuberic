@@ -35,5 +35,8 @@ pub(crate) fn test_control(
         epoch: Mutex::new(None),
         close: Mutex::new(None),
         builds: Mutex::new(BTreeMap::new()),
+        recovery_tasks: tokio_util::task::TaskTracker::new(),
+        #[cfg(feature = "testing")]
+        recovery_spawned: std::sync::atomic::AtomicUsize::new(0),
     })
 }
