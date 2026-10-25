@@ -1888,6 +1888,19 @@ impl<F: ApplicationFactory> TestCluster<F> {
         self.check().await
     }
     pub async fn restart(&mut self, reference: &ReplicaRef) -> super::Result<ReplicaRef> {
+        let expected = self.core.set().await?.spec.replicas as usize;
+        self.request_restart(reference).await?;
+        let topology = self.settle_members(expected).await?;
+        topology
+            .members
+            .into_iter()
+            .find(|member| member.replica_id() == reference.replica_id())
+            .ok_or_else(|| TestError::new(ErrorKind::Fatal, "restarted member missing"))
+    }
+
+    /// Reopens the process without driving controller admission. Call settle
+    /// explicitly after observing the fresh process's closed access.
+    pub async fn request_restart(&mut self, reference: &ReplicaRef) -> super::Result<ReplicaRef> {
         self.stop(reference).await?;
         self.core
             .supervisor
@@ -1895,12 +1908,17 @@ impl<F: ApplicationFactory> TestCluster<F> {
             .await
             .stopped
             .remove(reference.instance_id());
-        let topology = self.settle().await?;
-        topology
-            .members
-            .into_iter()
-            .find(|member| member.replica_id() == reference.replica_id())
-            .ok_or_else(|| TestError::new(ErrorKind::Fatal, "restarted member missing"))
+        loop {
+            self.check().await?;
+            let observation = self.observe().await?;
+            if let Some((fresh, _)) = observation.snapshots.iter().find(|(fresh, _)| {
+                fresh.replica_id() == reference.replica_id()
+                    && fresh.process_session_id() != reference.process_session_id()
+            }) {
+                return Ok(fresh.clone());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     fn validate_resource(&self, reference: &ResourceRef) -> super::Result<serde_json::Value> {
         if reference.cluster != self.nonce {

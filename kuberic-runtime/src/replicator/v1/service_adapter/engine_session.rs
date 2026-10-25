@@ -12,8 +12,8 @@ use crate::protocol::public_operations::{
     RemoteReplicaSelection, ReplicaPublication, ReplicaPublicationStage,
 };
 use crate::protocol::types::{
-    Epoch, HistoryContext, ProcessSessionId, ReplicaIdentity, ReplicaStorageIncarnationContext,
-    ReplicatorCreationId, ResourceUid,
+    Epoch, HistoryContext, ProcessSessionId, ReplicaIdentity, ReplicaRole,
+    ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
 };
 use crate::{Result, RuntimeError};
 
@@ -87,6 +87,7 @@ pub(in crate::replicator::v1) struct Binding {
     pub(super) nonce: String,
     pub(super) source: ReplicaPublication,
     pub(super) target: ReplicaPublication,
+    pub(super) recovery: bool,
 }
 
 impl Binding {
@@ -95,6 +96,7 @@ impl Binding {
             nonce: uuid::Uuid::new_v4().to_string(),
             source,
             target,
+            recovery: false,
         };
         binding.validate()?;
         Ok(binding)
@@ -103,6 +105,51 @@ impl Binding {
     pub(super) fn validate(&self) -> Result<()> {
         if uuid::Uuid::parse_str(&self.nonce).is_err() {
             return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if self.recovery {
+            self.source
+                .validate()
+                .map_err(|e| RuntimeError::AuthorityMismatch(e.into()))?;
+            self.target
+                .validate()
+                .map_err(|e| RuntimeError::AuthorityMismatch(e.into()))?;
+            let source = &self.source.scope;
+            let target = &self.target.scope;
+            let configuration = &source.configuration;
+            if self.source.stage != ReplicaPublicationStage::AchievedScope
+                || self.source.role != ReplicaRole::Primary
+                || !matches!(
+                    (self.target.stage, self.target.role),
+                    (ReplicaPublicationStage::DiscoveryPending, ReplicaRole::None)
+                        | (
+                            ReplicaPublicationStage::AchievedScope,
+                            ReplicaRole::ActiveSecondary
+                        )
+                )
+                || source.history != target.history
+                || source.epoch != target.epoch
+                || configuration.previous.is_some()
+                || target.configuration.previous.is_some()
+                || configuration.current != target.configuration.current
+                || configuration.current.primary_id != source.storage.replica.replica_id
+                || !configuration.current.members.iter().any(|m| {
+                    m.identity == target.storage.replica && m.role == ReplicaRole::ActiveSecondary
+                })
+                || !configuration.replicas.iter().any(|peer| {
+                    peer.identity == target.storage.replica
+                        && peer.storage_incarnation == target.storage
+                        && peer.process_session_id != target.process_session_id
+                })
+                || !target.configuration.replicas.iter().any(|peer| {
+                    peer.identity == source.storage.replica
+                        && peer.storage_incarnation == source.storage
+                        && peer.process_session_id == source.process_session_id
+                        && peer.replication_address == self.source.replication_address
+                })
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            return Ok(());
         }
         RemoteReplicaSelection {
             source: self.source.clone(),
@@ -138,7 +185,8 @@ impl Binding {
         } else {
             return false;
         };
-        publication.stage == ReplicaPublicationStage::AchievedScope
+        (publication.stage == ReplicaPublicationStage::AchievedScope
+            || (self.recovery && publication == &self.target))
             && publication.scope == origin.scope
             && publication.role == origin.role
     }
@@ -151,6 +199,8 @@ pub(super) enum Control {
     Confirm,
     Complete,
     Retire,
+    Recover,
+    Recovered,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +224,7 @@ struct Entry {
     binding: Binding,
     phase: Phase,
     admitted: Arc<AtomicBool>,
+    copy_completed: bool,
 }
 
 #[derive(Default)]
@@ -231,6 +282,27 @@ impl Fence {
 }
 
 impl Sessions {
+    pub(super) fn completed(&self, binding: &Binding) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .entries
+            .get(&binding.nonce)
+            .is_some_and(|entry| entry.binding == *binding && entry.phase == Phase::Completed)
+    }
+
+    pub(super) fn predecessor_completed(&self, binding: &Binding) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .entries
+            .get(&binding.nonce)
+            .is_some_and(|entry| {
+                entry.binding == *binding
+                    && entry.copy_completed
+                    && matches!(entry.phase, Phase::Completed | Phase::Retiring)
+            })
+    }
     #[cfg(feature = "testing")]
     pub(super) fn inspect(&self) -> serde_json::Value {
         let state = self.0.lock().unwrap();
@@ -275,6 +347,7 @@ impl Sessions {
                 binding: binding.clone(),
                 phase,
                 admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: false,
             },
         );
         if receiver {
@@ -321,6 +394,39 @@ impl Sessions {
                 binding: binding.clone(),
                 phase: Phase::Proposed,
                 admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: false,
+            },
+        );
+        Ok(binding)
+    }
+
+    pub(super) fn recovery_proposal(&self, old: &Binding, binding: Binding) -> Result<Binding> {
+        binding.validate()?;
+        let mut state = self.0.lock().unwrap();
+        if !binding.recovery
+            || state.closed
+            || state.entries.len() >= MAX_SESSIONS
+            || !state
+                .entries
+                .get(&old.nonce)
+                .is_some_and(|entry| entry.binding == *old && entry.phase == Phase::Retiring)
+            || state.entries.contains_key(&binding.nonce)
+            || state.entries.values().any(|entry| {
+                entry.binding.nonce != old.nonce
+                    && entry.binding.secondary().identity == binding.secondary().identity
+                    && entry.phase != Phase::Retired
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        state.entries.get_mut(&old.nonce).unwrap().phase = Phase::Retired;
+        state.entries.insert(
+            binding.nonce.clone(),
+            Entry {
+                binding: binding.clone(),
+                phase: Phase::Proposed,
+                admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: false,
             },
         );
         Ok(binding)
@@ -356,6 +462,7 @@ impl Sessions {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         entry.phase = to;
+        entry.copy_completed |= to == Phase::Completed;
         entry.admitted.store(true, Ordering::Release);
         Ok(())
     }
@@ -427,6 +534,7 @@ impl Sessions {
                     binding: binding.clone(),
                     phase: Phase::Retiring,
                     admitted: Arc::new(AtomicBool::new(false)),
+                    copy_completed: false,
                 },
             );
         }

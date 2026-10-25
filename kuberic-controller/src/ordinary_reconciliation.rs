@@ -440,6 +440,10 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
         if changed {
             return self.persist_goals(raw, status).await;
         }
+        if pending {
+            // Submission may already have changed the host. Plan only from a fresh observation.
+            return Ok(action(ReconcileKind::Waiting));
+        }
         let mut reopen = Vec::new();
         for peer in peers
             .values()
@@ -447,6 +451,10 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
         {
             if peer.goals.iter().any(|observation| {
                 observation.goal.scope.process_session_id == peer.process_session_id
+            }) || status.replica_goals.iter().any(|entry| {
+                entry.goal.scope.storage == peer.storage
+                    && entry.goal.scope.process_session_id == peer.process_session_id
+                    && entry.goal.scope.creation_id == peer.creation_id
             }) {
                 continue;
             }
@@ -498,10 +506,13 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
         }
         if peers.values().any(|peer| {
             peer.goals.iter().any(|observation| {
-                matches!(
-                    observation.goal.desired,
-                    ReplicaGoalKind::Close | ReplicaGoalKind::Abort
-                )
+                observation.goal.scope.storage == peer.storage
+                    && observation.goal.scope.process_session_id == peer.process_session_id
+                    && observation.goal.scope.creation_id == peer.creation_id
+                    && matches!(
+                        observation.goal.desired,
+                        ReplicaGoalKind::Close | ReplicaGoalKind::Abort
+                    )
             })
         }) {
             return Ok(action(ReconcileKind::Waiting));
@@ -599,9 +610,6 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 .extend(preparations.into_iter().take(PREPARATION_BATCH));
             return self.persist_goals(raw, status).await;
         }
-        if pending {
-            return Ok(action(ReconcileKind::Waiting));
-        }
         if current.is_none() {
             let sessions = vec![endpoint(primary, ReplicaRole::Primary)];
             status.public_v1_topology = Some(
@@ -673,11 +681,137 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             .copied()
             .collect::<Vec<_>>();
         if addition.is_empty() {
+            let sessions = current
+                .members
+                .iter()
+                .map(|member| endpoint(peers[&member.identity.replica_id], member.role))
+                .collect::<Vec<_>>();
+            let topology = status.public_v1_topology.as_ref().unwrap();
+            if current.members.len() > 1 && topology.sessions != sessions {
+                let old_primary = topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.role == ReplicaRole::Primary)
+                    .ok_or_else(|| invalid("current topology lacks its primary session"))?;
+                if *old_primary != endpoint(primary, ReplicaRole::Primary) {
+                    return Err(invalid(
+                        "current-member recovery cannot replace the primary",
+                    ));
+                }
+                for member in current
+                    .members
+                    .iter()
+                    .filter(|m| m.role == ReplicaRole::ActiveSecondary)
+                {
+                    let peer = peers[&member.identity.replica_id];
+                    let prior = topology
+                        .sessions
+                        .iter()
+                        .find(|session| session.identity == member.identity)
+                        .ok_or_else(|| invalid("recovery lost its admitted predecessor"))?;
+                    if prior.storage_incarnation != peer.storage
+                        || !peer.publication.as_ref().is_some_and(|publication| {
+                            publication.stage == ReplicaPublicationStage::AchievedScope
+                                && publication.role == ReplicaRole::ActiveSecondary
+                                && publication.scope.configuration.current == current
+                                && publication.scope.configuration.previous.is_none()
+                                && status.replica_goals.iter().any(|entry| {
+                                    entry.goal.scope == publication.scope
+                                        && achieved(entry)
+                                        && matches!(
+                                            entry.goal.desired,
+                                            ReplicaGoalKind::Prepare {
+                                                role: ReplicaRole::ActiveSecondary
+                                            }
+                                        )
+                                })
+                        }) && *prior != endpoint(peer, member.role)
+                    {
+                        return Ok(action(ReconcileKind::Waiting));
+                    }
+                }
+                let configuration = configuration_for(primary_id, &current, None, &peers)?;
+                let retained = status.replica_goals.iter().rev().find(|entry| {
+                    entry.goal.scope.storage == primary.storage
+                        && entry.goal.scope.process_session_id == primary.process_session_id
+                        && entry.goal.scope.creation_id == primary.creation_id
+                        && entry.goal.scope.configuration == configuration
+                        && matches!(
+                            entry.goal.desired,
+                            ReplicaGoalKind::Reconfigure {
+                                role: ReplicaRole::Primary,
+                                catch_up: Some(PublicCatchUpMode::WriteQuorum)
+                            }
+                        )
+                });
+                if retained.is_none() {
+                    status.replica_goals.push(goal(
+                        primary,
+                        configuration,
+                        ReplicaGoalKind::Reconfigure {
+                            role: ReplicaRole::Primary,
+                            catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                        },
+                        &status.replica_goals,
+                    )?);
+                    return self.persist_goals(raw, status).await;
+                }
+                if !retained.is_some_and(achieved)
+                    || primary.write_status != AccessStatus::Granted
+                    || primary.read_status != AccessStatus::Granted
+                {
+                    return Ok(action(ReconcileKind::Waiting));
+                }
+                for member in current
+                    .members
+                    .iter()
+                    .filter(|m| m.role == ReplicaRole::ActiveSecondary)
+                {
+                    let peer = peers[&member.identity.replica_id];
+                    if topology.sessions.contains(&endpoint(peer, member.role)) {
+                        continue;
+                    }
+                    let configuration =
+                        configuration_for(member.identity.replica_id, &current, None, &peers)?;
+                    if !status.replica_goals.iter().any(|entry| {
+                        entry.goal.scope.storage == peer.storage
+                            && entry.goal.scope.process_session_id == peer.process_session_id
+                            && entry.goal.scope.creation_id == peer.creation_id
+                            && entry.goal.scope.configuration == configuration
+                            && achieved(entry)
+                            && matches!(
+                                entry.goal.desired,
+                                ReplicaGoalKind::Reconfigure {
+                                    role: ReplicaRole::ActiveSecondary,
+                                    catch_up: None
+                                }
+                            )
+                    }) {
+                        status.replica_goals.push(goal(
+                            peer,
+                            configuration,
+                            ReplicaGoalKind::Reconfigure {
+                                role: ReplicaRole::ActiveSecondary,
+                                catch_up: None,
+                            },
+                            &status.replica_goals,
+                        )?);
+                        return self.persist_goals(raw, status).await;
+                    }
+                }
+                status.public_v1_topology = Some(
+                    PublicV1TopologyState::from_configuration(&current, &sessions)
+                        .map_err(invalid)?,
+                );
+                return self.persist_goals(raw, status).await;
+            }
             let serving = primary.write_status == AccessStatus::Granted
                 && primary.read_status == AccessStatus::Granted;
             if !serving
                 && !status.replica_goals.iter().any(|entry| {
                     entry.goal.scope.storage == primary.storage
+                        && entry.goal.scope.process_session_id == primary.process_session_id
+                        && entry.goal.scope.creation_id == primary.creation_id
                         && matches!(
                             entry.goal.desired,
                             ReplicaGoalKind::Reconfigure {
@@ -699,6 +833,41 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                     &status.replica_goals,
                 )?;
                 status.replica_goals.push(activation);
+                return self.persist_goals(raw, status).await;
+            }
+            // A singleton has no remote session to replace or readmit.
+            if current.members.len() == 1
+                && serving
+                && primary.publication.as_ref().is_some_and(|publication| {
+                    publication.stage == ReplicaPublicationStage::AchievedScope
+                        && publication.role == ReplicaRole::Primary
+                        && publication.scope.storage == primary.storage
+                        && publication.scope.process_session_id == primary.process_session_id
+                        && publication.scope.creation_id == primary.creation_id
+                        && publication.scope.configuration.current == current
+                        && publication.scope.configuration.previous.is_none()
+                        && status.replica_goals.iter().any(|entry| {
+                            entry.goal.scope == publication.scope
+                                && achieved(entry)
+                                && matches!(
+                                    entry.goal.desired,
+                                    ReplicaGoalKind::Reconfigure {
+                                        role: ReplicaRole::Primary,
+                                        catch_up: Some(PublicCatchUpMode::WriteQuorum)
+                                    }
+                                )
+                        })
+                })
+                && status.public_v1_topology.as_ref().unwrap().sessions
+                    != [endpoint(primary, ReplicaRole::Primary)]
+            {
+                status.public_v1_topology = Some(
+                    PublicV1TopologyState::from_configuration(
+                        &current,
+                        &[endpoint(primary, ReplicaRole::Primary)],
+                    )
+                    .map_err(invalid)?,
+                );
                 return self.persist_goals(raw, status).await;
             }
             self.converge_public_v1_write_service(raw, serving.then_some(&primary.storage.replica))

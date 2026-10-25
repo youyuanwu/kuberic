@@ -61,7 +61,136 @@ impl Pair {
             binding,
         }
     }
+}
 
+#[tokio::test]
+async fn m2_recovery_session_rejects_stale_identity_epoch_and_successor_before_effects() {
+    let mut pair = Pair::new().await;
+    let mut source = pair.binding.source.clone();
+    let mut target = pair.binding.target.clone();
+    let current = ConfigurationDescriptor::new(
+        source.scope.epoch,
+        source.scope.storage.replica.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.scope.storage.replica.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.scope.storage.replica.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        2,
+    );
+    let peer = |publication: &ReplicaPublication, role| ReplicaPeerDescription {
+        identity: publication.scope.storage.replica.clone(),
+        replication_address: publication.replication_address.clone(),
+        process_session_id: publication.scope.process_session_id.clone(),
+        storage_incarnation: publication.scope.storage.clone(),
+        role,
+        current_progress: -1,
+        catch_up_capability: -1,
+        is_up: true,
+        is_ready: true,
+        must_catchup: false,
+    };
+    let mut predecessor = peer(&target, ReplicaRole::ActiveSecondary);
+    predecessor.process_session_id = ProcessSessionId::new("contained-predecessor");
+    source.scope.configuration = ReplicaConfigurationScope {
+        current: current.clone(),
+        previous: None,
+        replicas: vec![predecessor],
+    };
+    target.scope.configuration = ReplicaConfigurationScope {
+        current,
+        previous: None,
+        replicas: vec![peer(&source, ReplicaRole::Primary)],
+    };
+    target.stage = ReplicaPublicationStage::DiscoveryPending;
+    target.role = ReplicaRole::None;
+    pair.binding = Binding {
+        nonce: uuid::Uuid::new_v4().to_string(),
+        source: source.clone(),
+        target: target.clone(),
+        recovery: true,
+    };
+    pair.publish(source, target);
+    pair.target
+        .selected_role(pair.binding.epoch(), ReplicaRole::ActiveSecondary);
+    pair.establish().await;
+    pair.target
+        .control(&pair.binding, Control::Confirm)
+        .await
+        .unwrap();
+    pair.source.sessions.complete(&pair.binding).unwrap();
+    let before = pair.source.sessions.inspect();
+    for fault in 0..7 {
+        let mut stale = pair.binding.clone();
+        match fault {
+            0 => {
+                stale.target.scope.process_session_id =
+                    ProcessSessionId::new("contained-predecessor")
+            }
+            1 => stale.target.scope.creation_id = ReplicatorCreationId::new("old-creation"),
+            2 => {
+                stale.target.scope.storage.storage_generation =
+                    StorageGeneration::new("other-storage")
+            }
+            3 => {
+                stale.target.scope.history.history_id =
+                    crate::protocol::types::HistoryId::new("other-history")
+            }
+            4 => stale.target.scope.epoch.configuration_number += 1,
+            5 => stale.target.replication_address.push_str("stale-endpoint"),
+            _ => stale.nonce = uuid::Uuid::new_v4().to_string(),
+        }
+        assert!(pair.target.control(&stale, Control::Confirm).await.is_err());
+        assert_eq!(pair.source.sessions.inspect(), before);
+    }
+    let sender = pair.source.acknowledgements();
+    let permit = sender.reserve_owned().await.unwrap();
+    let (credited, observed) = tokio::sync::oneshot::channel();
+    pair.source_access.validated.forget_permits(usize::MAX);
+    pair.source_access.pause.store(true, Ordering::SeqCst);
+    pair.source
+        .sessions
+        .effect(&pair.binding, || {
+            pair.source.queue_ack(
+                pair.binding.clone(),
+                permit,
+                Box::new(move || {
+                    let _ = credited.send(());
+                    Ok(())
+                }),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    validated(&pair.source_access).await;
+    pair.source.sessions.retire(&pair.binding).unwrap();
+    assert!(pair.source.sessions.predecessor_completed(&pair.binding));
+    assert!(!pair.source.sessions.completed(&pair.binding));
+    pair.source_access.release.add_permits(1);
+    assert!(
+        observed.await.is_err(),
+        "retired ACK must not credit its native callback"
+    );
+    assert!(pair.target.confirm_effect(&pair.binding).await.is_err());
+    let mut successor = pair.binding.clone();
+    successor.nonce = uuid::Uuid::new_v4().to_string();
+    assert!(pair.target.sessions.reserve(&successor).is_err());
+    assert!(
+        pair.target
+            .sessions
+            .effect(&pair.binding, || panic!("late ACK/effect"))
+            .is_err()
+    );
+    assert!(!pair.target.sessions.completed(&pair.binding));
+    pair.finish().await;
+}
+
+impl Pair {
     fn access(publication: ReplicaPublication) -> Arc<Access> {
         Arc::new(Access {
             publication: Mutex::new(publication),

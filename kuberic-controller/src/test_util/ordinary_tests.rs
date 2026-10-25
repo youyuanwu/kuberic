@@ -509,6 +509,9 @@ impl ApplicationFactory for Applications {
 
 struct ObservedTransport {
     grpc: GrpcAgentApi,
+    held_snapshot: StdMutex<Option<ReplicaAgentSnapshot>>,
+    lost_discover_reply: AtomicBool,
+    discover_submissions: StdMutex<Vec<ReplicaGoal>>,
     lost_build_reply: AtomicBool,
     lose_remove_ack_reply: AtomicBool,
     lost_remove_ack: StdMutex<Option<(ReplicaGoalAcknowledgement, ReplicaAgentSnapshot)>>,
@@ -533,6 +536,18 @@ impl AgentApi for ObservedTransport {
                 .as_ref()
                 .is_some_and(|target| target.replica_id == 2);
         let mut response = self.grpc.get_snapshot(endpoint, token, request).await?;
+        if let Some(snapshot) = self.held_snapshot.lock().unwrap().as_ref()
+            && serde_json::from_slice::<ReplicaAgentQueryResult>(&response.canonical_json)
+                .is_ok_and(|result| {
+                    matches!(result, ReplicaAgentQueryResult::Initialized(current)
+                    if current.storage == snapshot.storage)
+                })
+        {
+            response.canonical_json = serde_json::to_vec(&ReplicaAgentQueryResult::Initialized(
+                Box::new(snapshot.clone()),
+            ))
+            .unwrap();
+        }
         if incompatible {
             response.protocol_version = 14;
         }
@@ -545,11 +560,21 @@ impl AgentApi for ObservedTransport {
         request: proto::ReplicaGoalRequest,
     ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
         let goal: ReplicaGoal = serde_json::from_slice(&request.canonical_json).unwrap();
+        let discover = matches!(goal.desired, ReplicaGoalKind::Discover);
+        if discover {
+            self.discover_submissions.lock().unwrap().push(goal.clone());
+        }
         let build = matches!(goal.desired, ReplicaGoalKind::Build { .. });
         if build {
             self.build_submissions.fetch_add(1, Ordering::AcqRel);
         }
         let result = self.grpc.submit_goal(endpoint, token, request).await;
+        if discover && self.lost_discover_reply.swap(false, Ordering::AcqRel) {
+            result?;
+            return Err(AgentRpcError::Unavailable(
+                "injected lost accepted Discover reply".into(),
+            ));
+        }
         if build && self.lost_build_reply.swap(false, Ordering::AcqRel) {
             result?;
             return Err(AgentRpcError::Unavailable(
@@ -650,6 +675,9 @@ async fn start(
     .unwrap();
     let transport = Arc::new(ObservedTransport {
         grpc: GrpcAgentApi::new(Duration::from_secs(3)),
+        held_snapshot: StdMutex::new(None),
+        lost_discover_reply: AtomicBool::new(false),
+        discover_submissions: StdMutex::new(Vec::new()),
         lost_build_reply: AtomicBool::new(lost_reply),
         lose_remove_ack_reply: AtomicBool::new(false),
         lost_remove_ack: StdMutex::new(None),
@@ -1167,12 +1195,20 @@ async fn scale(harness: &Harness<Applications>, replicas: u32) {
 }
 
 async fn restart_target(harness: &mut Harness<Applications>, applications: &Applications) {
-    let old = applications.engine(2);
+    restart_replica(harness, applications, 2).await;
+}
+
+async fn restart_replica(
+    harness: &mut Harness<Applications>,
+    applications: &Applications,
+    id: i64,
+) {
+    let old = applications.engine(id);
     let uid = old.context().identity().unwrap().instance_id.to_string();
     harness.stop(&uid).await.unwrap();
     harness.supervisor.lock().await.stopped.remove(&uid);
     wait(async || {
-        let new = applications.engine(2);
+        let new = applications.engine(id);
         !Arc::ptr_eq(&old, &new)
             && harness
                 .supervisor
@@ -1186,6 +1222,186 @@ async fn restart_target(harness: &mut Harness<Applications>, applications: &Appl
     assert!(
         old.engine_joined.load(Ordering::Acquire) && old.service_joined.load(Ordering::Acquire)
     );
+}
+
+#[tokio::test]
+async fn production_ordinary_closed_predecessor_cannot_block_exact_singleton_reopen_activation() {
+    let (mut harness, applications, transport) = start(false, 1, false).await;
+    assert_eq!(harness.ready_members(1).await.unwrap(), 1);
+    let old = applications.engine(1);
+    let before = peers(&observe(&harness, transport.clone()).await).remove(0);
+    let bytes = std::fs::read(old.root.join("durable-state")).unwrap();
+    let terminal = ReplicaGoal {
+        format: ORDINARY_ACTION_FORMAT,
+        identity: before.identity.clone(),
+        operation_id: OperationId::new("exact-predecessor-close"),
+        revision: before
+            .goals
+            .iter()
+            .map(|entry| entry.goal.revision)
+            .max()
+            .unwrap()
+            + 1,
+        scope: before.publication.as_ref().unwrap().scope.clone(),
+        desired: ReplicaGoalKind::Close,
+    };
+    let api = Api::<KubericSet>::namespaced(harness.api.client(), NAMESPACE);
+    let mut set = api.get(NAME).await.unwrap();
+    set.status
+        .as_mut()
+        .unwrap()
+        .replica_goals
+        .push(crate::crd::RetainedReplicaGoal::new(terminal.clone()).unwrap());
+    api.replace_status(NAME, &PostParams::default(), &set)
+        .await
+        .unwrap();
+    until(&mut harness, || {
+        old.engine_joined.load(Ordering::Acquire) && old.service_joined.load(Ordering::Acquire)
+    })
+    .await;
+    pump(&mut harness, 3).await;
+    assert_eq!(old.closes.load(Ordering::Acquire), 1);
+    restart_replica(&mut harness, &applications, 1).await;
+    assert_eq!(harness.ready_members(1).await.unwrap(), 1);
+    let after = peers(&observe(&harness, transport.clone()).await).remove(0);
+    let status = harness.set().await.unwrap().status.unwrap();
+    assert_eq!(after.storage, before.storage);
+    assert_ne!(after.process_session_id, before.process_session_id);
+    assert_ne!(after.creation_id, before.creation_id);
+    assert_eq!(after.write_status, AccessStatus::Granted);
+    let session = &status.public_v1_topology.unwrap().sessions[0];
+    assert_eq!(session.process_session_id, after.process_session_id);
+    assert_eq!(session.replicator_creation_id, after.creation_id);
+    assert!(status.replica_goals.iter().any(|entry| {
+        entry.goal == terminal
+            && entry
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+    }));
+    assert!(status.replica_goals.iter().any(|entry| {
+        entry.goal.scope.process_session_id == after.process_session_id
+            && entry.goal.scope.creation_id == after.creation_id
+            && matches!(
+                entry.goal.desired,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::WriteQuorum)
+                }
+            )
+            && entry
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+    }));
+    assert_eq!(applications.engine(1).opens.load(Ordering::Acquire), 1);
+    assert_eq!(
+        std::fs::read(old.root.join("durable-state")).unwrap(),
+        bytes
+    );
+    close(harness, &applications).await;
+}
+
+#[tokio::test]
+async fn production_ordinary_reopen_retries_one_discover_with_lost_reply_and_held_publication() {
+    let (mut harness, applications, transport) = start(false, 2, false).await;
+    until(&mut harness, || {
+        applications
+            .engines
+            .lock()
+            .unwrap()
+            .get(&1)
+            .is_some_and(|engine| engine.builds.load(Ordering::Acquire) > 0)
+    })
+    .await;
+    applications.release();
+    assert_eq!(harness.ready_members(2).await.unwrap(), 1);
+    let before = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 2)
+        .unwrap();
+    let prefix = std::fs::read(applications.engine(2).root.join("durable-state")).unwrap();
+    restart_target(&mut harness, &applications).await;
+    let reopened = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 2)
+        .unwrap();
+    assert_eq!(reopened.storage, before.storage);
+    assert_eq!(reopened.open_mode, OpenMode::Existing);
+    assert_ne!(reopened.process_session_id, before.process_session_id);
+    assert_ne!(reopened.creation_id, before.creation_id);
+    assert!(reopened.publication.is_none());
+    *transport.held_snapshot.lock().unwrap() = Some(reopened.clone());
+    transport.lost_discover_reply.store(true, Ordering::Release);
+    pump(&mut harness, 8).await;
+    let retained = harness.set().await.unwrap().status.unwrap().replica_goals;
+    let owners = retained
+        .iter()
+        .filter(|entry| entry.goal.scope.process_session_id == reopened.process_session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        owners.len(),
+        1,
+        "stale discovery observation appended another owner"
+    );
+    let selected = &owners[0].goal;
+    assert!(matches!(selected.desired, ReplicaGoalKind::Discover));
+    assert!(owners[0].outcome.is_none());
+    let retries = transport
+        .discover_submissions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|goal| goal.scope.process_session_id == reopened.process_session_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        retries.len() > 1,
+        "lost response did not exercise exact retry"
+    );
+    assert!(retries.iter().all(|goal| goal == selected));
+    let engine = applications.engine(2);
+    wait(async || engine.opens.load(Ordering::Acquire) == 1).await;
+    *transport.held_snapshot.lock().unwrap() = None;
+    until(&mut harness, || {
+        engine.role_calls.load(Ordering::Acquire) > 0
+    })
+    .await;
+    pump(&mut harness, 4).await;
+    let observed = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage == reopened.storage)
+        .unwrap();
+    assert_eq!(
+        observed
+            .goals
+            .iter()
+            .filter(|entry| entry.goal == *selected)
+            .count(),
+        1
+    );
+    assert!(
+        harness
+            .set()
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .replica_goals
+            .iter()
+            .any(|entry| entry.goal == *selected
+                && entry
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved))
+    );
+    assert_eq!(engine.opens.load(Ordering::Acquire), 1);
+    assert_eq!(
+        std::fs::read(engine.root.join("durable-state")).unwrap(),
+        prefix
+    );
+    assert_eq!(transport.forbidden.load(Ordering::Acquire), 0);
+    close(harness, &applications).await;
 }
 
 async fn build_goal(harness: &Harness<Applications>) -> ReplicaGoal {

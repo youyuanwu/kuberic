@@ -328,6 +328,13 @@ impl Root {
 pub(super) struct PrimaryHandle(Weak<Root>);
 
 impl PrimaryHandle {
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_recoveries(&self) -> serde_json::Value {
+        match self.root() {
+            Ok(root) => root.manager.lock().unwrap().inspect_recoveries(),
+            Err(_) => serde_json::Value::Null,
+        }
+    }
     pub(super) fn idle_replica_ids(&self) -> Result<Vec<i64>, PrimaryError> {
         let root = self.root()?;
         let state = root.state.lock().unwrap();
@@ -621,6 +628,57 @@ impl PrimaryHandle {
         Ok(handle)
     }
 
+    pub(super) fn begin_recovery(
+        &self,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+    ) -> Result<BuildIdleHandle, PrimaryError> {
+        let root = self.root()?;
+        let (handle, pending, start, _activity) = {
+            let mut state = root.state.lock().unwrap();
+            Root::check_open(&state)?;
+            root.check_route(&config.route)?;
+            let route = config.route.clone();
+            let old = state
+                .bindings
+                .get(&route.destination.replica)
+                .ok_or(PrimaryError::UnknownSession(route.destination.replica))?;
+            if old.idle
+                || match &old.owner {
+                    SessionOwner::Build(build) => {
+                        !build.result().is_some_and(|end| end.result.is_ok())
+                    }
+                    SessionOwner::Established(_) => true,
+                }
+            {
+                return Err(PrimaryError::InvalidBinding(route.destination.replica));
+            }
+            let (build, pending, start) = BuildIdle::prepare_recovery(
+                &root.manager,
+                config,
+                provider,
+                callbacks,
+                root.clock.clone(),
+            )?;
+            let handle = build.handle();
+            state.bindings.insert(
+                route.destination.replica,
+                Binding {
+                    route,
+                    session: handle.session(),
+                    owner: SessionOwner::Build(handle.clone()),
+                    idle: false,
+                },
+            );
+            state.queued.push(build);
+            (handle, pending, start, root.activity(&mut state))
+        };
+        pending.dispatch(root.clock.now())?;
+        start.dispatch();
+        Ok(handle)
+    }
+
     pub(super) fn enqueue(
         &self,
         data: OperationData,
@@ -741,12 +799,13 @@ impl PrimaryHandle {
         envelope: &wire::Envelope,
     ) -> Result<ContextObservation, PrimaryError> {
         let (_root, binding, _activity) = self.select(envelope)?;
-        if !binding.idle {
-            return Err(PrimaryError::NotBuilding(binding.route.destination.replica));
-        }
-
         match binding.owner {
-            SessionOwner::Build(build) => Ok(build.receive_context(envelope)?),
+            SessionOwner::Build(build) if binding.idle || build.result().is_none() => {
+                Ok(build.receive_context(envelope)?)
+            }
+            SessionOwner::Build(_) => {
+                Err(PrimaryError::NotBuilding(binding.route.destination.replica))
+            }
             SessionOwner::Established(_) => {
                 Err(PrimaryError::NotBuilding(binding.route.destination.replica))
             }
@@ -764,7 +823,11 @@ impl PrimaryHandle {
         let (root, binding, _activity) = self.select(envelope)?;
         match binding.owner {
             SessionOwner::Build(build) => {
-                build.receive_ack_for_role(envelope, binding.idle, || root.progress())?;
+                build.receive_ack_for_role(
+                    envelope,
+                    binding.idle || build.result().is_none(),
+                    || root.progress(),
+                )?;
             }
             SessionOwner::Established(copy) => {
                 let Some(wire::envelope::Body::ReplicationAck(body)) = &envelope.body else {

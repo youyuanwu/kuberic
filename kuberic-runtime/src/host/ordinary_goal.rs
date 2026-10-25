@@ -88,8 +88,18 @@ fn new_voters<'a>(
                                 known.identity == peer.identity
                                     && known.storage_incarnation.as_ref()
                                         == Some(&peer.storage_incarnation)
-                                    && known.process_session_id == peer.process_session_id
-                                    && known.replication_address == peer.replication_address
+                                    && ((known.process_session_id == peer.process_session_id
+                                        && known.replication_address == peer.replication_address)
+                                        // An unchanged current member is not a fresh voter.
+                                        // The ordinary native configuration callback must
+                                        // validate its exact recovered session before its
+                                        // receipt/publication can be accepted.
+                                        || (old.current == goal.scope.configuration.current
+                                            && old.previous.is_none()
+                                            && goal.scope.configuration.previous.is_none()
+                                            && known.role == ReplicaRole::ActiveSecondary
+                                            && peer.role == ReplicaRole::ActiveSecondary
+                                            && known.process_session_id != peer.process_session_id))
                             })
                     })
                 })

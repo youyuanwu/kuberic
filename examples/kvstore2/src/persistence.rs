@@ -47,7 +47,7 @@ struct OperationRecord {
     data: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct NativeSnapshot {
     version: u32,
@@ -352,6 +352,7 @@ impl KvPersistence {
                 "native KV snapshot is ahead of local commitment".into(),
             ));
         }
+
         serde_json::to_vec(&NativeSnapshot {
             version: 2,
             lsn,
@@ -359,6 +360,24 @@ impl KvPersistence {
         })
         .map(Bytes::from)
         .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    pub(crate) fn validate_copy_prefix(&self, data: &[u8], boundary: i64) -> Result<()> {
+        let retained: NativeSnapshot =
+            serde_json::from_slice(data).map_err(|e| RuntimeError::Application(e.to_string()))?;
+        if retained.lsn < 0 || retained.lsn > boundary {
+            return Err(RuntimeError::Application(
+                "copy prefix exceeds source boundary".into(),
+            ));
+        }
+        let actual: NativeSnapshot = serde_json::from_slice(&self.native_snapshot(retained.lsn)?)
+            .map_err(|e| RuntimeError::Application(e.to_string()))?;
+        if retained != actual {
+            return Err(RuntimeError::Application(
+                "copy prefix conflicts with retained history".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn native_install(&self, data: Bytes) -> Result<i64> {

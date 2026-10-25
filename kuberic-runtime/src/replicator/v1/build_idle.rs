@@ -359,6 +359,27 @@ impl BuildIdle {
         callbacks: BuildCallbacks,
         clock: Clock,
     ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
+        Self::prepare_transfer(manager, config, provider, callbacks, clock, false)
+    }
+
+    pub(super) fn prepare_recovery(
+        manager: &Arc<Mutex<ReplicaManager>>,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        clock: Clock,
+    ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
+        Self::prepare_transfer(manager, config, provider, callbacks, clock, true)
+    }
+
+    fn prepare_transfer(
+        manager: &Arc<Mutex<ReplicaManager>>,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        clock: Clock,
+        recovery: bool,
+    ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
         if callbacks
             .fence
             .as_ref()
@@ -406,15 +427,22 @@ impl BuildIdle {
             alive: AtomicBool::new(true),
             terminal: Mutex::new(None),
         }));
-        let (pending, start) = manager.lock().unwrap().admit_build(
-            EstablishedIdle {
-                replica_id,
-                session,
-                finish_copy_target: None,
-            },
-            handle.clone(),
-            &mut establishment,
-        )?;
+        let member = EstablishedIdle {
+            replica_id,
+            session,
+            finish_copy_target: None,
+        };
+        let (pending, start) = if recovery {
+            manager
+                .lock()
+                .unwrap()
+                .admit_recovery(member, handle.clone(), &mut establishment)?
+        } else {
+            manager
+                .lock()
+                .unwrap()
+                .admit_build(member, handle.clone(), &mut establishment)?
+        };
         let owner = Self {
             handle,
             establishment,

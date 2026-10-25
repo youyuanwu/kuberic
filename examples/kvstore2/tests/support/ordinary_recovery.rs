@@ -5,6 +5,216 @@ use kuberic_runtime::protocol::public_operations::{PublicV1CallKind, ReplicaGoal
 use kuberic_runtime::protocol::types::AccessStatus;
 use ordinary_cluster::Fixture;
 
+#[allow(dead_code, reason = "selected by the KV recovery integration binary")]
+pub async fn singleton_restart() {
+    let mut fixture = Fixture::start("m2-singleton-recovery", 1).await;
+    let result = async {
+        let source = fixture.replicas[0].service.clone();
+        source
+            .replicate_put("retained".into(), "acknowledged".into())
+            .await
+            .unwrap();
+        let old = fixture.replicas[0].reference.clone();
+        let before = fixture.snapshot(0).await;
+        let fresh = fixture.cluster.request_restart(&old).await?;
+        assert_eq!(fresh.storage_incarnation(), old.storage_incarnation());
+        assert_ne!(fresh.process_session_id(), old.process_session_id());
+        let observation = fixture.cluster.observe().await?;
+        let snapshot = observation.snapshot(&fresh).unwrap();
+        assert_eq!(snapshot.history, before.history);
+        assert_ne!(snapshot.write_status, AccessStatus::Granted);
+        assert_ne!(snapshot.read_status, AccessStatus::Granted);
+        let reopened = fixture.cluster.service(&fresh).await?;
+        assert!(reopened.get("retained").await.is_err());
+        assert!(
+            reopened
+                .replicate_put("early".into(), "forbidden".into())
+                .await
+                .is_err()
+        );
+        let topology = fixture.cluster.settle_members(1).await?;
+        assert_eq!(
+            topology.primary().process_session_id(),
+            fresh.process_session_id()
+        );
+        assert_eq!(
+            reopened.get("retained").await.unwrap().as_deref(),
+            Some("acknowledged")
+        );
+        reopened
+            .replicate_put("after".into(), "acknowledged".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get("after").await.unwrap().as_deref(),
+            Some("acknowledged")
+        );
+        assert!(source.get("retained").await.is_err());
+        // The convenience helper also preserves the configured singleton cardinality.
+        let again = fixture.cluster.restart(topology.primary()).await?;
+        assert_eq!(again.storage_incarnation(), old.storage_incarnation());
+        let service = fixture.cluster.service(&again).await?;
+        assert_eq!(
+            service.get("retained").await.unwrap().as_deref(),
+            Some("acknowledged")
+        );
+        assert_eq!(
+            service.get("after").await.unwrap().as_deref(),
+            Some("acknowledged")
+        );
+        Ok(())
+    }
+    .await;
+    fixture.finish(result).await;
+}
+
+#[allow(dead_code, reason = "selected by the KV recovery integration binary")]
+pub async fn retained_secondary_restart() {
+    secondary_restart(false).await;
+}
+
+#[allow(dead_code, reason = "selected by the KV recovery integration binary")]
+pub async fn retired_secondary_recovery() {
+    secondary_restart(true).await;
+}
+
+async fn secondary_restart(retire: bool) {
+    let mut fixture = Fixture::start("m2-secondary-recovery", 3).await;
+    let result = async {
+        let source = fixture.replicas[0].service.clone();
+        let primary = fixture.replicas[0].reference.clone();
+        let old = fixture.replicas[1].reference.clone();
+        let old_service = fixture.replicas[1].service.clone();
+        source.replicate_put("retained".into(), "acknowledged".into()).await.unwrap();
+        let before = fixture.snapshot(1).await;
+        let prior_sessions = fixture.cluster.native_transport_observation(&primary).await?;
+        let gate = kvstore2::state::CopyGate::enabled(
+            fixture.cluster.application_root(&primary).await?.join(".recovery-copy-gate")).unwrap();
+        gate.hold().unwrap();
+        let fresh = fixture.cluster.request_restart(&old).await?;
+        for _ in 0..40 {
+            fixture.cluster.step().await?;
+            let native = fixture.cluster.native_transport_observation(&primary).await?;
+            if native["sessions"]["entries"].as_array().unwrap().iter().any(|entry| {
+                entry["binding"]["recovery"] == true && entry["phase"] == "Active"
+            }) { break; }
+        }
+        let active = fixture.cluster.native_transport_observation(&primary).await?;
+        assert!(active["sessions"]["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["binding"]["recovery"] == true && entry["phase"] == "Active"
+        }));
+        let reopened = fixture.cluster.service(&fresh).await?;
+        let held = fixture.cluster.observe().await?;
+        let snapshot = held.snapshot(&fresh).unwrap();
+        assert!(held.set().status.as_ref().unwrap().public_v1_topology.as_ref().unwrap()
+            .sessions.iter().any(|session| session.process_session_id == *old.process_session_id()));
+        assert_eq!(snapshot.history, before.history);
+        assert_eq!(snapshot.storage, before.storage);
+        assert_ne!(snapshot.process_session_id, before.process_session_id);
+        assert_ne!(snapshot.creation_id, before.creation_id);
+        assert_ne!(snapshot.write_status, AccessStatus::Granted);
+        assert_ne!(snapshot.read_status, AccessStatus::Granted);
+        assert!(snapshot.publication.as_ref().is_some_and(|p| {
+            p.stage == kuberic_runtime::protocol::public_operations::ReplicaPublicationStage::DiscoveryPending
+        }));
+        assert_eq!(reopened.persistence().get("retained").as_deref(), Some("acknowledged"));
+        assert!(reopened.get("retained").await.is_err());
+        assert!(reopened.replicate_put("early".into(), "forbidden".into()).await.is_err());
+        if retire {
+            let root = fixture.cluster.application_root(&fresh).await?;
+            let bytes = std::fs::read(root.join("state.json")).unwrap();
+            for _ in 0..20 { fixture.cluster.step().await?; }
+            let abort = fixture.cluster.retain_ordinary_terminal(&primary, PublicV1CallKind::Abort).await?;
+            loop {
+                fixture.cluster.step().await?;
+                if fixture.cluster.native_transport_observation(&primary).await?["sessions"]["closed"] == true {
+                    break;
+                }
+            }
+            gate.release().unwrap();
+            assert_eq!(fixture.settled(0, &abort).await, ReplicaGoalStatus::Achieved);
+            assert!(!fixture.snapshot(0).await.provider_writer_held);
+            let uncertain = fixture.cluster.observe().await?;
+            let receiver = uncertain.snapshot(&fresh).unwrap();
+            assert_ne!(receiver.read_status, AccessStatus::Granted);
+            assert_ne!(receiver.write_status, AccessStatus::Granted);
+            if !receiver.withdrawn {
+                let target_abort = fixture.cluster.retain_ordinary_terminal(&fresh, PublicV1CallKind::Abort).await?;
+                loop {
+                    fixture.cluster.step().await?;
+                    let state = fixture.cluster.observe().await?;
+                    if state.snapshot(&fresh).unwrap().goals.iter().any(|entry| {
+                        entry.goal == target_abort && entry.status == ReplicaGoalStatus::Achieved
+                    }) { break; }
+                }
+            }
+            for _ in 0..40 {
+                fixture.cluster.step().await?;
+                let observation = fixture.cluster.observe().await?;
+                if observation.snapshot(&fresh).unwrap().withdrawn
+                    && !observation.snapshot(&fresh).unwrap().provider_writer_held { break; }
+            }
+            let state = fixture.cluster.observe().await?;
+            let target = state.snapshot(&fresh).unwrap();
+            assert!(target.withdrawn);
+            assert!(!target.provider_writer_held);
+            assert_eq!(std::fs::read(root.join("state.json")).unwrap(), bytes);
+            assert_eq!(reopened.persistence().get("retained").as_deref(), Some("acknowledged"));
+            assert!(reopened.get("retained").await.is_err());
+            let native = fixture.cluster.native_transport_observation(&fresh).await?;
+            let entries = native["sessions"]["entries"].as_array().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert!(entries.iter().all(|entry| entry["admitted"] == false && entry["phase"] != "Completed"));
+            return Ok(());
+        }
+        gate.release().unwrap();
+        let transfer = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let native = fixture.cluster.native_transport_observation(&primary).await?;
+                if native["sessions"]["entries"].as_array().unwrap().iter().any(|entry| {
+                    entry["binding"]["recovery"] == true && entry["phase"] == "Completed"
+                }) { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok::<_, kuberic_controller::test_util::TestError>(())
+        }).await;
+        transfer.unwrap()?;
+        let completed = fixture.cluster.native_transport_observation(&primary).await?;
+        assert!(completed["recoveries"].as_array().unwrap().iter()
+            .flat_map(|owner| owner.as_array().unwrap()).any(|transfer| {
+                transfer["replica"] == old.replica_id() && transfer["complete"] == true
+                    && transfer["voting"] == false
+            }), "actual completed native transfer must remain nonvoting before ordinary configuration");
+        let topology = fixture.cluster.settle_members(3).await?;
+        assert_eq!(topology.primary(), &primary);
+        let current = topology.secondaries().find(|r| r.replica_id() == old.replica_id()).unwrap();
+        assert_eq!(current.process_session_id(), fresh.process_session_id());
+        source.replicate_put("after".into(), "acknowledged".into()).await.unwrap();
+        assert_eq!(source.get("retained").await.unwrap().as_deref(), Some("acknowledged"));
+        assert_eq!(source.get("after").await.unwrap().as_deref(), Some("acknowledged"));
+        for member in topology.secondaries() {
+            let service = fixture.cluster.service(member).await?;
+            assert_eq!(service.persistence().get("retained").as_deref(), Some("acknowledged"));
+            assert_eq!(service.persistence().get("after").as_deref(), Some("acknowledged"));
+        }
+        let native = fixture.cluster.native_transport_observation(&primary).await?;
+        let entries = native["sessions"]["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|entry| entry["binding"]["recovery"] == true
+            && entry["phase"] == "Completed"
+            && entry["binding"]["target"]["scope"]["processSessionId"] == fresh.process_session_id().as_str()));
+        for old_entry in prior_sessions["sessions"]["entries"].as_array().unwrap().iter().filter(|entry| {
+            entry["binding"]["target"]["scope"]["processSessionId"] == old.process_session_id().as_str()
+        }) {
+            assert!(entries.iter().any(|entry| entry["binding"] == old_entry["binding"]
+                && entry["phase"] == "Retired" && entry["admitted"] == false));
+        }
+        assert!(old_service.get("retained").await.is_err());
+        assert!(old_service.replicate_put("late".into(), "forbidden".into()).await.is_err());
+        Ok(())
+    }.await;
+    fixture.finish(result).await;
+}
+
 pub async fn fresh_restart_build_and_corrective_empty_replacement() {
     let mut fixture = Fixture::start("kv-fresh-restart", 1).await;
     let result = async {
@@ -19,7 +229,7 @@ pub async fn fresh_restart_build_and_corrective_empty_replacement() {
         assert_eq!(fixture.settled(0, &close).await, ReplicaGoalStatus::Achieved);
         assert!(!fixture.snapshot(0).await.provider_writer_held);
         eprintln!("actual singleton acknowledged data and ordinary Close/writer settlement passed; requesting production restart");
-        let current = fixture.cluster.restart(&old).await?;
+        let current = fixture.cluster.request_restart(&old).await?;
         assert_eq!(current.storage_incarnation(), old.storage_incarnation());
         assert_ne!(current.process_session_id(), old.process_session_id());
         assert_ne!(current.replicator_creation_id(), old.replicator_creation_id());

@@ -225,6 +225,7 @@ async fn compose(
         close: Mutex::new(None),
         builds: Mutex::new(BTreeMap::new()),
     });
+    owner.transport.attach_production(&owner);
     Ok(ReplicatorInterfaces::primary(
         owner.clone(),
         Some(owner.clone()),
@@ -300,7 +301,7 @@ impl StateProvider for SessionProvider {
     }
 }
 
-struct Production {
+pub(super) struct Production {
     facade: Arc<Facade>,
     transport: Arc<Transport>,
     context: ReplicatorFactoryContext,
@@ -312,6 +313,166 @@ struct Production {
 }
 
 impl Production {
+    pub(super) async fn recover_source(&self, binding: &Binding, completed: bool) -> Result<()> {
+        if !binding.recovery || self.transport.local() != &binding.primary() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if completed {
+            let receiver = self
+                .builds
+                .lock()
+                .unwrap()
+                .get(&binding.nonce)
+                .cloned()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            let outcome = receiver.borrow().clone().ok_or(RuntimeError::QueueFull)?;
+            outcome.map_err(RuntimeError::ControlPlane)?;
+            self.transport.authorize(binding).await?;
+            return self
+                .transport
+                .sessions
+                .completed(binding)
+                .then_some(())
+                .ok_or(RuntimeError::AuthorityNotAdmitted);
+        }
+        binding.validate()?;
+        let mut builds = self.builds.lock().unwrap();
+        if builds.contains_key(&binding.nonce) {
+            return Ok(());
+        }
+        // Insert before launching: retries attach to this exact retained work.
+        let (result, receiver) = watch::channel(None);
+        builds.insert(binding.nonce.clone(), receiver);
+        drop(builds);
+        let transport = self.transport.clone();
+        let facade = self.facade.clone();
+        let peers = self.peers.clone();
+        let binding = binding.clone();
+        let persisted =
+            self.context.public_v1_binding().state_persistence == StatePersistence::Persisted;
+        transport.clone().spawn(async move {
+            let outcome = async {
+                let old = transport
+                    .sessions
+                    .binding_for(binding.secondary().identity.replica_id.value())
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let old_endpoint = old.secondary();
+                let predecessor = binding
+                    .source
+                    .scope
+                    .configuration
+                    .replicas
+                    .iter()
+                    .find(|peer| peer.identity == old_endpoint.identity)
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let source = transport.publication().await?;
+                if source != binding.source
+                    || !transport.sessions.predecessor_completed(&old)
+                    || old.primary() != binding.primary()
+                    || old.history() != binding.history()
+                    || old.epoch() != binding.epoch()
+                    || old_endpoint.storage != binding.secondary().storage
+                    || old_endpoint.process_session_id != predecessor.process_session_id
+                    || old_endpoint.address != predecessor.replication_address
+                    || old_endpoint.process_session_id == binding.secondary().process_session_id
+                    || old_endpoint.creation_id == binding.secondary().creation_id
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                let target = transport
+                    .recovery_peer(
+                        &binding.secondary().identity,
+                        &binding.secondary().process_session_id,
+                        binding.history(),
+                    )
+                    .await?;
+                if target != binding.target {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                transport.join_predecessor(&old).await?;
+                let binding = transport
+                    .sessions
+                    .recovery_proposal(&old, binding.clone())?;
+                let incarnation = transport.establish(&binding).await?;
+                let target = binding.secondary();
+                let information = ReplicaInformation {
+                    identity: target.identity,
+                    replication_address: target.address,
+                    process_session_id: target.process_session_id,
+                    storage_incarnation: Some(target.storage),
+                    role: ReplicaRole::ActiveSecondary,
+                    current_progress: crate::replicator::INVALID_LSN,
+                    catch_up_capability: crate::replicator::INVALID_LSN,
+                    must_catchup: false,
+                };
+                let fence = transport.fence(&binding);
+                transport.sessions.effect(&binding, || {
+                    Self::prepare(
+                        &transport,
+                        &peers,
+                        persisted,
+                        &information,
+                        binding.clone(),
+                        fence,
+                        incarnation,
+                    )
+                })??;
+                facade.recover(information).await?;
+                transport.authorize_completion(&binding).await?;
+                transport.control(&binding, Control::Complete).await?;
+                transport.authorize_completion(&binding).await?;
+                transport.sessions.complete(&binding)
+            }
+            .await;
+            let failed = outcome.is_err();
+            result.send_replace(Some(outcome.map_err(|e| e.to_string())));
+            if failed {
+                transport.sessions.retire(&binding)?;
+            }
+            Ok(())
+        });
+        Ok(())
+    }
+
+    async fn recover_secondary(&self, epoch: Epoch) -> Result<()> {
+        let target = self.transport.publication().await?;
+        if target.scope.epoch != epoch
+            || target.stage
+                != crate::protocol::public_operations::ReplicaPublicationStage::DiscoveryPending
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let primary = target
+            .scope
+            .configuration
+            .replicas
+            .iter()
+            .find(|peer| {
+                peer.identity.replica_id == target.scope.configuration.current.primary_id
+                    && peer.role == ReplicaRole::Primary
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let source = self
+            .transport
+            .recovery_peer(
+                &primary.identity,
+                &primary.process_session_id,
+                &target.scope.history,
+            )
+            .await?;
+        let binding = Binding {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            source,
+            target,
+            recovery: true,
+        };
+        binding.validate()?;
+        self.transport.sessions.reserve(&binding)?;
+        self.transport.control(&binding, Control::Recover).await?;
+        self.transport.control(&binding, Control::Recovered).await?;
+        self.transport.confirm_effect(&binding).await
+    }
+
     fn prepare(
         transport: &Arc<Transport>,
         peers: &Arc<Mutex<BTreeMap<ReplicaId, PeerBinding>>>,
@@ -362,7 +523,7 @@ impl Production {
         Ok(())
     }
 
-    fn configuration(
+    async fn configuration(
         &self,
         current: &ReplicaSetConfiguration,
         previous: Option<&ReplicaSetConfiguration>,
@@ -383,6 +544,31 @@ impl Production {
                 .is_some_and(|peer| matches_binding(&peer.information, information))
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let binding = self
+                .transport
+                .sessions
+                .binding_for(information.identity.replica_id.value())
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if !self.transport.sessions.completed(&binding) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            self.transport.authorize(&binding).await?;
+            if binding.recovery {
+                let target = self
+                    .transport
+                    .recovery_peer(
+                        &binding.secondary().identity,
+                        &binding.secondary().process_session_id,
+                        binding.history(),
+                    )
+                    .await?;
+                if target.stage
+                    != crate::protocol::public_operations::ReplicaPublicationStage::AchievedScope
+                    || target.role != ReplicaRole::ActiveSecondary
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
             }
         }
         Ok(())
@@ -551,6 +737,11 @@ impl Replicator for Production {
     }
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
         let selected = self.transport.selected_lifecycle();
+        if selected == Some((epoch, ReplicaRole::ActiveSecondary))
+            && self.transport.sessions.inbound().is_none()
+        {
+            self.recover_secondary(epoch).await?;
+        }
         if selected == Some((epoch, ReplicaRole::IdleSecondary)) {
             // Initial idle selection has no replication queue yet. StartCopy
             // initializes its native epoch/boundary; repeating that selected
@@ -596,7 +787,8 @@ impl PrimaryReplicator for Production {
         current: ReplicaSetConfiguration,
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
-        self.configuration(&current, (!empty_previous(&previous)).then_some(&previous))?;
+        self.configuration(&current, (!empty_previous(&previous)).then_some(&previous))
+            .await?;
         let selected = (
             current.configuration.clone(),
             (!empty_previous(&previous)).then(|| previous.configuration.clone()),
@@ -615,7 +807,7 @@ impl PrimaryReplicator for Production {
         &self,
         current: ReplicaSetConfiguration,
     ) -> Result<()> {
-        self.configuration(&current, None)?;
+        self.configuration(&current, None).await?;
         let selected = current.configuration.clone();
         self.facade
             .update_current_replica_set_configuration(current)

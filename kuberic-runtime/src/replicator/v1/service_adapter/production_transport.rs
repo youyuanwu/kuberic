@@ -270,6 +270,7 @@ pub(super) struct Transport {
     next_incarnation: AtomicI64,
     pub(super) sessions: Arc<Sessions>,
     facade: Mutex<Option<Weak<Facade>>>,
+    production: Mutex<Option<Weak<super::production::Production>>>,
     controls: Arc<tokio::sync::Semaphore>,
     lifecycle: Mutex<Option<(Epoch, ReplicaRole)>>,
     configuration: Mutex<Option<(ConfigurationDescriptor, Option<ConfigurationDescriptor>)>>,
@@ -338,6 +339,7 @@ impl Transport {
             next_incarnation: AtomicI64::new(1),
             sessions: Arc::new(Sessions::default()),
             facade: Mutex::new(None),
+            production: Mutex::new(None),
             controls: Arc::new(tokio::sync::Semaphore::new(32)),
             lifecycle: Mutex::new(None),
             configuration: Mutex::new(None),
@@ -381,6 +383,7 @@ impl Transport {
                         "nativeCredits": owner.native_credits.load(Ordering::Acquire),
                         "ingressObservations": *owner.ingress_observations.lock().unwrap(),
                         "receivers": owner.registry.inspect_receivers(),
+                        "recoveries": owner.registry.inspect_recoveries(),
                         "lifecycle": owner.selected_lifecycle(),
                     })
                 },
@@ -443,6 +446,45 @@ impl Transport {
 
     pub(super) fn attach(&self, facade: &Arc<Facade>) {
         *self.facade.lock().unwrap() = Some(Arc::downgrade(facade));
+    }
+
+    pub(super) fn attach_production(&self, production: &Arc<super::production::Production>) {
+        *self.production.lock().unwrap() = Some(Arc::downgrade(production));
+    }
+
+    pub(super) async fn join_predecessor(&self, binding: &Binding) -> Result<()> {
+        self.sessions.retire(binding)?;
+        let peer = self
+            .peers
+            .lock()
+            .unwrap()
+            .remove(&binding.secondary().identity.replica_id.value());
+        if let Some(peer) = peer {
+            if peer.binding != *binding {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            peer.current.store(false, Ordering::Release);
+            peer.carrier.shutdown();
+            peer.tasks.close();
+            peer.tasks.wait().await;
+        }
+        let settlement = self
+            .ack_settlements
+            .lock()
+            .unwrap()
+            .get(&binding.nonce)
+            .cloned();
+        if let Some(settlement) = settlement {
+            settlement.tasks.close();
+            settlement.tasks.wait().await;
+            if let Some(error) = settlement.failure.lock().unwrap().as_ref() {
+                return Err(application(error));
+            }
+        }
+        self.check_health()?;
+        // Authenticated fresh publication on this exact storage is possible
+        // only after the agent's predecessor writer/creation containment barrier.
+        Ok(())
     }
 
     pub(super) fn begin_role_change(&self, epoch: Epoch, role: ReplicaRole) {
@@ -616,6 +658,12 @@ impl Transport {
                 return Ok(());
             }
             self.quarantine(binding);
+            if self.local == binding.primary() {
+                // Losing confirmation fences this peer, not the Primary's
+                // healthy quorum. Its immutable completion witness and joins
+                // remain required before any recovered sender can replace it.
+                return Ok(());
+            }
             return Err(error);
         }
         match self.sessions.effect(binding, || {
@@ -681,6 +729,27 @@ impl Transport {
         Ok(publication)
     }
 
+    pub(super) async fn recovery_peer(
+        &self,
+        identity: &crate::protocol::types::ReplicaIdentity,
+        process: &crate::protocol::types::ProcessSessionId,
+        history: &HistoryContext,
+    ) -> Result<ReplicaPublication> {
+        let mut stop = self.stop.subscribe();
+        loop {
+            match self.discover(identity, process, history).await {
+                Err(RuntimeError::ControlPlane(_)) => {
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait_for(|stopped| *stopped) => return Err(RuntimeError::Closed),
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn validate_publications(&self, binding: &Binding) -> Result<()> {
         binding.validate()?;
         let local = self.publication().await?;
@@ -694,13 +763,21 @@ impl Transport {
         } else {
             return Err(RuntimeError::AuthorityNotAdmitted);
         };
-        let publication = self
-            .discover(
+        let publication = if binding.recovery {
+            self.recovery_peer(
                 &remote.identity,
                 &remote.process_session_id,
                 binding.history(),
             )
-            .await?;
+            .await?
+        } else {
+            self.discover(
+                &remote.identity,
+                &remote.process_session_id,
+                binding.history(),
+            )
+            .await?
+        };
         if !binding.exact_publication(&publication) {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -724,13 +801,21 @@ impl Transport {
         } else {
             binding.primary()
         };
-        let publication = self
-            .discover(
+        let publication = if binding.recovery {
+            self.recovery_peer(
                 &remote.identity,
                 &remote.process_session_id,
                 binding.history(),
             )
-            .await?;
+            .await?
+        } else {
+            self.discover(
+                &remote.identity,
+                &remote.process_session_id,
+                binding.history(),
+            )
+            .await?
+        };
         let (source, target) = if primary {
             (&local, &publication)
         } else {
@@ -751,7 +836,13 @@ impl Transport {
                 || now.scope.epoch != origin.scope.epoch
                 || now.scope.configuration.current.primary_id
                     != binding.primary().identity.replica_id
-                || !publication_admitted(now, origin, binding, is_source, completion)
+                || !publication_admitted(
+                    now,
+                    origin,
+                    binding,
+                    is_source,
+                    completion && !(binding.recovery && !is_source),
+                )
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
@@ -765,7 +856,9 @@ impl Transport {
                         .sessions
                         .binding_for(peer.identity.replica_id.value())
                         .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                    self.sessions.active(&session)?;
+                    // This validates an unrelated configured descriptor, not
+                    // that peer's effects/ACKs. Its own admission still checks
+                    // Active above. Retirement must not fence healthy quorum.
                     if session.primary() != binding.primary()
                         || session.history() != binding.history()
                         || session.epoch() != binding.epoch()
@@ -781,6 +874,22 @@ impl Transport {
                         && peer.process_session_id == endpoint.process_session_id
                         && peer.storage_incarnation == endpoint.storage
                         && peer.replication_address == endpoint.address
+                        || self
+                            .sessions
+                            .binding_for(peer.identity.replica_id.value())
+                            .is_some_and(|replacement| {
+                                replacement.recovery
+                                    && (peer.identity != binding.secondary().identity
+                                        || self.sessions.active(&replacement).is_ok())
+                                    && replacement.secondary() == endpoint
+                                    && replacement
+                                        .source
+                                        .scope
+                                        .configuration
+                                        .replicas
+                                        .contains(peer)
+                                    && peer.storage_incarnation == endpoint.storage
+                            })
                 } else {
                     // The source checks every descriptor against its actual
                     // private bindings, including pending compatible scopes.
@@ -965,6 +1074,9 @@ impl Transport {
                 Some(Control::Confirm) => crate::replicator::TestingTcpRouteKind::EngineConfirm,
                 Some(Control::Complete) => crate::replicator::TestingTcpRouteKind::EngineComplete,
                 Some(Control::Retire) => crate::replicator::TestingTcpRouteKind::EngineRetire,
+                Some(Control::Recover | Control::Recovered) => {
+                    crate::replicator::TestingTcpRouteKind::EngineConfirm
+                }
                 None => crate::replicator::TestingTcpRouteKind::Build,
             },
             self.local.identity.instance_id.as_str(),
@@ -998,6 +1110,11 @@ impl Transport {
     }
 
     async fn control_once(&self, binding: &Binding, command: Control) -> Result<()> {
+        let retry_connect = binding.recovery
+            && matches!(
+                command,
+                Control::Reserve | Control::Activate | Control::Recover | Control::Recovered
+            );
         let control = ControlEnvelope {
             binding: binding.clone(),
             command,
@@ -1020,17 +1137,36 @@ impl Transport {
             .connect_timeout(Duration::from_secs(5))
             .connect()
             .await
-            .map_err(application)?;
+            .map_err(|error| {
+                if retry_connect {
+                    RuntimeError::QueueFull
+                } else {
+                    application(error)
+                }
+            })?;
             let mut client = wire::carrier_client::CarrierClient::new(channel)
                 .max_decoding_message_size(MAX_CONTROL)
                 .max_encoding_message_size(MAX_CONTROL);
             let mut request = Request::new(futures::stream::iter([request]));
             *request.metadata_mut() = self.metadata(binding, true)?;
             let response = client.exchange(request).await.map_err(|error| {
-                if error.code() == tonic::Code::ResourceExhausted {
+                if error.code() == tonic::Code::ResourceExhausted
+                    || (retry_connect
+                        && matches!(
+                            error.code(),
+                            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                        ))
+                {
                     RuntimeError::QueueFull
                 } else if error.code() == tonic::Code::PermissionDenied {
-                    RuntimeError::AuthorityNotAdmitted
+                    if matches!(command, Control::Recover | Control::Recovered) {
+                        RuntimeError::ControlPlane(format!(
+                            "recovered-member session rejected: {}",
+                            error.message()
+                        ))
+                    } else {
+                        RuntimeError::AuthorityNotAdmitted
+                    }
                 } else {
                     application(error)
                 }
@@ -1065,7 +1201,13 @@ impl Transport {
         };
         tokio::time::timeout(Duration::from_secs(5), exchange)
             .await
-            .map_err(|_| application("engine session control timed out"))?
+            .map_err(|_| {
+                if retry_connect {
+                    RuntimeError::QueueFull
+                } else {
+                    application("engine session control timed out")
+                }
+            })?
     }
 
     pub(super) async fn establish(self: &Arc<Self>, binding: &Binding) -> Result<i64> {
@@ -1090,6 +1232,18 @@ impl Transport {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         match control.command {
+            Control::Recover | Control::Recovered if primary && binding.recovery => {
+                let owner = self
+                    .production
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or(RuntimeError::Closed)?;
+                owner
+                    .recover_source(binding, control.command == Control::Recovered)
+                    .await
+            }
             Control::Reserve if !primary => {
                 self.validate_publications(binding).await?;
                 self.sessions.reserve(binding)?;
@@ -1397,6 +1551,7 @@ impl Transport {
             next_incarnation: AtomicI64::new(1),
             sessions: Arc::new(Sessions::default()),
             facade: Mutex::new(None),
+            production: Mutex::new(None),
             controls: Arc::new(tokio::sync::Semaphore::new(32)),
             lifecycle: Mutex::new(None),
             configuration: Mutex::new(None),
@@ -1774,8 +1929,12 @@ impl wire::carrier_server::Carrier for Listener {
                 let outcome = AssertUnwindSafe(owner.receive_control(&control))
                     .catch_unwind()
                     .await
-                    .map_err(|_| "engine control owner panicked".to_owned())
-                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    .map_err(|_| (false, "engine control owner panicked".to_owned()))
+                    .and_then(|result| {
+                        result.map_err(|error| {
+                            (matches!(error, RuntimeError::QueueFull), error.to_string())
+                        })
+                    });
                 #[cfg(feature = "testing")]
                 if outcome.is_ok() && control.command == Control::Retire {
                     owner
@@ -1790,7 +1949,13 @@ impl wire::carrier_server::Carrier for Listener {
             });
             loop {
                 if let Some(result) = completed.borrow().clone() {
-                    result.map_err(Status::permission_denied)?;
+                    result.map_err(|(retry, error)| {
+                        if retry {
+                            Status::resource_exhausted(error)
+                        } else {
+                            Status::permission_denied(error)
+                        }
+                    })?;
                     break;
                 }
                 completed

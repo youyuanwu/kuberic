@@ -34,7 +34,13 @@ impl ApplicationFactory for KvFactory {
             Arc::new(KvService::new(
                 Arc::new(KvPersistence::open(&root).map_err(error)?),
                 context.replication_address().into(),
-                CopyGate::disabled(),
+                CopyGate::enabled(root.join(".recovery-copy-gate")).map_err(|e| {
+                    kuberic_controller::test_util::TestError::with_source(
+                        kuberic_controller::test_util::ErrorKind::Application,
+                        "copy gate",
+                        e,
+                    )
+                })?,
             )),
             if fresh {
                 ApplicationStorageState::FreshEmpty

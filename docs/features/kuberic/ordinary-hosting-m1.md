@@ -129,6 +129,17 @@ Matching-format restart preserves goals, selected-call uncertainty and applicati
 bytes, but invalidates old process-bound publication. Fresh Open advertises fresh
 DiscoveryPending; old interrupted Build is uncertain, never replayed as success.
 Fresh recovery/callback evidence is required before achieved eligibility.
+The ordinary reconciler retries the exact retained Discover identity while its
+response or publication is outstanding, then reobserves before selecting more
+work. It must not append a second Discover from a pre-submission snapshot.
+Settled predecessor terminal goals remain retained but cannot block a newly
+contained process's preparation or supply its activation receipt. Singleton
+reopening selects fresh current-process catch-up and refreshes its session only
+after actual achieved primary scope and granted access; this is not remote-peer
+readmission or recovery-election policy.
+The live secondary-reopen oracle uses authenticated ordinary snapshots, exact
+retained goal outcomes and the current publication/storage/process/creation
+and topology session, not legacy callback completions or advisory role strings.
 The qualified crash-image fixture is not process-kill, power-loss or exhaustive
 M3 recovery evidence.
 
@@ -188,3 +199,35 @@ Bearer authentication is not TLS or hostile-administrator/orphan protection.
 No native executable differential, live Kubernetes/Kind, power-loss, downstream
 MySQL, broad settings/security or production-readiness certification is claimed.
 Existing [source provenance and notices](sf-v1-port-provenance.md) remain.
+
+### Bounded M2 retained-member recovery repair
+
+The built-in engine now distinguishes recovery of an admitted secondary from
+fresh idle Build. With an unchanged available Primary, current configuration,
+epoch and history, a fresh process on the same established storage reserves a
+new authenticated private session while DiscoveryPending. The source verifies
+its retained completed predecessor, fences and joins the old carrier/effect/ACK
+owners, and replaces the native sender without changing membership or inheriting
+ACK credit. Actual provider copy/context and replication-boundary acknowledgements
+must finish before ProgramEpoch and the ordinary preparation outcome succeed.
+Transfer traffic remains nonvoting until the source's ordinary configuration
+callback selects the completed sender. The incomplete-copy guard remains intact.
+
+KV supplies the complete retained committed prefix as copy context. The source
+checks that prefix against its own history before returning a nonregressing
+snapshot; the application committer durably installs it before opening the
+replication consumer. Incomplete, corrupt or conflicting inputs fail closed,
+without resetting application data. Retirement retains uncertainty and receiver
+reservation; late copy cannot install into a successor.
+
+The controller accepts the exact fresh preparation, then obtains ordinary source
+configuration/catch-up and target reconfiguration outcomes before updating the
+topology session. The source callback validates its retained completed recovery
+session, not descriptor numbers alone. Fresh voter additions still require exact
+two-ended Ready, configuration receipts and separate access admission.
+
+`TestCluster::request_restart` observes a real fresh, unadmitted process;
+`restart` additionally settles the configured membership cardinality. Native KV
+recovery tests preserve acknowledged data, closed recovery access, fresh ongoing
+replication and post-restart quorum writes. This bounded repair does not certify
+the full Phase 6 or M3 election, primary replacement, contraction or handoff matrix.

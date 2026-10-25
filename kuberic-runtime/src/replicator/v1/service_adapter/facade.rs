@@ -186,6 +186,7 @@ enum Command {
     CurrentConfiguration(ReplicaSetConfiguration),
     Catchup(CatchupMode),
     Build(ReplicaInformation),
+    Recover(ReplicaInformation),
     Remove(i64),
 }
 
@@ -243,6 +244,9 @@ pub(crate) struct Facade {
 }
 
 impl Facade {
+    pub(super) async fn recover(&self, information: ReplicaInformation) -> crate::Result<()> {
+        self.completed(Command::Recover(information)).await
+    }
     pub(super) fn start(
         adapter: ServiceReplicator,
         config: FacadeConfig,
@@ -593,6 +597,41 @@ fn handle(
                 }
                 let peer = config.peer(&info)?;
                 let build = adapter.build_replica(peer.build.clone(), peer.callbacks.clone())?;
+                let response = response.take().unwrap();
+                waits.push(
+                    async move {
+                        reply(
+                            response,
+                            build
+                                .wait()
+                                .await
+                                .map(|()| Value::Completed)
+                                .map_err(FacadeError::from),
+                        );
+                    }
+                    .boxed(),
+                );
+                return Ok(None);
+            }
+            Command::Recover(info) => {
+                if info.role != ReplicaRole::ActiveSecondary {
+                    return Err(FacadeError::Input(
+                        "recovery requires a current secondary".into(),
+                    ));
+                }
+                let peer = config.peer(&info)?;
+                let build = BuildOperation(
+                    adapter
+                        .owner
+                        .primary()
+                        .map_err(AdapterError::from)?
+                        .begin_recovery(
+                            peer.build.clone(),
+                            adapter.provider.clone(),
+                            peer.callbacks.clone(),
+                        )
+                        .map_err(AdapterError::from)?,
+                );
                 let response = response.take().unwrap();
                 waits.push(
                     async move {
