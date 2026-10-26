@@ -1250,7 +1250,7 @@ async fn control(
     control_at(&pair.binding(), binding, command).await
 }
 
-async fn control_at(
+pub(super) async fn control_at(
     destination_binding: &serde_json::Value,
     binding: serde_json::Value,
     command: &str,

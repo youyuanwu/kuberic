@@ -705,7 +705,14 @@ where
                     )) if matches!(startup_result, Ok(false)) => Ok(()),
                     result => result,
                 };
-            with_shutdown_error(startup_result.map(|_| ()), cleanup, "control shutdown")?;
+            let settled =
+                with_shutdown_error(startup_result.map(|_| ()), cleanup, "control shutdown");
+            if settled.is_ok()
+                && let Some(handle) = prepared_rx.borrow().as_ref()
+            {
+                handle.store.release_process_storage();
+            }
+            settled?;
             return Ok(None);
         }
         let handle = prepared_rx
@@ -714,6 +721,7 @@ where
             .expect("prepared before readiness");
         let supervisor_shutdown = shutdown.clone();
         let supervisor_runtime = handle.runtime.clone();
+        let supervisor_store = handle.store.clone();
         let mut stopping = shutdown.subscribe();
         let completion = tokio::spawn(async move {
             let first = tokio::select! {
@@ -724,7 +732,11 @@ where
                         supervisor_runtime.abort();
                         let drain = drain_runtime(&supervisor_runtime).await;
                         let control = finish_control(&mut control_task).await;
-                        return with_shutdown_error(control, drain, "replicator drain");
+                        let settled = with_shutdown_error(control, drain, "replicator drain");
+                        if settled.is_ok() {
+                            supervisor_store.release_process_storage();
+                        }
+                        return settled;
                     }
                     result = &mut control_task => result,
             };
@@ -733,11 +745,15 @@ where
             let first = first
                 .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
                 .and_then(|result| result);
-            with_shutdown_error(
+            let settled = with_shutdown_error(
                 first,
                 drain_runtime(&supervisor_runtime).await,
                 "replicator drain",
-            )
+            );
+            if settled.is_ok() {
+                supervisor_store.release_process_storage();
+            }
+            settled
         });
         Ok(Some(RunningReplica {
             handle,

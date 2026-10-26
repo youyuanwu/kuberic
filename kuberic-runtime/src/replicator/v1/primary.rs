@@ -57,6 +57,8 @@ use super::sender::SenderConfig;
 use super::session::{AckUpdate, ReplicationSession, SendIntent};
 use super::transport::{ProtocolError, Route, wire};
 
+pub(super) const FROZEN_PREVIOUS_INCARNATION: i64 = 0;
+
 #[derive(Clone, Debug, thiserror::Error)]
 pub(super) enum PrimaryError {
     #[error("primary is closing or closed")]
@@ -328,6 +330,38 @@ impl Root {
 pub(super) struct PrimaryHandle(Weak<Root>);
 
 impl PrimaryHandle {
+    pub(super) fn continuation_session(
+        &self,
+        route: &Route,
+        identity: &super::session::SessionIdentity,
+        epoch: Epoch,
+    ) -> Result<ReplicationSession, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        let id = route.destination.replica;
+        let binding = state
+            .bindings
+            .get(&id)
+            .ok_or(PrimaryError::UnknownSession(id))?;
+        let (_, native_epoch) = root
+            .manager
+            .lock()
+            .unwrap()
+            .build_identity(route, identity.remote_incarnation)?;
+        if binding.idle
+            || binding.route.source != route.source
+            || binding.route.destination != route.destination
+            || binding.route.sender_address != route.sender_address
+            || binding.route.remote_address != route.remote_address
+            || binding.session.identity() != *identity
+            || native_epoch != epoch
+        {
+            return Err(PrimaryError::InvalidBinding(id));
+        }
+        Ok(binding.session.clone())
+    }
+
     #[cfg(feature = "testing")]
     pub(super) fn inspect_recoveries(&self) -> serde_json::Value {
         match self.root() {
@@ -381,6 +415,13 @@ impl PrimaryHandle {
         state.queue_policy = config;
         root.wake.notify_one();
         Ok(())
+    }
+
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_configuration(&self) -> serde_json::Value {
+        self.root().map_or(serde_json::Value::Null, |root| {
+            root.manager.lock().unwrap().inspect_configuration()
+        })
     }
 
     /// Explicit established-membership seam, not native promotion/role creation.
@@ -501,61 +542,76 @@ impl PrimaryHandle {
                 }
                 .into());
             }
-            let mut resolve =
-                |set: ReplicaConfiguration, is_current: bool| -> Result<ReplicaSet, PrimaryError> {
-                    let mut members = Vec::new();
-                    for replica in set.replicas {
-                        root.check_route(&replica.route)?;
-                        let id = replica.route.destination.replica;
-                        if replica
-                            .progress
-                            .is_some_and(|progress| progress < 0 || progress == Lsn::MAX)
-                        {
-                            return Err(PrimaryError::InvalidProgress(id));
-                        }
-                        if is_current
-                            && replica.progress.is_none()
-                            && !manager.accepts_unknown_current(id)
-                        {
-                            return Err(PrimaryError::UnknownCurrentProgress(id));
-                        }
-                        // Native configuration lookup is ID-based. An existing root
-                        // retains its bound endpoint, incarnation, callback and ACKs.
-                        let (route, session) = if let Some(binding) = state.bindings.get(&id) {
-                            (binding.route.clone(), binding.session.clone())
-                        } else if let Some(binding) = created.get(&id) {
-                            binding.clone()
-                        } else {
-                            let (identity, epoch) = manager
-                                .build_identity(&replica.route, replica.remote_incarnation)?;
-                            let session = ReplicationSession::new(
-                                identity,
-                                epoch,
-                                replica.progress.unwrap_or(-1),
-                                root.sender,
-                                root.send.clone(),
-                                root.clock.now(),
-                            );
-                            session.open();
-                            let binding = (replica.route, session);
-                            created.insert(id, binding.clone());
-                            binding
-                        };
-                        if is_current && manager.has_idle_membership(id) {
-                            promotions.push(session.clone());
-                        }
-                        routes.insert(id, route);
-                        members.push(SessionMember {
-                            replica_id: id,
-                            session,
-                            must_catchup: replica.must_catchup,
-                        });
+            let mut resolve = |set: ReplicaConfiguration,
+                               is_current: bool|
+             -> Result<ReplicaSet, PrimaryError> {
+                let mut members = Vec::new();
+                for replica in set.replicas {
+                    root.check_route(&replica.route)?;
+                    let id = replica.route.destination.replica;
+                    let frozen_previous = replica.remote_incarnation == FROZEN_PREVIOUS_INCARNATION;
+                    if frozen_previous
+                        && (is_current || replica.progress.is_some() || replica.must_catchup)
+                    {
+                        return Err(PrimaryError::InvalidBinding(id));
                     }
-                    Ok(ReplicaSet {
-                        write_quorum: set.write_quorum,
-                        members,
-                    })
-                };
+                    if replica
+                        .progress
+                        .is_some_and(|progress| progress < 0 || progress == Lsn::MAX)
+                    {
+                        return Err(PrimaryError::InvalidProgress(id));
+                    }
+                    if is_current
+                        && replica.progress.is_none()
+                        && !manager.accepts_unknown_current(id)
+                    {
+                        return Err(PrimaryError::UnknownCurrentProgress(id));
+                    }
+                    // Native configuration lookup is ID-based. An existing root
+                    // retains its bound endpoint, incarnation, callback and ACKs.
+                    let (route, session) = if let Some(binding) = state.bindings.get(&id) {
+                        if is_current
+                            && binding.session.identity().remote_incarnation
+                                == FROZEN_PREVIOUS_INCARNATION
+                        {
+                            return Err(PrimaryError::InvalidBinding(id));
+                        }
+                        (binding.route.clone(), binding.session.clone())
+                    } else if let Some(binding) = created.get(&id) {
+                        binding.clone()
+                    } else {
+                        let (identity, epoch) =
+                            manager.build_identity(&replica.route, replica.remote_incarnation)?;
+                        let session = ReplicationSession::new(
+                            identity,
+                            epoch,
+                            replica.progress.unwrap_or(-1),
+                            root.sender,
+                            root.send.clone(),
+                            root.clock.now(),
+                        );
+                        if !frozen_previous {
+                            session.open();
+                        }
+                        let binding = (replica.route, session);
+                        created.insert(id, binding.clone());
+                        binding
+                    };
+                    if is_current && manager.has_idle_membership(id) {
+                        promotions.push(session.clone());
+                    }
+                    routes.insert(id, route);
+                    members.push(SessionMember {
+                        replica_id: id,
+                        session,
+                        must_catchup: replica.must_catchup,
+                    });
+                }
+                Ok(ReplicaSet {
+                    write_quorum: set.write_quorum,
+                    members,
+                })
+            };
             let current = resolve(current, true)?;
             let previous = previous.map(|set| resolve(set, false)).transpose()?;
             drop(manager);
@@ -739,7 +795,7 @@ impl PrimaryHandle {
     }
 
     pub(super) fn remove_idle(&self, id: i64) -> Result<(), PrimaryError> {
-        self.remove_idle_selected(id, false, |native_idle| {
+        self.remove_idle_selected(id, false, |native_idle, _| {
             native_idle
                 .then_some(())
                 .ok_or(super::replica_manager::ConfigurationError::IdleNotFound(id).into())
@@ -749,7 +805,7 @@ impl PrimaryHandle {
     pub(super) fn remove_idle_with(
         &self,
         id: i64,
-        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
+        before_remove: impl FnOnce(bool, Epoch) -> Result<(), ManagerError>,
     ) -> Result<(), PrimaryError> {
         self.remove_idle_selected(id, true, before_remove)
     }
@@ -758,7 +814,7 @@ impl PrimaryHandle {
         &self,
         id: i64,
         exclude_voters: bool,
-        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
+        before_remove: impl FnOnce(bool, Epoch) -> Result<(), ManagerError>,
     ) -> Result<(), PrimaryError> {
         let root = self.root()?;
         let (effects, _activity) = {
@@ -766,7 +822,10 @@ impl PrimaryHandle {
             Root::check_open(&state)?;
             let effects = {
                 let mut manager = root.manager.lock().unwrap();
-                let effects = manager.remove_idle_with(id, exclude_voters, before_remove)?;
+                let epoch = manager.epoch();
+                let effects = manager.remove_idle_with(id, exclude_voters, |native_idle| {
+                    before_remove(native_idle, epoch)
+                })?;
                 if !manager.contains_session(id) {
                     state.bindings.remove(&id);
                 } else if let Some(binding) = state.bindings.get_mut(&id) {
@@ -828,6 +887,9 @@ impl PrimaryHandle {
                 .get(&id)
                 .ok_or(PrimaryError::UnknownSession(id))?
                 .clone();
+            if binding.session.identity().remote_incarnation == FROZEN_PREVIOUS_INCARNATION {
+                return Err(PrimaryError::InvalidBinding(id));
+            }
             binding.route.check(envelope, true)?;
             if envelope.version != 1 {
                 return Err(ProtocolError::UnsupportedVersion(envelope.version).into());

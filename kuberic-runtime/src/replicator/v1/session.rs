@@ -163,8 +163,31 @@ impl ReplicationSession {
         self.state.lock().unwrap().identity.clone()
     }
 
+    pub(super) fn continue_transport(
+        &self,
+        expected: &SessionIdentity,
+        epoch: Epoch,
+        incarnation: i64,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.active
+            || &state.identity != expected
+            || state.sending_epoch != epoch
+            || incarnation <= expected.remote_incarnation
+        {
+            return false;
+        }
+        state.identity.remote_incarnation = incarnation;
+        true
+    }
+
     pub(super) fn same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn transport_active(&self) -> bool {
+        self.state.lock().unwrap().active
     }
 
     pub(super) fn update_sending_epoch(&self, epoch: Epoch) {

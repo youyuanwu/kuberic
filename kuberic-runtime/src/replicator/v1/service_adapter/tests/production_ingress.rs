@@ -265,6 +265,10 @@ impl Pump {
     async fn start(owner: &Arc<Transport>, binding: Binding, peer: i64) -> Self {
         owner.sessions.propose(&binding).unwrap();
         owner.sessions.activate_source(&binding).unwrap();
+        Self::start_route(owner, binding, route(1, peer)).await
+    }
+
+    async fn start_route(owner: &Arc<Transport>, binding: Binding, native_route: Route) -> Self {
         let limits = CarrierLimits {
             outbound_count: 32,
             outbound_bytes: 8192,
@@ -276,7 +280,7 @@ impl Pump {
                 max_payload_bytes: 1024,
             },
         };
-        let (local, ingress) = Carrier::new(route(1, peer), limits).unwrap();
+        let (local, ingress) = Carrier::new(native_route.clone(), limits).unwrap();
         owner.spawn(
             owner
                 .clone()
@@ -294,7 +298,7 @@ impl Pump {
                 })
                 .await
         });
-        let (remote, remote_ingress) = Carrier::new(route(peer, 1), limits).unwrap();
+        let (remote, remote_ingress) = Carrier::new(native_route.reversed(), limits).unwrap();
         let (binding, _) = remote.bind().unwrap();
         let channel = tonic::transport::Endpoint::from_shared(address)
             .unwrap()

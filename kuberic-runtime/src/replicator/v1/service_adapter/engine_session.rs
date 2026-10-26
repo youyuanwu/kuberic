@@ -88,6 +88,10 @@ pub(in crate::replicator::v1) struct Binding {
     pub(super) source: ReplicaPublication,
     pub(super) target: ReplicaPublication,
     pub(super) recovery: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) continuation: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) reformation: bool,
 }
 
 impl Binding {
@@ -100,6 +104,14 @@ impl Binding {
                 .current
                 .members
                 .iter()
+                .chain(
+                    self.source
+                        .scope
+                        .configuration
+                        .previous
+                        .iter()
+                        .flat_map(|previous| &previous.members),
+                )
                 .any(|member| {
                     member.identity == self.target.scope.storage.replica
                         && member.role == ReplicaRole::ActiveSecondary
@@ -112,13 +124,26 @@ impl Binding {
             source,
             target,
             recovery: false,
+            continuation: None,
+            reformation: false,
         };
         binding.validate()?;
         Ok(binding)
     }
 
     pub(super) fn validate(&self) -> Result<()> {
-        if uuid::Uuid::parse_str(&self.nonce).is_err() {
+        if uuid::Uuid::parse_str(&self.nonce).is_err()
+            || (self.reformation
+                && (self.recovery
+                    || self.continuation.is_some()
+                    || !self.admitted_reconfiguration()))
+            || self.continuation.as_ref().is_some_and(|predecessor| {
+                self.recovery
+                    || predecessor == &self.nonce
+                    || uuid::Uuid::parse_str(predecessor).is_err()
+                    || !self.admitted_reconfiguration()
+            })
+        {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         if self.admitted_reconfiguration() {
@@ -230,6 +255,10 @@ impl Binding {
         Endpoint::publication(&self.source)
     }
 
+    pub(super) fn retained_receiver(&self) -> bool {
+        self.reformation || self.continuation.is_some()
+    }
+
     pub(super) fn secondary(&self) -> Endpoint {
         Endpoint::publication(&self.target)
     }
@@ -265,8 +294,12 @@ pub(super) enum Control {
     Confirm,
     Complete,
     Retire,
+    CheckReformation,
+    Reform,
     Recover,
     Recovered,
+    Continue,
+    CheckContinuation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +317,8 @@ enum Phase {
     Active,
     Completed,
     Retiring,
+    RetiringSource,
+    SourceRetired,
     Retired,
 }
 
@@ -294,6 +329,15 @@ struct Entry {
     copy_completed: bool,
     predecessor: Option<String>,
     proposed: bool,
+}
+
+impl Entry {
+    fn conflicts_with(&self, binding: &Binding) -> bool {
+        self.binding.secondary().identity.replica_id == binding.secondary().identity.replica_id
+            && self.phase != Phase::Retired
+            && !(self.phase == Phase::SourceRetired
+                && self.binding.secondary().storage != binding.secondary().storage)
+    }
 }
 
 #[derive(Default)]
@@ -325,22 +369,47 @@ pub(super) struct IdleRemoval<'a> {
 }
 
 impl IdleRemoval<'_> {
-    pub(super) fn retire(mut self, native_idle: bool) -> Result<()> {
+    pub(super) fn retire(mut self, native_idle: bool, native_epoch: Epoch) -> Result<()> {
+        let source_only = !native_idle
+            && self
+                .state
+                .entries
+                .get(&self.binding.nonce)
+                .is_some_and(|entry| {
+                    entry.binding == *self.binding
+                        && entry.copy_completed
+                        && entry.phase == Phase::Retiring
+                        && self.binding.epoch().data_loss_number == native_epoch.data_loss_number
+                        && self.binding.epoch().configuration_number
+                            < native_epoch.configuration_number
+                });
         if !native_idle
+            && !source_only
             && !self
                 .state
                 .entries
                 .get(&self.binding.nonce)
                 .is_some_and(|entry| {
                     entry.binding == *self.binding
-                        && !self.binding.recovery
-                        && !entry.copy_completed
-                        && matches!(entry.phase, Phase::Proposed | Phase::Active)
+                        && ((!self.binding.recovery
+                            && !entry.copy_completed
+                            && matches!(entry.phase, Phase::Proposed | Phase::Active))
+                            || (self.binding.retained_receiver()
+                                && entry.copy_completed
+                                && entry.phase == Phase::Completed))
                 })
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        Sessions::retire_locked(&mut self.state, self.binding, || Ok(()))
+        Sessions::retire_locked(&mut self.state, self.binding, || Ok(()))?;
+        if source_only {
+            self.state
+                .entries
+                .get_mut(&self.binding.nonce)
+                .unwrap()
+                .phase = Phase::RetiringSource;
+        }
+        Ok(())
     }
 }
 
@@ -350,6 +419,12 @@ pub(in crate::replicator::v1) struct Fence {
 }
 
 impl Fence {
+    pub(super) fn denied() -> Self {
+        Self {
+            admitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     // Native owners may hold their own locks here. Only effect/retirement
     // admission takes the session gate; native checks never acquire it.
     pub(in crate::replicator::v1) fn check(&self) -> Result<()> {
@@ -389,6 +464,217 @@ impl Fence {
 }
 
 impl Sessions {
+    pub(super) fn reformation_predecessor(&self, binding: &Binding) -> Result<Binding> {
+        binding.validate()?;
+        let state = self.0.lock().unwrap();
+        let old = state
+            .receiver
+            .as_ref()
+            .and_then(|nonce| state.entries.get(nonce))
+            .filter(|entry| {
+                let source = entry.binding.primary();
+                let next = binding.primary();
+                !state.closed
+                    && binding.reformation
+                    && entry.phase == Phase::Retiring
+                    && entry.copy_completed
+                    && entry.binding.secondary() == binding.secondary()
+                    && entry.binding.history() == binding.history()
+                    && entry.binding.epoch().data_loss_number == binding.epoch().data_loss_number
+                    && entry.binding.epoch().configuration_number
+                        < binding.epoch().configuration_number
+                    && source != next
+                    && (source.identity.replica_id != next.identity.replica_id
+                        || (source.identity == next.identity
+                            && source.storage == next.storage
+                            && source.process_session_id != next.process_session_id
+                            && source.creation_id != next.creation_id))
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if state
+            .entries
+            .values()
+            .any(|entry| entry.binding.nonce != old.binding.nonce && entry.conflicts_with(binding))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(old.binding.clone())
+    }
+
+    pub(super) fn reform_receiver(
+        &self,
+        binding: &Binding,
+        native: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let old = self.reformation_predecessor(binding)?;
+        self.replace_receiver(binding, &old, native)
+    }
+
+    fn replace_receiver(
+        &self,
+        binding: &Binding,
+        old: &Binding,
+        native: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.closed
+            || state.entries.len() >= MAX_SESSIONS
+            || state.entries.contains_key(&binding.nonce)
+            || state.receiver.as_ref() != Some(&old.nonce)
+            || !state.entries.get(&old.nonce).is_some_and(|entry| {
+                entry.binding == *old && entry.phase == Phase::Retiring && entry.copy_completed
+            })
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.binding.nonce != old.nonce && entry.conflicts_with(binding))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        native()?;
+        state.entries.get_mut(&old.nonce).unwrap().phase = Phase::Retired;
+        state.entries.insert(
+            binding.nonce.clone(),
+            Entry {
+                binding: binding.clone(),
+                phase: Phase::Reserved,
+                admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: true,
+                predecessor: Some(old.nonce.clone()),
+                proposed: true,
+            },
+        );
+        state.receiver = Some(binding.nonce.clone());
+        Ok(())
+    }
+
+    pub(super) fn retained_completed(&self, binding: &Binding) -> bool {
+        let state = self.0.lock().unwrap();
+        !state.closed
+            && state.entries.get(&binding.nonce).is_some_and(|entry| {
+                entry.binding == *binding
+                    && entry.copy_completed
+                    && matches!(entry.phase, Phase::Completed | Phase::Retiring)
+            })
+    }
+
+    pub(super) fn continuation_predecessor(&self, binding: &Binding) -> Result<Binding> {
+        binding.validate()?;
+        let state = self.0.lock().unwrap();
+        let old = binding
+            .continuation
+            .as_ref()
+            .and_then(|nonce| state.entries.get(nonce))
+            .filter(|entry| {
+                !state.closed
+                    && entry.phase == Phase::Retiring
+                    && entry.copy_completed
+                    && entry.binding.primary() == binding.primary()
+                    && entry.binding.secondary() == binding.secondary()
+                    && entry.binding.history() == binding.history()
+                    && entry.binding.epoch().data_loss_number == binding.epoch().data_loss_number
+                    && entry.binding.epoch().configuration_number
+                        < binding.epoch().configuration_number
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if state
+            .entries
+            .values()
+            .any(|entry| entry.binding.nonce != old.binding.nonce && entry.conflicts_with(binding))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(old.binding.clone())
+    }
+
+    pub(super) fn continue_session(
+        &self,
+        binding: &Binding,
+        receiver: bool,
+        native: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let old = self.continuation_predecessor(binding)?;
+        let mut state = self.0.lock().unwrap();
+        if state.closed
+            || state.entries.len() >= MAX_SESSIONS
+            || state.entries.contains_key(&binding.nonce)
+            || state.entries.get(&old.nonce).map(|entry| entry.phase) != Some(Phase::Retiring)
+            || (receiver && state.receiver.as_ref() != Some(&old.nonce))
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.binding.nonce != old.nonce && entry.conflicts_with(binding))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        native()?;
+        state.entries.get_mut(&old.nonce).unwrap().phase = Phase::Retired;
+        state.entries.insert(
+            binding.nonce.clone(),
+            Entry {
+                binding: binding.clone(),
+                phase: if receiver {
+                    Phase::Reserved
+                } else {
+                    Phase::Proposed
+                },
+                admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: true,
+                predecessor: Some(old.nonce),
+                proposed: true,
+            },
+        );
+        if receiver {
+            state.receiver = Some(binding.nonce.clone());
+        }
+        Ok(())
+    }
+
+    pub(super) fn poll_delivery<T>(
+        &self,
+        origin: &mut Option<Binding>,
+        continues: impl FnOnce(&T) -> bool,
+        poll: impl FnOnce() -> Poll<T>,
+    ) -> Poll<(T, Option<Binding>)> {
+        let state = self.0.lock().unwrap();
+        if origin.is_none() {
+            *origin = state
+                .receiver
+                .as_ref()
+                .and_then(|nonce| state.entries.get(nonce))
+                .map(|entry| entry.binding.clone());
+        }
+        let Poll::Ready(value) = poll() else {
+            return Poll::Pending;
+        };
+        let current = state
+            .receiver
+            .as_ref()
+            .and_then(|nonce| state.entries.get(nonce))
+            .filter(|entry| {
+                !state.closed && matches!(entry.phase, Phase::Active | Phase::Completed)
+            });
+        let mut selected = origin.clone();
+        if continues(&value)
+            && let (Some(current), Some(origin)) = (current, origin)
+        {
+            let mut ancestor = Some(&current.binding);
+            while let Some(binding) = ancestor {
+                if binding == origin {
+                    selected = Some(current.binding.clone());
+                    break;
+                }
+                ancestor = state
+                    .entries
+                    .get(&binding.nonce)
+                    .and_then(|entry| entry.predecessor.as_ref())
+                    .and_then(|nonce| state.entries.get(nonce))
+                    .map(|entry| &entry.binding);
+            }
+        }
+        Poll::Ready((value, selected))
+    }
+
     #[cfg(all(test, feature = "testing"))]
     pub(super) fn removal_cut(&self, cut: RemovalCut) {
         let hook = self.1.lock().unwrap().clone();
@@ -447,13 +733,13 @@ impl Sessions {
                 Err(RuntimeError::AuthorityNotAdmitted)
             };
         }
-        if state.entries.len() >= MAX_SESSIONS
+        if binding.retained_receiver()
+            || state.entries.len() >= MAX_SESSIONS
             || (receiver && state.receiver.is_some())
-            || state.entries.values().any(|entry| {
-                entry.binding.secondary().identity.replica_id
-                    == binding.secondary().identity.replica_id
-                    && entry.phase != Phase::Retired
-            })
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.conflicts_with(binding))
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -481,6 +767,9 @@ impl Sessions {
 
     pub(super) fn proposal(&self, binding: Binding) -> Result<Binding> {
         binding.validate()?;
+        if binding.continuation.is_some() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let mut state = self.0.lock().unwrap();
         if state.closed {
             return Err(RuntimeError::Closed);
@@ -498,11 +787,10 @@ impl Sessions {
             return Ok(entry.binding.clone());
         }
         if state.entries.len() >= MAX_SESSIONS
-            || state.entries.values().any(|entry| {
-                entry.binding.secondary().identity.replica_id
-                    == binding.secondary().identity.replica_id
-                    && entry.phase != Phase::Retired
-            })
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.conflicts_with(&binding))
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -566,12 +854,10 @@ impl Sessions {
                         && peer.replication_address == endpoint.address
                         && peer.storage_incarnation == endpoint.storage
                 })
-            || state.entries.values().any(|entry| {
-                entry.binding.nonce != old.nonce
-                    && entry.binding.secondary().identity.replica_id
-                        == binding.secondary().identity.replica_id
-                    && entry.phase != Phase::Retired
-            })
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.binding.nonce != old.nonce && entry.conflicts_with(binding))
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -710,7 +996,7 @@ impl Sessions {
             .values()
             .find(|entry| {
                 entry.binding.secondary().identity.replica_id.value() == replica
-                    && entry.phase != Phase::Retired
+                    && !matches!(entry.phase, Phase::Retired | Phase::SourceRetired)
                     && entry.proposed
             })
             .map(|entry| entry.binding.clone())
@@ -727,6 +1013,24 @@ impl Sessions {
 
     pub(super) fn retire(&self, binding: &Binding) -> Result<()> {
         self.retire_with(binding, || Ok(()))
+    }
+
+    pub(super) fn quarantine(&self, binding: &Binding, contain: impl FnOnce(bool)) {
+        let mut state = self.0.lock().unwrap();
+        let receiver = state.receiver.as_ref() == Some(&binding.nonce);
+        let Some(entry) = state
+            .entries
+            .get_mut(&binding.nonce)
+            .filter(|entry| entry.binding == *binding)
+        else {
+            return;
+        };
+        if !matches!(entry.phase, Phase::Active | Phase::Completed) {
+            return;
+        }
+        entry.phase = Phase::Retiring;
+        entry.admitted.store(false, Ordering::Release);
+        contain(receiver);
     }
 
     pub(super) fn retire_with<T>(
@@ -779,7 +1083,10 @@ impl Sessions {
                 predecessor: None,
                 proposed: true,
             });
-        if entry.phase != Phase::Retired {
+        if !matches!(
+            entry.phase,
+            Phase::Retired | Phase::RetiringSource | Phase::SourceRetired
+        ) {
             entry.phase = Phase::Retiring;
         }
         entry.admitted.store(false, Ordering::Release);
@@ -789,6 +1096,26 @@ impl Sessions {
     /// Only an actual target join permits this transition, never an RPC timeout.
     pub(super) fn settled(&self, binding: &Binding) -> Result<()> {
         self.transition_retired(binding)
+    }
+
+    pub(super) fn source_retirement_selected(&self, binding: &Binding) -> bool {
+        let state = self.0.lock().unwrap();
+        state
+            .entries
+            .get(&binding.nonce)
+            .is_some_and(|entry| entry.binding == *binding && entry.phase == Phase::RetiringSource)
+    }
+
+    pub(super) fn source_transport_settled(&self, binding: &Binding) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        let entry = state
+            .entries
+            .get_mut(&binding.nonce)
+            .filter(|entry| entry.binding == *binding && entry.phase == Phase::RetiringSource)
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        entry.phase = Phase::SourceRetired;
+        entry.proposed = false;
+        Ok(())
     }
 
     fn transition_retired(&self, binding: &Binding) -> Result<()> {
@@ -854,7 +1181,10 @@ impl Sessions {
 
     fn retire_entries(state: &mut State) {
         for entry in state.entries.values_mut() {
-            if entry.phase != Phase::Retired {
+            if !matches!(
+                entry.phase,
+                Phase::Retired | Phase::SourceRetired | Phase::RetiringSource
+            ) {
                 entry.phase = Phase::Retiring;
             }
             entry.admitted.store(false, Ordering::Release);

@@ -313,6 +313,10 @@ impl ReplicaManager {
         Ok(manager)
     }
 
+    pub(super) fn epoch(&self) -> Epoch {
+        self.epoch
+    }
+
     pub(super) fn update_epoch(&mut self, epoch: Epoch) -> Result<Lsn, ManagerError> {
         self.ensure_active()?;
         if epoch < self.epoch || epoch.data_loss_number < 0 || epoch.configuration_number < 0 {
@@ -480,6 +484,24 @@ impl ReplicaManager {
             .filter(|member| self.is_idle(member.replica_id))
             .map(|member| member.replica_id)
             .collect()
+    }
+
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_configuration(&self) -> serde_json::Value {
+        let describe = |set: &ReplicaSet| {
+            serde_json::json!({
+                "writeQuorum": set.write_quorum,
+                "members": set.members.iter().map(|member| serde_json::json!({
+                    "replica": member.replica_id,
+                    "incarnation": member.session.identity().remote_incarnation,
+                    "active": member.session.transport_active(),
+                })).collect::<Vec<_>>(),
+            })
+        };
+        serde_json::json!({
+            "current": self.current.as_ref().map(describe),
+            "previous": self.previous.as_ref().map(describe),
+        })
     }
 
     pub(super) fn build_identity(

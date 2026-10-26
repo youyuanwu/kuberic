@@ -807,12 +807,6 @@ fn old_service_identity(root: &Path, id: i64) -> ReplicaIdentity {
 #[tokio::test]
 async fn sqlite_real_provider_restart_settlement_and_handoff() {
     use sqlite_replicated::v1_test_bridge::FailureCut;
-    if std::env::var_os("RUST_LOG").is_some() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_test_writer()
-            .try_init();
-    }
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = root();
         let a = root.path().join("source");

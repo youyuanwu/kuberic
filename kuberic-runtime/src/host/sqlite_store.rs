@@ -1,7 +1,7 @@
 //! SQLite-backed agent persistence.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -222,9 +222,63 @@ pub(crate) struct SqliteStore {
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     path: PathBuf,
     connection: Mutex<Connection>,
+    process_storage: Mutex<Option<Vec<File>>>,
+}
+
+impl Drop for SqliteStore {
+    fn drop(&mut self) {
+        // Lost/failed cleanup is not a writer-release receipt. Keep the OS
+        // ownership until process death even if the last diagnostic handle drops.
+        if let Some(files) = self.process_storage.get_mut().unwrap().take() {
+            std::mem::forget(files);
+        }
+    }
 }
 
 impl SqliteStore {
+    pub(crate) fn release_process_storage(&self) {
+        self.process_storage.lock().unwrap().take();
+    }
+
+    fn lock_process_storage(
+        path: &Path,
+        application_paths: Option<&BTreeMap<String, PathBuf>>,
+    ) -> Result<Vec<File>> {
+        let mut locks = vec![path.with_extension("owner")];
+        for application in application_paths
+            .into_iter()
+            .flat_map(|paths| paths.values())
+        {
+            let name = application.file_name().ok_or_else(|| {
+                crate::host::HostError::InitializationNotAuthorized(
+                    "application storage must name a storage resource".into(),
+                )
+            })?;
+            locks.push(
+                application.with_file_name(format!(".{}.kuberic-owner", name.to_string_lossy())),
+            );
+        }
+        locks.sort();
+        locks.dedup();
+        let mut files = Vec::new();
+        for lock in locks {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock)?;
+            file.try_lock().map_err(|error| {
+                crate::host::HostError::CommandRejected(format!(
+                    "storage lifetime is already owned at {}: {error}",
+                    lock.display()
+                ))
+            })?;
+            files.push(file);
+        }
+        Ok(files)
+    }
+
     pub(crate) fn metadata_database_path(pvc_root: &Path) -> PathBuf {
         pvc_root.join(".kuberic").join(DATABASE_FILE)
     }
@@ -286,6 +340,7 @@ impl SqliteStore {
                 #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
                 path: path.clone(),
                 connection: Mutex::new(connection),
+                process_storage: Mutex::new(None),
             })
         })();
         if result.is_err() {
@@ -322,6 +377,7 @@ impl SqliteStore {
             #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
             path,
             connection: Mutex::new(connection),
+            process_storage: Mutex::new(None),
         })
     }
 
@@ -349,6 +405,7 @@ impl SqliteStore {
             #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
             path,
             connection: Mutex::new(connection),
+            process_storage: Mutex::new(None),
         })
     }
 
@@ -363,6 +420,17 @@ impl SqliteStore {
             crate::host::HostError::InitializationNotAuthorized(message.into())
         })?;
         let path = path.as_ref().to_path_buf();
+        classify_replacement_format(&path)?;
+        // Lock the existing inode without creating anything. Matching-format
+        // journal recovery must not race another process, while full retained
+        // format/path validation still precedes all owner-file creation.
+        let metadata = File::open(&path)?;
+        metadata.try_lock().map_err(|error| {
+            crate::host::HostError::CommandRejected(format!(
+                "storage lifetime is already owned at {}: {error}",
+                path.display()
+            ))
+        })?;
         let state = classify_replacement_store(
             &path,
             &expected_binding.identity,
@@ -383,6 +451,8 @@ impl SqliteStore {
                 "application storage paths differ from the authorized agent binding".into(),
             ));
         }
+        let mut process_storage = Self::lock_process_storage(&path, application_storage_paths)?;
+        process_storage.push(metadata);
         let connection = open_writable_connection(&path).map_err(|error| {
             crate::host::HostError::Corrupt(format!("cannot open SQLite metadata: {error}"))
         })?;
@@ -392,6 +462,7 @@ impl SqliteStore {
             #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
             path,
             connection: Mutex::new(connection),
+            process_storage: Mutex::new(Some(process_storage)),
         })
     }
 
@@ -2408,12 +2479,7 @@ fn validate_expected_identity(
     Ok(())
 }
 
-fn classify_replacement_store(
-    path: &Path,
-    expected_protocol: &PublicV1Identity,
-    expected_binding: Option<&PublicV1LifecycleBinding>,
-    validate_identity: impl Fn(&StorageIdentity) -> Result<()>,
-) -> Result<AgentState> {
+fn classify_replacement_format(path: &Path) -> Result<u32> {
     if !path.is_file() {
         return Err(crate::host::HostError::MissingEstablishedStore);
     }
@@ -2428,6 +2494,16 @@ fn classify_replacement_store(
             observed: version,
         });
     }
+    Ok(version)
+}
+
+fn classify_replacement_store(
+    path: &Path,
+    expected_protocol: &PublicV1Identity,
+    expected_binding: Option<&PublicV1LifecycleBinding>,
+    validate_identity: impl Fn(&StorageIdentity) -> Result<()>,
+) -> Result<AgentState> {
+    let version = classify_replacement_format(path)?;
     recover_current_rollback_journal(
         path,
         expected_protocol,
@@ -2766,6 +2842,23 @@ mod tests {
                 SqliteStore::open_replacement_bound_existing(&path, Some(&identity()), &binding)
                     .is_err()
             );
+            let observed = crate::host::provisioning::ObservedStorageIdentity {
+                resource_uid: identity().resource_uid,
+                pod_uid: identity().pod_uid,
+                pvc_uid: identity().pvc_uid,
+                instance_id: identity().local_identity.instance_id,
+            };
+            assert!(
+                SqliteStore::open_replacement_for_process(
+                    &path,
+                    &observed,
+                    identity().local_identity.replica_id,
+                    None,
+                    &binding,
+                )
+                .is_err()
+            );
+            assert!(!path.with_extension("owner").exists());
             assert_eq!(std::fs::read(&path).unwrap(), before_database);
             assert_eq!(std::fs::read(&application).unwrap(), before_application);
             assert_eq!(
@@ -2776,6 +2869,83 @@ mod tests {
                 before_names
             );
         }
+    }
+
+    #[test]
+    fn m3_storage_lifetime_excludes_overlap_and_crash_releases_os_ownership() {
+        const CHILD: &str = "KUBERIC_M3_STORAGE_OWNER_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let files =
+                SqliteStore::lock_process_storage(&root.join("agent.sqlite3"), None).unwrap();
+            let binding = PublicV1LifecycleBinding {
+                identity: PublicV1Identity::new(1),
+                resource_uid: identity().resource_uid,
+                spec_generation: 1,
+                state_persistence: crate::protocol::public_operations::StatePersistence::Persisted,
+            };
+            let mut store = SqliteStore::create_replacement_authorized(
+                root.join("agent.sqlite3"),
+                AgentState::new(identity()),
+                binding,
+            )
+            .unwrap();
+            *store.process_storage.get_mut().unwrap() = Some(files);
+            // Model a lost cleanup owner, not successful Close or task join.
+            drop(store);
+            std::fs::write(root.join("ready"), b"owned").unwrap();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../.paw/work/sf-hosting-m3")
+            .join(format!("phase2-source-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host::sqlite_store::tests::m3_storage_lifetime_excludes_overlap_and_crash_releases_os_ownership",
+                "--nocapture",
+            ])
+            .env(CHILD, &root)
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !root.join("ready").is_file() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child stopped before owning storage"
+            );
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("storage owner child did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(SqliteStore::lock_process_storage(&root.join("agent.sqlite3"), None).is_err());
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+        let ownership =
+            SqliteStore::lock_process_storage(&root.join("agent.sqlite3"), None).unwrap();
+        assert!(SqliteStore::lock_process_storage(&root.join("agent.sqlite3"), None).is_err());
+        drop(ownership);
+        assert!(SqliteStore::lock_process_storage(&root.join("agent.sqlite3"), None).is_ok());
+        let application = BTreeMap::from([("application".into(), root.join("shared-app"))]);
+        let first =
+            SqliteStore::lock_process_storage(&root.join("first.sqlite3"), Some(&application))
+                .unwrap();
+        assert!(
+            SqliteStore::lock_process_storage(&root.join("second.sqlite3"), Some(&application),)
+                .is_err(),
+            "distinct metadata paths must not confer shared application writer ownership"
+        );
+        drop(first);
+        assert!(
+            SqliteStore::lock_process_storage(&root.join("second.sqlite3"), Some(&application),)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -2840,6 +3010,23 @@ mod tests {
                 SqliteStore::open_replacement_bound_existing(&path, Some(&identity()), &binding,)
                     .is_err()
             );
+            let observed = crate::host::provisioning::ObservedStorageIdentity {
+                resource_uid: identity().resource_uid,
+                pod_uid: identity().pod_uid,
+                pvc_uid: identity().pvc_uid,
+                instance_id: identity().local_identity.instance_id,
+            };
+            assert!(
+                SqliteStore::open_replacement_for_process(
+                    &path,
+                    &observed,
+                    identity().local_identity.replica_id,
+                    None,
+                    &binding,
+                )
+                .is_err()
+            );
+            assert!(!path.with_extension("owner").exists());
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
     }

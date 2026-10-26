@@ -2429,6 +2429,80 @@ async fn ordinary_goal_admitted_voters_keep_config_authority_but_leaving_never_r
 }
 
 #[tokio::test]
+async fn m3_consumed_build_removes_from_current_source_scope_once_without_renewing_ready() {
+    let (source, target, selection) = remote_pair().await;
+    let mut build = source.goal.clone();
+    build.operation_id = OperationId::new("m3-consumed-build");
+    build.revision = 2;
+    build.desired = ReplicaGoalKind::Build {
+        remote: Box::new(selection.clone()),
+    };
+    source.submit(&build).await.unwrap();
+    source.achieved(&build).await;
+    source.acknowledge(&build).await;
+    let admit = admission_goal(&source, &selection, 3);
+    source.submit(&admit).await.unwrap();
+    source.achieved(&admit).await;
+    let mut leave = catch_up_goal(&source, 4);
+    leave.scope.epoch.configuration_number += 1;
+    leave.scope.configuration.current = ConfigurationDescriptor::new(
+        leave.scope.epoch,
+        leave.scope.configuration.current.primary_id,
+        leave.scope.configuration.current.members.clone(),
+        leave.scope.configuration.current.write_quorum,
+    );
+    source.submit(&leave).await.unwrap();
+    let live = source.achieved(&leave).await.publication.unwrap();
+    let state = source.store.load_state().await.unwrap();
+    assert!(
+        state.public_v1_operation_state.as_ref().unwrap().operations[&build.operation_id]
+            .ordinary
+            .as_ref()
+            .unwrap()
+            .logically_retired
+    );
+    let mut remove = source.goal.clone();
+    remove.operation_id = OperationId::new("m3-current-source-removal");
+    remove.revision = 5;
+    remove.scope = live.scope;
+    remove.desired = ReplicaGoalKind::Remove {
+        remote: Box::new(selection),
+    };
+    remove.validate().unwrap();
+    source.submit(&remove).await.unwrap();
+    source.achieved(&remove).await;
+    source.submit(&remove).await.unwrap();
+    source.achieved(&remove).await;
+    assert_eq!(source.probe.remove_calls.load(Ordering::Acquire), 1);
+    source.acknowledge(&remove).await;
+    let before = source.store.load_state().await.unwrap();
+    assert!(source.submit(&remove).await.is_err());
+    source.acknowledge(&remove).await;
+    assert_eq!(source.store.load_state().await.unwrap(), before);
+    assert_eq!(target.probe.close_calls.load(Ordering::Acquire), 0);
+    assert!(target.snapshot().await.publication.is_some());
+    let mut duplicate = remove.clone();
+    duplicate.operation_id = OperationId::new("m3-cannot-reinvoke-old-removal");
+    duplicate.revision += 1;
+    assert!(source.submit(&duplicate).await.is_err());
+    assert!(source.submit(&build).await.is_err());
+    assert_eq!(source.probe.build_calls.load(Ordering::Acquire), 1);
+    assert_eq!(source.probe.remove_calls.load(Ordering::Acquire), 1);
+    assert_eq!(source.store.load_state().await.unwrap(), before);
+    assert!(
+        source
+            .snapshot()
+            .await
+            .remote_operations
+            .iter()
+            .all(|remote| { remote.state == RemoteReplicaState::Dropped })
+    );
+    source.assert_reopens().await;
+    source.finish().await;
+    target.finish().await;
+}
+
+#[tokio::test]
 async fn ordinary_goal_matching_crash_image_opens_fresh_process_but_never_replays_interrupted_build()
  {
     let (source, target, selection) = remote_pair().await;

@@ -265,6 +265,49 @@ async fn missing_current_replay_is_atomic_but_previous_only_is_explicitly_paused
 }
 
 #[tokio::test(start_paused = true)]
+async fn m3_frozen_previous_is_never_live_or_a_current_admission() {
+    let rig = rig();
+    current(&rig, &[], 1);
+    let mut committed = rig.enqueue();
+    assert_eq!(committed.completion.try_recv(), Ok(Ok(())));
+    let mut frozen = replica(30, None);
+    frozen.remote_incarnation = FROZEN_PREVIOUS_INCARNATION;
+    assert_eq!(
+        rig.handle
+            .update_catchup_configuration(Some(set(2, vec![frozen.clone()])), set(1, Vec::new()),)
+            .unwrap(),
+        vec![30],
+    );
+    let old = session(&rig, 30);
+    assert!(!old.transport_active());
+    assert!(replication_lsns(&rig).is_empty());
+    assert!(matches!(
+        rig.handle
+            .update_current_configuration(set(2, vec![frozen.clone()])),
+        Err(PrimaryError::InvalidBinding(30)),
+    ));
+    assert!(matches!(
+        rig.handle
+            .update_current_configuration(set(2, vec![replica(30, Some(1))])),
+        Err(PrimaryError::InvalidBinding(30)),
+    ));
+    assert!(old.same_instance(&session(&rig, 30)));
+    assert!(!old.transport_active());
+    let mut pending = rig.enqueue();
+    assert!(matches!(
+        rig.handle.receive_ack(&ack(30, 2, 2, -1)),
+        Err(PrimaryError::InvalidBinding(30))
+    ));
+    assert_eq!(pending.completion.try_recv(), Err(TryRecvError::Empty));
+    current(&rig, &[], 1);
+    assert_eq!(pending.completion.try_recv(), Ok(Ok(())));
+    assert!(matches!(
+        rig.handle.receive_ack(&ack(30, 2, 2, -1)),
+        Err(PrimaryError::UnknownSession(30))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
 async fn current_only_update_retires_previous_session_and_its_retry_timer() {
     let mut rig = rig();
     rig.handle

@@ -238,6 +238,8 @@ async fn m2_recovery_session_rejects_stale_identity_epoch_and_successor_before_e
         source: source.clone(),
         target: target.clone(),
         recovery: true,
+        continuation: None,
+        reformation: false,
     };
     pair.publish(source, target);
     pair.target

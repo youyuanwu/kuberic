@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 use crate::application::{Lsn, OperationData, OperationDataStream, StateProvider};
@@ -25,7 +26,7 @@ use crate::{Result, RuntimeError};
 use super::super::copy_async_operation::CopyConfig;
 use super::super::copy_context_receiver::CopyContextConfig;
 use super::super::operation_queue::QueueConfig;
-use super::super::primary::PrimaryConfig;
+use super::super::primary::{FROZEN_PREVIOUS_INCARNATION, PrimaryConfig};
 use super::super::replica_manager::QueuePolicyConfig;
 use super::super::secondary::{SecondaryCallbacks, SecondaryConfig};
 use super::super::secondary_copy_receiver::SecondaryCopyConfig;
@@ -183,18 +184,19 @@ async fn compose(
         local: local.identity.clone(),
         peers: Vec::new(),
         close_quorum_wait: Duration::from_secs(5),
-        resolve_peer: Some(Arc::new(move |information| {
+        resolve_peer: Some(Arc::new(move |information, configuration_only| {
             resolve
                 .lock()
                 .unwrap()
                 .get(&information.identity.replica_id)
                 .filter(|bound| {
                     matches_binding(&bound.information, information)
-                        && bound
-                            .callbacks
-                            .fence
-                            .as_ref()
-                            .is_some_and(|fence| fence.check().is_ok())
+                        && (configuration_only
+                            || bound
+                                .callbacks
+                                .fence
+                                .as_ref()
+                                .is_some_and(|fence| fence.check().is_ok()))
                 })
                 .cloned()
                 .ok_or_else(|| FacadeError::Input("no live production peer binding".into()))
@@ -326,6 +328,9 @@ impl StateProvider for SessionProvider {
             .sessions
             .inbound()
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if binding.retained_receiver() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         self.transport.confirm_effect(&binding).await?;
         let fence = self.transport.fence(&binding);
         fence.check()?;
@@ -413,7 +418,12 @@ impl Production {
     #[cfg(feature = "testing")]
     pub(super) fn inspect(&self) -> serde_json::Value {
         let builds = self.builds.lock().unwrap();
+        let native_configuration = match self.facade.service().target() {
+            Ok(Target::Primary(primary)) => primary.inspect_configuration(),
+            _ => serde_json::Value::Null,
+        };
         serde_json::json!({
+            "nativeConfiguration": native_configuration,
             "retainedResults": builds.len(),
             "pendingResults": builds.values().filter(|result| result.borrow().is_none()).count(),
             "recoveryWork": self.recovery_tasks.len(),
@@ -587,6 +597,8 @@ impl Production {
             source,
             target,
             recovery: true,
+            continuation: None,
+            reformation: false,
         };
         binding.validate()?;
         self.transport.sessions.reserve(&binding)?;
@@ -654,6 +666,35 @@ impl Production {
             return Err(RuntimeError::NotPrimary);
         }
         self.settle_changed_role().await?;
+        if let Some(previous) = previous {
+            for information in &previous.replicas {
+                self.retained_previous(information, current, Some(previous))
+                    .await?;
+            }
+        }
+        let mut staged = BTreeMap::new();
+        for information in current.replicas.iter().chain(
+            previous
+                .into_iter()
+                .flat_map(|configuration| &configuration.replicas),
+        ) {
+            if staged.contains_key(&information.identity.replica_id)
+                || self
+                    .retained_previous(information, current, previous)
+                    .await?
+                || self
+                    .transport
+                    .sessions
+                    .binding_for(information.identity.replica_id.value())
+                    .is_some()
+            {
+                continue;
+            }
+            staged.insert(
+                information.identity.replica_id,
+                self.admitted_proposal(information).await?,
+            );
+        }
         let mut recoveries = Vec::new();
         for information in current.replicas.iter().chain(
             previous
@@ -661,23 +702,88 @@ impl Production {
                 .flat_map(|configuration| &configuration.replicas),
         ) {
             if self
+                .retained_previous(information, current, previous)
+                .await
+                .map_err(|error| {
+                    RuntimeError::ControlPlane(format!(
+                        "retained PC descriptor {}: {error}",
+                        information.identity.replica_id
+                    ))
+                })?
+            {
+                continue;
+            }
+            let planned = staged.remove(&information.identity.replica_id);
+            if let Some(old) = self
                 .transport
                 .sessions
                 .binding_for(information.identity.replica_id.value())
-                .is_none()
+                .filter(|old| {
+                    self.transport.sessions.active(old).is_err()
+                        && old.epoch() < current.configuration.epoch
+                })
             {
-                let source = self.transport.publication().await?;
-                let target = self
+                self.continue_session(&old, information, current, previous)
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::ControlPlane(format!(
+                            "epoch continuation {}: {error}",
+                            information.identity.replica_id
+                        ))
+                    })?;
+            }
+            if let Some(binding) = self
+                .transport
+                .sessions
+                .binding_for(information.identity.replica_id.value())
+                .filter(|binding| {
+                    planned.is_none()
+                        && binding.reformation
+                        && !self.transport.sessions.completed(binding)
+                })
+            {
+                let mut result = self
+                    .builds
+                    .lock()
+                    .unwrap()
+                    .get(&binding.nonce)
+                    .cloned()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                loop {
+                    if let Some(outcome) = result.borrow().clone() {
+                        outcome.map_err(RuntimeError::ControlPlane)?;
+                        break;
+                    }
+                    result.changed().await.map_err(|_| {
+                        RuntimeError::ControlPlane("native reformation owner was lost".into())
+                    })?;
+                }
+                self.transport.validate_publications(&binding).await?;
+                if !recoveries
+                    .iter()
+                    .any(|known: &Binding| known.nonce == binding.nonce)
+                {
+                    recoveries.push(binding);
+                }
+                continue;
+            }
+            if planned.is_some()
+                || self
                     .transport
-                    .discover(
-                        &information.identity,
-                        &information.process_session_id,
-                        &source.scope.history,
-                    )
-                    .await?;
-                let binding = Binding::new(source, target)?;
-                if !binding.admitted_reconfiguration() {
-                    return Err(RuntimeError::AuthorityNotAdmitted);
+                    .sessions
+                    .binding_for(information.identity.replica_id.value())
+                    .is_none()
+            {
+                let binding = if let Some(binding) = planned {
+                    binding
+                } else {
+                    self.admitted_proposal(information).await?
+                };
+                if binding.reformation {
+                    self.reform_session(binding.clone(), information.clone())
+                        .await?;
+                    recoveries.push(binding);
+                    continue;
                 }
                 let binding = self.transport.sessions.proposal(binding)?;
                 let incarnation = self.transport.establish(&binding).await?;
@@ -731,6 +837,18 @@ impl Production {
                 .into_iter()
                 .flat_map(|configuration| &configuration.replicas),
         ) {
+            if self
+                .retained_previous(information, current, previous)
+                .await
+                .map_err(|error| {
+                    RuntimeError::ControlPlane(format!(
+                        "retained PC validation {}: {error}",
+                        information.identity.replica_id
+                    ))
+                })?
+            {
+                continue;
+            }
             if !self
                 .peers
                 .lock()
@@ -748,7 +866,12 @@ impl Production {
             if !self.transport.sessions.completed(&binding) {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
-            self.transport.authorize(&binding).await?;
+            self.transport.authorize(&binding).await.map_err(|error| {
+                RuntimeError::ControlPlane(format!(
+                    "configured session {}: {error}",
+                    information.identity.replica_id
+                ))
+            })?;
             if binding.recovery {
                 let target = self
                     .transport
@@ -769,6 +892,397 @@ impl Production {
         Ok(())
     }
 
+    async fn admitted_proposal(&self, information: &ReplicaInformation) -> Result<Binding> {
+        let source = self.transport.publication().await?;
+        let target = self
+            .transport
+            .discover(
+                &information.identity,
+                &information.process_session_id,
+                &source.scope.history,
+            )
+            .await?;
+        let binding = Binding::new(source, target)?;
+        if !binding.admitted_reconfiguration() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let mut candidate = binding.clone();
+        candidate.reformation = true;
+        let binding = if self
+            .transport
+            .control(&candidate, Control::CheckReformation)
+            .await
+            .is_ok()
+        {
+            candidate
+        } else {
+            binding
+        };
+        self.transport.sessions.proposal(binding)
+    }
+
+    async fn retained_previous(
+        &self,
+        information: &ReplicaInformation,
+        current: &ReplicaSetConfiguration,
+        previous: Option<&ReplicaSetConfiguration>,
+    ) -> Result<bool> {
+        if current
+            .configuration
+            .members
+            .iter()
+            .any(|member| member.identity == information.identity)
+            || !previous.is_some_and(|previous| {
+                previous
+                    .configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == information.identity)
+            })
+        {
+            return Ok(false);
+        }
+        let publication = self.transport.publication().await?;
+        let Some(description) = publication
+            .scope
+            .configuration
+            .replicas
+            .iter()
+            .find(|peer| peer.identity == information.identity)
+        else {
+            return Ok(false);
+        };
+        if description.is_up {
+            return Ok(false);
+        }
+        let existing = self
+            .transport
+            .sessions
+            .binding_for(information.identity.replica_id.value())
+            .filter(|binding| self.transport.sessions.retained_completed(binding));
+        let Some(binding) = existing else {
+            // No prior outbound session exists on a newly promoted/reopened
+            // Primary. Only the exact selected unavailable PC-only descriptor
+            // may populate native quorum metadata; it never gets a carrier.
+            let source = self.transport.publication().await?;
+            if source.scope.epoch != current.configuration.epoch
+                || source.scope.configuration.current != current.configuration
+                || source.scope.configuration.previous
+                    != previous.map(|previous| previous.configuration.clone())
+                || self.transport.selected_lifecycle()
+                    != Some((source.scope.epoch, ReplicaRole::Primary))
+                || self
+                    .transport
+                    .sessions
+                    .binding_for(information.identity.replica_id.value())
+                    .is_some()
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let descriptor = source
+                .scope
+                .configuration
+                .replicas
+                .iter()
+                .find(|peer| {
+                    peer.identity == information.identity
+                        && Some(&peer.storage_incarnation)
+                            == information.storage_incarnation.as_ref()
+                        && peer.process_session_id == information.process_session_id
+                        && peer.replication_address == information.replication_address
+                        && peer.role == information.role
+                        && !peer.is_up
+                        && !peer.is_ready
+                        && peer.current_progress == crate::application::INVALID_LSN
+                        && peer.catch_up_capability == crate::application::INVALID_LSN
+                        && information.current_progress == crate::application::INVALID_LSN
+                        && information.catch_up_capability == crate::application::INVALID_LSN
+                })
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            let mut native_route = local_route(&source.scope.history, self.transport.local())?;
+            let mut digest = Sha256::new();
+            digest.update(b"kuberic-v1-frozen-previous-only");
+            digest.update(
+                serde_json::to_vec(descriptor)
+                    .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?,
+            );
+            native_route.destination.replica = information.identity.replica_id.value();
+            native_route.destination.incarnation =
+                bytes::Bytes::copy_from_slice(&digest.finalize()[..16]);
+            native_route.remote_address = information.replication_address.clone();
+            self.peers.lock().unwrap().insert(
+                information.identity.replica_id,
+                PeerBinding {
+                    information: information.clone(),
+                    build: BuildConfig {
+                        route: native_route,
+                        remote_incarnation: FROZEN_PREVIOUS_INCARNATION,
+                        copy: copy_config(),
+                        context: None,
+                    },
+                    callbacks: BuildCallbacks {
+                        fence: Some(Fence::denied()),
+                        replication: Arc::new(|_| false),
+                        copy: Arc::new(|_| false),
+                        context_ack: Arc::new(|_, _| false),
+                    },
+                },
+            );
+            return Ok(true);
+        };
+        if !self
+            .peers
+            .lock()
+            .unwrap()
+            .get(&information.identity.replica_id)
+            .is_some_and(|peer| matches_binding(&peer.information, information))
+            || binding.primary() != *self.transport.local()
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let native_route = route(&binding, self.transport.local())?;
+        let identity = super::super::session::SessionIdentity {
+            primary_endpoint: native_route.sender_address.clone(),
+            remote_endpoint: native_route.remote_address.clone(),
+            remote_incarnation: self.transport.native_incarnation(&binding)?,
+        };
+        match self.facade.service().target().map_err(error)? {
+            Target::Primary(primary) => {
+                primary
+                    .continuation_session(&native_route, &identity, current.configuration.epoch)
+                    .map_err(|failure| error(failure.into()))?;
+            }
+            _ => return Err(RuntimeError::NotPrimary),
+        }
+        Ok(true)
+    }
+
+    pub(super) fn frozen_previous_peer(
+        &self,
+        publication: &crate::protocol::public_operations::ReplicaPublication,
+        peer: &crate::protocol::public_operations::ReplicaPeerDescription,
+    ) -> bool {
+        !peer.is_up
+            && !peer.is_ready
+            && !peer.must_catchup
+            && peer.current_progress == crate::application::INVALID_LSN
+            && peer.catch_up_capability == crate::application::INVALID_LSN
+            && !publication
+                .scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .any(|member| member.identity == peer.identity)
+            && publication
+                .scope
+                .configuration
+                .previous
+                .as_ref()
+                .is_some_and(|previous| {
+                    previous
+                        .members
+                        .iter()
+                        .any(|member| member.identity == peer.identity && member.role == peer.role)
+                })
+            && self.transport.selected_lifecycle()
+                == Some((publication.scope.epoch, ReplicaRole::Primary))
+            && self
+                .peers
+                .lock()
+                .unwrap()
+                .get(&peer.identity.replica_id)
+                .is_some_and(|bound| {
+                    bound.build.remote_incarnation == FROZEN_PREVIOUS_INCARNATION
+                        && bound.information.identity == peer.identity
+                        && bound.information.process_session_id == peer.process_session_id
+                        && bound.information.storage_incarnation.as_ref()
+                            == Some(&peer.storage_incarnation)
+                        && bound.information.replication_address == peer.replication_address
+                        && bound.information.role == peer.role
+                        && bound
+                            .callbacks
+                            .fence
+                            .as_ref()
+                            .is_some_and(|fence| fence.check().is_err())
+                })
+    }
+
+    async fn reform_session(
+        &self,
+        binding: Binding,
+        information: ReplicaInformation,
+    ) -> Result<()> {
+        let source = &binding.source;
+        if self.transport.selected_lifecycle() != Some((source.scope.epoch, ReplicaRole::Primary)) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let binding = self.transport.sessions.proposal(binding)?;
+        let persisted =
+            self.context.public_v1_binding().state_persistence == StatePersistence::Persisted;
+        let transport = self.transport.clone();
+        let peers = self.peers.clone();
+        let (mut receiver, work) = {
+            let mut builds = self.builds.lock().unwrap();
+            if let Some(existing) = builds.get(&binding.nonce) {
+                (existing.clone(), None)
+            } else {
+                let (result, receiver) = watch::channel(None);
+                builds.insert(binding.nonce.clone(), receiver.clone());
+                (receiver, Some(result))
+            }
+        };
+        if let Some(result) = work {
+            transport.clone().spawn(async move {
+                let outcome: Result<()> = async {
+                    let _continuation = transport.continuations.lock().await;
+                    transport.validate_publications(&binding).await?;
+                    transport.control(&binding, Control::Reform).await?;
+                    let incarnation = transport.admit(binding.clone(), true).await?;
+                    let fence = transport.fence(&binding);
+                    transport.sessions.effect(&binding, || {
+                        Self::prepare(
+                            &transport,
+                            &peers,
+                            persisted,
+                            &information,
+                            binding.clone(),
+                            fence,
+                            incarnation,
+                        )
+                    })??;
+                    // Configuration, not Build/copy, creates the new sender.
+                    Ok(())
+                }
+                .await;
+                if outcome.is_err() {
+                    transport.sessions.retire(&binding)?;
+                }
+                result.send_replace(Some(outcome.map_err(|failure| failure.to_string())));
+                Ok(())
+            });
+        }
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result.map_err(RuntimeError::ControlPlane);
+            }
+            receiver.changed().await.map_err(|_| {
+                RuntimeError::ControlPlane("native reformation owner was lost".into())
+            })?;
+        }
+    }
+
+    async fn continue_session(
+        &self,
+        old: &Binding,
+        information: &ReplicaInformation,
+        current: &ReplicaSetConfiguration,
+        previous: Option<&ReplicaSetConfiguration>,
+    ) -> Result<()> {
+        let source = self.transport.publication().await?;
+        if source.scope.epoch != current.configuration.epoch
+            || source.scope.configuration.current != current.configuration
+            || source.scope.configuration.previous
+                != previous.map(|previous| previous.configuration.clone())
+            || self.transport.selected_lifecycle()
+                != Some((source.scope.epoch, ReplicaRole::Primary))
+            || !self
+                .peers
+                .lock()
+                .unwrap()
+                .get(&information.identity.replica_id)
+                .is_some_and(|peer| matches_binding(&peer.information, information))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+
+        let target = self
+            .transport
+            .discover(
+                &information.identity,
+                &information.process_session_id,
+                &source.scope.history,
+            )
+            .await?;
+        let mut binding = Binding::new(source, target)?;
+        binding.continuation = Some(old.nonce.clone());
+        if self.transport.sessions.continuation_predecessor(&binding)? != *old {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let native_route = route(old, self.transport.local())?;
+        let identity = super::super::session::SessionIdentity {
+            primary_endpoint: native_route.sender_address.clone(),
+            remote_endpoint: native_route.remote_address.clone(),
+            remote_incarnation: self.transport.native_incarnation(old)?,
+        };
+        let native = match self.facade.service().target().map_err(error)? {
+            Target::Primary(primary) => primary
+                .continuation_session(&native_route, &identity, binding.epoch())
+                .map_err(|failure| error(failure.into()))?,
+            _ => return Err(RuntimeError::NotPrimary),
+        };
+        self.transport
+            .control(&binding, Control::CheckContinuation)
+            .await?;
+        let persisted =
+            self.context.public_v1_binding().state_persistence == StatePersistence::Persisted;
+        let transport = self.transport.clone();
+        let peers = self.peers.clone();
+        let old = old.clone();
+        let information = information.clone();
+        let (result, mut receiver) = watch::channel(None);
+        self.builds
+            .lock()
+            .unwrap()
+            .insert(binding.nonce.clone(), receiver.clone());
+        transport.clone().spawn(async move {
+            let outcome = async {
+                let _continuation = transport.continuations.lock().await;
+                transport.sessions.continuation_predecessor(&binding)?;
+                transport.join_predecessor(&old).await?;
+                transport.validate_publications(&binding).await?;
+                transport
+                    .sessions
+                    .continue_session(&binding, false, || Ok(()))?;
+                transport.control(&binding, Control::Continue).await?;
+                let incarnation = transport.admit(binding.clone(), true).await?;
+                let fence = transport.fence(&binding);
+                transport.sessions.effect(&binding, || {
+                    if !native.continue_transport(&identity, binding.epoch(), incarnation) {
+                        return Err(RuntimeError::AuthorityNotAdmitted);
+                    }
+                    Self::prepare(
+                        &transport,
+                        &peers,
+                        persisted,
+                        &information,
+                        binding.clone(),
+                        fence,
+                        incarnation,
+                    )
+                })??;
+                transport.authorize_completion(&binding).await?;
+                transport.control(&binding, Control::Complete).await?;
+                transport.authorize_completion(&binding).await?;
+                transport.sessions.complete(&binding)
+            }
+            .await;
+            if outcome.is_err() {
+                transport.sessions.retire(&binding)?;
+            }
+            result.send_replace(Some(outcome.map_err(|failure| failure.to_string())));
+            Ok(())
+        });
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result.map_err(RuntimeError::ControlPlane);
+            }
+            receiver.changed().await.map_err(|_| {
+                RuntimeError::ControlPlane("native continuation owner was lost".into())
+            })?;
+        }
+    }
+
     fn stream(&self, copy: bool) -> Result<OperationStream> {
         let service = self.facade.service();
         let stream = if copy {
@@ -787,21 +1301,38 @@ impl Production {
         let acknowledgements = transport.acknowledgements();
         let role_changing = self.role_changing.clone();
         let stream_binding = Arc::new(Mutex::new(transport.sessions.inbound()));
+        let selection = transport.clone();
+        let selected_binding = stream_binding.clone();
+        let mut stream = Box::pin(stream);
+        let stream = futures::stream::poll_fn(move |cx| {
+            let mut origin = selected_binding.lock().unwrap();
+            selection
+                .sessions
+                .poll_delivery(
+                    &mut origin,
+                    |value: &Option<std::result::Result<super::ServiceOperation, AdapterError>>| {
+                        !copy
+                            && matches!(value, Some(Ok(operation)) if !operation.is_end_of_stream())
+                    },
+                    || stream.as_mut().poll_next(cx),
+                )
+                .map(|(value, binding)| {
+                    value.map(|operation| {
+                        let operation = operation.map_err(error)?;
+                        Ok::<_, RuntimeError>((
+                            operation,
+                            binding.ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                        ))
+                    })
+                })
+        });
         Ok(OperationStream::new(
-            Box::pin(stream.then(move |operation| {
+            Box::pin(stream.then(move |selected| {
                 let transport = transport.clone();
                 let acknowledgements = acknowledgements.clone();
                 let role_changing = role_changing.clone();
-                let stream_binding = stream_binding.clone();
                 async move {
-                    let operation = operation.map_err(error)?;
-                    let binding = {
-                        let mut origin = stream_binding.lock().unwrap();
-                        if origin.is_none() {
-                            *origin = transport.sessions.inbound();
-                        }
-                        origin.clone().ok_or(RuntimeError::AuthorityNotAdmitted)?
-                    };
+                    let (operation, binding) = selected?;
                     if let Some(drainage) = role_drainage_operation(
                         transport.clone(),
                         role_changing,
@@ -942,6 +1473,12 @@ impl Replicator for Production {
             return self.transport.check_health();
         }
         let prior = self.transport.selected_lifecycle();
+        let native_epoch = *self.epoch.lock().unwrap();
+        if prior.is_some_and(|(old_epoch, old_role)| {
+            native_epoch == Some(old_epoch) && old_role == role && old_epoch != epoch
+        }) {
+            return self.update_epoch(epoch).await;
+        }
         let recovering = prior.is_none() && role == ReplicaRole::ActiveSecondary;
         let transition = prior.is_some_and(|(_, old_role)| {
             old_role != role
@@ -1097,6 +1634,9 @@ impl PrimaryReplicator for Production {
             .transport
             .sessions
             .proposal(Binding::new(source, target)?)?;
+        if binding.retained_receiver() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let mut result = {
             let mut builds = self.builds.lock().unwrap();
             if let Some(result) = builds.get(&binding.nonce) {
@@ -1193,6 +1733,10 @@ impl PrimaryReplicator for Production {
                     )
                     .await?;
                 peers.lock().unwrap().remove(&replica);
+                if transport.sessions.source_retirement_selected(&binding) {
+                    transport.join_predecessor(&binding).await?;
+                    return transport.sessions.source_transport_settled(&binding);
+                }
                 transport.retire_remote(&binding).await
             }
             .await;

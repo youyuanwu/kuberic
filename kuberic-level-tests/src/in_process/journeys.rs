@@ -1060,6 +1060,107 @@ async fn contained_restart_renews_session_and_dynamic_endpoints() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_primary_process_reopen_preserves_quorum_data_and_fences_old_service() -> Result<()>
+{
+    let mut harness = Harness::new().await?;
+    let result = async {
+        let primary = harness.ready().await?;
+        let acknowledged = harness.write("primary-reopen", "acknowledged").await?;
+        let before = harness.report(primary).await?;
+        let old_service = harness.service(primary).await?;
+        let root = harness
+            .data_root(before.replica.instance_id.as_str())
+            .await?;
+        let previous = harness
+            .set()
+            .await?
+            .status
+            .context("topology status missing")?
+            .public_v1_topology
+            .context("topology missing")?
+            .configuration()
+            .map_err(anyhow::Error::msg)?;
+        harness.stop(primary, true).await?;
+        ensure!(old_service.get("primary-reopen").await.is_err());
+        harness.ready().await?;
+        let after = harness.report(primary).await?;
+        ensure!(
+            after.replica == before.replica
+                && after.storage_incarnation == before.storage_incarnation
+        );
+        ensure!(after.process_session_id != before.process_session_id);
+        ensure!(after.replicator_creation_id != before.replicator_creation_id);
+        ensure!(
+            harness
+                .data_root(after.replica.instance_id.as_str())
+                .await?
+                == root
+                && root.exists()
+        );
+        let status = harness
+            .set()
+            .await?
+            .status
+            .context("renewed topology status missing")?;
+        let selected = status
+            .replica_goals
+            .iter()
+            .filter(|entry| {
+                entry.goal.scope.process_session_id == after.process_session_id
+                    && entry.goal.scope.creation_id == after.replicator_creation_id
+            })
+            .collect::<Vec<_>>();
+        let provisional = selected
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Prepare {
+                        role: kuberic_runtime::protocol::types::ReplicaRole::Primary
+                    }
+                ) && entry.goal.scope.configuration.current.members.len() == 1
+            })
+            .context("controller omitted the nonserving provisional source preparation")?;
+        let joint = selected
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: kuberic_runtime::protocol::types::ReplicaRole::Primary,
+                        catch_up: Some(
+                            kuberic_runtime::protocol::public_operations::PublicCatchUpMode::All
+                        ),
+                    }
+                ) && entry.goal.scope.configuration.previous.as_ref() == Some(&previous)
+            })
+            .context("controller omitted the real old-PC joint reformation")?;
+        ensure!(
+            previous.epoch < provisional.goal.scope.epoch
+                && provisional.goal.scope.epoch < joint.goal.scope.epoch
+        );
+        ensure!(joint.goal.scope.configuration.current.members == previous.members);
+        harness
+            .assert_values("primary-reopen", "acknowledged")
+            .await?;
+        let later = harness.write("primary-reopen", "after-reopen").await?;
+        ensure!(later > acknowledged);
+        harness
+            .assert_values("primary-reopen", "after-reopen")
+            .await?;
+        ensure!(
+            old_service
+                .replicate_put("old-process".into(), "forbidden".into())
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> {
     let mut harness = Harness::new().await?;
     let result = async {

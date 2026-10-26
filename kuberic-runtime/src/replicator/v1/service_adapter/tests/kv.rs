@@ -21,7 +21,7 @@ fn application(error: io::Error) -> RuntimeError {
     RuntimeError::Application(error.to_string())
 }
 
-struct KvProvider(Arc<Committer>);
+pub(super) struct KvProvider(pub(super) Arc<Committer>);
 
 #[async_trait]
 impl StateProvider for KvProvider {
@@ -89,7 +89,7 @@ impl StatefulServiceReplica for KvApplication {
     }
 }
 
-fn store(path: &std::path::Path) -> Arc<Committer> {
+pub(super) fn store(path: &std::path::Path) -> Arc<Committer> {
     Arc::new(
         Committer::open(
             path,

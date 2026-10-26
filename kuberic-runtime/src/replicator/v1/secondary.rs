@@ -123,6 +123,8 @@ pub(super) struct SecondaryAck {
     pub(super) replication: ReceiverAck,
     pub(super) copy: SecondaryCopyAck,
     pub(super) error: i32,
+    pub(super) transport_generation: u64,
+    pub(super) transport_owner: uuid::Uuid,
 }
 
 #[derive(Clone)]
@@ -179,6 +181,7 @@ struct State {
     promoting: bool,
     external_epoch: bool,
     transferred: bool,
+    transport_generation: u64,
 }
 
 // Cleanup callbacks retain the real provider, but not a root->receiver->root
@@ -188,6 +191,7 @@ struct CallbackLifetime {
 }
 
 struct Root {
+    transport_owner: uuid::Uuid,
     state: Mutex<State>,
     replication: Arc<Mutex<SecondaryReceiver>>,
     copy_dispatch: SharedDispatchQueue,
@@ -238,6 +242,8 @@ impl Root {
                 replication: self.replication.lock().unwrap().capture_ack(),
                 copy: state.copy.capture_ack(),
                 error: state.ack_error,
+                transport_generation: state.transport_generation,
+                transport_owner: self.transport_owner,
             }
         };
         let route = self.reply_route.get().unwrap().lock().unwrap().clone();
@@ -329,6 +335,106 @@ impl Root {
 pub(super) struct SecondaryHandle(Weak<Root>);
 
 impl SecondaryHandle {
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn transport_ack(&self) -> SecondaryAck {
+        let root = self.root().unwrap();
+        let mut state = root.state.lock().unwrap();
+        let replication = root.replication.lock().unwrap().capture_ack();
+        SecondaryAck {
+            replication,
+            copy: state.copy.capture_ack(),
+            error: state.ack_error,
+            transport_generation: state.transport_generation,
+            transport_owner: root.transport_owner,
+        }
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn same_instance(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(super) fn transport_identity(&self) -> Result<(uuid::Uuid, u64), SecondaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::admit(&state)?;
+        Ok((root.transport_owner, state.transport_generation))
+    }
+
+    pub(super) fn continue_transport(
+        &self,
+        route: &Route,
+        epoch: Epoch,
+    ) -> Result<(), SecondaryError> {
+        self.continuation_transport(route, route, epoch, true)
+    }
+
+    pub(super) fn check_continuation_transport(
+        &self,
+        route: &Route,
+        epoch: Epoch,
+    ) -> Result<(), SecondaryError> {
+        self.continuation_transport(route, route, epoch, false)
+    }
+
+    pub(super) fn reform_transport(
+        &self,
+        predecessor: &Route,
+        successor: &Route,
+        epoch: Epoch,
+        advance: bool,
+    ) -> Result<(), SecondaryError> {
+        if predecessor.source != successor.source
+            || predecessor.sender_address != successor.sender_address
+        {
+            return Err(SecondaryError::EpochPending);
+        }
+        self.continuation_transport(predecessor, successor, epoch, advance)
+    }
+
+    fn continuation_transport(
+        &self,
+        predecessor: &Route,
+        successor: &Route,
+        epoch: Epoch,
+        advance: bool,
+    ) -> Result<(), SecondaryError> {
+        let root = self.root()?;
+        let mut state = root.state.lock().unwrap();
+        Root::admit(&state)?;
+        let replication = root.replication.lock().unwrap();
+        let progress = replication
+            .queue()
+            .ok_or(SecondaryError::NotReady)?
+            .progress();
+        let mut bound = root.reply_route.get().unwrap().lock().unwrap();
+        if state.copy.is_copy_in_progress()
+            || state.context_acquiring
+            || state.context_requested
+            || (state.context_active && !matches!(state.context_result, Some(Ok(()))))
+            || state.external_epoch
+            || state.pending_epoch.is_some()
+            || state.running_epoch.is_some()
+            || replication.minimum_sending_epoch() != Some(epoch)
+            || progress.commit_head != progress.complete_head
+            || progress.tail != progress.commit_head
+            || bound.source != predecessor.source
+            || bound.destination != predecessor.destination
+            || bound.sender_address != predecessor.sender_address
+            || bound.remote_address != predecessor.remote_address
+        {
+            return Err(SecondaryError::EpochPending);
+        }
+        if advance {
+            state.transport_generation = state
+                .transport_generation
+                .checked_add(1)
+                .ok_or(SecondaryError::Closed)?;
+            *bound = successor.clone();
+        }
+        Ok(())
+    }
+
     fn root(&self) -> Result<Arc<Root>, SecondaryError> {
         self.0.upgrade().ok_or(SecondaryError::OwnerDropped)
     }
@@ -772,6 +878,7 @@ impl Secondary {
                 clock.now(),
             );
             Root {
+                transport_owner: uuid::Uuid::new_v4(),
                 copy_dispatch: copy.dispatch_queue(),
                 replication_dispatch: replication.lock().unwrap().dispatch_queue(),
                 replication: replication.clone(),
@@ -795,6 +902,7 @@ impl Secondary {
                     promoting: false,
                     external_epoch: false,
                     transferred: false,
+                    transport_generation: 0,
                 }),
                 establishment: OnceLock::new(),
                 reply_route: OnceLock::new(),

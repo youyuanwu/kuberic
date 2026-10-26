@@ -111,9 +111,31 @@ fn configuration_for(
     let replicas = members
         .into_iter()
         .map(|(id, member)| {
-            let peer = peers
+            let Some(peer) = peers
                 .get(&id)
-                .ok_or_else(|| invalid("configuration peer is unavailable"))?;
+                .filter(|peer| peer.storage.replica == member.identity)
+            else {
+                let mut retained = peers
+                    .get(&local)
+                    .and_then(|local| local.publication.as_ref())
+                    .and_then(|publication| {
+                        publication
+                            .scope
+                            .configuration
+                            .replicas
+                            .iter()
+                            .find(|description| description.identity == member.identity)
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        invalid("unavailable configuration peer lacks exact retained metadata")
+                    })?;
+                retained.role = member.role;
+                retained.is_up = false;
+                retained.is_ready = false;
+                retained.must_catchup = false;
+                return Ok(retained);
+            };
             let publication = peer
                 .publication
                 .as_ref()
@@ -161,7 +183,525 @@ fn current_terminal(snapshot: &ReplicaAgentSnapshot) -> bool {
     })
 }
 
+fn replacement_predecessor(
+    status: &KubericSetStatus,
+    current: &ConfigurationDescriptor,
+    id: ReplicaId,
+) -> Option<ReplicaStorageIncarnationContext> {
+    if current
+        .members
+        .iter()
+        .any(|member| member.identity.replica_id == id)
+    {
+        return None;
+    }
+    status.replica_goals.iter().rev().find_map(|entry| {
+        if !achieved(entry)
+            || entry.goal.scope.configuration.current != *current
+            || !matches!(
+                entry.goal.desired,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        let predecessor = entry
+            .goal
+            .scope
+            .configuration
+            .previous
+            .as_ref()?
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == id)?;
+        entry
+            .goal
+            .scope
+            .configuration
+            .replicas
+            .iter()
+            .find(|peer| peer.identity == predecessor.identity)
+            .map(|peer| peer.storage_incarnation.clone())
+    })
+}
+
 impl<A: AgentApi + 'static> KubeClusterApi<A> {
+    async fn sample_recovery(
+        &self,
+        raw: &RawObservation,
+        peer: &ReplicaAgentSnapshot,
+    ) -> Result<ReplicaAgentSnapshot> {
+        let response = self
+            .agents
+            .get_snapshot(
+                &peer_address(raw, &peer.storage.replica)?,
+                &self.bearer_token,
+                kuberic_runtime::control::proto::ReplicaSnapshotRequest {
+                    protocol_version: ORDINARY_ACTION_FORMAT,
+                    resource_uid: peer.history.resource_uid.to_string(),
+                    target: Some(peer.storage.replica.clone().into()),
+                    expected_process_session_id: peer.process_session_id.to_string(),
+                    sample_native_progress: true,
+                },
+            )
+            .await
+            .map_err(crate::cluster_api::map_agent_effect_error)?;
+        if response.protocol_version != ORDINARY_ACTION_FORMAT {
+            return Err(invalid("recovery sample changed format"));
+        }
+        let ReplicaAgentQueryResult::Initialized(sample) =
+            serde_json::from_slice(&response.canonical_json)
+                .map_err(|error| invalid(error.to_string()))?
+        else {
+            return Err(invalid("recovery sample lost initialized storage"));
+        };
+        if sample.identity != peer.identity
+            || sample.history != peer.history
+            || sample.storage != peer.storage
+            || sample.process_session_id != peer.process_session_id
+            || sample.creation_id != peer.creation_id
+            || sample.publication != peer.publication
+        {
+            return Err(ControllerError::ObservationStale);
+        }
+        Ok(*sample)
+    }
+
+    async fn reconcile_primary_reopen(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        let Some(primary) = peers.get(&current.primary_id) else {
+            return Ok(None);
+        };
+        let Some(topology) = status.public_v1_topology.as_ref() else {
+            return Ok(None);
+        };
+        let Some(prior) = topology
+            .sessions
+            .iter()
+            .find(|session| session.role == ReplicaRole::Primary)
+        else {
+            return Err(invalid("retained topology lost its primary endpoint"));
+        };
+        if current.members.len() == 1 || *prior == endpoint(primary, ReplicaRole::Primary) {
+            return Ok(None);
+        }
+        if prior.storage_incarnation != primary.storage || prior.identity != primary.storage.replica
+        {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        let provisional_epoch = Epoch::new(
+            current.epoch.data_loss_number,
+            current
+                .epoch
+                .configuration_number
+                .checked_add(1)
+                .ok_or_else(|| invalid("configuration epoch exhausted"))?,
+        );
+        let epoch = Epoch::new(
+            current.epoch.data_loss_number,
+            provisional_epoch
+                .configuration_number
+                .checked_add(1)
+                .ok_or_else(|| invalid("configuration epoch exhausted"))?,
+        );
+        let provisional = ConfigurationDescriptor::new(
+            provisional_epoch,
+            current.primary_id,
+            vec![ConfigurationMember {
+                identity: primary.storage.replica.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let next = ConfigurationDescriptor::new(
+            epoch,
+            current.primary_id,
+            current.members.clone(),
+            current.write_quorum,
+        );
+        let mut status = status.clone();
+        if !status.replica_goals.iter().any(|entry| {
+            entry.goal.scope.storage == primary.storage
+                && entry.goal.scope.process_session_id == primary.process_session_id
+                && entry.goal.scope.creation_id == primary.creation_id
+                && entry.goal.scope.configuration.current == provisional
+                && matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Prepare {
+                        role: ReplicaRole::Primary
+                    }
+                )
+        }) {
+            status.replica_goals.push(goal(
+                primary,
+                ReplicaConfigurationScope {
+                    current: provisional,
+                    previous: None,
+                    replicas: Vec::new(),
+                },
+                ReplicaGoalKind::Prepare {
+                    role: ReplicaRole::Primary,
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        if current.members.iter().any(|member| {
+            !peers.get(&member.identity.replica_id).is_some_and(|peer| {
+                peer.storage.replica == member.identity
+                    && peer.publication.as_ref().is_some_and(|publication| {
+                        publication.stage == ReplicaPublicationStage::AchievedScope
+                    })
+            })
+        }) {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        let mut sampled = BTreeMap::new();
+        for member in &current.members {
+            sampled.insert(
+                member.identity.replica_id,
+                self.sample_recovery(raw, peers[&member.identity.replica_id])
+                    .await?,
+            );
+        }
+        let Some(progress) = sampled[&current.primary_id]
+            .progress
+            .value()
+            .filter(|value| *value >= 0)
+        else {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        };
+        if sampled.values().any(|peer| {
+            peer.progress
+                .value()
+                .is_none_or(|value| value < 0 || value > progress)
+        }) {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        let sampled = sampled
+            .iter()
+            .map(|(id, peer)| (*id, peer))
+            .collect::<BTreeMap<_, _>>();
+        let selected = |entry: &RetainedReplicaGoal,
+                        peer: &ReplicaAgentSnapshot,
+                        previous: Option<&ConfigurationDescriptor>| {
+            entry.goal.scope.storage == peer.storage
+                && entry.goal.scope.process_session_id == peer.process_session_id
+                && entry.goal.scope.creation_id == peer.creation_id
+                && entry.goal.scope.configuration.current == next
+                && entry.goal.scope.configuration.previous.as_ref() == previous
+                && matches!(entry.goal.desired, ReplicaGoalKind::Reconfigure { .. })
+        };
+        for member in next
+            .members
+            .iter()
+            .filter(|member| member.identity.replica_id != next.primary_id)
+        {
+            let peer = sampled[&member.identity.replica_id];
+            if !status
+                .replica_goals
+                .iter()
+                .any(|entry| selected(entry, peer, Some(current)))
+            {
+                status.replica_goals.push(goal(
+                    peer,
+                    configuration_for(member.identity.replica_id, &next, Some(current), &sampled)?,
+                    ReplicaGoalKind::Reconfigure {
+                        role: member.role,
+                        catch_up: None,
+                    },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        for previous in [Some(current), None] {
+            let primary = sampled[&next.primary_id];
+            if !status
+                .replica_goals
+                .iter()
+                .any(|entry| selected(entry, primary, previous))
+            {
+                status.replica_goals.push(goal(
+                    primary,
+                    configuration_for(next.primary_id, &next, previous, &sampled)?,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        catch_up: Some(PublicCatchUpMode::All),
+                    },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        for member in next
+            .members
+            .iter()
+            .filter(|member| member.identity.replica_id != next.primary_id)
+        {
+            let peer = sampled[&member.identity.replica_id];
+            if !status
+                .replica_goals
+                .iter()
+                .any(|entry| selected(entry, peer, None))
+            {
+                status.replica_goals.push(goal(
+                    peer,
+                    configuration_for(member.identity.replica_id, &next, None, &sampled)?,
+                    ReplicaGoalKind::Reconfigure {
+                        role: member.role,
+                        catch_up: None,
+                    },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        if sampled.values().any(|peer| {
+            !peer.publication.as_ref().is_some_and(|publication| {
+                publication.stage == ReplicaPublicationStage::AchievedScope
+                    && publication.scope.configuration.current == next
+                    && publication.scope.configuration.previous.is_none()
+            })
+        }) {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        let sessions = next
+            .members
+            .iter()
+            .map(|member| endpoint(sampled[&member.identity.replica_id], member.role))
+            .collect::<Vec<_>>();
+        status.public_v1_topology =
+            Some(PublicV1TopologyState::from_configuration(&next, &sessions).map_err(invalid)?);
+        self.persist_goals(raw, status).await.map(Some)
+    }
+
+    async fn cleanup_replaced_storage(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+    ) -> Result<bool> {
+        let mut candidates = BTreeMap::new();
+        for entry in status.replica_goals.iter().filter(|entry| achieved(entry)) {
+            let Some(previous) = entry.goal.scope.configuration.previous.as_ref() else {
+                continue;
+            };
+            for member in &previous.members {
+                if entry
+                    .goal
+                    .scope
+                    .configuration
+                    .current
+                    .members
+                    .iter()
+                    .any(|next| next.identity == member.identity)
+                    || !current.members.iter().any(|next| {
+                        next.identity.replica_id == member.identity.replica_id
+                            && next.identity != member.identity
+                    })
+                {
+                    continue;
+                }
+                if let Some(peer) = entry
+                    .goal
+                    .scope
+                    .configuration
+                    .replicas
+                    .iter()
+                    .find(|peer| peer.identity == member.identity)
+                {
+                    candidates.insert(member.identity.clone(), peer.storage_incarnation.clone());
+                }
+            }
+        }
+        for storage in candidates.values() {
+            let ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } = &storage.storage else {
+                continue;
+            };
+            let pod = raw
+                .pods
+                .iter()
+                .find(|pod| pod.uid().as_deref() == Some(pod_uid.as_str()));
+            let pvc = raw
+                .pvcs
+                .iter()
+                .find(|pvc| pvc.uid().as_deref() == Some(pvc_uid.as_str()));
+            let service = raw.services.iter().any(|service| {
+                service
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.selector.as_ref())
+                    .and_then(|selector| selector.get(crate::crd::INSTANCE_LABEL))
+                    .is_some_and(|selected| selected == storage.replica.instance_id.as_str())
+            });
+            if pod.is_some() || pvc.is_some() || service {
+                self.delete_replica_scaffolding(
+                    raw,
+                    pod.map(ResourceExt::name_any).as_deref(),
+                    Some(pod_uid),
+                    if pod.is_none() {
+                        pvc.map(ResourceExt::name_any)
+                    } else {
+                        None
+                    }
+                    .as_deref(),
+                    if pod.is_none() { Some(pvc_uid) } else { None },
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn reconcile_missing_secondaries(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        let absent = current
+            .members
+            .iter()
+            .filter(|member| {
+                member.identity.replica_id != current.primary_id
+                    && !raw.pods.iter().any(|pod| {
+                        pod.uid().as_deref() == Some(member.identity.instance_id.as_str())
+                            && pod.metadata.deletion_timestamp.is_none()
+                    })
+            })
+            .map(|member| member.identity.replica_id)
+            .collect::<Vec<_>>();
+        if absent.is_empty() || !peers.contains_key(&current.primary_id) {
+            return Ok(None);
+        }
+        let members = current
+            .members
+            .iter()
+            .filter(|member| !absent.contains(&member.identity.replica_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if members.len() < current.write_quorum as usize
+            || members.iter().any(|member| {
+                !peers
+                    .get(&member.identity.replica_id)
+                    .is_some_and(|peer| peer.storage.replica == member.identity)
+            })
+        {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        let next = ConfigurationDescriptor::new(
+            Epoch::new(
+                current.epoch.data_loss_number,
+                current
+                    .epoch
+                    .configuration_number
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("configuration epoch exhausted"))?,
+            ),
+            current.primary_id,
+            members,
+            current.write_quorum,
+        );
+        let mut status = status.clone();
+        let selected = |entry: &RetainedReplicaGoal,
+                        peer: &ReplicaAgentSnapshot,
+                        previous: Option<&ConfigurationDescriptor>| {
+            entry.goal.scope.storage == peer.storage
+                && entry.goal.scope.process_session_id == peer.process_session_id
+                && entry.goal.scope.creation_id == peer.creation_id
+                && entry.goal.scope.configuration.current == next
+                && entry.goal.scope.configuration.previous.as_ref() == previous
+                && matches!(entry.goal.desired, ReplicaGoalKind::Reconfigure { .. })
+        };
+        for member in next
+            .members
+            .iter()
+            .filter(|member| member.identity.replica_id != next.primary_id)
+        {
+            let peer = peers[&member.identity.replica_id];
+            if !status
+                .replica_goals
+                .iter()
+                .any(|entry| selected(entry, peer, Some(current)))
+            {
+                status.replica_goals.push(goal(
+                    peer,
+                    configuration_for(member.identity.replica_id, &next, Some(current), peers)?,
+                    ReplicaGoalKind::Reconfigure {
+                        role: member.role,
+                        catch_up: None,
+                    },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        let primary = peers[&next.primary_id];
+        if !status
+            .replica_goals
+            .iter()
+            .any(|entry| selected(entry, primary, Some(current)))
+        {
+            status.replica_goals.push(goal(
+                primary,
+                configuration_for(next.primary_id, &next, Some(current), peers)?,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        for member in &next.members {
+            let peer = peers[&member.identity.replica_id];
+            if !status
+                .replica_goals
+                .iter()
+                .any(|entry| selected(entry, peer, None))
+            {
+                status.replica_goals.push(goal(
+                    peer,
+                    configuration_for(member.identity.replica_id, &next, None, peers)?,
+                    ReplicaGoalKind::Reconfigure {
+                        role: member.role,
+                        catch_up: (member.role == ReplicaRole::Primary)
+                            .then_some(PublicCatchUpMode::WriteQuorum),
+                    },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+            if !peer.publication.as_ref().is_some_and(|publication| {
+                publication.stage == ReplicaPublicationStage::AchievedScope
+                    && publication.role == member.role
+                    && publication.scope.configuration.current == next
+                    && publication.scope.configuration.previous.is_none()
+            }) {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            }
+        }
+        let sessions = next
+            .members
+            .iter()
+            .map(|member| endpoint(peers[&member.identity.replica_id], member.role))
+            .collect::<Vec<_>>();
+        status.public_v1_topology =
+            Some(PublicV1TopologyState::from_configuration(&next, &sessions).map_err(invalid)?);
+        self.persist_goals(raw, status).await.map(Some)
+    }
+
     async fn persist_goals(
         &self,
         raw: &RawObservation,
@@ -248,7 +788,14 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             return Err(invalid(message.clone()));
         }
         let mut status = raw.set.status.clone().unwrap_or_default();
-        let peers = snapshots(raw);
+        let mut observed = raw.clone();
+        observed.agents.retain(|key, _| {
+            raw.pods.iter().any(|pod| {
+                pod.uid().as_deref() == Some(key.instance_id.as_str())
+                    && pod.metadata.deletion_timestamp.is_none()
+            })
+        });
+        let peers = snapshots(&observed);
         let desired = (1..=raw.set.spec.replicas)
             .map(|id| ReplicaId::new(i64::from(id)))
             .collect::<Vec<_>>();
@@ -259,9 +806,26 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             .transpose()
             .map_err(invalid)?;
 
-        if crate::reconciler::bootstrap_resources_missing(raw, &desired, current.as_ref()) {
+        let replacements = current
+            .as_ref()
+            .map(|current| {
+                desired
+                    .iter()
+                    .filter_map(|id| {
+                        replacement_predecessor(&status, current, *id)
+                            .map(|predecessor| (*id, predecessor))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let bootstrap_ids = desired
+            .iter()
+            .filter(|id| !replacements.contains_key(id))
+            .copied()
+            .collect::<Vec<_>>();
+        if crate::reconciler::bootstrap_resources_missing(raw, &bootstrap_ids, current.as_ref()) {
             self.ensure_replica_support(raw).await?;
-            self.ensure_replica_scaffolding(raw, &desired).await?;
+            self.ensure_replica_scaffolding(raw, &bootstrap_ids).await?;
             return Ok(action(ReconcileKind::Executed));
         }
         let uid = ResourceUid::new(
@@ -269,9 +833,40 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 .uid()
                 .ok_or_else(|| invalid("missing resource UID"))?,
         );
-        if let Some(command) =
-            crate::reconciler::next_initialization_command(raw, &uid, &desired, current.as_ref())?
-        {
+        for (id, predecessor) in &replacements {
+            let base = derive_replacement_resource_name(&uid, &predecessor.replica);
+            let pod_name = format!("{}-{base}", raw.set.name_any());
+            let ready = raw
+                .pods
+                .iter()
+                .find(|pod| pod.name_any() == pod_name && pod.metadata.deletion_timestamp.is_none())
+                .is_some_and(|pod| {
+                    raw.pvcs
+                        .iter()
+                        .any(|pvc| pvc.name_any() == format!("{pod_name}-data"))
+                        && pod.uid().is_some_and(|uid| {
+                            raw.services.iter().any(|service| {
+                                service
+                                    .spec
+                                    .as_ref()
+                                    .and_then(|spec| spec.selector.as_ref())
+                                    .and_then(|selector| selector.get(crate::crd::INSTANCE_LABEL))
+                                    == Some(&uid)
+                            })
+                        })
+                });
+            if !ready {
+                self.ensure_replacement_scaffolding(raw, *id, &predecessor.replica)
+                    .await?;
+                return Ok(action(ReconcileKind::Executed));
+            }
+        }
+        if let Some(command) = crate::reconciler::next_initialization_command(
+            &observed,
+            &uid,
+            &desired,
+            current.as_ref(),
+        )? {
             self.execute_command(
                 raw,
                 &kuberic_runtime::protocol::command::ProtocolCommand::InitializeAgentStore(
@@ -564,9 +1159,23 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             return self.persist_goals(raw, status).await;
         }
         if desired.iter().any(|id| !peers.contains_key(id)) {
+            if let Some(current) = current.as_ref()
+                && let Some(next) = self
+                    .reconcile_missing_secondaries(raw, &status, current, &peers)
+                    .await?
+            {
+                return Ok(next);
+            }
             return Ok(action(ReconcileKind::Waiting));
         }
         let primary = peers.get(&primary_id).ok_or_else(|| invalid("retained-history election requires fresh recovery/progress evidence; M1 cannot elect an unavailable primary"))?;
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .reconcile_primary_reopen(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
+        }
         for id in &desired {
             let peer = peers[id];
             if peer.publication.as_ref().is_some_and(|publication| {
@@ -676,6 +1285,12 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             .copied()
             .collect::<Vec<_>>();
         if addition.is_empty() {
+            if self
+                .cleanup_replaced_storage(raw, &status, &current)
+                .await?
+            {
+                return Ok(action(ReconcileKind::Executed));
+            }
             let sessions = current
                 .members
                 .iter()
@@ -898,6 +1513,30 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                     .publication
                     .as_ref()
                     .ok_or_else(|| invalid("target unpublished"))?;
+                if let Some(predecessor) = replacements.get(id)
+                    && let Some(old) = status.replica_goals.iter().rev().find_map(|entry| {
+                        match &entry.goal.desired {
+                            ReplicaGoalKind::Build { remote }
+                                if remote.target.scope.storage == *predecessor
+                                    && remote.source.scope.storage == primary.storage
+                                    && remote.source.scope.process_session_id == primary.process_session_id
+                                    && remote.source.scope.creation_id == primary.creation_id => Some(remote.clone()),
+                            _ => None,
+                        }
+                    })
+                    && !status.replica_goals.iter().any(|entry| {
+                        achieved(entry)
+                            && matches!(&entry.goal.desired, ReplicaGoalKind::Remove { remote } if remote == &old)
+                    })
+                {
+                    status.replica_goals.push(goal(
+                        primary,
+                        source_publication.scope.configuration.clone(),
+                        ReplicaGoalKind::Remove { remote: old },
+                        &status.replica_goals,
+                    )?);
+                    return self.persist_goals(raw, status).await;
+                }
                 if !primary.remote_operations.iter().any(|remote| {
                     remote.selection.source == *source_publication
                         && remote.selection.target == *target_publication
@@ -906,7 +1545,7 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 }) {
                     if status.replica_goals.iter().any(|entry| {
                         matches!(&entry.goal.desired, ReplicaGoalKind::Build { remote }
-                            if remote.target.scope.storage.replica.replica_id == *id)
+                            if remote.target.scope.storage == target.storage)
                     }) {
                         return Err(invalid(
                             "retained Build cannot be reused after target/source publication changed",

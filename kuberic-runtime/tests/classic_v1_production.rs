@@ -893,7 +893,8 @@ impl<A: Sample> Node<A> {
         assert_eq!(
             m2_builtin::settled(self, &goal).await,
             ReplicaGoalStatus::Achieved,
-            "{goal:?}"
+            "{goal:?}; snapshot={:?}",
+            m2_builtin::snapshot(self).await,
         );
         self.scope = Some(scope);
         goal
@@ -1619,6 +1620,608 @@ async fn public_factory_real_kv_copy_quorum_commit_restart_and_promotion() {
     })
     .await
     .expect("bounded production KV journey");
+}
+
+#[tokio::test]
+async fn m3_retained_primary_process_reforms_actual_surviving_kv_receiver() {
+    use kuberic_runtime::replicator::TestingTcpRoute;
+    use kuberic_runtime::testing::{PublicCutPosition, PublicOperationCut};
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for position in [
+            PublicCutPosition::InstructionSelected,
+            PublicCutPosition::CallbackSuccess,
+            PublicCutPosition::InstructionApplied,
+        ] {
+            let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../.paw/work/sf-hosting-m3")
+                .join(format!("phase2-source-kv-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let source_root = root.join("source");
+            let target_root = root.join("target");
+            let source_route = TestingTcpRoute::register("pod-1".into(), |_, address| {
+                Box::pin(async move { Ok(address) })
+            })
+            .unwrap();
+            let target_route = TestingTcpRoute::register("pod-2".into(), |_, address| {
+                Box::pin(async move { Ok(address) })
+            })
+            .unwrap();
+            let mut source = Node::<KvService>::start(&source_root, 1, 0).await;
+            let mut target = Node::<KvService>::start(&target_root, 2, 0).await;
+            let epoch = Epoch::new(0, 1);
+            source.open(ReplicaRole::Primary, epoch).await;
+            let singleton = source.single(epoch).await;
+            target.open(ReplicaRole::IdleSecondary, epoch).await;
+            let build = source.build(&mut target, epoch, &singleton).await;
+            let committed = source
+                .service
+                .replicate_put("retained".into(), "before-source-restart".into())
+                .await
+                .unwrap();
+            let old_source = m2_builtin::snapshot(&source).await.publication.unwrap();
+            let old_target = m2_builtin::snapshot(&target).await.publication.unwrap();
+            let old_binding =
+                source_route.inspect_native().unwrap()["sessions"]["entries"][0]["binding"].clone();
+            let old_receiver =
+                target_route.inspect_native().unwrap()["peers"][0]["ackOwner"].clone();
+            assert!(!old_receiver.is_null());
+            let target_service = target.service.clone();
+            let observer = source.running.handle();
+            let old_service = source.service.clone();
+            let overlap = ReplicaHost::new(
+                ReplicaProcessConfig {
+                    resource_uid: source.history.resource_uid.clone(),
+                    replica_id: source.identity.replica_id,
+                    pod_uid: PodUid::new("pod-1"),
+                    pvc_uid: PvcUid::new("pvc-1"),
+                    data_root: source_root.clone(),
+                    replication_address: "127.0.0.1:0".parse().unwrap(),
+                    bearer_token: CREDENTIAL.into(),
+                    rpc_deadline: Duration::from_secs(5),
+                    transport_window_capacity: 64,
+                },
+                source.service.clone(),
+                ApplicationStorageState::Established,
+                Arc::new(m2_builtin::ResolverMap::default()),
+            )
+            .with_application_storage_paths(std::collections::BTreeMap::from([(
+                "application".into(),
+                source_root.join("application"),
+            )]));
+            let overlapping = overlap
+                .start(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap())
+                .await;
+            assert!(
+                overlapping
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("storage lifetime is already owned")
+            );
+            assert_eq!(observer.public_v1_provider_writer_count(), 1);
+            let revision = source.revision;
+            let history = source.history.clone();
+            let storage = source.storage.clone();
+            assert!(source.stop().await.is_none());
+            assert_eq!(observer.public_v1_provider_writer_count(), 0);
+            assert_eq!(
+                old_service.persistence().get("retained").as_deref(),
+                Some("before-source-restart")
+            );
+
+            let mut source = Node::<KvService>::start(&source_root, 1, revision).await;
+            assert_ne!(source.session, old_source.scope.process_session_id);
+            assert_eq!(source.storage, storage);
+            assert_eq!(source.history, history);
+            let unopened = m2_builtin::snapshot_sampling(&source, true).await;
+            assert!(unopened.publication.is_none());
+            assert!(unopened.progress.value().is_none());
+            assert!(m2_builtin::submit(&source, &build).await.is_err());
+            let epoch = Epoch::new(0, 2);
+            source.open(ReplicaRole::Primary, epoch).await;
+            let provisional = m2_builtin::snapshot_sampling(&source, true).await;
+            assert_eq!(provisional.progress.value(), Some(committed));
+            assert!(provisional.capability.value().is_some());
+            assert_ne!(provisional.write_status, AccessStatus::Granted);
+            assert!(
+                source
+                    .service
+                    .replicate_put("forbidden".into(), "provisional".into())
+                    .await
+                    .is_err()
+            );
+            let new_source = provisional.publication.unwrap();
+            assert_ne!(new_source.scope.creation_id, old_source.scope.creation_id);
+            // Prepare installs a real provisional singleton. Preserve the completed
+            // current-only anti-regression boundary by selecting a later epoch for
+            // joint reformation, not reinterpreting that singleton as the old PC.
+            let epoch = Epoch::new(0, 3);
+            let current = ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![
+                    ConfigurationMember {
+                        identity: source.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    },
+                    ConfigurationMember {
+                        identity: target.identity.clone(),
+                        role: ReplicaRole::ActiveSecondary,
+                    },
+                ],
+                2,
+            );
+            let previous = old_source.scope.configuration.current;
+            let source_peer = source.peer(ReplicaRole::Primary).await;
+            let probe = serde_json::json!({
+                "nonce": uuid::Uuid::new_v4().to_string(),
+                "source": new_source,
+                "target": old_target,
+                "recovery": false,
+                "reformation": true,
+            });
+            assert!(
+                m2_builtin::control_at(&old_binding, probe, "CheckReformation")
+                    .await
+                    .is_err()
+            );
+            target
+                .goal(
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        catch_up: None,
+                    },
+                    ReplicaConfigurationScope {
+                        current: current.clone(),
+                        previous: Some(previous.clone()),
+                        replicas: vec![source_peer],
+                    },
+                )
+                .await;
+            assert_eq!(
+                m2_builtin::snapshot(&target)
+                    .await
+                    .publication
+                    .unwrap()
+                    .scope
+                    .creation_id,
+                old_target.scope.creation_id
+            );
+            assert!(Arc::ptr_eq(&target.service, &target_service));
+            let target_peer = target.peer(ReplicaRole::ActiveSecondary).await;
+            let cut = Arc::new(PublicOperationCut {
+                position,
+                index: 3,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            let handle = source.running.handle();
+            handle.set_public_operation_cut(Some(cut.clone()));
+            let mut client = proto::agent_control_client::AgentControlClient::connect(
+                source.control_address.clone(),
+            )
+            .await
+            .unwrap();
+            let request = proto::ReplicaSnapshotRequest {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                resource_uid: source.history.resource_uid.to_string(),
+                target: Some(source.identity.clone().into()),
+                expected_process_session_id: source.session.to_string(),
+                sample_native_progress: true,
+            };
+            let mut reconfigure = Box::pin(source.goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                ReplicaConfigurationScope {
+                    current: current.clone(),
+                    previous: Some(previous),
+                    replicas: vec![target_peer.clone()],
+                },
+            ));
+            tokio::select! {
+                _ = cut.entered.notified() => {}
+                _ = &mut reconfigure => panic!("reformation completed before {position:?}"),
+            }
+            let response = client
+                .get_snapshot(authorized(request))
+                .await
+                .unwrap()
+                .into_inner();
+            let ReplicaAgentQueryResult::Initialized(gap) =
+                serde_json::from_slice(&response.canonical_json).unwrap()
+            else {
+                panic!("retained process remains initialized");
+            };
+            assert_ne!(gap.write_status, AccessStatus::Granted);
+            assert!(
+                gap.progress.value().is_none(),
+                "pending scope must not sample authority"
+            );
+            assert!(
+                client
+                    .submit_goal(authorized(proto::ReplicaGoalRequest {
+                        protocol_version: ORDINARY_ACTION_FORMAT,
+                        canonical_json: serde_json::to_vec(&build).unwrap(),
+                    }))
+                    .await
+                    .is_err()
+            );
+            for command in ["Reserve", "Complete", "BodyStart", "Ack"] {
+                assert!(
+                    m2_builtin::control_at(&old_binding, old_binding.clone(), command)
+                        .await
+                        .is_err()
+                );
+            }
+            handle.set_public_operation_cut(None);
+            cut.release.notify_one();
+            reconfigure.await;
+            let native = target_route.inspect_native().unwrap();
+            let peer = &native["peers"][0];
+            assert_eq!(peer["ackOwner"], old_receiver);
+            assert_eq!(peer["ackGeneration"], 1);
+            let binding = &peer["binding"];
+            assert_eq!(binding["reformation"], true);
+            assert_ne!(binding["nonce"], old_binding["nonce"]);
+            assert_eq!(
+                binding["source"]["scope"]["processSessionId"],
+                source.session.as_str()
+            );
+            assert_eq!(
+                native["sessions"]["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["binding"]["nonce"] == old_binding["nonce"])
+                    .unwrap()["phase"],
+                "Retired"
+            );
+            assert!(native["failure"].is_null());
+            for command in [
+                "Reserve",
+                "Activate",
+                "Complete",
+                "Retire",
+                "BodyStart",
+                "Ack",
+            ] {
+                let outcome = m2_builtin::control_at(binding, old_binding.clone(), command).await;
+                if command == "Retire" {
+                    outcome.unwrap();
+                } else {
+                    assert!(outcome.is_err(), "{command}: {outcome:?}");
+                }
+                assert_eq!(
+                    target_route.inspect_native().unwrap()["peers"][0]["ackOwner"],
+                    old_receiver
+                );
+                assert!(target_route.inspect_native().unwrap()["failure"].is_null());
+            }
+            assert_eq!(
+                m2_builtin::snapshot(&source).await.write_status,
+                AccessStatus::ReconfigurationPending
+            );
+            source
+                .goal(
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                    },
+                    ReplicaConfigurationScope {
+                        current: current.clone(),
+                        previous: None,
+                        replicas: vec![target_peer],
+                    },
+                )
+                .await;
+            let later = source
+                .service
+                .replicate_put("retained".into(), "after-source-restart".into())
+                .await
+                .unwrap();
+            assert!(later > committed);
+            assert_eq!(
+                target.service.persistence().get("retained").as_deref(),
+                Some("after-source-restart")
+            );
+            target
+                .goal(
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        catch_up: None,
+                    },
+                    ReplicaConfigurationScope {
+                        current,
+                        previous: None,
+                        replicas: vec![source.peer(ReplicaRole::Primary).await],
+                    },
+                )
+                .await;
+            assert_eq!(
+                target_route.inspect_native().unwrap()["peers"][0]["ackOwner"],
+                old_receiver
+            );
+            assert_eq!(
+                source_route.inspect_native().unwrap()["production"]["recoverySpawned"],
+                0
+            );
+            source.close().await;
+            target.close().await;
+            assert_eq!(observer.public_v1_provider_writer_count(), 0);
+        }
+    })
+    .await
+    .expect("bounded retained-primary source reformation");
+}
+
+#[tokio::test]
+async fn m3_changed_primary_reforms_surviving_kv_receiver_with_unavailable_previous() {
+    use kuberic_runtime::replicator::TestingTcpRoute;
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../.paw/work/sf-hosting-m3")
+            .join(format!("phase2-source-failover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let routes = [1, 2, 3].map(|id| {
+            TestingTcpRoute::register(format!("pod-{id}"), |_, address| {
+                Box::pin(async move { Ok(address) })
+            })
+            .unwrap()
+        });
+        let mut source = Node::<KvService>::start_sized(&root.join("source"), 1, 0, 3).await;
+        let mut successor = Node::<KvService>::start_sized(&root.join("successor"), 2, 0, 3).await;
+        let mut survivor = Node::<KvService>::start_sized(&root.join("survivor"), 3, 0, 3).await;
+        let epoch = Epoch::new(0, 1);
+        source.open(ReplicaRole::Primary, epoch).await;
+        let singleton = source.single(epoch).await;
+        successor.open(ReplicaRole::IdleSecondary, epoch).await;
+        survivor.open(ReplicaRole::IdleSecondary, epoch).await;
+        for target in [&mut successor, &mut survivor] {
+            let build = source.build_idle(target, epoch, &singleton).await;
+            let mut client = proto::agent_control_client::AgentControlClient::connect(
+                source.control_address.clone(),
+            )
+            .await
+            .unwrap();
+            client
+                .acknowledge_goal(authorized(proto::ReplicaGoalRequest {
+                    protocol_version: ORDINARY_ACTION_FORMAT,
+                    canonical_json: serde_json::to_vec(&ReplicaGoalAcknowledgement {
+                        goal: build,
+                        logically_retired: false,
+                    })
+                    .unwrap(),
+                }))
+                .await
+                .unwrap();
+        }
+        let full = ConfigurationDescriptor::new(
+            epoch,
+            source.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: successor.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+                ConfigurationMember {
+                    identity: survivor.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        for previous in [Some(singleton), None] {
+            let source_peer = source.peer(ReplicaRole::Primary).await;
+            let successor_peer = successor.peer(ReplicaRole::ActiveSecondary).await;
+            let survivor_peer = survivor.peer(ReplicaRole::ActiveSecondary).await;
+            source
+                .goal(
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        catch_up: previous.is_none().then_some(PublicCatchUpMode::All),
+                    },
+                    ReplicaConfigurationScope {
+                        current: full.clone(),
+                        previous: previous.clone(),
+                        replicas: vec![successor_peer.clone(), survivor_peer.clone()],
+                    },
+                )
+                .await;
+            successor
+                .goal(
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        catch_up: None,
+                    },
+                    ReplicaConfigurationScope {
+                        current: full.clone(),
+                        previous: previous.clone(),
+                        replicas: vec![source_peer.clone(), survivor_peer],
+                    },
+                )
+                .await;
+            survivor
+                .goal(
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        catch_up: None,
+                    },
+                    ReplicaConfigurationScope {
+                        current: full.clone(),
+                        previous,
+                        replicas: vec![source_peer, successor_peer],
+                    },
+                )
+                .await;
+        }
+        let committed = source
+            .service
+            .replicate_put("retained".into(), "before-loss".into())
+            .await
+            .unwrap();
+        // All is an actual native wait, not inferred from quorum completion.
+        source
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                ReplicaConfigurationScope {
+                    current: full.clone(),
+                    previous: None,
+                    replicas: vec![
+                        successor.peer(ReplicaRole::ActiveSecondary).await,
+                        survivor.peer(ReplicaRole::ActiveSecondary).await,
+                    ],
+                },
+            )
+            .await;
+        assert_eq!(
+            survivor.service.persistence().get("retained").as_deref(),
+            Some("before-loss")
+        );
+        let old_receiver = routes[2].inspect_native().unwrap()["peers"][0]["ackOwner"].clone();
+        let survivor_creation = m2_builtin::snapshot(&survivor).await.creation_id;
+        let mut absent = source.peer(ReplicaRole::Primary).await;
+        absent.is_up = false;
+        absent.is_ready = false;
+        absent.current_progress = INVALID_LSN;
+        absent.catch_up_capability = INVALID_LSN;
+        assert!(source.stop().await.is_none());
+        let epoch = Epoch::new(0, 2);
+        let current = ConfigurationDescriptor::new(
+            epoch,
+            successor.identity.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: successor.identity.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: survivor.identity.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        survivor
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::ActiveSecondary,
+                    catch_up: None,
+                },
+                ReplicaConfigurationScope {
+                    current: current.clone(),
+                    previous: Some(full.clone()),
+                    replicas: vec![successor.peer(ReplicaRole::Primary).await, absent.clone()],
+                },
+            )
+            .await;
+        successor
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                ReplicaConfigurationScope {
+                    current: current.clone(),
+                    previous: Some(full.clone()),
+                    replicas: vec![survivor.peer(ReplicaRole::ActiveSecondary).await, absent],
+                },
+            )
+            .await;
+        let native = routes[2].inspect_native().unwrap();
+        assert_eq!(native["peers"].as_array().unwrap().len(), 1);
+        assert_eq!(native["peers"][0]["ackOwner"], old_receiver);
+        assert_eq!(native["peers"][0]["binding"]["reformation"], true);
+        assert_eq!(
+            native["peers"][0]["binding"]["source"]["scope"]["storage"]["replica"]["replicaId"],
+            2
+        );
+        assert_eq!(
+            m2_builtin::snapshot(&survivor).await.creation_id,
+            survivor_creation
+        );
+        let source_native = routes[1].inspect_native().unwrap();
+        let native_previous = &source_native["production"]["nativeConfiguration"]["previous"];
+        assert_eq!(native_previous["writeQuorum"], full.write_quorum);
+        let unavailable = native_previous["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["replica"] == 1)
+            .unwrap();
+        assert_eq!(unavailable["active"], false);
+        assert_eq!(unavailable["incarnation"], 0);
+        assert_eq!(
+            source_native["peers"].as_array().unwrap().len(),
+            1,
+            "unavailable PC-only metadata must never create a carrier"
+        );
+        assert_eq!(
+            source_native["sessions"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["phase"] == "Completed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            m2_builtin::snapshot(&successor).await.write_status,
+            AccessStatus::ReconfigurationPending
+        );
+        // Joint catch-up retains the real PC. Application writes remain closed
+        // until the actual current-only callback completes below.
+        successor
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                ReplicaConfigurationScope {
+                    current: current.clone(),
+                    previous: None,
+                    replicas: vec![survivor.peer(ReplicaRole::ActiveSecondary).await],
+                },
+            )
+            .await;
+        let later = successor
+            .service
+            .replicate_put("retained".into(), "after-loss".into())
+            .await
+            .unwrap();
+        assert!(later > committed);
+        assert_eq!(
+            survivor.service.persistence().get("retained").as_deref(),
+            Some("after-loss")
+        );
+        survivor
+            .goal(
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::ActiveSecondary,
+                    catch_up: None,
+                },
+                ReplicaConfigurationScope {
+                    current,
+                    previous: None,
+                    replicas: vec![successor.peer(ReplicaRole::Primary).await],
+                },
+            )
+            .await;
+        successor.close().await;
+        survivor.close().await;
+    })
+    .await
+    .expect("bounded surviving receiver handover");
 }
 
 async fn sql_write(

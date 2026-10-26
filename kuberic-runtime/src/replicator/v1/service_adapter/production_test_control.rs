@@ -3,6 +3,10 @@
 use super::*;
 
 impl Production {
+    pub(in crate::replicator::v1::service_adapter) fn changing_role(&self) -> bool {
+        self.role_changing.load(Ordering::Acquire)
+    }
+
     #[cfg(feature = "testing")]
     pub(in crate::replicator::v1::service_adapter) fn removal_primary(
         &self,

@@ -20,6 +20,63 @@ fn voter(role: ReplicaRole) -> bool {
     matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
 }
 
+fn retained_source_member(
+    state: &AgentState,
+    goal: &ReplicaGoal,
+    peer: &ReplicaPeerDescription,
+) -> bool {
+    let Some(record) = state
+        .public_v1_operation_state
+        .as_ref()
+        .and_then(|preview| {
+            preview
+                .operations
+                .values()
+                .filter(|record| {
+                    record.intent.revision < goal.revision
+                        && record.intent.process_session_id != goal.scope.process_session_id
+                        && record.accepted_history.as_ref() == Some(&goal.scope.history)
+                        && record.accepted_storage.as_ref() == Some(&goal.scope.storage)
+                        && record.intent.goal().is_some_and(|old| {
+                            !matches!(
+                                old.desired,
+                                ReplicaGoalKind::Build { .. } | ReplicaGoalKind::Remove { .. }
+                            )
+                        })
+                })
+                .max_by_key(|record| record.intent.revision)
+        })
+    else {
+        return false;
+    };
+    let Some(old) = record.intent.goal() else {
+        return false;
+    };
+    // Historical membership only permits attempting native reformation. It
+    // supplies neither Ready nor receiver authority; that actual callback must
+    // prove and join the higher-epoch retained receiver before access can open.
+    record.stage == PublicOperationStage::Completed
+        && record.disposition == Some(PublicOperationDisposition::Succeeded)
+        && record.lifecycle.in_flight.is_none()
+        && old.scope.creation_id != goal.scope.creation_id
+        && old.scope.epoch.data_loss_number == goal.scope.epoch.data_loss_number
+        && old.scope.epoch.configuration_number < goal.scope.epoch.configuration_number
+        && old.role() == Some(ReplicaRole::Primary)
+        && old.scope.configuration.previous.is_none()
+        && goal.scope.configuration.previous.as_ref() == Some(&old.scope.configuration.current)
+        && goal.scope.configuration.current.primary_id == old.scope.configuration.current.primary_id
+        && goal.scope.configuration.current.members == old.scope.configuration.current.members
+        && super::public_lifecycle::achieved_configuration_from_record(record).is_some()
+        && old.scope.configuration.replicas.iter().any(|known| {
+            known.identity == peer.identity
+                && known.storage_incarnation == peer.storage_incarnation
+                && known.process_session_id == peer.process_session_id
+                && known.replication_address == peer.replication_address
+                && known.role == ReplicaRole::ActiveSecondary
+                && peer.role == ReplicaRole::ActiveSecondary
+        })
+}
+
 fn new_voters<'a>(
     state: &AgentState,
     goal: &'a ReplicaGoal,
@@ -76,6 +133,9 @@ fn new_voters<'a>(
             peers
                 .into_iter()
                 .filter(|peer| {
+                    if retained_source_member(state, goal, peer) {
+                        return false;
+                    }
                     previous.as_ref().is_none_or(|old| {
                         !std::iter::once(&old.current)
                             .chain(old.previous.iter())
@@ -404,6 +464,16 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
                     .into(),
             ));
         }
+        if matches!(goal.desired, ReplicaGoalKind::Remove { .. })
+            && preview.operations.values().any(|record| {
+                record.intent.goal().is_some_and(|previous| {
+                    matches!(previous.desired, ReplicaGoalKind::Remove { .. })
+                        && previous.remote() == goal.remote()
+                })
+            })
+        {
+            return Err(reject("remote removal already has an immutable goal owner"));
+        }
         let current_generation = retained
             .iter()
             .filter_map(|record| {
@@ -473,8 +543,11 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
             false,
         )
         .as_ref()
-            != Some(&remote.source)
-        {
+        .is_none_or(|current| {
+            current.scope != goal.scope
+                || current.stage != ReplicaPublicationStage::AchievedScope
+                || current.role != ReplicaRole::Primary
+        }) {
             return Err(reject(
                 "ordinary Remove requires a live achieved Primary source",
             ));
@@ -551,10 +624,6 @@ pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryG
                             && old.remote() == Some(remote.as_ref())
                     }) && record.stage == PublicOperationStage::Completed
                         && record.disposition == Some(PublicOperationDisposition::Succeeded)
-                        && record
-                            .ordinary
-                            .as_ref()
-                            .is_some_and(|ordinary| !ordinary.logically_retired)
                 })
             });
         if !ready {

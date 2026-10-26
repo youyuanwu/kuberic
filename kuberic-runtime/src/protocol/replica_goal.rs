@@ -295,10 +295,16 @@ impl ReplicaGoal {
                     return Err("goal role differs from selected configuration");
                 }
             }
-            ReplicaGoalKind::Build { remote } | ReplicaGoalKind::Remove { remote } => {
+            ReplicaGoalKind::Build { remote } => {
                 remote.validate()?;
                 if remote.source.scope != self.scope {
                     return Err("remote source differs from goal scope");
+                }
+            }
+            ReplicaGoalKind::Remove { remote } => {
+                remote.validate()?;
+                if !remote.source.scope.compatible_with(&self.scope) {
+                    return Err("remote removal changed its exact source creation");
                 }
             }
             ReplicaGoalKind::Close | ReplicaGoalKind::Abort => {}

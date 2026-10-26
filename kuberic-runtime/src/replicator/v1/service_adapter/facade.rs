@@ -43,7 +43,7 @@ pub(super) struct PeerBinding {
 }
 
 type PeerResolver =
-    Arc<dyn Fn(&ReplicaInformation) -> Result<PeerBinding, FacadeError> + Send + Sync>;
+    Arc<dyn Fn(&ReplicaInformation, bool) -> Result<PeerBinding, FacadeError> + Send + Sync>;
 
 pub(super) struct FacadeConfig {
     pub(super) local: ReplicaIdentity,
@@ -405,10 +405,18 @@ impl FacadeConfig {
     }
 
     fn peer(&self, info: &ReplicaInformation) -> Result<PeerBinding, FacadeError> {
+        self.resolve_peer_input(info, false)
+    }
+
+    fn resolve_peer_input(
+        &self,
+        info: &ReplicaInformation,
+        configuration_only: bool,
+    ) -> Result<PeerBinding, FacadeError> {
         info.validate_public_progress()
             .map_err(|error| FacadeError::Input(error.to_string()))?;
         if let Some(resolve) = &self.resolve_peer {
-            let peer = resolve(info)?;
+            let peer = resolve(info, configuration_only)?;
             if !matches_binding(&peer.information, info) {
                 return Err(FacadeError::Input("resolved peer binding changed".into()));
             }
@@ -432,6 +440,7 @@ impl FacadeConfig {
         &self,
         input: &ReplicaSetConfiguration,
         final_configuration: bool,
+        previous_metadata: bool,
     ) -> Result<ReplicaConfiguration, FacadeError> {
         let configuration = &input.configuration;
         if configuration.configuration_id != configuration.expected_id()
@@ -457,7 +466,7 @@ impl FacadeConfig {
             if !described.insert(replica.identity.replica_id) {
                 return Err(FacadeError::Input("duplicate replica description".into()));
             }
-            self.peer(replica)?;
+            self.resolve_peer_input(replica, previous_metadata)?;
         }
         let mut members = BTreeSet::new();
         let mut replicas = Vec::new();
@@ -482,7 +491,7 @@ impl FacadeConfig {
             if info.role != member.role || (final_configuration && info.must_catchup) {
                 return Err(FacadeError::Input("remote voting role/MustCatchup".into()));
             }
-            let peer = self.peer(info)?;
+            let peer = self.resolve_peer_input(info, previous_metadata)?;
             replicas.push(ReplicaDescriptor {
                 route: peer.build.route.clone(),
                 remote_incarnation: peer.build.remote_incarnation,
@@ -584,14 +593,15 @@ fn handle(
                 let previous = if empty_previous(&previous) {
                     None
                 } else {
-                    Some(config.configuration(&previous, false)?)
+                    Some(config.configuration(&previous, false, true)?)
                 };
-                let current = config.configuration(&current, false)?;
+                let current = config.configuration(&current, false, false)?;
                 adapter.update_catchup_configuration(previous, current)?;
                 return Ok(Some(Value::Completed));
             }
             Command::CurrentConfiguration(current) => {
-                adapter.update_current_configuration(config.configuration(&current, true)?)?;
+                adapter
+                    .update_current_configuration(config.configuration(&current, true, false)?)?;
                 return Ok(Some(Value::Completed));
             }
             Command::Catchup(mode) => {
@@ -677,8 +687,8 @@ fn handle(
                 let primary = adapter.owner.primary().map_err(AdapterError::from)?;
                 let removal = sessions.idle_removal(&binding);
                 primary
-                    .remove_idle_with(id, move |native_idle| {
-                        removal.retire(native_idle).map_err(|error| {
+                    .remove_idle_with(id, move |native_idle, epoch| {
+                        removal.retire(native_idle, epoch).map_err(|error| {
                             super::super::replica_manager::ManagerError::BuildLifecycle(
                                 error.to_string(),
                             )

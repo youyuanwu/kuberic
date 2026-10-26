@@ -621,7 +621,9 @@ impl<F: ApplicationFactory> Harness<F> {
                             .any(|uid| snapshot.storage.replica.instance_id.as_str() == uid)
                     })
                     .collect::<Vec<_>>();
-                if Self::ordinary_settled(status, &snapshots, expected) {
+                if Self::ordinary_settled(status, &snapshots, expected)
+                    && self.replaced_resources_settled(status)
+                {
                     return Ok(status
                         .public_v1_topology
                         .as_ref()
@@ -632,6 +634,50 @@ impl<F: ApplicationFactory> Harness<F> {
             }
             self.step().await?;
         }
+    }
+
+    fn replaced_resources_settled(&self, status: &KubericSetStatus) -> bool {
+        let Some(topology) = status.public_v1_topology.as_ref() else {
+            return false;
+        };
+        for kind in [Kind::Pod, Kind::Pvc, Kind::Service] {
+            for object in self.api.snapshot(kind) {
+                let Some(id) = object["metadata"]["labels"][crate::crd::REPLICA_ID_LABEL]
+                    .as_str()
+                    .and_then(|value| value.parse::<i64>().ok())
+                else {
+                    continue;
+                };
+                let Some(current) = topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.identity.replica_id.value() == id)
+                else {
+                    continue;
+                };
+                let obsolete = match kind {
+                    Kind::Pod => {
+                        object["metadata"]["uid"].as_str()
+                            != Some(current.identity.instance_id.as_str())
+                    }
+                    Kind::Pvc => match &current.storage_incarnation.storage {
+                        kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+                            pvc_uid,
+                            ..
+                        } => object["metadata"]["uid"].as_str() != Some(pvc_uid.as_str()),
+                        _ => false,
+                    },
+                    Kind::Service => object["spec"]["selector"][crate::crd::INSTANCE_LABEL]
+                        .as_str()
+                        .is_some_and(|uid| uid != current.identity.instance_id.as_str()),
+                    _ => false,
+                };
+                if obsolete {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     #[cfg(test)]

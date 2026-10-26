@@ -180,6 +180,8 @@ impl Recovery {
             source: primary_publication,
             target: target_publication,
             recovery: true,
+            continuation: None,
+            reformation: false,
         };
         binding.validate().unwrap();
         Self {
