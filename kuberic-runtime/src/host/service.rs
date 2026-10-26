@@ -881,30 +881,6 @@ where
             PublicV1HistoryCommand::Recover { intent, .. } => {
                 self.execute_public_intent(*intent).await
             }
-            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
-                let state = self.store.load_state().await?;
-                if authority.attempt.target != state.identity.local_identity {
-                    return Err(crate::host::HostError::IdentityMismatch(
-                        "inbound build authority targets another replica".into(),
-                    ));
-                }
-                self.runtime
-                    .install_replacement_inbound_build_authority(&authority)
-                    .await
-                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
-            }
-            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
-                let state = self.store.load_state().await?;
-                if authority.attempt.target != state.identity.local_identity {
-                    return Err(crate::host::HostError::IdentityMismatch(
-                        "inbound build authority targets another replica".into(),
-                    ));
-                }
-                self.runtime
-                    .revoke_replacement_inbound_build_authority(&authority)
-                    .await
-                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
-            }
             PublicV1HistoryCommand::SessionRenewal { command } => {
                 self.execute_session_renewal(*command).await
             }
@@ -1025,7 +1001,7 @@ where
                 if survivor.identity == self.store.load_state().await?.identity.local_identity {
                     replay_role_at_epoch(
                         callbacks.replicator.as_ref(),
-                        self.runtime.native_role_epoch()?,
+                        None,
                         *epoch,
                         survivor.role,
                     )
@@ -1195,7 +1171,7 @@ where
             ProtocolCommand::PublicV1History(command) => {
                 if !matches!(command.as_ref(), PublicV1HistoryCommand::Initialize { .. }) {
                     return Err(Status::failed_precondition(
-                        "legacy engine-grant and renewal dispatch is unavailable in ordinary hosting format 15",
+                        "legacy renewal dispatch is unavailable in ordinary hosting format 16",
                     ));
                 }
                 self.execute_history(*command)
@@ -1810,7 +1786,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("unavailable in ordinary hosting format 15")
+                .contains("unavailable in ordinary hosting format 16")
         );
         assert_eq!(store.load_state().await.unwrap(), before);
         service

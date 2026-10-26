@@ -40,16 +40,16 @@ requires only the coherent ordinary bundle, not a companion or diagnostics.
 Read-only generic peer discovery is available through factory context; early
 publication permits recovery before achieved role scope. The host retains calls
 and actual ordinary Close-after-Abort settlement independently of RPC observers.
-Legacy `CustomReplicatorControl`/grant APIs remain for engine/component consumers
-awaiting M2; production does not dispatch that route.
+Shared companion/grant APIs have been removed. Engines own authenticated
+transfer sessions and their actual descendants through ordinary Abort/Close.
 
 ## Built-In Replicator
 
 `DefaultReplicatorFactory::new()` is the sole built-in factory. It constructs the
 source-guided Service Fabric classic V1 owners, with no engine persistence
-argument, selector, shadow writer, or fallback. **Ordinary production integration
-explicitly rejects before engine/listener effects until M2**. The following
-composition remains for native/component development, not a deployable M1 default.
+argument, selector, shadow writer, or fallback. Ordinary Open owns the real
+endpoint; Build uses engine-owned sessions rather than a controller attempt ID.
+This does not implement comprehensive M3 election, contraction or handoff policy.
 
 Applications call:
 
@@ -65,7 +65,7 @@ at most one provider writer.
 
 ## Durable Ownership
 
-- agent schema 15: identity, history, canonical goals/frozen actions/receipts,
+- agent schema 16: identity, history, canonical goals/frozen actions/receipts,
   source remote outcomes/watermarks, uncertainty and terminal
   completion;
 - provider: application bytes, progress, retained operations, copy state;
@@ -88,13 +88,15 @@ automatic retained-history reformation and comprehensive recovery remain M3.
 
 ## Public V1 Protocol
 
-Matched host/control/CRD format 15 is required. Serialized public values use
+Matched host/control/CRD format 16 is required. Serialized public values use
 the `identity` field. Prior identities and old report/command branches are rejected.
 
 The bounded tonic carrier authenticates with the host's agent bearer credential.
 Generic ordinary discovery binds current identity/storage/process/creation/
-endpoint/scope without an operation or target grant. Existing native carrier
-bindings remain component/M2 context, not a replacement-session completion claim.
+endpoint/scope without an operation or target grant. Engine sessions bind both
+current creations and fence effects independently of host operation identities.
+Negative Build evidence retains its exact ordinary goal and canonical digest;
+it cannot install or revive a native session.
 This is not TLS, native SF wire interoperability, or a replacement for network
 isolation and namespace RBAC.
 

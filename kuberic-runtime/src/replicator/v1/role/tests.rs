@@ -899,6 +899,7 @@ async fn role_handoff_retains_pending_actual_build_provider_for_explicit_later_d
             },
             rig.provider.clone(),
             BuildCallbacks {
+                fence: None,
                 replication: Arc::new(|_| true),
                 copy: Arc::new(|_| true),
                 context_ack: Arc::new(|_, _| true),
@@ -1062,6 +1063,7 @@ async fn primary_reported_build_fault_prevents_demotion_instead_of_creating_heal
             },
             rig.provider.clone(),
             BuildCallbacks {
+                fence: None,
                 replication: Arc::new(|_| true),
                 copy: Arc::new(|_| true),
                 context_ack: Arc::new(|_, _| true),

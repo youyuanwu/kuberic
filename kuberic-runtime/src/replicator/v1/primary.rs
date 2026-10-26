@@ -328,6 +328,13 @@ impl Root {
 pub(super) struct PrimaryHandle(Weak<Root>);
 
 impl PrimaryHandle {
+    #[cfg(feature = "testing")]
+    pub(super) fn inspect_recoveries(&self) -> serde_json::Value {
+        match self.root() {
+            Ok(root) => root.manager.lock().unwrap().inspect_recoveries(),
+            Err(_) => serde_json::Value::Null,
+        }
+    }
     pub(super) fn idle_replica_ids(&self) -> Result<Vec<i64>, PrimaryError> {
         let root = self.root()?;
         let state = root.state.lock().unwrap();
@@ -578,9 +585,20 @@ impl PrimaryHandle {
         provider: Arc<dyn StateProvider>,
         callbacks: BuildCallbacks,
     ) -> Result<BuildIdleHandle, PrimaryError> {
+        self.begin_build_with_cut(config, provider, callbacks, || {})
+    }
+
+    pub(super) fn begin_build_with_cut(
+        &self,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        acquired: impl FnOnce(),
+    ) -> Result<BuildIdleHandle, PrimaryError> {
         let root = self.root()?;
         let (handle, pending, start, _activity) = {
             let mut state = root.state.lock().unwrap();
+            acquired();
             Root::check_open(&state)?;
             root.check_route(&config.route)?;
             let route = config.route.clone();
@@ -607,6 +625,57 @@ impl PrimaryHandle {
         let result = pending.dispatch(root.clock.now());
         start.dispatch();
         result?;
+        Ok(handle)
+    }
+
+    pub(super) fn begin_recovery(
+        &self,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+    ) -> Result<BuildIdleHandle, PrimaryError> {
+        let root = self.root()?;
+        let (handle, pending, start, _activity) = {
+            let mut state = root.state.lock().unwrap();
+            Root::check_open(&state)?;
+            root.check_route(&config.route)?;
+            let route = config.route.clone();
+            let old = state
+                .bindings
+                .get(&route.destination.replica)
+                .ok_or(PrimaryError::UnknownSession(route.destination.replica))?;
+            if old.idle
+                || match &old.owner {
+                    SessionOwner::Build(build) => {
+                        !build.result().is_some_and(|end| end.result.is_ok())
+                    }
+                    SessionOwner::Established(_) => true,
+                }
+            {
+                return Err(PrimaryError::InvalidBinding(route.destination.replica));
+            }
+            let (build, pending, start) = BuildIdle::prepare_recovery(
+                &root.manager,
+                config,
+                provider,
+                callbacks,
+                root.clock.clone(),
+            )?;
+            let handle = build.handle();
+            state.bindings.insert(
+                route.destination.replica,
+                Binding {
+                    route,
+                    session: handle.session(),
+                    owner: SessionOwner::Build(handle.clone()),
+                    idle: false,
+                },
+            );
+            state.queued.push(build);
+            (handle, pending, start, root.activity(&mut state))
+        };
+        pending.dispatch(root.clock.now())?;
+        start.dispatch();
         Ok(handle)
     }
 
@@ -670,13 +739,34 @@ impl PrimaryHandle {
     }
 
     pub(super) fn remove_idle(&self, id: i64) -> Result<(), PrimaryError> {
+        self.remove_idle_selected(id, false, |native_idle| {
+            native_idle
+                .then_some(())
+                .ok_or(super::replica_manager::ConfigurationError::IdleNotFound(id).into())
+        })
+    }
+
+    pub(super) fn remove_idle_with(
+        &self,
+        id: i64,
+        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
+    ) -> Result<(), PrimaryError> {
+        self.remove_idle_selected(id, true, before_remove)
+    }
+
+    fn remove_idle_selected(
+        &self,
+        id: i64,
+        exclude_voters: bool,
+        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
+    ) -> Result<(), PrimaryError> {
         let root = self.root()?;
         let (effects, _activity) = {
             let mut state = root.state.lock().unwrap();
             Root::check_open(&state)?;
             let effects = {
                 let mut manager = root.manager.lock().unwrap();
-                let effects = manager.remove_idle(id)?;
+                let effects = manager.remove_idle_with(id, exclude_voters, before_remove)?;
                 if !manager.contains_session(id) {
                     state.bindings.remove(&id);
                 } else if let Some(binding) = state.bindings.get_mut(&id) {
@@ -688,6 +778,31 @@ impl PrimaryHandle {
         };
         effects.dispatch(root.clock.now())?;
         Ok(())
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_session(&self, id: i64) -> ReplicationSession {
+        self.root().unwrap().state.lock().unwrap().bindings[&id]
+            .session
+            .clone()
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_build(&self, id: i64) -> BuildIdleHandle {
+        match &self.root().unwrap().state.lock().unwrap().bindings[&id].owner {
+            SessionOwner::Build(build) => build.clone(),
+            _ => panic!("actual completed Build owner required"),
+        }
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn removal_membership(&self, id: i64) -> (bool, bool, bool) {
+        self.root()
+            .unwrap()
+            .manager
+            .lock()
+            .unwrap()
+            .removal_membership(id)
     }
 
     fn select(
@@ -730,12 +845,13 @@ impl PrimaryHandle {
         envelope: &wire::Envelope,
     ) -> Result<ContextObservation, PrimaryError> {
         let (_root, binding, _activity) = self.select(envelope)?;
-        if !binding.idle {
-            return Err(PrimaryError::NotBuilding(binding.route.destination.replica));
-        }
-
         match binding.owner {
-            SessionOwner::Build(build) => Ok(build.receive_context(envelope)?),
+            SessionOwner::Build(build) if binding.idle || build.result().is_none() => {
+                Ok(build.receive_context(envelope)?)
+            }
+            SessionOwner::Build(_) => {
+                Err(PrimaryError::NotBuilding(binding.route.destination.replica))
+            }
             SessionOwner::Established(_) => {
                 Err(PrimaryError::NotBuilding(binding.route.destination.replica))
             }
@@ -753,7 +869,11 @@ impl PrimaryHandle {
         let (root, binding, _activity) = self.select(envelope)?;
         match binding.owner {
             SessionOwner::Build(build) => {
-                build.receive_ack_for_role(envelope, binding.idle, || root.progress())?;
+                build.receive_ack_for_role(
+                    envelope,
+                    binding.idle || build.result().is_none(),
+                    || root.progress(),
+                )?;
             }
             SessionOwner::Established(copy) => {
                 let Some(wire::envelope::Body::ReplicationAck(body)) = &envelope.body else {

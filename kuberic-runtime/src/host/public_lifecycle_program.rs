@@ -464,6 +464,7 @@ pub(super) async fn execute(
                 {
                     return Err(HostError::IdentityMismatch("open context changed".into()));
                 }
+                let partition = context.partition.clone();
                 let control = match callbacks.application.clone().open(context).await {
                     Ok(control) => control,
                     Err(error) => {
@@ -473,6 +474,12 @@ pub(super) async fn execute(
                 };
                 if !callbacks.application_control_matches(&control) {
                     callbacks.abort_once();
+                    control.abort();
+                    if let Err(error) = control.close().await {
+                        partition.record_creation_cleanup_failure(format!(
+                            "different returned Replicator Close failed: {error}"
+                        ));
+                    }
                     return Err(HostError::IdentityMismatch(
                         "application returned a different Replicator".into(),
                     ));
@@ -516,12 +523,7 @@ pub(super) async fn execute(
                         // exact renewal may advance its epoch without same-role ChangeRole.
                         crate::host::service::replay_role_at_epoch(
                             callbacks.replicator.as_ref(),
-                            callbacks
-                                .native_role_epoch
-                                .as_ref()
-                                .map(|observe| observe())
-                                .transpose()?
-                                .flatten(),
+                            None,
                             epoch,
                             role,
                         )
@@ -668,11 +670,6 @@ pub(super) async fn execute(
                     unreachable!()
                 };
                 let mut replica = ReplicaInformation::idle_build(
-                    if intent.goal().is_some() {
-                        crate::protocol::types::OperationId::default()
-                    } else {
-                        build.attempt.clone()
-                    },
                     build.replica.clone(),
                     build.replication_address.clone(),
                 );

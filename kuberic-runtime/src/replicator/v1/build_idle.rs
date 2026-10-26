@@ -45,6 +45,7 @@ pub(super) struct BuildConfig {
 
 #[derive(Clone)]
 pub(super) struct BuildCallbacks {
+    pub(super) fence: Option<super::service_adapter::engine_session::Fence>,
     pub(super) replication: Arc<dyn Fn(SendIntent) -> bool + Send + Sync>,
     pub(super) copy: Arc<dyn Fn(CopySendAction) -> bool + Send + Sync>,
     pub(super) context_ack: Arc<dyn Fn(CopyContextAck, bool) -> bool + Send + Sync>,
@@ -358,6 +359,34 @@ impl BuildIdle {
         callbacks: BuildCallbacks,
         clock: Clock,
     ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
+        Self::prepare_transfer(manager, config, provider, callbacks, clock, false)
+    }
+
+    pub(super) fn prepare_recovery(
+        manager: &Arc<Mutex<ReplicaManager>>,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        clock: Clock,
+    ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
+        Self::prepare_transfer(manager, config, provider, callbacks, clock, true)
+    }
+
+    fn prepare_transfer(
+        manager: &Arc<Mutex<ReplicaManager>>,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        clock: Clock,
+        recovery: bool,
+    ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
+        if callbacks
+            .fence
+            .as_ref()
+            .is_some_and(|fence| fence.check().is_err())
+        {
+            return Err(EstablishError::Cancelled.into());
+        }
         config.route.validate().map_err(EstablishError::from)?;
         if config.route.source.partition != config.route.destination.partition {
             return Err(EstablishError::from(ProtocolError::Shape("cross-partition build")).into());
@@ -386,6 +415,7 @@ impl BuildIdle {
             callbacks.context_ack,
             clock.clone(),
         )?;
+        establishment.fence = callbacks.fence;
         let handle = BuildIdleHandle(Arc::new(Root {
             manager: Arc::downgrade(manager),
             establishment: establishment.handle(),
@@ -397,15 +427,22 @@ impl BuildIdle {
             alive: AtomicBool::new(true),
             terminal: Mutex::new(None),
         }));
-        let (pending, start) = manager.lock().unwrap().admit_build(
-            EstablishedIdle {
-                replica_id,
-                session,
-                finish_copy_target: None,
-            },
-            handle.clone(),
-            &mut establishment,
-        )?;
+        let member = EstablishedIdle {
+            replica_id,
+            session,
+            finish_copy_target: None,
+        };
+        let (pending, start) = if recovery {
+            manager
+                .lock()
+                .unwrap()
+                .admit_recovery(member, handle.clone(), &mut establishment)?
+        } else {
+            manager
+                .lock()
+                .unwrap()
+                .admit_build(member, handle.clone(), &mut establishment)?
+        };
         let owner = Self {
             handle,
             establishment,

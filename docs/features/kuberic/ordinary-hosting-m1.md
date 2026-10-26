@@ -1,10 +1,16 @@
 # Ordinary Hosting M1
 
-**IMPLEMENTED: generic host/controller contract.** This is a development
-checkpoint, **not a deployable default-engine stack**. Built-in V1, KVStore2,
-SQLite, the external provider example and PostgreSQL explicitly reject ordinary
-production integration before their Open effects. Their authenticated engine
-sessions and ordinary lifecycle integration are **M2, not implemented**.
+**IMPLEMENTED: generic host/controller contract and bounded M2 integration.**
+Built-in V1, KVStore2, SQLite, the external provider and independent PostgreSQL
+now use ordinary hosting, engine-owned authenticated sessions and retained
+native/transport/application Close. Applicable M2 implementation acceptance
+passed through the independent Phase 6 review; documentation implementation
+review and actual independent final Sol/Astra gates remain pending.
+This is an experimental development checkpoint, not production certification.
+See the bounded
+[engine](testing.md#built-in-m2-engine-slice) and
+[application selections](testing.md#built-in-m2-application-slice), not a claim
+that the complete M2 workflow or historical recovery journeys are qualified.
 Comprehensive recovery/failover qualification is **M3, not implemented**.
 See the [roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap).
 
@@ -24,7 +30,7 @@ status pruning; this is not a live-cluster or native Service Fabric execution.
 | Engine/service | Real endpoint and authenticated native recovery/transfer, application data, effect fencing and ordinary descendant joining |
 
 The [production reconciler](../../../kuberic-controller/src/reconciler.rs#L670)
-uses [ordinary reconciliation](../../../kuberic-controller/src/ordinary_reconciliation.rs#L226).
+uses [ordinary reconciliation](../../../kuberic-controller/src/ordinary_reconciliation.rs#L238).
 It first retains independent Discover/Open goals for eligible peers. Once their
 actual endpoints exist, it retains role/scope preparation, including Prepare
 IdleSecondary on a Build target. It then calls ordinary source Build, accepts
@@ -33,8 +39,8 @@ catch-up for voting/access. It never installs or revokes a target engine grant.
 Fresh metadata provisioning remains an authenticated initialization command;
 legacy callback-program, grant and renewal production dispatch rejects.
 
-The [canonical CRD goal](../../../kuberic-controller/src/crd.rs#L80) replaces
-controller command JSON. The [local operation owner](../../../kuberic-runtime/src/host/ordinary_goal.rs#L177)
+The [canonical CRD goal](../../../kuberic-controller/src/crd.rs) replaces
+controller command JSON. The [local operation owner](../../../kuberic-runtime/src/host/ordinary_goal.rs)
 freezes its ordinary actions and receipts in the existing journal, not a parallel
 readiness ledger. Controller recreation resumes exact retained goals. A task
 does not reappear merely because its durable goal remains.
@@ -89,6 +95,19 @@ Ready removal on a still valid Open/Primary source calls ordinary Remove and
 retires **local** idle ownership only. It is not proof of target receiver
 drainage. InBuild cancellation uses a whole-creation Abort goal, never Remove
 on an aborted allocation; target settlement is separate.
+The built-in engine takes the session effect gate **before** the native
+state/manager locks, matching authenticated ingress. Under those native locks,
+it excludes both current and previous voting membership, even when the peer
+also retains native idle membership, before fencing or removing anything.
+Rejected voter Remove changes neither endpoint's session, native sender/build,
+transport nor ACK owner. Legal idle removal still fences synchronously under
+the same configuration-adoption lock and retains remote
+retirement/join work even if its caller disappears.
+An exact owned transfer still awaiting native Build may also be cancelled,
+but only after the same native lock excludes current/previous voters.
+The facade rechecks the peer's effect fence while selecting configuration
+inside its native command actor, so an already validated queued callback
+cannot readopt a legally removed peer while its metadata is still retained.
 Acknowledging the exact retained settled Remove result is retryable after its
 negative watermark is committed, including a lost reply or later controller
 status conflict. It never repeats Remove or proves target containment.
@@ -111,7 +130,7 @@ use ordinary callbacks; incompatible replacement requires withdrawal:
 3. Acknowledge containment/release the provider writer only after actual required
    success, or independently verified process containment.
 
-[Settlement](../../../kuberic-runtime/src/host/hosting.rs#L1320) retains sticky
+[Settlement](../../../kuberic-runtime/src/host/hosting.rs#L1079) retains sticky
 errors and joins late factory allocations as well as registered children.
 Failed preparation uses the same barrier. A child Close error remains a failed
 public outcome even after other descendants join. Failed/lost/hung joining
@@ -124,13 +143,26 @@ Matching-format restart preserves goals, selected-call uncertainty and applicati
 bytes, but invalidates old process-bound publication. Fresh Open advertises fresh
 DiscoveryPending; old interrupted Build is uncertain, never replayed as success.
 Fresh recovery/callback evidence is required before achieved eligibility.
+The ordinary reconciler retries the exact retained Discover identity while its
+response or publication is outstanding, then reobserves before selecting more
+work. It must not append a second Discover from a pre-submission snapshot.
+Settled predecessor terminal goals remain retained but cannot block a newly
+contained process's preparation or supply its activation receipt. Singleton
+reopening selects fresh current-process catch-up and refreshes its session only
+after actual achieved primary scope and granted access; this is not remote-peer
+readmission or recovery-election policy.
+The live secondary-reopen oracle uses authenticated ordinary snapshots, exact
+retained goal outcomes and the current publication/storage/process/creation
+and topology session, not legacy callback completions or advisory role strings.
 The qualified crash-image fixture is not process-kill, power-loss or exhaustive
 M3 recovery evidence.
 
 ## Fresh-deployment format
 
 Host schema, control identity/envelopes and required
-`KubericSet.spec.hostingFormat` are **15**. Retained CRD goals/outcomes are
+`KubericSet.spec.hostingFormat` are **16**, including generated CRD, shipped
+sample and fixtures. M1's original format-15 acceptance is historical, not a
+supported reader. Retained CRD goals/outcomes are
 structurally typed and canonically validated. Old/missing/mixed formats and
 legacy retained commands reject before authoritative mutation.
 
@@ -162,24 +194,99 @@ receipt gaps, exact Ready/separate admission, failed preparation, retained
 engine/service/host joins, writer fencing, tombstones/bounds and matching-format
 uncertainty. [Testing](testing.md#ordinary-hosting-m1) records validation scope.
 
-Old built-in/PG/controller journey names now assert exact **M2 unavailable**
-where their production integration was removed. Their later historical property
-clauses do not execute at this checkpoint. A green wrapper is **not** evidence
-of built-in copy, PG SQL/WAL/replay or old failover/terminal behavior. Actual
-native/component and generic host negatives run separately. Remaining legacy
-companion/grant APIs serve those not-yet-moved engine consumers/components;
-they are not a production fallback or required by the ordinary M1 route.
+Actual built-in/application and independent PG witnesses execute copy, ACK,
+native SQL/WAL/replay and real joining. Former unavailable wrappers and
+grant-era fixtures have been converted; shared companion/grant/control fields
+are removed. Their assertions now live at ordinary host or concrete engine
+owners, rather than disappearing with the old API.
+Historical broad bodies remain enabled and red at their actual later limits.
+The [evidence boundary](testing.md#m2-accepted-evidence-and-remaining-boundaries)
+records aggregate infrastructure termination, complete native complements,
+changed-primary handoff and replacement/election diagnostics without crediting
+unexecuted suffixes. Duplicate Discover, incomplete retained-member copy and
+stale predecessor-terminal Build veto were M2 defects and are now repaired,
+not deferred as M3.
 
 Automatic admitted contraction, planned primary replacement and retained-history
 election/reformation are explicitly unavailable or waiting for fresh evidence.
-M2 must move actual built-in/PG consumers, qualify authenticated session retirement/
-effect fencing and ordinary joining, then delete superseded consumer paths.
 M3 must qualify the full crash/failover/replacement matrix.
 PG durable metadata, WAL/backup/slots/lineage and physical SQL/process obligations
 remain; [metadata removal](../postgres/stateless-metadata-prerequisites.md) is
 separately deferred.
 
 Bearer authentication is not TLS or hostile-administrator/orphan protection.
-No native executable differential, live Kubernetes/Kind, power-loss, downstream
+Full owned live bootstrap passed on the exact recovery image source recorded
+in [testing](testing.md#m2-accepted-evidence-and-remaining-boundaries); it predates
+the final terminal-owner controller repair and is not its live qualification.
+No native executable differential, power-loss, downstream
 MySQL, broad settings/security or production-readiness certification is claimed.
 Existing [source provenance and notices](sf-v1-port-provenance.md) remain.
+
+### Bounded M2 retained-member recovery repair
+
+The built-in engine now distinguishes recovery of an admitted secondary from
+fresh idle Build. With an unchanged available Primary, current configuration,
+epoch and history, a fresh process on the same established storage reserves a
+new authenticated private session while DiscoveryPending. The source verifies
+its retained completed predecessor, fences and joins the old carrier/effect/ACK
+owners, and replaces the native sender without changing membership or inheriting
+ACK credit. Actual provider copy/context and replication-boundary acknowledgements
+must finish before ProgramEpoch and the ordinary preparation outcome succeed.
+Transfer traffic remains nonvoting until the source's ordinary configuration
+callback selects the completed sender. The incomplete-copy guard remains intact.
+
+KV supplies the complete retained committed prefix as copy context. The source
+checks that prefix against its own history before returning a nonregressing
+snapshot; the application committer durably installs it before opening the
+replication consumer. Incomplete, corrupt or conflicting inputs fail closed,
+without resetting application data. Retirement retains uncertainty and receiver
+reservation; late copy cannot install into a successor.
+
+Before spawning recovery work, the source reserves an exact attempt in its
+existing creation-bounded session owner. Only one nonce may replace a given
+target/predecessor; exact duplicates attach to its retained immutable result.
+Pending and failed attempts consume that budget too. Exhaustion rejects before
+allocating results or spawning work, without TTL-forgetting uncertainty.
+After discovery awaits, the captured reservation and source publication must
+still match. Predecessor removal compares the complete binding under the peer
+map lock; a stale recovery cannot take a successor's carrier or ACK owner.
+
+Recovery completion observers await that exact retained source result instead
+of treating unfinished work as QueueFull and repeatedly serializing authenticated
+poll requests. Waiting observers remain bounded by the existing control budget,
+with capacity left for activation and ACK progress. After the result settles,
+the source still revalidates the current binding and actual completion; neither
+waiting nor an old successful result grants admission after retirement.
+
+The outgoing carrier's first stream binding and tracked connection child are
+registered under the exact session effect gate before native Build can send
+StartCopy. An unpolled connection owner therefore retains that first frame
+instead of losing it until the sender's retry timer. Retirement still joins
+the actual connection child, including work held in publication validation;
+binding a stream does not bypass authenticated peer admission or grant ACK
+credit.
+
+The controller accepts the exact fresh preparation, then obtains ordinary source
+configuration/catch-up and target reconfiguration outcomes before updating the
+topology session. The source callback validates its retained completed recovery
+session, not descriptor numbers alone. Fresh voter additions still require exact
+two-ended Ready, configuration receipts and separate access admission.
+
+`TestCluster::request_restart` observes a real fresh, unadmitted process;
+`restart` additionally settles the configured membership cardinality. Native KV
+recovery tests preserve acknowledged data, closed recovery access, fresh ongoing
+replication and post-restart quorum writes. This bounded repair is part of
+accepted M2 implementation evidence, not general M3 election, primary
+replacement, contraction or handoff qualification.
+
+An achieved predecessor Close remains in retained history after restart, but
+does not veto a fresh idle Build for the admitted new process/creation. Both
+Build submission and later scheduling use the same exact live storage/process/
+creation terminal check. A current owner's Abort or Close still blocks Build,
+including pending, failed or uncertain settlement; no terminal history is
+discarded and exact two-ended Ready and separate voter/access admission remain
+required. Production-controller regressions observe the actual native target
+copy before acceptance, and KV growth checks acknowledged `retained`/`later`
+values plus continuing replication before requesting any replacement. The
+historical scenario's subsequent secondary replacement remains a separate M3
+diagnostic, not a fresh-growth acceptance waiver.

@@ -15,6 +15,8 @@ use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
+#[path = "public_endpoint.rs"]
+mod public_endpoint;
 #[path = "public_transport.rs"]
 mod public_transport;
 #[path = "public_v1.rs"]
@@ -93,7 +95,7 @@ struct PgConfiguration {
 
 pub struct PgReplicator {
     public_v1: std::sync::OnceLock<public_v1::PublicPg>,
-    fault_owner: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    fault_owner: std::sync::Mutex<Vec<crate::owned_task::PgTask>>,
     instance: Arc<PgInstanceManager>,
     durable: Arc<PgDurableStore>,
     observer: PgNativeObserver,
@@ -195,7 +197,7 @@ impl PgReplicator {
     ) -> Self {
         Self {
             public_v1: std::sync::OnceLock::new(),
-            fault_owner: Mutex::new(None),
+            fault_owner: std::sync::Mutex::new(Vec::new()),
             observer: PgNativeObserver::with_store(instance.clone(), durable.clone()).await,
             instance,
             durable,
@@ -520,9 +522,7 @@ impl PgReplicator {
         let target = configuration
             .replicas
             .iter()
-            .find(|r| {
-                r.identity == request.authority.target && r.build_id == request.authority.build_id
-            })
+            .find(|r| r.identity == request.authority.target)
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
         let source = configuration
             .replicas
@@ -1250,6 +1250,9 @@ impl PgReplicator {
     }
 
     fn abort(&self) {
+        if self.is_public_v1() {
+            self.public_abort();
+        }
         self.cancellation.cancel();
         if self.public_closed() {
             return;
@@ -1422,11 +1425,11 @@ impl PgReplicator {
         kuberic_runtime::protocol::validation::validate_configuration(&current.configuration, None)
             .map_err(application_error)?;
         let mut builds = BTreeMap::new();
-        for replica in current.replicas.iter().filter(|r| !r.build_id.is_empty()) {
+        for replica in &current.replicas {
             if builds
                 .insert(
                     replica.identity.replica_id,
-                    (&replica.identity, &replica.build_id),
+                    (&replica.identity, &replica.process_session_id),
                 )
                 .is_some()
             {
@@ -1467,10 +1470,19 @@ impl PgReplicator {
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        if current.replicas.iter().any(|r| {
-            durable.build_epoch == Some(current.configuration.epoch)
-                && durable.retired_builds.contains(&r.build_id)
-        }) {
+        if durable
+            .native_build
+            .iter()
+            .chain(&durable.outbound_builds)
+            .chain(&durable.suspended_builds)
+            .any(|build| {
+                durable.build_epoch == Some(current.configuration.epoch)
+                    && crate::build::native_build_selected(&build.request, &current)
+                    && durable
+                        .retired_builds
+                        .contains(&build.request.authority.build_id)
+            })
+        {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         let local = &durable.identity.replica;
@@ -1524,10 +1536,7 @@ impl PgReplicator {
             if !admitted_standby
                 && !becoming_primary
                 && !recovering_standby
-                && !current
-                    .replicas
-                    .iter()
-                    .any(|r| r.identity == *local && r.build_id == build.request.authority.build_id)
+                && !crate::build::native_build_selected(&build.request, &current)
             {
                 self.stop().await?;
             }
@@ -1840,8 +1849,35 @@ impl PgReplicator {
                 .await
                 .clone()
                 .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            let build_id = durable
+                .outbound_builds
+                .iter()
+                .chain(&durable.suspended_builds)
+                .find(|build| {
+                    crate::build::native_build_selected(&build.request, &configuration)
+                        && build.request.authority.target == replica.identity
+                        && build.request.target_session == replica.process_session_id
+                })
+                .map(|build| build.request.authority.build_id.clone())
+                .unwrap_or_else(|| {
+                    use sha2::{Digest, Sha256};
+                    let input = serde_json::to_vec(&(
+                        "pg-native-build",
+                        &durable.identity,
+                        durable.generation,
+                        &configuration.configuration,
+                        &replica.identity,
+                        &replica.process_session_id,
+                        &replica.replication_address,
+                    ))
+                    .expect("native build identity serialization");
+                    OperationId::new(format!(
+                        "pg-native-{:x}",
+                        bytes::Bytes::copy_from_slice(&Sha256::digest(input))
+                    ))
+                });
             let authority = BuildAuthority {
-                build_id: replica.build_id.clone(),
+                build_id,
                 kind: if configuration
                     .configuration
                     .members
@@ -2082,7 +2118,17 @@ impl PrimaryReplicator for PgReplicator {
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
         if self.is_public_v1() {
-            return self.public_configuration(current, Some(previous)).await;
+            let empty_previous = previous.replicas.is_empty()
+                && previous.configuration
+                    == ConfigurationDescriptor::new(
+                        current.configuration.epoch,
+                        current.configuration.primary_id,
+                        Vec::new(),
+                        0,
+                    );
+            return self
+                .public_configuration(current, (!empty_previous).then_some(previous))
+                .await;
         }
         self.install_configuration_pair(current, Some(previous.configuration))
             .await

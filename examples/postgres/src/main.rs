@@ -8,10 +8,9 @@ use kuberic_runtime::StatefulServiceReplica;
 use kuberic_runtime::host::ReplicaEndpointResolver;
 use kuberic_runtime::host::{ReplicaHost, ReplicaProcessConfig, RunningReplica};
 use kuberic_runtime::protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaIdentity, ResourceUid};
-use postgres_replicated::{PgService, PgServiceConfig, data_service::PgDataServiceImpl};
+use postgres_replicated::{PgService, PgServiceConfig};
 
 type ProcessResult = Result<(), Box<dyn std::error::Error>>;
-type CoordinationTask = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Parser)]
@@ -182,7 +181,9 @@ async fn run() -> ProcessResult {
         }
     }
     let application = Arc::new(
-        PgService::deferred(service_config).with_coordination_token(coordination_token.clone()),
+        PgService::deferred(service_config)
+            .with_coordination_token(coordination_token)
+            .with_listener_address(config.application_address),
     );
     let local_identity = ReplicaIdentity {
         replica_id: ReplicaId::new(config.replica_id),
@@ -238,7 +239,7 @@ async fn run() -> ProcessResult {
     let mut replica = match started {
         Ok(Ok(Some(replica))) => {
             if let Some(trigger) = trigger {
-                return finish_shutdown(replica, &application, None, None, trigger).await;
+                return finish_shutdown(replica, &application, None, trigger).await;
             }
             replica
         }
@@ -256,45 +257,17 @@ async fn run() -> ProcessResult {
             .await;
         }
     };
-    let listener = match tokio::net::TcpListener::bind(config.application_address).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            return finish_shutdown(replica, &application, None, None, Err(error.into())).await;
-        }
+    let (completion, result) = tokio::select! {
+        result = replica.wait() => (Some(result), Ok(())),
+        result = &mut signal => (None, result.map_err(Box::<dyn std::error::Error>::from)),
     };
-    let mut shutdown = replica.shutdown_signal();
-    let coordination_service = PgDataServiceImpl::new(application.clone(), coordination_token);
-    let mut coordination = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(coordination_service.into_server())
-            .serve_with_incoming_shutdown(
-                tokio_stream::wrappers::TcpListenerStream::new(listener),
-                async move {
-                    let _ = shutdown.wait_for(|stopped| *stopped).await;
-                },
-            )
-            .await
-    });
-    let (completion, result, coordination_finished) = tokio::select! {
-        result = replica.wait() => (Some(result), Ok(()), false),
-        result = &mut coordination => (None, flatten_coordination(result), true),
-        result = &mut signal => (None, result.map_err(Box::<dyn std::error::Error>::from), false),
-    };
-    finish_shutdown(
-        replica,
-        &application,
-        completion,
-        (!coordination_finished).then_some(coordination),
-        result,
-    )
-    .await
+    finish_shutdown(replica, &application, completion, result).await
 }
 
 async fn finish_shutdown(
     mut replica: RunningReplica,
     application: &PgService,
     completion: Option<kuberic_runtime::host::Result<()>>,
-    coordination: Option<CoordinationTask>,
     trigger: ProcessResult,
 ) -> ProcessResult {
     replica.shutdown();
@@ -304,17 +277,7 @@ async fn finish_shutdown(
         Some(result) => result,
         None => replica.wait().await,
     };
-    let mut result = with_cleanup(completion.map_err(Into::into), trigger, "shutdown trigger");
-    if let Some(coordination) = coordination {
-        // Runtime shutdown has revoked process authority. Cancel retained RPCs,
-        // join their cleanup, and do not wait on a peer to close an HTTP/2 stream.
-        coordination.abort();
-        let cleanup = match coordination.await {
-            Err(error) if error.is_cancelled() => Ok(()),
-            result => flatten_coordination(result),
-        };
-        result = with_cleanup(result, cleanup, "coordination shutdown");
-    }
+    let result = with_cleanup(completion.map_err(Into::into), trigger, "shutdown trigger");
     finish_application(application, result).await
 }
 
@@ -331,14 +294,6 @@ async fn finish_application(application: &PgService, result: ProcessResult) -> P
         );
     }
     with_cleanup(result, cleanup, "application shutdown")
-}
-
-fn flatten_coordination(
-    result: Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>,
-) -> ProcessResult {
-    result
-        .map_err(Box::<dyn std::error::Error>::from)?
-        .map_err(Into::into)
 }
 
 fn with_cleanup(primary: ProcessResult, cleanup: ProcessResult, context: &str) -> ProcessResult {

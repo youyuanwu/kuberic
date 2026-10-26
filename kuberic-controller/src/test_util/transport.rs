@@ -515,6 +515,25 @@ impl Network {
         destination: &str,
         endpoint: &str,
     ) -> Result<String> {
+        // These engine cuts observe local work; unlike the control/data kinds,
+        // their endpoint is local and their return value is not a socket dial.
+        if matches!(
+            kind,
+            TestingTcpRouteKind::ConfirmReceived
+                | TestingTcpRouteKind::BeforeDispatch
+                | TestingTcpRouteKind::BeforeCredit
+                | TestingTcpRouteKind::AfterContext
+                | TestingTcpRouteKind::BuildResult
+                | TestingTcpRouteKind::BeforeDelivery
+                | TestingTcpRouteKind::RetireResponse
+                | TestingTcpRouteKind::RecoveryDiscovery
+                | TestingTcpRouteKind::RecoveryReceived
+                | TestingTcpRouteKind::ConfigurationValidated
+                | TestingTcpRouteKind::ConfigurationAdmitted
+                | TestingTcpRouteKind::RemoveAdmitted
+        ) {
+            return Ok(endpoint.to_owned());
+        }
         self.route_inner(Some(kind), source, destination, endpoint)
             .await
     }
@@ -667,6 +686,10 @@ impl Network {
         Self::healthy(&state)
     }
 
+    pub(super) async fn retain_cleanup_failure(&self, error: String) {
+        self.0.state.lock().await.fatal.push(error);
+    }
+
     pub async fn assert_drained(&self) -> Result<()> {
         let state = self.0.state.lock().await;
         ensure!(
@@ -685,6 +708,63 @@ impl Network {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn m2_ordinary_local_engine_cuts_do_not_reassign_socket_endpoint_ownership() -> Result<()>
+    {
+        let network = Network::default();
+        let backend = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", backend.local_addr()?);
+        let routed = network
+            .route_data(
+                TestingTcpRouteKind::EngineConfirm,
+                "target",
+                "source",
+                &endpoint,
+            )
+            .await?;
+        for cut in [
+            TestingTcpRouteKind::ConfirmReceived,
+            TestingTcpRouteKind::BeforeDispatch,
+            TestingTcpRouteKind::BeforeCredit,
+            TestingTcpRouteKind::AfterContext,
+            TestingTcpRouteKind::BuildResult,
+            TestingTcpRouteKind::BeforeDelivery,
+            TestingTcpRouteKind::RetireResponse,
+            TestingTcpRouteKind::RecoveryDiscovery,
+            TestingTcpRouteKind::RecoveryReceived,
+            TestingTcpRouteKind::ConfigurationValidated,
+            TestingTcpRouteKind::ConfigurationAdmitted,
+            TestingTcpRouteKind::RemoveAdmitted,
+        ] {
+            assert_eq!(
+                network
+                    .route_data(cut, "source", "target", &endpoint)
+                    .await?,
+                endpoint
+            );
+        }
+        assert_eq!(
+            network
+                .route_data(
+                    TestingTcpRouteKind::EngineConfirm,
+                    "target",
+                    "source",
+                    &endpoint
+                )
+                .await?,
+            routed
+        );
+        let (mut client, mut server) = connect(&routed, &backend).await?;
+        client.write_all(b"authenticated-transport").await?;
+        let mut received = [0; 23];
+        server.read_exact(&mut received).await?;
+        assert_eq!(&received, b"authenticated-transport");
+        drop(client);
+        drop(server);
+        network.finish().await?;
+        network.assert_drained().await
+    }
 
     fn already_active<T>(result: Result<T>) {
         let Err(error) = result else {

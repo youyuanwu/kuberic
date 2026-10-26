@@ -1,6 +1,7 @@
 use super::{ReplicaRef, ResourceRef};
-use crate::crd::{KubericSet, PublicV1OperationStatus, PublicV1TransitionState};
-use kuberic_runtime::protocol::public_operations::{PublicOperationProgram, PublicV1CallKind};
+use crate::crd::{KubericSet, RetainedReplicaGoal};
+use kuberic_runtime::protocol::public_operations::{PublicV1CallKind, ReplicaGoal};
+use kuberic_runtime::protocol::types::ReplicaRole;
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
@@ -19,6 +20,12 @@ pub enum Barrier {
     Operation {
         stage: BarrierStage,
         kind: Option<PublicV1CallKind>,
+        participant: Option<ReplicaRef>,
+    },
+    /// Selects a whole Prepare/Reconfigure goal, not an inner role callback.
+    Role {
+        stage: BarrierStage,
+        role: ReplicaRole,
         participant: Option<ReplicaRef>,
     },
     SwitchoverPeerEpoch {
@@ -52,14 +59,18 @@ impl Barrier {
     }
     pub(super) fn stage(&self) -> BarrierStage {
         match self {
-            Self::Operation { stage, .. } | Self::SwitchoverHandoff { stage, .. } => *stage,
+            Self::Operation { stage, .. }
+            | Self::Role { stage, .. }
+            | Self::SwitchoverHandoff { stage, .. } => *stage,
             Self::SwitchoverPeerEpoch { .. } => BarrierStage::Intent,
             Self::SwitchoverPeerConfiguration { .. } => BarrierStage::Completion,
         }
     }
     pub(super) fn participant(&self) -> Option<&ReplicaRef> {
         match self {
-            Self::Operation { participant, .. } => participant.as_ref(),
+            Self::Operation { participant, .. } | Self::Role { participant, .. } => {
+                participant.as_ref()
+            }
             Self::SwitchoverPeerEpoch { peer, .. }
             | Self::SwitchoverPeerConfiguration { peer, .. } => Some(peer),
             Self::SwitchoverHandoff { source, .. } => Some(source),
@@ -67,58 +78,77 @@ impl Barrier {
     }
     pub(super) fn request(&self) -> Option<&SwitchoverRequest> {
         match self {
-            Self::Operation { .. } => None,
+            Self::Operation { .. } | Self::Role { .. } => None,
             Self::SwitchoverPeerEpoch { request, .. }
             | Self::SwitchoverPeerConfiguration { request, .. }
             | Self::SwitchoverHandoff { request, .. } => Some(request),
         }
     }
-    pub(super) fn matches(&self, object: &serde_json::Value) -> bool {
-        let Ok(set) = serde_json::from_value::<KubericSet>(object.clone()) else {
-            return false;
-        };
-        let Some(status) = set.status else {
-            return false;
-        };
-        let Some(operation) = status.public_v1_operation else {
-            return false;
-        };
-        let Ok(command) = operation.command() else {
-            return false;
-        };
-        if self.participant().is_some_and(|reference| {
-            !reference.matches_command(&command.target, &command.intent.process_session_id)
-        }) {
+    pub(super) fn matches_goal(&self, entry: &RetainedReplicaGoal, set: &KubericSet) -> bool {
+        use kuberic_runtime::protocol::public_operations::ReplicaGoalKind;
+
+        if entry.validate().is_err()
+            || set.metadata.uid.as_deref() != Some(entry.goal.scope.history.resource_uid.as_str())
+            || (self.stage() == BarrierStage::Completion) != entry.outcome.is_some()
+            || self.participant().is_some_and(|reference| {
+                !reference.matches_command(
+                    &entry.goal.scope.storage.replica,
+                    &entry.goal.scope.process_session_id,
+                ) || reference.storage_incarnation() != &entry.goal.scope.storage
+                    || reference.replicator_creation_id() != &entry.goal.scope.creation_id
+            })
+        {
             return false;
         }
-        if self.request().is_some_and(|request| {
-            status
-                .public_v1_topology
+        if let Some(request) = self.request() {
+            let pending = set
+                .status
                 .as_ref()
-                .and_then(|topology| topology.pending_switchover.as_ref())
-                .is_none_or(|pending| pending.request_id != request.id)
-        }) {
-            return false;
+                .and_then(|status| status.public_v1_topology.as_ref())
+                .and_then(|topology| topology.pending_switchover.as_ref());
+            let target = &request.target;
+            let scope = &entry.goal.scope;
+            let target_bound = (scope.storage == *target.storage_incarnation()
+                && scope.process_session_id == *target.process_session_id())
+                || scope.configuration.replicas.iter().any(|replica| {
+                    replica.identity == *target.identity()
+                        && replica.process_session_id == *target.process_session_id()
+                        && replica.storage_incarnation == *target.storage_incarnation()
+                });
+            if pending.is_none_or(|pending| {
+                pending.request_id != request.id
+                    || i64::from(pending.target_replica_id) != target.replica_id()
+            }) || !target_bound
+            {
+                return false;
+            }
         }
+        let role = match &entry.goal.desired {
+            ReplicaGoalKind::Prepare { role } | ReplicaGoalKind::Reconfigure { role, .. } => {
+                Some(*role)
+            }
+            _ => None,
+        };
         match self {
-            Self::Operation { kind, .. } => kind.as_ref().is_none_or(|kind| {
-                status
-                    .public_v1_transition
-                    .as_ref()
-                    .is_some_and(|transition| transition.call_kind == *kind)
+            Self::Operation { kind, .. } => kind.is_none_or(|kind| {
+                (kind == PublicV1CallKind::Role && role.is_some())
+                    || matches!(
+                        (&entry.goal.desired, kind),
+                        (ReplicaGoalKind::Build { .. }, PublicV1CallKind::Build)
+                            | (ReplicaGoalKind::Remove { .. }, PublicV1CallKind::Remove)
+                            | (ReplicaGoalKind::Close, PublicV1CallKind::Close)
+                            | (ReplicaGoalKind::Abort, PublicV1CallKind::Abort)
+                    )
             }),
-            Self::SwitchoverPeerEpoch { .. } => matches!(
-                command.intent.program,
-                Some(PublicOperationProgram::Epoch { .. })
-            ),
-            Self::SwitchoverPeerConfiguration { .. } => matches!(
-                command.intent.program,
-                Some(PublicOperationProgram::Configuration(_))
-            ),
-            Self::SwitchoverHandoff { .. } => matches!(
-                command.intent.program,
-                Some(PublicOperationProgram::Swap { .. })
-            ),
+            Self::Role { role: selected, .. } => role == Some(*selected),
+            Self::SwitchoverPeerEpoch { .. } | Self::SwitchoverPeerConfiguration { .. } => {
+                role == Some(ReplicaRole::ActiveSecondary)
+            }
+            Self::SwitchoverHandoff { request, .. } => {
+                role == Some(ReplicaRole::ActiveSecondary)
+                    && entry.goal.scope.configuration.current.primary_id
+                        == request.target.identity().replica_id
+            }
         }
     }
 }
@@ -139,35 +169,29 @@ impl SwitchoverRequest {
     }
 }
 
-/// Detached evidence of the exact persisted command and frozen transition.
+/// Detached evidence of the exact persisted controller status.
 #[derive(Clone, Debug)]
 pub struct OperationEvidence {
     set: KubericSet,
+    goal: Option<ReplicaGoal>,
 }
 impl OperationEvidence {
-    pub(super) fn new(set: KubericSet) -> Self {
-        Self { set }
+    pub(super) fn new(set: KubericSet, goal: Option<ReplicaGoal>) -> Self {
+        Self { set, goal }
     }
     pub fn set(&self) -> &KubericSet {
         &self.set
     }
-    pub fn operation(&self) -> &PublicV1OperationStatus {
+    /// The exact changed goal selected by the status barrier. A completion
+    /// conflict retains its prior, not-yet-accepted controller outcome.
+    pub fn goal(&self) -> Option<&RetainedReplicaGoal> {
+        let goal = self.goal.as_ref()?;
         self.set
             .status
-            .as_ref()
-            .unwrap()
-            .public_v1_operation
-            .as_ref()
-            .unwrap()
-    }
-    pub fn transition(&self) -> &PublicV1TransitionState {
-        self.set
-            .status
-            .as_ref()
-            .unwrap()
-            .public_v1_transition
-            .as_ref()
-            .unwrap()
+            .as_ref()?
+            .replica_goals
+            .iter()
+            .find(|entry| entry.goal == *goal)
     }
 }
 
@@ -202,6 +226,7 @@ impl CompletionConflict {
             })??;
         Ok(OperationEvidence::new(
             serde_json::from_value(value).map_err(anyhow::Error::from)?,
+            self.barrier.goal(),
         ))
     }
     pub fn release(self) {

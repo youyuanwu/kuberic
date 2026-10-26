@@ -158,15 +158,16 @@ fn native_production_owners_remain_private() {
         })
         .expect("native owner module");
     assert!(!matches!(native.vis, syn::Visibility::Public(_)));
-    let control = replicator
+    let creation = replicator
         .items
         .iter()
         .find_map(|item| match item {
-            Item::Trait(item) if item.ident == "NativeRuntimeControl" => Some(item),
+            Item::Struct(item) if item.ident == "ReplicatorCreation" => Some(item),
             _ => None,
         })
-        .expect("native runtime capability");
-    assert!(!matches!(control.vis, syn::Visibility::Public(_)));
+        .expect("private creation owner");
+    assert!(!matches!(creation.vis, syn::Visibility::Public(_)));
+    assert!(!source("src/replicator/mod.rs").contains("NativeRuntimeControl"));
 
     let adapter = syn::parse_file(&source("src/replicator/v1/service_adapter.rs")).unwrap();
     for owner in ["production", "production_transport"] {

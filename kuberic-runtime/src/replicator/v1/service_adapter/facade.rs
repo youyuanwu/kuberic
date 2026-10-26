@@ -186,7 +186,13 @@ enum Command {
     CurrentConfiguration(ReplicaSetConfiguration),
     Catchup(CatchupMode),
     Build(ReplicaInformation),
+    Recover(ReplicaInformation),
     Remove(i64),
+    RemoveFenced(
+        i64,
+        Arc<engine_session::Sessions>,
+        Box<engine_session::Binding>,
+    ),
 }
 
 struct Request {
@@ -243,6 +249,22 @@ pub(crate) struct Facade {
 }
 
 impl Facade {
+    pub(super) async fn remove_fenced(
+        &self,
+        id: ReplicaId,
+        sessions: Arc<engine_session::Sessions>,
+        binding: engine_session::Binding,
+    ) -> crate::Result<()> {
+        self.completed(Command::RemoveFenced(
+            id.value(),
+            sessions,
+            Box::new(binding),
+        ))
+        .await
+    }
+    pub(super) async fn recover(&self, information: ReplicaInformation) -> crate::Result<()> {
+        self.completed(Command::Recover(information)).await
+    }
     pub(super) fn start(
         adapter: ServiceReplicator,
         config: FacadeConfig,
@@ -609,8 +631,57 @@ fn handle(
                 );
                 return Ok(None);
             }
+            Command::Recover(info) => {
+                if info.role != ReplicaRole::ActiveSecondary {
+                    return Err(FacadeError::Input(
+                        "recovery requires a current secondary".into(),
+                    ));
+                }
+                let peer = config.peer(&info)?;
+                let build = BuildOperation(
+                    adapter
+                        .owner
+                        .primary()
+                        .map_err(AdapterError::from)?
+                        .begin_recovery(
+                            peer.build.clone(),
+                            adapter.provider.clone(),
+                            peer.callbacks.clone(),
+                        )
+                        .map_err(AdapterError::from)?,
+                );
+                let response = response.take().unwrap();
+                waits.push(
+                    async move {
+                        reply(
+                            response,
+                            build
+                                .wait()
+                                .await
+                                .map(|()| Value::Completed)
+                                .map_err(FacadeError::from),
+                        );
+                    }
+                    .boxed(),
+                );
+                return Ok(None);
+            }
             Command::Remove(id) => {
                 adapter.remove_replica(id)?;
+                return Ok(Some(Value::Completed));
+            }
+            Command::RemoveFenced(id, sessions, binding) => {
+                let primary = adapter.owner.primary().map_err(AdapterError::from)?;
+                let removal = sessions.idle_removal(&binding);
+                primary
+                    .remove_idle_with(id, move |native_idle| {
+                        removal.retire(native_idle).map_err(|error| {
+                            super::super::replica_manager::ManagerError::BuildLifecycle(
+                                error.to_string(),
+                            )
+                        })
+                    })
+                    .map_err(AdapterError::from)?;
                 return Ok(Some(Value::Completed));
             }
         }

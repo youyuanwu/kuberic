@@ -118,7 +118,7 @@ private-path hidden variant crate::protocol::public_operations::replica_goal::Re
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Close
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Discover
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Prepare { { role : ReplicaRole , } }
-private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Reconfigure { { role : ReplicaRole , # [serde (rename = "catchUp")] catch_up : Option < PublicCatchUpMode > , } }
+private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Reconfigure { { role : ReplicaRole , # [serde (rename = "catchUp" , skip_serializing_if = "Option::is_none")] catch_up : Option < PublicCatchUpMode > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Remove { { remote : Box < RemoteReplicaSelection > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalStatus::Achieved
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalStatus::Failed((String))
@@ -757,9 +757,7 @@ public-path documented variant crate::protocol::command::ProtocolCommand::Initia
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1History((Box < PublicV1HistoryCommand >))
 public-path documented variant crate::protocol::command::ProtocolCommand::PublicV1Operation((Box < PublicV1OperationCommand >))
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Initialize { { identity : PublicV1Identity , accepted : PublicV1AcceptedStatus , storage : ReplicaStorageIncarnationContext , } }
-public-path documented variant crate::protocol::command::PublicV1HistoryCommand::InstallInboundBuildAuthority { { authority : Box < PublicInboundBuildAuthority > , } }
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::Recover { { accepted : PublicV1AcceptedStatus , intent : Box < PublicOperationIntent > , } }
-public-path documented variant crate::protocol::command::PublicV1HistoryCommand::RevokeInboundBuildAuthority { { authority : Box < PublicInboundBuildAuthority > , } }
 public-path documented variant crate::protocol::command::PublicV1HistoryCommand::SessionRenewal { { command : Box < PublicV1SessionRenewalCommand > , } }
 public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::CloseAccessAndIngress { { accepted : PublicV1SessionRenewalStatus , } }
 public-path documented variant crate::protocol::command::PublicV1SessionRenewalCommand::InstallFreshConfiguration { { accepted : PublicV1SessionRenewalStatus , configuration : ConfigurationDescriptor , } }
@@ -978,15 +976,6 @@ public-path hidden field crate::protocol::public_operations::ProcessSessionRenew
 public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::resource_uid: ResourceUid
 public-path hidden field crate::protocol::public_operations::ProcessSessionRenewalRequired::surviving_sessions: Vec < ProcessSessionEndpoint >
 public-path hidden field crate::protocol::public_operations::ProviderReplicaIdentity::replica: ReplicaIdentity
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::build_id: OperationId
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::epoch: Epoch
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::resource_uid: ResourceUid
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::source: ReplicaIdentity
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::source_session: ProcessSessionId
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::source_storage: ReplicaStorageIncarnationContext
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target: ReplicaIdentity
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target_session: ProcessSessionId
-public-path hidden field crate::protocol::public_operations::PublicBuildAttemptReference::target_storage: ReplicaStorageIncarnationContext
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::attempt: OperationId
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::current_configuration_id: Option < ConfigurationId >
 public-path hidden field crate::protocol::public_operations::PublicBuildInput::epoch: Epoch
@@ -1023,18 +1012,6 @@ public-path hidden field crate::protocol::public_operations::PublicFaultAction::
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::predecessor_session: ProcessSessionId
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::resources: FrozenReplicaResources
 public-path hidden field crate::protocol::public_operations::PublicFaultAction::target: ReplicaIdentity
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::attempt: PublicBuildAttemptReference
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::current_configuration_id: ConfigurationId
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::history: HistoryContext
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_id: OperationId
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::operation_revision: u64
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::source_address: String
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildAuthority::target_address: String
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::authority: PublicInboundBuildAuthority
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::catch_up_boundary_lsn: i64
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::durable_lsn: i64
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::final_sequence: u64
-public-path hidden field crate::protocol::public_operations::PublicInboundBuildReceipt::replication_boundary_lsn: i64
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::current: ConfigurationDescriptor
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::data_loss_recovery: Option < PublicDataLossRecoveryInput >
 public-path hidden field crate::protocol::public_operations::PublicLifecycleInput::epoch: Epoch
@@ -1066,7 +1043,6 @@ public-path hidden field crate::protocol::public_operations::PublicOperationInte
 public-path hidden field crate::protocol::public_operations::PublicProgress::catch_up_capability: ProgressQueryResult
 public-path hidden field crate::protocol::public_operations::PublicProgress::current_progress: ProgressQueryResult
 public-path hidden field crate::protocol::public_operations::PublicProgress::role: PublicProgressRole
-public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::build_id: OperationId
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::catch_up_capability: i64
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::current_progress: i64
 public-path hidden field crate::protocol::public_operations::PublicReplicaDescriptor::identity: ReplicaIdentity
@@ -1101,7 +1077,7 @@ public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOpe
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::result: PublicV1AcceptedResult
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::revision: u64
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedOperationCompletion::storage_incarnation: ReplicaStorageIncarnationContext
-public-path hidden field crate::protocol::public_operations::PublicV1AcceptedRebuildRequired::build: Option < PublicBuildAttemptReference >
+public-path hidden field crate::protocol::public_operations::PublicV1AcceptedRebuildRequired::goal: Option < ReplicaGoal >
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedRebuildRequired::kind: PublicV1AcceptedRebuildKind
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedRebuildRequired::local_replica: Option < ReplicaIdentity >
 public-path hidden field crate::protocol::public_operations::PublicV1AcceptedRebuildRequired::local_storage: Option < PvcUid >
@@ -1216,8 +1192,6 @@ public-path hidden impl crate::protocol::public_operations::PublicDataLossRecove
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_id (& self) -> OperationId
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn expected_kind (persistence : StatePersistence , fault : FaultType) -> PublicFaultActionKind
 public-path hidden impl crate::protocol::public_operations::PublicFaultAction::fn validate (& self) -> Result < () , & 'static str >
-public-path hidden impl crate::protocol::public_operations::PublicInboundBuildAuthority::fn validate (& self) -> Result < () , & 'static str >
-public-path hidden impl crate::protocol::public_operations::PublicInboundBuildReceipt::fn validate (& self) -> Result < () , & 'static str >
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn configuration (& self) -> PublicConfiguration
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn digest (& self) -> CanonicalOperationInputDigest
 public-path hidden impl crate::protocol::public_operations::PublicLifecycleInput::fn validate (& self) -> Result < () , & 'static str >
@@ -1260,15 +1234,12 @@ public-path hidden struct crate::protocol::public_operations::LocalProviderRebui
 public-path hidden struct crate::protocol::public_operations::ProcessAttemptContext
 public-path hidden struct crate::protocol::public_operations::ProcessSessionRenewalRequired
 public-path hidden struct crate::protocol::public_operations::ProviderReplicaIdentity
-public-path hidden struct crate::protocol::public_operations::PublicBuildAttemptReference
 public-path hidden struct crate::protocol::public_operations::PublicBuildInput
 public-path hidden struct crate::protocol::public_operations::PublicConfiguration
 public-path hidden struct crate::protocol::public_operations::PublicDataLossRecoveryInput
 public-path hidden struct crate::protocol::public_operations::PublicDataLossRecoveryStatus
 public-path hidden struct crate::protocol::public_operations::PublicDataLossSessionRenewal
 public-path hidden struct crate::protocol::public_operations::PublicFaultAction
-public-path hidden struct crate::protocol::public_operations::PublicInboundBuildAuthority
-public-path hidden struct crate::protocol::public_operations::PublicInboundBuildReceipt
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleInput
 public-path hidden struct crate::protocol::public_operations::PublicLifecycleReport
 public-path hidden struct crate::protocol::public_operations::PublicOperationIntent
@@ -1296,7 +1267,7 @@ public-path hidden struct crate::protocol::public_operations::ServiceLocation
 public-path hidden use crate::protocol::public_operations::replica_goal :: *
 public-path hidden variant crate::protocol::public_operations::CanonicalOperationInputDigest::V1((CanonicalOperationInputDigestV1))
 public-path hidden variant crate::protocol::public_operations::CanonicalReplicaRebuildRequired::LocalProvider { { reason : ReplicaRebuildReason , provider : ProviderReplicaIdentity , operation : CapturedPublicOperationIdentity , local_replica : ReplicaIdentity , local_storage : PvcUid , } }
-public-path hidden variant crate::protocol::public_operations::CanonicalReplicaRebuildRequired::RemoteBuildTarget { { reason : ReplicaRebuildReason , operation : CapturedPublicOperationIdentity , build : Box < PublicBuildAttemptReference > , } }
+public-path hidden variant crate::protocol::public_operations::CanonicalReplicaRebuildRequired::RemoteBuildTarget { { reason : ReplicaRebuildReason , operation : CapturedPublicOperationIdentity , goal : Box < ReplicaGoal > , } }
 public-path hidden variant crate::protocol::public_operations::DataLossRenewalDecision::InvokeCallback
 public-path hidden variant crate::protocol::public_operations::DataLossRenewalDecision::RetireWithoutCallback
 public-path hidden variant crate::protocol::public_operations::DataLossRenewalDecision::Terminal

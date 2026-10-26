@@ -43,6 +43,8 @@ pub struct KvService {
     fail_role: std::sync::atomic::AtomicBool,
     #[cfg(feature = "testing")]
     role_calls: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "testing")]
+    abort_access: Mutex<Option<(AccessStatus, AccessStatus)>>,
 }
 
 #[cfg(feature = "testing")]
@@ -99,6 +101,8 @@ impl KvService {
             fail_role: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             role_calls: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            abort_access: Mutex::new(None),
         }
     }
 
@@ -118,9 +122,19 @@ impl KvService {
     }
 
     #[cfg(feature = "testing")]
+    pub fn abort_access_observation(&self) -> Option<(AccessStatus, AccessStatus)> {
+        *self.abort_access.lock().unwrap()
+    }
+
+    #[cfg(feature = "testing")]
     pub fn fail_next_close(&self) {
         self.fail_close
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn fail_next_persist(&self) {
+        self.persistence().fail_next_persist_for_test();
     }
 
     #[cfg(feature = "testing")]
@@ -313,11 +327,6 @@ impl KvService {
 #[async_trait]
 impl StatefulServiceReplica for KvService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
-        if context.partition.ordinary_hosting() {
-            return Err(RuntimeError::ControlPlane(
-                "built-in ordinary hosting integration is unavailable until M2".into(),
-            ));
-        }
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);
         }
@@ -397,7 +406,9 @@ impl StatefulServiceReplica for KvService {
         }
         match role {
             ReplicaRole::Primary => committer.promote().map_err(application)?,
-            ReplicaRole::IdleSecondary => self.start_secondary(true).await?,
+            ReplicaRole::IdleSecondary if previous != ReplicaRole::IdleSecondary => {
+                self.start_secondary(true).await?
+            }
             ReplicaRole::ActiveSecondary if previous == ReplicaRole::Primary => {
                 committer.demote().map_err(application)?;
                 self.start_secondary(false).await?;
@@ -408,7 +419,7 @@ impl StatefulServiceReplica for KvService {
             ReplicaRole::None if previous == ReplicaRole::Primary => {
                 committer.demote().map_err(application)?
             }
-            ReplicaRole::ActiveSecondary | ReplicaRole::None => {}
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary | ReplicaRole::None => {}
         }
         *self.role.lock().unwrap() = role;
         Ok(RoleChange {
@@ -428,7 +439,10 @@ impl StatefulServiceReplica for KvService {
         }
         let committer = self.committer.lock().unwrap().clone();
         let result = if let Some(committer) = committer {
-            committer.close().await.map_err(application)
+            match committer.close().await {
+                Err(error) if crate::v1::is_abort(&error) && *self.stop.borrow() => Ok(()),
+                result => result.map_err(application),
+            }
         } else {
             Ok(())
         };
@@ -441,6 +455,15 @@ impl StatefulServiceReplica for KvService {
     }
 
     fn abort(&self) {
+        #[cfg(feature = "testing")]
+        if let Ok(partition) = self.partition.try_read()
+            && let Some(partition) = partition.as_ref()
+        {
+            self.abort_access.lock().unwrap().get_or_insert((
+                partition.get_read_status_now(),
+                partition.get_write_status_now(),
+            ));
+        }
         if let Some(committer) = self.committer.lock().unwrap().as_ref() {
             committer.abort();
         }
@@ -490,7 +513,13 @@ async fn consume_copy(
         {
             return failed(stream, partition, error.to_string()).await;
         }
-        completed |= operation.end_of_stream;
+        if operation.end_of_stream {
+            if let Err(error) = store.finish_copy() {
+                return failed(stream, partition, error.to_string()).await;
+            }
+            completed = true;
+            copied.send_replace(CopyCompletion::Complete);
+        }
         operation.acknowledge()?;
     }
     if !completed {
@@ -501,10 +530,6 @@ async fn consume_copy(
         )
         .await;
     }
-    if let Err(error) = store.finish_copy() {
-        return failed(stream, partition, error.to_string()).await;
-    }
-    copied.send_replace(CopyCompletion::Complete);
     Ok(())
 }
 

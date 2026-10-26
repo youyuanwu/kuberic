@@ -1,4 +1,4 @@
-use super::cluster::{ConfigurationEvidence, Harness};
+use super::cluster::Harness;
 use super::*;
 use anyhow::{Context, Result, ensure};
 use kuberic_runtime::{
@@ -10,6 +10,7 @@ use kuberic_runtime::{
 use std::sync::Arc;
 
 pub(super) struct EmptyApplication {
+    root: Option<std::path::PathBuf>,
     stop: tokio::sync::watch::Sender<bool>,
     streams: tokio::sync::Mutex<tokio::task::JoinSet<kuberic_runtime::Result<()>>>,
     control: tokio::sync::Mutex<Option<Arc<dyn Replicator>>>,
@@ -19,6 +20,7 @@ pub(super) struct EmptyApplication {
 impl Default for EmptyApplication {
     fn default() -> Self {
         Self {
+            root: None,
             stop: tokio::sync::watch::channel(false).0,
             streams: Default::default(),
             control: Default::default(),
@@ -41,6 +43,216 @@ impl EmptyApplication {
 }
 struct EmptyState;
 pub(super) struct EmptyFactory;
+
+#[tokio::test]
+async fn ordinary_role_barriers_match_exact_scope_role_stage_and_request() -> Result<()> {
+    let mut cluster = TestCluster::builder(EmptyFactory)
+        .initial_replicas(2)
+        .start()
+        .await?;
+    let result = async {
+        let topology = cluster.settle_members(2).await?;
+        let primary = topology.primary().clone();
+        let secondary = topology.secondaries().next().unwrap().clone();
+        let mut set = cluster.observe().await?.set().clone();
+        let goals = &set.status.as_ref().context("status missing")?.replica_goals;
+        let primary_goal = goals
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Prepare {
+                        role: ReplicaRole::Primary
+                    }
+                )
+            })
+            .context("actual primary Prepare missing")?
+            .clone();
+        let secondary_goal = goals
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        ..
+                    }
+                )
+            })
+            .context("actual secondary role receipt missing")?
+            .clone();
+        let current_primary = goals
+            .iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        ..
+                    }
+                ) && entry.goal.scope.configuration.previous.is_none()
+            })
+            .context("actual current primary configuration missing")?
+            .clone();
+        for stage in [BarrierStage::Intent, BarrierStage::Completion] {
+            let mut entry = primary_goal.clone();
+            if stage == BarrierStage::Intent {
+                entry.outcome = None;
+            }
+            let selected = Barrier::Role {
+                stage,
+                role: ReplicaRole::Primary,
+                participant: Some(primary.clone()),
+            };
+            assert!(selected.matches_goal(&entry, &set));
+            assert!(
+                Barrier::Operation {
+                    stage,
+                    kind: Some(PublicV1CallKind::Role),
+                    participant: Some(primary.clone()),
+                }
+                .matches_goal(&entry, &set)
+            );
+            assert!(
+                !Barrier::Role {
+                    stage,
+                    role: ReplicaRole::IdleSecondary,
+                    participant: Some(primary.clone()),
+                }
+                .matches_goal(&entry, &set)
+            );
+            assert!(
+                !Barrier::Role {
+                    stage,
+                    role: ReplicaRole::Primary,
+                    participant: Some(secondary.clone()),
+                }
+                .matches_goal(&entry, &set)
+            );
+            let mut crossed = entry.clone();
+            crossed.goal.scope.creation_id = ReplicatorCreationId::new("another-creation");
+            crossed.digest = crossed.goal.intent().input_digest;
+            if let Some(outcome) = &mut crossed.outcome {
+                outcome.goal = crossed.goal.clone();
+            }
+            crossed.validate().map_err(anyhow::Error::msg)?;
+            assert!(!selected.matches_goal(&crossed, &set));
+            let mut crossed_storage = entry.clone();
+            crossed_storage.goal.scope.storage.storage_generation =
+                StorageGeneration::new("another-storage");
+            crossed_storage.digest = crossed_storage.goal.intent().input_digest;
+            if let Some(outcome) = &mut crossed_storage.outcome {
+                outcome.goal = crossed_storage.goal.clone();
+            }
+            crossed_storage.validate().map_err(anyhow::Error::msg)?;
+            assert!(!selected.matches_goal(&crossed_storage, &set));
+            let mut invalid = entry.clone();
+            invalid.goal.revision += 1;
+            assert!(!selected.matches_goal(&invalid, &set));
+            let mut another_set = set.clone();
+            another_set.metadata.uid = Some("another-resource".into());
+            assert!(
+                !Barrier::Role {
+                    stage,
+                    role: ReplicaRole::Primary,
+                    participant: None,
+                }
+                .matches_goal(&entry, &another_set)
+            );
+            entry.outcome = if stage == BarrierStage::Intent {
+                primary_goal.outcome.clone()
+            } else {
+                None
+            };
+            assert!(!selected.matches_goal(&entry, &set));
+        }
+        let request = cluster.submit_switchover(&secondary).await?;
+        let spec = cluster.observe().await?.set().spec.switchover.clone();
+        set.status
+            .as_mut()
+            .unwrap()
+            .public_v1_topology
+            .as_mut()
+            .unwrap()
+            .pending_switchover = spec;
+        let mut intent = secondary_goal.clone();
+        intent.outcome = None;
+        let prepare = Barrier::SwitchoverPeerEpoch {
+            request: request.clone(),
+            peer: secondary.clone(),
+        };
+        let configured = Barrier::SwitchoverPeerConfiguration {
+            request: request.clone(),
+            peer: secondary.clone(),
+        };
+        assert!(prepare.matches_goal(&intent, &set));
+        assert!(configured.matches_goal(&secondary_goal, &set));
+
+        // Matching a hypothetical handoff goal does not execute M3 policy.
+        let mut goal = current_primary.goal.clone();
+        let mut members = goal.scope.configuration.current.members.clone();
+        for member in &mut members {
+            member.role = if member.identity == *secondary.identity() {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            };
+        }
+        goal.scope.configuration.current = ConfigurationDescriptor::new(
+            goal.scope.epoch,
+            secondary.identity().replica_id,
+            members,
+            goal.scope.configuration.current.write_quorum,
+        );
+        for replica in &mut goal.scope.configuration.replicas {
+            if replica.identity == *secondary.identity() {
+                replica.role = ReplicaRole::Primary;
+            }
+        }
+        goal.desired = ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::ActiveSecondary,
+            catch_up: None,
+        };
+        let handoff_goal =
+            crate::crd::RetainedReplicaGoal::new(goal).map_err(anyhow::Error::msg)?;
+        let handoff = Barrier::SwitchoverHandoff {
+            request,
+            source: primary,
+            stage: BarrierStage::Intent,
+        };
+        assert!(handoff.matches_goal(&handoff_goal, &set));
+        let mut crossed_peer = handoff_goal.goal.clone();
+        crossed_peer
+            .scope
+            .configuration
+            .replicas
+            .iter_mut()
+            .find(|replica| replica.identity == *secondary.identity())
+            .context("selected target descriptor missing")?
+            .process_session_id = ProcessSessionId::new("another-process");
+        let crossed_peer =
+            crate::crd::RetainedReplicaGoal::new(crossed_peer).map_err(anyhow::Error::msg)?;
+        assert!(!handoff.matches_goal(&crossed_peer, &set));
+        set.status
+            .as_mut()
+            .unwrap()
+            .public_v1_topology
+            .as_mut()
+            .unwrap()
+            .pending_switchover
+            .as_mut()
+            .unwrap()
+            .request_id = "different-request".into();
+        assert!(!prepare.matches_goal(&intent, &set));
+        assert!(!configured.matches_goal(&secondary_goal, &set));
+        assert!(!handoff.matches_goal(&handoff_goal, &set));
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    cluster.finish(result).await?;
+    Ok(())
+}
 
 #[async_trait::async_trait]
 impl StateProvider for EmptyState {
@@ -113,6 +325,7 @@ impl StatefulServiceReplica for EmptyApplication {
             let mut tasks = self.streams.lock().await;
             for mut stream in streams {
                 let mut stop = self.stop.subscribe();
+                let root = self.root.clone();
                 tasks.spawn(async move {
                     tokio::select! {
                         biased;
@@ -132,6 +345,14 @@ impl StatefulServiceReplica for EmptyApplication {
                                     stream.report_fault(reason.clone())?;
                                     return Err(kuberic_runtime::RuntimeError::Application(reason));
                                 }
+                                if !operation.end_of_stream
+                                    && let Some(root) = &root {
+                                    let path = root.join("copied-state");
+                                    std::fs::write(&path, &operation.data)
+                                        .map_err(|error| kuberic_runtime::RuntimeError::Application(error.to_string()))?;
+                                    std::fs::File::open(path).and_then(|file| file.sync_all())
+                                        .map_err(|error| kuberic_runtime::RuntimeError::Application(error.to_string()))?;
+                                }
                                 operation.acknowledge()?;
                             }
                             Ok(())
@@ -146,8 +367,9 @@ impl StatefulServiceReplica for EmptyApplication {
         })
     }
     async fn close(&self) -> kuberic_runtime::Result<()> {
-        self.stop.send_replace(true);
-        Ok(())
+        self.drain()
+            .await
+            .map_err(|error| kuberic_runtime::RuntimeError::Application(error.to_string()))
     }
     fn abort(&self) {
         self.stop.send_replace(true);
@@ -195,7 +417,10 @@ impl ApplicationFactory for EmptyFactory {
             ));
         }
         Ok(CreatedApplication::new(
-            Arc::new(EmptyApplication::default()),
+            Arc::new(EmptyApplication {
+                root: Some(context.application_root().to_owned()),
+                ..Default::default()
+            }),
             if fresh {
                 kuberic_runtime::host::ApplicationStorageState::FreshEmpty
             } else {
@@ -207,44 +432,6 @@ impl ApplicationFactory for EmptyFactory {
     async fn shutdown_and_drain(&self, service: Arc<EmptyApplication>) -> super::Result<()> {
         service.drain().await
     }
-}
-
-fn rewrite_detached_configuration(
-    status: &crate::crd::KubericSetStatus,
-    evidence: &ConfigurationEvidence,
-    change: impl Fn(&mut PublicOperationProgram),
-) -> Result<(crate::crd::KubericSetStatus, ConfigurationEvidence)> {
-    let mut status = status.clone();
-    let mut evidence = evidence.clone();
-    let mut authority = status
-        .public_v1_authority
-        .as_ref()
-        .unwrap()
-        .authority()
-        .map_err(anyhow::Error::msg)?;
-    for (intent, completion) in evidence.operations.values_mut() {
-        let old = PublicV1AcceptedOperationCompletion::from_completion(completion);
-        let accepted = authority
-            .completed_operations
-            .iter_mut()
-            .find(|accepted| **accepted == old)
-            .context("detached baseline not accepted")?;
-        let program = intent.program.as_mut().unwrap();
-        change(program);
-        intent.input_digest = program.digest();
-        completion.input_digest = intent.input_digest.clone();
-        if matches!(program, PublicOperationProgram::Epoch { .. }) {
-            completion.call_kind = PublicV1CallKind::Epoch;
-            completion.current_configuration_id = None;
-        }
-        intent.validate().map_err(anyhow::Error::msg)?;
-        *accepted = PublicV1AcceptedOperationCompletion::from_completion(completion);
-    }
-    status.public_v1_authority = Some(
-        crate::crd::PublicV1AuthorityStatus::from_authority(&authority)
-            .map_err(anyhow::Error::msg)?,
-    );
-    Ok((status, evidence))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -261,23 +448,10 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
     )
     .await?;
     let result: Result<()> = async {
-        if harness.ordinary_integration_unavailable().await? {
-            return Ok(());
-        }
-        let mut barrier = harness.api.arm_operation_barrier("sample")?;
-        let pending = loop {
-            tokio::select! {pending=barrier.entered()=>break pending?,step=harness.step()=>step?,}
-        };
-        barrier.release();
         harness.ready().await?;
         let status = harness.set().await?.status.context("status missing")?;
-        let mut reports = Vec::new();
-        for id in 1..=3 {
-            reports.push(harness.report(id).await?);
-        }
-        ensure!(Core::settled(&status, &reports, 3));
-        let evidence = harness.configuration_evidence(&reports).await?;
-        ensure!(Core::configurations_settled(&status, &reports, &evidence));
+        let snapshots = harness.ordinary_snapshots().await?;
+        ensure!(Core::ordinary_settled(&status, &snapshots, 3));
         let mut pending_transfer = status.clone();
         let topology = pending_transfer.public_v1_topology.as_mut().unwrap();
         topology.pending_switchover = Some(crate::crd::PlannedSwitchoverRequestSpec {
@@ -291,86 +465,36 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
                 .replica_id
                 .value() as u32,
         });
-        ensure!(!Core::settled(&pending_transfer, &reports, 3));
-        ensure!(!Core::configurations_settled(
-            &pending_transfer,
-            &reports,
-            &evidence
-        ));
-        let (altered_status, altered_evidence) =
-            rewrite_detached_configuration(&status, &evidence, |program| {
-                if let PublicOperationProgram::Configuration(public)
-                | PublicOperationProgram::CatchUp {
-                    configuration: public,
-                    ..
-                } = program
-                    && let Some(peer) = public.replicas.first_mut()
-                {
-                    peer.process_session_id = ProcessSessionId::new("stale-peer");
-                }
-            })?;
-        ensure!(!Core::configurations_settled(
-            &altered_status,
-            &reports,
-            &altered_evidence
-        ));
-        let (unrelated_status, unrelated) =
-            rewrite_detached_configuration(&status, &evidence, |program| {
-                *program = PublicOperationProgram::Epoch {
-                    epoch: status.public_v1_topology.as_ref().unwrap().epoch,
-                };
-            })?;
-        ensure!(!Core::configurations_settled(
-            &unrelated_status,
-            &reports,
-            &unrelated
-        ));
-        let (historical_status, historical) =
-            rewrite_detached_configuration(&status, &evidence, |program| {
-                if let PublicOperationProgram::Configuration(public)
-                | PublicOperationProgram::CatchUp {
-                    configuration: public,
-                    ..
-                } = program
-                {
-                    let mut epoch = public.current.epoch;
-                    epoch.configuration_number += 1;
-                    public.current = ConfigurationDescriptor::new(
-                        epoch,
-                        public.current.primary_id,
-                        public.current.members.clone(),
-                        public.current.write_quorum,
-                    );
-                }
-            })?;
-        ensure!(!Core::configurations_settled(
-            &historical_status,
-            &reports,
-            &historical
-        ));
-        for field in ["publicV1Operation", "publicV1Transition"] {
-            let mut altered = serde_json::to_value(&status)?;
-            altered[field] = pending["status"][field].clone();
-            ensure!(
-                !altered[field].is_null(),
-                "pending observation missing {field}"
-            );
-            ensure!(!Core::settled(
-                &serde_json::from_value(altered)?,
-                &reports,
-                3
-            ));
+        ensure!(!Core::ordinary_settled(&pending_transfer, &snapshots, 3));
+        for index in 0..status.replica_goals.len() {
+            let mut pending = status.clone();
+            pending.replica_goals[index].outcome = None;
+            ensure!(!Core::ordinary_settled(&pending, &snapshots, 3));
         }
+        let mut stale_scope = snapshots.clone();
+        stale_scope[0]
+            .publication
+            .as_mut()
+            .unwrap()
+            .scope
+            .configuration
+            .current
+            .epoch
+            .configuration_number += 1;
+        ensure!(!Core::ordinary_settled(&status, &stale_scope, 3));
+        let mut missing_receipt = snapshots.clone();
+        missing_receipt[0].goals.clear();
+        ensure!(!Core::ordinary_settled(&status, &missing_receipt, 3));
         // Pending replacement and renewal must independently prevent readiness.
         let mut replacement = status.clone();
         replacement.public_v1_replacement = Some(
             crate::crd::PublicV1ReplacementState::new(
                 &status.public_v1_topology.as_ref().unwrap().configuration_id,
-                reports[1].storage_incarnation.clone(),
+                snapshots[1].storage.clone(),
             )
             .map_err(anyhow::Error::msg)?,
         );
-        ensure!(!Core::settled(&replacement, &reports, 3));
+        ensure!(!Core::ordinary_settled(&replacement, &snapshots, 3));
         let topology = status.public_v1_topology.as_ref().unwrap();
         let configuration = topology.configuration().map_err(anyhow::Error::msg)?;
         let predecessor = topology
@@ -390,8 +514,8 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
         let required = ProcessSessionRenewalRequired {
             operation_id: OperationId::new("detached-pending-renewal"),
             reason: ProcessSessionRenewalReason::ActiveSecondaryReplacement,
-            resource_uid: reports[0].resource_uid.clone(),
-            history: reports[0].history.clone(),
+            resource_uid: snapshots[0].history.resource_uid.clone(),
+            history: snapshots[0].history.clone(),
             previous_epoch: configuration.epoch,
             renewal_epoch: epoch,
             predecessor: predecessor.clone(),
@@ -418,81 +542,71 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
             crate::crd::PublicV1SessionRenewalState::from_renewal(&renewal)
                 .map_err(anyhow::Error::msg)?,
         );
-        ensure!(!Core::settled(&pending_renewal, &reports, 3));
+        ensure!(!Core::ordinary_settled(&pending_renewal, &snapshots, 3));
         for (field, value) in [
             ("processSessionId", serde_json::json!("stale-session")),
-            ("replicatorCreationId", serde_json::json!("stale-creation")),
-            (
-                "storageIncarnation",
-                serde_json::to_value(&reports[2].storage_incarnation)?,
-            ),
-            ("role", serde_json::json!("none")),
+            ("creationId", serde_json::json!("stale-creation")),
+            ("storage", serde_json::to_value(&snapshots[2].storage)?),
             ("writeStatus", serde_json::json!("granted")),
             ("readStatus", serde_json::json!("granted")),
         ] {
-            let mut altered = reports.clone();
+            let mut altered = snapshots.clone();
             let mut report = serde_json::to_value(&altered[1])?;
             report[field] = value;
             altered[1] = serde_json::from_value(report)?;
             ensure!(
-                !Core::settled(&status, &altered, 3),
+                !Core::ordinary_settled(&status, &altered, 3),
                 "accepted stale {field}"
             );
         }
-        let mut altered = reports.clone();
+        let mut altered = snapshots.clone();
         altered
             .iter_mut()
-            .find(|report| report.role == ReplicaRole::Primary)
+            .find(|report| report.publication.as_ref().unwrap().role == ReplicaRole::Primary)
             .unwrap()
             .write_status = AccessStatus::NotPrimary;
-        ensure!(!Core::settled(&status, &altered, 3));
-        for index in 0..reports.len() {
-            let mut altered = reports.clone();
-            altered[index].progress.current_progress = ProgressQueryResult::NotReady;
-            ensure!(
-                !Core::settled(&status, &altered, 3)
-                    && !Core::configurations_settled(&status, &altered, &evidence),
-                "unavailable native progress accepted for {:?}",
-                altered[index].role
-            );
+        ensure!(!Core::ordinary_settled(&status, &altered, 3));
+        {
+            let mut altered = snapshots.clone();
+            altered[1].publication.as_mut().unwrap().stage =
+                ReplicaPublicationStage::DiscoveryPending;
+            ensure!(!Core::ordinary_settled(&status, &altered, 3));
         }
-        let mut outsider = reports[0].clone();
-        outsider.replica.instance_id = ReplicaInstanceId::new("excluded-predecessor");
+        let mut no_progress = snapshots.clone();
+        for snapshot in &mut no_progress {
+            snapshot.progress = ProgressQueryResult::NotReady;
+            snapshot.capability = ProgressQueryResult::NotReady;
+        }
+        ensure!(
+            Core::ordinary_settled(&status, &no_progress, 3),
+            "optional progress became an admission precondition"
+        );
+        let mut outsider = snapshots[0].clone();
+        outsider.storage.replica.instance_id = ReplicaInstanceId::new("excluded-predecessor");
         outsider.write_status = AccessStatus::Granted;
-        altered = reports.clone();
+        altered = snapshots.clone();
         altered.push(outsider.clone());
-        ensure!(!Core::settled(&status, &altered, 3));
+        ensure!(!Core::ordinary_settled(&status, &altered, 3));
         outsider.write_status = AccessStatus::NotPrimary;
         outsider.read_status = AccessStatus::NotPrimary;
-        altered = reports.clone();
+        altered = snapshots.clone();
         altered.push(outsider.clone());
         ensure!(
-            !Core::settled(&status, &altered, 3),
+            !Core::ordinary_settled(&status, &altered, 3),
             "nonwriting unauthorized role accepted"
         );
-        outsider.role = ReplicaRole::None;
+        outsider.publication = None;
         outsider.read_status = AccessStatus::Granted;
-        altered = reports.clone();
+        altered = snapshots.clone();
         altered.push(outsider.clone());
         ensure!(
-            !Core::settled(&status, &altered, 3),
+            !Core::ordinary_settled(&status, &altered, 3),
             "excluded reader accepted"
         );
-        let uids = reports
-            .iter()
-            .map(|report| report.replica.instance_id.to_string())
-            .chain(std::iter::once(outsider.replica.instance_id.to_string()))
-            .collect::<Vec<_>>();
-        ensure!(!Core::observations_complete(&uids, &reports));
         ensure!(
-            !Core::observations_complete(&uids, &reports[..2]),
-            "two admitted observations hid unreachable predecessor"
+            !Core::ordinary_settled(&status, &snapshots[..2], 3),
+            "missing admitted observation was accepted"
         );
-        altered = reports;
-        for report in &mut altered {
-            report.completed_operations.clear();
-        }
-        ensure!(!Core::settled(&status, &altered, 3));
         Ok(())
     }
     .await;
@@ -553,9 +667,6 @@ async fn public_singleton_scale_uses_real_build_and_preserves_default_controls()
         .start()
         .await?;
     let result: super::Result<()> = async {
-        if cluster.ordinary_integration_unavailable().await? {
-            return Ok(());
-        }
         let singleton = cluster.settle_members(1).await?;
         assert_eq!(singleton.members().count(), 1);
         let before = cluster.observe().await?;
@@ -568,26 +679,23 @@ async fn public_singleton_scale_uses_real_build_and_preserves_default_controls()
         }
         assert_eq!(cluster.observe().await?.set().spec.replicas, 1);
         cluster.scale_to(2).await?;
-        let pause = cluster
-            .pause_at(super::Barrier::completion(
-                kuberic_runtime::protocol::public_operations::PublicV1CallKind::Build,
-            ))
-            .await?;
-        assert!(matches!(
-            pause
-                .evidence()
-                .operation()
-                .command()
-                .unwrap()
-                .intent
-                .program,
-            Some(kuberic_runtime::protocol::public_operations::PublicOperationProgram::Build(_))
-        ));
-        assert_eq!(
-            cluster.scale_to(1).await.unwrap_err().kind(),
-            super::ErrorKind::InvalidConfiguration
-        );
-        cluster.resume(pause).await?;
+        loop {
+            let observed = cluster.observe().await?;
+            if let Some(build) = observed.set().status.as_ref().and_then(|status| {
+                status
+                    .replica_goals
+                    .iter()
+                    .find(|entry| matches!(entry.goal.desired, ReplicaGoalKind::Build { .. }))
+            }) {
+                let ReplicaGoalKind::Build { remote } = &build.goal.desired else {
+                    unreachable!()
+                };
+                assert_eq!(remote.target.role, ReplicaRole::IdleSecondary);
+                assert_eq!(remote.source.scope.configuration.current.members.len(), 1);
+                break;
+            }
+            cluster.step().await?;
+        }
         assert_eq!(cluster.settle_members(2).await?.members().count(), 2);
         Ok(())
     }
@@ -599,14 +707,6 @@ async fn exact_cross_cluster_stopped_and_observation_references_are_checked() ->
     let mut first = TestCluster::builder(EmptyFactory).start().await?;
     let mut second = TestCluster::builder(EmptyFactory).start().await?;
     let result: Result<()> = async {
-        let (a, b) = tokio::try_join!(
-            first.ordinary_integration_unavailable(),
-            second.ordinary_integration_unavailable()
-        )?;
-        if a || b {
-            ensure!(a && b, "identical factories disagreed on M1 engine support");
-            return Ok(());
-        }
         let (a, b) = tokio::try_join!(first.settle(), second.settle())?;
         assert_eq!(
             first.service(b.primary()).await.err().unwrap().kind(),
@@ -632,6 +732,11 @@ async fn exact_cross_cluster_stopped_and_observation_references_are_checked() ->
         );
         drop(hold);
         drop(second.hold_deletion(&resource).await?);
+        let service = first.service(a.primary()).await?;
+        let isolation = first.isolate(std::slice::from_ref(a.primary())).await?;
+        assert!(Arc::ptr_eq(&service, &first.service(a.primary()).await?));
+        assert!(first.observe().await?.snapshot(a.primary()).is_none());
+        first.heal(isolation).await?;
         let stopped = a.secondaries().next().unwrap().clone();
         first.stop(&stopped).await?;
         assert_eq!(
@@ -674,9 +779,7 @@ impl ApplicationFactory for FailingDrainFactory {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finalization_preserves_scenario_and_every_application_drain_error() -> Result<()> {
     let mut cluster = TestCluster::builder(FailingDrainFactory).start().await?;
-    if !cluster.ordinary_integration_unavailable().await? {
-        cluster.settle().await?;
-    }
+    cluster.settle().await?;
     let error = cluster
         .finish(Err(anyhow::anyhow!("scenario-source")))
         .await
@@ -801,14 +904,7 @@ async fn timed_out_drain_keeps_application_and_route_owners_until_they_join() ->
     .teardown_timeout(std::time::Duration::from_millis(500))
     .start()
     .await?;
-    let uids = if cluster.ordinary_integration_unavailable().await? {
-        cluster
-            .observe()
-            .await?
-            .replicas()
-            .map(|reference| reference.instance_id().to_owned())
-            .collect::<Vec<_>>()
-    } else {
+    let uids = {
         cluster
             .settle()
             .await?
@@ -1013,9 +1109,7 @@ impl ApplicationFactory for PanickingDrainFactory {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_application_drain_panic_remains_a_cleanup_source() -> Result<()> {
     let mut cluster = TestCluster::builder(PanickingDrainFactory).start().await?;
-    if !cluster.ordinary_integration_unavailable().await? {
-        cluster.settle().await?;
-    }
+    cluster.settle().await?;
     let error = cluster
         .finish(Ok::<_, anyhow::Error>(()))
         .await
@@ -1053,14 +1147,7 @@ async fn early_drop_requests_owned_async_drain_without_claiming_completion() -> 
     let mut cluster = TestCluster::builder(CountingDrainFactory(completed.clone()))
         .start()
         .await?;
-    let uids = if cluster.ordinary_integration_unavailable().await? {
-        cluster
-            .observe()
-            .await?
-            .replicas()
-            .map(|reference| reference.instance_id().to_owned())
-            .collect::<Vec<_>>()
-    } else {
+    let uids = {
         cluster
             .settle()
             .await?

@@ -40,6 +40,7 @@ struct Probe {
     fail_close: AtomicBool,
     block_build: AtomicBool,
     panic_build: AtomicBool,
+    build_rebuild: StdMutex<Option<RemoteBuildTargetRebuildRequired>>,
     build_gate: Semaphore,
     build_entered: Semaphore,
     build_calls: AtomicUsize,
@@ -55,6 +56,7 @@ struct Probe {
     factory_gate: Semaphore,
     factory_entered: Semaphore,
     factory_listener: StdMutex<Option<TcpListener>>,
+    replacement_return: StdMutex<Option<Arc<Probe>>>,
 }
 
 impl Probe {
@@ -88,6 +90,7 @@ impl Probe {
             fail_close: AtomicBool::new(false),
             block_build: AtomicBool::new(false),
             panic_build: AtomicBool::new(false),
+            build_rebuild: StdMutex::new(None),
             build_gate: Semaphore::new(0),
             build_entered: Semaphore::new(0),
             build_calls: AtomicUsize::new(0),
@@ -103,6 +106,7 @@ impl Probe {
             factory_gate: Semaphore::new(0),
             factory_entered: Semaphore::new(0),
             factory_listener: StdMutex::new(None),
+            replacement_return: StdMutex::new(None),
         })
     }
 }
@@ -194,7 +198,13 @@ impl StatefulServiceReplica for Application {
                 }),
             )
             .await?;
-        Ok(interfaces.replicator())
+        let replacement = self.0.replacement_return.lock().unwrap().clone();
+        if let Some(replacement) = replacement {
+            replacement.open().await?;
+            Ok(replacement)
+        } else {
+            Ok(interfaces.replicator())
+        }
     }
     async fn change_role(&self, _: ReplicaRole) -> crate::Result<RoleChange> {
         Ok(RoleChange {
@@ -313,10 +323,6 @@ impl PrimaryReplicator for Probe {
         Ok(())
     }
     async fn build_replica(&self, replica: ReplicaInformation) -> crate::Result<()> {
-        assert!(
-            replica.build_id.is_empty(),
-            "controller operation leaked into engine transfer identity"
-        );
         assert_eq!(replica.current_progress, INVALID_LSN);
         assert_eq!(replica.catch_up_capability, INVALID_LSN);
         self.build_calls.fetch_add(1, Ordering::AcqRel);
@@ -328,6 +334,11 @@ impl PrimaryReplicator for Probe {
             !self.panic_build.load(Ordering::Acquire),
             "injected ordinary Build owner panic"
         );
+        if let Some(failure) = self.build_rebuild.lock().unwrap().clone() {
+            return Err(RuntimeError::ReplicaRebuildRequired(Box::new(
+                ReplicaRebuildRequired::RemoteBuildTarget(Box::new(failure)),
+            )));
+        }
         Ok(())
     }
     async fn remove_replica(&self, _: ReplicaId) -> crate::Result<()> {
@@ -398,7 +409,11 @@ impl Fixture {
     async fn with_policy(id: i64, block_role: bool, policy: EffectivePolicy) -> Self {
         let root = tempfile::Builder::new()
             .prefix(".ordinary-host-")
-            .tempdir_in(std::env::current_dir().unwrap())
+            .tempdir_in(
+                std::env::var_os("TMPDIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap()),
+            )
             .unwrap();
         let uid = ResourceUid::new("ordinary-resource");
         let local = replica(id);
@@ -1122,33 +1137,42 @@ async fn ordinary_goal_reopen_preserves_selected_call_frozen_prefix_and_rejects_
 }
 
 #[tokio::test]
-async fn ordinary_goal_builtin_factory_is_unavailable_before_engine_or_listener_effects() {
+async fn ordinary_goal_builtin_factory_opens_actual_engine_listener_and_writer() {
     let fixture = Fixture::new(1, false).await;
     fixture
         .probe
         .use_default_factory
         .store(true, Ordering::Release);
     fixture.submit(&fixture.goal).await.unwrap();
-    entered(&fixture.probe.application_close_entered).await;
-    let snapshot = fixture.snapshot().await;
-    assert!(snapshot.publication.is_none());
-    assert!(
-        matches!(&snapshot.goals[0].status, ReplicaGoalStatus::Failed(error)
-        if error.contains("unavailable until M2"))
-    );
-    assert_eq!(fixture.runtime.provider_writer_lease_count(), 0);
+    let snapshot = fixture.achieved(&fixture.goal).await;
+    let publication = snapshot.publication.unwrap();
+    assert_eq!(publication.stage, ReplicaPublicationStage::AchievedScope);
+    assert_eq!(publication.role, ReplicaRole::Primary);
+    tokio::net::TcpStream::connect(
+        publication
+            .replication_address
+            .trim_start_matches("http://")
+            .trim_end_matches('/'),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fixture.runtime.provider_writer_lease_count(), 1);
     assert_eq!(fixture.probe.open_calls.load(Ordering::Acquire), 0);
     assert!(fixture.probe.listener.lock().unwrap().is_none());
     assert!(
-        fixture
-            .store
-            .load_state()
-            .await
-            .unwrap()
-            .public_v1_operation_state
-            .unwrap()
-            .current_inbound_build_authority
-            .is_none()
+        !serde_json::to_value(
+            fixture
+                .store
+                .load_state()
+                .await
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+        )
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("currentInboundBuildAuthority")
     );
     fixture.finish().await;
 }
@@ -1742,12 +1766,99 @@ async fn ordinary_goal_primary_activation_requires_current_only_successful_catch
 }
 
 #[tokio::test]
+async fn m2_ordinary_creation_cleanup_is_retained_for_a_different_returned_control() {
+    let fixture = Fixture::new(1, false).await;
+    let replacement = Probe::new();
+    replacement.block_close.store(true, Ordering::Release);
+    fixture.probe.block_close.store(true, Ordering::Release);
+    *fixture.probe.replacement_return.lock().unwrap() = Some(replacement.clone());
+    fixture.submit(&fixture.goal).await.unwrap();
+    entered(&replacement.close_entered).await;
+    let address = replacement
+        .listener
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let pending = fixture.snapshot().await;
+    assert!(pending.publication.is_none() && pending.provider_writer_held);
+    assert_ne!(pending.read_status, AccessStatus::Granted);
+    assert_ne!(pending.write_status, AccessStatus::Granted);
+    replacement.close_gate.add_permits(1);
+    entered(&fixture.probe.close_entered).await;
+    assert!(fixture.snapshot().await.provider_writer_held);
+    fixture.probe.close_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fixture.snapshot().await.provider_writer_held {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let settled = fixture.snapshot().await;
+    assert!(settled.withdrawn && settled.publication.is_none());
+    assert!(
+        settled.goals.iter().any(|entry| entry.goal == fixture.goal
+            && matches!(entry.status, ReplicaGoalStatus::Failed(_)))
+    );
+    assert_eq!(replacement.close_calls.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 1);
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn m2_ordinary_creation_cleanup_failure_of_different_returned_control_is_sticky() {
+    let fixture = Fixture::new(1, false).await;
+    let replacement = Probe::new();
+    replacement.fail_close.store(true, Ordering::Release);
+    *fixture.probe.replacement_return.lock().unwrap() = Some(replacement.clone());
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.failed(&fixture.goal).await;
+    for _ in 0..2 {
+        let error = fixture.runtime.shutdown_and_drain().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different returned Replicator Close failed"),
+            "{error}"
+        );
+    }
+    let snapshot = fixture.snapshot().await;
+    assert!(snapshot.withdrawn && snapshot.publication.is_none() && snapshot.provider_writer_held);
+    assert_eq!(replacement.close_calls.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.probe.close_calls.load(Ordering::Acquire), 1);
+    fixture.shutdown.send_replace(true);
+    let _ = fixture.server.await.unwrap();
+}
+
+#[tokio::test]
 async fn ordinary_goal_build_does_not_replace_serving_primary_access_owner() {
     let (source, target, mut selection) = remote_pair().await;
     let catch_up = catch_up_goal(&source, 2);
     source.submit(&catch_up).await.unwrap();
     selection.source = source.achieved(&catch_up).await.publication.unwrap();
     assert_access(&source, AccessStatus::Granted).await;
+    let mut control =
+        proto::agent_control_client::AgentControlClient::connect(source.address.clone())
+            .await
+            .unwrap();
+    let response = control
+        .get_status(auth(proto::GetAgentStatusRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let report = crate::control::normalize_public_v1_agent_status_report(response).unwrap();
+    assert_eq!(report.role, ReplicaRole::Primary);
+    assert_eq!(report.progress.role, PublicProgressRole::Primary);
+    assert!(matches!(
+        report.progress.current_progress,
+        ProgressQueryResult::NotQueried(_)
+    ));
+    assert_eq!(report.write_status, AccessStatus::Granted);
+    assert_eq!(source.probe.progress_calls.load(Ordering::Acquire), 0);
     let mut build = source.goal.clone();
     build.operation_id = OperationId::new("serving-build");
     build.revision = 3;
@@ -2111,7 +2222,11 @@ async fn ordinary_goal_matching_crash_image_opens_fresh_process_but_never_replay
     entered(&source.probe.build_entered).await;
     let root = tempfile::Builder::new()
         .prefix(".ordinary-crash-image-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir_in(
+            std::env::var_os("TMPDIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap()),
+        )
         .unwrap();
     let database = root.path().join("agent.sqlite3");
     // The selected Build is held after its committed selection, with no open
@@ -2426,6 +2541,208 @@ async fn remote_pair() -> (Fixture, Fixture, RemoteReplicaSelection) {
         generation: 1,
     };
     (source, target, selection)
+}
+
+#[tokio::test]
+async fn m2_ordinary_rebuild_error_preserves_exact_goal_wire_and_reopen() {
+    let (source, target, remote) = remote_pair().await;
+    let mut goal = source.goal.clone();
+    goal.operation_id = OperationId::new("ordinary-rebuild-cancelled-observer");
+    goal.revision = 2;
+    goal.desired = ReplicaGoalKind::Build {
+        remote: Box::new(remote.clone()),
+    };
+    let failure = RemoteBuildTargetRebuildRequired {
+        reason: ReplicaRebuildReason::RemoteCopyConflict,
+        epoch: goal.scope.epoch,
+        target: remote.target.scope.storage.replica.clone(),
+        target_session: remote.target.scope.process_session_id.clone(),
+    };
+    let before = source.store.load_state().await.unwrap();
+    let input = PublicBuildInput {
+        attempt: goal.operation_id.clone(),
+        epoch: goal.scope.epoch,
+        current_configuration_id: Some(goal.scope.configuration.current.configuration_id.clone()),
+        replica: failure.target.clone(),
+        target_storage: remote.target.scope.storage.clone(),
+        process_session_id: failure.target_session.clone(),
+        source_address: remote.source.replication_address.clone(),
+        replication_address: remote.target.replication_address.clone(),
+        history: Some(goal.scope.history.clone()),
+    };
+    for dimension in ["target", "process", "epoch"] {
+        let mut changed = failure.clone();
+        match dimension {
+            "target" => changed.target = replica(3),
+            "process" => changed.target_session = ProcessSessionId::new("stale-target"),
+            "epoch" => changed.epoch.configuration_number += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            crate::host::public_lifecycle::enrich_remote_rebuild(
+                &before.identity,
+                &goal.scope.storage,
+                &goal.intent(),
+                &input,
+                ReplicaRebuildRequired::RemoteBuildTarget(Box::new(changed)),
+            )
+            .is_err()
+        );
+        assert_eq!(source.store.load_state().await.unwrap(), before);
+    }
+    *source.probe.build_rebuild.lock().unwrap() = Some(failure);
+    let cut = Arc::new(crate::host::public_lifecycle::PublicOperationCut {
+        position: crate::host::public_lifecycle::PublicCutPosition::InstructionApplied,
+        index: 0,
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    source.runtime.set_public_operation_cut(Some(cut.clone()));
+    source.submit(&goal).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), cut.entered.notified())
+        .await
+        .unwrap();
+    let registry = source.service.registry.get().unwrap();
+    let operation = registry
+        .operation_for_validation(&goal.operation_id)
+        .await
+        .unwrap();
+    let retained = source
+        .store
+        .public_operation_records()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.intent == goal.intent())
+        .unwrap();
+    let canonical = match retained.lifecycle.outcomes.as_slice() {
+        [crate::host::state::PublicInstructionOutcome::RebuildRequired(error)] => error.clone(),
+        outcomes => panic!("missing actual Build failure receipt: {outcomes:?}"),
+    };
+    assert!(
+        matches!(canonical.as_ref(), CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+        goal: captured, ..
+    } if captured.as_ref() == &goal)
+    );
+    let observer = tokio::spawn({
+        let operation = operation.clone();
+        async move { operation.cancel_root().await }
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!observer.is_finished());
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    source.runtime.set_public_operation_cut(None);
+    cut.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = source.snapshot().await;
+            if snapshot.goals.iter().any(|entry| {
+                entry.goal == goal && matches!(entry.status, ReplicaGoalStatus::Failed(_))
+            }) && !snapshot.provider_writer_held
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(source.submit(&goal).await.is_err());
+    assert_eq!(source.probe.build_calls.load(Ordering::Acquire), 1);
+    let stored = source.store.load_state().await.unwrap();
+    let preview = stored.public_v1_operation_state.as_ref().unwrap();
+    let record = &preview.operations[&goal.operation_id];
+    assert_eq!(record.lifecycle.outcomes, retained.lifecycle.outcomes);
+    assert_ne!(
+        record.disposition,
+        Some(crate::host::state::PublicOperationDisposition::Succeeded)
+    );
+    let reopened = SqliteStore::open_replacement_bound_existing(
+        source._root.path().join("agent.sqlite3"),
+        Some(&stored.identity),
+        preview.binding.as_ref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reopened.load_state().await.unwrap(), stored);
+    let projection = source
+        .runtime
+        .replacement_report_projection(goal.scope.process_session_id.clone(), 1)
+        .await
+        .unwrap();
+    let report = crate::host::public_lifecycle::public_v1_report(
+        source.store.as_ref(),
+        &goal.identity,
+        projection,
+    )
+    .await
+    .unwrap();
+    assert!(report.completed_operations.iter().any(|completion| {
+        matches!(&completion.result, PublicV1OperationResult::RebuildRequired(error) if error == &canonical)
+    }));
+    let envelope = crate::control::convert::public_v1_agent_status_to_proto(&report);
+    assert_eq!(
+        crate::control::convert::normalize_public_v1_agent_status_report(envelope.clone()).unwrap(),
+        report
+    );
+    for dimension in [
+        "operation",
+        "revision",
+        "source-process",
+        "target-process",
+        "creation",
+        "storage",
+        "endpoint",
+        "generation",
+    ] {
+        let mut changed = envelope.clone();
+        let failure = changed
+            .public_v1
+            .as_mut()
+            .unwrap()
+            .completed_operations
+            .iter_mut()
+            .find_map(|completion| completion.rebuild_required.as_mut())
+            .unwrap();
+        let mut captured: ReplicaGoal =
+            serde_json::from_str(failure.goal_json.as_ref().unwrap()).unwrap();
+        match dimension {
+            "operation" => captured.operation_id = OperationId::new("crossed-operation"),
+            "revision" => captured.revision += 1,
+            "source-process" => {
+                captured.scope.process_session_id = ProcessSessionId::new("crossed-source")
+            }
+            _ => {
+                let ReplicaGoalKind::Build { remote } = &mut captured.desired else {
+                    unreachable!()
+                };
+                match dimension {
+                    "target-process" => {
+                        remote.target.scope.process_session_id =
+                            ProcessSessionId::new("crossed-target")
+                    }
+                    "creation" => {
+                        remote.target.scope.creation_id =
+                            ReplicatorCreationId::new("crossed-creation")
+                    }
+                    "storage" => {
+                        remote.target.scope.storage.storage_generation =
+                            StorageGeneration::new("crossed-storage")
+                    }
+                    "endpoint" => remote.target.replication_address = "http://127.0.0.1:1".into(),
+                    "generation" => remote.generation += 1,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        failure.goal_json = Some(serde_json::to_string(&captured).unwrap());
+        assert!(
+            crate::control::convert::normalize_public_v1_agent_status_report(changed).is_err(),
+            "{dimension}"
+        );
+    }
+    source.finish().await;
+    target.finish().await;
 }
 
 #[tokio::test]

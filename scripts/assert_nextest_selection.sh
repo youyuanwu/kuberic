@@ -41,8 +41,26 @@ if (($# == 0)); then
   exit 2
 fi
 
-output="$(mktemp)"
-trap 'rm -f "$output"' EXIT
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "$root/target"
+if [[ -L "$root/target" || ! -d "$root/target" ]]; then
+  echo "$label: repository-local target directory is required" >&2
+  exit 1
+fi
+owned=""
+for ((attempt = 0; attempt < 64; attempt++)); do
+  candidate="$root/target/nextest-selection-$$-$RANDOM-$attempt"
+  if mkdir -m 700 -- "$candidate" 2>/dev/null; then
+    owned="$candidate"
+    break
+  fi
+done
+if [[ -z "$owned" ]]; then
+  echo "$label: cannot allocate owned repository-local inventory directory" >&2
+  exit 1
+fi
+output="$owned/inventory"
+trap 'rm -f -- "$output"; rmdir -- "$owned"' EXIT
 
 "$@" >"$output"
 

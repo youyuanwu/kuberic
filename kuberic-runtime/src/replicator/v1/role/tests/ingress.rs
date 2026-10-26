@@ -592,6 +592,7 @@ async fn primary_context_dispatch_and_current_secondary_context_error_use_actual
             },
             rig.provider.clone(),
             BuildCallbacks {
+                fence: None,
                 replication: Arc::new(|_| true),
                 copy: Arc::new(|_| true),
                 context_ack: Arc::new(|_, _| true),

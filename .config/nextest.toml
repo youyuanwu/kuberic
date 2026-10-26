@@ -36,7 +36,7 @@ not package(=postgres-replicated) and not (
     or (binary_id(=kuberic-controller)
         and test(=cluster_api::tests::production_kubernetes_api_requires_one_exact_namespace))
     or (binary_id(=kuberic-controller::public_api)
-        and test(/^(crdgen_preserves_public_v1_only_typed_status|deployment_sources_installation_namespace_from_metadata_namespace_only|deployment_prevents_concurrent_controller_reconciliation|production_inventory_contains_only_public_v1_controller_surfaces)$/))
+        and test(/^(crdgen_preserves_public_v1_only_typed_status|shipped_sample_matches_ordinary_hosting_format|deployment_sources_installation_namespace_from_metadata_namespace_only|deployment_prevents_concurrent_controller_reconciliation|production_inventory_contains_only_public_v1_controller_surfaces)$/))
     or (binary_id(=kvstore2::bin/kvstore2)
         and test(/^tests::(application_main_uses_the_agent_host_instead_of_protocol_internals|default_manifest_neither_enables_nor_routes_live_test_gate)$/))
     or (binary_id(=sqlite-replicated::bin/sqlite-replicated)
@@ -62,7 +62,7 @@ or (binary_id(=kuberic-runtime::public_v1_recovery)
 or (binary_id(=kuberic-controller)
     and test(=cluster_api::tests::production_kubernetes_api_requires_one_exact_namespace))
 or (binary_id(=kuberic-controller::public_api)
-    and test(/^(crdgen_preserves_public_v1_only_typed_status|deployment_sources_installation_namespace_from_metadata_namespace_only|deployment_prevents_concurrent_controller_reconciliation|production_inventory_contains_only_public_v1_controller_surfaces)$/))
+    and test(/^(crdgen_preserves_public_v1_only_typed_status|shipped_sample_matches_ordinary_hosting_format|deployment_sources_installation_namespace_from_metadata_namespace_only|deployment_prevents_concurrent_controller_reconciliation|production_inventory_contains_only_public_v1_controller_surfaces)$/))
 or (binary_id(=kvstore2::bin/kvstore2)
     and test(/^tests::(application_main_uses_the_agent_host_instead_of_protocol_internals|default_manifest_neither_enables_nor_routes_live_test_gate)$/))
 or (binary_id(=sqlite-replicated::bin/sqlite-replicated)
@@ -124,7 +124,7 @@ slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 
 [[profile.default.overrides]]
-filter = 'binary_id(=kuberic-runtime) and test(=host::sqlite_store::tests::terminal_inbound_build_receipt_reopens_for_exact_replay_only)'
+filter = 'binary_id(=kuberic-runtime) and test(=host::sqlite_store::tests::removed_ingress_fields_reject_before_metadata_mutation)'
 slow-timeout = { period = "270s", terminate-after = 1 }
 test-group = 'process-boundaries'
 

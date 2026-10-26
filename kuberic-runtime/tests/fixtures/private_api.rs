@@ -9,7 +9,7 @@ use kuberic_runtime::host::{
 };
 use kuberic_runtime::replicator::stream::{OperationKind, OperationStream, ReceivedOperation};
 use kuberic_runtime::replicator::{
-    NativeRuntimeControl, PartitionAccessView, Replicator, ReplicatorAttachment,
+    PartitionAccessView, Replicator, ReplicatorAttachment, ReplicatorCreation,
     ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorInterfaces,
     ReplicatorRegistration, StatefulServicePartition, v1,
 };

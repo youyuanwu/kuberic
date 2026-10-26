@@ -533,6 +533,7 @@ impl<P: StateProvider + 'static> Node<P> {
                 }),
             },
             BuildCallbacks {
+                fence: None,
                 replication: Arc::new(move |intent| send.send(from, intent)),
                 copy: Arc::new(move |action| copies.copy(&route(from, to), action, false)),
                 context_ack: Arc::new(move |ack, _| {

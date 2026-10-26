@@ -284,23 +284,6 @@ impl SqliteStore {
                 }
                 Ok(())
             }
-            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
-                self.inner
-                    .install_public_v1_inbound_build_authority(authority)
-                    .await
-            }
-            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
-                let current = self
-                    .inner
-                    .public_v1_inbound_build_authority(&authority.attempt.build_id)
-                    .await?;
-                if current.as_ref() != Some(authority.as_ref()) {
-                    return Err(crate::host::HostError::CommandRejected(
-                        "inbound build authority changed before revocation".into(),
-                    ));
-                }
-                self.inner.revoke_public_v1_inbound_build_authority().await
-            }
             PublicV1HistoryCommand::SessionRenewal { .. } => {
                 Err(crate::host::HostError::CommandRejected(
                     "session-renewal commands require an attached public executor".into(),
@@ -585,80 +568,6 @@ impl SqliteStore {
                 Some(crate::host::state::PublicOperationDisposition::Failed(
                     detail.into(),
                 )),
-            )
-            .await?;
-        Ok(())
-    }
-
-    pub async fn mark_public_v1_build_rebuild_cancelled(
-        &self,
-        intent: &crate::protocol::public_operations::PublicOperationIntent,
-        rebuild: crate::protocol::public_operations::CanonicalReplicaRebuildRequired,
-    ) -> crate::host::Result<()> {
-        self.mark_public_v1_build_rebuild_pending(intent, rebuild)
-            .await?;
-        self.cancel_public_v1_build_rebuild_pending(intent).await
-    }
-
-    pub async fn cancel_public_v1_build_rebuild_pending(
-        &self,
-        intent: &crate::protocol::public_operations::PublicOperationIntent,
-    ) -> crate::host::Result<()> {
-        self.inner
-            .advance_public_operation(
-                &intent.operation_id,
-                intent.revision,
-                &intent.process_session_id,
-                crate::host::state::PublicOperationStage::Running,
-                crate::host::state::PublicOperationStage::ContainmentPending,
-                Some(crate::host::state::PublicOperationDisposition::Cancelled),
-            )
-            .await?;
-        Ok(())
-    }
-
-    pub async fn mark_public_v1_build_rebuild_pending(
-        &self,
-        intent: &crate::protocol::public_operations::PublicOperationIntent,
-        rebuild: crate::protocol::public_operations::CanonicalReplicaRebuildRequired,
-    ) -> crate::host::Result<()> {
-        let record = self
-            .inner
-            .public_operation_records()
-            .await?
-            .into_iter()
-            .find(|record| record.intent == *intent)
-            .ok_or_else(|| {
-                crate::host::HostError::CommandRejected("public-v1 build is not journaled".into())
-            })?;
-        self.inner
-            .advance_public_operation(
-                &intent.operation_id,
-                intent.revision,
-                &intent.process_session_id,
-                record.stage,
-                crate::host::state::PublicOperationStage::Running,
-                None,
-            )
-            .await?;
-        self.inner
-            .public_instruction(
-                intent,
-                0,
-                crate::host::state::PublicInstruction::Build,
-                None,
-            )
-            .await?;
-        self.inner
-            .public_instruction(
-                intent,
-                0,
-                crate::host::state::PublicInstruction::Build,
-                Some(
-                    crate::host::state::PublicInstructionOutcome::RebuildRequired(Box::new(
-                        rebuild,
-                    )),
-                ),
             )
             .await?;
         Ok(())

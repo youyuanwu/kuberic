@@ -46,6 +46,186 @@ struct Engine {
     trace: StdMutex<Vec<&'static str>>,
 }
 
+#[tokio::test]
+async fn ordinary_finalization_retains_routes_until_actual_close_and_descendant_joins() {
+    let applications = Applications::new(false);
+    let mut harness = Harness::new(
+        applications.clone(),
+        NAMESPACE.into(),
+        NAME.into(),
+        "ordinary-cleanup-ownership".into(),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        1,
+    )
+    .await
+    .unwrap();
+    harness.ready_members(1).await.unwrap();
+    let snapshot = harness.ordinary_snapshots().await.unwrap().remove(0);
+    let uid = snapshot.storage.replica.instance_id.to_string();
+    let publication = snapshot.publication.unwrap();
+    let network = harness.network.clone();
+    let routed = network
+        .route("cleanup-observer", &uid, &publication.replication_address)
+        .await
+        .unwrap();
+    assert_eq!(request(&routed, 0).await, 1);
+    let engine = applications.engine(1);
+    engine.close_hold.store(true, Ordering::Release);
+    engine.service_close_hold.store(true, Ordering::Release);
+    let finish = tokio::spawn(harness.finish(Ok(())));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.closes.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!finish.is_finished());
+    assert_eq!(
+        network.diagnostics()["closed"],
+        false,
+        "normal finalization cannot destroy routes before ordinary Close joins"
+    );
+    assert_eq!(
+        request(&routed, 0).await,
+        0,
+        "the fenced engine still owns its real socket"
+    );
+    assert!(
+        TestingTcpRoute::register(uid.clone(), |_, endpoint| {
+            Box::pin(async move { Ok(endpoint) })
+        })
+        .is_err()
+    );
+    engine.close_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.service_closes.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!finish.is_finished());
+    assert_eq!(network.diagnostics()["closed"], false);
+    assert!(
+        network
+            .physical_route("cleanup-observer", &publication.replication_address)
+            .await
+            .is_some()
+    );
+    assert!(engine.engine_joined.load(Ordering::Acquire));
+    assert!(!engine.service_joined.load(Ordering::Acquire));
+    engine.service_close_release.add_permits(1);
+    finish.await.unwrap().unwrap();
+    assert!(engine.service_joined.load(Ordering::Acquire));
+    network.assert_drained().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_finalization_timeout_keeps_routes_and_late_close_failure_owned() {
+    let applications = Applications::new(false);
+    let mut harness = Harness::new(
+        applications.clone(),
+        NAMESPACE.into(),
+        NAME.into(),
+        "ordinary-cleanup-timeout".into(),
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        1,
+    )
+    .await
+    .unwrap();
+    harness.ready_members(1).await.unwrap();
+    let snapshot = harness.ordinary_snapshots().await.unwrap().remove(0);
+    let uid = snapshot.storage.replica.instance_id.to_string();
+    let publication = snapshot.publication.unwrap();
+    let network = harness.network.clone();
+    let routed = network
+        .route("cleanup-observer", &uid, &publication.replication_address)
+        .await
+        .unwrap();
+    let engine = applications.engine(1);
+    engine.close_hold.store(true, Ordering::Release);
+    engine.close_failure.store(true, Ordering::Release);
+    let error = harness
+        .finish(Err(anyhow!("original scenario failure")))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("original scenario failure"));
+    assert_eq!(network.diagnostics()["closed"], false);
+    assert_eq!(request(&routed, 0).await, 0);
+    assert!(
+        TestingTcpRoute::register(uid, |_, endpoint| { Box::pin(async move { Ok(endpoint) }) })
+            .is_err()
+    );
+    engine.close_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if network.diagnostics()["closed"] == true {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(engine.engine_joined.load(Ordering::Acquire));
+    assert!(engine.service_joined.load(Ordering::Acquire));
+    let failure = network.assert_drained().await.unwrap_err();
+    assert!(format!("{failure:#}").contains("ordinary fixture Close failed"));
+}
+
+#[tokio::test]
+async fn production_ordinary_builtin_copies_actual_application_bytes_before_admission() {
+    let mut harness = Harness::new(
+        super::super::tests::EmptyFactory,
+        NAMESPACE.into(),
+        NAME.into(),
+        "ordinary-builtin".into(),
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        3,
+    )
+    .await
+    .unwrap();
+    let result = async {
+        assert_eq!(harness.ready_members(3).await?, 1);
+        let snapshots = harness.ordinary_snapshots().await?;
+        assert_eq!(snapshots.len(), 3);
+        for snapshot in snapshots {
+            let publication = snapshot.publication.unwrap();
+            assert_eq!(publication.stage, ReplicaPublicationStage::AchievedScope);
+            assert!(publication.scope.configuration.previous.is_none());
+            assert_eq!(publication.scope.configuration.current.members.len(), 3);
+            let id = snapshot.storage.replica.replica_id.value();
+            if id != 1 {
+                let root = harness
+                    .data_root(snapshot.storage.replica.instance_id.as_str())
+                    .await?;
+                assert_eq!(
+                    std::fs::read(root.join("application/copied-state"))?,
+                    b"empty-provider-v1"
+                );
+                assert_ne!(snapshot.read_status, AccessStatus::Granted);
+                assert_ne!(snapshot.write_status, AccessStatus::Granted);
+            } else {
+                assert_eq!(snapshot.write_status, AccessStatus::Granted);
+                assert_eq!(snapshot.remote_operations.len(), 2);
+                assert!(
+                    snapshot
+                        .remote_operations
+                        .iter()
+                        .all(|remote| remote.accepted)
+                );
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    harness.finish(result).await.unwrap();
+}
+
 impl Engine {
     fn new(root: PathBuf, held: bool) -> Arc<Self> {
         Arc::new(Self {
@@ -376,7 +556,6 @@ impl PrimaryReplicator for Engine {
         Ok(())
     }
     async fn build_replica(&self, replica: ReplicaInformation) -> kuberic_runtime::Result<()> {
-        assert!(replica.build_id.is_empty());
         assert_eq!(replica.current_progress, INVALID_LSN);
         self.builds.fetch_add(1, Ordering::AcqRel);
         self.trace.lock().unwrap().push("build-enter");
@@ -460,15 +639,42 @@ impl ApplicationFactory for Applications {
 
 struct ObservedTransport {
     grpc: GrpcAgentApi,
+    held_snapshot: StdMutex<Option<ReplicaAgentSnapshot>>,
+    lost_discover_reply: AtomicBool,
+    discover_submissions: StdMutex<Vec<ReplicaGoal>>,
     lost_build_reply: AtomicBool,
     lose_remove_ack_reply: AtomicBool,
     lost_remove_ack: StdMutex<Option<(ReplicaGoalAcknowledgement, ReplicaAgentSnapshot)>>,
     remove_acknowledgements: AtomicUsize,
     build_submissions: AtomicUsize,
+    build_goals: StdMutex<Vec<ReplicaGoal>>,
+    build_acknowledgements: StdMutex<Vec<ReplicaGoal>>,
     forbidden: AtomicUsize,
     snapshots: AtomicUsize,
     incompatible_peer: AtomicBool,
 }
+
+impl ObservedTransport {
+    fn new(lost_reply: bool) -> Arc<Self> {
+        Arc::new(Self {
+            grpc: GrpcAgentApi::new(Duration::from_secs(3)),
+            held_snapshot: StdMutex::new(None),
+            lost_discover_reply: AtomicBool::new(false),
+            discover_submissions: StdMutex::new(Vec::new()),
+            lost_build_reply: AtomicBool::new(lost_reply),
+            lose_remove_ack_reply: AtomicBool::new(false),
+            lost_remove_ack: StdMutex::new(None),
+            remove_acknowledgements: AtomicUsize::new(0),
+            build_submissions: AtomicUsize::new(0),
+            build_goals: StdMutex::new(Vec::new()),
+            build_acknowledgements: StdMutex::new(Vec::new()),
+            forbidden: AtomicUsize::new(0),
+            snapshots: AtomicUsize::new(0),
+            incompatible_peer: AtomicBool::new(false),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentApi for ObservedTransport {
     async fn get_snapshot(
@@ -484,6 +690,18 @@ impl AgentApi for ObservedTransport {
                 .as_ref()
                 .is_some_and(|target| target.replica_id == 2);
         let mut response = self.grpc.get_snapshot(endpoint, token, request).await?;
+        if let Some(snapshot) = self.held_snapshot.lock().unwrap().as_ref()
+            && serde_json::from_slice::<ReplicaAgentQueryResult>(&response.canonical_json)
+                .is_ok_and(|result| {
+                    matches!(result, ReplicaAgentQueryResult::Initialized(current)
+                    if current.storage == snapshot.storage)
+                })
+        {
+            response.canonical_json = serde_json::to_vec(&ReplicaAgentQueryResult::Initialized(
+                Box::new(snapshot.clone()),
+            ))
+            .unwrap();
+        }
         if incompatible {
             response.protocol_version = 14;
         }
@@ -496,11 +714,22 @@ impl AgentApi for ObservedTransport {
         request: proto::ReplicaGoalRequest,
     ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
         let goal: ReplicaGoal = serde_json::from_slice(&request.canonical_json).unwrap();
+        let discover = matches!(goal.desired, ReplicaGoalKind::Discover);
+        if discover {
+            self.discover_submissions.lock().unwrap().push(goal.clone());
+        }
         let build = matches!(goal.desired, ReplicaGoalKind::Build { .. });
         if build {
             self.build_submissions.fetch_add(1, Ordering::AcqRel);
+            self.build_goals.lock().unwrap().push(goal.clone());
         }
         let result = self.grpc.submit_goal(endpoint, token, request).await;
+        if discover && self.lost_discover_reply.swap(false, Ordering::AcqRel) {
+            result?;
+            return Err(AgentRpcError::Unavailable(
+                "injected lost accepted Discover reply".into(),
+            ));
+        }
         if build && self.lost_build_reply.swap(false, Ordering::AcqRel) {
             result?;
             return Err(AgentRpcError::Unavailable(
@@ -517,6 +746,12 @@ impl AgentApi for ObservedTransport {
     ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
         let acknowledgement: ReplicaGoalAcknowledgement =
             serde_json::from_slice(&request.canonical_json).unwrap();
+        if matches!(acknowledgement.goal.desired, ReplicaGoalKind::Build { .. }) {
+            self.build_acknowledgements
+                .lock()
+                .unwrap()
+                .push(acknowledgement.goal.clone());
+        }
         let remove = matches!(acknowledgement.goal.desired, ReplicaGoalKind::Remove { .. });
         if remove {
             self.remove_acknowledgements.fetch_add(1, Ordering::AcqRel);
@@ -599,23 +834,13 @@ async fn start(
     )
     .await
     .unwrap();
-    let transport = Arc::new(ObservedTransport {
-        grpc: GrpcAgentApi::new(Duration::from_secs(3)),
-        lost_build_reply: AtomicBool::new(lost_reply),
-        lose_remove_ack_reply: AtomicBool::new(false),
-        lost_remove_ack: StdMutex::new(None),
-        remove_acknowledgements: AtomicUsize::new(0),
-        build_submissions: AtomicUsize::new(0),
-        forbidden: AtomicUsize::new(0),
-        snapshots: AtomicUsize::new(0),
-        incompatible_peer: AtomicBool::new(false),
-    });
+    let transport = ObservedTransport::new(lost_reply);
     harness.reconciler = production(&harness.api, transport.clone());
     (harness, applications, transport)
 }
 
-async fn observe(
-    harness: &Harness<Applications>,
+async fn observe<F: ApplicationFactory>(
+    harness: &Harness<F>,
     transport: Arc<ObservedTransport>,
 ) -> RawObservation {
     KubeClusterApi::new(
@@ -674,7 +899,7 @@ async fn until(harness: &mut Harness<Applications>, mut predicate: impl FnMut() 
         goals
     );
 }
-async fn pump(harness: &mut Harness<Applications>, passes: usize) {
+async fn pump<F: ApplicationFactory>(harness: &mut Harness<F>, passes: usize) {
     for _ in 0..passes {
         harness.step().await.unwrap();
     }
@@ -933,8 +1158,7 @@ async fn production_ordinary_held_build_lost_reply_recreation_exact_ready_then_s
 }
 
 #[tokio::test]
-async fn production_ordinary_builtin_factory_reports_exact_m2_unavailable_before_engine_or_listener_effects()
- {
+async fn production_ordinary_builtin_factory_opens_real_native_endpoints_without_grants() {
     let (mut harness, applications, transport) = start(false, 2, false).await;
     until(&mut harness, || {
         applications.engines.lock().unwrap().len() == 2
@@ -943,40 +1167,39 @@ async fn production_ordinary_builtin_factory_reports_exact_m2_unavailable_before
     for engine in applications.engines.lock().unwrap().values() {
         engine.default_factory.store(true, Ordering::Release);
     }
-    let unavailable = tokio::time::timeout(Duration::from_secs(10), async {
+    let opened = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             harness.step().await.unwrap();
-            let set = harness.set().await.unwrap();
-            let failures = set
-                .status
-                .iter()
-                .flat_map(|status| &status.replica_goals)
-                .filter_map(
-                    |entry| match entry.outcome.as_ref().map(|outcome| &outcome.status) {
-                        Some(ReplicaGoalStatus::Failed(message)) => Some(message),
-                        _ => None,
-                    },
-                )
-                .collect::<Vec<_>>();
-            if !failures.is_empty() {
-                assert!(
-                    failures.iter().all(|message| message
-                        .contains("built-in ordinary hosting integration is unavailable until M2")),
-                    "{failures:?}"
-                );
+            let observed = observe(&harness, transport.clone()).await;
+            let snapshots = peers(&observed);
+            if snapshots.len() == 2
+                && snapshots.iter().all(|snapshot| {
+                    snapshot.publication.as_ref().is_some_and(|publication| {
+                        publication.stage == ReplicaPublicationStage::AchievedScope
+                    })
+                })
+            {
                 break;
             }
         }
     })
     .await;
     assert!(
-        unavailable.is_ok(),
+        opened.is_ok(),
         "support did not settle: {:?}",
         harness.last_error
     );
     for snapshot in peers(&observe(&harness, transport.clone()).await) {
-        assert!(snapshot.publication.is_none());
-        assert!(!snapshot.provider_writer_held);
+        let publication = snapshot.publication.unwrap();
+        tokio::net::TcpStream::connect(
+            publication
+                .replication_address
+                .trim_start_matches("http://")
+                .trim_end_matches('/'),
+        )
+        .await
+        .unwrap();
+        assert!(snapshot.provider_writer_held);
         assert_ne!(snapshot.read_status, AccessStatus::Granted);
         assert_ne!(snapshot.write_status, AccessStatus::Granted);
     }
@@ -1110,7 +1333,7 @@ async fn production_ordinary_mixed_peer_format_rejects_before_fresh_store_resour
     close(harness, &applications).await;
 }
 
-async fn scale(harness: &Harness<Applications>, replicas: u32) {
+async fn scale<F: ApplicationFactory>(harness: &Harness<F>, replicas: u32) {
     let api = Api::<KubericSet>::namespaced(harness.api.client(), NAMESPACE);
     let mut set = api.get(NAME).await.unwrap();
     set.spec.replicas = replicas;
@@ -1120,12 +1343,20 @@ async fn scale(harness: &Harness<Applications>, replicas: u32) {
 }
 
 async fn restart_target(harness: &mut Harness<Applications>, applications: &Applications) {
-    let old = applications.engine(2);
+    restart_replica(harness, applications, 2).await;
+}
+
+async fn restart_replica(
+    harness: &mut Harness<Applications>,
+    applications: &Applications,
+    id: i64,
+) {
+    let old = applications.engine(id);
     let uid = old.context().identity().unwrap().instance_id.to_string();
     harness.stop(&uid).await.unwrap();
     harness.supervisor.lock().await.stopped.remove(&uid);
     wait(async || {
-        let new = applications.engine(2);
+        let new = applications.engine(id);
         !Arc::ptr_eq(&old, &new)
             && harness
                 .supervisor
@@ -1139,6 +1370,545 @@ async fn restart_target(harness: &mut Harness<Applications>, applications: &Appl
     assert!(
         old.engine_joined.load(Ordering::Acquire) && old.service_joined.load(Ordering::Acquire)
     );
+}
+
+#[tokio::test]
+async fn production_ordinary_closed_predecessor_cannot_block_exact_singleton_reopen_activation() {
+    let (mut harness, applications, transport) = start(false, 1, false).await;
+    assert_eq!(harness.ready_members(1).await.unwrap(), 1);
+    let old = applications.engine(1);
+    let before = peers(&observe(&harness, transport.clone()).await).remove(0);
+    let bytes = std::fs::read(old.root.join("durable-state")).unwrap();
+    let terminal = ReplicaGoal {
+        format: ORDINARY_ACTION_FORMAT,
+        identity: before.identity.clone(),
+        operation_id: OperationId::new("exact-predecessor-close"),
+        revision: before
+            .goals
+            .iter()
+            .map(|entry| entry.goal.revision)
+            .max()
+            .unwrap()
+            + 1,
+        scope: before.publication.as_ref().unwrap().scope.clone(),
+        desired: ReplicaGoalKind::Close,
+    };
+    let api = Api::<KubericSet>::namespaced(harness.api.client(), NAMESPACE);
+    let mut set = api.get(NAME).await.unwrap();
+    set.status
+        .as_mut()
+        .unwrap()
+        .replica_goals
+        .push(crate::crd::RetainedReplicaGoal::new(terminal.clone()).unwrap());
+    api.replace_status(NAME, &PostParams::default(), &set)
+        .await
+        .unwrap();
+    until(&mut harness, || {
+        old.engine_joined.load(Ordering::Acquire) && old.service_joined.load(Ordering::Acquire)
+    })
+    .await;
+    pump(&mut harness, 3).await;
+    assert_eq!(old.closes.load(Ordering::Acquire), 1);
+    restart_replica(&mut harness, &applications, 1).await;
+    assert_eq!(harness.ready_members(1).await.unwrap(), 1);
+    let after = peers(&observe(&harness, transport.clone()).await).remove(0);
+    let status = harness.set().await.unwrap().status.unwrap();
+    assert_eq!(after.storage, before.storage);
+    assert_ne!(after.process_session_id, before.process_session_id);
+    assert_ne!(after.creation_id, before.creation_id);
+    assert_eq!(after.write_status, AccessStatus::Granted);
+    let session = &status.public_v1_topology.unwrap().sessions[0];
+    assert_eq!(session.process_session_id, after.process_session_id);
+    assert_eq!(session.replicator_creation_id, after.creation_id);
+    assert!(status.replica_goals.iter().any(|entry| {
+        entry.goal == terminal
+            && entry
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+    }));
+    assert!(status.replica_goals.iter().any(|entry| {
+        entry.goal.scope.process_session_id == after.process_session_id
+            && entry.goal.scope.creation_id == after.creation_id
+            && matches!(
+                entry.goal.desired,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::WriteQuorum)
+                }
+            )
+            && entry
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+    }));
+    assert_eq!(applications.engine(1).opens.load(Ordering::Acquire), 1);
+    assert_eq!(
+        std::fs::read(old.root.join("durable-state")).unwrap(),
+        bytes
+    );
+    close(harness, &applications).await;
+}
+
+async fn builtin_singleton() -> (
+    Harness<super::super::tests::EmptyFactory>,
+    Arc<ObservedTransport>,
+) {
+    let mut harness = Harness::new(
+        super::super::tests::EmptyFactory,
+        NAMESPACE.into(),
+        NAME.into(),
+        "ordinary-builtin-growth".into(),
+        Duration::from_secs(35),
+        Duration::from_secs(10),
+        1,
+    )
+    .await
+    .unwrap();
+    let transport = ObservedTransport::new(false);
+    harness.reconciler = production(&harness.api, transport.clone());
+    assert_eq!(harness.ready_members(1).await.unwrap(), 1);
+    (harness, transport)
+}
+
+async fn retain_terminal<F: ApplicationFactory>(
+    harness: &Harness<F>,
+    peer: &ReplicaAgentSnapshot,
+    desired: ReplicaGoalKind,
+) -> ReplicaGoal {
+    let api = Api::<KubericSet>::namespaced(harness.api.client(), NAMESPACE);
+    let mut set = api.get(NAME).await.unwrap();
+    let goal = ReplicaGoal {
+        format: ORDINARY_ACTION_FORMAT,
+        identity: peer.identity.clone(),
+        operation_id: OperationId::new(format!("growth-terminal-{}", peer.process_session_id)),
+        revision: peer
+            .goals
+            .iter()
+            .map(|entry| entry.goal.revision)
+            .chain(
+                set.status
+                    .as_ref()
+                    .unwrap()
+                    .replica_goals
+                    .iter()
+                    .filter(|entry| entry.goal.scope.storage == peer.storage)
+                    .map(|entry| entry.goal.revision),
+            )
+            .max()
+            .unwrap()
+            + 1,
+        scope: peer.publication.as_ref().unwrap().scope.clone(),
+        desired,
+    };
+    set.status
+        .as_mut()
+        .unwrap()
+        .replica_goals
+        .push(crate::crd::RetainedReplicaGoal::new(goal.clone()).unwrap());
+    api.replace_status(NAME, &PostParams::default(), &set)
+        .await
+        .unwrap();
+    goal
+}
+
+async fn retain_fresh_build<F: ApplicationFactory>(harness: &mut Harness<F>) -> ReplicaGoal {
+    scale(harness, 2).await;
+    loop {
+        if let Some(entry) = harness
+            .set()
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .replica_goals
+            .into_iter()
+            .find(|entry| matches!(entry.goal.desired, ReplicaGoalKind::Build { .. }))
+        {
+            assert!(entry.outcome.is_none());
+            return entry.goal;
+        }
+        harness.step().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn production_ordinary_predecessor_close_allows_one_exact_build_and_actual_native_copy() {
+    let (mut harness, transport) = builtin_singleton().await;
+    let before = peers(&observe(&harness, transport.clone()).await).remove(0);
+    let terminal = retain_terminal(&harness, &before, ReplicaGoalKind::Close).await;
+    loop {
+        harness.step().await.unwrap();
+        if harness
+            .set()
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .replica_goals
+            .iter()
+            .any(|entry| {
+                entry.goal == terminal
+                    && entry
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
+            })
+        {
+            break;
+        }
+    }
+    let closed = peers(&observe(&harness, transport.clone()).await).remove(0);
+    assert!(closed.withdrawn);
+    assert!(!closed.provider_writer_held);
+    let uid = before.storage.replica.instance_id.to_string();
+    harness.stop(&uid).await.unwrap();
+    harness.supervisor.lock().await.stopped.remove(&uid);
+    wait(async || {
+        harness
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .get(&uid)
+            .is_some_and(|host| host.running.is_some())
+    })
+    .await;
+    assert_eq!(harness.ready_members(1).await.unwrap(), 1);
+    let reopened = peers(&observe(&harness, transport.clone()).await).remove(0);
+    assert_eq!(reopened.storage, before.storage);
+    assert_eq!(reopened.history, before.history);
+    assert_ne!(reopened.process_session_id, before.process_session_id);
+    assert_ne!(reopened.creation_id, before.creation_id);
+    assert_eq!(reopened.write_status, AccessStatus::Granted);
+    assert!(
+        reopened
+            .goals
+            .iter()
+            .any(|entry| { entry.goal == terminal && entry.status == ReplicaGoalStatus::Achieved })
+    );
+
+    let build = retain_fresh_build(&mut harness).await;
+    assert!(transport.build_goals.lock().unwrap().is_empty());
+    let ReplicaGoalKind::Build { remote } = &build.desired else {
+        unreachable!()
+    };
+    assert_eq!(build.scope.process_session_id, reopened.process_session_id);
+    assert_eq!(build.scope.creation_id, reopened.creation_id);
+    let target = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage == remote.target.scope.storage)
+        .unwrap();
+    assert_eq!(target.publication.as_ref().unwrap(), &remote.target);
+    assert_eq!(remote.target.role, ReplicaRole::IdleSecondary);
+    let copied = harness
+        .data_root(target.storage.replica.instance_id.as_str())
+        .await
+        .unwrap()
+        .join("application/copied-state");
+    assert!(!copied.exists());
+    harness.step().await.unwrap();
+    wait(async || {
+        peers(&observe(&harness, transport.clone()).await)
+            .iter()
+            .any(|peer| {
+                peer.remote_operations.iter().any(|operation| {
+                    operation.operation_id == build.operation_id
+                        && operation.selection == **remote
+                        && operation.state == RemoteReplicaState::Ready
+                        && !operation.accepted
+                })
+            })
+    })
+    .await;
+    assert_eq!(std::fs::read(&copied).unwrap(), b"empty-provider-v1");
+    assert_eq!(*transport.build_goals.lock().unwrap(), vec![build.clone()]);
+    assert!(transport.build_acknowledgements.lock().unwrap().is_empty());
+    let raw = observe(&harness, transport.clone()).await;
+    assert_eq!(
+        raw.set
+            .status
+            .as_ref()
+            .unwrap()
+            .public_v1_topology
+            .as_ref()
+            .unwrap()
+            .member_count,
+        1
+    );
+    let target = peers(&raw)
+        .into_iter()
+        .find(|peer| peer.storage == remote.target.scope.storage)
+        .unwrap();
+    assert_ne!(target.read_status, AccessStatus::Granted);
+    assert_ne!(target.write_status, AccessStatus::Granted);
+    harness.step().await.unwrap();
+    let accepted = observe(&harness, transport.clone()).await;
+    assert!(
+        peers(&accepted)
+            .iter()
+            .any(|peer| peer.remote_operations.iter().any(|operation| {
+                operation.operation_id == build.operation_id
+                    && operation.selection == **remote
+                    && operation.state == RemoteReplicaState::Ready
+                    && operation.accepted
+            }))
+    );
+    assert_eq!(
+        accepted
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .public_v1_topology
+            .as_ref()
+            .unwrap()
+            .member_count,
+        1
+    );
+    assert_eq!(harness.ready_members(2).await.unwrap(), 1);
+    pump(&mut harness, 3).await;
+    assert_eq!(*transport.build_goals.lock().unwrap(), vec![build.clone()]);
+    assert_eq!(
+        *transport.build_acknowledgements.lock().unwrap(),
+        vec![build.clone()]
+    );
+    let status = harness.set().await.unwrap().status.unwrap();
+    for goal in [&terminal, &build] {
+        let entries = status
+            .replica_goals
+            .iter()
+            .filter(|entry| entry.goal == *goal)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].outcome.as_ref().unwrap().status,
+            ReplicaGoalStatus::Achieved
+        );
+    }
+    assert_eq!(std::fs::read(copied).unwrap(), b"empty-provider-v1");
+    assert_eq!(transport.forbidden.load(Ordering::Acquire), 0);
+    harness.finish(Ok(())).await.unwrap();
+}
+
+#[tokio::test]
+async fn production_ordinary_current_terminal_vetoes_pending_build_before_actual_copy() {
+    for id in [1, 2] {
+        for desired in [ReplicaGoalKind::Close, ReplicaGoalKind::Abort] {
+            let (mut harness, transport) = builtin_singleton().await;
+            let build = retain_fresh_build(&mut harness).await;
+            let raw = observe(&harness, transport.clone()).await;
+            let target = peers(&raw)
+                .into_iter()
+                .find(|peer| peer.storage.replica.replica_id.value() == 2)
+                .unwrap();
+            let copied = harness
+                .data_root(target.storage.replica.instance_id.as_str())
+                .await
+                .unwrap()
+                .join("application/copied-state");
+            let peer = peers(&raw)
+                .into_iter()
+                .find(|peer| peer.storage.replica.replica_id.value() == id)
+                .unwrap();
+            let terminal = retain_terminal(&harness, &peer, desired).await;
+            let endpoint = crate::cluster_api::agent_endpoint(
+                raw.pods
+                    .iter()
+                    .find(|pod| {
+                        pod.uid().as_deref() == Some(peer.storage.replica.instance_id.as_str())
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+            transport
+                .grpc
+                .submit_goal(
+                    &endpoint,
+                    "local-test-token",
+                    proto::ReplicaGoalRequest {
+                        protocol_version: ORDINARY_ACTION_FORMAT,
+                        canonical_json: serde_json::to_vec(&terminal).unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            wait(async || {
+                peers(&observe(&harness, transport.clone()).await)
+                    .iter()
+                    .any(|snapshot| {
+                        snapshot.storage == peer.storage
+                            && snapshot.withdrawn
+                            && snapshot.goals.iter().any(|entry| {
+                                entry.goal == terminal
+                                    && entry.status == ReplicaGoalStatus::Achieved
+                            })
+                    })
+            })
+            .await;
+            let closed = peers(&observe(&harness, transport.clone()).await)
+                .into_iter()
+                .find(|snapshot| snapshot.storage == peer.storage)
+                .unwrap();
+            for status in [
+                ReplicaGoalStatus::Pending,
+                ReplicaGoalStatus::Failed("retained current terminal failure".into()),
+                ReplicaGoalStatus::Uncertain("retained current terminal uncertainty".into()),
+                ReplicaGoalStatus::Achieved,
+            ] {
+                let mut held = closed.clone();
+                held.goals
+                    .iter_mut()
+                    .find(|entry| entry.goal == terminal)
+                    .unwrap()
+                    .status = status;
+                *transport.held_snapshot.lock().unwrap() = Some(held);
+                pump(&mut harness, 2).await;
+                assert!(transport.build_goals.lock().unwrap().is_empty());
+                assert!(transport.build_acknowledgements.lock().unwrap().is_empty());
+                assert!(!copied.exists());
+            }
+            *transport.held_snapshot.lock().unwrap() = None;
+            let blocked = observe(&harness, transport.clone()).await;
+            assert!(
+                blocked
+                    .set
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .replica_goals
+                    .iter()
+                    .any(|entry| entry.goal == build && entry.outcome.is_none())
+            );
+            assert!(
+                peers(&blocked)
+                    .iter()
+                    .all(|peer| peer.remote_operations.is_empty())
+            );
+            assert_eq!(
+                blocked
+                    .set
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .public_v1_topology
+                    .as_ref()
+                    .unwrap()
+                    .member_count,
+                1
+            );
+            assert!(
+                peers(&blocked)
+                    .iter()
+                    .filter(|peer| peer.storage.replica.replica_id.value() == 2)
+                    .all(|peer| peer.read_status != AccessStatus::Granted
+                        && peer.write_status != AccessStatus::Granted)
+            );
+            harness.finish(Ok(())).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn production_ordinary_reopen_retries_one_discover_with_lost_reply_and_held_publication() {
+    let (mut harness, applications, transport) = start(false, 2, false).await;
+    until(&mut harness, || {
+        applications
+            .engines
+            .lock()
+            .unwrap()
+            .get(&1)
+            .is_some_and(|engine| engine.builds.load(Ordering::Acquire) > 0)
+    })
+    .await;
+    applications.release();
+    assert_eq!(harness.ready_members(2).await.unwrap(), 1);
+    let before = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 2)
+        .unwrap();
+    let prefix = std::fs::read(applications.engine(2).root.join("durable-state")).unwrap();
+    restart_target(&mut harness, &applications).await;
+    let reopened = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage.replica.replica_id.value() == 2)
+        .unwrap();
+    assert_eq!(reopened.storage, before.storage);
+    assert_eq!(reopened.open_mode, OpenMode::Existing);
+    assert_ne!(reopened.process_session_id, before.process_session_id);
+    assert_ne!(reopened.creation_id, before.creation_id);
+    assert!(reopened.publication.is_none());
+    *transport.held_snapshot.lock().unwrap() = Some(reopened.clone());
+    transport.lost_discover_reply.store(true, Ordering::Release);
+    pump(&mut harness, 8).await;
+    let retained = harness.set().await.unwrap().status.unwrap().replica_goals;
+    let owners = retained
+        .iter()
+        .filter(|entry| entry.goal.scope.process_session_id == reopened.process_session_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        owners.len(),
+        1,
+        "stale discovery observation appended another owner"
+    );
+    let selected = &owners[0].goal;
+    assert!(matches!(selected.desired, ReplicaGoalKind::Discover));
+    assert!(owners[0].outcome.is_none());
+    let retries = transport
+        .discover_submissions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|goal| goal.scope.process_session_id == reopened.process_session_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        retries.len() > 1,
+        "lost response did not exercise exact retry"
+    );
+    assert!(retries.iter().all(|goal| goal == selected));
+    let engine = applications.engine(2);
+    wait(async || engine.opens.load(Ordering::Acquire) == 1).await;
+    *transport.held_snapshot.lock().unwrap() = None;
+    until(&mut harness, || {
+        engine.role_calls.load(Ordering::Acquire) > 0
+    })
+    .await;
+    pump(&mut harness, 4).await;
+    let observed = peers(&observe(&harness, transport.clone()).await)
+        .into_iter()
+        .find(|peer| peer.storage == reopened.storage)
+        .unwrap();
+    assert_eq!(
+        observed
+            .goals
+            .iter()
+            .filter(|entry| entry.goal == *selected)
+            .count(),
+        1
+    );
+    assert!(
+        harness
+            .set()
+            .await
+            .unwrap()
+            .status
+            .unwrap()
+            .replica_goals
+            .iter()
+            .any(|entry| entry.goal == *selected
+                && entry
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved))
+    );
+    assert_eq!(engine.opens.load(Ordering::Acquire), 1);
+    assert_eq!(
+        std::fs::read(engine.root.join("durable-state")).unwrap(),
+        prefix
+    );
+    assert_eq!(transport.forbidden.load(Ordering::Acquire), 0);
+    close(harness, &applications).await;
 }
 
 async fn build_goal(harness: &Harness<Applications>) -> ReplicaGoal {

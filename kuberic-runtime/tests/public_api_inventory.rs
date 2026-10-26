@@ -25,6 +25,8 @@ fn application_replication_api_has_no_parallel_driver_or_admission_surface() {
             "OperationMetadata",
             "StreamOperation",
             "ServiceStreams",
+            "ReplicaInformation::build_id",
+            "PublicReplicaDescriptor::build_id",
         ] {
             assert!(
                 !entry.contains(forbidden),
@@ -193,6 +195,12 @@ fn host_capabilities_are_not_source_public_even_when_doc_hidden() {
             "PartitionAccessView",
             "ReplicatorRegistration",
             "NativeRuntimeControl",
+            "CustomReplicatorControl",
+            "CallbackOwnership",
+            "with_custom_control",
+            "outbound_build_authority",
+            "validate_build_authority",
+            "struct crate::replicator::ReplicatorCreation",
             "crate::replicator::ReplicatorFactoryContext::fn new",
             "crate::replicator::StatefulServicePartition::fn new",
             "crate::replicator::ReplicatorInterfaces::fn testing_",

@@ -24,9 +24,8 @@ mod transport;
 
 pub use application::{ApplicationFactory, CreatedApplication, ReplicaContext};
 pub use cluster::{
-    ClusterBuilder, Observation, ObservationFailure, ObservationFailureKind, OperationDispatch,
-    ReplicaRef, ResourceKind, ResourceObservation, ResourceRef, SupportResource, TestCluster,
-    Topology,
+    ClusterBuilder, Observation, ObservationFailure, ObservationFailureKind, ReplicaRef,
+    ResourceKind, ResourceObservation, ResourceRef, SupportResource, TestCluster, Topology,
 };
 pub use error::{ErrorKind, Result, TestError};
 pub use faults::{

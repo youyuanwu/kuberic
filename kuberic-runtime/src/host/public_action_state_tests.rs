@@ -145,7 +145,6 @@ async fn secondary_host_installation_does_not_claim_primary_configuration_stage(
         replicas: vec![PublicReplicaDescriptor {
             identity: primary.clone(),
             role: ReplicaRole::Primary,
-            build_id: OperationId::default(),
             replication_address: "http://127.0.0.1:2".into(),
             process_session_id: ProcessSessionId::new("other-session"),
             storage_incarnation: Some(ReplicaStorageIncarnationContext {
@@ -512,8 +511,7 @@ async fn swap_starting_joint_stage_cannot_hide_behind_a_newer_refreshed_epoch() 
 
 #[tokio::test]
 async fn promotion_selected_catchup_cancellation_fences_all_same_epoch_wait_entrypoints() {
-    let mut fixture = Fixture::new().await;
-    fixture.callbacks.native_observer_callbacks = true;
+    let fixture = Fixture::new().await;
     fixture.probe.block_catchup.store(true, Ordering::Release);
     let configuration = current(&fixture).await;
     let input = PublicLifecycleInput {

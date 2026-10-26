@@ -267,7 +267,6 @@ impl Journey {
         source.callbacks.primary = Arc::new(RemotePrimary(source.probe.clone(), remote.clone()));
         let (contained, witness) = tokio::sync::watch::channel(false);
         source.callbacks.containment = Some(witness);
-        source.callbacks.wait_for_containment = true;
         for fixture in [&mut source, &mut target] {
             let replica = fixture
                 .bind_open_context(crate::application::OpenMode::Existing)

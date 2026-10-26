@@ -284,11 +284,13 @@ impl PgDurableState {
                 .retain(|build| build.request.authority.current_configuration.epoch > previous);
         }
         self.build_epoch = Some(epoch);
-        let selected = current
-            .replicas
+        let selected = self
+            .native_build
             .iter()
-            .filter(|r| !r.build_id.is_empty())
-            .map(|r| &r.build_id)
+            .chain(&self.outbound_builds)
+            .chain(&self.suspended_builds)
+            .filter(|build| crate::build::native_build_selected(&build.request, current))
+            .map(|build| build.request.authority.build_id.clone())
             .collect::<BTreeSet<_>>();
         if selected.len() > crate::build::MAX_BUILDS
             || selected.iter().any(|id| !bounded_build_id(id))
@@ -336,7 +338,7 @@ impl PgDurableState {
                 .any(|b| &b.request.authority.build_id == id)
         });
         let mut known = self.retired_builds.clone();
-        known.extend(selected.into_iter().cloned());
+        known.extend(selected);
         known.extend(
             self.outbound_builds
                 .iter()
@@ -951,6 +953,142 @@ mod tests {
                 agent_generation: AgentGeneration::new("generation-1"),
             },
         }
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn m2_pg_native_build_selection_preserves_durable_authority_without_host_descriptor_ids()
+    {
+        use crate::build::{
+            PgBuildMethod, PgBuildProgress, PgBuildRequest, PgBuildStage, PgLineage,
+        };
+        use kuberic_runtime::protocol::types::{
+            BuildAuthorityKind, ConfigurationDescriptor, ConfigurationMember, ProcessSessionId,
+            ReplicaRole,
+        };
+        use kuberic_runtime::replicator::{ReplicaInformation, ReplicaSetConfiguration};
+
+        let root = crate::testing::TestDataDir::new("native-selection");
+        let source = identity().replica;
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("target-pod"),
+            agent_generation: AgentGeneration::new("target-generation"),
+        };
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            source.replica_id,
+            vec![ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        );
+        let mut source_peer = ReplicaInformation::active_peer(
+            source.clone(),
+            "http://127.0.0.1:5001".into(),
+            ProcessSessionId::new("source-process"),
+            7,
+            0,
+            false,
+        )
+        .unwrap();
+        source_peer.role = ReplicaRole::Primary;
+        let mut target_peer =
+            ReplicaInformation::idle_build(target.clone(), "http://127.0.0.1:5002".into());
+        target_peer.process_session_id = ProcessSessionId::new("target-process");
+        target_peer.current_progress = 7;
+        let configuration = ReplicaSetConfiguration {
+            configuration: current.clone(),
+            replicas: vec![source_peer, target_peer],
+        };
+        let request = PgBuildRequest {
+            version: crate::build::BUILD_PROTOCOL_VERSION,
+            resource_uid: identity().resource_uid,
+            authority: BuildAuthority {
+                build_id: OperationId::new("independent-native-id"),
+                kind: BuildAuthorityKind::Provisioning,
+                source,
+                target,
+                current_configuration: current,
+                replication_boundary_lsn: 7,
+            },
+            source_session: ProcessSessionId::new("source-process"),
+            target_session: ProcessSessionId::new("target-process"),
+            source_endpoint: "http://127.0.0.1:5001".into(),
+            source_host: "127.0.0.1".into(),
+            source_port: 5432,
+            lineage: PgLineage {
+                system_identifier: "1".into(),
+                timeline: 1,
+                history: Vec::new(),
+                history_text: String::new(),
+            },
+        };
+        request.validate().unwrap();
+        assert!(crate::build::native_build_selected(
+            &request,
+            &configuration
+        ));
+        for dimension in ["source", "target", "epoch", "boundary", "role"] {
+            let mut changed = configuration.clone();
+            match dimension {
+                "source" => {
+                    changed.replicas[0].process_session_id = ProcessSessionId::new("old-source")
+                }
+                "target" => {
+                    changed.replicas[1].process_session_id = ProcessSessionId::new("old-target")
+                }
+                "epoch" => changed.configuration.epoch.configuration_number += 1,
+                "boundary" => changed.replicas[1].current_progress += 1,
+                "role" => changed.replicas[1].role = ReplicaRole::ActiveSecondary,
+                _ => unreachable!(),
+            }
+            assert!(
+                !crate::build::native_build_selected(&request, &changed),
+                "{dimension}"
+            );
+        }
+        let store = PgDurableStore::open(root.path().join("meta"), identity(), StorageMode::Fresh)
+            .await
+            .unwrap();
+        let progress = PgBuildProgress {
+            request: request.clone(),
+            stage: PgBuildStage::Intent,
+            method: PgBuildMethod::Fresh,
+            sequence: 1,
+            evidence: None,
+        };
+        store
+            .update(|state| {
+                state.outbound_builds.push(progress.clone());
+                state.reconcile_builds(&configuration)
+            })
+            .await
+            .unwrap();
+        let before = store.snapshot().await;
+        assert_eq!(before.outbound_builds, vec![progress]);
+        drop(store);
+        let store = PgDurableStore::open(
+            root.path().join("meta"),
+            identity(),
+            StorageMode::Established,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.snapshot().await, before);
+        let mut successor = configuration;
+        successor.replicas[1].process_session_id = ProcessSessionId::new("successor-process");
+        store
+            .update(|state| state.reconcile_builds(&successor))
+            .await
+            .unwrap();
+        let retired = store.snapshot().await;
+        assert!(retired.outbound_builds.is_empty());
+        assert!(retired.retired_builds.contains(&request.authority.build_id));
+        assert!(retired.build_is_terminal(&request.authority));
+        assert_eq!(retired.version, before.version);
+        assert_eq!(retired.identity, before.identity);
     }
 
     #[cfg(feature = "testing")]

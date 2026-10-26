@@ -100,7 +100,6 @@ async fn newer_swap_final_epoch_cannot_hide_an_older_or_different_executed_start
             starting.replicas.push(PublicReplicaDescriptor {
                 identity: peer.clone(),
                 role: ReplicaRole::ActiveSecondary,
-                build_id: OperationId::default(),
                 replication_address: "http://127.0.0.1:2".into(),
                 process_session_id: ProcessSessionId::new("peer-session"),
                 storage_incarnation: Some(ReplicaStorageIncarnationContext {
@@ -203,7 +202,6 @@ async fn successor_swap_starts_from_receipted_configuration_before_predecessor_r
         release: tokio::sync::Notify::new(),
     });
     fixture.callbacks.cut = Some(cut.clone());
-    fixture.callbacks.native_observer_callbacks = true;
     let predecessor = fixture.launch(swap(current.clone(), false), 3).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), cut.entered.notified())
         .await

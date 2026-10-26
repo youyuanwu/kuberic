@@ -10,7 +10,7 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 15;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 16;
 
 #[path = "replica_goal.rs"]
 mod replica_goal;
@@ -456,7 +456,6 @@ impl PublicConfiguration {
         for replica in &self.replicas {
             replica.validate()?;
             if !identities.insert(&replica.identity)
-                || replica.build_id != OperationId::default()
                 || !members.iter().any(|member| {
                     member.identity == replica.identity && member.role == replica.role
                 })
@@ -530,7 +529,6 @@ impl PublicConfiguration {
             if !identities.insert(&replica.identity)
                 || replica.identity.replica_id == local_replica_id
                 || replica.role != ReplicaRole::ActiveSecondary
-                || replica.build_id != OperationId::default()
                 || !expected_ready_secondaries.contains(&replica.identity)
             {
                 return Err(
@@ -556,9 +554,8 @@ impl PublicConfiguration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicReplicaDescriptor {
-    pub build_id: OperationId,
     pub identity: ReplicaIdentity,
     pub replication_address: String,
     pub process_session_id: ProcessSessionId,
@@ -632,94 +629,6 @@ pub fn validate_progress_value(progress: i64) -> Result<(), &'static str> {
     if progress < -1 {
         Err("public progress is below INVALID_LSN")
     } else {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicBuildAttemptReference {
-    pub resource_uid: ResourceUid,
-    pub epoch: Epoch,
-    pub build_id: OperationId,
-    pub source: ReplicaIdentity,
-    pub source_storage: ReplicaStorageIncarnationContext,
-    pub source_session: ProcessSessionId,
-    pub target: ReplicaIdentity,
-    pub target_storage: ReplicaStorageIncarnationContext,
-    pub target_session: ProcessSessionId,
-}
-
-impl PublicBuildAttemptReference {
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
-        if self.resource_uid.is_empty()
-            || self.build_id.is_empty()
-            || self.source_session.is_empty()
-            || self.target_session.is_empty()
-            || self.epoch.data_loss_number < 0
-            || self.epoch.configuration_number < 0
-        {
-            return Err("public build attempt reference is incomplete");
-        }
-        validate_exact_replica_identity(&self.source)?;
-        validate_exact_replica_identity(&self.target)?;
-        self.source_storage.validate()?;
-        self.target_storage.validate()?;
-        if self.source_storage.replica != self.source || self.target_storage.replica != self.target
-        {
-            return Err("public build storage differs from its replica identity");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicInboundBuildAuthority {
-    pub operation_id: OperationId,
-    pub operation_revision: u64,
-    pub attempt: PublicBuildAttemptReference,
-    pub history: HistoryContext,
-    pub current_configuration_id: ConfigurationId,
-    pub source_address: String,
-    pub target_address: String,
-}
-
-impl PublicInboundBuildAuthority {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        self.attempt.validate()?;
-        self.history.validate()?;
-        if self.operation_id.is_empty()
-            || self.operation_revision == 0
-            || self.current_configuration_id.is_empty()
-            || self.source_address.trim().is_empty()
-            || self.target_address.is_empty()
-        {
-            return Err("inbound build authority lacks configuration or endpoint address");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PublicInboundBuildReceipt {
-    pub authority: PublicInboundBuildAuthority,
-    pub final_sequence: u64,
-    pub replication_boundary_lsn: i64,
-    pub catch_up_boundary_lsn: i64,
-    pub durable_lsn: i64,
-}
-
-impl PublicInboundBuildReceipt {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        self.authority.validate()?;
-        if self.replication_boundary_lsn < 0
-            || self.catch_up_boundary_lsn < self.replication_boundary_lsn
-            || self.durable_lsn < self.catch_up_boundary_lsn
-        {
-            return Err("inbound build receipt has inconsistent durable progress");
-        }
         Ok(())
     }
 }
@@ -2134,7 +2043,7 @@ pub enum CanonicalReplicaRebuildRequired {
     RemoteBuildTarget {
         reason: ReplicaRebuildReason,
         operation: CapturedPublicOperationIdentity,
-        build: Box<PublicBuildAttemptReference>,
+        goal: Box<ReplicaGoal>,
     },
 }
 
@@ -2156,13 +2065,17 @@ impl CanonicalReplicaRebuildRequired {
                 }
             }
             Self::RemoteBuildTarget {
-                operation, build, ..
+                operation, goal, ..
             } => {
                 operation.validate()?;
-                build.validate()?;
-                if build.resource_uid != operation.resource_uid
-                    || build.epoch != operation.epoch
-                    || build.build_id != operation.operation_id
+                goal.validate()?;
+                if !matches!(goal.desired, ReplicaGoalKind::Build { .. })
+                    || goal.scope.history.resource_uid != operation.resource_uid
+                    || goal.scope.epoch != operation.epoch
+                    || goal.operation_id != operation.operation_id
+                    || goal.revision != operation.revision
+                    || goal.identity != operation.identity
+                    || goal.scope.process_session_id != operation.detecting_session
                 {
                     return Err("remote rebuild attempt differs from captured operation");
                 }
@@ -2173,8 +2086,7 @@ impl CanonicalReplicaRebuildRequired {
 
     fn validate_for_report(
         &self,
-        completion_id: &OperationId,
-        completion_revision: u64,
+        completion: &PublicV1OperationCompletion,
         report_identity: &PublicV1Identity,
         report_resource_uid: &ResourceUid,
         report_replica: &ReplicaIdentity,
@@ -2186,8 +2098,8 @@ impl CanonicalReplicaRebuildRequired {
                 operation
             }
         };
-        if &operation.operation_id != completion_id
-            || operation.revision != completion_revision
+        if operation.operation_id != completion.operation_id
+            || operation.revision != completion.revision
             || &operation.identity != report_identity
             || &operation.resource_uid != report_resource_uid
             || &operation.detecting_session != report_session
@@ -2198,8 +2110,10 @@ impl CanonicalReplicaRebuildRequired {
             Self::LocalProvider { local_replica, .. } if local_replica != report_replica => {
                 Err("local rebuild evidence differs from the reporting replica")
             }
-            Self::RemoteBuildTarget { build, .. }
-                if &build.source != report_replica || &build.source_session != report_session =>
+            Self::RemoteBuildTarget { goal, .. }
+                if &goal.scope.storage.replica != report_replica
+                    || &goal.scope.process_session_id != report_session
+                    || goal.intent().input_digest != completion.input_digest =>
             {
                 Err("remote rebuild source differs from the reporting replica")
             }
@@ -2404,8 +2318,7 @@ impl PublicV1OperationCompletion {
                 return Err("public-v1 failure completion lacks detail");
             }
             PublicV1OperationResult::RebuildRequired(rebuild) => rebuild.validate_for_report(
-                &self.operation_id,
-                self.revision,
+                self,
                 report_identity,
                 report_resource_uid,
                 report_replica,
@@ -2938,7 +2851,7 @@ pub struct PublicV1AcceptedRebuildRequired {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_storage: Option<PvcUid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build: Option<PublicBuildAttemptReference>,
+    pub goal: Option<ReplicaGoal>,
 }
 
 impl PublicV1AcceptedRebuildRequired {
@@ -2957,12 +2870,12 @@ impl PublicV1AcceptedRebuildRequired {
                 provider_replica: Some(provider.replica.clone()),
                 local_replica: Some(local_replica.clone()),
                 local_storage: Some(local_storage.clone()),
-                build: None,
+                goal: None,
             },
             CanonicalReplicaRebuildRequired::RemoteBuildTarget {
                 reason,
                 operation,
-                build,
+                goal,
             } => Self {
                 kind: PublicV1AcceptedRebuildKind::RemoteBuildTarget,
                 reason: *reason,
@@ -2970,7 +2883,7 @@ impl PublicV1AcceptedRebuildRequired {
                 provider_replica: None,
                 local_replica: None,
                 local_storage: None,
-                build: Some(build.as_ref().clone()),
+                goal: Some(goal.as_ref().clone()),
             },
         }
     }
@@ -2989,23 +2902,27 @@ impl PublicV1AcceptedRebuildRequired {
                     .ok_or("accepted local rebuild lacks local replica")?;
                 if provider != local
                     || self.local_storage.as_ref().is_none_or(PvcUid::is_empty)
-                    || self.build.is_some()
+                    || self.goal.is_some()
                 {
                     return Err("accepted local rebuild shape is inconsistent");
                 }
             }
             PublicV1AcceptedRebuildKind::RemoteBuildTarget => {
-                let build = self
-                    .build
+                let goal = self
+                    .goal
                     .as_ref()
                     .ok_or("accepted remote rebuild lacks exact build identity")?;
-                build.validate()?;
+                goal.validate()?;
                 if self.provider_replica.is_some()
                     || self.local_replica.is_some()
                     || self.local_storage.is_some()
-                    || build.resource_uid != self.operation.resource_uid
-                    || build.epoch != self.operation.epoch
-                    || build.build_id != self.operation.operation_id
+                    || !matches!(goal.desired, ReplicaGoalKind::Build { .. })
+                    || goal.scope.history.resource_uid != self.operation.resource_uid
+                    || goal.scope.epoch != self.operation.epoch
+                    || goal.operation_id != self.operation.operation_id
+                    || goal.revision != self.operation.revision
+                    || goal.identity != self.operation.identity
+                    || goal.scope.process_session_id != self.operation.detecting_session
                 {
                     return Err("accepted remote rebuild shape is inconsistent");
                 }
@@ -3314,7 +3231,6 @@ impl CanonicalEncoder {
     }
 
     fn public_replica(&mut self, replica: &PublicReplicaDescriptor) {
-        self.string(replica.build_id.as_str());
         self.replica_identity(&replica.identity);
         self.string(&replica.replication_address);
         self.string(replica.process_session_id.as_str());

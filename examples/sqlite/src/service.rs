@@ -104,6 +104,10 @@ pub struct SqliteService {
     replication_address: String,
     stop: watch::Sender<bool>,
     consumers: AsyncMutex<Consumers>,
+    #[cfg(feature = "testing")]
+    stream_exit: Arc<crate::testing::PauseGate>,
+    #[cfg(feature = "testing")]
+    fail_stream_exit: Arc<AtomicBool>,
 }
 
 impl SqliteService {
@@ -140,6 +144,10 @@ impl SqliteService {
             replication_address,
             stop: watch::channel(false).0,
             consumers: AsyncMutex::new(Consumers::default()),
+            #[cfg(feature = "testing")]
+            stream_exit: Default::default(),
+            #[cfg(feature = "testing")]
+            fail_stream_exit: Default::default(),
         })
     }
     pub fn persistence(&self) -> &Arc<SqlitePersistence> {
@@ -223,6 +231,38 @@ impl SqliteService {
         self.committer().cloned()
     }
 
+    #[cfg(feature = "testing")]
+    pub fn consumer_exit_gate(&self) -> &crate::testing::PauseGate {
+        &self.stream_exit
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn fail_next_consumer_exit(&self) {
+        self.fail_stream_exit.store(true, Ordering::Release);
+    }
+
+    fn spawn_consumer(
+        &self,
+        consumers: &mut Consumers,
+        task: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    ) {
+        #[cfg(feature = "testing")]
+        let (exit, fail) = (self.stream_exit.clone(), self.fail_stream_exit.clone());
+        consumers.tasks.spawn(async move {
+            let result = task.await;
+            #[cfg(feature = "testing")]
+            {
+                exit.pause().await;
+                if fail.swap(false, Ordering::AcqRel) {
+                    return Err(RuntimeError::Application(
+                        "injected SQLite consumer join failure".into(),
+                    ));
+                }
+            }
+            result
+        });
+    }
+
     async fn start_secondary(&self, copy: bool) -> Result<()> {
         let replicator = self
             .replicator
@@ -254,7 +294,7 @@ impl SqliteService {
             let store = store.clone();
             let partition = partition.clone();
             let mut stop = self.stop.subscribe();
-            consumers.tasks.spawn(async move {
+            self.spawn_consumer(&mut consumers, async move {
                 let receive = async move {
                     let mut completed = false;
                     while let Some(operation) = match stream.get_operation().await {
@@ -271,7 +311,13 @@ impl SqliteService {
                         {
                             return failed(stream, partition, error.to_string()).await;
                         }
-                        completed |= operation.end_of_stream;
+                        if operation.end_of_stream {
+                            if let Err(error) = store.finish_copy() {
+                                return failed(stream, partition, error.to_string()).await;
+                            }
+                            completed = true;
+                            copied.send_replace(CopyCompletion::Complete);
+                        }
                         operation.acknowledge()?;
                     }
                     if !completed {
@@ -282,10 +328,6 @@ impl SqliteService {
                         )
                         .await;
                     }
-                    if let Err(error) = store.finish_copy() {
-                        return failed(stream, partition, error.to_string()).await;
-                    }
-                    copied.send_replace(CopyCompletion::Complete);
                     Ok(())
                 };
                 tokio::select! {
@@ -297,7 +339,7 @@ impl SqliteService {
         }
         let mut stream = replicator.replication_operations()?;
         let mut stop = self.stop.subscribe();
-        consumers.tasks.spawn(async move {
+        self.spawn_consumer(&mut consumers, async move {
             let receive = async move {
                 let mut completion = completion;
                 let mut copied = *completion.borrow();
@@ -350,7 +392,10 @@ impl SqliteService {
     }
 
     pub async fn shutdown_and_drain(&self) -> Result<()> {
-        let service = self.close().await;
+        self.close().await
+    }
+
+    async fn drain_consumers(&self, service: Result<()>) -> Result<()> {
         let mut consumers = self.consumers.lock().await;
         while let Some(result) = consumers.tasks.join_next().await {
             match result {
@@ -362,7 +407,11 @@ impl SqliteService {
         if consumers.errors.is_empty() {
             service
         } else {
-            Err(RuntimeError::Application(consumers.errors.join("; ")))
+            let errors = consumers.errors.join("; ");
+            Err(RuntimeError::Application(match service {
+                Ok(()) => errors,
+                Err(error) => format!("{error}; {errors}"),
+            }))
         }
     }
 }
@@ -370,11 +419,6 @@ impl SqliteService {
 #[async_trait]
 impl StatefulServiceReplica for SqliteService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
-        if context.partition.ordinary_hosting() {
-            return Err(RuntimeError::ControlPlane(
-                "built-in ordinary hosting integration is unavailable until M2".into(),
-            ));
-        }
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);
         }
@@ -488,7 +532,9 @@ impl StatefulServiceReplica for SqliteService {
                     .map_err(persistence_error)?;
                 self.active.store(true, Ordering::Release);
             }
-            ReplicaRole::IdleSecondary => self.start_secondary(true).await?,
+            ReplicaRole::IdleSecondary if previous != ReplicaRole::IdleSecondary => {
+                self.start_secondary(true).await?
+            }
             ReplicaRole::ActiveSecondary if previous == ReplicaRole::Primary => {
                 self.committer()?.demote().map_err(persistence_error)?;
                 self.start_secondary(false).await?;
@@ -499,7 +545,7 @@ impl StatefulServiceReplica for SqliteService {
             ReplicaRole::None if previous == ReplicaRole::Primary => {
                 self.committer()?.demote().map_err(persistence_error)?
             }
-            ReplicaRole::ActiveSecondary | ReplicaRole::None => {}
+            ReplicaRole::IdleSecondary | ReplicaRole::ActiveSecondary | ReplicaRole::None => {}
         }
         *self.role.lock().unwrap() = role;
         Ok(RoleChange {
@@ -509,13 +555,10 @@ impl StatefulServiceReplica for SqliteService {
     async fn close(&self) -> Result<()> {
         self.active.store(false, Ordering::Release);
         let result = if let Some(committer) = self.committer.get() {
-            committer.close().await.map_err(|error| {
-                if crate::v1::is_abort(&error) {
-                    RuntimeError::OperationCancelled
-                } else {
-                    persistence_error(error)
-                }
-            })
+            match committer.close().await {
+                Err(error) if crate::v1::is_abort(&error) && *self.stop.borrow() => Ok(()),
+                result => result.map_err(persistence_error),
+            }
         } else {
             Ok(())
         };
@@ -523,7 +566,7 @@ impl StatefulServiceReplica for SqliteService {
         self.control.lock().unwrap().take();
         self.replicator.lock().unwrap().take();
         self.partition.lock().unwrap().take();
-        result
+        self.drain_consumers(result).await
     }
     fn abort(&self) {
         self.active.store(false, Ordering::Release);

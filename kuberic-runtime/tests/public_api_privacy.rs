@@ -12,7 +12,11 @@ fn external_applications_can_use_contracts_but_cannot_forge_host_capabilities() 
         .unwrap_or_else(|| target.clone());
     fs::create_dir_all(&target).unwrap();
     let fixture = tempfile::tempdir_in(&target).unwrap();
-    fs::create_dir(fixture.path().join("scratch")).unwrap();
+    fs::create_dir_all(&build_target).unwrap();
+    let isolated_target = tempfile::Builder::new()
+        .prefix("runtime-public-api-")
+        .tempdir_in(&build_target)
+        .unwrap();
     fs::write(
         fixture.path().join("Cargo.toml"),
         format!(
@@ -64,8 +68,7 @@ path = "private.rs"
             .arg("--manifest-path")
             .arg(fixture.path().join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(&build_target)
-            .env("TMPDIR", fixture.path().join("scratch"))
+            .arg(isolated_target.path())
             .output()
             .expect("check external application")
     };
@@ -88,7 +91,7 @@ path = "private.rs"
         "struct `ReplicatorCreationReservation` is private",
         "trait `ReplicatorRegistration` is private",
         "trait `PartitionAccessView` is private",
-        "trait `NativeRuntimeControl` is private",
+        "struct `ReplicatorCreation` is private",
         "no method named `selected_epoch`",
         "no method named `idle_replicas`",
         "no method named `containment`",

@@ -10,6 +10,7 @@ pub mod monitor;
 pub mod native;
 mod owned_command;
 mod owned_process;
+pub mod owned_task;
 #[doc(hidden)]
 pub mod process_supervisor;
 pub mod service;

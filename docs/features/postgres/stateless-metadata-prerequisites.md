@@ -5,10 +5,13 @@
 owners. The [single project roadmap](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
 owns generic host/agent/controller migration; this is a **separate removal gate**,
 not another competing generic implementation plan.
-Generic [M1](../kuberic/ordinary-hosting-m1.md) is implemented; PostgreSQL
-replacement sessions/ordinary lifecycle integration remain M2, and production
-Open is explicitly unavailable at this checkpoint. Neither M1 nor green
-unsupported-controller smoke wrappers satisfy any field-removal row below.
+Generic [M1 and bounded M2 integration](../kuberic/ordinary-hosting-m1.md) are
+implemented. Independent PG ordinary Open, authenticated native sessions,
+exact joint/current continuation, physical SQL/pre-auth fencing and actual
+Close-after-Abort joins are qualified in routine smoke. This removes no durable
+PG field. Neither that acceptance nor the old unsupported-controller wrappers
+satisfy any field-removal row below; exhaustive M3 and final workflow reviews
+remain separate.
 
 ## Superseded prerequisites
 
@@ -35,7 +38,8 @@ and all production read/write sites at the then-current source revision.
 Current entry points:
 [metadata schema/identity:18–88](../../../examples/postgres/src/durable.rs#L18-L88),
 [native policy:144–164](../../../examples/postgres/src/durable.rs#L144-L164),
-[hosted Build:2368–2701](../../../examples/postgres/src/public_v1.rs#L2368-L2701).
+[native Build/terminal owner](../../../examples/postgres/src/public_v1.rs),
+[private session/continuation/retirement](../../../examples/postgres/src/public_session.rs).
 These anchors identify present owners, not a completed inventory.
 
 Each row must specify:
@@ -84,8 +88,8 @@ generic relay.
 
 Use [current validation tiers/selectors](../kuberic/testing.md#hosting-redesign-baselines-and-future-acceptance)
 as baselines; add claim-specific missing cases in later authorized work.
-No Rust/PG suite or metadata-removal implementation ran for this documentation
-delivery. Native differential, production upgrades and downstream engines remain
+No Rust/PG suite was rerun for this documentation delivery, and no metadata-removal
+implementation is supplied. Native differential, production upgrades and downstream engines remain
 unqualified.
 
 [historical]: https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/docs/features/postgres/stateless-metadata-prerequisites.md

@@ -11,6 +11,7 @@ use crate::config::PgConfig;
 use crate::generation::GenerationClock;
 use crate::owned_command::{CapturedCommands, OwnedCommands};
 use crate::owned_process::OwnedProcess;
+use crate::owned_task::{PgTask, PgTasks};
 use kuberic_runtime::replicator::StatefulServicePartition;
 
 use tokio_util::sync::CancellationToken;
@@ -53,6 +54,13 @@ pub(crate) struct GenerationFault {
     fault: kuberic_runtime::protocol::types::FaultType,
 }
 
+#[cfg(all(test, feature = "testing"))]
+#[derive(Default)]
+pub(crate) struct DriverExitGate {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
+
 #[derive(Clone)]
 pub(crate) struct GenerationLease(Arc<ProcessGeneration>);
 
@@ -70,11 +78,12 @@ struct ProcessGeneration {
     cleanup_result: ProcessMutex<Option<Result<(), PgError>>>,
     state: ProcessMutex<PgProcessState>,
     shutdown: CancellationToken,
-    monitors: ProcessMutex<Vec<tokio::task::JoinHandle<()>>>,
+    tasks: Arc<PgTasks>,
+    tasks_result: ProcessMutex<Option<Result<(), PgError>>>,
 }
 
 impl ProcessGeneration {
-    fn new(id: u64) -> Self {
+    fn new(id: u64, tasks: Arc<PgTasks>) -> Self {
         Self {
             id,
             child: ProcessMutex::new(None),
@@ -83,7 +92,8 @@ impl ProcessGeneration {
             cleanup_result: ProcessMutex::new(None),
             state: ProcessMutex::new(PgProcessState::Stopped),
             shutdown: CancellationToken::new(),
-            monitors: ProcessMutex::new(Vec::new()),
+            tasks,
+            tasks_result: ProcessMutex::new(None),
         }
     }
 
@@ -93,6 +103,14 @@ impl ProcessGeneration {
             .unwrap()
             .as_ref()
             .is_some_and(|child| !child.exited().unwrap_or(false))
+    }
+
+    fn spawn_monitor(&self, future: impl Future<Output = ()> + Send + 'static) {
+        let _cleanup = self.cleanup_lock.lock().unwrap();
+        if self.shutdown.is_cancelled() || self.cleanup_result.lock().unwrap().is_some() {
+            return;
+        }
+        self.tasks.retain(self.id, true, tokio::spawn(future));
     }
 
     fn retire(&self, commands: &CapturedCommands, data_dir: &Path) -> Result<(), PgError> {
@@ -106,9 +124,7 @@ impl ProcessGeneration {
             return Ok(());
         }
         self.shutdown.cancel();
-        for task in self.monitors.lock().unwrap().drain(..) {
-            task.abort();
-        }
+        self.tasks.fence(self.id);
         let helpers = commands.terminate();
         let postgres = self
             .child
@@ -176,10 +192,11 @@ fn publish_stopped_generation(
         return Ok(());
     }
     let retired = matches!(*current.cleanup_result.lock().unwrap(), Some(Ok(())))
+        && matches!(*current.tasks_result.lock().unwrap(), Some(Ok(())))
         && *current.state.lock().unwrap() == PgProcessState::Stopped;
     if retired && !closed.load(Ordering::Acquire) && !next.is_retired() {
         match next.allocate() {
-            Ok(id) => *current = Arc::new(ProcessGeneration::new(id)),
+            Ok(id) => *current = Arc::new(ProcessGeneration::new(id, current.tasks.clone())),
             Err(error) => {
                 closed.store(true, Ordering::Release);
                 *current.state.lock().unwrap() = PgProcessState::Faulted;
@@ -322,7 +339,10 @@ impl PgInstanceManager {
             data_dir,
             pg_bin,
             port,
-            current: Arc::new(ProcessMutex::new(Arc::new(ProcessGeneration::new(0)))),
+            current: Arc::new(ProcessMutex::new(Arc::new(ProcessGeneration::new(
+                0,
+                Arc::new(PgTasks::default()),
+            )))),
             next_generation: Arc::new(GenerationClock::default()),
             launches_closed: Arc::new(AtomicBool::new(false)),
             abort_generation: AtomicU64::new(0),
@@ -406,7 +426,8 @@ impl PgInstanceManager {
         let _lifecycle = self.lifecycle().await;
         self.next_generation.bind(store).await?;
         let id = self.next_generation.allocate()?;
-        *self.current.lock().unwrap() = Arc::new(ProcessGeneration::new(id));
+        let mut current = self.current.lock().unwrap();
+        *current = Arc::new(ProcessGeneration::new(id, current.tasks.clone()));
         Ok(())
     }
 
@@ -564,13 +585,20 @@ impl PgInstanceManager {
                 "owned PostgreSQL startup was aborted".into(),
             ));
         }
+        if current.cleanup_result.lock().unwrap().is_some()
+            && !matches!(*current.tasks_result.lock().unwrap(), Some(Ok(())))
+        {
+            return Err(PgError::Process(
+                "retired Rust descendants are not joined".into(),
+            ));
+        }
         let id = self.next_generation.allocate().map_err(|error| {
             self.launches_closed.store(true, Ordering::Release);
             *current.state.lock().unwrap() = PgProcessState::Faulted;
             *current.cleanup_result.lock().unwrap() = Some(Err(error.clone()));
             error.with_generation(current.id)
         })?;
-        let generation = Arc::new(ProcessGeneration::new(id));
+        let generation = Arc::new(ProcessGeneration::new(id, current.tasks.clone()));
         *current = generation.clone();
         self.launches_closed.store(false, Ordering::Release);
         Ok(generation)
@@ -901,7 +929,7 @@ impl PgInstanceManager {
         // Forward stdout + stderr through tracing in one task
         let stdout = BufReader::new(stdout);
         let stderr = BufReader::new(stderr);
-        let log_task = tokio::spawn(async move {
+        generation.spawn_monitor(async move {
             let mut stdout_lines = stdout.lines();
             let mut stderr_lines = stderr.lines();
             loop {
@@ -921,7 +949,6 @@ impl PgInstanceManager {
                 }
             }
         });
-        generation.monitors.lock().unwrap().push(log_task);
 
         // Fresh shutdown token for this run
         let shutdown = generation.shutdown.clone();
@@ -980,7 +1007,7 @@ impl PgInstanceManager {
             let exit_shutdown = shutdown.clone();
             let exit_fault_reporter = fault_reporter.clone();
             let exit_port = self.port;
-            let exit_task = tokio::spawn(async move {
+            generation.spawn_monitor(async move {
                 let result = tokio::select! {
                     biased;
                     _ = exit_shutdown.cancelled() => return,
@@ -1001,7 +1028,6 @@ impl PgInstanceManager {
                     *observed.state.lock().unwrap() = PgProcessState::Faulted;
                 }
             });
-            generation.monitors.lock().unwrap().push(exit_task);
         }
 
         // Spawn pg_isready health monitor — catches PG hung but process alive
@@ -1013,7 +1039,7 @@ impl PgInstanceManager {
         let shutdown = shutdown.clone();
         let health_generation = generation.clone();
         let helpers = generation.helpers.clone();
-        let health_task = tokio::spawn(async move {
+        generation.spawn_monitor(async move {
             let mut consecutive_failures: u32 = 0;
             loop {
                 tokio::select! {
@@ -1054,11 +1080,10 @@ impl PgInstanceManager {
                 }
             }
         });
-        generation.monitors.lock().unwrap().push(health_task);
 
         if let Some((instance, cancellation)) = parameters.cancellation {
             let observed = generation.clone();
-            let task = tokio::spawn(async move {
+            generation.spawn_monitor(async move {
                 cancellation.cancelled().await;
                 if let Some(instance) = instance.upgrade() {
                     let _lifecycle = instance.lifecycle().await;
@@ -1072,7 +1097,6 @@ impl PgInstanceManager {
                     }
                 }
             });
-            generation.monitors.lock().unwrap().push(task);
         }
         tracing::info!(port = self.port, "PostgreSQL started");
         Ok(())
@@ -1291,6 +1315,7 @@ impl PgInstanceManager {
                     "fast",
                     "-R",
                     "-w",
+                    "--no-clean",
                 ]),
                 Some((std::time::Duration::from_secs(60), "public pg_basebackup")),
             )
@@ -1403,9 +1428,18 @@ impl PgInstanceManager {
     }
 
     /// Connect to the local PG instance via UDS.
-    pub async fn connect(
+    pub async fn connect(&self) -> Result<(tokio_postgres::Client, PgTask), PgError> {
+        #[cfg(all(test, feature = "testing"))]
+        let connection = self.connect_owned(None);
+        #[cfg(not(all(test, feature = "testing")))]
+        let connection = self.connect_owned();
+        connection.await
+    }
+
+    async fn connect_owned(
         &self,
-    ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), PgError> {
+        #[cfg(all(test, feature = "testing"))] exit_gate: Option<Arc<DriverExitGate>>,
+    ) -> Result<(tokio_postgres::Client, PgTask), PgError> {
         let generation = self.generation();
         let (client, connection) =
             tokio_postgres::connect(&self.connection_string(), tokio_postgres::NoTls)
@@ -1415,19 +1449,30 @@ impl PgInstanceManager {
                         .with_generation(generation.id)
                 })?;
 
+        let _cleanup = generation.cleanup_lock.lock().unwrap();
+        self.complete_generation(&generation, Ok(()))?;
+        let shutdown = generation.shutdown.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                // Expected during shutdown — PG kills connections on pg_ctl stop
-                tracing::debug!("PG connection closed: {}", e);
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {},
+                result = connection => if let Err(error) = result {
+                    tracing::debug!(%error, "PG connection closed");
+                },
+            }
+            #[cfg(all(test, feature = "testing"))]
+            if let Some(gate) = exit_gate {
+                gate.entered.notify_one();
+                gate.release.notified().await;
             }
         });
-
-        self.complete_generation(&generation, Ok((client, handle)))
+        Ok((
+            client,
+            generation.tasks.retain(generation.id, false, handle),
+        ))
     }
 
-    pub async fn connect_application(
-        &self,
-    ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), PgError> {
+    pub async fn connect_application(&self) -> Result<(tokio_postgres::Client, PgTask), PgError> {
         let generation = self.generation();
         let connection_string = self.application_connection_string();
         let (client, connection) =
@@ -1437,12 +1482,42 @@ impl PgInstanceManager {
                     PgError::Connection(format!("connect to {connection_string}: {error}"))
                         .with_generation(generation.id)
                 })?;
+        let _cleanup = generation.cleanup_lock.lock().unwrap();
+        self.complete_generation(&generation, Ok(()))?;
+        let shutdown = generation.shutdown.clone();
         let handle = tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::debug!("PG application connection closed: {}", error);
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {},
+                result = connection => if let Err(error) = result {
+                    tracing::debug!(%error, "PG application connection closed");
+                },
             }
         });
-        self.complete_generation(&generation, Ok((client, handle)))
+        Ok((
+            client,
+            generation.tasks.retain(generation.id, false, handle),
+        ))
+    }
+
+    pub(crate) async fn join_tasks(&self) -> Result<(), PgError> {
+        self.generation().tasks.join(None).await
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) async fn connect_with_driver_exit(
+        &self,
+        gate: Arc<DriverExitGate>,
+    ) -> Result<(tokio_postgres::Client, PgTask), PgError> {
+        self.connect_owned(Some(gate)).await
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) async fn lose_monitor(&self) {
+        self.generation()
+            .tasks
+            .lose_monitor(self.generation_id())
+            .await;
     }
 
     async fn finish_owned(&self) -> Result<(), PgError> {
@@ -1477,13 +1552,15 @@ impl PgInstanceManager {
         let retired = generation.clone();
         #[cfg(feature = "testing")]
         let hook = self.cleanup_hook.lock().unwrap().take();
-        let result = tokio::task::spawn_blocking(move || {
+        let (completed, outcome) = tokio::sync::watch::channel(None);
+        let task = tokio::task::spawn_blocking(move || {
             if ticket
                 .phase
                 .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                return Ok(());
+                completed.send_replace(Some(Ok(())));
+                return;
             }
             #[cfg(feature = "testing")]
             if let Some(hook) = &hook {
@@ -1503,13 +1580,18 @@ impl PgInstanceManager {
             if let Some(hook) = hook {
                 hook.finished.notify_one();
             }
-            result
-        })
-        .await
-        .map_err(|error| {
-            PgError::Process(format!("join PostgreSQL cleanup: {error}"))
-                .with_generation(generation.id)
-        })?;
+            completed.send_replace(Some(result));
+        });
+        generation.tasks.retain(generation.id, false, task).await?;
+        let mut result = outcome
+            .borrow()
+            .clone()
+            .ok_or_else(|| PgError::Process("PostgreSQL cleanup result lost".into()))?;
+        let tasks = generation.tasks.join(Some(generation.id)).await;
+        *generation.tasks_result.lock().unwrap() = Some(tasks.clone());
+        if let Err(error) = tasks {
+            result = Err(error.with_cleanup(result));
+        }
         // A live caller already owns lifecycle_lock. A detached completion may
         // publish only after acquiring it, so fault acknowledgement and process
         // replacement cannot interleave across the generation check.

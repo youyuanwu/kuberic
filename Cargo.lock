@@ -1443,6 +1443,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
+ "kuberic-controller",
  "kuberic-runtime",
  "serde",
  "serde_json",

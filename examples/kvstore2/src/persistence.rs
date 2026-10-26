@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(any(test, feature = "testing"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -45,7 +47,7 @@ struct OperationRecord {
     data: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct NativeSnapshot {
     version: u32,
@@ -59,7 +61,7 @@ pub struct KvPersistence {
     state: Mutex<PersistedState>,
     #[cfg(feature = "testing")]
     apply_pause: Mutex<Option<ApplyPause>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     fail_next_persist: AtomicBool,
     #[cfg(test)]
     stream_calls: (AtomicU64, AtomicU64),
@@ -116,7 +118,7 @@ impl KvPersistence {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn fail_next_persist_for_test(&self) {
         self.fail_next_persist.store(true, Ordering::SeqCst);
     }
@@ -187,7 +189,7 @@ impl KvPersistence {
             state: Mutex::new(state),
             #[cfg(feature = "testing")]
             apply_pause: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             fail_next_persist: AtomicBool::new(false),
             #[cfg(test)]
             stream_calls: (AtomicU64::new(0), AtomicU64::new(0)),
@@ -350,6 +352,7 @@ impl KvPersistence {
                 "native KV snapshot is ahead of local commitment".into(),
             ));
         }
+
         serde_json::to_vec(&NativeSnapshot {
             version: 2,
             lsn,
@@ -357,6 +360,24 @@ impl KvPersistence {
         })
         .map(Bytes::from)
         .map_err(|error| RuntimeError::Application(error.to_string()))
+    }
+
+    pub(crate) fn validate_copy_prefix(&self, data: &[u8], boundary: i64) -> Result<()> {
+        let retained: NativeSnapshot =
+            serde_json::from_slice(data).map_err(|e| RuntimeError::Application(e.to_string()))?;
+        if retained.lsn < 0 || retained.lsn > boundary {
+            return Err(RuntimeError::Application(
+                "copy prefix exceeds source boundary".into(),
+            ));
+        }
+        let actual: NativeSnapshot = serde_json::from_slice(&self.native_snapshot(retained.lsn)?)
+            .map_err(|e| RuntimeError::Application(e.to_string()))?;
+        if retained != actual {
+            return Err(RuntimeError::Application(
+                "copy prefix conflicts with retained history".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn native_install(&self, data: Bytes) -> Result<i64> {
@@ -411,7 +432,7 @@ impl KvPersistence {
     }
 
     fn persist(&self, state: &PersistedState) -> Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self.fail_next_persist.swap(false, Ordering::SeqCst) {
             return Err(RuntimeError::Application(
                 "injected persistence failure".into(),
