@@ -1367,7 +1367,12 @@ fn assert_exact_inventory_fixtures() {
     }
 }
 
-fn conformance_command(action: &str, root: &Path, archive: Option<&Path>) -> Command {
+fn conformance_command(
+    action: &str,
+    root: &Path,
+    archive: Option<&Path>,
+    partition: &ExecutionPartition,
+) -> Command {
     let mut command = Command::new("cargo");
     command.current_dir(root).args(["nextest", action]);
     if let Some(archive) = archive {
@@ -1375,6 +1380,14 @@ fn conformance_command(action: &str, root: &Path, archive: Option<&Path>) -> Com
     } else {
         // Match the source job's feature graph instead of rebuilding a package subset.
         command.args(["--workspace", "--all-features"]);
+    }
+    if action == "run" {
+        let threads = if partition.id == NATIVE_PARTITION {
+            "2"
+        } else {
+            "1"
+        };
+        command.args(["-j", threads]);
     }
     command
 }
@@ -1401,7 +1414,7 @@ fn run_scenarios(subject: &str, partition: &ExecutionPartition, deadline: Comman
             }
         })
         .filter(|path| path.is_file());
-    let mut list = conformance_command("list", &root, archive.as_deref());
+    let mut list = conformance_command("list", &root, archive.as_deref(), partition);
     list.args([
         "--message-format",
         "json",
@@ -1413,7 +1426,7 @@ fn run_scenarios(subject: &str, partition: &ExecutionPartition, deadline: Comman
     ]);
     let inventory_started = Instant::now();
     eprintln!(
-        "Public V1 partition {}: inventory and serial execution share {:?}",
+        "Public V1 partition {}: inventory and bounded execution share {:?}",
         partition.id,
         deadline.work.saturating_duration_since(inventory_started),
     );
@@ -1433,8 +1446,7 @@ fn run_scenarios(subject: &str, partition: &ExecutionPartition, deadline: Comman
         deadline.work.saturating_duration_since(Instant::now()),
     );
 
-    let mut run = conformance_command("run", &root, archive.as_deref());
-    run.args(["-j", "1"]);
+    let mut run = conformance_command("run", &root, archive.as_deref(), partition);
     let extract = archive.as_ref().map(|_| {
         let path = root.join("target").join(format!(
             "public-v1-conformance-extract-{}",
@@ -1475,7 +1487,7 @@ fn run_scenarios(subject: &str, partition: &ExecutionPartition, deadline: Comman
         String::from_utf8_lossy(&run.stderr)
     );
     eprintln!(
-        "Public V1 partition {}: serial execution passed in {:?}\n{}\n{}",
+        "Public V1 partition {}: bounded execution passed in {:?}\n{}\n{}",
         partition.id,
         execution_started.elapsed(),
         String::from_utf8_lossy(&run.stdout),
@@ -1489,21 +1501,33 @@ mod bounded_process_tests {
 
     #[test]
     fn nested_commands_reuse_workspace_features_or_the_exact_archive() {
-        for action in ["list", "run"] {
-            for archive in [None, Some(Path::new("conformance.tar.zst"))] {
-                let command = conformance_command(action, Path::new("."), archive);
-                let expected = if archive.is_some() {
-                    vec!["nextest", action, "--archive-file", "conformance.tar.zst"]
-                } else {
-                    vec!["nextest", action, "--workspace", "--all-features"]
-                };
-                assert_eq!(
-                    command
-                        .get_args()
-                        .map(|argument| argument.to_str().unwrap())
-                        .collect::<Vec<_>>(),
-                    expected
-                );
+        for partition in execution_partitions() {
+            for action in ["list", "run"] {
+                for archive in [None, Some(Path::new("conformance.tar.zst"))] {
+                    let command = conformance_command(action, Path::new("."), archive, &partition);
+                    let mut expected = if archive.is_some() {
+                        vec!["nextest", action, "--archive-file", "conformance.tar.zst"]
+                    } else {
+                        vec!["nextest", action, "--workspace", "--all-features"]
+                    };
+                    if action == "run" {
+                        expected.extend([
+                            "-j",
+                            if partition.id == NATIVE_PARTITION {
+                                "2"
+                            } else {
+                                "1"
+                            },
+                        ]);
+                    }
+                    assert_eq!(
+                        command
+                            .get_args()
+                            .map(|argument| argument.to_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                }
             }
         }
     }
