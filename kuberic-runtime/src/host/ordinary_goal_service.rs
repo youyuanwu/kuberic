@@ -211,14 +211,24 @@ impl<S: AgentStore + 'static> AgentService<S> {
             .map_err(status_from_runtime)?;
         if matches!(
             goal.desired,
-            ReplicaGoalKind::Discover | ReplicaGoalKind::Prepare { .. }
+            ReplicaGoalKind::Discover
+                | ReplicaGoalKind::Prepare { .. }
+                | ReplicaGoalKind::RestoreRetainedMember { .. }
         ) {
             let state = self.store.load_state().await.map_err(status_from_agent)?;
-            callbacks.open_context = Some(
-                self.runtime
-                    .public_open_context(state.application_open_mode())
-                    .await,
-            );
+            let mut context = self
+                .runtime
+                .public_open_context(state.application_open_mode())
+                .await;
+            if matches!(goal.desired, ReplicaGoalKind::RestoreRetainedMember { .. }) {
+                if context.mode != crate::application::OpenMode::Existing {
+                    return Err(Status::failed_precondition(
+                        "retained restoration cannot initialize storage",
+                    ));
+                }
+                context.partition = context.partition.with_retained_member_instructions();
+            }
+            callbacks.open_context = Some(context);
         }
         let intent = goal.intent();
         let (operation, attempt, mut access_guard) =

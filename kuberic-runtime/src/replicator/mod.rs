@@ -641,9 +641,92 @@ pub struct ReplicatorFactoryContext {
     public_v1_replication_address: std::net::SocketAddr,
     native_factory_started: Arc<AtomicBool>,
     ordinary_contract: bool,
+    retained_member_instructions: bool,
+    builtin_factory_created: Arc<OnceLock<std::sync::Weak<ReplicatorCreation>>>,
+    builtin_registered: Arc<OnceLock<crate::protocol::types::ReplicatorCreationId>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedRetainedMember {
+    scope: crate::protocol::public_operations::ReplicaScope,
+    qualification: crate::protocol::public_operations::RetainedMemberQualification,
+}
+
+impl CheckedRetainedMember {
+    pub(crate) fn new(
+        scope: crate::protocol::public_operations::ReplicaScope,
+        qualification: crate::protocol::public_operations::RetainedMemberQualification,
+    ) -> Self {
+        Self {
+            scope,
+            qualification,
+        }
+    }
+
+    pub(crate) fn scope(&self) -> &crate::protocol::public_operations::ReplicaScope {
+        &self.scope
+    }
+
+    pub(crate) fn epoch(&self) -> crate::protocol::types::Epoch {
+        self.scope.epoch
+    }
+
+    pub(crate) fn history(&self) -> &crate::protocol::types::HistoryContext {
+        &self.scope.history
+    }
+
+    pub(crate) fn qualification(
+        &self,
+    ) -> &crate::protocol::public_operations::RetainedMemberQualification {
+        &self.qualification
+    }
 }
 
 impl ReplicatorFactoryContext {
+    fn builtin_creation_matches(&self, creation: &Arc<ReplicatorCreation>) -> bool {
+        self.builtin_factory_created
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|actual| Arc::ptr_eq(&actual, creation))
+    }
+
+    /// Called by the builtin adapter only after the actual retained role
+    /// constructor and its real provider callbacks have succeeded.
+    pub(crate) async fn confirm_retained_native_initialization(
+        &self,
+        selected: &CheckedRetainedMember,
+    ) -> Result<()> {
+        let current = self
+            .retained_member_restore()
+            .await?
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if &current != selected
+            || self
+                .builtin_factory_created
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .is_none()
+            || self.builtin_registered.get() != Some(&current.scope.creation_id)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.access
+            .confirm_retained_native_initialization(
+                self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                &current,
+            )
+            .await
+    }
+
+    pub(crate) async fn retained_member_restore(&self) -> Result<Option<CheckedRetainedMember>> {
+        if !self.ordinary_contract {
+            return Ok(None);
+        }
+        self.access
+            .retained_member_restore(self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?)
+            .await
+    }
+
     pub(crate) fn with_ordinary_contract(mut self, ordinary: bool) -> Self {
         self.ordinary_contract = ordinary;
         self
@@ -704,6 +787,9 @@ impl ReplicatorFactoryContext {
             public_v1_replication_address,
             native_factory_started: Arc::new(AtomicBool::new(false)),
             ordinary_contract: false,
+            retained_member_instructions: false,
+            builtin_factory_created: Arc::new(OnceLock::new()),
+            builtin_registered: Arc::new(OnceLock::new()),
         }
     }
 
@@ -742,6 +828,7 @@ impl ReplicatorFactoryContext {
         let mut context = self.clone();
         context.reservation = Some(reservation);
         context.native_factory_started = Arc::new(AtomicBool::new(false));
+        context.builtin_factory_created = Arc::new(OnceLock::new());
         context
     }
 
@@ -795,6 +882,25 @@ impl ReplicatorFactoryContext {
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
+    fn retained_native_initialization(&self) -> Option<CheckedRetainedMember> {
+        None
+    }
+
+    async fn confirm_retained_native_initialization(
+        &self,
+        _reservation: ReplicatorCreationReservation,
+        _selected: &CheckedRetainedMember,
+    ) -> Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    async fn retained_member_restore(
+        &self,
+        _reservation: ReplicatorCreationReservation,
+    ) -> Result<Option<CheckedRetainedMember>> {
+        Ok(None)
+    }
+
     async fn local_publication(
         &self,
         _reservation: ReplicatorCreationReservation,
@@ -900,6 +1006,25 @@ pub struct StatefulServicePartition {
 }
 
 impl StatefulServicePartition {
+    pub fn restoring_retained_member(&self) -> bool {
+        self.context.retained_member_instructions
+    }
+
+    pub(crate) fn with_retained_member_instructions(mut self) -> Self {
+        self.context.retained_member_instructions = true;
+        self
+    }
+
+    pub(crate) fn builtin_native_registration(
+        &self,
+    ) -> Option<crate::protocol::types::ReplicatorCreationId> {
+        self.context.builtin_registered.get().cloned()
+    }
+
+    pub(crate) fn retained_native_initialization(&self) -> Option<CheckedRetainedMember> {
+        self.context.access.retained_native_initialization()
+    }
+
     pub(crate) fn record_creation_cleanup_failure(&self, error: String) {
         self.registration.record_creation_cleanup_failure(error);
     }
@@ -982,6 +1107,7 @@ impl StatefulServicePartition {
         })?;
         let reservation = self.registration.reserve_replicator_creation()?;
         let context = self.context.for_creation(reservation);
+        let provenance = context.clone();
         #[cfg(feature = "testing")]
         let testing_route = testing_transport::before_attachment(
             self.context.identity.instance_id.as_str(),
@@ -1007,6 +1133,19 @@ impl StatefulServicePartition {
                     .await);
             }
         };
+        if self.restoring_retained_member()
+            && !provenance.builtin_creation_matches(&interfaces.creation)
+        {
+            self.registration.cancel_replicator_creation(reservation);
+            return Err(interfaces
+                .failed_creation(
+                    RuntimeError::AuthorityMismatch(
+                        "independent factory cannot inherit builtin retained restoration".into(),
+                    ),
+                    self.registration.as_ref(),
+                )
+                .await);
+        }
         if let Err(error) = interfaces
             .creation
             .bind_settings(self.context.identity.clone(), settings)
@@ -1027,6 +1166,12 @@ impl StatefulServicePartition {
                 .await);
         }
         attachment.disarm();
+        if provenance.builtin_creation_matches(&interfaces.creation) {
+            let _ = self
+                .context
+                .builtin_registered
+                .set(reservation.identity(RuntimeHostToken::new()).to_public_id());
+        }
         #[cfg(feature = "testing")]
         if let Some(route) = testing_route
             .filter(|route| testing_transport::has_native_transport(route, reservation))
@@ -1055,6 +1200,12 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         validate_public_v1_factories(PUBLIC_V1_FACTORIES)?;
-        v1::create_production(context, state_provider, settings).await
+        let provenance = context.clone();
+        let interfaces = v1::create_production(context, state_provider, settings).await?;
+        provenance
+            .builtin_factory_created
+            .set(Arc::downgrade(&interfaces.creation))
+            .map_err(|_| RuntimeError::AuthorityNotAdmitted)?;
+        Ok(interfaces)
     }
 }

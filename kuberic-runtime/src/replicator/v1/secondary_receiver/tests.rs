@@ -16,6 +16,8 @@ use crate::replicator::v1::buffers::{BufferLimits, BufferPolicy};
 use crate::replicator::v1::operation_queue::QueueOperation;
 use crate::replicator::v1::operation_stream::StreamEvent;
 
+mod retained;
+
 fn config(persisted: bool, required: bool) -> ReceiverConfig {
     ReceiverConfig {
         queue: QueueConfig {

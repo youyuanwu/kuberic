@@ -21,14 +21,21 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
                 vec![Revoke, Cleanup]
             }
         }
-        Some(P::AgentGoal(goal)) => goal_programs(goal)
-            .iter()
-            .flat_map(|program| {
-                let mut selected = intent.clone();
-                selected.program = Some(program.clone());
-                operation_instructions(&selected)
-            })
-            .collect(),
+        Some(P::AgentGoal(goal)) => {
+            let mut actions = goal_programs(goal)
+                .iter()
+                .flat_map(|program| {
+                    let mut selected = intent.clone();
+                    selected.program = Some(program.clone());
+                    operation_instructions(&selected)
+                })
+                .collect::<Vec<_>>();
+            if retained_primary_recovery(goal) {
+                actions.retain(|instruction| *instruction != ApplicationRole);
+                actions.push(ApplicationRole);
+            }
+            actions
+        }
         Some(P::Open { .. }) => vec![ApplicationOpen, ReplicatorOpen],
         Some(P::Role { .. }) => vec![ReplicatorRole, ApplicationRole],
         Some(P::Epoch { .. }) => vec![ProgramEpoch],
@@ -68,6 +75,98 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
     }
 }
 
+fn retained_primary_recovery(goal: &crate::protocol::public_operations::ReplicaGoal) -> bool {
+    use crate::protocol::public_operations::ReplicaGoalKind as G;
+    matches!(
+        goal.desired,
+        G::Reconfigure {
+            role: ReplicaRole::Primary,
+            catch_up: Some(PublicCatchUpMode::All),
+        }
+    ) && goal
+        .scope
+        .configuration
+        .previous
+        .as_ref()
+        .is_some_and(|previous| {
+            goal.scope.epoch > previous.epoch
+                && goal.scope.epoch.data_loss_number == previous.epoch.data_loss_number
+                && previous.primary_id == goal.scope.storage.replica.replica_id
+                && goal.scope.configuration.current.primary_id == previous.primary_id
+                && goal.scope.configuration.current.members == previous.members
+                && goal.scope.configuration.current.write_quorum == previous.write_quorum
+        })
+}
+
+pub(crate) fn ordinary_handoff(
+    goal: &crate::protocol::public_operations::ReplicaGoal,
+) -> Option<PublicOperationProgram> {
+    use crate::protocol::public_operations::ReplicaGoalKind as G;
+    let previous = goal.scope.configuration.previous.as_ref()?;
+    let local = &goal.scope.storage.replica;
+    if !matches!(
+        goal.desired,
+        G::Reconfigure {
+            role: ReplicaRole::ActiveSecondary,
+            catch_up: Some(PublicCatchUpMode::All),
+        }
+    ) || previous.primary_id != local.replica_id
+        || goal.scope.configuration.current.primary_id == local.replica_id
+        || goal.scope.epoch <= previous.epoch
+        || goal.scope.epoch.data_loss_number != previous.epoch.data_loss_number
+        || goal.scope.configuration.current.write_quorum != previous.write_quorum
+        || goal.scope.configuration.current.members.len() != previous.members.len()
+        || !previous.members.iter().all(|member| {
+            goal.scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .any(|next| next.identity == member.identity)
+        })
+        || !previous
+            .members
+            .iter()
+            .any(|member| &member.identity == local && member.role == ReplicaRole::Primary)
+    {
+        return None;
+    }
+    let mut refreshed = goal.scope.configuration.ordinary();
+    refreshed.current = crate::protocol::types::ConfigurationDescriptor::new(
+        goal.scope.epoch,
+        previous.primary_id,
+        refreshed
+            .current
+            .members
+            .iter()
+            .map(|member| crate::protocol::types::ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity.replica_id == previous.primary_id {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        refreshed.current.write_quorum,
+    );
+    for replica in &mut refreshed.replicas {
+        replica.role = ReplicaRole::ActiveSecondary;
+    }
+    let mut starting = refreshed.clone();
+    starting.current = previous.clone();
+    starting.previous = None;
+    Some(PublicOperationProgram::Swap {
+        starting,
+        refreshed,
+        epoch: goal.scope.epoch,
+        handoff: ReplicaRole::ActiveSecondary,
+        catch_up_specific_quorum: false,
+        mode: PublicCatchUpMode::All,
+        controller_composed: true,
+    })
+}
+
 pub(crate) fn goal_programs(
     goal: &crate::protocol::public_operations::ReplicaGoal,
 ) -> Vec<PublicOperationProgram> {
@@ -95,7 +194,37 @@ pub(crate) fn goal_programs(
                 programs.push(P::Configuration(goal.scope.configuration.ordinary()));
             }
         }
+        G::RestoreRetainedMember { .. } => {
+            programs.push(P::Open {
+                replica: goal.scope.storage.replica.clone(),
+                existing: true,
+            });
+            programs.push(P::Role {
+                epoch: goal.scope.epoch,
+                role: ReplicaRole::ActiveSecondary,
+            });
+            programs.push(P::Epoch {
+                epoch: goal.scope.epoch,
+            });
+            programs.push(P::Configuration(goal.scope.configuration.ordinary()));
+        }
+        G::RefreshPrimary { catch_up } => {
+            programs.push(P::Epoch {
+                epoch: goal.scope.epoch,
+            });
+            programs.push(match catch_up {
+                Some(mode) if goal.scope.configuration.previous.is_some() => P::CatchUp {
+                    configuration: goal.scope.configuration.ordinary(),
+                    mode: *mode,
+                },
+                _ => P::Configuration(goal.scope.configuration.ordinary()),
+            });
+        }
         G::Reconfigure { role, catch_up } => {
+            if let Some(handoff) = ordinary_handoff(goal) {
+                programs.push(handoff);
+                return programs;
+            }
             programs.push(P::Role {
                 epoch: goal.scope.epoch,
                 role: *role,
@@ -415,6 +544,27 @@ pub(super) async fn execute(
         callbacks.abort_once();
     }
     for (index, instruction) in actions.into_iter().enumerate().skip(start) {
+        if intent.goal().is_some_and(|goal| {
+            matches!(
+                goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }
+            )
+        }) {
+            let current = store.load_state().await?;
+            let selected = current
+                .public_v1_operation_state
+                .as_ref()
+                .and_then(|preview| preview.operations.get(&intent.operation_id))
+                .ok_or_else(|| {
+                    HostError::CommandRejected("restoration owner disappeared".into())
+                })?;
+            super::super::ordinary_goal::retained::validate_receipt(&current, selected)?;
+            if selected.superseded_by.is_some() {
+                return Err(HostError::CommandRejected(
+                    "retained creation was superseded".into(),
+                ));
+            }
+        }
         if intent.goal().is_some()
             && !intent.class.is_terminal()
             && *callbacks.aborted.lock().unwrap()
@@ -487,7 +637,25 @@ pub(super) async fn execute(
                 O::Done
             }
             ReplicatorOpen => match callbacks.replicator.open().await {
-                Ok(endpoint) if !endpoint.trim().is_empty() => O::Endpoint(endpoint),
+                Ok(endpoint) if !endpoint.trim().is_empty() => {
+                    if crate::protocol::public_operations::ORDINARY_ACTION_FORMAT == 19
+                        && callbacks.open_context.as_ref().is_some_and(|context| {
+                            context.partition.builtin_native_registration().as_ref()
+                                == Some(&callbacks.replicator_creation_id)
+                        })
+                    {
+                        O::BuiltinNativeEndpoint {
+                            endpoint,
+                            process_id: std::process::id(),
+                            process_lifetime:
+                                super::super::ordinary_goal::retained::process_lifetime_id()
+                                    .to_owned(),
+                            storage_owner: None,
+                        }
+                    } else {
+                        O::Endpoint(endpoint)
+                    }
+                }
                 Ok(_) => {
                     callbacks.abort_once();
                     return Err(HostError::CommandRejected(
@@ -551,7 +719,21 @@ pub(super) async fn execute(
                         None,
                     )
                     .await?;
-                    O::Done
+                    if let Some(goal) = intent.goal().filter(|goal| matches!(goal.desired,
+                        crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }))
+                    {
+                        let initialized = callbacks.open_context.as_ref()
+                            .and_then(|context| context.partition.retained_native_initialization())
+                            .ok_or_else(|| HostError::CommandRejected(
+                                "builtin adapter did not receipt actual retained native initialization".into(),
+                            ))?;
+                        if initialized.scope() != &goal.scope {
+                            return Err(HostError::IdentityMismatch("retained native receipt crossed creation".into()));
+                        }
+                        O::RetainedNativeInitialized(Box::new(goal.scope.clone()))
+                    } else {
+                        O::Done
+                    }
                 } else {
                     O::ApplicationRole(
                         super::local_callback(
@@ -786,7 +968,7 @@ pub(super) async fn execute(
                 O::Done
             }
             Revoke => {
-                (callbacks.revoke_access)()?;
+                (callbacks.revoke_access)(intent.class.is_terminal())?;
                 O::Done
             }
             _ => unreachable!("role instruction in public program"),

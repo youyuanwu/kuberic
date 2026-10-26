@@ -19,9 +19,25 @@ struct Access {
     withdrawn: AtomicBool,
     faults: AtomicUsize,
     writer_releases: AtomicUsize,
+    discovery: Mutex<Option<(String, bool, usize)>>,
 }
 #[async_trait]
 impl PartitionAccessView for Access {
+    fn peer_control_endpoint(&self, _: &ReplicaIdentity) -> crate::Result<String> {
+        let mut configured = self.discovery.lock().unwrap();
+        let (address, unavailable, queries) = configured
+            .as_mut()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        *queries += 1;
+        Ok(if std::mem::take(unavailable) {
+            "http://127.0.0.1:0".to_owned()
+        } else {
+            address.clone()
+        })
+    }
+    async fn native_credentials(&self) -> crate::Result<Arc<str>> {
+        Ok(Arc::from("test-token"))
+    }
     fn partition_information(&self) -> PartitionInformation {
         PartitionInformation {
             partition_id: PartitionId::new("pump-test"),
@@ -131,6 +147,7 @@ fn owner(registry: MessageRegistry, pause: bool) -> (Arc<Transport>, Arc<Access>
         withdrawn: AtomicBool::new(false),
         faults: AtomicUsize::new(0),
         writer_releases: AtomicUsize::new(0),
+        discovery: Mutex::new(None),
     });
     let context = ReplicatorFactoryContext::new(
         crate::replicator::RuntimeHostToken::new(),

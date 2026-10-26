@@ -33,6 +33,7 @@ pub struct KvService {
     partition: RwLock<Option<StatefulServicePartition>>,
     committer: Mutex<Option<Arc<Committer>>>,
     role: Mutex<ReplicaRole>,
+    restoring_retained: std::sync::atomic::AtomicBool,
     stop: watch::Sender<bool>,
     streams: AsyncMutex<Consumers>,
     #[cfg(feature = "testing")]
@@ -91,6 +92,7 @@ impl KvService {
             partition: RwLock::new(None),
             committer: Mutex::new(None),
             role: Mutex::new(ReplicaRole::None),
+            restoring_retained: std::sync::atomic::AtomicBool::new(false),
             stop: watch::channel(false).0,
             streams: AsyncMutex::new(Consumers::default()),
             #[cfg(feature = "testing")]
@@ -334,6 +336,10 @@ impl StatefulServiceReplica for KvService {
             return Ok(control);
         }
         self.persistence().authorize_open(context.mode)?;
+        self.restoring_retained.store(
+            context.restoring_retained_member(),
+            std::sync::atomic::Ordering::Release,
+        );
         *self.partition.write().await = Some(context.partition.clone());
         let (fault, mut faults) = tokio::sync::mpsc::unbounded_channel::<String>();
         let committer = Arc::new(
@@ -400,6 +406,16 @@ impl StatefulServiceReplica for KvService {
             return Err(RuntimeError::Closed);
         }
         let previous = *self.role.lock().unwrap();
+        if previous == ReplicaRole::None
+            && self
+                .restoring_retained
+                .load(std::sync::atomic::Ordering::Acquire)
+            && role != ReplicaRole::ActiveSecondary
+        {
+            return Err(RuntimeError::InvalidReplication(
+                "retained KV initialization requires secondary role".into(),
+            ));
+        }
         let committer = self.committer()?;
         if role == ReplicaRole::Primary || previous == ReplicaRole::Primary {
             committer.wait_for_role_drain().await.map_err(application)?;
@@ -414,7 +430,24 @@ impl StatefulServiceReplica for KvService {
                 self.start_secondary(false).await?;
             }
             ReplicaRole::ActiveSecondary if previous == ReplicaRole::None => {
-                self.start_secondary(true).await?
+                if self
+                    .restoring_retained
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    let control = self
+                        .control
+                        .read()
+                        .await
+                        .clone()
+                        .ok_or(RuntimeError::NotOpen)?;
+                    let boundary = control.current_progress().await?;
+                    committer
+                        .restore_retained_secondary(boundary)
+                        .map_err(application)?;
+                    self.start_secondary(false).await?;
+                } else {
+                    self.start_secondary(true).await?;
+                }
             }
             ReplicaRole::None if previous == ReplicaRole::Primary => {
                 committer.demote().map_err(application)?

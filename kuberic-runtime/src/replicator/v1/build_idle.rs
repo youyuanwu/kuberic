@@ -359,7 +359,7 @@ impl BuildIdle {
         callbacks: BuildCallbacks,
         clock: Clock,
     ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
-        Self::prepare_transfer(manager, config, provider, callbacks, clock, false)
+        Self::prepare_transfer(manager, config, provider, callbacks, clock, None, false)
     }
 
     pub(super) fn prepare_recovery(
@@ -369,7 +369,26 @@ impl BuildIdle {
         callbacks: BuildCallbacks,
         clock: Clock,
     ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
-        Self::prepare_transfer(manager, config, provider, callbacks, clock, true)
+        Self::prepare_transfer(manager, config, provider, callbacks, clock, None, true)
+    }
+
+    pub(super) fn prepare_replacement(
+        manager: &Arc<Mutex<ReplicaManager>>,
+        predecessor: ReplicationSession,
+        config: BuildConfig,
+        provider: Arc<dyn StateProvider>,
+        callbacks: BuildCallbacks,
+        clock: Clock,
+    ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
+        Self::prepare_transfer(
+            manager,
+            config,
+            provider,
+            callbacks,
+            clock,
+            Some(predecessor),
+            false,
+        )
     }
 
     fn prepare_transfer(
@@ -378,6 +397,7 @@ impl BuildIdle {
         provider: Arc<dyn StateProvider>,
         callbacks: BuildCallbacks,
         clock: Clock,
+        predecessor: Option<ReplicationSession>,
         recovery: bool,
     ) -> Result<(Self, ManagerEffects, SessionSendBatch), BuildError> {
         if callbacks
@@ -432,7 +452,14 @@ impl BuildIdle {
             session,
             finish_copy_target: None,
         };
-        let (pending, start) = if recovery {
+        let (pending, start) = if let Some(predecessor) = predecessor {
+            manager.lock().unwrap().admit_replacement(
+                &predecessor,
+                member,
+                handle.clone(),
+                &mut establishment,
+            )?
+        } else if recovery {
             manager
                 .lock()
                 .unwrap()

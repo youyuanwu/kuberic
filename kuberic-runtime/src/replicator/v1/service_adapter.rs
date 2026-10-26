@@ -55,6 +55,11 @@ pub(crate) enum LifecycleObservation {
     Ready(crate::protocol::types::ReplicaRole),
     Closed,
     Faulted,
+    TransportQuorum {
+        epoch: Epoch,
+        revision: u64,
+        available: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,12 +112,14 @@ pub(super) struct ServiceReplicator {
     provider: Arc<dyn StateProvider>,
     registry: MessageRegistry,
     control: Option<Control>,
+    retained_epoch: Option<Epoch>,
     observe: Option<Arc<dyn Fn(LifecycleObservation) + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
 enum Control {
     ChangeRole,
+    RestoreRetained(Epoch),
     UpdateEpoch,
     Progress,
     DataLoss,
@@ -143,6 +150,7 @@ impl ServiceReplicator {
             limits: config.secondary.context.buffer_limits,
             write_access: Arc::new(Mutex::new(write_access)),
             write_admission: None,
+            retained_receiver: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             before_assignment: None,
         };
@@ -153,6 +161,7 @@ impl ServiceReplicator {
             provider,
             registry,
             control: None,
+            retained_epoch: None,
             observe: None,
         })
     }
@@ -204,8 +213,21 @@ impl ServiceReplicator {
         if self.control.is_some() {
             return Err(RoleError::Busy.into());
         }
+        let draining = if matches!(control, Control::ChangeRole) {
+            self.service.retained_receiver.lock().unwrap().clone()
+        } else {
+            None
+        };
+        if let Some(receiver) = &draining {
+            receiver.draining.store(true, Ordering::Release);
+        }
         let result = begin(&mut self.owner);
         self.refresh();
+        if result.is_err()
+            && let Some(receiver) = &draining
+        {
+            receiver.draining.store(false, Ordering::Release);
+        }
         result?;
         self.control = Some(control);
         Ok(())
@@ -307,7 +329,29 @@ impl ServiceReplicator {
             result?;
             return Err(RoleError::Aborted.into());
         }
+        if result.is_err()
+            && matches!(control, Control::ChangeRole)
+            && let Some(receiver) = self.service.retained_receiver.lock().unwrap().as_ref()
+        {
+            receiver.draining.store(false, Ordering::Release);
+        }
         result?;
+        match control {
+            Control::RestoreRetained(epoch) => {
+                self.retained_epoch = Some(epoch);
+                *self.service.retained_receiver.lock().unwrap() =
+                    Some(Arc::new(RetainedReceiver {
+                        secondary: self.owner.secondary()?,
+                        bound: AtomicBool::new(false),
+                        draining: AtomicBool::new(false),
+                    }));
+            }
+            Control::ChangeRole => {
+                self.retained_epoch = None;
+                self.service.retained_receiver.lock().unwrap().take();
+            }
+            _ => {}
+        }
         Ok(if matches!(control, Control::Progress) {
             ControlResult::Progress(
                 self.owner
@@ -395,8 +439,15 @@ pub(super) struct ServiceHandle {
     limits: BufferLimits,
     write_access: Arc<Mutex<Arc<dyn Fn() -> WriteAccess + Send + Sync>>>,
     write_admission: Option<Arc<Mutex<()>>>,
+    retained_receiver: Arc<Mutex<Option<Arc<RetainedReceiver>>>>,
     #[cfg(test)]
     before_assignment: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+struct RetainedReceiver {
+    secondary: SecondaryHandle,
+    bound: AtomicBool,
+    draining: AtomicBool,
 }
 
 impl ServiceHandle {
@@ -464,6 +515,7 @@ impl ServiceHandle {
         Ok(ServiceStream {
             stream,
             secondary,
+            retained_receiver: self.retained_receiver.lock().unwrap().clone(),
             kind,
             terminated: false,
         })
@@ -534,6 +586,7 @@ enum StreamKind {
 pub(super) struct ServiceStream {
     stream: OperationStream,
     secondary: SecondaryHandle,
+    retained_receiver: Option<Arc<RetainedReceiver>>,
     kind: StreamKind,
     terminated: bool,
 }
@@ -558,6 +611,7 @@ impl Stream for ServiceStream {
                     return Poll::Ready(Some(Ok(ServiceOperation {
                         operation,
                         secondary: this.secondary.clone(),
+                        retained_receiver: this.retained_receiver.clone(),
                         kind: this.kind,
                     })));
                 }
@@ -582,10 +636,24 @@ impl Stream for ServiceStream {
 pub(super) struct ServiceOperation {
     operation: ReceivedOperation,
     secondary: SecondaryHandle,
+    retained_receiver: Option<Arc<RetainedReceiver>>,
     kind: StreamKind,
 }
 
 impl ServiceOperation {
+    fn is_current_unbound_retained(&self, service: &ServiceHandle) -> bool {
+        if service.aborted.load(Ordering::Acquire) || service.target.upgrade().is_none() {
+            return false;
+        }
+        let current = service.retained_receiver.lock().unwrap();
+        matches!(self.kind, StreamKind::Replication)
+            && self.operation.callback_required()
+            && matches!((&self.retained_receiver, current.as_ref()),
+            (Some(origin), Some(current)) if Arc::ptr_eq(origin, current)
+                && !origin.bound.load(Ordering::Acquire)
+                && origin.draining.load(Ordering::Acquire))
+    }
+
     pub(super) fn lsn(&self) -> Lsn {
         self.operation.queue_operation().lsn()
     }

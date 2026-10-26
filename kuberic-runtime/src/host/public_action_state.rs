@@ -32,7 +32,10 @@ fn epoch(intent: &PublicOperationIntent) -> Option<Epoch> {
         })
 }
 
-fn achieved_role(record: &PublicOperationRecord, application: bool) -> Option<ReplicaRole> {
+pub(crate) fn achieved_role(
+    record: &PublicOperationRecord,
+    application: bool,
+) -> Option<ReplicaRole> {
     let instructions = public_lifecycle::record_instructions(record);
     instructions
         .iter()
@@ -43,7 +46,7 @@ fn achieved_role(record: &PublicOperationRecord, application: bool) -> Option<Re
                     && matches!(outcome, O::ApplicationRole(_))
             } else {
                 matches!(instruction, I::ReplicatorRole | I::ReplicatorPrimary)
-                    && matches!(outcome, O::Done)
+                    && matches!(outcome, O::Done | O::RetainedNativeInitialized(_))
             };
             if !is_child {
                 return None;
@@ -216,6 +219,40 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
         let Some(goal) = intent.goal() else {
             return false;
         };
+        if matches!(goal.desired, ReplicaGoalKind::RefreshPrimary { .. }) {
+            let removed = installed
+                .current
+                .members
+                .iter()
+                .filter(|member| !incoming.current.members.contains(member))
+                .collect::<Vec<_>>();
+            let added = incoming
+                .current
+                .members
+                .iter()
+                .filter(|member| !installed.current.members.contains(member))
+                .collect::<Vec<_>>();
+            return incoming.current.epoch == installed.current.epoch
+                && incoming.current.primary_id == installed.current.primary_id
+                && incoming.current.write_quorum == installed.current.write_quorum
+                && incoming.previous.as_ref().is_some_and(|previous| {
+                    previous.epoch < incoming.current.epoch
+                        && previous.primary_id == installed.current.primary_id
+                        && previous.members == installed.current.members
+                        && previous.write_quorum == installed.current.write_quorum
+                })
+                && removed.len() == 1
+                && added.len() == 1
+                && removed[0].role == crate::protocol::types::ReplicaRole::ActiveSecondary
+                && added[0].role == crate::protocol::types::ReplicaRole::ActiveSecondary
+                && removed[0].identity.replica_id == added[0].identity.replica_id
+                && super::ordinary_goal::admission_ready(state, goal).is_ok_and(|ready| {
+                    ready.len() == 1
+                        && ready[0].target.scope.storage.replica == added[0].identity
+                        && ready[0].source.scope.configuration.current == installed.current
+                        && ready[0].source.scope.configuration.previous.is_none()
+                });
+        }
         matches!(
             goal.desired,
             ReplicaGoalKind::Reconfigure {

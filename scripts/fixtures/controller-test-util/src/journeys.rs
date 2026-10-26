@@ -26,7 +26,9 @@ async fn assert_values(
     members: usize,
     expected: i64,
 ) -> Result<()> {
+    eprintln!("counter values: requesting settled members={members}, value={expected}");
     let topology = cluster.settle_members(members).await?;
+    eprintln!("counter values: topology settled for value={expected}");
     let mut services = Vec::new();
     for replica in topology.members() {
         services.push((
@@ -36,8 +38,10 @@ async fn assert_values(
     }
     cluster
         .drive(async {
+            let mut last = Vec::new();
             loop {
                 let mut matches = 0;
+                let mut observed = Vec::new();
                 for (service, primary) in &services {
                     if *primary {
                         ensure!(service.read().await? == service.committed_value()?);
@@ -49,17 +53,25 @@ async fn assert_values(
                             ))
                         ));
                     }
-                    if service.committed_value()? == expected {
+                    let value = service.committed_value()?;
+                    observed.push(value);
+                    if value == expected {
                         matches += 1;
                     }
                 }
                 if matches == services.len() {
+                    eprintln!("counter values: matched value={expected}");
                     return Ok::<_, anyhow::Error>(());
+                }
+                if observed != last {
+                    eprintln!("counter values: waiting for {expected}, actual={observed:?}");
+                    last = observed;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await?;
+    eprintln!("counter values: drive completed value={expected}");
     Ok(())
 }
 
@@ -299,15 +311,20 @@ async fn stopped_primary_failover_preserves_receipts_and_fences_the_old_service(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_live_isolation_and_group_quorum_loss_restore_the_application() -> Result<()> {
     let mut cluster = cluster().await?;
+    let started = std::time::Instant::now();
+    let stage = |name| eprintln!("counter combined {:?}: {name}", started.elapsed());
     let result = async {
         let topology = cluster.settle().await?;
+        stage("bootstrap settled");
         let old = topology.primary().clone();
         let old_service = cluster.service(&old).await?;
         cluster
             .drive(async { Ok::<_, anyhow::Error>(old_service.set(41).await?) })
             .await?;
         let isolation = cluster.isolate(&[old]).await?;
+        stage("Primary isolation acknowledged");
         let survivors = cluster.settle_survivors(&isolation, 2).await?;
+        stage("survivor election settled");
         let writer = cluster.service(survivors.primary()).await?;
         cluster
             .drive(async { Ok::<_, anyhow::Error>(writer.set(47).await?) })
@@ -328,13 +345,16 @@ async fn real_live_isolation_and_group_quorum_loss_restore_the_application() -> 
                 .is_err()
         );
         cluster.heal(isolation).await?;
+        stage("Primary isolation healed");
         let topology = cluster.settle().await?;
+        stage("old Primary retired/rejoined");
         ensure!(old_service.set(99).await.is_err());
         assert_values(&mut cluster, 3, 47).await?;
 
         let writer = cluster.service(topology.primary()).await?;
         let isolated = topology.secondaries().cloned().collect::<Vec<_>>();
         let isolation = cluster.isolate(&isolated).await?;
+        stage("group isolation acknowledged");
         ensure!(
             cluster
                 .probe(async {
@@ -351,7 +371,9 @@ async fn real_live_isolation_and_group_quorum_loss_restore_the_application() -> 
             "second fault was accepted"
         );
         cluster.heal(isolation).await?;
+        stage("group isolation healed");
         let topology = cluster.settle().await?;
+        stage("group recovery settled");
         let writer = cluster.service(topology.primary()).await?;
         let recovered = writer.read().await?;
         ensure!(
@@ -362,6 +384,7 @@ async fn real_live_isolation_and_group_quorum_loss_restore_the_application() -> 
         cluster
             .drive(async { Ok::<_, anyhow::Error>(writer.set(59).await?) })
             .await?;
+        stage("post-recovery write acknowledged");
         assert_values(&mut cluster, 3, 59).await?;
         Ok::<_, anyhow::Error>(())
     }

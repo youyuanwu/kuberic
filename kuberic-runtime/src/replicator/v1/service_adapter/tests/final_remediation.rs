@@ -309,6 +309,760 @@ impl Recovery {
     }
 }
 
+struct DiscoveryPeer {
+    publication: Arc<Mutex<ReplicaPublication>>,
+    rejection: Arc<Mutex<Option<tonic::Code>>>,
+}
+
+#[tonic::async_trait]
+impl crate::control::proto::replica_peer_server::ReplicaPeer for DiscoveryPeer {
+    async fn get_status(
+        &self,
+        _: tonic::Request<crate::control::proto::GetAgentStatusRequest>,
+    ) -> std::result::Result<tonic::Response<crate::control::proto::AgentStatusReport>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("discovery fixture"))
+    }
+    async fn execute(
+        &self,
+        _: tonic::Request<crate::control::proto::ExecuteCommandRequest>,
+    ) -> std::result::Result<
+        tonic::Response<crate::control::proto::ExecuteCommandResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented("discovery fixture"))
+    }
+    async fn discover(
+        &self,
+        request: tonic::Request<crate::control::proto::ReplicaDiscoveryRequest>,
+    ) -> std::result::Result<
+        tonic::Response<crate::control::proto::ReplicaSnapshotResponse>,
+        tonic::Status,
+    > {
+        if request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer test-token")
+        {
+            return Err(tonic::Status::permission_denied(
+                "exact test endpoint credentials required",
+            ));
+        }
+        if let Some(code) = *self.rejection.lock().unwrap() {
+            return Err(tonic::Status::new(code, "positive discovery rejection"));
+        }
+        Ok(tonic::Response::new(
+            crate::control::proto::ReplicaSnapshotResponse {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                canonical_json: serde_json::to_vec(&Some(self.publication.lock().unwrap().clone()))
+                    .unwrap(),
+            },
+        ))
+    }
+}
+
+#[tokio::test]
+async fn m3_typed_discovery_outage_retries_real_recovery_but_crossed_publication_does_not() {
+    let recovery = Recovery::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let publication = Arc::new(Mutex::new(recovery.binding.source.clone()));
+    let service = DiscoveryPeer {
+        publication: publication.clone(),
+        rejection: Arc::new(Mutex::new(None)),
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                crate::control::proto::replica_peer_server::ReplicaPeerServer::new(service),
+            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    recovery.fresh.test_publish(Vec::new());
+    *recovery.fresh_access.discovery.lock().unwrap() = Some((address, true, 0));
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    recovery.complete().await;
+    recovery.write().await;
+    assert!(
+        recovery
+            .fresh_access
+            .discovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .2
+            >= 2,
+        "real dial unavailability must precede compatible discovery and recovery"
+    );
+    publication.lock().unwrap().scope.process_session_id =
+        ProcessSessionId::new("crossed-source-process");
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            recovery.fresh.recovery_peer(
+                &recovery.binding.primary().identity,
+                &recovery.binding.primary().process_session_id,
+                recovery.binding.history(),
+            )
+        )
+        .await
+        .unwrap(),
+        Err(RuntimeError::AuthorityNotAdmitted)
+    ));
+    *publication.lock().unwrap() = recovery.binding.source.clone();
+    recovery.finish().await;
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn m3_positive_discovery_rpc_rejection_returns_without_outage_retry() {
+    let recovery = Recovery::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let rejection = Arc::new(Mutex::new(None));
+    let service = DiscoveryPeer {
+        publication: Arc::new(Mutex::new(recovery.binding.source.clone())),
+        rejection: rejection.clone(),
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                crate::control::proto::replica_peer_server::ReplicaPeerServer::new(service),
+            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    recovery.fresh.test_publish(Vec::new());
+    *recovery.fresh_access.discovery.lock().unwrap() = Some((address, false, 0));
+    for code in [
+        tonic::Code::PermissionDenied,
+        tonic::Code::Unauthenticated,
+        tonic::Code::InvalidArgument,
+        tonic::Code::FailedPrecondition,
+    ] {
+        *rejection.lock().unwrap() = Some(code);
+        let before = recovery
+            .fresh_access
+            .discovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .2;
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                recovery.fresh.recovery_peer(
+                    &recovery.binding.primary().identity,
+                    &recovery.binding.primary().process_session_id,
+                    recovery.binding.history()
+                )
+            )
+            .await
+            .unwrap(),
+            Err(RuntimeError::ControlPlane(_))
+        ));
+        assert_eq!(
+            recovery
+                .fresh_access
+                .discovery
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .2,
+            before + 1
+        );
+    }
+    *rejection.lock().unwrap() = None;
+    recovery.finish().await;
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn m3_unavailable_source_fences_wire_before_draining_established_local_receipt() {
+    unavailable_source_receipts(false).await;
+}
+
+#[tokio::test]
+async fn m3_unanswered_source_confirmation_drains_finite_receipts_without_wire_credit() {
+    unavailable_source_receipts(true).await;
+}
+
+async fn unavailable_source_receipts(unanswered: bool) {
+    let recovery = Recovery::new().await;
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    recovery.complete().await;
+    let gate = Gate::new();
+    let remote = Gate::new();
+    remote.armed.store(false, Ordering::Release);
+    let _source_route =
+        unanswered.then(|| recovery.route(vec![(Cut::ConfirmReceived, remote.clone())]));
+    let unavailable = Arc::new(AtomicBool::new(false));
+    let held = gate.clone();
+    let disconnected = unavailable.clone();
+    let _route = TestingTcpRoute::register_with_kind(
+        recovery.fresh.local().identity.instance_id.to_string(),
+        move |kind, _, address| {
+            let held = held.clone();
+            let disconnected = disconnected.clone();
+            Box::pin(async move {
+                if kind == Cut::BeforeCredit && held.armed.swap(false, Ordering::SeqCst) {
+                    held.entered.add_permits(1);
+                    held.release.acquire().await.unwrap().forget();
+                }
+                if kind == Cut::EngineConfirm && disconnected.load(Ordering::Acquire) && !unanswered
+                {
+                    return Ok("http://127.0.0.1:0".to_owned());
+                }
+                Ok(address)
+            })
+        },
+    )
+    .unwrap();
+    let mut stream = recovery
+        .target
+        .state_replicator()
+        .unwrap()
+        .replication_operations()
+        .unwrap();
+    let before = recovery.fresh.native_credit_count();
+    let mut completions = Vec::new();
+    let mut last_lsn = 0;
+    for index in 0..3 {
+        let write = recovery
+            .source
+            .state_replicator()
+            .unwrap()
+            .begin_replicate(Bytes::from_static(b"actual-retained-receiver-operation"))
+            .unwrap();
+        let operation = tokio::time::timeout(Duration::from_secs(5), stream.get_operation())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.lsn, write.lsn);
+        assert_eq!(
+            operation.data,
+            Bytes::from_static(b"actual-retained-receiver-operation")
+        );
+        last_lsn = write.lsn;
+        completions.push(write.completion);
+        operation.acknowledge().unwrap();
+        if index == 0 {
+            gate.entered().await;
+        }
+    }
+    assert_eq!(recovery.fresh.native_credit_count(), before);
+    remote.armed.store(unanswered, Ordering::Release);
+    unavailable.store(true, Ordering::Release);
+    gate.release.add_permits(1);
+    if unanswered {
+        remote.entered().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while recovery.fresh.native_credit_count() != before + 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the existing five-second wire deadline must settle finite local receipts");
+    } else {
+        until(|| recovery.fresh.native_credit_count() == before + 3).await;
+    }
+    assert!(recovery.fresh.sessions.active(&recovery.binding).is_err());
+    assert!(recovery.fresh.check_health().is_ok());
+    assert!(
+        recovery
+            .fresh
+            .inspect_acks()
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["failure"].is_null())
+    );
+    for completion in &mut completions {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), completion)
+                .await
+                .is_err(),
+            "local durability drainage must not export an unconfirmed wire ACK"
+        );
+    }
+    remote.release.add_permits(1);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recovery.target.replicator().update_epoch(epoch(2)),
+    )
+    .await
+    .expect("all real pre-fence local receipts must drain for a higher epoch")
+    .unwrap();
+    assert_eq!(
+        recovery
+            .target
+            .replicator()
+            .current_progress()
+            .await
+            .unwrap(),
+        last_lsn
+    );
+    unavailable.store(false, Ordering::Release);
+    assert!(
+        recovery
+            .fresh
+            .confirm_effect(&recovery.binding)
+            .await
+            .is_err()
+    );
+    assert!(recovery.fresh.check_health().is_ok());
+    let mut successor = recovery.binding.clone();
+    successor.nonce = uuid::Uuid::new_v4().to_string();
+    assert!(recovery.fresh.sessions.reserve(&successor).is_err());
+    assert_eq!(recovery.fresh.native_credit_count(), before + 3);
+    recovery.finish().await;
+    for completion in completions {
+        assert!(completion.await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn m3_unavailable_ingress_drops_unconfirmed_frame_without_destroying_retained_receiver() {
+    unavailable_owned_work(Some(Cut::BeforeDispatch)).await;
+}
+
+#[tokio::test]
+async fn m3_unavailable_delivery_drains_only_previously_accepted_native_operation() {
+    unavailable_owned_work(Some(Cut::BeforeDelivery)).await;
+}
+
+#[tokio::test]
+async fn m3_unavailable_receiver_keeps_handed_out_local_durability_receipt_drainable() {
+    unavailable_owned_work(None).await;
+}
+
+async fn unavailable_owned_work(cut: Option<Cut>) {
+    let recovery = Recovery::new().await;
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    recovery.complete().await;
+    let gate = Gate::new();
+    let unavailable = Arc::new(AtomicBool::new(false));
+    let blocked = unavailable.clone();
+    let held = gate.clone();
+    let _route = TestingTcpRoute::register_with_kind(
+        recovery.fresh.local().identity.instance_id.to_string(),
+        move |kind, _, address| {
+            let held = held.clone();
+            let blocked = blocked.clone();
+            Box::pin(async move {
+                if cut == Some(kind) && held.armed.swap(false, Ordering::SeqCst) {
+                    held.entered.add_permits(1);
+                    held.release.acquire().await.unwrap().forget();
+                }
+                Ok(
+                    if kind == Cut::EngineConfirm && blocked.load(Ordering::Acquire) {
+                        "http://127.0.0.1:0".to_owned()
+                    } else {
+                        address
+                    },
+                )
+            })
+        },
+    )
+    .unwrap();
+    let mut stream = recovery
+        .target
+        .state_replicator()
+        .unwrap()
+        .replication_operations()
+        .unwrap();
+    let read = tokio::spawn(async move { stream.get_operation().await });
+    let write = recovery
+        .source
+        .state_replicator()
+        .unwrap()
+        .begin_replicate(Bytes::from_static(b"owned-before-source-unavailability"))
+        .unwrap();
+    let mut completion = write.completion;
+    let before = recovery.fresh.native_credit_count();
+    if cut.is_some() {
+        gate.entered().await;
+        unavailable.store(true, Ordering::Release);
+        gate.release.add_permits(1);
+    }
+    if cut == Some(Cut::BeforeDispatch) {
+        until(|| recovery.fresh.sessions.active(&recovery.binding).is_err()).await;
+        read.abort();
+        assert!(matches!(read.await, Err(error) if error.is_cancelled()));
+        assert_eq!(recovery.fresh.native_credit_count(), before);
+        assert_eq!(
+            recovery
+                .target
+                .replicator()
+                .current_progress()
+                .await
+                .unwrap(),
+            0
+        );
+    } else {
+        let operation = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.lsn, write.lsn);
+        assert_eq!(
+            operation.data,
+            Bytes::from_static(b"owned-before-source-unavailability")
+        );
+        if cut.is_none() {
+            unavailable.store(true, Ordering::Release);
+            assert!(matches!(
+                recovery.fresh.confirm_effect(&recovery.binding).await,
+                Err(RuntimeError::PeerUnavailable(_))
+            ));
+        }
+        assert!(recovery.fresh.sessions.active(&recovery.binding).is_err());
+        operation.acknowledge().unwrap();
+        assert_eq!(recovery.fresh.native_credit_count(), before + 1);
+        assert!(operation.acknowledge().is_err());
+        assert_eq!(
+            recovery
+                .target
+                .replicator()
+                .current_progress()
+                .await
+                .unwrap(),
+            write.lsn
+        );
+    }
+    assert!(recovery.fresh.check_health().is_ok());
+    assert!(
+        recovery
+            .fresh
+            .sessions
+            .fence(&recovery.binding)
+            .check()
+            .is_err()
+    );
+    let mut successor = recovery.binding.clone();
+    successor.nonce = uuid::Uuid::new_v4().to_string();
+    assert!(recovery.fresh.sessions.reserve(&successor).is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut completion)
+            .await
+            .is_err(),
+        "retained local work is not an unconfirmed source quorum ACK"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recovery.target.replicator().update_epoch(epoch(2)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(recovery.fresh.check_health().is_ok());
+    recovery.finish().await;
+    assert!(completion.await.is_err());
+}
+
+#[tokio::test]
+async fn m3_unavailable_source_local_receipt_failure_remains_sticky_through_actual_close() {
+    let recovery = Recovery::new().await;
+    recovery
+        .fresh
+        .control(&recovery.binding, Control::Recover)
+        .await
+        .unwrap();
+    recovery.complete().await;
+    let _route = TestingTcpRoute::register_with_kind(
+        recovery.fresh.local().identity.instance_id.to_string(),
+        |kind, _, address| {
+            Box::pin(async move {
+                Ok(if kind == Cut::EngineConfirm {
+                    "http://127.0.0.1:0".to_owned()
+                } else {
+                    address
+                })
+            })
+        },
+    )
+    .unwrap();
+    let before = recovery.fresh.native_credit_count();
+    let permit = recovery
+        .fresh
+        .acknowledgements()
+        .reserve_owned()
+        .await
+        .unwrap();
+    recovery
+        .fresh
+        .sessions
+        .effect(&recovery.binding, || {
+            recovery.fresh.queue_ack(
+                recovery.binding.clone(),
+                permit,
+                Box::new(|| {
+                    Err(RuntimeError::Application(
+                        "actual local receipt descendant failed".into(),
+                    ))
+                }),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    until(|| {
+        recovery
+            .fresh
+            .inspect_acks()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["failure"].is_string())
+    })
+    .await;
+    assert_eq!(recovery.fresh.native_credit_count(), before);
+    assert!(recovery.fresh.check_health().is_err());
+    assert!(recovery.fresh.sessions.active(&recovery.binding).is_err());
+    recovery.target.replicator().abort();
+    let failure = recovery
+        .target
+        .replicator()
+        .close()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        failure.contains("actual local receipt descendant failed"),
+        "{failure}"
+    );
+    assert_eq!(
+        recovery
+            .target
+            .replicator()
+            .close()
+            .await
+            .unwrap_err()
+            .to_string(),
+        failure
+    );
+    assert!(recovery.fresh.drain().await.is_err());
+    assert_eq!(recovery.fresh.cardinality(), 0);
+    recovery.source.replicator().abort();
+    recovery.source.replicator().close().await.unwrap();
+    recovery.pair.finish().await;
+}
+
+#[tokio::test]
+async fn m3_owned_local_receipt_error_and_panic_stay_sticky_without_wire_credit() {
+    for panic in [false, true] {
+        let recovery = Recovery::new().await;
+        recovery
+            .fresh
+            .control(&recovery.binding, Control::Recover)
+            .await
+            .unwrap();
+        recovery.complete().await;
+        let _route = TestingTcpRoute::register_with_kind(
+            recovery.fresh.local().identity.instance_id.to_string(),
+            |kind, _, address| {
+                Box::pin(async move {
+                    Ok(if kind == Cut::EngineConfirm {
+                        "http://127.0.0.1:0".to_owned()
+                    } else {
+                        address
+                    })
+                })
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            recovery.fresh.confirm_effect(&recovery.binding).await,
+            Err(RuntimeError::PeerUnavailable(_))
+        ));
+        let before = recovery.fresh.native_credit_count();
+        let failure = recovery
+            .fresh
+            .drain_local_receipt(&recovery.binding, || {
+                assert!(!panic, "injected actual local receipt callback panic");
+                Err(RuntimeError::Application(
+                    "injected actual local receipt callback failure".into(),
+                ))
+            })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(recovery.fresh.native_credit_count(), before);
+        assert!(recovery.fresh.check_health().is_err());
+        recovery.target.replicator().abort();
+        let closed = recovery
+            .target
+            .replicator()
+            .close()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            closed.contains(&failure),
+            "{closed} did not retain {failure}"
+        );
+        assert_eq!(
+            recovery
+                .target
+                .replicator()
+                .close()
+                .await
+                .unwrap_err()
+                .to_string(),
+            closed
+        );
+        assert!(recovery.fresh.drain().await.is_err());
+        assert_eq!(recovery.fresh.cardinality(), 0);
+        recovery.source.replicator().abort();
+        recovery.source.replicator().close().await.unwrap();
+        recovery.pair.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn m3_queued_receipt_panics_before_and_during_local_drain_keep_actual_close_joinable() {
+    for panic_later in [false, true] {
+        let recovery = Recovery::new().await;
+        recovery
+            .fresh
+            .control(&recovery.binding, Control::Recover)
+            .await
+            .unwrap();
+        recovery.complete().await;
+        let held = Gate::new();
+        let gate = held.clone();
+        let _route = TestingTcpRoute::register_with_kind(
+            recovery.fresh.local().identity.instance_id.to_string(),
+            move |kind, _, address| {
+                let gate = gate.clone();
+                Box::pin(async move {
+                    if kind == Cut::BeforeCredit && gate.armed.swap(false, Ordering::SeqCst) {
+                        gate.entered.add_permits(1);
+                        gate.release.acquire().await.unwrap().forget();
+                    }
+                    Ok(if kind == Cut::EngineConfirm {
+                        "http://127.0.0.1:0".to_owned()
+                    } else {
+                        address
+                    })
+                })
+            },
+        )
+        .unwrap();
+        let called = Arc::new(AtomicUsize::new(0));
+        let before = recovery.fresh.native_credit_count();
+        for index in 0..2 {
+            let permit = recovery
+                .fresh
+                .acknowledgements()
+                .reserve_owned()
+                .await
+                .unwrap();
+            let called = called.clone();
+            recovery
+                .fresh
+                .sessions
+                .effect(&recovery.binding, || {
+                    recovery.fresh.queue_ack(
+                        recovery.binding.clone(),
+                        permit,
+                        Box::new(move || {
+                            called.fetch_add(1, Ordering::AcqRel);
+                            assert!(
+                                (index == 1) != panic_later,
+                                "injected queued native callback panic"
+                            );
+                            Ok(())
+                        }),
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            if index == 0 {
+                held.entered().await;
+            }
+        }
+        held.release.add_permits(1);
+        until(|| {
+            recovery
+                .fresh
+                .inspect_acks()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["failure"].is_string())
+        })
+        .await;
+        assert_eq!(
+            called.load(Ordering::Acquire),
+            if panic_later { 2 } else { 1 }
+        );
+        assert_eq!(
+            recovery.fresh.native_credit_count(),
+            before + i64::from(panic_later)
+        );
+        assert!(recovery.fresh.sessions.active(&recovery.binding).is_err());
+        assert!(
+            recovery
+                .fresh
+                .sessions
+                .fence(&recovery.binding)
+                .check()
+                .is_err()
+        );
+        recovery.target.replicator().abort();
+        let failure = recovery
+            .target
+            .replicator()
+            .close()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(failure.contains("native ACK owner panicked"), "{failure}");
+        assert_eq!(
+            recovery
+                .target
+                .replicator()
+                .close()
+                .await
+                .unwrap_err()
+                .to_string(),
+            failure
+        );
+        assert!(recovery.fresh.drain().await.is_err());
+        assert_eq!(recovery.fresh.cardinality(), 0);
+        recovery.source.replicator().abort();
+        recovery.source.replicator().close().await.unwrap();
+        recovery.pair.finish().await;
+    }
+}
+
 #[tokio::test]
 async fn m2_cleanup_cancels_local_confirmation_without_dropping_remote_control_join() {
     let recovery = Recovery::new().await;
@@ -650,6 +1404,15 @@ async fn m2_recover_rpc_budget_bounds_results_and_work_with_invalid_retired_dupl
         .retire_remote(&invalid_scope)
         .await
         .unwrap();
+    until(|| {
+        recovery
+            .pair
+            .source
+            .sessions
+            .active(&recovery.predecessor)
+            .is_err()
+    })
+    .await;
     let before = recovery.pair.source.test_production().inspect();
     assert_eq!(before["retainedResults"], 2);
     assert_eq!(before["recoverySpawned"], 1);
@@ -732,7 +1495,24 @@ async fn m2_recover_rpc_budget_bounds_results_and_work_with_invalid_retired_dupl
             .pair
             .source
             .sessions
-            .completed(&recovery.predecessor)
+            .predecessor_completed(&recovery.predecessor)
+    );
+    assert!(
+        recovery
+            .pair
+            .source
+            .sessions
+            .active(&recovery.predecessor)
+            .is_err()
+    );
+    assert!(
+        recovery
+            .pair
+            .source
+            .sessions
+            .fence(&recovery.predecessor)
+            .check()
+            .is_err()
     );
     assert_eq!(
         recovery

@@ -1374,6 +1374,16 @@ async fn restart_replica(
 
 #[tokio::test]
 async fn production_ordinary_closed_predecessor_cannot_block_exact_singleton_reopen_activation() {
+    closed_predecessor_singleton_reopen(false).await;
+}
+
+#[tokio::test]
+async fn production_ordinary_closed_singleton_reopen_after_observation_cutoff_preserves_activation()
+{
+    closed_predecessor_singleton_reopen(true).await;
+}
+
+async fn closed_predecessor_singleton_reopen(after_cutoff: bool) {
     let (mut harness, applications, transport) = start(false, 1, false).await;
     assert_eq!(harness.ready_members(1).await.unwrap(), 1);
     let old = applications.engine(1);
@@ -1409,6 +1419,29 @@ async fn production_ordinary_closed_predecessor_cannot_block_exact_singleton_reo
     .await;
     pump(&mut harness, 3).await;
     assert_eq!(old.closes.load(Ordering::Acquire), 1);
+    if after_cutoff {
+        loop {
+            let raw = observe(&harness, transport.clone()).await;
+            let unavailable = raw
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_topology.as_ref())
+                .and_then(|topology| topology.unavailable_since_unix_seconds)
+                .is_some_and(|since| {
+                    raw.now_unix_seconds.saturating_sub(since)
+                        >= i64::try_from(raw.set.spec.failover_delay_seconds).unwrap()
+                });
+            if unavailable {
+                eprintln!(
+                    "closed singleton cutoff evidence: status={:?}; observed agents={:?}",
+                    raw.set.status, raw.agents
+                );
+                break;
+            }
+            harness.step().await.unwrap();
+        }
+    }
     restart_replica(&mut harness, &applications, 1).await;
     assert_eq!(harness.ready_members(1).await.unwrap(), 1);
     let after = peers(&observe(&harness, transport.clone()).await).remove(0);

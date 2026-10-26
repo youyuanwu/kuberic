@@ -30,6 +30,7 @@ use crate::replicator::v1::transport::wire;
 mod data_loss;
 mod ingress;
 mod open;
+mod retained;
 
 struct Provider {
     epochs: Mutex<Vec<EpochBarrier>>,
@@ -41,6 +42,7 @@ struct Provider {
     fail_progress: AtomicBool,
     fail_copy: AtomicBool,
     copy_calls: AtomicUsize,
+    context_calls: AtomicUsize,
     copy_boundaries: Mutex<Vec<Lsn>>,
     copy_gate: Semaphore,
     data_loss_calls: AtomicUsize,
@@ -62,6 +64,7 @@ impl Provider {
             fail_progress: AtomicBool::new(false),
             fail_copy: AtomicBool::new(false),
             copy_calls: AtomicUsize::new(0),
+            context_calls: AtomicUsize::new(0),
             copy_boundaries: Mutex::new(Vec::new()),
             copy_gate: Semaphore::new(100),
             data_loss_calls: AtomicUsize::new(0),
@@ -98,6 +101,7 @@ impl StateProvider for Provider {
         Ok(self.progress)
     }
     async fn get_copy_context(&self) -> crate::Result<OperationDataStream> {
+        self.context_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Box::pin(stream::empty()))
     }
     async fn get_copy_state(

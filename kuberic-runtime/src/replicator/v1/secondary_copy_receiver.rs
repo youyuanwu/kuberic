@@ -45,6 +45,8 @@ impl SecondaryCopyConfig {
 pub(super) enum SecondaryCopyError {
     #[error("copy queue capacities must be powers of two, with 1 < initial <= maximum")]
     InvalidCapacity,
+    #[error("retained local initialization cannot claim a completed remote copy")]
+    InvalidInitialization,
     #[error("operation {0} is not fresh copy data or the configured terminal marker")]
     InvalidOperation(Lsn),
     #[error("ACK does not belong to a committed operation of this copy receiver")]
@@ -150,6 +152,19 @@ pub(super) struct SecondaryCopyReceiver {
 
 impl SecondaryCopyReceiver {
     pub(super) fn new(config: SecondaryCopyConfig) -> Result<Self, SecondaryCopyError> {
+        Self::create(config, false)
+    }
+
+    pub(super) fn for_retained_state(
+        config: SecondaryCopyConfig,
+    ) -> Result<Self, SecondaryCopyError> {
+        if config.copy_done {
+            return Err(SecondaryCopyError::InvalidInitialization);
+        }
+        Self::create(config, true)
+    }
+
+    fn create(config: SecondaryCopyConfig, retained: bool) -> Result<Self, SecondaryCopyError> {
         if !config.is_valid() {
             return Err(SecondaryCopyError::InvalidCapacity);
         }
@@ -158,7 +173,7 @@ impl SecondaryCopyReceiver {
             staged: Vec::new(),
         }));
         let dispatch = SharedDispatchQueue::new();
-        let queue = if config.copy_done {
+        let queue = if config.copy_done || retained {
             // This newly constructed queue cannot have readers or external wakers.
             dispatch.close().dispatch();
             None
@@ -192,7 +207,7 @@ impl SecondaryCopyReceiver {
             dispatch,
             last_copy_lsn: -1,
             all_received: config.copy_done,
-            queue_closed: config.copy_done,
+            queue_closed: config.copy_done || retained,
             last_completed_ack: 0,
             terminal_enqueued: false,
             eos_acked: !config.require_service_ack,

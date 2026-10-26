@@ -44,6 +44,13 @@ async fn native_controller_unreachable_survivor_fences_until_exact_return_or_exp
         }
         fixture.cluster.heal(isolation).await?;
         eprintln!("actual ordinary data, primary containment and unknown-survivor fencing passed; exact survivor returned, requesting recovery");
+        let survivors = fixture.cluster.settle_members(2).await?;
+        assert_ne!(survivors.primary().identity(), primary.identity());
+        assert_eq!(fixture.cluster.service(survivors.primary()).await?.get("unreachable-tail").await.unwrap().as_deref(), Some("acknowledged"));
+        let reopened = fixture.cluster.request_restart(&primary).await?;
+        assert_eq!(reopened.storage_incarnation(), primary.storage_incarnation());
+        assert_ne!(reopened.process_session_id(), primary.process_session_id());
+        assert_ne!(reopened.replicator_creation_id(), primary.replicator_creation_id());
         let topology = fixture.cluster.settle_members(3).await?;
         assert_ne!(topology.primary().identity(), primary.identity());
         assert_eq!(fixture.cluster.service(topology.primary()).await?.get("unreachable-tail").await.unwrap().as_deref(), Some("acknowledged"));

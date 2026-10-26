@@ -671,6 +671,23 @@ impl Committer {
         }
     }
 
+    pub(crate) fn restore_retained_secondary(&self, native_boundary: i64) -> io::Result<()> {
+        let mut state = self.core.state.lock().unwrap();
+        Core::live(&state)?;
+        if native_boundary < 0
+            || state.pending != 0
+            || state.mode != Mode::None
+            || self.core.store.progress()?.committed_lsn != native_boundary
+        {
+            return Err(io::Error::other(
+                "SQLite retained initialization differs from native checkpoint",
+            ));
+        }
+        state.mode = Mode::Secondary;
+        self.core.changed.notify_waiters();
+        Ok(())
+    }
+
     pub fn begin_copy(&self) -> io::Result<()> {
         let mut state = self.core.state.lock().unwrap();
         Core::live(&state)?;

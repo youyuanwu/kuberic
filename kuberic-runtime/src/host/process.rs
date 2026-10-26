@@ -94,6 +94,69 @@ struct ReplacementProcessHandle {
 }
 
 impl ReplicaHandle {
+    /// Waits for a durable owner-scoped exit instruction. Returning this notice
+    /// does not join cleanup, release storage, or assert OS process death.
+    pub async fn wait_for_retained_recovery_exit(
+        &self,
+    ) -> Result<crate::protocol::public_operations::RetainedRecoveryExitNotice> {
+        let replacement = self.replacement.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "retained recovery requires ordinary hosting".into(),
+            )
+        })?;
+        let mut revision = replacement.registry.revision_receiver();
+        let process = crate::protocol::types::ProcessSessionId::new(self.process_session.as_ref());
+        loop {
+            let state = self.store.load_state().await?;
+            if let Some(notice) = crate::host::ordinary_goal::retained::status(&state, &process)
+                && notice.process_id == std::process::id()
+                && notice.process_lifetime
+                    == crate::host::ordinary_goal::retained::process_lifetime_id()
+                && notice.qualification.predecessor_creation_id
+                    == self.runtime.replacement_replicator_creation_id()?
+                && replacement.registry.is_fenced()
+            {
+                return Ok(notice);
+            }
+            revision.changed().await.map_err(|_| {
+                crate::host::HostError::CommandRejected(
+                    "recovery notice owner was lost; physical exclusion is unknown".into(),
+                )
+            })?;
+        }
+    }
+
+    /// Read-only validation of the durable cause, NOT validation of death or
+    /// reaping. The supervisor must independently reap its exact owned child.
+    pub fn validate_retained_recovery_exit_cause(
+        data_root: &Path,
+        history: &crate::protocol::types::HistoryContext,
+        storage: &crate::protocol::types::ReplicaStorageIncarnationContext,
+        process: &crate::protocol::types::ProcessSessionId,
+        creation: &crate::protocol::types::ReplicatorCreationId,
+        reaped_process_id: u32,
+    ) -> Result<crate::protocol::public_operations::RetainedRecoveryExitNotice> {
+        let state = SqliteStore::read_retained_recovery_state(
+            &SqliteStore::metadata_database_path(data_root),
+        )?;
+        let notice =
+            crate::host::ordinary_goal::retained::status(&state, process).ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "no exact durable retained recovery cause".into(),
+                )
+            })?;
+        if notice.history != *history
+            || notice.storage != *storage
+            || notice.process_id != reaped_process_id
+            || notice.qualification.predecessor_creation_id != *creation
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "reaped member differs from durable recovery cause".into(),
+            ));
+        }
+        Ok(notice)
+    }
+
     pub async fn diagnostics(&self) -> Result<ReplicaDiagnostics> {
         let state = self.store.load_state().await?;
         let blocking = state
@@ -542,6 +605,12 @@ pub struct RunningReplica {
 }
 
 impl RunningReplica {
+    pub async fn recovery_exit_required(
+        &self,
+    ) -> Result<crate::protocol::public_operations::RetainedRecoveryExitNotice> {
+        self.handle.wait_for_retained_recovery_exit().await
+    }
+
     pub fn handle(&self) -> ReplicaHandle {
         self.handle.clone()
     }
@@ -842,6 +911,7 @@ where
             self.config.bearer_token.clone(),
         )?;
         let local_session = agent.local_session().clone();
+        store.bind_process_owner(&local_session)?;
         let process_session: Arc<str> = Arc::from(local_session.as_str());
         let replacement_registry = agent
             .public_operation_runtime(binding.identity.clone())

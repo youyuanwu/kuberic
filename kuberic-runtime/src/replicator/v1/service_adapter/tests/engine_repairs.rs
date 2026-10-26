@@ -97,6 +97,7 @@ async fn m3_role_drainage_refuses_numbered_eos_data_stale_binding_and_epoch_only
             ServiceOperation {
                 operation: native,
                 secondary: secondary.clone(),
+                retained_receiver: None,
                 kind: StreamKind::Copy,
             },
             OperationKind::Copy,
@@ -326,6 +327,7 @@ impl Pair {
             withdrawn: AtomicBool::new(false),
             faults: AtomicUsize::new(0),
             writer_releases: AtomicUsize::new(0),
+            discovery: Mutex::new(None),
         })
     }
 

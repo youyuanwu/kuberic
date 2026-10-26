@@ -86,7 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
     });
+    let recovery = replica.handle();
     tokio::select! {
+        result = recovery.wait_for_retained_recovery_exit() => {
+            result?;
+            eprintln!("durable retained-member recovery requires physical process exit");
+            std::process::exit(70);
+        },
         result = replica.wait() => result?,
         result = &mut client => result??,
         result = shutdown_signal() => result?,

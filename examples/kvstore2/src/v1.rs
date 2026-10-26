@@ -409,6 +409,23 @@ impl Committer {
         }
     }
 
+    pub(crate) fn restore_retained_secondary(&self, native_boundary: i64) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        live(&state)?;
+        if native_boundary < 0
+            || state.pending != 0
+            || state.mode != Mode::None
+            || self.store.native_progress() != native_boundary
+        {
+            return Err(io::Error::other(
+                "KV retained initialization differs from native checkpoint",
+            ));
+        }
+        state.mode = Mode::Secondary;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
     pub fn begin_copy(&self) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
         live(&state)?;
@@ -594,6 +611,59 @@ mod tests {
             lsn,
             completion: Box::pin(async { Ok(()) }),
         }
+    }
+
+    #[tokio::test]
+    async fn retained_secondary_requires_exact_native_boundary_and_preserves_data_without_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, _) = open(root.path());
+        source.promote().unwrap();
+        source
+            .begin_put("retained".into(), "acknowledged".into(), |_| {
+                Ok(assigned(1))
+            })
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+        drop(source);
+        let (restored, faults) = open(root.path());
+        assert!(restored.apply_secondary(2, Bytes::new()).is_err());
+        assert!(restored.restore_retained_secondary(-1).is_err());
+        assert!(restored.restore_retained_secondary(0).is_err());
+        assert!(restored.restore_retained_secondary(2).is_err());
+        assert_eq!(restored.progress().unwrap(), 1);
+        assert_eq!(
+            restored.get("retained", || Ok(())).unwrap().as_deref(),
+            Some("acknowledged")
+        );
+        restored.restore_retained_secondary(1).unwrap();
+        assert!(restored.restore_retained_secondary(1).is_err());
+        restored
+            .apply_secondary(
+                2,
+                KvPersistence::encode_put("later".into(), "replicated".into()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(restored.progress().unwrap(), 2);
+        assert_eq!(
+            restored.get("retained", || Ok(())).unwrap().as_deref(),
+            Some("acknowledged")
+        );
+        assert_eq!(
+            restored.get("later", || Ok(())).unwrap().as_deref(),
+            Some("replicated")
+        );
+        assert!(faults.lock().unwrap().is_empty());
+        restored.close().await.unwrap();
+        assert!(restored.restore_retained_secondary(2).is_err());
+        let copy = tempfile::tempdir().unwrap();
+        let (copy, _) = open(copy.path());
+        copy.begin_copy().unwrap();
+        assert!(copy.restore_retained_secondary(0).is_err());
+        assert!(copy.finish_copy().is_err());
+        copy.close().await.unwrap();
     }
 
     #[tokio::test]

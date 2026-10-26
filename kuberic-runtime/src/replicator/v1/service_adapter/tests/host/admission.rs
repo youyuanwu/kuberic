@@ -76,7 +76,7 @@ async fn access_approved_assignment_shares_actual_host_revoke_and_final_catchup_
     let executor = tokio::runtime::Handle::current();
     let revoker = std::thread::spawn(move || {
         attempted.send(()).unwrap();
-        revoke().unwrap();
+        revoke(false).unwrap();
         fenced.send(()).unwrap();
         executor.block_on(async move {
             handoff

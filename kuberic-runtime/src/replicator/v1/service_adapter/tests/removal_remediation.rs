@@ -3,6 +3,9 @@ use crate::replicator::v1::service_adapter::engine_session::RemovalCut;
 use crate::replicator::{ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode};
 use std::sync::Condvar;
 
+#[path = "outer_replacement.rs"]
+mod outer_replacement;
+
 async fn complete_build(
     source: &ReplicatorInterfaces,
     target: &ReplicatorInterfaces,
@@ -859,6 +862,70 @@ fn next_configuration(current: &ReplicaSetConfiguration) -> ReplicaSetConfigurat
         information.catch_up_capability = 1;
     }
     next
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m3_retained_receiver_local_eos_uses_joined_ancestry_without_new_data_or_network_credit() {
+    let pair = Pair::new().await;
+    let (source, target, current) = established_pair(&pair, Arc::new(Provider::new())).await;
+    let origin = pair.target.sessions.inbound().unwrap();
+    let mut stream = target
+        .state_replicator()
+        .unwrap()
+        .replication_operations()
+        .unwrap();
+    source.replicator().update_epoch(epoch(2)).await.unwrap();
+    target.replicator().update_epoch(epoch(2)).await.unwrap();
+    let next = next_configuration(&current);
+    publish_configuration(&pair, &next, Some(&current), 1);
+    source
+        .primary_replicator()
+        .unwrap()
+        .update_catch_up_replica_set_configuration(next, current)
+        .await
+        .unwrap();
+    let retained = pair.target.sessions.inbound().unwrap();
+    assert_ne!(origin.nonce, retained.nonce);
+    assert!(
+        pair.target
+            .sessions
+            .retiring_receiver_successor(&origin)
+            .is_none()
+    );
+    let control = target.replicator();
+    let promotion =
+        tokio::spawn(async move { control.change_role(epoch(3), ReplicaRole::Primary).await });
+    let eos = tokio::time::timeout(Duration::from_secs(5), stream.get_operation())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(eos.end_of_stream);
+    assert_eq!(eos.lsn, 0);
+    assert_eq!(eos.epoch, Epoch::new(0, 0));
+    assert_eq!(
+        pair.target.sessions.retiring_receiver_successor(&origin),
+        Some(retained)
+    );
+    let mut crossed = origin.clone();
+    crossed.nonce = uuid::Uuid::new_v4().to_string();
+    assert!(
+        pair.target
+            .sessions
+            .retiring_receiver_successor(&crossed)
+            .is_none()
+    );
+    let before = pair.source.sessions.inspect();
+    eos.acknowledge().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), promotion)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(pair.source.sessions.inspect(), before);
+    assert_eq!(target.replicator().current_progress().await.unwrap(), 1);
+    close(&[&source, &target]).await;
+    pair.finish().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -27,6 +27,8 @@ mod admission;
 mod configuration;
 mod policy;
 mod rejection_order;
+mod replacement;
+mod warm_replacement;
 
 #[tokio::test]
 async fn recovery_reset_requires_selected_send_and_queue_drain_without_reopening_closed_primary() {

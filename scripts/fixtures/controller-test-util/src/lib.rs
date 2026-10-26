@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -441,7 +442,9 @@ impl StateProvider for CounterStore {
 }
 
 pub struct CounterService {
-    store: Arc<CounterStore>,
+    store: Option<Arc<CounterStore>>,
+    #[cfg(feature = "harness")]
+    proxy: Option<kuberic_controller::test_util::ReplicaContext>,
     open_modes: Mutex<Vec<OpenMode>>,
     address: String,
     partition: RwLock<Option<StatefulServicePartition>>,
@@ -452,7 +455,10 @@ pub struct CounterService {
     writes: AsyncMutex<JoinSet<Result<()>>>,
     write_gate: Arc<AsyncMutex<()>>,
     role: Mutex<ReplicaRole>,
+    restoring_retained: AtomicBool,
     drain: AsyncMutex<DrainOutcome>,
+    aborted: AtomicBool,
+    close_after_abort: OnceLock<bool>,
 }
 
 #[derive(Default)]
@@ -484,8 +490,14 @@ impl DrainOutcome {
 
 impl CounterService {
     pub fn new(store: CounterStore, address: String) -> Self {
+        Self::inert(Some(store), address)
+    }
+
+    fn inert(store: Option<CounterStore>, address: String) -> Self {
         Self {
-            store: Arc::new(store),
+            store: store.map(Arc::new),
+            #[cfg(feature = "harness")]
+            proxy: None,
             open_modes: Mutex::new(Vec::new()),
             address,
             partition: RwLock::new(None),
@@ -496,15 +508,49 @@ impl CounterService {
             writes: AsyncMutex::new(JoinSet::new()),
             write_gate: Arc::new(AsyncMutex::new(())),
             role: Mutex::new(ReplicaRole::None),
+            restoring_retained: AtomicBool::new(false),
             drain: AsyncMutex::new(DrainOutcome::default()),
+            aborted: AtomicBool::new(false),
+            close_after_abort: OnceLock::new(),
         }
     }
 
+    #[cfg(feature = "harness")]
+    fn process_proxy(context: kuberic_controller::test_util::ReplicaContext) -> Self {
+        let mut service = Self::inert(None, String::new());
+        service.proxy = Some(context);
+        service
+    }
+
+    fn local_store(&self) -> &Arc<CounterStore> {
+        self.store
+            .as_ref()
+            .expect("data proxies cannot own a local provider")
+    }
+
     pub fn open_modes(&self) -> Vec<OpenMode> {
-        self.open_modes.lock().unwrap().clone()
+        self.try_open_modes()
+            .expect("counter open-mode observation unavailable")
+    }
+
+    pub fn try_open_modes(&self) -> Result<Vec<OpenMode>> {
+        #[cfg(feature = "harness")]
+        if let Some(proxy) = &self.proxy {
+            let observation = proxy.member_observation().map_err(app_error)?;
+            return serde_json::from_value(observation["application"]["openModes"].clone())
+                .map_err(app_error);
+        }
+        Ok(self.open_modes.lock().unwrap().clone())
     }
 
     pub async fn set(&self, value: i64) -> Result<i64> {
+        #[cfg(feature = "harness")]
+        if let Some(proxy) = &self.proxy {
+            if *self.stop.borrow() {
+                return Err(RuntimeError::Closed);
+            }
+            return proxy_value(proxy, CounterRequest::Set(value)).await;
+        }
         let permit = self.write_gate.clone().lock_owned().await;
         let mut writes = self.writes.lock().await;
         if *self.stop.borrow() {
@@ -534,11 +580,11 @@ impl CounterService {
         if trace_counter() {
             eprintln!(
                 "counter {} admitted value {value} at {}",
-                self.store.root.display(),
+                self.local_store().root.display(),
                 admitted.lsn,
             );
         }
-        let store = self.store.clone();
+        let store = self.local_store().clone();
         let (outcome, observer) = oneshot::channel();
         writes.spawn(async move {
             let _permit = permit;
@@ -583,6 +629,13 @@ impl CounterService {
     }
 
     pub async fn read(&self) -> Result<i64> {
+        #[cfg(feature = "harness")]
+        if let Some(proxy) = &self.proxy {
+            if *self.stop.borrow() {
+                return Err(RuntimeError::Closed);
+            }
+            return proxy_value(proxy, CounterRequest::Read).await;
+        }
         let partition = self
             .partition
             .read()
@@ -593,17 +646,28 @@ impl CounterService {
         if access != AccessStatus::Granted {
             return Err(RuntimeError::ReadClosed(access));
         }
-        let state = self.store.state.lock().unwrap();
+        let state = self.local_store().state.lock().unwrap();
         state.value_at(state.committed)
     }
 
     /// Fixture diagnostic of service-owned durable state, not a serving read.
     pub fn committed_value(&self) -> Result<i64> {
-        let state = self.store.state.lock().unwrap();
+        #[cfg(feature = "harness")]
+        if let Some(proxy) = &self.proxy {
+            let observation = proxy.member_observation().map_err(app_error)?;
+            return observation["application"]["committedValue"]
+                .as_i64()
+                .ok_or_else(|| app_error("counter observation has no committed value"));
+        }
+        let state = self.local_store().state.lock().unwrap();
         state.value_at(state.committed)
     }
 
     pub async fn shutdown_and_drain(&self) -> Result<()> {
+        #[cfg(feature = "harness")]
+        if self.proxy.is_some() {
+            return Err(app_error("only the exact child owner can stop a member"));
+        }
         match self.close().await {
             Err(RuntimeError::OperationCancelled) => {
                 if self.read().await.is_ok() || self.set(0).await.is_ok() {
@@ -637,7 +701,7 @@ impl CounterService {
         partition: StatefulServicePartition,
     ) {
         let mut stop = self.stop.subscribe();
-        let store = self.store.clone();
+        let store = self.local_store().clone();
         let kind = if copy_done.is_some() {
             "copy"
         } else {
@@ -708,6 +772,10 @@ impl CounterService {
 #[async_trait]
 impl StatefulServiceReplica for CounterService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        #[cfg(feature = "harness")]
+        if self.proxy.is_some() {
+            return Err(app_error("a data proxy cannot be opened by a host"));
+        }
         self.open_modes.lock().unwrap().push(context.mode);
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);
@@ -715,12 +783,14 @@ impl StatefulServiceReplica for CounterService {
         if let Some(control) = self.control.read().await.clone() {
             return Ok(control);
         }
-        self.store.authorize_open(context.mode)?;
+        self.local_store().authorize_open(context.mode)?;
+        self.restoring_retained
+            .store(context.restoring_retained_member(), Ordering::Release);
         let interfaces = context
             .partition
             .with_factory(Arc::new(DefaultReplicatorFactory::new()))
             .create_replicator(
-                Some(self.store.clone()),
+                Some(self.local_store().clone()),
                 Some(ReplicatorSettings {
                     replication_address: self.address.clone(),
                 }),
@@ -735,11 +805,26 @@ impl StatefulServiceReplica for CounterService {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        #[cfg(feature = "harness")]
+        if self.proxy.is_some() {
+            return Err(app_error("a data proxy cannot change replica roles"));
+        }
+        if *self.stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
         let previous = *self.role.lock().unwrap();
+        if previous == ReplicaRole::None
+            && self.restoring_retained.load(Ordering::Acquire)
+            && role != ReplicaRole::ActiveSecondary
+        {
+            return Err(app_error(
+                "retained counter initialization requires secondary role",
+            ));
+        }
         if trace_counter() {
             eprintln!(
                 "counter {} role {previous:?} -> {role:?}",
-                self.store.root.display(),
+                self.local_store().root.display(),
             );
         }
         if role == ReplicaRole::Primary || previous == ReplicaRole::Primary {
@@ -764,9 +849,30 @@ impl StatefulServiceReplica for CounterService {
                 .await
                 .clone()
                 .ok_or(RuntimeError::NotOpen)?;
-            let copy = role == ReplicaRole::IdleSecondary || previous != ReplicaRole::Primary;
+            let retained = previous == ReplicaRole::None
+                && role == ReplicaRole::ActiveSecondary
+                && self.restoring_retained.load(Ordering::Acquire);
+            if retained {
+                let control = self
+                    .control
+                    .read()
+                    .await
+                    .clone()
+                    .ok_or(RuntimeError::NotOpen)?;
+                let boundary = control.current_progress().await?;
+                if boundary < 0 || self.local_store().state.lock().unwrap().committed != boundary {
+                    return Err(app_error(
+                        "counter retained initialization differs from native checkpoint",
+                    ));
+                }
+            }
+            let copy = !retained
+                && (role == ReplicaRole::IdleSecondary || previous != ReplicaRole::Primary);
             let (copied, completion) = watch::channel(!copy);
             let mut tasks = self.consumers.lock().await;
+            if *self.stop.borrow() {
+                return Err(RuntimeError::Closed);
+            }
             if copy {
                 self.spawn_consumer(
                     &mut tasks,
@@ -791,17 +897,92 @@ impl StatefulServiceReplica for CounterService {
     }
 
     async fn close(&self) -> Result<()> {
+        #[cfg(feature = "harness")]
+        if self.proxy.is_some() {
+            return Err(app_error("a data proxy cannot certify child Close"));
+        }
+        let after_abort = *self
+            .close_after_abort
+            .get_or_init(|| self.aborted.load(Ordering::Acquire));
         self.stop.send_replace(true);
         self.state.write().await.take();
         self.control.write().await.take();
         self.partition.write().await.take();
         *self.role.lock().unwrap() = ReplicaRole::None;
-        self.drain_owned_tasks().await
+        match self.drain_owned_tasks().await {
+            Err(RuntimeError::OperationCancelled) if after_abort => Ok(()),
+            result => result,
+        }
     }
 
     fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
         self.stop.send_replace(true);
     }
+}
+
+#[cfg(feature = "harness")]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum CounterRequest {
+    Set(i64),
+    Read,
+}
+
+#[cfg(feature = "harness")]
+#[derive(Serialize, Deserialize)]
+enum CounterError {
+    Closed,
+    NotOpen,
+    NotPrimary,
+    OperationCancelled,
+    ReadClosed(AccessStatus),
+    WriteClosed(AccessStatus),
+    Application(String),
+}
+
+#[cfg(feature = "harness")]
+impl From<RuntimeError> for CounterError {
+    fn from(error: RuntimeError) -> Self {
+        match error {
+            RuntimeError::Closed => Self::Closed,
+            RuntimeError::NotOpen => Self::NotOpen,
+            RuntimeError::NotPrimary => Self::NotPrimary,
+            RuntimeError::OperationCancelled => Self::OperationCancelled,
+            RuntimeError::ReadClosed(status) => Self::ReadClosed(status),
+            RuntimeError::WriteClosed(status) => Self::WriteClosed(status),
+            error => Self::Application(error.to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "harness")]
+impl From<CounterError> for RuntimeError {
+    fn from(error: CounterError) -> Self {
+        match error {
+            CounterError::Closed => Self::Closed,
+            CounterError::NotOpen => Self::NotOpen,
+            CounterError::NotPrimary => Self::NotPrimary,
+            CounterError::OperationCancelled => Self::OperationCancelled,
+            CounterError::ReadClosed(status) => Self::ReadClosed(status),
+            CounterError::WriteClosed(status) => Self::WriteClosed(status),
+            CounterError::Application(message) => Self::Application(message),
+        }
+    }
+}
+
+#[cfg(feature = "harness")]
+async fn proxy_value(
+    context: &kuberic_controller::test_util::ReplicaContext,
+    request: CounterRequest,
+) -> Result<i64> {
+    let response = context
+        .member_data(serde_json::to_value(request).map_err(app_error)?)
+        .await
+        .map_err(app_error)?;
+    let result: std::result::Result<i64, CounterError> =
+        serde_json::from_value(response).map_err(app_error)?;
+    result.map_err(Into::into)
 }
 
 #[cfg(feature = "harness")]
@@ -811,6 +992,12 @@ pub use harness::CounterFactory;
 
 #[cfg(all(test, feature = "harness"))]
 mod journeys;
+
+#[cfg(all(test, feature = "process-members"))]
+mod process_tests;
+
+#[cfg(feature = "process-members")]
+pub mod retained_witness;
 
 #[cfg(test)]
 mod provider_tests {
@@ -894,6 +1081,54 @@ mod provider_tests {
         assert!(!fresh);
         store.authorize_open(OpenMode::Existing)?;
         assert_eq!(store.state.lock().unwrap().committed, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_abort_joins_typed_work_but_never_erases_a_prior_close_or_worker_failure()
+    -> Result<()> {
+        let root =
+            tempfile::tempdir_in(std::env::current_dir().map_err(app_error)?).map_err(app_error)?;
+        for failed in [false, true] {
+            let (store, _) = CounterStore::open(&root.path().join(format!("aborted-{failed}")))?;
+            let service = CounterService::new(store, "http://127.0.0.1:0".into());
+            let mut writes = service.writes.lock().await;
+            writes.spawn(async { Err(RuntimeError::OperationCancelled) });
+            if failed {
+                writes.spawn(async { Err(app_error("actual worker storage failure")) });
+            }
+            drop(writes);
+            service.abort();
+            for _ in 0..2 {
+                let result = service.close().await;
+                if failed {
+                    assert!(matches!(result, Err(RuntimeError::Application(error))
+                        if error.contains("actual worker storage failure")));
+                } else {
+                    result?;
+                }
+                assert!(service.writes.lock().await.is_empty());
+                assert!(service.consumers.lock().await.is_empty());
+                assert!(service.read().await.is_err());
+                assert!(service.set(99).await.is_err());
+            }
+        }
+        let (store, _) = CounterStore::open(&root.path().join("failed-close-first"))?;
+        let service = CounterService::new(store, "http://127.0.0.1:0".into());
+        service
+            .writes
+            .lock()
+            .await
+            .spawn(async { Err(RuntimeError::OperationCancelled) });
+        assert!(matches!(
+            service.close().await,
+            Err(RuntimeError::OperationCancelled)
+        ));
+        service.abort();
+        assert!(matches!(
+            service.close().await,
+            Err(RuntimeError::OperationCancelled)
+        ));
         Ok(())
     }
 

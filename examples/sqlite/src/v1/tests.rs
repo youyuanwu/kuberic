@@ -166,6 +166,43 @@ async fn create(service: &Committer) {
 }
 
 #[tokio::test]
+async fn retained_secondary_requires_exact_native_boundary_and_preserves_sql_without_copy() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, _) = open(root.path());
+    standalone(&source, 1);
+    create(&source).await;
+    execute(&source, "INSERT INTO t VALUES (7)")
+        .wait()
+        .await
+        .unwrap();
+    source.close().await.unwrap();
+    drop(source);
+    let (restored, faults) = open(root.path());
+    let before = application_tree(root.path());
+    assert!(restored.restore_retained_secondary(-1).is_err());
+    assert!(restored.restore_retained_secondary(1).is_err());
+    assert!(restored.restore_retained_secondary(3).is_err());
+    assert_eq!(application_tree(root.path()), before);
+    restored.restore_retained_secondary(2).unwrap();
+    assert_eq!(application_tree(root.path()), before);
+    assert!(restored.restore_retained_secondary(2).is_err());
+    assert_eq!(restored.progress().unwrap(), 2);
+    assert_eq!(
+        restored.query("SELECT v FROM t").unwrap(),
+        vec![vec![Value::Integer(7)]]
+    );
+    assert!(faults.lock().unwrap().is_empty());
+    restored.close().await.unwrap();
+    assert!(restored.restore_retained_secondary(2).is_err());
+    let root = tempfile::tempdir().unwrap();
+    let (copy, _) = open(root.path());
+    copy.begin_copy().unwrap();
+    assert!(copy.restore_retained_secondary(0).is_err());
+    assert!(copy.finish_copy().is_err());
+    copy.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn real_sql_publication_client_drop_and_repeated_outcome() {
     let root = tempfile::tempdir().unwrap();
     let (service, faults) = open(root.path());

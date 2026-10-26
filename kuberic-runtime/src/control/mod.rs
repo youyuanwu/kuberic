@@ -9,7 +9,7 @@ mod discovery;
 mod scale_down;
 mod scale_up;
 #[cfg(feature = "host")]
-pub(crate) use discovery::resolve_replica_publication;
+pub(crate) use discovery::{peer_observation_error, resolve_replica_publication};
 
 pub mod proto {
     tonic::include_proto!("kuberic.level.v1");

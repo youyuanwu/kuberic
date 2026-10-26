@@ -32,7 +32,9 @@ use super::super::transport::{Route, wire};
 mod facade;
 mod host;
 mod kv;
+mod native_replacement;
 mod production_ingress;
+mod retained;
 mod sqlite;
 
 struct Provider {

@@ -26,6 +26,7 @@ nextest-build-only: nextest-source
 # Build every workspace test binary without executing source or behavior tests.
 nextest-archive: install-nextest
     cargo build -p postgres-replicated --bin postgres-replicated --all-features
+    cargo build -p kuberic-level-tests --all-features --bins
     mkdir -p "$(dirname "{{ nextest_archive }}")"
     cargo nextest archive --workspace --all-features --profile ci \
         --archive-file "{{ nextest_archive }}"

@@ -22,6 +22,8 @@ use crate::replicator::v1::buffers::{self, BufferLimits, BufferPolicy};
 use crate::replicator::v1::operation_queue::QueueOperation;
 use crate::replicator::v1::operation_stream::StreamEvent;
 
+mod retained;
+
 fn config(required: bool, eos: bool) -> SecondaryCopyConfig {
     SecondaryCopyConfig {
         initial_capacity: 4,

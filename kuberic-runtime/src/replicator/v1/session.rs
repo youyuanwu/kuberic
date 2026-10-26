@@ -163,6 +163,11 @@ impl ReplicationSession {
         self.state.lock().unwrap().identity.clone()
     }
 
+    #[cfg(test)]
+    pub(super) fn sending_epoch(&self) -> Epoch {
+        self.state.lock().unwrap().sending_epoch
+    }
+
     pub(super) fn continue_transport(
         &self,
         expected: &SessionIdentity,
@@ -185,7 +190,6 @@ impl ReplicationSession {
         Arc::ptr_eq(&self.state, &other.state)
     }
 
-    #[cfg(any(test, feature = "testing"))]
     pub(super) fn transport_active(&self) -> bool {
         self.state.lock().unwrap().active
     }

@@ -1,8 +1,33 @@
 use super::*;
 
-pub const ORDINARY_ACTION_FORMAT: u32 = 17;
+pub const ORDINARY_ACTION_FORMAT: u32 = 19;
 pub const MAX_REMOTE_SELECTIONS: usize = 256;
 pub const MAX_REMOTE_GENERATIONS: usize = 64;
+
+/// Historical eligibility only: no progress, Ready or successor authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedMemberQualification {
+    pub predecessor_process_session_id: ProcessSessionId,
+    pub predecessor_creation_id: ReplicatorCreationId,
+    pub admitted_operation_id: OperationId,
+    pub admitted_revision: u64,
+    pub configuration: ConfigurationDescriptor,
+}
+
+/// An instruction to the executable to exclude this exact physical owner.
+/// It is neither successful Cleanup nor proof that the process has exited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetainedRecoveryExitNotice {
+    pub fault_operation_id: OperationId,
+    pub fault_revision: u64,
+    pub process_id: u32,
+    pub process_lifetime: String,
+    pub history: HistoryContext,
+    pub storage: ReplicaStorageIncarnationContext,
+    pub qualification: RetainedMemberQualification,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -28,6 +53,45 @@ pub struct ReplicaConfigurationScope {
 }
 
 impl ReplicaConfigurationScope {
+    pub(crate) fn fresh_idle_replacement(
+        &self,
+        storage: &ReplicaStorageIncarnationContext,
+        process: &ProcessSessionId,
+    ) -> bool {
+        self.previous.is_none()
+            && self.current.primary_id != storage.replica.replica_id
+            && self
+                .current
+                .members
+                .iter()
+                .filter(|member| member.identity.replica_id == storage.replica.replica_id)
+                .count()
+                == 1
+            && self.current.members.iter().any(|member| {
+                member.identity.replica_id == storage.replica.replica_id
+                    && member.identity != storage.replica
+                    && member.role == ReplicaRole::ActiveSecondary
+                    && self.replicas.iter().any(|peer| {
+                        peer.identity == member.identity
+                            && peer.storage_incarnation != *storage
+                            && match (&peer.storage_incarnation.storage, &storage.storage) {
+                                (
+                                    ReplicaStorageIdentity::Persistent { pvc_uid: old, .. },
+                                    ReplicaStorageIdentity::Persistent { pvc_uid: fresh, .. },
+                                ) => old != fresh,
+                                (old, fresh) => old != fresh,
+                            }
+                            && peer.process_session_id != *process
+                            && peer.role == ReplicaRole::ActiveSecondary
+                            && !peer.is_up
+                            && !peer.is_ready
+                            && !peer.must_catchup
+                            && peer.current_progress == super::INVALID_LSN
+                            && peer.catch_up_capability == super::INVALID_LSN
+                    })
+            })
+    }
+
     pub(crate) fn ordinary(&self) -> PublicConfiguration {
         PublicConfiguration {
             current: self.current.clone(),
@@ -141,6 +205,39 @@ impl RemoteReplicaSelection {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.source.validate()?;
         self.target.validate()?;
+        let source_configuration = &self.source.scope.configuration;
+        let target_configuration = &self.target.scope.configuration;
+        let replacement = source_configuration.fresh_idle_replacement(
+            &self.target.scope.storage,
+            &self.target.scope.process_session_id,
+        ) && target_configuration.fresh_idle_replacement(
+            &self.target.scope.storage,
+            &self.target.scope.process_session_id,
+        ) && source_configuration.current == target_configuration.current
+            && source_configuration.previous.is_none()
+            && target_configuration.previous.is_none()
+            && source_configuration.current.primary_id
+                == self.source.scope.storage.replica.replica_id
+            && source_configuration.ordinary().validate().is_ok()
+            && target_configuration.replicas.len() == source_configuration.replicas.len() + 1
+            && source_configuration
+                .replicas
+                .iter()
+                .all(|peer| target_configuration.replicas.contains(peer))
+            && target_configuration
+                .replicas
+                .iter()
+                .filter(|peer| {
+                    peer.identity == self.source.scope.storage.replica
+                        && peer.storage_incarnation == self.source.scope.storage
+                        && peer.process_session_id == self.source.scope.process_session_id
+                        && peer.replication_address == self.source.replication_address
+                        && peer.role == ReplicaRole::Primary
+                        && peer.is_up
+                        && peer.is_ready
+                })
+                .count()
+                == 1;
         if self.generation == 0
             || self.target_control_address.is_empty()
             || self.source.stage != ReplicaPublicationStage::AchievedScope
@@ -150,13 +247,13 @@ impl RemoteReplicaSelection {
             || self.source.scope.storage.replica == self.target.scope.storage.replica
             || self.source.scope.history != self.target.scope.history
             || self.source.scope.epoch != self.target.scope.epoch
-            || self.source.scope.configuration != self.target.scope.configuration
+            || (self.source.scope.configuration != self.target.scope.configuration && !replacement)
             || std::iter::once(&self.source.scope.configuration.current)
                 .chain(self.source.scope.configuration.previous.iter())
                 .any(|configuration| {
                     configuration.members.iter().any(|member| {
                         member.identity.replica_id == self.target.scope.storage.replica.replica_id
-                    })
+                    }) && !replacement
                 })
         {
             return Err("remote selection requires exact achieved source and prepared idle target");
@@ -170,11 +267,18 @@ impl RemoteReplicaSelection {
 #[schemars(with = "ReplicaGoalKindSchema")]
 pub enum ReplicaGoalKind {
     Discover,
+    RestoreRetainedMember {
+        qualification: Box<RetainedMemberQualification>,
+    },
     Prepare {
         role: ReplicaRole,
     },
     Reconfigure {
         role: ReplicaRole,
+        #[serde(rename = "catchUp", skip_serializing_if = "Option::is_none")]
+        catch_up: Option<PublicCatchUpMode>,
+    },
+    RefreshPrimary {
         #[serde(rename = "catchUp", skip_serializing_if = "Option::is_none")]
         catch_up: Option<PublicCatchUpMode>,
     },
@@ -196,6 +300,7 @@ struct ReplicaGoalKindSchema {
     role: Option<ReplicaRole>,
     catch_up: Option<PublicCatchUpMode>,
     remote: Option<Box<RemoteReplicaSelection>>,
+    qualification: Option<Box<RetainedMemberQualification>>,
 }
 
 #[derive(JsonSchema)]
@@ -203,8 +308,10 @@ struct ReplicaGoalKindSchema {
 #[allow(dead_code)]
 enum ReplicaGoalKindTag {
     Discover,
+    RestoreRetainedMember,
     Prepare,
     Reconfigure,
+    RefreshPrimary,
     Build,
     Remove,
     Close,
@@ -214,7 +321,7 @@ enum ReplicaGoalKindTag {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaGoal {
-    #[schemars(range(min = 17, max = 17))]
+    #[schemars(range(min = 19, max = 19))]
     pub format: u32,
     pub identity: PublicV1Identity,
     pub operation_id: OperationId,
@@ -234,10 +341,53 @@ impl ReplicaGoal {
         }
         self.scope.validate()?;
         match &self.desired {
+            ReplicaGoalKind::RestoreRetainedMember { qualification } => {
+                // Dormant until the parent advances the complete matched format.
+                if self.format != 19
+                    || qualification.predecessor_process_session_id.is_empty()
+                    || qualification.predecessor_creation_id.is_empty()
+                    || qualification.admitted_operation_id.is_empty()
+                    || qualification.admitted_revision == 0
+                    || qualification.admitted_revision >= self.revision
+                    || qualification.predecessor_process_session_id == self.scope.process_session_id
+                    || qualification.predecessor_creation_id == self.scope.creation_id
+                    || qualification.configuration != self.scope.configuration.current
+                    || self.scope.configuration.previous.is_some()
+                    || self.scope.configuration.replicas.iter().any(|peer| {
+                        peer.current_progress != INVALID_LSN
+                            || peer.catch_up_capability != INVALID_LSN
+                            || peer.must_catchup
+                    })
+                {
+                    return Err(
+                        "retained restoration requires exact historical current-only qualification without progress",
+                    );
+                }
+                let mut validation = self.clone();
+                validation.desired = ReplicaGoalKind::Prepare {
+                    role: ReplicaRole::ActiveSecondary,
+                };
+                validation.validate()?;
+            }
             ReplicaGoalKind::Discover => {
                 if !self.scope.configuration.replicas.is_empty() {
                     return Err("discovery goal carries premature engine peer descriptions");
                 }
+            }
+            ReplicaGoalKind::RefreshPrimary { catch_up } => {
+                if matches!(catch_up, Some(PublicCatchUpMode::All))
+                    || (catch_up.is_none() && self.scope.configuration.previous.is_some())
+                {
+                    return Err(
+                        "Primary refresh requires preparation or exact WriteQuorum replacement",
+                    );
+                }
+                let mut validation = self.clone();
+                validation.desired = ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: None,
+                };
+                validation.validate()?;
             }
             ReplicaGoalKind::Prepare { role, .. } | ReplicaGoalKind::Reconfigure { role, .. } => {
                 if *role != ReplicaRole::IdleSecondary {
@@ -278,6 +428,10 @@ impl ReplicaGoal {
                                 member.identity.replica_id == self.scope.storage.replica.replica_id
                             })
                         })
+                    && !self
+                        .scope
+                        .configuration
+                        .fresh_idle_replacement(&self.scope.storage, &self.scope.process_session_id)
                 {
                     return Err("idle preparation cannot overlap selected voting membership");
                 }
@@ -357,6 +511,8 @@ impl ReplicaGoal {
     #[cfg(feature = "host")]
     pub(crate) fn role(&self) -> Option<ReplicaRole> {
         match self.desired {
+            ReplicaGoalKind::RestoreRetainedMember { .. } => Some(ReplicaRole::ActiveSecondary),
+            ReplicaGoalKind::RefreshPrimary { .. } => Some(ReplicaRole::Primary),
             ReplicaGoalKind::Prepare { role, .. } | ReplicaGoalKind::Reconfigure { role, .. } => {
                 Some(role)
             }
@@ -438,6 +594,14 @@ pub struct ReplicaAgentSnapshot {
     pub remote_operations: Vec<RemoteReplicaObservation>,
     pub progress: ProgressQueryResult,
     pub capability: ProgressQueryResult,
+    /// Includes fault-only operations which are not projected as ordinary goals.
+    #[serde(default)]
+    pub accepted_revision_high_watermark: u64,
+    #[serde(default)]
+    pub retained_recovery_exit: Option<RetainedRecoveryExitNotice>,
+    /// Agent-checked historical eligibility, never a new native-role receipt.
+    #[serde(default)]
+    pub retained_member_qualification: Option<RetainedMemberQualification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

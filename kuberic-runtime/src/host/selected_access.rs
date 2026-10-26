@@ -53,6 +53,9 @@ pub(super) struct SelectedAccess {
 }
 
 impl SelectedAccess {
+    pub(super) fn epoch(&self) -> Option<Epoch> {
+        self.epoch
+    }
     pub(super) fn initialized(&self) -> bool {
         self.status.is_some()
     }
@@ -367,13 +370,33 @@ impl AccessOwner {
             access.valid = true;
             access.active = false;
             access.status = Some(PENDING);
-            access.demoting = matches!(record.intent.program, Some(P::Swap { .. }));
+            let selected = record
+                .intent
+                .goal()
+                .and_then(super::super::public_lifecycle::program::ordinary_handoff)
+                .or_else(|| record.intent.program.clone());
+            access.demoting = matches!(selected, Some(P::Swap { .. }));
             if record.intent.class.is_terminal() {
                 access.demoted = true;
                 access.primary_reconciliation = None;
                 access.status = Some(DENIED);
             } else {
-                match record.intent.program.as_ref() {
+                match selected.as_ref() {
+                    Some(P::AgentGoal(goal)) if matches!(goal.desired,
+                        crate::protocol::public_operations::ReplicaGoalKind::RefreshPrimary { .. }) =>
+                    {
+                        let retained = matches!(goal.desired,
+                            crate::protocol::public_operations::ReplicaGoalKind::RefreshPrimary {
+                                catch_up: Some(crate::protocol::public_operations::PublicCatchUpMode::WriteQuorum),
+                            }) && goal.scope.configuration.previous.is_none()
+                            && previously_valid && access.caught_up
+                            && access.configuration.as_ref().is_some_and(|prior| {
+                                prior.previous.is_some()
+                                    && prior.current == goal.scope.configuration.current
+                            });
+                        access.revoked = true;
+                        access.caught_up = retained;
+                    }
                     Some(P::AgentGoal(goal)) if goal.role() == Some(ReplicaRole::Primary) => {
                         access.begin_promotion();
                     }
@@ -781,6 +804,8 @@ pub(super) fn complete(host: &Arc<RuntimeHost>, operation: &Arc<PartitionOperati
                 goal.desired,
                 crate::protocol::public_operations::ReplicaGoalKind::Reconfigure {
                     role: ReplicaRole::Primary,
+                    catch_up: Some(_),
+                } | crate::protocol::public_operations::ReplicaGoalKind::RefreshPrimary {
                     catch_up: Some(_),
                 }
             ) && goal.scope.configuration.previous.is_none()

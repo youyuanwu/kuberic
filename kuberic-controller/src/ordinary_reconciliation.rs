@@ -61,6 +61,7 @@ fn goal(
         .goals
         .iter()
         .map(|observation| observation.goal.revision)
+        .chain(std::iter::once(snapshot.accepted_revision_high_watermark))
         .chain(
             retained
                 .iter()
@@ -99,20 +100,25 @@ fn configuration_for(
     peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
 ) -> Result<ReplicaConfigurationScope> {
     let mut members = BTreeMap::new();
+    let local_identity = &peers
+        .get(&local)
+        .ok_or_else(|| invalid("configuration local process is unavailable"))?
+        .storage
+        .replica;
     for member in previous
         .into_iter()
         .chain(std::iter::once(current))
         .flat_map(|set| &set.members)
     {
-        if member.identity.replica_id != local {
-            members.insert(member.identity.replica_id, member);
+        if &member.identity != local_identity {
+            members.insert(member.identity.clone(), member);
         }
     }
     let replicas = members
         .into_iter()
-        .map(|(id, member)| {
+        .map(|(identity, member)| {
             let Some(peer) = peers
-                .get(&id)
+                .get(&identity.replica_id)
                 .filter(|peer| peer.storage.replica == member.identity)
             else {
                 let mut retained = peers
@@ -171,6 +177,45 @@ fn achieved(entry: &RetainedReplicaGoal) -> bool {
         .is_some_and(|outcome| outcome.status == ReplicaGoalStatus::Achieved)
 }
 
+fn switchover_configuration(
+    current: &ConfigurationDescriptor,
+    primary_id: ReplicaId,
+    advance: i64,
+) -> Result<ConfigurationDescriptor> {
+    if !current
+        .members
+        .iter()
+        .any(|member| member.identity.replica_id == primary_id)
+    {
+        return Err(invalid("switchover target is not an admitted member"));
+    }
+    Ok(ConfigurationDescriptor::new(
+        Epoch::new(
+            current.epoch.data_loss_number,
+            current
+                .epoch
+                .configuration_number
+                .checked_add(advance)
+                .ok_or_else(|| invalid("configuration epoch exhausted"))?,
+        ),
+        primary_id,
+        current
+            .members
+            .iter()
+            .cloned()
+            .map(|mut member| {
+                member.role = if member.identity.replica_id == primary_id {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                };
+                member
+            })
+            .collect(),
+        current.write_quorum,
+    ))
+}
+
 fn current_terminal(snapshot: &ReplicaAgentSnapshot) -> bool {
     snapshot.goals.iter().any(|observation| {
         observation.goal.scope.storage == snapshot.storage
@@ -183,17 +228,265 @@ fn current_terminal(snapshot: &ReplicaAgentSnapshot) -> bool {
     })
 }
 
+fn retained_member_history<'a>(
+    status: &'a KubericSetStatus,
+    current: &ConfigurationDescriptor,
+    peer: &ReplicaAgentSnapshot,
+) -> Option<&'a RetainedReplicaGoal> {
+    let qualification = peer.retained_member_qualification.as_ref()?;
+    let topology = status.public_v1_topology.as_ref()?;
+    if peer.format != ORDINARY_ACTION_FORMAT
+        || peer.withdrawn
+        || peer.open_mode != OpenMode::Existing
+        || peer.retained_recovery_exit.is_some()
+        || current_terminal(peer)
+        || !matches!(
+            peer.storage.storage,
+            ReplicaStorageIdentity::Persistent { .. }
+        )
+        || qualification.configuration != *current
+        || qualification.predecessor_process_session_id == peer.process_session_id
+        || qualification.predecessor_creation_id == peer.creation_id
+        || topology.pending_switchover.is_some()
+        || !current.members.iter().any(|member| {
+            member.identity == peer.storage.replica
+                && member.role == ReplicaRole::ActiveSecondary
+                && member.identity.replica_id != current.primary_id
+        })
+        || !topology.sessions.iter().any(|session| {
+            session.identity == peer.storage.replica
+                && session.storage_incarnation == peer.storage
+                && session.process_session_id == qualification.predecessor_process_session_id
+                && session.replicator_creation_id == qualification.predecessor_creation_id
+                && session.role == ReplicaRole::ActiveSecondary
+        })
+        || status.replica_goals.iter().any(|entry| {
+            entry.goal.scope.configuration.previous.as_ref() == Some(current)
+                && entry.goal.scope.configuration.current != *current
+                && entry.goal.scope.epoch > current.epoch
+        })
+    {
+        return None;
+    }
+    status.replica_goals.iter().find(|entry| {
+        achieved(entry)
+            && entry.goal.operation_id == qualification.admitted_operation_id
+            && entry.goal.revision == qualification.admitted_revision
+            && entry.goal.identity == peer.identity
+            && entry.goal.scope.history == peer.history
+            && entry.goal.scope.storage == peer.storage
+            && entry.goal.scope.process_session_id == qualification.predecessor_process_session_id
+            && entry.goal.scope.creation_id == qualification.predecessor_creation_id
+            && entry.goal.scope.epoch == current.epoch
+            && entry.goal.scope.configuration.current == *current
+            && entry.goal.scope.configuration.previous.is_none()
+            && matches!(
+                entry.goal.desired,
+                ReplicaGoalKind::Prepare {
+                    role: ReplicaRole::ActiveSecondary
+                } | ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::ActiveSecondary,
+                    ..
+                } | ReplicaGoalKind::RestoreRetainedMember { .. }
+            )
+            && peer.goals.iter().any(|observation| {
+                observation.goal == entry.goal && observation.status == ReplicaGoalStatus::Achieved
+            })
+    })
+}
+
+fn retained_storage_present(raw: &RawObservation, peer: &ReplicaAgentSnapshot) -> bool {
+    let ReplicaStorageIdentity::Persistent { pod_uid, pvc_uid } = &peer.storage.storage else {
+        return false;
+    };
+    let Some(pvc) = raw.pvcs.iter().find(|pvc| {
+        pvc.uid().as_deref() == Some(pvc_uid.as_str()) && pvc.metadata.deletion_timestamp.is_none()
+    }) else {
+        return false;
+    };
+    raw.pods.iter().any(|pod| {
+        pod.uid().as_deref() == Some(pod_uid.as_str())
+            && pod_uid.as_str() == peer.storage.replica.instance_id.as_str()
+            && pod.metadata.deletion_timestamp.is_none()
+            && pod.spec.as_ref().is_some_and(|spec| {
+                spec.volumes.as_ref().is_some_and(|volumes| {
+                    volumes.iter().any(|volume| {
+                        volume
+                            .persistent_volume_claim
+                            .as_ref()
+                            .is_some_and(|claim| claim.claim_name == pvc.name_any())
+                    })
+                })
+            })
+    })
+}
+
+fn retained_restore_configuration(historical: &RetainedReplicaGoal) -> ReplicaConfigurationScope {
+    let mut configuration = historical.goal.scope.configuration.clone();
+    for description in &mut configuration.replicas {
+        description.current_progress = INVALID_LSN;
+        description.catch_up_capability = INVALID_LSN;
+        description.is_up = false;
+        description.is_ready = false;
+        description.must_catchup = false;
+    }
+    configuration
+}
+
+fn select_retained_restore(
+    status: &KubericSetStatus,
+    current: &ConfigurationDescriptor,
+    peer: &ReplicaAgentSnapshot,
+) -> Result<Option<RetainedReplicaGoal>> {
+    let Some(historical) = retained_member_history(status, current, peer) else {
+        return Ok(None);
+    };
+    if peer.publication.is_some()
+        || peer.provider_writer_held
+        || peer
+            .goals
+            .iter()
+            .any(|observation| observation.goal.scope.process_session_id == peer.process_session_id)
+        || status.replica_goals.iter().any(|entry| {
+            entry.goal.scope.storage == peer.storage
+                && entry.goal.scope.process_session_id == peer.process_session_id
+        })
+    {
+        return Ok(None);
+    }
+    goal(
+        peer,
+        retained_restore_configuration(historical),
+        ReplicaGoalKind::RestoreRetainedMember {
+            qualification: Box::new(peer.retained_member_qualification.clone().unwrap()),
+        },
+        &status.replica_goals,
+    )
+    .map(Some)
+}
+
+fn retained_restore_matches(
+    status: &KubericSetStatus,
+    current: &ConfigurationDescriptor,
+    peer: &ReplicaAgentSnapshot,
+    selected: &ReplicaGoal,
+) -> bool {
+    let ReplicaGoalKind::RestoreRetainedMember { qualification } = &selected.desired else {
+        return false;
+    };
+    retained_member_history(status, current, peer).is_some_and(|historical| {
+        peer.retained_member_qualification.as_ref() == Some(qualification.as_ref())
+            && selected.identity == peer.identity
+            && selected.scope.history == peer.history
+            && selected.scope.storage == peer.storage
+            && selected.scope.process_session_id == peer.process_session_id
+            && selected.scope.creation_id == peer.creation_id
+            && selected.scope.epoch == current.epoch
+            && selected.scope.configuration == retained_restore_configuration(historical)
+            && !peer.goals.iter().any(|observation| {
+                observation.goal.scope.process_session_id == peer.process_session_id
+                    && observation.goal != *selected
+            })
+            && !status.replica_goals.iter().any(|entry| {
+                entry.goal.scope.storage == peer.storage
+                    && entry.goal.scope.process_session_id == peer.process_session_id
+                    && entry.goal != *selected
+            })
+    })
+}
+
+fn retained_restore_achieved(peer: &ReplicaAgentSnapshot, selected: &ReplicaGoal) -> bool {
+    let ReplicaGoalKind::RestoreRetainedMember { qualification } = &selected.desired else {
+        return false;
+    };
+    peer.format == ORDINARY_ACTION_FORMAT
+        && !peer.withdrawn
+        && !current_terminal(peer)
+        && peer.retained_recovery_exit.is_none()
+        && peer.identity == selected.identity
+        && peer.history == selected.scope.history
+        && peer.storage == selected.scope.storage
+        && peer.process_session_id == selected.scope.process_session_id
+        && peer.creation_id == selected.scope.creation_id
+        && peer.retained_member_qualification.as_ref() == Some(qualification.as_ref())
+        && peer.goals.iter().any(|observation| {
+            observation.goal == *selected && observation.status == ReplicaGoalStatus::Achieved
+        })
+        && peer.publication.as_ref().is_some_and(|publication| {
+            publication.validate().is_ok()
+                && publication.stage == ReplicaPublicationStage::AchievedScope
+                && publication.role == ReplicaRole::ActiveSecondary
+                && publication.scope == selected.scope
+        })
+}
+
+fn adopt_retained_member(
+    status: &KubericSetStatus,
+    current: &ConfigurationDescriptor,
+    sampled: &ReplicaAgentSnapshot,
+    selected: &RetainedReplicaGoal,
+) -> Result<Option<KubericSetStatus>> {
+    if !achieved(selected)
+        || !retained_restore_matches(status, current, sampled, &selected.goal)
+        || !retained_restore_achieved(sampled, &selected.goal)
+        || sampled.progress.value().is_none_or(|value| value < 0)
+        || sampled.capability.value().is_none_or(|value| value < 0)
+    {
+        return Ok(None);
+    }
+    let mut next = status.clone();
+    let topology = next.public_v1_topology.as_mut().unwrap();
+    let session = topology
+        .sessions
+        .iter_mut()
+        .find(|session| session.identity == sampled.storage.replica)
+        .unwrap();
+    *session = endpoint(sampled, ReplicaRole::ActiveSecondary);
+    if topology.configuration().map_err(invalid)? != *current {
+        return Err(invalid(
+            "retained restoration changed configuration membership",
+        ));
+    }
+    Ok(Some(next))
+}
+
 fn replacement_predecessor(
     status: &KubericSetStatus,
     current: &ConfigurationDescriptor,
     id: ReplicaId,
 ) -> Option<ReplicaStorageIncarnationContext> {
-    if current
+    if let Some(member) = current
         .members
         .iter()
-        .any(|member| member.identity.replica_id == id)
+        .find(|member| member.identity.replica_id == id)
     {
-        return None;
+        if id == current.primary_id
+            || current.members.len().saturating_sub(1) >= current.write_quorum as usize
+        {
+            return None;
+        }
+        return status.replica_goals.iter().rev().find_map(|entry| {
+            (achieved(entry)
+                && entry.goal.scope.configuration.current == *current
+                && matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        ..
+                    } | ReplicaGoalKind::RefreshPrimary { .. }
+                ))
+            .then(|| {
+                entry
+                    .goal
+                    .scope
+                    .configuration
+                    .replicas
+                    .iter()
+                    .find(|peer| peer.identity == member.identity)
+                    .map(|peer| peer.storage_incarnation.clone())
+            })
+            .flatten()
+        });
     }
     status.replica_goals.iter().rev().find_map(|entry| {
         if !achieved(entry)
@@ -229,6 +522,1292 @@ fn replacement_predecessor(
 }
 
 impl<A: AgentApi + 'static> KubeClusterApi<A> {
+    async fn reconcile_retained_members(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        for member in current
+            .members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::ActiveSecondary)
+        {
+            let Some(peer) = peers.get(&member.identity.replica_id) else {
+                continue;
+            };
+            if status
+                .public_v1_topology
+                .as_ref()
+                .unwrap()
+                .sessions
+                .contains(&endpoint(peer, member.role))
+            {
+                continue;
+            }
+            let selected = status.replica_goals.iter().rev().find(|entry| {
+                entry.goal.scope.storage == peer.storage
+                    && entry.goal.scope.process_session_id == peer.process_session_id
+                    && entry.goal.scope.creation_id == peer.creation_id
+                    && matches!(
+                        entry.goal.desired,
+                        ReplicaGoalKind::RestoreRetainedMember { .. }
+                    )
+            });
+            if let Some(selected) = selected {
+                if selected.outcome.as_ref().is_some_and(|outcome| {
+                    matches!(
+                        outcome.status,
+                        ReplicaGoalStatus::Failed(_) | ReplicaGoalStatus::Uncertain(_)
+                    )
+                }) || peer.goals.iter().any(|observation| {
+                    observation.goal == selected.goal
+                        && matches!(
+                            observation.status,
+                            ReplicaGoalStatus::Failed(_) | ReplicaGoalStatus::Uncertain(_)
+                        )
+                }) {
+                    // Preserve the original error through normal completion and scoped blocking.
+                    return Ok(None);
+                }
+                if !retained_storage_present(raw, peer)
+                    || !retained_restore_matches(status, current, peer, &selected.goal)
+                {
+                    return Err(invalid(
+                        "retained restoration lost exact historical eligibility",
+                    ));
+                }
+                if !achieved(selected) {
+                    return Ok(None);
+                }
+                if !retained_restore_achieved(peer, &selected.goal) {
+                    return Err(ControllerError::ObservationStale);
+                }
+                // This query must run while the restoration scope is still achieved:
+                // native reformation observes its fresh paired receipts here.
+                let sampled = self.sample_recovery(raw, peer).await?;
+                let Some(next) = adopt_retained_member(status, current, &sampled, selected)? else {
+                    return Ok(Some(action(ReconcileKind::Waiting)));
+                };
+                return self.persist_goals(raw, next).await.map(Some);
+            }
+            // Preserve normal source-dependent retained transfer when the
+            // existing Primary is still published. Local cold reconstruction
+            // does not itself reconnect a same-epoch live source's old session.
+            // Already selected reconstruction above still runs to settlement.
+            if peers
+                .get(&current.primary_id)
+                .is_some_and(|primary| !primary.withdrawn && primary.publication.is_some())
+            {
+                continue;
+            }
+            if let Some(selected) = select_retained_restore(status, current, peer)? {
+                if !retained_storage_present(raw, peer) {
+                    return Err(ControllerError::ObservationStale);
+                }
+                let mut next = status.clone();
+                next.replica_goals.push(selected);
+                return self.persist_goals(raw, next).await.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn reconcile_full_quorum_replacement(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        if current.members.len() != 2
+            || current.write_quorum != 2
+            || status
+                .public_v1_topology
+                .as_ref()
+                .unwrap()
+                .pending_switchover
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let member = current
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id != current.primary_id)
+            .unwrap();
+        if raw.pods.iter().any(|pod| {
+            pod.uid().as_deref() == Some(member.identity.instance_id.as_str())
+                && pod.metadata.deletion_timestamp.is_none()
+        }) {
+            return Ok(None);
+        }
+        let Some(source) = peers.get(&current.primary_id).filter(|peer| {
+            !peer.withdrawn
+                && status
+                    .public_v1_topology
+                    .as_ref()
+                    .unwrap()
+                    .sessions
+                    .iter()
+                    .any(|session| {
+                        session.identity.replica_id == current.primary_id
+                            && session.storage_incarnation == peer.storage
+                    })
+        }) else {
+            return Ok(None);
+        };
+        let predecessor = status
+            .replica_goals
+            .iter()
+            .rev()
+            .filter(|entry| achieved(entry))
+            .filter(|entry| entry.goal.scope.configuration.current == *current)
+            .find_map(|entry| {
+                entry
+                    .goal
+                    .scope
+                    .configuration
+                    .replicas
+                    .iter()
+                    .find(|peer| peer.identity == member.identity)
+                    .cloned()
+            })
+            .ok_or_else(|| invalid("full-quorum replacement lacks exact predecessor metadata"))?;
+        let Some(target) = peers
+            .get(&member.identity.replica_id)
+            .filter(|peer| peer.storage.replica != member.identity && !peer.withdrawn)
+        else {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        };
+        if target.storage == predecessor.storage_incarnation
+            || target.process_session_id == predecessor.process_session_id
+        {
+            return Err(invalid(
+                "full-quorum successor is not a distinct physical process",
+            ));
+        }
+        let mut preparation = current.clone();
+        preparation.epoch.configuration_number = current
+            .epoch
+            .configuration_number
+            .checked_add(1)
+            .ok_or_else(|| invalid("configuration epoch exhausted"))?;
+        preparation.configuration_id = preparation.expected_id();
+        let mut down = predecessor.clone();
+        down.is_up = false;
+        down.is_ready = false;
+        down.must_catchup = false;
+        down.current_progress = INVALID_LSN;
+        down.catch_up_capability = INVALID_LSN;
+        let prepared_scope = ReplicaConfigurationScope {
+            current: preparation.clone(),
+            previous: None,
+            replicas: vec![down],
+        };
+        let mut status = status.clone();
+        let source_prepared = status.replica_goals.iter().any(|entry| {
+            achieved(entry)
+                && entry.goal.scope.storage == source.storage
+                && entry.goal.scope.process_session_id == source.process_session_id
+                && entry.goal.scope.creation_id == source.creation_id
+                && entry.goal.scope.configuration == prepared_scope
+                && matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::RefreshPrimary { catch_up: None }
+                        | ReplicaGoalKind::Prepare {
+                            role: ReplicaRole::Primary
+                        }
+                )
+        });
+        if !source_prepared {
+            let Some(publication) = &source.publication else {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            };
+            let desired = if publication.stage == ReplicaPublicationStage::DiscoveryPending
+                && publication.role == ReplicaRole::None
+            {
+                ReplicaGoalKind::Prepare {
+                    role: ReplicaRole::Primary,
+                }
+            } else if publication.stage == ReplicaPublicationStage::AchievedScope
+                && publication.role == ReplicaRole::Primary
+                && publication.scope.configuration.current == *current
+                && publication.scope.configuration.previous.is_none()
+            {
+                ReplicaGoalKind::RefreshPrimary { catch_up: None }
+            } else {
+                return Err(invalid(
+                    "replacement source is not the exact stable retained Primary",
+                ));
+            };
+            status.replica_goals.push(goal(
+                source,
+                prepared_scope,
+                desired,
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        if target.publication.is_none() {
+            status.replica_goals.push(goal(
+                target,
+                ReplicaConfigurationScope {
+                    current: preparation.clone(),
+                    previous: None,
+                    replicas: Vec::new(),
+                },
+                ReplicaGoalKind::Discover,
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        if target.publication.as_ref().unwrap().stage == ReplicaPublicationStage::DiscoveryPending {
+            let source_publication = source
+                .publication
+                .as_ref()
+                .ok_or_else(|| invalid("prepared source lost its publication"))?;
+            let sampled = self.sample_recovery(raw, source).await?;
+            let mut idle = prepared_scope;
+            idle.replicas.push(ReplicaPeerDescription {
+                identity: source.storage.replica.clone(),
+                replication_address: source_publication.replication_address.clone(),
+                process_session_id: source.process_session_id.clone(),
+                storage_incarnation: source.storage.clone(),
+                role: ReplicaRole::Primary,
+                current_progress: sampled.progress.value().unwrap_or(INVALID_LSN),
+                catch_up_capability: sampled.capability.value().unwrap_or(INVALID_LSN),
+                is_up: true,
+                is_ready: true,
+                must_catchup: false,
+            });
+            status.replica_goals.push(goal(
+                target,
+                idle,
+                ReplicaGoalKind::Prepare {
+                    role: ReplicaRole::IdleSecondary,
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        let built = status.replica_goals.iter().find(|entry| {
+            achieved(entry)
+                && entry.goal.scope.storage == source.storage
+                && entry.goal.scope.process_session_id == source.process_session_id
+                && entry.goal.scope.creation_id == source.creation_id
+                && matches!(&entry.goal.desired, ReplicaGoalKind::Build { remote }
+                    if remote.target.scope.storage == target.storage
+                        && remote.target.scope.process_session_id == target.process_session_id
+                        && remote.target.scope.creation_id == target.creation_id)
+        });
+        if built.is_none() {
+            let source_publication = source
+                .publication
+                .clone()
+                .ok_or_else(|| invalid("prepared replacement source is unpublished"))?;
+            let target_publication = target.publication.clone().unwrap();
+            let generation = source
+                .remote_operations
+                .iter()
+                .filter(|remote| {
+                    remote.selection.target.scope.storage == target.storage
+                        && remote.selection.target.scope.process_session_id
+                            == target.process_session_id
+                        && remote.selection.target.scope.creation_id == target.creation_id
+                })
+                .map(|remote| remote.selection.generation)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| invalid("remote generation exhausted"))?;
+            let endpoint = raw
+                .pods
+                .iter()
+                .find(|pod| {
+                    pod.uid().as_deref() == Some(target.storage.replica.instance_id.as_str())
+                        && pod.metadata.deletion_timestamp.is_none()
+                })
+                .and_then(crate::cluster_api::agent_endpoint)
+                .ok_or_else(|| invalid("replacement target has no exact control endpoint"))?;
+            let remote = RemoteReplicaSelection {
+                source: source_publication.clone(),
+                target: target_publication,
+                target_control_address: endpoint,
+                generation,
+            };
+            remote.validate().map_err(invalid)?;
+            status.replica_goals.push(goal(
+                source,
+                source_publication.scope.configuration.clone(),
+                ReplicaGoalKind::Build {
+                    remote: Box::new(remote),
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        let mut next = preparation.clone();
+        next.members
+            .iter_mut()
+            .find(|candidate| candidate.identity.replica_id == target.storage.replica.replica_id)
+            .unwrap()
+            .identity = target.storage.replica.clone();
+        next.configuration_id = next.expected_id();
+        let selected = |entry: &RetainedReplicaGoal,
+                        peer: &ReplicaAgentSnapshot,
+                        previous: Option<&ConfigurationDescriptor>| {
+            achieved(entry)
+                && entry.goal.scope.storage == peer.storage
+                && entry.goal.scope.process_session_id == peer.process_session_id
+                && entry.goal.scope.creation_id == peer.creation_id
+                && entry.goal.scope.configuration.current == next
+                && entry.goal.scope.configuration.previous.as_ref() == previous
+        };
+        if !status.replica_goals.iter().any(|entry| {
+            selected(entry, source, Some(current))
+                && matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::RefreshPrimary {
+                        catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                    }
+                )
+        }) {
+            status.replica_goals.push(goal(
+                source,
+                configuration_for(current.primary_id, &next, Some(current), peers)?,
+                ReplicaGoalKind::RefreshPrimary {
+                    catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        for previous in [Some(current), None] {
+            if !status.replica_goals.iter().any(|entry| {
+                selected(entry, target, previous)
+                    && matches!(
+                        entry.goal.desired,
+                        ReplicaGoalKind::Reconfigure {
+                            role: ReplicaRole::ActiveSecondary,
+                            ..
+                        }
+                    )
+            }) {
+                status.replica_goals.push(goal(
+                    target,
+                    configuration_for(target.storage.replica.replica_id, &next, previous, peers)?,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        catch_up: None,
+                    },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        if !status.replica_goals.iter().any(|entry| {
+            selected(entry, source, None)
+                && matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::RefreshPrimary {
+                        catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                    }
+                )
+        }) {
+            status.replica_goals.push(goal(
+                source,
+                configuration_for(current.primary_id, &next, None, peers)?,
+                ReplicaGoalKind::RefreshPrimary {
+                    catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        let sessions = vec![
+            endpoint(source, ReplicaRole::Primary),
+            endpoint(target, ReplicaRole::ActiveSecondary),
+        ];
+        let mut topology =
+            PublicV1TopologyState::from_configuration(&next, &sessions).map_err(invalid)?;
+        topology.completed_switchover_request_id = status
+            .public_v1_topology
+            .as_ref()
+            .unwrap()
+            .completed_switchover_request_id
+            .clone();
+        status.public_v1_topology = Some(topology);
+        self.persist_goals(raw, status).await.map(Some)
+    }
+
+    async fn reconcile_accepted_switchover(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        let topology = status
+            .public_v1_topology
+            .as_ref()
+            .ok_or_else(|| invalid("switchover lacks retained topology"))?;
+        let request = topology.pending_switchover.as_ref().or_else(|| {
+            raw.set.spec.switchover.as_ref().filter(|request| {
+                topology.completed_switchover_request_id.as_ref() != Some(&request.request_id)
+            })
+        });
+        let Some(request) = request else {
+            return Ok(None);
+        };
+        let target = ReplicaId::new(i64::from(request.target_replica_id));
+        let mut status = status.clone();
+        if topology.pending_switchover.is_none() && target == current.primary_id {
+            status
+                .public_v1_topology
+                .as_mut()
+                .unwrap()
+                .completed_switchover_request_id = Some(request.request_id.clone());
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        if topology.pending_switchover.is_none()
+            && (peers.get(&current.primary_id).is_none_or(|peer| {
+                peer.withdrawn
+                    || peer.read_status != AccessStatus::Granted
+                    || peer.write_status != AccessStatus::Granted
+            }) || status.replica_goals.iter().any(|entry| {
+                entry.goal.scope.configuration.previous.as_ref() == Some(current)
+                    && entry.goal.scope.configuration.current.primary_id != current.primary_id
+                    && matches!(
+                        entry.goal.desired,
+                        ReplicaGoalKind::Reconfigure {
+                            role: ReplicaRole::Primary,
+                            ..
+                        }
+                    )
+            }))
+        {
+            // An unaccepted request cannot obstruct an already-selected election.
+            return Ok(None);
+        }
+        if current.members.iter().any(|member| {
+            peers.get(&member.identity.replica_id).is_none_or(|peer| {
+                peer.withdrawn
+                    || !topology.sessions.contains(&endpoint(peer, member.role))
+                    || peer.publication.as_ref().is_none_or(|publication| {
+                        publication.stage != ReplicaPublicationStage::AchievedScope
+                    })
+            })
+        }) {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        let intermediate = switchover_configuration(current, current.primary_id, 1)?;
+        let handoff = switchover_configuration(current, target, 1)?;
+        let next = switchover_configuration(current, target, 2)?;
+        let source = peers[&current.primary_id];
+        if topology.pending_switchover.is_none() {
+            if current.members.iter().any(|member| {
+                peers[&member.identity.replica_id]
+                    .publication
+                    .as_ref()
+                    .is_none_or(|publication| {
+                        publication.role != member.role
+                            || publication.scope.configuration.current != *current
+                            || publication.scope.configuration.previous.is_some()
+                    })
+            }) {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            }
+            status
+                .public_v1_topology
+                .as_mut()
+                .unwrap()
+                .pending_switchover = Some(request.clone());
+            status.replica_goals.push(goal(
+                source,
+                configuration_for(current.primary_id, current, None, peers)?,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        let selected = |configuration: &ConfigurationDescriptor,
+                        peer: &ReplicaAgentSnapshot,
+                        desired: &ReplicaGoalKind| {
+            status.replica_goals.iter().rev().find(|entry| {
+                entry.goal.scope.storage == peer.storage
+                    && entry.goal.scope.process_session_id == peer.process_session_id
+                    && entry.goal.scope.creation_id == peer.creation_id
+                    && entry.goal.scope.configuration.current == *configuration
+                    && entry.goal.desired == *desired
+            })
+        };
+        if !selected(
+            current,
+            source,
+            &ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                catch_up: Some(PublicCatchUpMode::All),
+            },
+        )
+        .is_some_and(achieved)
+        {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        for member in intermediate
+            .members
+            .iter()
+            .filter(|member| member.identity.replica_id != current.primary_id)
+        {
+            let peer = peers[&member.identity.replica_id];
+            let desired = ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::ActiveSecondary,
+                catch_up: None,
+            };
+            if let Some(entry) = selected(&intermediate, peer, &desired) {
+                if !achieved(entry) {
+                    return Ok(Some(action(ReconcileKind::Waiting)));
+                }
+            } else {
+                status.replica_goals.push(goal(
+                    peer,
+                    configuration_for(
+                        member.identity.replica_id,
+                        &intermediate,
+                        Some(current),
+                        peers,
+                    )?,
+                    desired,
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        let desired = ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::ActiveSecondary,
+            catch_up: Some(PublicCatchUpMode::All),
+        };
+        if let Some(entry) = selected(&handoff, source, &desired) {
+            if !achieved(entry) {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            }
+        } else {
+            let mut configuration =
+                configuration_for(current.primary_id, &handoff, Some(current), peers)?;
+            for peer in &mut configuration.replicas {
+                peer.must_catchup = peer.identity.replica_id == target;
+            }
+            status
+                .replica_goals
+                .push(goal(source, configuration, desired, &status.replica_goals)?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        let desired = ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::Primary,
+            catch_up: Some(PublicCatchUpMode::All),
+        };
+        if selected(&next, peers[&target], &desired).is_some() {
+            // Existing election continuation finishes only this frozen selection.
+            return Ok(None);
+        }
+        let mut sampled = BTreeMap::new();
+        for member in &current.members {
+            let observed = self
+                .sample_recovery(raw, peers[&member.identity.replica_id])
+                .await?;
+            if observed.progress.value().is_none_or(|lsn| lsn < 0)
+                || observed.capability.value().is_none_or(|lsn| lsn < 0)
+            {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            }
+            sampled.insert(member.identity.replica_id, observed);
+        }
+        let sampled = sampled.iter().map(|(id, peer)| (*id, peer)).collect();
+        status.replica_goals.push(goal(
+            peers[&target],
+            configuration_for(target, &next, Some(current), &sampled)?,
+            desired,
+            &status.replica_goals,
+        )?);
+        self.persist_goals(raw, status).await.map(Some)
+    }
+
+    async fn prepare_selected_primary_dependencies(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        let selected = status.replica_goals.iter().find(|entry| {
+            entry.outcome.is_none()
+                && entry.goal.scope.configuration.previous.as_ref() == Some(current)
+                && entry.goal.scope.configuration.current != *current
+                && entry.goal.scope.epoch > current.epoch
+                && matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        ..
+                    }
+                )
+        });
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let next = &selected.goal.scope.configuration.current;
+        let mut status = status.clone();
+        for member in next
+            .members
+            .iter()
+            .filter(|member| member.identity.replica_id != next.primary_id)
+        {
+            let Some(peer) = peers.get(&member.identity.replica_id) else {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            };
+            if !current
+                .members
+                .iter()
+                .any(|old| old.identity == member.identity)
+                && peer
+                    .publication
+                    .as_ref()
+                    .is_some_and(|publication| publication.role == ReplicaRole::IdleSecondary)
+            {
+                continue;
+            }
+            if !status.replica_goals.iter().any(|entry| {
+                entry.goal.scope.storage == peer.storage
+                    && entry.goal.scope.process_session_id == peer.process_session_id
+                    && entry.goal.scope.creation_id == peer.creation_id
+                    && entry.goal.scope.configuration.current == *next
+                    && entry.goal.scope.configuration.previous.as_ref() == Some(current)
+                    && matches!(entry.goal.desired, ReplicaGoalKind::Reconfigure { role, .. } if role == member.role)
+            }) {
+                status.replica_goals.push(goal(
+                    peer, configuration_for(member.identity.replica_id, next, Some(current), peers)?,
+                    ReplicaGoalKind::Reconfigure { role: member.role, catch_up: None },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn reconcile_returned_primary(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        for terminal in status.replica_goals.iter().filter(|entry| {
+            achieved(entry)
+                && matches!(entry.goal.desired, ReplicaGoalKind::Abort)
+                && entry.goal.scope.epoch < current.epoch
+                && replacement_predecessor(
+                    status,
+                    current,
+                    entry.goal.scope.storage.replica.replica_id,
+                )
+                .as_ref()
+                    == Some(&entry.goal.scope.storage)
+        }) {
+            if let Some(pod) = raw.pods.iter().find(|pod| {
+                pod.uid().as_deref()
+                    == Some(terminal.goal.scope.storage.replica.instance_id.as_str())
+                    && pod.metadata.deletion_timestamp.is_none()
+            }) {
+                let ReplicaStorageIdentity::Persistent { pod_uid, .. } =
+                    &terminal.goal.scope.storage.storage
+                else {
+                    return Err(invalid("former Primary settlement lacks persistent owner"));
+                };
+                self.delete_replica_scaffolding(
+                    raw,
+                    Some(&pod.name_any()),
+                    Some(pod_uid),
+                    None,
+                    None,
+                )
+                .await?;
+                return Ok(Some(action(ReconcileKind::Applied)));
+            }
+        }
+        let Some(returned) = peers.values().find(|peer| {
+            peer.storage.replica.replica_id.value() <= i64::from(raw.set.spec.replicas)
+                && replacement_predecessor(status, current, peer.storage.replica.replica_id)
+                    .as_ref()
+                    == Some(&peer.storage)
+                && peer.publication.as_ref().is_some_and(|publication| {
+                    publication.stage == ReplicaPublicationStage::AchievedScope
+                        && publication.role == ReplicaRole::Primary
+                        && publication.scope.epoch < current.epoch
+                })
+        }) else {
+            return Ok(None);
+        };
+        let Some(primary) = peers.get(&current.primary_id) else {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        };
+        let old_progress = self.sample_recovery(raw, returned).await?;
+        let primary_progress = self.sample_recovery(raw, primary).await?;
+        if old_progress.progress.value().is_none_or(|lsn| lsn < 0)
+            || primary_progress
+                .progress
+                .value()
+                .is_none_or(|lsn| lsn < old_progress.progress.value().unwrap_or(i64::MAX))
+        {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        let mut next = status.clone();
+        next.replica_goals.push(goal(
+            returned,
+            returned
+                .publication
+                .as_ref()
+                .unwrap()
+                .scope
+                .configuration
+                .clone(),
+            ReplicaGoalKind::Abort,
+            &status.replica_goals,
+        )?);
+        self.persist_goals(raw, next).await.map(Some)
+    }
+
+    async fn reconcile_quorum_healing(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        let topology = status.public_v1_topology.as_ref().unwrap();
+        let Some(primary) = peers.get(&current.primary_id).filter(|peer| {
+            !peer.withdrawn
+                && topology
+                    .sessions
+                    .contains(&endpoint(peer, ReplicaRole::Primary))
+        }) else {
+            return Ok(None);
+        };
+        if topology.pending_switchover.is_some() {
+            return Ok(None);
+        }
+        let next = status.replica_goals.iter().find_map(|entry| {
+            (entry.goal.scope.configuration.previous.as_ref() == Some(current)
+                && entry.goal.scope.epoch > current.epoch
+                && entry.goal.scope.configuration.current.primary_id == current.primary_id
+                && entry.goal.scope.configuration.current.members == current.members
+                && entry.goal.scope.configuration.current.write_quorum == current.write_quorum
+                && matches!(
+                    entry.goal.desired,
+                    ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::ActiveSecondary,
+                        ..
+                    }
+                ))
+            .then(|| entry.goal.scope.configuration.current.clone())
+        });
+        let Some(next) = next else {
+            let native_quorum_lost = primary.write_status == AccessStatus::NoWriteQuorum
+                && primary.publication.as_ref().is_some_and(|publication| {
+                    publication.stage == ReplicaPublicationStage::AchievedScope
+                        && publication.role == ReplicaRole::Primary
+                        && publication.scope.configuration.current == *current
+                        && publication.scope.configuration.previous.is_none()
+                })
+                && current.members.iter().all(|member| {
+                    raw.pods.iter().any(|pod| {
+                        pod.uid().as_deref() == Some(member.identity.instance_id.as_str())
+                            && pod.metadata.deletion_timestamp.is_none()
+                    })
+                });
+            let available = current
+                .members
+                .iter()
+                .filter(|member| {
+                    peers.get(&member.identity.replica_id).is_some_and(|peer| {
+                        !peer.withdrawn
+                            && topology.sessions.contains(&endpoint(peer, member.role))
+                            && peer.publication.as_ref().is_some_and(|publication| {
+                                publication.stage == ReplicaPublicationStage::AchievedScope
+                                    && publication.role == member.role
+                                    && publication.scope.configuration.current == *current
+                                    && publication.scope.configuration.previous.is_none()
+                            })
+                    })
+                })
+                .count();
+            if available >= current.write_quorum as usize && !native_quorum_lost {
+                return Ok(None);
+            }
+            let missing = current.members.iter().any(|member| {
+                member.identity.replica_id != current.primary_id
+                    && !peers
+                        .get(&member.identity.replica_id)
+                        .is_some_and(|peer| peer.storage.replica == member.identity)
+                    && raw.pods.iter().any(|pod| {
+                        pod.uid().as_deref() == Some(member.identity.instance_id.as_str())
+                            && pod.metadata.deletion_timestamp.is_none()
+                    })
+            });
+            if !missing && !native_quorum_lost {
+                return Ok(None);
+            }
+            let mut next = current.clone();
+            next.epoch.configuration_number = next
+                .epoch
+                .configuration_number
+                .checked_add(1)
+                .ok_or_else(|| invalid("configuration epoch exhausted"))?;
+            next.configuration_id = next.expected_id();
+            let mut status = status.clone();
+            for member in current
+                .members
+                .iter()
+                .filter(|member| member.identity.replica_id != current.primary_id)
+            {
+                let session = topology
+                    .sessions
+                    .iter()
+                    .find(|session| session.identity == member.identity)
+                    .ok_or_else(|| invalid("recovery member lacks retained endpoint"))?;
+                let old = status
+                    .replica_goals
+                    .iter()
+                    .rev()
+                    .find(|entry| {
+                        achieved(entry)
+                            && entry.goal.scope.storage == session.storage_incarnation
+                            && entry.goal.scope.process_session_id == session.process_session_id
+                            && entry.goal.scope.creation_id == session.replicator_creation_id
+                            && matches!(
+                                entry.goal.desired,
+                                ReplicaGoalKind::Reconfigure {
+                                    role: ReplicaRole::ActiveSecondary,
+                                    ..
+                                }
+                            )
+                    })
+                    .ok_or_else(|| invalid("recovery member lacks achieved retained goal"))?;
+                let mut selected = old.goal.clone();
+                selected.revision = status
+                    .replica_goals
+                    .iter()
+                    .filter(|entry| entry.goal.scope.storage.replica == member.identity)
+                    .map(|entry| entry.goal.revision)
+                    .max()
+                    .unwrap_or(selected.revision)
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("goal revision exhausted"))?;
+                selected.operation_id = OperationId::new(format!(
+                    "goal-{}-{}-{}",
+                    member.identity.replica_id,
+                    selected.scope.process_session_id,
+                    selected.revision,
+                ));
+                selected.scope.epoch = next.epoch;
+                selected.scope.configuration.current = next.clone();
+                selected.scope.configuration.previous = Some(current.clone());
+                for description in &mut selected.scope.configuration.replicas {
+                    let observed = peers.get(&description.identity.replica_id).filter(|peer| {
+                        peer.storage == description.storage_incarnation
+                            && peer.process_session_id == description.process_session_id
+                            && peer.creation_id
+                                == topology
+                                    .sessions
+                                    .iter()
+                                    .find(|session| session.identity == description.identity)
+                                    .map(|session| session.replicator_creation_id.clone())
+                                    .unwrap_or_default()
+                    });
+                    description.is_up = observed.is_some();
+                    description.is_ready = observed.is_some();
+                    description.current_progress = INVALID_LSN;
+                    description.catch_up_capability = INVALID_LSN;
+                    description.must_catchup = false;
+                }
+                selected.desired = ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::ActiveSecondary,
+                    catch_up: None,
+                };
+                status
+                    .replica_goals
+                    .push(RetainedReplicaGoal::new(selected).map_err(invalid)?);
+            }
+            return self.persist_goals(raw, status).await.map(Some);
+        };
+        let mut sampled = BTreeMap::new();
+        for member in &next.members {
+            let Some(peer) = peers.get(&member.identity.replica_id) else {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            };
+            let observed = self.sample_recovery(raw, peer).await?;
+            if observed.progress.value().is_none_or(|lsn| lsn < 0)
+                || observed.capability.value().is_none_or(|lsn| lsn < 0)
+            {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            }
+            sampled.insert(member.identity.replica_id, observed);
+        }
+        let sampled = sampled
+            .iter()
+            .map(|(id, peer)| (*id, peer))
+            .collect::<BTreeMap<_, _>>();
+        let mut status = status.clone();
+        let selected = |entry: &RetainedReplicaGoal, id, previous| {
+            achieved(entry)
+                && entry.goal.scope.storage == sampled[&id].storage
+                && entry.goal.scope.process_session_id == sampled[&id].process_session_id
+                && entry.goal.scope.creation_id == sampled[&id].creation_id
+                && entry.goal.scope.configuration.current == next
+                && entry.goal.scope.configuration.previous.as_ref() == previous
+                && matches!(entry.goal.desired, ReplicaGoalKind::Reconfigure { .. })
+        };
+        if !status
+            .replica_goals
+            .iter()
+            .any(|entry| selected(entry, current.primary_id, Some(current)))
+        {
+            status.replica_goals.push(goal(
+                primary,
+                configuration_for(current.primary_id, &next, Some(current), &sampled)?,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        for member in &next.members {
+            let id = member.identity.replica_id;
+            if !status
+                .replica_goals
+                .iter()
+                .any(|entry| selected(entry, id, None))
+            {
+                status.replica_goals.push(goal(
+                    sampled[&id],
+                    configuration_for(id, &next, None, &sampled)?,
+                    ReplicaGoalKind::Reconfigure {
+                        role: member.role,
+                        catch_up: (member.role == ReplicaRole::Primary)
+                            .then_some(PublicCatchUpMode::All),
+                    },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        let sessions = next
+            .members
+            .iter()
+            .map(|member| endpoint(sampled[&member.identity.replica_id], member.role))
+            .collect::<Vec<_>>();
+        let mut next_topology =
+            PublicV1TopologyState::from_configuration(&next, &sessions).map_err(invalid)?;
+        next_topology.completed_switchover_request_id =
+            topology.completed_switchover_request_id.clone();
+        status.public_v1_topology = Some(next_topology);
+        self.persist_goals(raw, status).await.map(Some)
+    }
+
+    fn primary_dependencies_ready(
+        goal: &ReplicaGoal,
+        current: Option<&ConfigurationDescriptor>,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> bool {
+        if !matches!(
+            goal.desired,
+            ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                ..
+            }
+        ) || current.is_none_or(|current| {
+            goal.scope.configuration.previous.as_ref() != Some(current)
+                || goal.scope.configuration.current == *current
+                || goal.scope.epoch <= current.epoch
+        }) {
+            return true;
+        }
+        goal.scope
+            .configuration
+            .current
+            .members
+            .iter()
+            .filter(|member| {
+                member.identity.replica_id != goal.scope.configuration.current.primary_id
+            })
+            .all(|member| {
+                peers.get(&member.identity.replica_id).is_some_and(|peer| {
+                    peer.storage.replica == member.identity
+                        && goal.scope.configuration.replicas.iter().any(|selected| {
+                            selected.identity == member.identity
+                                && selected.storage_incarnation == peer.storage
+                                && selected.process_session_id == peer.process_session_id
+                        })
+                        && peer.publication.as_ref().is_some_and(|publication| {
+                            publication.stage == ReplicaPublicationStage::AchievedScope
+                                && ((publication.role == member.role
+                                    && publication.scope.configuration.current
+                                        == goal.scope.configuration.current
+                                    && publication.scope.configuration.previous
+                                        == goal.scope.configuration.previous)
+                                    || (publication.role == ReplicaRole::IdleSecondary
+                                        && current.is_some_and(|current| {
+                                            !current
+                                                .members
+                                                .iter()
+                                                .any(|old| old.identity == member.identity)
+                                        })))
+                        })
+                })
+            })
+    }
+
+    async fn reconcile_survivor_election(
+        &self,
+        raw: &RawObservation,
+        status: &KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peers: &BTreeMap<ReplicaId, &ReplicaAgentSnapshot>,
+    ) -> Result<Option<ReconcileAction>> {
+        let selected = status
+            .replica_goals
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.goal.scope.configuration.previous.as_ref() == Some(current)
+                    && entry.goal.scope.configuration.current.primary_id != current.primary_id
+                    && matches!(
+                        entry.goal.desired,
+                        ReplicaGoalKind::Reconfigure {
+                            role: ReplicaRole::Primary,
+                            ..
+                        }
+                    )
+            })
+            .cloned();
+        let mut status = status.clone();
+        if selected.is_none() {
+            #[cfg(feature = "test-util")]
+            if std::env::var_os("KUBERIC_M3_ELECTION_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "ordinary election observation: primary={}, epoch={:?}, peers={:?}",
+                    current.primary_id,
+                    current.epoch,
+                    peers
+                        .iter()
+                        .map(|(id, peer)| (
+                            id,
+                            peer.withdrawn,
+                            peer.publication.as_ref().map(|publication| (
+                                publication.role,
+                                publication.stage,
+                                publication.scope.epoch,
+                            )),
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if peers
+                .get(&current.primary_id)
+                .is_some_and(|peer| !peer.withdrawn && peer.publication.is_some())
+            {
+                if status
+                    .public_v1_topology
+                    .as_ref()
+                    .is_some_and(|topology| topology.unavailable_primary_id.is_some())
+                {
+                    let topology = status.public_v1_topology.as_mut().unwrap();
+                    topology.unavailable_primary_id = None;
+                    topology.unavailable_since_unix_seconds = None;
+                    return self.persist_goals(raw, status).await.map(Some);
+                }
+                return Ok(None);
+            }
+            let topology = status
+                .public_v1_topology
+                .as_mut()
+                .ok_or_else(|| invalid("election lacks retained topology"))?;
+            if topology.unavailable_primary_id != Some(current.primary_id) {
+                topology.unavailable_primary_id = Some(current.primary_id);
+                topology.unavailable_since_unix_seconds = Some(raw.now_unix_seconds);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+            let delay = i64::try_from(raw.set.spec.failover_delay_seconds).unwrap_or(i64::MAX);
+            if raw.now_unix_seconds
+                < topology
+                    .unavailable_since_unix_seconds
+                    .unwrap_or(raw.now_unix_seconds)
+                    .saturating_add(delay)
+            {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            }
+            let mut sampled = BTreeMap::new();
+            #[cfg(feature = "test-util")]
+            let mut diagnostics = Vec::new();
+            for member in current
+                .members
+                .iter()
+                .filter(|member| member.identity.replica_id != current.primary_id)
+            {
+                let Some(peer) = peers.get(&member.identity.replica_id) else {
+                    continue;
+                };
+                if !topology.sessions.contains(&endpoint(peer, member.role))
+                    || !peer.publication.as_ref().is_some_and(|publication| {
+                        publication.stage == ReplicaPublicationStage::AchievedScope
+                            && publication.role == member.role
+                            && publication.scope.configuration.current == *current
+                            && publication.scope.configuration.previous.is_none()
+                    })
+                {
+                    continue;
+                }
+                let observed = self.sample_recovery(raw, peer).await?;
+                #[cfg(feature = "test-util")]
+                diagnostics.push(format!(
+                    "{}: progress={:?}, capability={:?}",
+                    member.identity.replica_id, observed.progress, observed.capability
+                ));
+                if observed
+                    .progress
+                    .value()
+                    .is_some_and(|progress| progress >= 0)
+                    && observed
+                        .capability
+                        .value()
+                        .is_some_and(|capability| capability >= 0)
+                {
+                    sampled.insert(member.identity.replica_id, observed);
+                }
+            }
+            if sampled.len() < current.write_quorum as usize {
+                #[cfg(feature = "test-util")]
+                if std::env::var_os("KUBERIC_M3_ELECTION_DIAGNOSTICS").is_some() {
+                    eprintln!(
+                        "ordinary election lacks sampled quorum {}: {}",
+                        current.write_quorum,
+                        diagnostics.join("; ")
+                    );
+                }
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            }
+            let maximum = sampled
+                .values()
+                .filter_map(|peer| peer.progress.value())
+                .max()
+                .unwrap();
+            let requested = raw
+                .set
+                .spec
+                .switchover
+                .as_ref()
+                .map(|request| ReplicaId::new(i64::from(request.target_replica_id)));
+            let primary_id = sampled
+                .iter()
+                .filter(|(_, peer)| peer.progress.value() == Some(maximum))
+                .min_by_key(|(id, _)| (Some(**id) != requested, **id))
+                .map(|(id, _)| *id)
+                .unwrap();
+            let members = sampled
+                .iter()
+                .map(|(id, peer)| ConfigurationMember {
+                    identity: peer.storage.replica.clone(),
+                    role: if *id == primary_id {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect();
+            let next = ConfigurationDescriptor::new(
+                Epoch::new(
+                    current.epoch.data_loss_number,
+                    current
+                        .epoch
+                        .configuration_number
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("configuration epoch exhausted"))?,
+                ),
+                primary_id,
+                members,
+                current.write_quorum,
+            );
+            let sampled = sampled
+                .iter()
+                .map(|(id, peer)| (*id, peer))
+                .collect::<BTreeMap<_, _>>();
+            status.replica_goals.push(goal(
+                sampled[&primary_id],
+                configuration_for(primary_id, &next, Some(current), &sampled)?,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(PublicCatchUpMode::All),
+                },
+                &status.replica_goals,
+            )?);
+            return self.persist_goals(raw, status).await.map(Some);
+        }
+        let selected = selected.unwrap();
+        let next = &selected.goal.scope.configuration.current;
+        if !achieved(&selected) {
+            return Ok(Some(action(ReconcileKind::Waiting)));
+        }
+        for member in &next.members {
+            let Some(peer) = peers.get(&member.identity.replica_id) else {
+                return Ok(Some(action(ReconcileKind::Waiting)));
+            };
+            if !status.replica_goals.iter().any(|entry| {
+                achieved(entry)
+                    && entry.goal.scope.storage == peer.storage
+                    && entry.goal.scope.process_session_id == peer.process_session_id
+                    && entry.goal.scope.creation_id == peer.creation_id
+                    && entry.goal.scope.configuration.current == *next
+                    && entry.goal.scope.configuration.previous.is_none()
+                    && matches!(entry.goal.desired, ReplicaGoalKind::Reconfigure { role, .. } if role == member.role)
+            }) {
+                status.replica_goals.push(goal(
+                    peer, configuration_for(member.identity.replica_id, next, None, peers)?,
+                    ReplicaGoalKind::Reconfigure { role: member.role,
+                        catch_up: (member.role == ReplicaRole::Primary).then_some(PublicCatchUpMode::All) },
+                    &status.replica_goals,
+                )?);
+                return self.persist_goals(raw, status).await.map(Some);
+            }
+        }
+        let sessions = next
+            .members
+            .iter()
+            .map(|member| endpoint(peers[&member.identity.replica_id], member.role))
+            .collect::<Vec<_>>();
+        let mut topology =
+            PublicV1TopologyState::from_configuration(next, &sessions).map_err(invalid)?;
+        let previous = status.public_v1_topology.as_ref().unwrap();
+        topology.completed_switchover_request_id = previous.completed_switchover_request_id.clone();
+        if let Some(request) = previous.pending_switchover.as_ref() {
+            if i64::from(request.target_replica_id) != next.primary_id.value() {
+                return Err(invalid("election cannot retarget an accepted switchover"));
+            }
+            topology.completed_switchover_request_id = Some(request.request_id.clone());
+        } else if let Some(request) = raw.set.spec.switchover.as_ref()
+            && i64::from(request.target_replica_id) == next.primary_id.value()
+        {
+            topology.completed_switchover_request_id = Some(request.request_id.clone());
+        }
+        status.public_v1_topology = Some(topology);
+        self.persist_goals(raw, status).await.map(Some)
+    }
+
     async fn sample_recovery(
         &self,
         raw: &RawObservation,
@@ -259,6 +1838,7 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             return Err(invalid("recovery sample lost initialized storage"));
         };
         if sample.identity != peer.identity
+            || sample.format != ORDINARY_ACTION_FORMAT
             || sample.history != peer.history
             || sample.storage != peer.storage
             || sample.process_session_id != peer.process_session_id
@@ -806,7 +2386,7 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             .transpose()
             .map_err(invalid)?;
 
-        let replacements = current
+        let historical_predecessors = current
             .as_ref()
             .map(|current| {
                 desired
@@ -820,7 +2400,15 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             .unwrap_or_default();
         let bootstrap_ids = desired
             .iter()
-            .filter(|id| !replacements.contains_key(id))
+            .filter(|id| !historical_predecessors.contains_key(id))
+            .filter(|id| {
+                current.as_ref().is_none_or(|configuration| {
+                    !configuration
+                        .members
+                        .iter()
+                        .any(|member| member.identity.replica_id == **id)
+                })
+            })
             .copied()
             .collect::<Vec<_>>();
         if crate::reconciler::bootstrap_resources_missing(raw, &bootstrap_ids, current.as_ref()) {
@@ -833,6 +2421,15 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 .uid()
                 .ok_or_else(|| invalid("missing resource UID"))?,
         );
+        let replacements = historical_predecessors
+            .into_iter()
+            .filter(|(_, predecessor)| {
+                !raw.pods.iter().any(|pod| {
+                    pod.uid().as_deref() == Some(predecessor.replica.instance_id.as_str())
+                        && pod.metadata.deletion_timestamp.is_none()
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         for (id, predecessor) in &replacements {
             let base = derive_replacement_resource_name(&uid, &predecessor.replica);
             let pod_name = format!("{}-{base}", raw.set.name_any());
@@ -952,6 +2549,20 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
             }
         }
 
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .reconcile_retained_members(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
+        }
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .prepare_selected_primary_dependencies(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
+        }
         let mut changed = false;
         let mut pending = false;
         for entry in status
@@ -994,6 +2605,13 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 && !matches!(observation.status, ReplicaGoalStatus::Pending)
             {
                 if observation.status == ReplicaGoalStatus::Achieved {
+                    if matches!(
+                        entry.goal.desired,
+                        ReplicaGoalKind::RestoreRetainedMember { .. }
+                    ) && !retained_restore_achieved(peer, &entry.goal)
+                    {
+                        return Err(invalid("restoration completion lost exact fresh receipts"));
+                    }
                     if let ReplicaGoalKind::Build { remote } = &entry.goal.desired
                         && (!exact_publications(remote, &peers)
                             || !peer.remote_operations.iter().any(|operation| {
@@ -1012,6 +2630,13 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                         continue;
                     }
                     let accepted = self.send_goal(raw, &entry.goal, true).await?;
+                    if matches!(
+                        entry.goal.desired,
+                        ReplicaGoalKind::RestoreRetainedMember { .. }
+                    ) && !retained_restore_achieved(&accepted, &entry.goal)
+                    {
+                        return Err(invalid("restoration acceptance lost exact fresh receipts"));
+                    }
                     if let ReplicaGoalKind::Build { remote } = &entry.goal.desired
                         && !accepted.remote_operations.iter().any(|operation| {
                             operation.operation_id == entry.goal.operation_id
@@ -1026,6 +2651,10 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 entry.outcome = Some(observation.clone());
                 changed = true;
             } else {
+                if !Self::primary_dependencies_ready(&entry.goal, current.as_ref(), &peers) {
+                    pending = true;
+                    continue;
+                }
                 // An RPC observer can be lost at any point; the same canonical goal is retried.
                 if matches!(entry.goal.desired, ReplicaGoalKind::Build { .. })
                     && peers.values().any(|snapshot| current_terminal(snapshot))
@@ -1071,7 +2700,20 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 })
                 .max_by_key(|observation| observation.goal.revision)
             {
-                let mut configuration = previous.goal.scope.configuration.clone();
+                let mut configuration = if let Some(current) = current.as_ref()
+                    && !current
+                        .members
+                        .iter()
+                        .any(|member| member.identity == peer.storage.replica)
+                {
+                    ReplicaConfigurationScope {
+                        current: current.clone(),
+                        previous: None,
+                        replicas: Vec::new(),
+                    }
+                } else {
+                    previous.goal.scope.configuration.clone()
+                };
                 configuration.replicas.clear();
                 reopen.push(goal(
                     peer,
@@ -1099,13 +2741,43 @@ impl<A: AgentApi + 'static> KubeClusterApi<A> {
                 "ordinary goal failed or is uncertain; creation settlement/replacement is required",
             ));
         }
-        if raw.set.spec.switchover.is_some() {
-            return Err(invalid(
-                "ordinary M1 planned primary replacement is unavailable; creation withdrawal is required",
-            ));
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .reconcile_quorum_healing(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
+        }
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .reconcile_accepted_switchover(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
+        }
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .reconcile_survivor_election(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
+        }
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .reconcile_returned_primary(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
         }
         if peers.values().any(|peer| current_terminal(peer)) {
             return Ok(action(ReconcileKind::Waiting));
+        }
+        if let Some(current) = current.as_ref()
+            && let Some(next) = self
+                .reconcile_full_quorum_replacement(raw, &status, current, &peers)
+                .await?
+        {
+            return Ok(next);
         }
         let primary_id = current
             .as_ref()
@@ -1707,4 +3379,890 @@ fn peer_address(raw: &RawObservation, identity: &ReplicaIdentity) -> Result<Stri
         "http://{}.{namespace}.svc:50051",
         derive_replica_endpoint_name(&ResourceUid::new(raw.set.uid().unwrap()), identity)
     ))
+}
+
+#[cfg(test)]
+mod switchover_tests {
+    use super::*;
+
+    fn current(epoch: i64) -> ConfigurationDescriptor {
+        ConfigurationDescriptor::new(
+            Epoch::new(7, epoch),
+            ReplicaId::new(1),
+            (1..=3)
+                .map(|id| ConfigurationMember {
+                    identity: ReplicaIdentity {
+                        replica_id: ReplicaId::new(id),
+                        instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+                        agent_generation: AgentGeneration::new(format!("agent-{id}")),
+                    },
+                    role: if id == 1 {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect(),
+            2,
+        )
+    }
+
+    #[test]
+    fn ordinary_switchover_retains_members_and_quorum_across_preparation_and_promotion() {
+        let starting = current(11);
+        let intermediate = switchover_configuration(&starting, starting.primary_id, 1).unwrap();
+        let handoff = switchover_configuration(&starting, ReplicaId::new(2), 1).unwrap();
+        let promoted = switchover_configuration(&starting, ReplicaId::new(2), 2).unwrap();
+        assert_eq!(intermediate.primary_id, starting.primary_id);
+        assert_eq!(handoff.primary_id, ReplicaId::new(2));
+        assert_eq!(promoted.primary_id, ReplicaId::new(2));
+        assert_eq!(intermediate.epoch, Epoch::new(7, 12));
+        assert_eq!(handoff.epoch, Epoch::new(7, 12));
+        assert_eq!(promoted.epoch, Epoch::new(7, 13));
+        for selected in [&intermediate, &handoff, &promoted] {
+            assert_eq!(selected.write_quorum, starting.write_quorum);
+            assert_eq!(
+                selected
+                    .members
+                    .iter()
+                    .map(|member| &member.identity)
+                    .collect::<Vec<_>>(),
+                starting
+                    .members
+                    .iter()
+                    .map(|member| &member.identity)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(selected.configuration_id, selected.expected_id());
+            assert_eq!(
+                selected
+                    .members
+                    .iter()
+                    .filter(|member| member.role == ReplicaRole::Primary)
+                    .map(|member| member.identity.replica_id)
+                    .collect::<Vec<_>>(),
+                [selected.primary_id]
+            );
+        }
+        assert_eq!(starting, current(11));
+    }
+
+    #[test]
+    fn ordinary_switchover_rejects_unadmitted_target_and_epoch_exhaustion() {
+        assert!(switchover_configuration(&current(11), ReplicaId::new(4), 1).is_err());
+        assert!(switchover_configuration(&current(i64::MAX), ReplicaId::new(2), 1).is_err());
+        assert!(switchover_configuration(&current(i64::MAX - 1), ReplicaId::new(2), 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_member_tests {
+    use super::*;
+    use crate::cluster_api::AgentRpcError;
+    use crate::crd::{KubericSet, KubericSetSpec};
+    use k8s_openapi::api::core::v1::{
+        PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Pod, PodSpec, Volume,
+    };
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kuberic_runtime::control::proto;
+    use std::sync::{Arc, Mutex};
+
+    fn storage(id: i64) -> ReplicaStorageIncarnationContext {
+        ReplicaStorageIncarnationContext {
+            replica: ReplicaIdentity {
+                replica_id: ReplicaId::new(id),
+                instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+                agent_generation: AgentGeneration::new(format!("agent-{id}")),
+            },
+            storage: ReplicaStorageIdentity::Persistent {
+                pod_uid: PodUid::new(format!("pod-{id}")),
+                pvc_uid: PvcUid::new(format!("pvc-{id}")),
+            },
+            storage_generation: StorageGeneration::new(format!("storage-{id}")),
+        }
+    }
+
+    fn fixture() -> (
+        ConfigurationDescriptor,
+        KubericSetStatus,
+        ReplicaAgentSnapshot,
+    ) {
+        let resource = ResourceUid::new("retained-controller");
+        let generation = PublicProtocolGeneration::new(1);
+        let initialization = derive_history_initialization_id(&resource, generation);
+        let history = derive_bootstrap_history(&resource, generation, &initialization);
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(history.data_loss_number, 11),
+            ReplicaId::new(1),
+            (1..=3)
+                .map(|id| ConfigurationMember {
+                    identity: storage(id).replica,
+                    role: if id == 1 {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect(),
+            2,
+        );
+        let configuration = ReplicaConfigurationScope {
+            current: current.clone(),
+            previous: None,
+            replicas: current
+                .members
+                .iter()
+                .filter(|member| member.identity.replica_id != ReplicaId::new(2))
+                .map(|member| ReplicaPeerDescription {
+                    identity: member.identity.clone(),
+                    replication_address: format!(
+                        "http://127.0.0.1:{}",
+                        50052 + member.identity.replica_id.value()
+                    ),
+                    process_session_id: ProcessSessionId::new(format!(
+                        "old-{}",
+                        member.identity.replica_id
+                    )),
+                    storage_incarnation: storage(member.identity.replica_id.value()),
+                    role: member.role,
+                    current_progress: 41,
+                    catch_up_capability: 0,
+                    is_up: true,
+                    is_ready: true,
+                    must_catchup: false,
+                })
+                .collect(),
+        };
+        let historical = ReplicaGoal {
+            format: ORDINARY_ACTION_FORMAT,
+            identity: PublicV1Identity::new(1),
+            operation_id: OperationId::new("accepted-secondary"),
+            revision: 4,
+            scope: ReplicaScope {
+                history: history.clone(),
+                storage: storage(2),
+                process_session_id: ProcessSessionId::new("old-2"),
+                creation_id: ReplicatorCreationId::new("old-creation-2"),
+                epoch: current.epoch,
+                configuration,
+            },
+            desired: ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::ActiveSecondary,
+                catch_up: None,
+            },
+        };
+        let observation = ReplicaGoalObservation {
+            goal: historical.clone(),
+            status: ReplicaGoalStatus::Achieved,
+            selected_call: None,
+            receipts: 1,
+        };
+        let mut retained = RetainedReplicaGoal::new(historical.clone()).unwrap();
+        retained.outcome = Some(observation.clone());
+        let sessions = current
+            .members
+            .iter()
+            .map(|member| ProcessSessionEndpoint {
+                identity: member.identity.clone(),
+                storage_incarnation: storage(member.identity.replica_id.value()),
+                process_session_id: ProcessSessionId::new(format!(
+                    "old-{}",
+                    member.identity.replica_id
+                )),
+                replicator_creation_id: ReplicatorCreationId::new(format!(
+                    "old-creation-{}",
+                    member.identity.replica_id
+                )),
+                role: member.role,
+            })
+            .collect::<Vec<_>>();
+        let status = KubericSetStatus {
+            replica_goals: vec![retained],
+            public_v1_topology: Some(
+                PublicV1TopologyState::from_configuration(&current, &sessions).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let peer = ReplicaAgentSnapshot {
+            format: ORDINARY_ACTION_FORMAT,
+            identity: historical.identity.clone(),
+            history,
+            storage: storage(2),
+            open_mode: OpenMode::Existing,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            withdrawn: false,
+            provider_writer_held: false,
+            process_session_id: ProcessSessionId::new("fresh-2"),
+            creation_id: ReplicatorCreationId::new("fresh-creation-2"),
+            publication: None,
+            goals: vec![observation],
+            remote_operations: Vec::new(),
+            progress: ProgressQueryResult::NotQueried("fresh process".into()),
+            capability: ProgressQueryResult::NotQueried("fresh process".into()),
+            accepted_revision_high_watermark: 8,
+            retained_recovery_exit: None,
+            retained_member_qualification: Some(RetainedMemberQualification {
+                predecessor_process_session_id: historical.scope.process_session_id,
+                predecessor_creation_id: historical.scope.creation_id,
+                admitted_operation_id: historical.operation_id,
+                admitted_revision: historical.revision,
+                configuration: current.clone(),
+            }),
+        };
+        (current, status, peer)
+    }
+
+    fn achieved_restore(
+        status: &mut KubericSetStatus,
+        current: &ConfigurationDescriptor,
+        peer: &mut ReplicaAgentSnapshot,
+    ) -> RetainedReplicaGoal {
+        let mut selected = select_retained_restore(status, current, peer)
+            .unwrap()
+            .unwrap();
+        let observation = ReplicaGoalObservation {
+            goal: selected.goal.clone(),
+            status: ReplicaGoalStatus::Achieved,
+            selected_call: None,
+            receipts: 1,
+        };
+        selected.outcome = Some(observation.clone());
+        peer.goals.push(observation);
+        peer.publication = Some(ReplicaPublication {
+            format: ORDINARY_ACTION_FORMAT,
+            scope: selected.goal.scope.clone(),
+            replication_address: "http://127.0.0.1:50054".into(),
+            generation: 1,
+            stage: ReplicaPublicationStage::AchievedScope,
+            role: ReplicaRole::ActiveSecondary,
+        });
+        status.replica_goals.push(selected.clone());
+        selected
+    }
+
+    fn raw(peer: &ReplicaAgentSnapshot) -> RawObservation {
+        let mut set = KubericSet::new(
+            "retained-controller",
+            KubericSetSpec {
+                hosting_format: ORDINARY_ACTION_FORMAT,
+                replicas: 3,
+                image: "test-only".into(),
+                failover_delay_seconds: 1,
+                switchover: None,
+            },
+        );
+        set.metadata.uid = Some(peer.history.resource_uid.to_string());
+        set.metadata.namespace = Some("default".into());
+        RawObservation {
+            set,
+            pods: vec![Pod {
+                metadata: ObjectMeta {
+                    name: Some("member-2".into()),
+                    uid: Some("pod-2".into()),
+                    annotations: Some(BTreeMap::from([(
+                        crate::crd::CONTROL_ADDRESS_ANNOTATION.into(),
+                        "http://127.0.0.1:50051".into(),
+                    )])),
+                    ..Default::default()
+                },
+                spec: Some(PodSpec {
+                    volumes: Some(vec![Volume {
+                        name: "data".into(),
+                        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                            claim_name: "member-2-data".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            pvcs: vec![PersistentVolumeClaim {
+                metadata: ObjectMeta {
+                    name: Some("member-2-data".into()),
+                    uid: Some("pvc-2".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            services: Vec::new(),
+            secrets: Vec::new(),
+            agents: BTreeMap::new(),
+            failures: Vec::new(),
+            now_unix_seconds: 100,
+        }
+    }
+
+    #[test]
+    fn retained_member_selects_direct_restore_without_progress_ready_or_quorum_change() {
+        let (current, status, peer) = fixture();
+        let selected = select_retained_restore(&status, &current, &peer)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            selected.goal.desired,
+            ReplicaGoalKind::RestoreRetainedMember { .. }
+        ));
+        assert_eq!(selected.goal.revision, 9);
+        assert_eq!(selected.goal.scope.storage, peer.storage);
+        assert_eq!(
+            selected.goal.scope.process_session_id,
+            peer.process_session_id
+        );
+        assert_eq!(selected.goal.scope.creation_id, peer.creation_id);
+        assert_eq!(selected.goal.scope.configuration.current, current);
+        assert!(selected.goal.scope.configuration.previous.is_none());
+        for description in &selected.goal.scope.configuration.replicas {
+            assert_eq!(description.current_progress, INVALID_LSN);
+            assert_eq!(description.catch_up_capability, INVALID_LSN);
+            assert!(!description.is_up);
+            assert!(!description.is_ready);
+            assert!(!description.must_catchup);
+        }
+        assert!(peer.publication.is_none());
+        assert!(peer.remote_operations.is_empty());
+        assert!(peer.progress.value().is_none());
+        assert_eq!(status.replica_goals[0].goal.revision, 4);
+        selected.validate().unwrap();
+    }
+
+    #[test]
+    fn retained_member_rejects_missing_crossed_and_unaccepted_historical_qualification() {
+        let (current, status, peer) = fixture();
+        let mut cases = Vec::new();
+        let mut changed = peer.clone();
+        changed.retained_member_qualification = None;
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed
+            .retained_member_qualification
+            .as_mut()
+            .unwrap()
+            .admitted_revision += 1;
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed
+            .retained_member_qualification
+            .as_mut()
+            .unwrap()
+            .admitted_operation_id = OperationId::new("unaccepted");
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed.history.resource_uid = ResourceUid::new("other-history");
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed.storage.storage_generation = StorageGeneration::new("other-generation");
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed.storage.storage = ReplicaStorageIdentity::Persistent {
+            pod_uid: PodUid::new("pod-2"),
+            pvc_uid: PvcUid::new("other-pvc"),
+        };
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed.storage.replica.instance_id = ReplicaInstanceId::new("other-pod");
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed.process_session_id = ProcessSessionId::new("old-2");
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed.creation_id = ReplicatorCreationId::new("old-creation-2");
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed.goals.clear();
+        cases.push(changed);
+        let mut changed = peer.clone();
+        changed
+            .retained_member_qualification
+            .as_mut()
+            .unwrap()
+            .configuration
+            .write_quorum = 1;
+        cases.push(changed);
+        for changed in cases {
+            assert!(
+                select_retained_restore(&status, &current, &changed)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for outcome in [
+            None,
+            Some(ReplicaGoalObservation {
+                status: ReplicaGoalStatus::Failed("sticky historical error".into()),
+                ..peer.goals[0].clone()
+            }),
+        ] {
+            let mut changed = status.clone();
+            changed.replica_goals[0].outcome = outcome;
+            assert!(
+                select_retained_restore(&changed, &current, &peer)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut changed = status.clone();
+        changed.replica_goals[0].goal.scope.configuration.previous = Some(current.clone());
+        assert!(
+            select_retained_restore(&changed, &current, &peer)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = status.clone();
+        changed.public_v1_topology.as_mut().unwrap().sessions[1].process_session_id =
+            ProcessSessionId::new("crossed-predecessor");
+        assert!(
+            select_retained_restore(&changed, &current, &peer)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retained_member_requires_unopened_secondary_and_no_selected_higher_epoch() {
+        let (current, status, peer) = fixture();
+        let selected = select_retained_restore(&status, &current, &peer)
+            .unwrap()
+            .unwrap();
+        let mut changed = peer.clone();
+        changed.publication = Some(ReplicaPublication {
+            format: ORDINARY_ACTION_FORMAT,
+            scope: selected.goal.scope.clone(),
+            replication_address: "http://127.0.0.1:50054".into(),
+            generation: 1,
+            stage: ReplicaPublicationStage::DiscoveryPending,
+            role: ReplicaRole::None,
+        });
+        assert!(
+            select_retained_restore(&status, &current, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.provider_writer_held = true;
+        assert!(
+            select_retained_restore(&status, &current, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.withdrawn = true;
+        assert!(
+            select_retained_restore(&status, &current, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        let mut discover = selected.goal.clone();
+        discover.desired = ReplicaGoalKind::Discover;
+        discover.scope.configuration.replicas.clear();
+        changed.goals.push(ReplicaGoalObservation {
+            goal: discover.clone(),
+            status: ReplicaGoalStatus::Pending,
+            selected_call: None,
+            receipts: 0,
+        });
+        assert!(
+            select_retained_restore(&status, &current, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = status.clone();
+        changed
+            .replica_goals
+            .push(RetainedReplicaGoal::new(discover).unwrap());
+        assert!(
+            select_retained_restore(&changed, &current, &peer)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = status.clone();
+        let mut transition = selected;
+        transition.goal.scope.configuration.current =
+            switchover_configuration(&current, ReplicaId::new(3), 1).unwrap();
+        transition.goal.scope.epoch = transition.goal.scope.configuration.current.epoch;
+        transition.goal.scope.configuration.previous = Some(current.clone());
+        changed.replica_goals.push(transition);
+        assert!(
+            select_retained_restore(&changed, &current, &peer)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.storage = storage(1);
+        changed.process_session_id = ProcessSessionId::new("fresh-1");
+        changed.creation_id = ReplicatorCreationId::new("fresh-creation-1");
+        changed
+            .retained_member_qualification
+            .as_mut()
+            .unwrap()
+            .predecessor_process_session_id = ProcessSessionId::new("old-1");
+        changed
+            .retained_member_qualification
+            .as_mut()
+            .unwrap()
+            .predecessor_creation_id = ReplicatorCreationId::new("old-creation-1");
+        assert!(
+            select_retained_restore(&status, &current, &changed)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer;
+        changed.accepted_revision_high_watermark = u64::MAX;
+        assert!(select_retained_restore(&status, &current, &changed).is_err());
+    }
+
+    #[test]
+    fn retained_member_revalidates_exact_selection_before_effects_and_completion() {
+        let (current, mut status, mut peer) = fixture();
+        let selected = achieved_restore(&mut status, &current, &mut peer);
+        assert!(retained_restore_matches(
+            &status,
+            &current,
+            &peer,
+            &selected.goal
+        ));
+        assert!(retained_restore_achieved(&peer, &selected.goal));
+
+        let mut crossed = selected.goal.clone();
+        crossed.scope.configuration.replicas[0].current_progress = 41;
+        assert!(!retained_restore_matches(
+            &status, &current, &peer, &crossed
+        ));
+        let mut crossed = selected.goal.clone();
+        crossed.scope.configuration.replicas[0].is_ready = true;
+        assert!(!retained_restore_matches(
+            &status, &current, &peer, &crossed
+        ));
+        let mut crossed = selected.goal.clone();
+        crossed.scope.creation_id = ReplicatorCreationId::new("another-creation");
+        assert!(!retained_restore_matches(
+            &status, &current, &peer, &crossed
+        ));
+
+        let mut extra = selected.goal.clone();
+        extra.operation_id = OperationId::new("other-fresh-work");
+        extra.revision += 1;
+        extra.desired = ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::ActiveSecondary,
+            catch_up: None,
+        };
+        let mut changed = peer.clone();
+        changed.goals.push(ReplicaGoalObservation {
+            goal: extra.clone(),
+            status: ReplicaGoalStatus::Pending,
+            selected_call: Some("ReplicatorRole".into()),
+            receipts: 0,
+        });
+        assert!(!retained_restore_matches(
+            &status,
+            &current,
+            &changed,
+            &selected.goal
+        ));
+        let mut changed = status.clone();
+        changed
+            .replica_goals
+            .push(RetainedReplicaGoal::new(extra.clone()).unwrap());
+        assert!(!retained_restore_matches(
+            &changed,
+            &current,
+            &peer,
+            &selected.goal
+        ));
+
+        extra.desired = ReplicaGoalKind::Abort;
+        peer.goals.push(ReplicaGoalObservation {
+            goal: extra,
+            status: ReplicaGoalStatus::Failed("actual terminal join error".into()),
+            selected_call: None,
+            receipts: 0,
+        });
+        assert!(!retained_restore_matches(
+            &status,
+            &current,
+            &peer,
+            &selected.goal
+        ));
+        assert!(!retained_restore_achieved(&peer, &selected.goal));
+    }
+
+    #[test]
+    fn retained_member_requires_the_exact_still_live_pod_and_pvc_mount() {
+        let (_, _, peer) = fixture();
+        let observed = raw(&peer);
+        assert!(retained_storage_present(&observed, &peer));
+        let mut changed = observed.clone();
+        changed.pvcs[0].metadata.uid = Some("other-pvc".into());
+        assert!(!retained_storage_present(&changed, &peer));
+        let mut changed = observed.clone();
+        changed.pods[0].metadata.uid = Some("other-pod".into());
+        assert!(!retained_storage_present(&changed, &peer));
+        let mut changed = observed;
+        changed.pods[0].spec.as_mut().unwrap().volumes = None;
+        assert!(!retained_storage_present(&changed, &peer));
+    }
+
+    #[test]
+    fn retained_member_adopts_only_achieved_exact_sample_and_preserves_old_errors() {
+        let (current, mut status, mut peer) = fixture();
+        let topology = status.public_v1_topology.as_mut().unwrap();
+        topology.unavailable_primary_id = Some(current.primary_id);
+        topology.unavailable_since_unix_seconds = Some(99);
+        topology.completed_switchover_request_id = Some("older-request".into());
+        let selected = achieved_restore(&mut status, &current, &mut peer);
+        let mut old_goal = status.replica_goals[0].goal.clone();
+        old_goal.operation_id = OperationId::new("unrelated-old-error");
+        old_goal.scope.storage = storage(3);
+        old_goal.scope.process_session_id = ProcessSessionId::new("old-3");
+        old_goal.scope.creation_id = ReplicatorCreationId::new("old-creation-3");
+        let description = old_goal
+            .scope
+            .configuration
+            .replicas
+            .iter_mut()
+            .find(|description| description.identity.replica_id == ReplicaId::new(3))
+            .unwrap();
+        description.identity = peer.storage.replica.clone();
+        description.storage_incarnation = peer.storage.clone();
+        description.process_session_id = ProcessSessionId::new("old-2");
+        description.replication_address = "http://127.0.0.1:50054".into();
+        let mut old_error = RetainedReplicaGoal::new(old_goal).unwrap();
+        old_error.outcome = Some(ReplicaGoalObservation {
+            goal: old_error.goal.clone(),
+            status: ReplicaGoalStatus::Uncertain("original unresolved result".into()),
+            selected_call: None,
+            receipts: 0,
+        });
+        status.replica_goals.push(old_error.clone());
+        assert!(
+            adopt_retained_member(&status, &current, &peer, &selected)
+                .unwrap()
+                .is_none()
+        );
+        for unavailable in [
+            ProgressQueryResult::NotQueried("not sampled".into()),
+            ProgressQueryResult::NotReady,
+            ProgressQueryResult::Failed("real query error".into()),
+            ProgressQueryResult::Value(INVALID_LSN),
+        ] {
+            peer.progress = ProgressQueryResult::Value(41);
+            peer.capability = unavailable.clone();
+            assert!(
+                adopt_retained_member(&status, &current, &peer, &selected)
+                    .unwrap()
+                    .is_none()
+            );
+            peer.progress = unavailable;
+            peer.capability = ProgressQueryResult::Value(0);
+            assert!(
+                adopt_retained_member(&status, &current, &peer, &selected)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        peer.progress = ProgressQueryResult::Value(41);
+        peer.capability = ProgressQueryResult::Value(0);
+        let next = adopt_retained_member(&status, &current, &peer, &selected)
+            .unwrap()
+            .unwrap();
+        let mut expected = status.public_v1_topology.clone().unwrap();
+        expected.sessions[1] = endpoint(&peer, ReplicaRole::ActiveSecondary);
+        assert_eq!(next.public_v1_topology.as_ref(), Some(&expected));
+        assert_eq!(expected.configuration().unwrap(), current);
+        assert_eq!(next.replica_goals, status.replica_goals);
+        assert_eq!(next.replica_goals.last(), Some(&old_error));
+        assert_eq!(
+            expected.sessions[0],
+            status.public_v1_topology.as_ref().unwrap().sessions[0]
+        );
+        assert!(peer.remote_operations.is_empty());
+
+        let mut pending = selected.clone();
+        pending.outcome = None;
+        assert!(
+            adopt_retained_member(&status, &current, &peer, &pending)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.publication.as_mut().unwrap().stage = ReplicaPublicationStage::DiscoveryPending;
+        assert!(
+            adopt_retained_member(&status, &current, &changed, &selected)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed
+            .publication
+            .as_mut()
+            .unwrap()
+            .scope
+            .epoch
+            .configuration_number += 1;
+        assert!(
+            adopt_retained_member(&status, &current, &changed, &selected)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.creation_id = ReplicatorCreationId::new("crossed-creation");
+        assert!(
+            adopt_retained_member(&status, &current, &changed, &selected)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.publication.as_mut().unwrap().generation = 0;
+        assert!(
+            adopt_retained_member(&status, &current, &changed, &selected)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.goals.last_mut().unwrap().status =
+            ReplicaGoalStatus::Uncertain("initialization result is not success".into());
+        assert!(
+            adopt_retained_member(&status, &current, &changed, &selected)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer.clone();
+        changed.retained_member_qualification = None;
+        assert!(
+            adopt_retained_member(&status, &current, &changed, &selected)
+                .unwrap()
+                .is_none()
+        );
+        let mut changed = peer;
+        changed.withdrawn = true;
+        assert!(
+            adopt_retained_member(&status, &current, &changed, &selected)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    struct RecoveryAgent {
+        sample: ReplicaAgentSnapshot,
+        request: Mutex<Option<proto::ReplicaSnapshotRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentApi for RecoveryAgent {
+        async fn get_snapshot(
+            &self,
+            endpoint: &str,
+            token: &str,
+            request: proto::ReplicaSnapshotRequest,
+        ) -> std::result::Result<proto::ReplicaSnapshotResponse, AgentRpcError> {
+            assert_eq!(endpoint, "http://127.0.0.1:50051");
+            assert_eq!(token, "controller-test");
+            *self.request.lock().unwrap() = Some(request);
+            Ok(proto::ReplicaSnapshotResponse {
+                protocol_version: ORDINARY_ACTION_FORMAT,
+                canonical_json: serde_json::to_vec(&ReplicaAgentQueryResult::Initialized(
+                    Box::new(self.sample.clone()),
+                ))
+                .unwrap(),
+            })
+        }
+
+        async fn get_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: proto::GetAgentStatusRequest,
+        ) -> std::result::Result<proto::AgentStatusReport, AgentRpcError> {
+            unreachable!("retained restoration uses canonical snapshots")
+        }
+
+        async fn execute(
+            &self,
+            _: &str,
+            _: &str,
+            _: proto::ExecuteCommandRequest,
+        ) -> std::result::Result<proto::ExecuteCommandResponse, AgentRpcError> {
+            unreachable!("retained restoration uses canonical goals")
+        }
+    }
+
+    fn api(sample: ReplicaAgentSnapshot) -> KubeClusterApi<RecoveryAgent> {
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        KubeClusterApi::new(
+            client,
+            Arc::new(RecoveryAgent {
+                sample,
+                request: Mutex::new(None),
+            }),
+            "controller-test",
+            "default",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn retained_member_queries_native_in_achieved_restore_scope_before_adoption() {
+        let (current, mut status, mut peer) = fixture();
+        let selected = achieved_restore(&mut status, &current, &mut peer);
+        let mut actual = peer.clone();
+        actual.progress = ProgressQueryResult::Value(41);
+        actual.capability = ProgressQueryResult::Value(0);
+        let api = api(actual);
+        let sampled = api.sample_recovery(&raw(&peer), &peer).await.unwrap();
+        let request = api.agents.request.lock().unwrap().clone().unwrap();
+        assert!(request.sample_native_progress);
+        assert_eq!(request.protocol_version, ORDINARY_ACTION_FORMAT);
+        assert_eq!(
+            request.expected_process_session_id,
+            peer.process_session_id.as_str()
+        );
+        assert_eq!(request.resource_uid, peer.history.resource_uid.as_str());
+        assert_eq!(request.target, Some(peer.storage.replica.clone().into()));
+        assert_eq!(sampled.publication, peer.publication);
+        assert_eq!(
+            sampled.publication.as_ref().unwrap().scope.epoch,
+            current.epoch
+        );
+        let adopted = adopt_retained_member(&status, &current, &sampled, &selected)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            adopted.public_v1_topology.as_ref().unwrap().sessions[1],
+            endpoint(&peer, ReplicaRole::ActiveSecondary)
+        );
+        assert_eq!(
+            status
+                .public_v1_topology
+                .as_ref()
+                .unwrap()
+                .configuration()
+                .unwrap(),
+            current
+        );
+        assert_eq!(adopted.replica_goals, status.replica_goals);
+    }
+
+    #[tokio::test]
+    async fn retained_member_rejects_crossed_sample_scope_before_adoption() {
+        let (current, mut status, mut peer) = fixture();
+        achieved_restore(&mut status, &current, &mut peer);
+        let mut changed = peer.clone();
+        changed
+            .publication
+            .as_mut()
+            .unwrap()
+            .scope
+            .epoch
+            .configuration_number += 1;
+        let api = api(changed);
+        assert!(matches!(
+            api.sample_recovery(&raw(&peer), &peer).await,
+            Err(ControllerError::ObservationStale)
+        ));
+    }
 }

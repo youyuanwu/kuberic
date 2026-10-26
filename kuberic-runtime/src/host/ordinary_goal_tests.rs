@@ -391,6 +391,179 @@ fn configuration() -> ReplicaConfigurationScope {
     }
 }
 
+fn m3_pair_configuration(
+    fixture: &Fixture,
+    number: i64,
+    primary: i64,
+) -> ReplicaConfigurationScope {
+    let mut storage = fixture.goal.scope.storage.clone();
+    storage.replica = replica(2);
+    storage.storage = ReplicaStorageIdentity::Persistent {
+        pod_uid: PodUid::new("pod-2"),
+        pvc_uid: PvcUid::new("pvc-2"),
+    };
+    storage.storage_generation = StorageGeneration::new("storage-2");
+    ReplicaConfigurationScope {
+        current: ConfigurationDescriptor::new(
+            Epoch::new(0, number),
+            ReplicaId::new(primary),
+            [1, 2]
+                .into_iter()
+                .map(|id| ConfigurationMember {
+                    identity: replica(id),
+                    role: if id == primary {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect(),
+            2,
+        ),
+        previous: None,
+        replicas: vec![ReplicaPeerDescription {
+            identity: replica(2),
+            replication_address: "http://127.0.0.1:20002".into(),
+            process_session_id: ProcessSessionId::new(uuid::Uuid::new_v4().to_string()),
+            storage_incarnation: storage,
+            role: if primary == 2 {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            },
+            current_progress: 1,
+            catch_up_capability: 1,
+            is_up: true,
+            is_ready: true,
+            must_catchup: primary == 2,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn m3_ordinary_primary_recovery_drains_native_all_before_reentering_application_role() {
+    use crate::host::state::PublicInstruction as I;
+    let fixture = Fixture::new(1, false).await;
+    let mut goal = fixture.goal.clone();
+    goal.scope.configuration = m3_pair_configuration(&fixture, 2, 1);
+    goal.scope.configuration.previous = Some(m3_pair_configuration(&fixture, 1, 1).current);
+    goal.scope.epoch = Epoch::new(0, 2);
+    goal.desired = ReplicaGoalKind::Reconfigure {
+        role: ReplicaRole::Primary,
+        catch_up: Some(PublicCatchUpMode::All),
+    };
+    goal.validate().unwrap();
+    let actions = crate::host::public_lifecycle::program::operation_instructions(&goal.intent());
+    assert_eq!(
+        actions,
+        [
+            I::ReplicatorRole,
+            I::ProgramEpoch,
+            I::Configuration,
+            I::FirstCatchUp,
+            I::ApplicationRole,
+        ]
+    );
+    goal.scope.configuration.previous.as_mut().unwrap().epoch = goal.scope.epoch;
+    let ordinary = crate::host::public_lifecycle::program::operation_instructions(&goal.intent());
+    assert_eq!(
+        ordinary[1],
+        I::ApplicationRole,
+        "same-epoch configuration is not retained epoch recovery"
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn m3_ordinary_handoff_freezes_swap_and_revocation_does_not_withdraw_creation() {
+    use crate::host::state::PublicInstruction as I;
+    let fixture = Fixture::new(1, false).await;
+    let mut goal = fixture.goal.clone();
+    goal.scope.configuration = m3_pair_configuration(&fixture, 2, 2);
+    goal.scope.configuration.previous = Some(m3_pair_configuration(&fixture, 1, 1).current);
+    goal.scope.epoch = Epoch::new(0, 2);
+    goal.desired = ReplicaGoalKind::Reconfigure {
+        role: ReplicaRole::ActiveSecondary,
+        catch_up: Some(PublicCatchUpMode::All),
+    };
+    goal.validate().unwrap();
+    let actions = crate::host::public_lifecycle::program::operation_instructions(&goal.intent());
+    assert_eq!(
+        actions,
+        [
+            I::Revoke,
+            I::ProgramEpoch,
+            I::RefreshedConfiguration,
+            I::SecondCatchUp,
+            I::ReplicatorRole,
+            I::ApplicationRole,
+        ]
+    );
+    let PublicOperationProgram::Swap {
+        refreshed, mode, ..
+    } = crate::host::public_lifecycle::program::ordinary_handoff(&goal).unwrap()
+    else {
+        panic!("ordinary handoff must use existing Swap");
+    };
+    assert_eq!(refreshed.current.primary_id, ReplicaId::new(1));
+    assert_eq!(refreshed.current.epoch, goal.scope.epoch);
+    assert_eq!(mode, PublicCatchUpMode::All);
+    assert!(
+        refreshed
+            .replicas
+            .iter()
+            .any(|peer| peer.identity == replica(2) && peer.must_catchup)
+    );
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.achieved(&fixture.goal).await;
+    let callbacks = fixture.runtime.public_lifecycle_callbacks().unwrap();
+    (callbacks.revoke_access)(false).unwrap();
+    assert!(!fixture.runtime.ordinary_withdrawn());
+    (callbacks.revoke_access)(true).unwrap();
+    assert!(fixture.runtime.ordinary_withdrawn());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn m3_primary_refresh_requires_actual_paired_roles_and_current_only_joint_proof() {
+    let fixture = Fixture::new(1, false).await;
+    let mut refresh = fixture.goal.clone();
+    refresh.operation_id = OperationId::new("native-only-primary-refresh");
+    refresh.revision += 1;
+    refresh.desired = ReplicaGoalKind::RefreshPrimary { catch_up: None };
+    let before = fixture.store.load_state().await.unwrap();
+    assert!(fixture.submit(&refresh).await.is_err());
+    assert_eq!(fixture.store.load_state().await.unwrap(), before);
+    assert_eq!(fixture.probe.open_calls.load(Ordering::Acquire), 0);
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.achieved(&fixture.goal).await;
+    refresh.scope.epoch.configuration_number += 1;
+    refresh.scope.configuration.current.epoch = refresh.scope.epoch;
+    refresh.scope.configuration.current.configuration_id =
+        refresh.scope.configuration.current.expected_id();
+    let calls = fixture.probe.role_entered.available_permits();
+    fixture.probe.block_role.store(true, Ordering::Release);
+    fixture.submit(&refresh).await.unwrap();
+    let completed = fixture.achieved(&refresh).await;
+    assert_eq!(fixture.probe.role_entered.available_permits(), calls);
+    assert_eq!(
+        completed.publication.as_ref().unwrap().role,
+        ReplicaRole::Primary
+    );
+    assert_ne!(completed.write_status, AccessStatus::Granted);
+    let mut invalid_final = refresh;
+    invalid_final.revision += 1;
+    invalid_final.operation_id = OperationId::new("missing-joint-proof");
+    invalid_final.desired = ReplicaGoalKind::RefreshPrimary {
+        catch_up: Some(PublicCatchUpMode::WriteQuorum),
+    };
+    let before = fixture.store.load_state().await.unwrap();
+    assert!(fixture.submit(&invalid_final).await.is_err());
+    assert_eq!(fixture.store.load_state().await.unwrap(), before);
+    assert_eq!(fixture.probe.role_entered.available_permits(), calls);
+    fixture.finish().await;
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     store: Arc<SqliteStore>,
@@ -1203,6 +1376,34 @@ async fn ordinary_goal_builtin_factory_opens_actual_engine_listener_and_writer()
 }
 
 #[tokio::test]
+async fn m3_retained_builtin_provenance_comes_from_registered_native_bundle_not_capabilities() {
+    assert_eq!(
+        ORDINARY_ACTION_FORMAT, 19,
+        "requires the coordinated final matched format"
+    );
+    for builtin in [true, false] {
+        let fixture = Fixture::new(1, false).await;
+        fixture
+            .probe
+            .use_default_factory
+            .store(builtin, Ordering::Release);
+        fixture.submit(&fixture.goal).await.unwrap();
+        fixture.achieved(&fixture.goal).await;
+        let state = fixture.store.load_state().await.unwrap();
+        let record = &state.public_v1_operation_state.as_ref().unwrap().operations
+            [&fixture.goal.operation_id];
+        assert_eq!(record.lifecycle.outcomes.iter().any(|outcome| matches!(outcome,
+            crate::host::state::PublicInstructionOutcome::BuiltinNativeEndpoint {
+                process_id, process_lifetime, ..
+            } if *process_id == std::process::id()
+                && process_lifetime == crate::host::ordinary_goal::retained::process_lifetime_id()
+        )), builtin);
+        assert!(record.ordinary.as_ref().unwrap().retained.is_none());
+        fixture.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn ordinary_goal_discovery_and_snapshot_require_authentication_before_mutation() {
     let fixture = Fixture::new(1, true).await;
     fixture.submit(&fixture.goal).await.unwrap();
@@ -1677,6 +1878,7 @@ async fn ordinary_goal_creation_budget_never_reclaims_unaccepted_remote_outcomes
                 logically_retired: false,
                 host_settled: true,
                 ready_admissions: Vec::new(),
+                retained: None,
             }),
             attempt: 1,
             attempt_results: Default::default(),

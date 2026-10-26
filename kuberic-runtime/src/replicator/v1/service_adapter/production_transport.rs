@@ -47,6 +47,10 @@ const CONTROL_HEADER: &str = "kuberic-engine-control";
 const MAX_CONTROL: usize = 64 * 1024;
 pub(super) const ACK_CAPACITY: usize = 48;
 
+#[cfg(test)]
+#[path = "production_replacement_transport_tests.rs"]
+mod replacement_tests;
+
 pub(super) struct Ack {
     pub(super) binding: Binding,
     pub(super) credit: Box<dyn FnOnce() -> Result<()> + Send>,
@@ -58,6 +62,7 @@ struct AckSettlement {
     binding: Binding,
     tasks: TaskTracker,
     failure: Mutex<Option<String>>,
+    local_drain: AtomicBool,
 }
 
 pub(super) fn buffer_limits() -> BufferLimits {
@@ -101,6 +106,9 @@ fn publication_admitted(
         ReplicaPublicationStage::AchievedScope => role,
         ReplicaPublicationStage::DiscoveryPending => !completion && now.role == ReplicaRole::None,
     };
+    if binding.replacement().is_some() {
+        return stage && replacement_scope(now, binding, source);
+    }
     let current = &now.scope.configuration;
     let captured = &origin.scope.configuration;
     let extends = |next: &ConfigurationDescriptor, prior: &ConfigurationDescriptor| {
@@ -144,6 +152,132 @@ fn publication_admitted(
                 && current.previous.as_ref().is_some_and(|previous| {
                     extends(previous, &captured.current) && extends(&current.current, previous)
                 })))
+}
+
+fn replacement_scope(now: &ReplicaPublication, binding: &Binding, source: bool) -> bool {
+    let origin = if source {
+        &binding.source
+    } else {
+        &binding.target
+    };
+    replacement_scope_from(now, binding, origin)
+}
+
+fn replacement_scope_from(
+    now: &ReplicaPublication,
+    binding: &Binding,
+    origin: &ReplicaPublication,
+) -> bool {
+    let Some(old) = binding.replacement() else {
+        return false;
+    };
+    let original = &binding.source.scope.configuration.current;
+    let scope = &now.scope.configuration;
+    if now.validate().is_err()
+        || now.scope.epoch != binding.epoch()
+        || now.scope.history != *binding.history()
+        || Endpoint::publication(now) != Endpoint::publication(origin)
+    {
+        return false;
+    }
+
+    let mut successor = original.clone();
+    let Some(slot) = successor
+        .members
+        .iter_mut()
+        .find(|member| member.identity == old.identity)
+    else {
+        return false;
+    };
+    slot.identity = binding.secondary().identity;
+    successor.configuration_id = successor.expected_id();
+    let mut previous = original.clone();
+    let Some(epoch) = previous.epoch.configuration_number.checked_sub(1) else {
+        return false;
+    };
+    previous.epoch.configuration_number = epoch;
+    previous.configuration_id = previous.expected_id();
+    let initial = scope.current == *original && scope.previous.is_none();
+    let admitted = scope.current == successor
+        && (scope.previous.as_ref() == Some(&previous) || scope.previous.is_none());
+    if (!initial && !admitted)
+        || scope.current.primary_id != binding.primary().identity.replica_id
+        || original.write_quorum <= 1
+    {
+        return false;
+    }
+    scope.replicas.iter().all(|peer| {
+        if peer.identity == old.identity {
+            return peer == &old;
+        }
+        if peer.identity == binding.secondary().identity {
+            return super::engine_session::endpoint_matches_peer(&binding.secondary(), peer)
+                && peer.role == ReplicaRole::ActiveSecondary
+                && !peer.must_catchup;
+        }
+        if peer.identity == binding.primary().identity {
+            return super::engine_session::endpoint_matches_peer(&binding.primary(), peer)
+                && peer.role == ReplicaRole::Primary
+                && !peer.must_catchup;
+        }
+        origin.scope.configuration.replicas.iter().any(|selected| {
+            selected.identity == peer.identity
+                && selected.storage_incarnation == peer.storage_incarnation
+                && selected.process_session_id == peer.process_session_id
+                && selected.replication_address == peer.replication_address
+                && selected.role == peer.role
+                && selected.must_catchup == peer.must_catchup
+        })
+    })
+}
+
+// Healthy peers require actual source confirmation for this bounded shape.
+fn replacement_cohort_shape(now: &ReplicaPublication, binding: &Binding, source: bool) -> bool {
+    let origin = if source {
+        &binding.source
+    } else {
+        &binding.target
+    };
+    let original = &binding.source.scope.configuration.current;
+    let current = &now.scope.configuration.current;
+    if now.validate().is_err()
+        || now.scope.history != *binding.history()
+        || now.scope.epoch != binding.epoch()
+        || Endpoint::publication(now) != Endpoint::publication(origin)
+        || current.epoch != original.epoch
+        || current.primary_id != original.primary_id
+        || current.write_quorum != original.write_quorum
+        || current.members.len() != original.members.len()
+    {
+        return false;
+    }
+    let changed: Vec<_> = original
+        .members
+        .iter()
+        .filter(|member| !current.members.contains(member))
+        .collect();
+    if changed.len() != 1 {
+        return false;
+    }
+    let old = changed[0];
+    if old.role != ReplicaRole::ActiveSecondary
+        || old.identity.replica_id == binding.secondary().identity.replica_id
+        || !current.members.iter().any(|member| {
+            member.identity.replica_id == old.identity.replica_id
+                && member.identity != old.identity
+                && member.role == old.role
+        })
+    {
+        return false;
+    }
+    let mut previous = original.clone();
+    let Some(epoch) = previous.epoch.configuration_number.checked_sub(1) else {
+        return false;
+    };
+    previous.epoch.configuration_number = epoch;
+    previous.configuration_id = previous.expected_id();
+    now.scope.configuration.previous.is_none()
+        || now.scope.configuration.previous.as_ref() == Some(&previous)
 }
 
 fn validate_message_epochs(
@@ -253,6 +387,9 @@ struct Peer {
     carrier: Carrier,
     connecting: AtomicBool,
     incarnation: i64,
+    reformation_boundary: Option<crate::application::Lsn>,
+    initial_ack: Arc<AtomicI64>,
+    fresh_ack: AtomicI64,
     ack_generation: u64,
     ack_owner: Option<uuid::Uuid>,
     current: Arc<AtomicBool>,
@@ -482,6 +619,9 @@ impl Transport {
                     "incarnation": peer.incarnation,
                     "ackOwner": peer.ack_owner.map(|owner| owner.to_string()),
                     "ackGeneration": peer.ack_generation,
+                    "reformationBoundary": peer.reformation_boundary,
+                    "initialNativeAck": peer.initial_ack.load(Ordering::Acquire),
+                    "processedNativeAck": peer.fresh_ack.load(Ordering::Acquire),
                     "owner": Arc::as_ptr(peer) as usize,
                     "current": peer.current.load(Ordering::Acquire),
                 }))
@@ -509,6 +649,11 @@ impl Transport {
     #[cfg(test)]
     pub(super) fn controls_available(&self) -> usize {
         self.controls.available_permits()
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn native_credit_count(&self) -> i64 {
+        self.native_credits.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -668,11 +813,22 @@ impl Transport {
                             settlement,
                             _queued,
                         } = ack;
-                        let outcome = AssertUnwindSafe(owner.credit(&binding, credit))
+                        let outcome = AssertUnwindSafe(owner.credit(&binding, credit, &settlement))
                             .catch_unwind()
                             .await
                             .unwrap_or_else(|_| Err(application("native ACK owner panicked")));
                         if let Err(error) = outcome {
+                            #[cfg(feature = "testing")]
+                            if std::env::var_os("KUBERIC_M3_ELECTION_DIAGNOSTICS").is_some() {
+                                eprintln!("native queued receipt failure: receiver={}, nonce={}, error={error:?}",
+                                    owner.local.identity.instance_id, binding.nonce);
+                            }
+                            tracing::warn!(
+                                receiver = %owner.local.identity.instance_id,
+                                nonce = %binding.nonce,
+                                %error,
+                                "native queued service receipt failed"
+                            );
                             let error = error.to_string();
                             settlement
                                 .failure
@@ -695,16 +851,8 @@ impl Transport {
             .clone()
     }
 
-    pub(super) fn queue_ack(
-        &self,
-        binding: Binding,
-        permit: tokio::sync::mpsc::OwnedPermit<Ack>,
-        credit: Box<dyn FnOnce() -> Result<()> + Send>,
-    ) -> Result<()> {
-        // Caller holds the session effect gate: retirement cannot close this
-        // session's join between registration and enqueue.
-        let settlement = self
-            .ack_settlements
+    fn ack_settlement(&self, binding: &Binding) -> Arc<AckSettlement> {
+        self.ack_settlements
             .lock()
             .unwrap()
             .entry(binding.nonce.clone())
@@ -713,9 +861,21 @@ impl Transport {
                     binding: binding.clone(),
                     tasks: TaskTracker::new(),
                     failure: Mutex::new(None),
+                    local_drain: AtomicBool::new(false),
                 })
             })
-            .clone();
+            .clone()
+    }
+
+    pub(super) fn queue_ack(
+        &self,
+        binding: Binding,
+        permit: tokio::sync::mpsc::OwnedPermit<Ack>,
+        credit: Box<dyn FnOnce() -> Result<()> + Send>,
+    ) -> Result<()> {
+        // Caller holds the session effect gate: retirement cannot close this
+        // session's join between registration and enqueue.
+        let settlement = self.ack_settlement(&binding);
         if settlement.binding != binding || settlement.tasks.is_closed() {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -728,17 +888,128 @@ impl Transport {
         Ok(())
     }
 
+    fn fence_unavailable_receiver(&self, binding: &Binding) -> Result<()> {
+        // This retires a real, copy-completed receiver, never establishes one.
+        // Keep its local native work, but permanently deny this nonce's wire.
+        if self.local != binding.secondary() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let facade = self
+            .facade
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if !matches!(facade.service().target(), Ok(super::Target::Secondary(_))) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let settlement = self.ack_settlement(binding);
+        self.sessions
+            .retire_unavailable_receiver_credit(binding, || {
+                settlement.tasks.close();
+                settlement.local_drain.store(true, Ordering::Release);
+                Ok(())
+            })??;
+        if let Some(peer) = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(&binding.primary().identity.replica_id.value())
+            .filter(|peer| peer.binding == *binding)
+        {
+            peer.current.store(false, Ordering::Release);
+            peer.carrier.shutdown();
+        }
+        Ok(())
+    }
+
+    pub(super) fn local_receiver_drain(&self, binding: &Binding) -> bool {
+        let enabled = self
+            .ack_settlements
+            .lock()
+            .unwrap()
+            .get(&binding.nonce)
+            .is_some_and(|settlement| {
+                settlement.binding == *binding && settlement.local_drain.load(Ordering::Acquire)
+            });
+        enabled
+            && self
+                .sessions
+                .drain_retiring_receiver_credit(binding, || Ok(()))
+                .is_ok()
+    }
+
+    pub(super) fn drain_local_receipt(
+        self: &Arc<Self>,
+        binding: &Binding,
+        credit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        // The native ticket still belongs to this exact retiring receiver.
+        // Caller/duplicate validation precedes this native-failure boundary.
+        if !self.local_receiver_drain(binding) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.sessions.drain_retiring_receiver_credit(binding, || {
+            let facade = self
+                .facade
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or(RuntimeError::Closed)?;
+            if facade.service().aborted.load(Ordering::Acquire) {
+                return Err(RuntimeError::Closed);
+            }
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(credit))
+                .unwrap_or_else(|_| Err(application("native local receipt owner panicked")));
+            if let Err(error) = outcome {
+                let failure = error.to_string();
+                self.ack_settlement(binding)
+                    .failure
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(failure.clone());
+                self.failure.lock().unwrap().get_or_insert(failure.clone());
+                self.spawn(async move { Err(application(failure)) });
+                return Err(error);
+            }
+            #[cfg(feature = "testing")]
+            self.native_credits.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })?
+    }
+
     async fn credit(
         &self,
         binding: &Binding,
         credit: Box<dyn FnOnce() -> Result<()> + Send>,
+        settlement: &AckSettlement,
     ) -> Result<()> {
+        // Catch the callback itself while its session gate is still held.
+        // The outer task catch cannot prevent poisoning that gate on unwind.
+        let credit = || {
+            std::panic::catch_unwind(AssertUnwindSafe(credit))
+                .unwrap_or_else(|_| Err(application("native ACK owner panicked")))
+        };
         #[cfg(feature = "testing")]
         self.test_cut(
             crate::replicator::TestingTcpRouteKind::BeforeCredit,
             binding,
         )
         .await?;
+        if settlement.local_drain.load(Ordering::Acquire) {
+            return match self.sessions.drain_retiring_receiver_credit(binding, || {
+                credit()?;
+                #[cfg(feature = "testing")]
+                self.native_credits.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }) {
+                Ok(result) => result,
+                Err(_) if self.sessions.active(binding).is_err() => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
         if self.sessions.active(binding).is_err() {
             return Ok(());
         }
@@ -751,6 +1022,27 @@ impl Transport {
         }
         .await;
         if let Err(error) = confirmation {
+            if matches!(error, RuntimeError::PeerUnavailable(_))
+                && self.fence_unavailable_receiver(binding).is_ok()
+            {
+                tracing::debug!(
+                    receiver = %self.local.identity.instance_id,
+                    nonce = %binding.nonce,
+                    %error,
+                    "fencing unavailable receiver wire session before local receipt drainage"
+                );
+                let credited = self.sessions.drain_retiring_receiver_credit(binding, || {
+                    credit()?;
+                    #[cfg(feature = "testing")]
+                    self.native_credits.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                });
+                return match credited {
+                    Ok(result) => result,
+                    Err(_) if self.sessions.active(binding).is_err() => Ok(()),
+                    Err(failure) => Err(failure),
+                };
+            }
             if matches!(
                 error,
                 RuntimeError::AuthorityNotAdmitted | RuntimeError::Closed
@@ -839,7 +1131,7 @@ impl Transport {
         let mut stop = self.stop.subscribe();
         loop {
             match self.discover(identity, process, history).await {
-                Err(RuntimeError::ControlPlane(_)) => {
+                Err(RuntimeError::PeerUnavailable(_)) => {
                     tokio::select! {
                         biased;
                         _ = stop.wait_for(|stopped| *stopped) => return Err(RuntimeError::Closed),
@@ -892,7 +1184,165 @@ impl Transport {
     }
 
     pub(super) async fn authorize_completion(&self, binding: &Binding) -> Result<()> {
+        if self.local == binding.primary()
+            && binding.reformation
+            && !self.fresh_reformation_ready(binding)?
+        {
+            return Err(RuntimeError::ProgressNotReady);
+        }
         self.authorize_publications(binding, true).await.map(|_| ())
+    }
+
+    fn fresh_reformation_ready(&self, binding: &Binding) -> Result<bool> {
+        let peer = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|peer| peer.binding == *binding)
+            .cloned()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let Some(boundary) = peer.reformation_boundary else {
+            return Ok(true);
+        };
+        if !peer.current.load(Ordering::Acquire)
+            || peer.fence.check().is_err()
+            || peer.fresh_ack.load(Ordering::Acquire) < boundary
+        {
+            return Ok(false);
+        }
+        let facade = self
+            .facade
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(RuntimeError::Closed)?;
+        let primary = match facade.service().target().map_err(application)? {
+            super::Target::Primary(primary) => primary,
+            _ => return Err(RuntimeError::AuthorityNotAdmitted),
+        };
+        let identity = super::super::session::SessionIdentity {
+            primary_endpoint: peer.route.sender_address.clone(),
+            remote_endpoint: peer.route.remote_address.clone(),
+            remote_incarnation: peer.incarnation,
+        };
+        let native = primary
+            .continuation_session(&peer.route, &identity, binding.epoch())
+            .map_err(application)?;
+        let progress = native.progress(0);
+        Ok(
+            !native.is_processing()
+                && progress.received >= boundary
+                && progress.applied >= boundary,
+        )
+    }
+
+    pub(super) fn reformation_checkpoint(&self, binding: &Binding) -> Result<Arc<AtomicI64>> {
+        self.peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|peer| peer.binding == *binding && peer.reformation_boundary.is_some())
+            .map(|peer| peer.initial_ack.clone())
+            .ok_or(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    fn record_reformation_checkpoint(
+        &self,
+        binding: &Binding,
+        ack: &wire::ReplicationAck,
+    ) -> Result<()> {
+        self.sessions.effect(binding, || {
+            let peer = self
+                .peers
+                .lock()
+                .unwrap()
+                .values()
+                .find(|peer| peer.binding == *binding)
+                .cloned()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            let boundary = peer
+                .reformation_boundary
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if peer.initial_ack.load(Ordering::Acquire) >= 0 {
+                return Ok(());
+            }
+            if ack.error != 0
+                || ack.replication_applied < 0
+                || ack.replication_applied != ack.replication_received
+                || ack.replication_received > boundary
+                || ack.copy_received != -1
+                || ack.copy_applied != -1
+            {
+                return Err(RuntimeError::InvalidReplication(
+                    "invalid fresh receiver checkpoint ACK".into(),
+                ));
+            }
+            match peer.initial_ack.compare_exchange(
+                -1,
+                ack.replication_applied,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => Ok(()),
+                Err(_) => Ok(()),
+            }
+        })?
+    }
+
+    pub(super) fn fresh_reformation_ready_for(&self, incarnation: i64) -> bool {
+        let binding = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|peer| peer.incarnation == incarnation)
+            .map(|peer| peer.binding.clone());
+        binding.is_some_and(|binding| self.fresh_reformation_ready(&binding).unwrap_or(false))
+    }
+
+    pub(super) async fn wait_for_fresh_reformation_ack(&self, binding: &Binding) -> Result<()> {
+        self.wait_for_reformation_ack(binding, true).await
+    }
+
+    pub(super) async fn wait_for_reformation_checkpoint(&self, binding: &Binding) -> Result<()> {
+        self.wait_for_reformation_ack(binding, false).await
+    }
+
+    async fn wait_for_reformation_ack(&self, binding: &Binding, installed: bool) -> Result<()> {
+        let mut stop = self.stop.subscribe();
+        let mut request = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            self.check_health()?;
+            self.authorize(binding).await?;
+            if if installed {
+                self.fresh_reformation_ready(binding)?
+            } else {
+                self.reformation_checkpoint(binding)?
+                    .load(Ordering::Acquire)
+                    >= 0
+            } {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                _ = stop.wait_for(|stopped| *stopped) => return Err(RuntimeError::Closed),
+                _ = request.tick() => {
+                    let route = route(binding, &self.local)?;
+                    self.replication(SendIntent {
+                        identity: super::super::session::SessionIdentity {
+                            primary_endpoint: route.sender_address,
+                            remote_endpoint: route.remote_address,
+                            remote_incarnation: self.native_incarnation(binding)?,
+                        },
+                        kind: SendKind::RequestAck,
+                        expires_after: None,
+                    });
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
     }
 
     // Reports only whether this invocation already obtained source confirmation.
@@ -937,30 +1387,56 @@ impl Transport {
             (true, source, &binding.source),
             (false, target, &binding.target),
         ] {
+            let ordinary_scope = publication_admitted(
+                now,
+                origin,
+                binding,
+                is_source,
+                completion
+                    && !binding.admitted_reconfiguration()
+                    && !(binding.recovery && !is_source),
+            ) && (binding.replacement().is_none()
+                || now.scope.configuration.current == binding.source.scope.configuration.current
+                || self.sessions.completed(binding));
+            let cohort_scope = if !ordinary_scope
+                && binding.replacement().is_none()
+                && !completion
+                && replacement_cohort_shape(now, binding, is_source)
+                && ((now.stage == ReplicaPublicationStage::DiscoveryPending
+                    && now.role == ReplicaRole::None)
+                    || (now.stage == ReplicaPublicationStage::AchievedScope
+                        && now.role
+                            == if is_source {
+                                ReplicaRole::Primary
+                            } else {
+                                ReplicaRole::ActiveSecondary
+                            })) {
+                if primary {
+                    self.sessions
+                        .completed_replacement_for(binding)
+                        .is_some_and(|selected| replacement_scope_from(now, &selected, origin))
+                } else {
+                    if !source_confirmed {
+                        self.control(binding, Control::Confirm).await?;
+                        source_confirmed = true;
+                    }
+                    true
+                }
+            } else {
+                false
+            };
             if Endpoint::publication(now) != Endpoint::publication(origin)
                 || now.scope.history != origin.scope.history
                 || now.scope.epoch != origin.scope.epoch
                 || now.scope.configuration.current.primary_id
                     != binding.primary().identity.replica_id
-                || !publication_admitted(
-                    now,
-                    origin,
-                    binding,
-                    is_source,
-                    completion
-                        && !binding.admitted_reconfiguration()
-                        && !(binding.recovery && !is_source),
-                )
+                || (!ordinary_scope && !cohort_scope)
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
             for peer in &now.scope.configuration.replicas {
                 if primary
                     && origin.scope.configuration.replicas.contains(peer)
-                    && self
-                        .sessions
-                        .binding_for(peer.identity.replica_id.value())
-                        .is_none()
                     && self
                         .production
                         .lock()
@@ -979,7 +1455,7 @@ impl Transport {
                     } else if primary {
                         let session = self
                             .sessions
-                            .binding_for(peer.identity.replica_id.value())
+                            .metadata_for_peer(peer)
                             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
                         // This validates an unrelated configured descriptor, not
                         // that peer's effects/ACKs. Its own admission still checks
@@ -1007,9 +1483,42 @@ impl Transport {
                                     == binding.epoch().data_loss_number
                                 && session.epoch().configuration_number
                                     < binding.epoch().configuration_number;
+                        let continuing_current = peer.role == ReplicaRole::ActiveSecondary
+                            && binding
+                                .source
+                                .scope
+                                .configuration
+                                .replicas
+                                .iter()
+                                .any(|selected| {
+                                    selected.identity == peer.identity
+                                        && selected.storage_incarnation == peer.storage_incarnation
+                                        && selected.process_session_id == peer.process_session_id
+                                        && selected.replication_address == peer.replication_address
+                                        && selected.is_up
+                                        && selected.is_ready
+                                        && selected.role == ReplicaRole::ActiveSecondary
+                                })
+                            && now
+                                .scope
+                                .configuration
+                                .current
+                                .members
+                                .iter()
+                                .any(|member| {
+                                    member.identity == peer.identity
+                                        && member.role == ReplicaRole::ActiveSecondary
+                                })
+                            && self.sessions.retained_completed(&session)
+                            && self.sessions.active(&session).is_err()
+                            && session.epoch().data_loss_number == binding.epoch().data_loss_number
+                            && session.epoch().configuration_number
+                                < binding.epoch().configuration_number;
                         if session.primary() != binding.primary()
                             || session.history() != binding.history()
-                            || (session.epoch() != binding.epoch() && !previous_only)
+                            || (session.epoch() != binding.epoch()
+                                && !previous_only
+                                && !continuing_current)
                         {
                             return Err(RuntimeError::AuthorityNotAdmitted);
                         }
@@ -1073,8 +1582,26 @@ impl Transport {
             let configuration = self.configuration.lock().unwrap();
             let matches = |publication: &ReplicaPublication| {
                 let scope = &publication.scope.configuration;
-                (scope.current == binding.source.scope.configuration.current
-                    && scope.previous == binding.source.scope.configuration.previous)
+                (binding.replacement().is_some()
+                    && replacement_scope(
+                        publication,
+                        binding,
+                        publication.scope.storage == binding.source.scope.storage,
+                    ))
+                    || self
+                        .sessions
+                        .completed_replacement_for(binding)
+                        .is_some_and(|selected| {
+                            let origin =
+                                if publication.scope.storage == binding.source.scope.storage {
+                                    &binding.source
+                                } else {
+                                    &binding.target
+                                };
+                            replacement_scope_from(publication, &selected, origin)
+                        })
+                    || (scope.current == binding.source.scope.configuration.current
+                        && scope.previous == binding.source.scope.configuration.previous)
                     || configuration.as_ref().is_some_and(|(current, previous)| {
                         let selected = &scope.current == current
                             && (&scope.previous == previous || scope.previous.is_none());
@@ -1110,8 +1637,25 @@ impl Transport {
             self.authorize(binding).await
         }
         .await;
-        if result.is_err() {
-            self.quarantine(binding);
+        if let Err(error) = &result {
+            #[cfg(feature = "testing")]
+            if std::env::var_os("KUBERIC_M3_ELECTION_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "native effect confirmation failure: receiver={}, nonce={}, error={error:?}",
+                    self.local.identity.instance_id, binding.nonce
+                );
+            }
+            tracing::warn!(
+                receiver = %self.local.identity.instance_id,
+                nonce = %binding.nonce,
+                %error,
+                "native effect confirmation failed"
+            );
+            if !matches!(error, RuntimeError::PeerUnavailable(_))
+                || self.fence_unavailable_receiver(binding).is_err()
+            {
+                self.quarantine(binding);
+            }
         }
         result
     }
@@ -1136,6 +1680,21 @@ impl Transport {
                 }
             }
         });
+        if self.local == binding.primary() {
+            self.observe_transport_quorum();
+        }
+    }
+
+    pub(super) fn observe_transport_quorum(&self) {
+        let owner = self
+            .production
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            owner.observe_transport_quorum();
+        }
     }
 
     pub(super) async fn effect_future<T>(
@@ -1239,6 +1798,10 @@ impl Transport {
                 Some(Control::Recover | Control::Recovered) => {
                     crate::replicator::TestingTcpRouteKind::EngineConfirm
                 }
+                // Reformation reconnects an initialized receiver without a
+                // copy/Build exchange. Keep its actual carrier dial distinct
+                // from the initial-copy cut and its diagnostic counter.
+                None if binding.reformation => crate::replicator::TestingTcpRouteKind::Replication,
                 None => crate::replicator::TestingTcpRouteKind::Build,
             },
             self.local.identity.instance_id.as_str(),
@@ -1303,7 +1866,7 @@ impl Transport {
                 if retry_connect {
                     RuntimeError::QueueFull
                 } else {
-                    application(error)
+                    RuntimeError::PeerUnavailable(error.to_string())
                 }
             })?;
             let mut client = wire::carrier_client::CarrierClient::new(channel)
@@ -1321,16 +1884,22 @@ impl Transport {
                 {
                     RuntimeError::QueueFull
                 } else if error.code() == tonic::Code::PermissionDenied {
-                    if matches!(command, Control::Recover | Control::Recovered) {
+                    if matches!(
+                        command,
+                        Control::Recover
+                            | Control::Recovered
+                            | Control::CheckReformation
+                            | Control::CheckContinuation
+                    ) {
                         RuntimeError::ControlPlane(format!(
-                            "recovered-member session rejected: {}",
+                            "{command:?} session rejected: {}",
                             error.message()
                         ))
                     } else {
                         RuntimeError::AuthorityNotAdmitted
                     }
                 } else {
-                    application(error)
+                    crate::control::peer_observation_error(error)
                 }
             })?;
             if response
@@ -1345,7 +1914,7 @@ impl Transport {
             let envelope = response
                 .message()
                 .await
-                .map_err(application)?
+                .map_err(crate::control::peer_observation_error)?
                 .ok_or(RuntimeError::AuthorityNotAdmitted)?;
             route.check(&envelope, true).map_err(application)?;
             let Some(wire::envelope::Body::EngineSessionControl(body)) = envelope.body else {
@@ -1355,7 +1924,11 @@ impl Transport {
                 || serde_json::from_slice::<ControlEnvelope>(&body.canonical_json)
                     .map_err(application)?
                     != control
-                || response.message().await.map_err(application)?.is_some()
+                || response
+                    .message()
+                    .await
+                    .map_err(crate::control::peer_observation_error)?
+                    .is_some()
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
@@ -1374,7 +1947,7 @@ impl Transport {
                     if retry_connect {
                         RuntimeError::QueueFull
                     } else {
-                        application("engine session control timed out")
+                        RuntimeError::PeerUnavailable("engine session control timed out".into())
                     }
                 })?
             },
@@ -1414,6 +1987,27 @@ impl Transport {
                     != Some((binding.epoch(), ReplicaRole::ActiveSecondary))
                 {
                     return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                if self.sessions.vacant_receiver() {
+                    let owner = self
+                        .production
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                    owner.retained_receiver_for_reformation(binding)?;
+                    if control.command == Control::CheckReformation {
+                        return Ok(());
+                    }
+                    self.control(binding, Control::Activate).await?;
+                    self.validate_publications(binding).await?;
+                    owner.retained_receiver_for_reformation(binding)?;
+                    self.sessions
+                        .restore_receiver(binding, || owner.bind_retained_receiver(binding))?;
+                    self.sessions.activate_target(binding)?;
+                    self.peer(binding.clone(), false).await?;
+                    return Ok(());
                 }
                 let old = self.sessions.reformation_predecessor(binding)?;
                 let facade = self
@@ -1544,6 +2138,16 @@ impl Transport {
             }
             Control::Reserve if !primary => {
                 self.validate_publications(binding).await?;
+                if self
+                    .production
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|owner| owner.requires_retained_reformation())
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
                 self.sessions.reserve(binding)?;
                 if self.sessions.active(binding).is_ok() {
                     return self.confirm_effect(binding).await;
@@ -1718,6 +2322,25 @@ impl Transport {
                     carrier,
                     connecting: AtomicBool::new(false),
                     incarnation,
+                    reformation_boundary: if self.local == binding.primary() && binding.reformation
+                    {
+                        let facade = self
+                            .facade
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                            .ok_or(RuntimeError::Closed)?;
+                        let primary = match facade.service().target().map_err(application)? {
+                            super::Target::Primary(primary) => primary,
+                            _ => return Err(RuntimeError::AuthorityNotAdmitted),
+                        };
+                        Some(primary.current_progress().map_err(application)?)
+                    } else {
+                        None
+                    },
+                    fresh_ack: AtomicI64::new(-1),
+                    initial_ack: Arc::new(AtomicI64::new(-1)),
                     ack_generation,
                     ack_owner,
                     current: current.clone(),
@@ -1828,10 +2451,49 @@ impl Transport {
                             ) =>
                         {
                             tracing::debug!(replica, "retired native session ACK dropped");
+                            // Before a new source root exists, retain only this
+                            // authenticated new receiver's real native checkpoint.
+                            if binding.reformation
+                                && self.local == binding.primary()
+                                && let Some(wire::envelope::Body::ReplicationAck(ack)) =
+                                    &envelope.body
+                            {
+                                self.record_reformation_checkpoint(&binding, ack)?;
+                            }
                         }
 
                         result => {
-                            result.map_err(application)?;
+                            let outcome = result.map_err(application)?;
+                            if matches!(outcome, super::super::ingress::Disposition::Processed)
+                                && self.local == binding.primary()
+                                && binding.reformation
+                                && let Some(wire::envelope::Body::ReplicationAck(ack)) =
+                                    &envelope.body
+                                && ack.replication_received >= 0
+                                && ack.replication_applied >= 0
+                                && ack.replication_applied <= ack.replication_received
+                            {
+                                if ack.error != 0
+                                    || ack.copy_received != -1
+                                    || ack.copy_applied != -1
+                                {
+                                    return Err(RuntimeError::InvalidReplication(
+                                        "fresh receiver ACK contains copy/error credit".into(),
+                                    ));
+                                }
+                                self.sessions.effect(&binding, || {
+                                    if let Some(peer) = self
+                                        .peers
+                                        .lock()
+                                        .unwrap()
+                                        .values()
+                                        .find(|peer| peer.binding == binding)
+                                    {
+                                        peer.fresh_ack
+                                            .fetch_max(ack.replication_applied, Ordering::AcqRel);
+                                    }
+                                })?;
+                            }
                         }
                     }
                 }
@@ -1944,6 +2606,9 @@ impl Transport {
                 return Ok(());
             }
             if self.authorize(&peer.binding).await.is_err() {
+                if self.local == peer.binding.primary() {
+                    self.quarantine(&peer.binding);
+                }
                 peer.carrier.shutdown();
                 return Ok(());
             }
@@ -1951,7 +2616,12 @@ impl Transport {
                 Some(binding) => binding,
                 None => match peer.carrier.bind() {
                     Ok((binding, _)) => binding,
-                    Err(SendError::Closed) => return Ok(()),
+                    Err(SendError::Closed) => {
+                        if self.local == peer.binding.primary() {
+                            self.quarantine(&peer.binding);
+                        }
+                        return Ok(());
+                    }
                     Err(error) => return Err(application(error)),
                 },
             };
@@ -2025,7 +2695,13 @@ impl Transport {
         match peer.carrier.try_send(route.envelope(body), expires) {
             Ok(()) => true,
             Err(SendError::QueueFull) => false,
-            Err(SendError::Closed | SendError::Transient) => true,
+            Err(SendError::Closed) => {
+                if self.local == peer.binding.primary() {
+                    self.quarantine(&peer.binding);
+                }
+                true
+            }
+            Err(SendError::Transient) => true,
             Err(error) => {
                 tracing::error!(%error, "native outbound representation rejected");
                 self.failure

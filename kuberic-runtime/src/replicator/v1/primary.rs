@@ -57,6 +57,8 @@ use super::sender::SenderConfig;
 use super::session::{AckUpdate, ReplicationSession, SendIntent};
 use super::transport::{ProtocolError, Route, wire};
 
+mod replacement;
+
 pub(super) const FROZEN_PREVIOUS_INCARNATION: i64 = 0;
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -127,6 +129,7 @@ pub(super) struct ReplicaDescriptor {
     pub(super) must_catchup: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct ReplicaConfiguration {
     /// Includes the primary's immediate vote; descriptors exclude the primary.
     pub(super) write_quorum: usize,
@@ -180,6 +183,7 @@ enum Phase {
 struct State {
     phase: Phase,
     bindings: BTreeMap<i64, Binding>,
+    replacement_predecessor: Option<Binding>,
     queued: Vec<BuildIdle>,
     activities: usize,
     aborted: bool,
@@ -191,6 +195,14 @@ struct State {
     queue_policy: QueuePolicyConfig,
     policy_deadline: Duration,
     idle_refreshed_at: Duration,
+}
+
+impl State {
+    fn all_bindings(&self) -> impl Iterator<Item = &Binding> {
+        self.bindings
+            .values()
+            .chain(self.replacement_predecessor.iter())
+    }
 }
 
 struct Root {
@@ -330,6 +342,16 @@ impl Root {
 pub(super) struct PrimaryHandle(Weak<Root>);
 
 impl PrimaryHandle {
+    pub(super) fn current_transport_sessions(
+        &self,
+    ) -> Result<Option<super::replica_manager::TransportQuorumSnapshot>, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        let manager = root.manager.lock().unwrap();
+        manager.check_reported_fault()?;
+        Ok(manager.current_transport_sessions())
+    }
     pub(super) fn continuation_session(
         &self,
         route: &Route,
@@ -450,6 +472,9 @@ impl PrimaryHandle {
         configuration: EstablishedConfiguration,
         routes: Vec<Route>,
     ) -> Result<ManagerEffects, PrimaryError> {
+        if state.replacement_predecessor.is_some() {
+            return Self::install_replacement_configuration(root, state, configuration, routes);
+        }
         let mut supplied = BTreeMap::new();
         for route in routes {
             root.check_route(&route)?;
@@ -532,7 +557,7 @@ impl PrimaryHandle {
                 return Err(PrimaryError::InvalidCurrentQuorum);
             }
             let mut created = BTreeMap::<i64, (Route, ReplicationSession)>::new();
-            let mut routes = BTreeMap::new();
+            let mut routes = Vec::new();
             let mut promotions = Vec::new();
             let manager = root.manager.lock().unwrap();
             if let Some(fault) = manager.build_fault() {
@@ -550,8 +575,16 @@ impl PrimaryHandle {
                     root.check_route(&replica.route)?;
                     let id = replica.route.destination.replica;
                     let frozen_previous = replica.remote_incarnation == FROZEN_PREVIOUS_INCARNATION;
+                    let selected_cold_source =
+                        state.replacement_predecessor.as_ref().is_some_and(|old| {
+                            replacement::same_route(&old.route, &replica.route)
+                                && old.session.identity().remote_incarnation
+                                    == FROZEN_PREVIOUS_INCARNATION
+                        });
                     if frozen_previous
-                        && (is_current || replica.progress.is_some() || replica.must_catchup)
+                        && ((is_current && !selected_cold_source)
+                            || replica.progress.is_some()
+                            || replica.must_catchup)
                     {
                         return Err(PrimaryError::InvalidBinding(id));
                     }
@@ -569,7 +602,25 @@ impl PrimaryHandle {
                     }
                     // Native configuration lookup is ID-based. An existing root
                     // retains its bound endpoint, incarnation, callback and ACKs.
-                    let (route, session) = if let Some(binding) = state.bindings.get(&id) {
+                    let replacement_binding = state
+                        .replacement_predecessor
+                        .as_ref()
+                        .filter(|old| old.route.destination.replica == id)
+                        .map(|old| {
+                            let candidates = [&state.bindings[&id], old];
+                            candidates
+                                .into_iter()
+                                .find(|binding| {
+                                    replacement::same_route(&binding.route, &replica.route)
+                                        && binding.session.identity().remote_incarnation
+                                            == replica.remote_incarnation
+                                })
+                                .ok_or(PrimaryError::InvalidBinding(id))
+                        })
+                        .transpose()?;
+                    let (route, session) = if let Some(binding) = replacement_binding {
+                        (binding.route.clone(), binding.session.clone())
+                    } else if let Some(binding) = state.bindings.get(&id) {
                         if is_current
                             && binding.session.identity().remote_incarnation
                                 == FROZEN_PREVIOUS_INCARNATION
@@ -600,7 +651,12 @@ impl PrimaryHandle {
                     if is_current && manager.has_idle_membership(id) {
                         promotions.push(session.clone());
                     }
-                    routes.insert(id, route);
+                    if !routes
+                        .iter()
+                        .any(|known| replacement::same_route(known, &route))
+                    {
+                        routes.push(route);
+                    }
                     members.push(SessionMember {
                         replica_id: id,
                         session,
@@ -623,7 +679,7 @@ impl PrimaryHandle {
                     previous,
                     catchup_configuration,
                 },
-                routes.into_values().collect(),
+                routes,
             )?;
             for session in promotions {
                 session.promote_to_active_secondary(root.clock.now());
@@ -700,7 +756,8 @@ impl PrimaryHandle {
                 .bindings
                 .get(&route.destination.replica)
                 .ok_or(PrimaryError::UnknownSession(route.destination.replica))?;
-            if old.idle
+            if state.replacement_predecessor.is_some()
+                || old.idle
                 || match &old.owner {
                     SessionOwner::Build(build) => {
                         !build.result().is_some_and(|end| end.result.is_ok())
@@ -882,11 +939,25 @@ impl PrimaryHandle {
                 .as_ref()
                 .ok_or(ProtocolError::Missing("source"))?
                 .replica;
-            let binding = state
+            let selected = state
                 .bindings
                 .get(&id)
-                .ok_or(PrimaryError::UnknownSession(id))?
-                .clone();
+                .ok_or(PrimaryError::UnknownSession(id))?;
+            let mut matching = state.all_bindings().filter(|binding| {
+                binding.route.destination.replica == id
+                    && binding.route.check(envelope, true).is_ok()
+            });
+            let binding = match matching.next() {
+                Some(binding) => binding.clone(),
+                None => {
+                    selected.route.check(envelope, true)?;
+                    return Err(PrimaryError::InvalidBinding(id));
+                }
+            };
+            if matching.next().is_some() {
+                return Err(PrimaryError::InvalidBinding(id));
+            }
+            drop(matching);
             if binding.session.identity().remote_incarnation == FROZEN_PREVIOUS_INCARNATION {
                 return Err(PrimaryError::InvalidBinding(id));
             }
@@ -1100,6 +1171,7 @@ impl Primary {
                 state: Mutex::new(State {
                     phase: Phase::Open,
                     bindings: BTreeMap::new(),
+                    replacement_predecessor: None,
                     queued: Vec::new(),
                     activities: 0,
                     aborted: false,
@@ -1204,7 +1276,7 @@ impl Primary {
         // Release removed roots outside serialization; their providers may own destructors.
         let retained = std::mem::take(&mut self.retained);
         let (keep, removed): (Vec<_>, Vec<_>) = retained.into_iter().partition(|build| {
-            state.bindings.values().any(|binding| match &binding.owner {
+            state.all_bindings().any(|binding| match &binding.owner {
                 SessionOwner::Build(handle) => handle.same_instance(&build.handle()),
                 SessionOwner::Established(_) => false,
             })
@@ -1294,8 +1366,7 @@ impl Primary {
                                 old.min(state.policy_deadline)
                             }));
                         for binding in state
-                            .bindings
-                            .values()
+                            .all_bindings()
                             .filter(|binding| binding.drives_replication_timer())
                         {
                             if let Some(next) = binding.session.retry_deadline() {
@@ -1336,11 +1407,11 @@ impl Primary {
                     let selected = {
                         let mut state = root.state.lock().unwrap();
                         if matches!(state.phase, Phase::Open | Phase::PreClose(_)) {
-                            let batches: Vec<_> = state.bindings.values()
+                            let batches: Vec<_> = state.all_bindings()
                                 .filter(|binding| binding.drives_replication_timer())
                                 .filter(|binding| binding.session.retry_deadline().is_some_and(|due| due <= root.clock.now()))
                                 .map(|binding| binding.session.on_timer(root.clock.now())).collect();
-                            let faults: Vec<_> = state.bindings.values()
+                            let faults: Vec<_> = state.all_bindings()
                                 .filter(|binding| binding.drives_replication_timer())
                                 .filter_map(|binding| binding.session.on_fault_timer(root.clock.now()))
                                 .collect();

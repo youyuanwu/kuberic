@@ -48,6 +48,30 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                 "replacement operation key differs from its intent".into(),
             ));
         }
+        for outcome in &operation.lifecycle.outcomes {
+            if let PublicInstructionOutcome::RecoveryExitRequired(notice) = outcome {
+                if &notice.fault_operation_id != operation_id {
+                    return Err(crate::host::HostError::Corrupt(
+                        "recovery cause is attached to another operation".into(),
+                    ));
+                }
+                if operation.containment != PublicOperationContainment::Pending {
+                    return Err(crate::host::HostError::Corrupt(
+                        "recovery exit notice cannot certify successful Cleanup".into(),
+                    ));
+                }
+                super::ordinary_goal::retained::validate_persisted_notice(state, notice)
+                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            }
+            if let PublicInstructionOutcome::RetainedNativeInitialized(scope) = outcome
+                && operation.intent.goal().is_none_or(|goal| {
+                    !matches!(goal.desired, crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. })
+                        || scope.as_ref() != &goal.scope
+                })
+            {
+                return Err(crate::host::HostError::Corrupt("native retained receipt is outside its exact restoration".into()));
+            }
+        }
         if let Some(goal) = operation.intent.goal() {
             let ordinary = operation.ordinary.as_ref().ok_or_else(|| {
                 crate::host::HostError::Corrupt("semantic goal lacks frozen local actions".into())
@@ -82,6 +106,7 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                         goal.desired,
                         crate::protocol::public_operations::ReplicaGoalKind::Discover
                             | crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
+                            | crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }
                     )
                 || (!tombstone && ordinary.actions != expected)
                 || operation.lifecycle.outcomes.len() > ordinary.actions.len()
@@ -97,6 +122,17 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
             }
             super::ordinary_goal::validate_frozen_admissions(state, operation)
                 .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            if matches!(
+                goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }
+            ) {
+                super::ordinary_goal::retained::validate_persisted_receipt(state, operation)
+                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            } else if ordinary.retained.is_some() {
+                return Err(crate::host::HostError::Corrupt(
+                    "retained custody attached to another recipe".into(),
+                ));
+            }
         } else if operation.ordinary.is_some() {
             return Err(crate::host::HostError::Corrupt(
                 "ordinary actions lack their canonical goal".into(),
@@ -223,6 +259,7 @@ pub(crate) struct SqliteStore {
     path: PathBuf,
     connection: Mutex<Connection>,
     process_storage: Mutex<Option<Vec<File>>>,
+    process_owner: Mutex<Option<crate::protocol::types::ProcessSessionId>>,
 }
 
 impl Drop for SqliteStore {
@@ -236,6 +273,47 @@ impl Drop for SqliteStore {
 }
 
 impl SqliteStore {
+    pub(crate) fn bind_process_owner(
+        &self,
+        process: &crate::protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        let custody = self.process_storage.lock().unwrap();
+        let mut owner = self.process_owner.lock().unwrap();
+        if process.is_empty()
+            || custody.as_ref().is_none_or(Vec::is_empty)
+            || owner.as_ref().is_some_and(|old| old != process)
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "process binding requires actual exclusive storage lifetime ownership".into(),
+            ));
+        }
+        *owner = Some(process.clone());
+        Ok(())
+    }
+
+    fn owns_process(&self, process: &crate::protocol::types::ProcessSessionId) -> bool {
+        self.process_storage
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|files| !files.is_empty())
+            && self.process_owner.lock().unwrap().as_ref() == Some(process)
+    }
+
+    pub(crate) fn read_retained_recovery_state(path: &Path) -> Result<AgentState> {
+        classify_replacement_format(path)?;
+        let connection = open_read_only_connection_with_immutable(path, false)?;
+        let state = load_state_from_connection(&connection)?;
+        if state.identity.schema_version != PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION {
+            return Err(crate::host::HostError::SchemaMismatch {
+                expected: PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
+                observed: state.identity.schema_version,
+            });
+        }
+        validate_public_v1_state(&state)?;
+        Ok(state)
+    }
+
     pub(crate) fn release_process_storage(&self) {
         self.process_storage.lock().unwrap().take();
     }
@@ -341,6 +419,7 @@ impl SqliteStore {
                 path: path.clone(),
                 connection: Mutex::new(connection),
                 process_storage: Mutex::new(None),
+                process_owner: Mutex::new(None),
             })
         })();
         if result.is_err() {
@@ -378,6 +457,7 @@ impl SqliteStore {
             path,
             connection: Mutex::new(connection),
             process_storage: Mutex::new(None),
+            process_owner: Mutex::new(None),
         })
     }
 
@@ -406,6 +486,7 @@ impl SqliteStore {
             path,
             connection: Mutex::new(connection),
             process_storage: Mutex::new(None),
+            process_owner: Mutex::new(None),
         })
     }
 
@@ -463,6 +544,7 @@ impl SqliteStore {
             path,
             connection: Mutex::new(connection),
             process_storage: Mutex::new(Some(process_storage)),
+            process_owner: Mutex::new(None),
         })
     }
 
@@ -754,7 +836,50 @@ impl AgentStore for SqliteStore {
             let mut state = load_state_from_connection(transaction)?;
             let local_identity = state.identity.local_identity.clone();
             super::public_action_state::validate(&state, intent)?;
-            let ordinary = intent.goal().map(|goal| super::ordinary_goal::freeze(&state, goal)).transpose()?;
+            let mut ordinary = intent.goal().map(|goal| super::ordinary_goal::freeze(&state, goal)).transpose()?;
+            let restoring = intent.goal().is_some_and(|goal| matches!(goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }));
+            if restoring {
+                let goal = intent.goal().unwrap();
+                let (old_pid, old_lifetime) = super::ordinary_goal::retained::validate_restore(&state, goal)?;
+                if !self.owns_process(&intent.process_session_id)
+                    || old_lifetime == super::ordinary_goal::retained::process_lifetime_id()
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "retained restoration requires a different real process with reacquired exact storage locks".into(),
+                    ));
+                }
+                if state.public_v1_operation_state.as_ref().is_some_and(|preview|
+                    preview.operations.contains_key(&intent.operation_id))
+                {
+                    let existing = state.public_v1_operation_state.as_ref().unwrap()
+                        .operations.get(&intent.operation_id).unwrap();
+                    super::ordinary_goal::retained::validate_receipt(&state, existing)?;
+                } else {
+                    let crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { qualification }
+                        = &goal.desired else { unreachable!() };
+                    ordinary.as_mut().unwrap().retained = Some(super::state::RetainedMemberReceipt {
+                        qualification: qualification.as_ref().clone(),
+                        successor_process: goal.scope.process_session_id.clone(),
+                        successor_creation: goal.scope.creation_id.clone(),
+                        owner_process_id: std::process::id(),
+                        predecessor_process_id: old_pid,
+                        predecessor_process_lifetime: old_lifetime,
+                        owner_process_lifetime: super::ordinary_goal::retained::process_lifetime_id().to_owned(),
+                    });
+                }
+            }
+            let recovery_cause = self.owns_process(&intent.process_session_id)
+                .then(|| super::ordinary_goal::retained::recovery_cause(&state, intent, std::process::id()))
+                .flatten();
+            let retained_lineage = super::ordinary_goal::retained::restored_process(&state, &intent.process_session_id);
+            let physically_superseded = if restoring {
+                state.public_v1_operation_state.as_ref().unwrap().operations.values()
+                    .filter(|record| super::ordinary_goal::retained::supersedes_fault(
+                        &state, intent.goal().unwrap(), record))
+                    .map(|record| record.intent.operation_id.clone())
+                    .collect::<Vec<_>>()
+            } else { Vec::new() };
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
@@ -792,6 +917,7 @@ impl AgentStore for SqliteStore {
 
             if intent.goal().is_some()
                 && preview.terminal
+                && !restoring && !retained_lineage
                 && !super::ordinary_goal::terminal_for_process(preview, &intent.process_session_id)
             {
                 preview.terminal = false;
@@ -885,12 +1011,12 @@ impl AgentStore for SqliteStore {
                         && preview.history.as_ref() == Some(&goal.scope.history)
                         && preview.storage_incarnation.as_ref() == Some(&goal.scope.storage)
                 });
-                if !renewal_authorized && !fresh_ordinary_open {
+                if !renewal_authorized && !fresh_ordinary_open && !restoring {
                     return Err(crate::host::HostError::IdentityMismatch(
                         "fresh session cannot resume predecessor public operations".into(),
                     ));
                 }
-                if !fresh_ordinary_open {
+                if !fresh_ordinary_open && !restoring {
                 preview.operations.clear();
                 preview.current_operation = None;
                 preview.current_topology_operation = None;
@@ -1292,9 +1418,20 @@ impl AgentStore for SqliteStore {
                         "public-operation blocker {blocker} is unknown"
                     )));
                 };
-                if record.stage != PublicOperationStage::Completed {
+                if record.stage != PublicOperationStage::Completed && !physically_superseded.contains(blocker) {
                     exact_blockers.insert(blocker.clone());
                 }
+            }
+            for id in &physically_superseded {
+                let predecessor = preview.operations.get_mut(id).unwrap();
+                if predecessor.superseded_by.as_ref().is_some_and(|existing| existing != &intent.operation_id) {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "excluded predecessor already has another scoped successor".into(),
+                    ));
+                }
+                predecessor.superseded_by = Some(intent.operation_id.clone());
+                // Physical custody settles this dependency, never the old
+                // disposition, lifecycle, Cleanup outcome or containment.
             }
             for operation_id in superseded {
                 let blocked = preview.operations.get_mut(operation_id).ok_or_else(|| {
@@ -1328,10 +1465,19 @@ impl AgentStore for SqliteStore {
                 accepted_storage: preview.storage_incarnation.clone(),
                 stage,
                 disposition: None,
-                containment: PublicOperationContainment::NotRequired,
+                containment: if recovery_cause.is_some() {
+                    PublicOperationContainment::Pending
+                } else {
+                    PublicOperationContainment::NotRequired
+                },
                 superseded_by: None,
                 blockers: exact_blockers,
-                lifecycle: Default::default(),
+                lifecycle: super::state::PublicLifecycleRecord {
+                    in_flight: None,
+                    outcomes: recovery_cause.into_iter()
+                        .map(|notice| PublicInstructionOutcome::RecoveryExitRequired(Box::new(notice)))
+                        .collect(),
+                },
             };
             preview
                 .operations
@@ -1616,6 +1762,21 @@ impl AgentStore for SqliteStore {
                 )));
             }
             let mut state = load_state_from_connection(transaction)?;
+            if matches!(next, PublicOperationStage::CallbackApplied | PublicOperationStage::Completed)
+                && let Some(record) = state.public_v1_operation_state.as_ref()
+                    .and_then(|preview| preview.operations.get(operation_id))
+                && record.intent.goal().is_some_and(|goal| matches!(goal.desired,
+                    crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }))
+                && (disposition == Some(PublicOperationDisposition::Succeeded)
+                    || (disposition.is_none() && record.disposition == Some(PublicOperationDisposition::Succeeded)))
+            {
+                super::ordinary_goal::retained::validate_receipt(&state, record)?;
+                if !self.owns_process(expected_process_session) {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "retained completion lost exclusive physical custody".into(),
+                    ));
+                }
+            }
             let contained_transient_reopen = next == PublicOperationStage::Completed
                 && disposition == Some(PublicOperationDisposition::Succeeded)
                 && state.public_v1_operation_state.as_ref()
@@ -1688,6 +1849,9 @@ impl AgentStore for SqliteStore {
             }
             record.containment = match next {
                 PublicOperationStage::ContainmentPending => PublicOperationContainment::Pending,
+                PublicOperationStage::Completed if record.lifecycle.outcomes.iter().any(|outcome| {
+                    matches!(outcome, PublicInstructionOutcome::RecoveryExitRequired(_))
+                }) => record.containment,
                 PublicOperationStage::Completed => PublicOperationContainment::Complete,
                 _ => record.containment,
             };
@@ -2003,7 +2167,54 @@ impl AgentStore for SqliteStore {
     ) -> Result<()> {
         use crate::host::state::{DataLossOutcome, PublicInstruction, PublicInstructionOutcome};
         self.with_transaction(|transaction| {
+            let mut outcome = outcome;
+            if let Some(PublicInstructionOutcome::BuiltinNativeEndpoint {
+                process_id, process_lifetime, storage_owner, ..
+            }) = outcome.as_mut() {
+                if *process_id != std::process::id()
+                    || process_lifetime.as_str() != super::ordinary_goal::retained::process_lifetime_id()
+                {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "builtin native registration returned from another physical process".into(),
+                    ));
+                }
+                // Never trust an input custody claim. Only the actual process
+                // store owner can attach its own independently held locks.
+                *storage_owner = self.owns_process(&intent.process_session_id)
+                    .then(|| intent.process_session_id.clone());
+            }
             let mut state = load_state_from_connection(transaction)?;
+            if let Some(goal) = intent.goal().filter(|goal| matches!(goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }))
+            {
+                let record = state.public_v1_operation_state.as_ref()
+                    .and_then(|preview| preview.operations.get(&intent.operation_id))
+                    .ok_or_else(|| crate::host::HostError::CommandRejected("restoration record disappeared".into()))?;
+                super::ordinary_goal::retained::validate_receipt(&state, record)?;
+                if !self.owns_process(&goal.scope.process_session_id) {
+                    return Err(crate::host::HostError::CommandRejected("restoration lost physical storage custody".into()));
+                }
+                if matches!(instruction, PublicInstruction::ApplicationRole)
+                    && !record.lifecycle.outcomes.iter().any(|outcome| matches!(outcome,
+                        PublicInstructionOutcome::RetainedNativeInitialized(scope) if scope.as_ref() == &goal.scope))
+                {
+                    return Err(crate::host::HostError::CommandRejected("retained application role precedes actual native initialization".into()));
+                }
+                if matches!(instruction, PublicInstruction::ReplicatorRole)
+                    && outcome.as_ref().is_some_and(|outcome| !matches!(outcome,
+                        PublicInstructionOutcome::RetainedNativeInitialized(scope) if scope.as_ref() == &goal.scope))
+                {
+                    return Err(crate::host::HostError::CommandRejected("retained role lacks actual native initialization receipt".into()));
+                }
+            }
+            if let Some(PublicInstructionOutcome::RetainedNativeInitialized(scope)) = &outcome
+                && intent.goal().is_none_or(|goal| {
+                    !matches!(goal.desired, crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. })
+                        || scope.as_ref() != &goal.scope
+                })
+            {
+                return Err(crate::host::HostError::CommandRejected("native retained receipt is outside its selected restoration".into()));
+            }
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("replacement store required".into())
             })?;
@@ -2103,11 +2314,14 @@ impl AgentStore for SqliteStore {
                         ) => true,
                         (
                             PublicInstruction::ReplicatorOpen,
-                            PublicInstructionOutcome::Endpoint(_),
+                            PublicInstructionOutcome::Endpoint(_)
+                                | PublicInstructionOutcome::BuiltinNativeEndpoint { .. },
                         )
                         | (PublicInstruction::Progress, PublicInstructionOutcome::Progress(_)) => {
                             true
                         }
+                        (PublicInstruction::ReplicatorRole,
+                            PublicInstructionOutcome::RetainedNativeInitialized(_)) => true,
                         (
                             PublicInstruction::ReplicatorClose,
                             PublicInstructionOutcome::CloseFailure {
@@ -2744,6 +2958,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn m3_retained_process_binding_requires_real_locked_open_not_metadata_or_uuid() {
+        use crate::protocol::public_operations::StatePersistence;
+        use crate::protocol::types::ProcessSessionId;
+        let root = crate::host::tests::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(root.path());
+        let binding = PublicV1LifecycleBinding {
+            identity: PublicV1Identity::new(1),
+            resource_uid: identity().resource_uid,
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let metadata = SqliteStore::create_replacement_authorized(
+            &path,
+            AgentState::new(identity()),
+            binding.clone(),
+        )
+        .unwrap();
+        let process = ProcessSessionId::new("process-owner");
+        assert!(metadata.bind_process_owner(&process).is_err());
+        assert!(!metadata.owns_process(&process));
+        drop(metadata);
+        let observed = crate::host::provisioning::ObservedStorageIdentity {
+            resource_uid: identity().resource_uid,
+            pod_uid: identity().pod_uid,
+            pvc_uid: identity().pvc_uid,
+            instance_id: identity().local_identity.instance_id,
+        };
+        let owner = SqliteStore::open_replacement_for_process(
+            &path,
+            &observed,
+            identity().local_identity.replica_id,
+            None,
+            &binding,
+        )
+        .unwrap();
+        owner.bind_process_owner(&process).unwrap();
+        assert!(owner.owns_process(&process));
+        assert!(
+            owner
+                .bind_process_owner(&ProcessSessionId::new("new-uuid"))
+                .is_err()
+        );
+        assert!(!owner.owns_process(&ProcessSessionId::new("new-uuid")));
+        assert!(
+            SqliteStore::open_replacement_for_process(
+                &path,
+                &observed,
+                identity().local_identity.replica_id,
+                None,
+                &binding,
+            )
+            .is_err()
+        );
+        owner.release_process_storage();
+        assert!(!owner.owns_process(&process));
+        assert!(owner.bind_process_owner(&process).is_err());
+    }
+
+    #[test]
+    fn m3_retained_final19_rejects18_readonly_cause_without_mutation() {
+        use crate::protocol::public_operations::StatePersistence;
+        assert_eq!(
+            PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 19,
+            "requires coordinated matched format"
+        );
+        let root = crate::host::tests::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(root.path());
+        let binding = PublicV1LifecycleBinding {
+            identity: PublicV1Identity::new(1),
+            resource_uid: identity().resource_uid,
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let store =
+            SqliteStore::create_replacement_authorized(&path, AgentState::new(identity()), binding)
+                .unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 18).unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+        assert!(SqliteStore::read_retained_recovery_state(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("owner").exists());
+    }
+
     #[tokio::test]
     async fn ordinary_store_reopen_retains_exact_history_and_storage() {
         use crate::protocol::public_operations::*;
@@ -2795,79 +3096,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m3_predecessor_format_16_rejects_before_retained_data_or_metadata_mutation() {
+    async fn m3_predecessor_formats_16_17_and_18_reject_before_retained_data_or_metadata_mutation()
+    {
         use crate::protocol::public_operations::*;
-        let directory = crate::host::tests::tempdir().unwrap();
-        let path = SqliteStore::metadata_database_path(directory.path());
-        let application = directory.path().join("acknowledged-application-data");
-        std::fs::write(&application, b"acknowledged-prefix-and-history").unwrap();
-        let binding = PublicV1LifecycleBinding {
-            identity: PublicV1Identity::new(1),
-            resource_uid: identity().resource_uid,
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let store = SqliteStore::create_replacement_authorized(
-            &path,
-            AgentState::new(identity()),
-            binding.clone(),
-        )
-        .unwrap();
-        let mut state = store.load_state().await.unwrap();
-        drop(store);
-        state.identity.schema_version = 16;
-        state
-            .public_v1_operation_state
-            .as_mut()
-            .unwrap()
-            .identity
-            .protocol_version = 16;
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
-                [serde_json::to_string(&state).unwrap()],
+        for predecessor in [16, 17, 18] {
+            let directory = crate::host::tests::tempdir().unwrap();
+            let path = SqliteStore::metadata_database_path(directory.path());
+            let application = directory.path().join("acknowledged-application-data");
+            std::fs::write(&application, b"acknowledged-prefix-and-history").unwrap();
+            let binding = PublicV1LifecycleBinding {
+                identity: PublicV1Identity::new(1),
+                resource_uid: identity().resource_uid,
+                spec_generation: 1,
+                state_persistence: StatePersistence::Persisted,
+            };
+            let store = SqliteStore::create_replacement_authorized(
+                &path,
+                AgentState::new(identity()),
+                binding.clone(),
             )
             .unwrap();
-        connection.pragma_update(None, "user_version", 16).unwrap();
-        drop(connection);
-        let before_database = std::fs::read(&path).unwrap();
-        let before_application = std::fs::read(&application).unwrap();
-        let before_names = std::fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<std::collections::BTreeSet<_>>();
-        for _ in 0..2 {
-            assert!(
-                SqliteStore::open_replacement_bound_existing(&path, Some(&identity()), &binding)
-                    .is_err()
-            );
-            let observed = crate::host::provisioning::ObservedStorageIdentity {
-                resource_uid: identity().resource_uid,
-                pod_uid: identity().pod_uid,
-                pvc_uid: identity().pvc_uid,
-                instance_id: identity().local_identity.instance_id,
-            };
-            assert!(
-                SqliteStore::open_replacement_for_process(
-                    &path,
-                    &observed,
-                    identity().local_identity.replica_id,
-                    None,
-                    &binding,
+            let mut state = store.load_state().await.unwrap();
+            drop(store);
+            state.identity.schema_version = predecessor;
+            state
+                .public_v1_operation_state
+                .as_mut()
+                .unwrap()
+                .identity
+                .protocol_version = predecessor;
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                    [serde_json::to_string(&state).unwrap()],
                 )
-                .is_err()
-            );
-            assert!(!path.with_extension("owner").exists());
-            assert_eq!(std::fs::read(&path).unwrap(), before_database);
-            assert_eq!(std::fs::read(&application).unwrap(), before_application);
-            assert_eq!(
-                std::fs::read_dir(directory.path())
-                    .unwrap()
-                    .map(|entry| entry.unwrap().file_name())
-                    .collect::<std::collections::BTreeSet<_>>(),
-                before_names
-            );
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", predecessor)
+                .unwrap();
+            drop(connection);
+            let before_database = std::fs::read(&path).unwrap();
+            let before_application = std::fs::read(&application).unwrap();
+            let before_names = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            for _ in 0..2 {
+                assert!(
+                    SqliteStore::open_replacement_bound_existing(
+                        &path,
+                        Some(&identity()),
+                        &binding
+                    )
+                    .is_err()
+                );
+                let observed = crate::host::provisioning::ObservedStorageIdentity {
+                    resource_uid: identity().resource_uid,
+                    pod_uid: identity().pod_uid,
+                    pvc_uid: identity().pvc_uid,
+                    instance_id: identity().local_identity.instance_id,
+                };
+                assert!(
+                    SqliteStore::open_replacement_for_process(
+                        &path,
+                        &observed,
+                        identity().local_identity.replica_id,
+                        None,
+                        &binding,
+                    )
+                    .is_err()
+                );
+                assert!(!path.with_extension("owner").exists());
+                assert_eq!(std::fs::read(&path).unwrap(), before_database);
+                assert_eq!(std::fs::read(&application).unwrap(), before_application);
+                assert_eq!(
+                    std::fs::read_dir(directory.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    before_names
+                );
+            }
         }
     }
 

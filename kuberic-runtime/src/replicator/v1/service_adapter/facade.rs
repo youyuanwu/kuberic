@@ -40,6 +40,8 @@ pub(super) struct PeerBinding {
     pub(super) information: ReplicaInformation,
     pub(super) build: BuildConfig,
     pub(super) callbacks: BuildCallbacks,
+    pub(super) conservative_progress: bool,
+    pub(super) fresh_checkpoint: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 type PeerResolver =
@@ -177,6 +179,7 @@ enum Value {
 enum Command {
     Open,
     ChangeRole(Epoch, Role),
+    RestoreRetained(Epoch),
     UpdateEpoch(Epoch),
     Progress,
     Capability,
@@ -186,6 +189,8 @@ enum Command {
     CurrentConfiguration(ReplicaSetConfiguration),
     Catchup(CatchupMode),
     Build(ReplicaInformation),
+    BuildReplacement(Box<ReplicaInformation>, ReplicaInformation),
+    RestoreReplacementSource(ReplicaSetConfiguration, Box<ReplicaInformation>),
     Recover(ReplicaInformation),
     Remove(i64),
     RemoveFenced(
@@ -249,6 +254,31 @@ pub(crate) struct Facade {
 }
 
 impl Facade {
+    pub(super) async fn restore_retained_secondary(&self, epoch: Epoch) -> crate::Result<()> {
+        self.completed(Command::RestoreRetained(epoch)).await
+    }
+
+    pub(super) async fn build_replacement(
+        &self,
+        predecessor: ReplicaInformation,
+        successor: ReplicaInformation,
+    ) -> crate::Result<()> {
+        self.completed(Command::BuildReplacement(Box::new(predecessor), successor))
+            .await
+    }
+
+    pub(super) async fn restore_replacement_source(
+        &self,
+        current: ReplicaSetConfiguration,
+        predecessor: ReplicaInformation,
+    ) -> crate::Result<()> {
+        self.completed(Command::RestoreReplacementSource(
+            current,
+            Box::new(predecessor),
+        ))
+        .await
+    }
+
     pub(super) async fn remove_fenced(
         &self,
         id: ReplicaId,
@@ -495,8 +525,20 @@ impl FacadeConfig {
             replicas.push(ReplicaDescriptor {
                 route: peer.build.route.clone(),
                 remote_incarnation: peer.build.remote_incarnation,
-                progress: (info.current_progress != crate::application::INVALID_LSN)
-                    .then_some(info.current_progress),
+                progress: if peer.conservative_progress {
+                    let checkpoint = peer
+                        .fresh_checkpoint
+                        .as_ref()
+                        .map(|checkpoint| checkpoint.load(Ordering::Acquire))
+                        .filter(|checkpoint| *checkpoint >= 0)
+                        .ok_or_else(|| {
+                            FacadeError::Input("fresh native ACK checkpoint unavailable".into())
+                        })?;
+                    Some(checkpoint)
+                } else {
+                    (info.current_progress != crate::application::INVALID_LSN)
+                        .then_some(info.current_progress)
+                },
                 must_catchup: info.must_catchup,
             });
         }
@@ -538,8 +580,9 @@ fn handle(
     } = request;
     let mut response = Some(response);
     let result = (|| -> Result<Option<Value>, FacadeError> {
-        if let Command::CatchupConfiguration(current, _) | Command::CurrentConfiguration(current) =
-            &command
+        if let Command::CatchupConfiguration(current, _)
+        | Command::CurrentConfiguration(current)
+        | Command::RestoreReplacementSource(current, _) = &command
             && (current.configuration.primary_id != config.local.replica_id
                 || !current.configuration.members.iter().any(|member| {
                     member.identity == config.local && member.role == ReplicaRole::Primary
@@ -561,6 +604,33 @@ fn handle(
             Command::ChangeRole(epoch, role) => adapter.select(Control::ChangeRole, |owner| {
                 owner.begin_change_role(role, epoch)
             })?,
+            Command::RestoreRetained(epoch) => {
+                if adapter.status() == RoleStatus::Ready(Role::ActiveSecondary)
+                    && adapter.retained_epoch == Some(epoch)
+                    && adapter.service.retained_receiver.lock().unwrap().is_some()
+                {
+                    // A cancelled caller retries the same actual initialized owner.
+                    let secondary = adapter.owner.secondary().map_err(AdapterError::from)?;
+                    secondary.current_progress().map_err(AdapterError::from)?;
+                    if matches!(
+                        secondary.transport_identity(),
+                        Err(SecondaryError::RetainedTransport)
+                    ) && adapter
+                        .service
+                        .retained_receiver
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|receiver| receiver.secondary.current_progress().is_ok())
+                    {
+                        return Ok(Some(Value::Completed));
+                    }
+                    return Err(FacadeError::Input("retained owner is already bound".into()));
+                }
+                adapter.select(Control::RestoreRetained(epoch), |owner| {
+                    owner.begin_restore_retained_secondary(epoch)
+                })?;
+            }
             Command::UpdateEpoch(epoch) => adapter.select(Control::UpdateEpoch, |owner| {
                 owner.begin_update_epoch(epoch)
             })?,
@@ -628,6 +698,94 @@ fn handle(
                 }
                 let peer = config.peer(&info)?;
                 let build = adapter.build_replica(peer.build.clone(), peer.callbacks.clone())?;
+                let response = response.take().unwrap();
+                waits.push(
+                    async move {
+                        reply(
+                            response,
+                            build
+                                .wait()
+                                .await
+                                .map(|()| Value::Completed)
+                                .map_err(FacadeError::from),
+                        );
+                    }
+                    .boxed(),
+                );
+                return Ok(None);
+            }
+            Command::RestoreReplacementSource(current, predecessor) => {
+                let predecessor = *predecessor;
+                if predecessor.role != ReplicaRole::ActiveSecondary
+                    || predecessor.current_progress != crate::application::INVALID_LSN
+                    || predecessor.catch_up_capability != crate::application::INVALID_LSN
+                    || predecessor.must_catchup
+                    || predecessor.storage_incarnation.is_none()
+                {
+                    return Err(FacadeError::Input(
+                        "cold replacement predecessor metadata".into(),
+                    ));
+                }
+                let old = config.resolve_peer_input(&predecessor, true)?;
+                if old.build.remote_incarnation < 0 {
+                    return Err(FacadeError::Input(
+                        "invalid replacement predecessor incarnation".into(),
+                    ));
+                }
+                let current = config.configuration(&current, true, true)?;
+                adapter
+                    .owner
+                    .primary()
+                    .map_err(AdapterError::from)?
+                    .restore_replacement_source(
+                        current,
+                        ReplicaDescriptor {
+                            route: old.build.route,
+                            remote_incarnation: old.build.remote_incarnation,
+                            progress: None,
+                            must_catchup: false,
+                        },
+                    )
+                    .map_err(AdapterError::from)?;
+                return Ok(Some(Value::Completed));
+            }
+            Command::BuildReplacement(predecessor, successor) => {
+                let predecessor = *predecessor;
+                if predecessor.role != ReplicaRole::ActiveSecondary
+                    || successor.role != ReplicaRole::IdleSecondary
+                    || predecessor.identity.replica_id != successor.identity.replica_id
+                    || predecessor.identity == successor.identity
+                    || predecessor.process_session_id == successor.process_session_id
+                    || predecessor.storage_incarnation.is_none()
+                    || successor.storage_incarnation.is_none()
+                    || predecessor.storage_incarnation == successor.storage_incarnation
+                    || predecessor.must_catchup
+                    || successor.must_catchup
+                {
+                    return Err(FacadeError::Input(
+                        "fresh physical replacement binding".into(),
+                    ));
+                }
+                let old = config.resolve_peer_input(&predecessor, true)?;
+                let new = config.peer(&successor)?;
+                let build = BuildOperation(
+                    adapter
+                        .owner
+                        .primary()
+                        .map_err(AdapterError::from)?
+                        .begin_replacement(
+                            ReplicaDescriptor {
+                                route: old.build.route,
+                                remote_incarnation: old.build.remote_incarnation,
+                                progress: None,
+                                must_catchup: false,
+                            },
+                            new.build,
+                            adapter.provider.clone(),
+                            new.callbacks,
+                        )
+                        .map_err(AdapterError::from)?,
+                );
                 let response = response.take().unwrap();
                 waits.push(
                     async move {

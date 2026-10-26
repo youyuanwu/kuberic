@@ -249,7 +249,7 @@ fn public_v1_history_data_loss_attempt_renews_higher_epoch() {
 
 #[tokio::test]
 async fn public_v1_history_store_uses_the_current_exact_schema() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 16);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 19);
     let directory = tempfile::tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let preview = PublicV1Identity::new(42);
@@ -305,7 +305,7 @@ async fn public_v1_history_store_uses_the_current_exact_schema() {
     assert_eq!(tables, vec!["agent_state"]);
     drop(connection);
 
-    for rejected_version in [6, 7, 11, 14, 15] {
+    for rejected_version in [6, 7, 11, 14, 15, 16, 17] {
         let directory = tempfile::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());
         create_rejected_store(&path, rejected_version, false);

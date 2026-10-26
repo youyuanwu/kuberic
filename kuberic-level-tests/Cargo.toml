@@ -11,23 +11,52 @@ publish = false
 [features]
 default = ["harness"]
 harness = []
+process-members = ["harness", "dep:kvstore2", "dep:sqlite-replicated", "dep:rusqlite", "dep:tonic"]
 
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+kuberic-controller = { workspace = true, features = ["test-util"] }
+kuberic-runtime = { workspace = true, features = ["host", "testing"] }
+serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
+kvstore2 = { path = "../examples/kvstore2", features = ["testing"], optional = true }
+sqlite-replicated = { path = "../examples/sqlite", features = ["testing"], optional = true }
+rusqlite = { workspace = true, features = ["serialize"], optional = true }
+tonic = { workspace = true, optional = true }
+
+[dev-dependencies]
 http = "1"
 k8s-openapi.workspace = true
 kube.workspace = true
-kuberic-controller = { workspace = true, features = ["test-util"] }
-kuberic-runtime = { workspace = true, features = ["host", "testing"] }
 kvstore2 = { path = "../examples/kvstore2", features = ["testing"] }
-serde = { workspace = true, features = ["derive"] }
-sha2.workspace = true
 tempfile = "3"
 tonic.workspace = true
+
+[[bin]]
+name = "kuberic-counter-member"
+path = "src/counter_member.rs"
+required-features = ["harness"]
+test = false
+
+[[bin]]
+name = "kuberic-retained-counter-member"
+path = "src/retained_counter_member.rs"
+required-features = ["process-members"]
+test = false
+
+[[bin]]
+name = "kuberic-retained-kv-member"
+path = "src/retained_kv_member.rs"
+required-features = ["process-members"]
+test = false
+
+[[bin]]
+name = "kuberic-retained-sqlite-member"
+path = "src/retained_sqlite_member.rs"
+required-features = ["process-members"]
+test = false

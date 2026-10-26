@@ -101,6 +101,7 @@ pub struct SqliteService {
     committer: Arc<OnceLock<Arc<Committer>>>,
     active: Arc<AtomicBool>,
     role: Mutex<ReplicaRole>,
+    restoring_retained: AtomicBool,
     replication_address: String,
     stop: watch::Sender<bool>,
     consumers: AsyncMutex<Consumers>,
@@ -141,6 +142,7 @@ impl SqliteService {
             committer,
             active: Arc::new(AtomicBool::new(false)),
             role: Mutex::new(ReplicaRole::None),
+            restoring_retained: AtomicBool::new(false),
             replication_address,
             stop: watch::channel(false).0,
             consumers: AsyncMutex::new(Consumers::default()),
@@ -428,6 +430,8 @@ impl StatefulServiceReplica for SqliteService {
         self.persistence
             .authorize_open(context.mode)
             .map_err(persistence_error)?;
+        self.restoring_retained
+            .store(context.restoring_retained_member(), Ordering::Release);
         *self.partition.lock().unwrap() = Some(context.partition.clone());
         let partitions = self.partition.clone();
         let active = self.active.clone();
@@ -501,8 +505,19 @@ impl StatefulServiceReplica for SqliteService {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange> {
+        if *self.stop.borrow() {
+            return Err(RuntimeError::Closed);
+        }
         self.active.store(false, Ordering::Release);
         let previous = *self.role.lock().unwrap();
+        if previous == ReplicaRole::None
+            && self.restoring_retained.load(Ordering::Acquire)
+            && role != ReplicaRole::ActiveSecondary
+        {
+            return Err(RuntimeError::InvalidReplication(
+                "retained SQLite initialization requires secondary role".into(),
+            ));
+        }
         if role == ReplicaRole::Primary || previous == ReplicaRole::Primary {
             self.committer()?
                 .wait_for_role_drain()
@@ -540,7 +555,21 @@ impl StatefulServiceReplica for SqliteService {
                 self.start_secondary(false).await?;
             }
             ReplicaRole::ActiveSecondary if previous == ReplicaRole::None => {
-                self.start_secondary(true).await?
+                if self.restoring_retained.load(Ordering::Acquire) {
+                    let control = self
+                        .control
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .ok_or(RuntimeError::NotOpen)?;
+                    let boundary = control.current_progress().await?;
+                    self.committer()?
+                        .restore_retained_secondary(boundary)
+                        .map_err(persistence_error)?;
+                    self.start_secondary(false).await?;
+                } else {
+                    self.start_secondary(true).await?;
+                }
             }
             ReplicaRole::None if previous == ReplicaRole::Primary => {
                 self.committer()?.demote().map_err(persistence_error)?

@@ -139,6 +139,8 @@ struct RuntimeHost {
     discovery_resolver: OnceLock<Arc<dyn super::transport::ReplicaEndpointResolver>>,
     native_address: OnceLock<String>,
     native_lifecycle: StdMutex<Option<crate::replicator::v1::LifecycleObservation>>,
+    retained_native_initialized: OnceLock<crate::replicator::CheckedRetainedMember>,
+    native_transport_quorum: StdMutex<Option<(Epoch, u64, bool)>>,
     identity: ReplicaIdentity,
     application: Arc<dyn StatefulServiceReplica>,
     public_v1_binding: crate::protocol::public_operations::PublicV1LifecycleBinding,
@@ -178,7 +180,20 @@ impl RuntimeHost {
         {
             return Some((AccessStatus::NotPrimary, AccessStatus::NotPrimary));
         }
-        let selected = self.selected_access.lock().unwrap().status();
+        let (mut selected, epoch) = {
+            let access = self.selected_access.lock().unwrap();
+            (access.status(), access.epoch())
+        };
+        if let Some(status) = &mut selected
+            && status.1 == AccessStatus::Granted
+            && self
+                .native_transport_quorum
+                .lock()
+                .unwrap()
+                .is_some_and(|(observed, _, available)| Some(observed) == epoch && !available)
+        {
+            status.1 = AccessStatus::NoWriteQuorum;
+        }
         if selected.is_some_and(|status| status.0 == AccessStatus::Granted)
             && matches!(*self.native_lifecycle.lock().unwrap(),
                 Some(crate::replicator::v1::LifecycleObservation::Ready(role)) if role != ReplicaRole::Primary)
@@ -339,6 +354,8 @@ impl PodRuntime {
                 discovery_resolver: OnceLock::new(),
                 native_address: OnceLock::new(),
                 native_lifecycle: StdMutex::new(None),
+                retained_native_initialized: OnceLock::new(),
+                native_transport_quorum: StdMutex::new(None),
             }),
         }
     }
@@ -413,17 +430,18 @@ impl PodRuntime {
             }
         });
         let revoke_host = Arc::downgrade(&self.host);
-        let revoke_access: Arc<dyn Fn() -> Result<()> + Send + Sync> = Arc::new(move || {
-            let host = revoke_host.upgrade().ok_or(RuntimeError::Closed)?;
-            let _admission = host.write_admission.lock().unwrap();
-            host.selected_access.lock().unwrap().revoke();
-            host.replacement_authority_fenced
-                .store(true, Ordering::Release);
-            if host.ordinary_contract.load(Ordering::Acquire) {
-                host.ordinary_withdrawn.store(true, Ordering::Release);
-            }
-            Ok(())
-        });
+        let revoke_access: Arc<dyn Fn(bool) -> Result<()> + Send + Sync> =
+            Arc::new(move |withdraw| {
+                let host = revoke_host.upgrade().ok_or(RuntimeError::Closed)?;
+                let _admission = host.write_admission.lock().unwrap();
+                host.selected_access.lock().unwrap().revoke();
+                host.replacement_authority_fenced
+                    .store(true, Ordering::Release);
+                if withdraw && host.ordinary_contract.load(Ordering::Acquire) {
+                    host.ordinary_withdrawn.store(true, Ordering::Release);
+                }
+                Ok(())
+            });
         let terminal_drain: crate::host::public_lifecycle::TerminalDrain = Arc::new(move || {
             let host = drain_host.upgrade();
             Box::pin(async move {
@@ -1311,6 +1329,129 @@ impl ReplacementFaultBridge {
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
+    fn retained_native_initialization(&self) -> Option<crate::replicator::CheckedRetainedMember> {
+        let host = self.host.upgrade()?;
+        if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
+            return None;
+        }
+        let selected = host.retained_native_initialized.get()?;
+        let registered = host.registered.get()?;
+        (registered.identity.to_public_id() == selected.scope().creation_id)
+            .then(|| selected.clone())
+    }
+
+    async fn confirm_retained_native_initialization(
+        &self,
+        reservation: ReplicatorCreationReservation,
+        selected: &crate::replicator::CheckedRetainedMember,
+    ) -> Result<()> {
+        let current = self
+            .retained_member_restore(reservation)
+            .await?
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let bridge = self.bridge().await?;
+        let state = bridge
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let record = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| {
+                preview
+                    .current_operation
+                    .as_ref()
+                    .and_then(|id| preview.operations.get(id))
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if &current != selected
+            || record.lifecycle.in_flight != Some(super::state::PublicInstruction::ReplicatorRole)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if let Some(previous) = host.retained_native_initialized.get() {
+            return if previous == selected {
+                Ok(())
+            } else {
+                Err(RuntimeError::AuthorityNotAdmitted)
+            };
+        }
+        host.retained_native_initialized
+            .set(current)
+            .map_err(|_| RuntimeError::AuthorityNotAdmitted)
+    }
+
+    async fn retained_member_restore(
+        &self,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<Option<crate::replicator::CheckedRetainedMember>> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let identity = reservation.identity(RuntimeHostToken::new());
+        let current = host.registered.get().map_or_else(
+            || host.replicator_creation.lock().is_ok_and(|creation| {
+                matches!(&*creation, ReplicatorCreationState::Reserved { identity: current, .. } if *current == identity)
+            }),
+            |registered| registered.identity == identity,
+        );
+        if !current
+            || host.closed.load(Ordering::Acquire)
+            || host.aborted.load(Ordering::Acquire)
+            || host.ordinary_withdrawn.load(Ordering::Acquire)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let bridge = self.bridge().await?;
+        let state = bridge
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let preview = state
+            .public_v1_operation_state
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let Some(record) = preview
+            .current_operation
+            .as_ref()
+            .and_then(|id| preview.operations.get(id))
+        else {
+            return Ok(None);
+        };
+        let Some(goal) = record.intent.goal() else {
+            return Ok(None);
+        };
+        let crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember {
+            qualification,
+        } = &goal.desired
+        else {
+            return Ok(None);
+        };
+        if goal.scope.process_session_id != bridge.process_session
+            || goal.scope.creation_id != identity.to_public_id()
+            || record.superseded_by.is_some()
+            || !matches!(record.stage, super::state::PublicOperationStage::Running)
+            || record
+                .ordinary
+                .as_ref()
+                .and_then(|ordinary| ordinary.retained.as_ref())
+                .is_none_or(|receipt| {
+                    receipt.owner_process_id != std::process::id()
+                        || receipt.owner_process_lifetime
+                            != super::ordinary_goal::retained::process_lifetime_id()
+                })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        super::ordinary_goal::retained::validate_receipt(&state, record)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        Ok(Some(crate::replicator::CheckedRetainedMember::new(
+            goal.scope.clone(),
+            qualification.as_ref().clone(),
+        )))
+    }
+
     async fn local_publication(
         &self,
         reservation: ReplicatorCreationReservation,
@@ -1497,6 +1638,22 @@ impl PartitionAccessView for HostAccessView {
                 |registered| registered.identity == identity,
             );
             if !current {
+                return;
+            }
+            if let crate::replicator::v1::LifecycleObservation::TransportQuorum {
+                epoch,
+                revision,
+                available,
+            } = observation
+            {
+                if !host.closed.load(Ordering::Acquire) && !host.aborted.load(Ordering::Acquire) {
+                    let mut prior = host.native_transport_quorum.lock().unwrap();
+                    if prior.is_none_or(|(old_epoch, old_revision, _)| {
+                        epoch >= old_epoch && revision > old_revision
+                    }) {
+                        *prior = Some((epoch, revision, available));
+                    }
+                }
                 return;
             }
             if (host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire))
@@ -1787,6 +1944,116 @@ mod tests {
             previous: None,
             replicas: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn transport_quorum_observations_are_creation_epoch_and_revision_qualified_not_role_grants()
+     {
+        use super::*;
+        use crate::application::{OpenContext, RoleChange};
+        use crate::protocol::public_operations::{PublicV1LifecycleBinding, StatePersistence};
+        use crate::protocol::types::{AccessStatus, ResourceUid};
+        use crate::replicator::PartitionAccessView;
+        use crate::replicator::v1::LifecycleObservation;
+
+        struct Application;
+        #[async_trait::async_trait]
+        impl StatefulServiceReplica for Application {
+            async fn open(self: Arc<Self>, _: OpenContext) -> Result<Arc<dyn Replicator>> {
+                panic!("transport observations must not invoke application Open")
+            }
+            async fn change_role(&self, _: ReplicaRole) -> Result<RoleChange> {
+                panic!("transport observations must not invoke application Role")
+            }
+            async fn close(&self) -> Result<()> {
+                panic!("transport observations must not invoke application Close")
+            }
+            fn abort(&self) {}
+        }
+        let current = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+        let obsolete = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+        let runtime = PodRuntime::new_replacement(
+            configuration(Epoch::new(0, 1)).current.members[0]
+                .identity
+                .clone(),
+            Arc::new(Application),
+            Arc::new(()),
+            PublicV1LifecycleBinding {
+                identity: crate::protocol::public_operations::PublicV1Identity::new(1),
+                resource_uid: ResourceUid::new("native-health"),
+                spec_generation: 1,
+                state_persistence: StatePersistence::Persisted,
+            },
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        *runtime.host.replicator_creation.lock().unwrap() = ReplicatorCreationState::Reserved {
+            identity: current.identity(RuntimeHostToken::new()),
+            provider_writer: ProviderWriterLease { consumed: false },
+        };
+        let access = HostAccessView {
+            host: Arc::downgrade(&runtime.host),
+            partition_information: runtime
+                .host
+                .state
+                .read()
+                .await
+                .partition_information
+                .clone(),
+        };
+        access.observe_native_lifecycle(current, LifecycleObservation::Ready(ReplicaRole::Primary));
+        let observation = |epoch, revision, available| LifecycleObservation::TransportQuorum {
+            epoch: Epoch::new(0, epoch),
+            revision,
+            available,
+        };
+        access.observe_native_lifecycle(obsolete, observation(1, 100, false));
+        assert!(
+            runtime
+                .host
+                .native_transport_quorum
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+        access.observe_native_lifecycle(current, observation(1, 2, false));
+        access.observe_native_lifecycle(current, observation(1, 1, true));
+        access.observe_native_lifecycle(current, observation(0, 100, true));
+        assert_eq!(
+            *runtime.host.native_transport_quorum.lock().unwrap(),
+            Some((Epoch::new(0, 1), 2, false))
+        );
+        access.observe_native_lifecycle(current, observation(2, 3, true));
+        access.observe_native_lifecycle(current, observation(2, 3, false));
+        assert_eq!(
+            *runtime.host.native_transport_quorum.lock().unwrap(),
+            Some((Epoch::new(0, 2), 3, true))
+        );
+        assert!(matches!(
+            *runtime.host.native_lifecycle.lock().unwrap(),
+            Some(LifecycleObservation::Ready(ReplicaRole::Primary))
+        ));
+        assert_eq!(
+            runtime.host.selected_status(),
+            None,
+            "availability cannot create selected role/catch-up receipts"
+        );
+        runtime.host.closed.store(true, Ordering::Release);
+        access.observe_native_lifecycle(current, observation(3, 4, false));
+        assert_eq!(
+            *runtime.host.native_transport_quorum.lock().unwrap(),
+            Some((Epoch::new(0, 2), 3, true))
+        );
+        runtime.host.closed.store(false, Ordering::Release);
+        runtime.host.aborted.store(true, Ordering::Release);
+        access.observe_native_lifecycle(current, observation(3, 4, false));
+        assert_eq!(
+            *runtime.host.native_transport_quorum.lock().unwrap(),
+            Some((Epoch::new(0, 2), 3, true))
+        );
+        assert_eq!(
+            access.write_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
     }
 
     #[tokio::test]

@@ -324,7 +324,7 @@ impl Fixture {
             replicator: replication.clone(),
             primary: replication,
             application_control_match: None,
-            revoke_access: Arc::new(|| Ok(())),
+            revoke_access: Arc::new(|_| Ok(())),
             capabilities: ReplicatorCapabilities::conservative(),
             replicator_creation_id: ReplicatorCreationId::new("creation"),
             open_context: None,

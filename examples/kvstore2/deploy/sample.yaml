@@ -4,7 +4,7 @@ metadata:
   name: kvstore2
   namespace: kuberic-system
 spec:
-  hostingFormat: 17
+  hostingFormat: 19
   replicas: 3
   # Ordinary hosting uses authenticated engine-owned copy/replication sessions.
   # Use fresh matching host/control/CRD metadata; never reset existing data.

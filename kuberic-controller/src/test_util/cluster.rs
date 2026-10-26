@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::{
-    application::{ApplicationFactory, ReplicaContext},
+    application::{ApplicationFactory, ProcessMember, ReplicaContext},
     kube::{ApiServer as TestApi, Kind},
     pod,
     transport::Network,
@@ -89,7 +89,8 @@ struct Hosted<F: ApplicationFactory> {
     startup: Option<JoinHandle<kuberic_runtime::host::Result<Option<RunningReplica>>>>,
     running: Option<RunningReplica>,
     data_root: PathBuf,
-    _route: kuberic_runtime::replicator::TestingTcpRoute,
+    _route: Option<kuberic_runtime::replicator::TestingTcpRoute>,
+    process: Option<ProcessMember>,
     network: Network,
     uid: String,
 }
@@ -102,6 +103,12 @@ impl<F: ApplicationFactory> Hosted<F> {
     async fn stop_with_routes(mut self, forget_routes: bool) -> Result<()> {
         self.startup_shutdown.send_replace(true);
         let mut errors = Vec::new();
+        let process_hosted = self.process.is_some();
+        if let Some(process) = self.process.take()
+            && let Err(error) = process.stop().await
+        {
+            errors.push(error);
+        }
         if let Some(startup) = self.startup.take() {
             match startup.await {
                 Ok(Ok(running)) => self.running = running,
@@ -115,7 +122,9 @@ impl<F: ApplicationFactory> Hosted<F> {
                 errors.push(error.into());
             }
         }
-        if let Err(error) = self.factory.shutdown_and_drain(self.service.clone()).await {
+        if !process_hosted
+            && let Err(error) = self.factory.shutdown_and_drain(self.service.clone()).await
+        {
             errors.push(anyhow::Error::new(error));
         }
         if forget_routes && let Err(error) = self.network.forget(&self.uid).await {
@@ -131,6 +140,61 @@ impl<F: ApplicationFactory> Hosted<F> {
             )
             .into())
         }
+    }
+
+    fn live(&self) -> bool {
+        self.process.as_ref().map_or_else(
+            || {
+                self.running
+                    .as_ref()
+                    .is_some_and(|running| !running.is_finished())
+            },
+            ProcessMember::live,
+        )
+    }
+
+    fn inspect_native(&self) -> Result<serde_json::Value> {
+        match &self.process {
+            Some(process) => process.inspect_native(),
+            None => Ok(self
+                ._route
+                .as_ref()
+                .context("native route missing")?
+                .inspect_native()?),
+        }
+    }
+
+    fn supports(
+        &self,
+        session: &kuberic_runtime::protocol::types::ProcessSessionId,
+        creation: &kuberic_runtime::protocol::types::ReplicatorCreationId,
+    ) -> Result<bool> {
+        match &self.process {
+            Some(process) => process.supports(session, creation),
+            None => Ok(kuberic_runtime::replicator::TestingTcpRoute::supports(
+                session, creation,
+            )),
+        }
+    }
+
+    async fn local_identity(
+        &self,
+    ) -> Result<(
+        PublicV1AgentReport,
+        kuberic_runtime::protocol::types::ProcessSessionEndpoint,
+    )> {
+        if let Some(process) = &self.process {
+            return process.identity().await;
+        }
+        let handle = self
+            .running
+            .as_ref()
+            .context("replica startup/session is not live")?
+            .handle();
+        Ok((
+            handle.public_v1_report().await?,
+            handle.public_v1_process_endpoint(ReplicaRole::None).await?,
+        ))
     }
 }
 
@@ -171,6 +235,7 @@ struct SupervisorState<F: ApplicationFactory> {
     stopped: BTreeSet<String>,
     held_deletions: Arc<std::sync::Mutex<BTreeSet<String>>>,
     drains: Vec<JoinHandle<Result<()>>>,
+    reaped_members: Vec<serde_json::Value>,
 }
 
 impl<F: ApplicationFactory> Default for SupervisorState<F> {
@@ -180,6 +245,7 @@ impl<F: ApplicationFactory> Default for SupervisorState<F> {
             stopped: BTreeSet::new(),
             held_deletions: Arc::default(),
             drains: Vec::new(),
+            reaped_members: Vec::new(),
         }
     }
 }
@@ -231,7 +297,13 @@ impl<F: ApplicationFactory> Harness<F> {
                 crate::observation::RawAgentObservation::ReplicaSnapshot(snapshot) => {
                     Some(*snapshot)
                 }
-                _ => None,
+                crate::observation::RawAgentObservation::Uninitialized(_) => None,
+                other => {
+                    eprintln!(
+                        "ordinary snapshot observation without an initialized snapshot: {other:?}"
+                    );
+                    None
+                }
             })
             .collect())
     }
@@ -305,6 +377,7 @@ impl<F: ApplicationFactory> Harness<F> {
                                     && matches!(
                                         entry.goal.desired,
                                         ReplicaGoalKind::Reconfigure { .. }
+                                            | ReplicaGoalKind::RefreshPrimary { .. }
                                     )
                                     && snapshot.goals.iter().any(|observation| {
                                         observation.goal == entry.goal
@@ -607,6 +680,7 @@ impl<F: ApplicationFactory> Harness<F> {
     }
 
     async fn ready_observed(&mut self, expected: usize, isolated: &[String]) -> Result<i64> {
+        let mut last_diagnostic = String::new();
         loop {
             self.check().await?;
             let set = self.set().await?;
@@ -621,6 +695,19 @@ impl<F: ApplicationFactory> Harness<F> {
                             .any(|uid| snapshot.storage.replica.instance_id.as_str() == uid)
                     })
                     .collect::<Vec<_>>();
+                if std::env::var_os("KUBERIC_M3_REOPEN_DIAGNOSTICS").is_some() {
+                    let diagnostic = serde_json::json!({
+                        "topology": status.public_v1_topology,
+                        "goals": status.replica_goals,
+                        "snapshots": snapshots,
+                        "lastReconcileError": self.last_error,
+                    })
+                    .to_string();
+                    if diagnostic != last_diagnostic {
+                        eprintln!("ordinary reopen observation: {diagnostic}");
+                        last_diagnostic = diagnostic;
+                    }
+                }
                 if Self::ordinary_settled(status, &snapshots, expected)
                     && self.replaced_resources_settled(status)
                 {
@@ -707,11 +794,7 @@ impl<F: ApplicationFactory> Harness<F> {
             .await
             .hosts
             .iter()
-            .filter(|(_, host)| {
-                host.running
-                    .as_ref()
-                    .is_some_and(|running| !running.is_finished())
-            })
+            .filter(|(_, host)| host.live())
             .map(|(uid, _)| uid.clone())
             .collect()
     }
@@ -808,6 +891,19 @@ impl<F: ApplicationFactory> Harness<F> {
     pub async fn finish(mut self, result: Result<()>) -> Result<()> {
         self.cancel_controller_call();
         let initial_transport = self.network.diagnostics();
+        let native_before_cleanup = {
+            let supervisor = self.supervisor.lock().await;
+            supervisor
+                .hosts
+                .iter()
+                .map(|(uid, host)| {
+                    let observation = host.inspect_native().unwrap_or_else(
+                        |error| serde_json::json!({"unavailable": error.to_string()}),
+                    );
+                    (uid.clone(), observation)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
         let scenario_kind = result
             .as_ref()
             .err()
@@ -871,7 +967,7 @@ impl<F: ApplicationFactory> Harness<F> {
                 scenario_kind
             };
             let agents=self.last_reports.lock().unwrap().values().map(|report|serde_json::json!({"identity":report.replica,"session":report.process_session_id,"creation":report.replicator_creation_id,"storage":report.storage_incarnation,"role":report.role,"read":report.read_status,"write":report.write_status,"progress":report.progress})).collect::<Vec<_>>();
-            let diagnostics = serde_json::json!({"resources":self.diagnostic_snapshot(),"agents":agents,"transportBeforeCleanup":initial_transport,"transport":self.network.diagnostics(),"reconcileErrors":self.reconcile_errors,"lastReconcileError":self.last_error.as_ref().map(|error|error.replace("local-test-token","[redacted]").chars().take(512).collect::<String>()),"retainedStorage":path,"pendingTaskOwners":owners.iter().filter(|task|!task.is_finished()).count()});
+            let diagnostics = serde_json::json!({"resources":self.diagnostic_snapshot(),"agents":agents,"nativeBeforeCleanup":native_before_cleanup,"transportBeforeCleanup":initial_transport,"transport":self.network.diagnostics(),"reconcileErrors":self.reconcile_errors,"lastReconcileError":self.last_error.as_ref().map(|error|error.replace("local-test-token","[redacted]").chars().take(512).collect::<String>()),"retainedStorage":path,"pendingTaskOwners":owners.iter().filter(|task|!task.is_finished()).count()});
             Err(super::TestError::combined(
                 kind,
                 format!(
@@ -973,6 +1069,54 @@ async fn supervise<F: ApplicationFactory>(
         if state.stopped.contains(&uid) {
             continue;
         }
+        let exited = state
+            .hosts
+            .get(&uid)
+            .and_then(|host| host.process.as_ref())
+            .map(ProcessMember::poll_exit)
+            .transpose()?
+            .flatten();
+        if let Some(exit) = exited {
+            let host = state
+                .hosts
+                .get(&uid)
+                .context("exited member owner missing")?;
+            let process = host
+                .process
+                .as_ref()
+                .context("exited member process missing")?;
+            // Exact OS reaping is necessary but not sufficient. The factory must
+            // validate the existing runtime's durable scoped recovery cause.
+            ensure!(
+                factory.recoverable_member_exit(&process.context, exit.pid, exit.status)?,
+                "owned member exited without a qualified recoverable cause"
+            );
+            let reaped = process.reaped_observation(&exit)?;
+            let (current_config, current_environment) =
+                pod::resolve(pod, &pvcs, &secrets, root, image)?;
+            ensure!(
+                current_config.data_root == host.data_root
+                    && current_environment.get("KUBERIC_PVC_UID")
+                        == process.context.environment.get("KUBERIC_PVC_UID")
+                    && current_environment.get("KUBERIC_RESOURCE_UID")
+                        == process.context.environment.get("KUBERIC_RESOURCE_UID")
+                    && pvcs.iter().any(|pvc| {
+                        pvc.uid().as_deref()
+                            == current_environment
+                                .get("KUBERIC_PVC_UID")
+                                .map(String::as_str)
+                            && pvc.metadata.deletion_timestamp.is_none()
+                    }),
+                "recoverable member no longer has its exact live PVC"
+            );
+            let mut host = state
+                .hosts
+                .remove(&uid)
+                .context("exited member disappeared")?;
+            state.reaped_members.push(reaped);
+            host.process.take().unwrap().finish_exited().await?;
+            network.forget(&uid).await?;
+        }
         if let Some(host) = state.hosts.get_mut(&uid) {
             if host.startup.as_ref().is_some_and(JoinHandle::is_finished) {
                 host.running = Some(
@@ -997,9 +1141,6 @@ async fn supervise<F: ApplicationFactory>(
         let status = pod.status.get_or_insert_with(PodStatus::default);
         status.pod_ip = Some("127.0.0.1".into());
         let (config, environment) = pod::resolve(pod, &pvcs, &secrets, root, image)?;
-        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let backend = format!("http://{}", control_listener.local_addr()?);
-        let control = network.route("controller", &uid, &backend).await?;
         let app_path = config.data_root.join("application");
         std::fs::create_dir_all(&app_path)?;
         use kuberic_runtime::protocol::types::{
@@ -1015,13 +1156,47 @@ async fn supervise<F: ApplicationFactory>(
                 &config.pvc_uid,
             )),
         };
+        let context = ReplicaContext {
+            identity,
+            root: app_path.clone(),
+            environment,
+            member: None,
+        };
+        let process = if let Some(executable) = factory.member_executable() {
+            Some(
+                ProcessMember::launch(
+                    executable,
+                    &config,
+                    context.clone(),
+                    api.clone(),
+                    network.clone(),
+                    namespace,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let control_listener = if process.is_none() {
+            Some(tokio::net::TcpListener::bind("127.0.0.1:0").await?)
+        } else {
+            None
+        };
+        let backend = match &process {
+            Some(process) => process.control.clone(),
+            None => format!(
+                "http://{}",
+                control_listener.as_ref().unwrap().local_addr()?
+            ),
+        };
+        let control = network.route("controller", &uid, &backend).await?;
         let application = tokio::time::timeout_at(
             deadline,
-            factory.create(ReplicaContext {
-                identity,
-                root: app_path.clone(),
-                environment,
-            }),
+            factory.create(
+                process
+                    .as_ref()
+                    .map_or(context, |process| process.context.clone()),
+            ),
         )
         .await?
         .map_err(|error| {
@@ -1041,30 +1216,41 @@ async fn supervise<F: ApplicationFactory>(
         let (startup_shutdown, receiver) = watch::channel(false);
         let routed_uid = uid.clone();
         let routed_network = network.clone();
-        let route = kuberic_runtime::replicator::TestingTcpRoute::register_with_kind(
-            uid.clone(),
-            move |kind, destination, endpoint| {
-                let network = routed_network.clone();
-                let uid = routed_uid.clone();
-                Box::pin(async move {
-                    network
-                        .route_data(kind, &uid, &destination, &endpoint)
-                        .await
-                        .map_err(std::io::Error::other)
-                })
-            },
-        )?;
-        let mut host = ReplicaHost::new(config, service.clone(), application.storage, resolver);
-        if !application.paths.is_empty() {
-            host = host.with_application_storage_paths(
-                application
-                    .paths
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, path)| (format!("application-{index}"), path))
-                    .collect(),
-            );
-        }
+        let route = if process.is_none() {
+            Some(
+                kuberic_runtime::replicator::TestingTcpRoute::register_with_kind(
+                    uid.clone(),
+                    move |kind, destination, endpoint| {
+                        let network = routed_network.clone();
+                        let uid = routed_uid.clone();
+                        Box::pin(async move {
+                            network
+                                .route_data(kind, &uid, &destination, &endpoint)
+                                .await
+                                .map_err(std::io::Error::other)
+                        })
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let host = if process.is_none() {
+            let mut host = ReplicaHost::new(config, service.clone(), application.storage, resolver);
+            if !application.paths.is_empty() {
+                host = host.with_application_storage_paths(
+                    application
+                        .paths
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, path)| (format!("application-{index}"), path))
+                        .collect(),
+                );
+            }
+            Some(host)
+        } else {
+            None
+        };
         pod.annotations_mut()
             .insert(CONTROL_ADDRESS_ANNOTATION.into(), control);
         let infrastructure = serde_json::to_value(&*pod)?;
@@ -1097,17 +1283,20 @@ async fn supervise<F: ApplicationFactory>(
             }
         }
         ensure!(updated, "Pod infrastructure updates repeatedly conflicted");
-        let startup = tokio::spawn(host.start_with_shutdown(control_listener, receiver));
+        let startup = host.map(|host| {
+            tokio::spawn(host.start_with_shutdown(control_listener.unwrap(), receiver))
+        });
         state.hosts.insert(
             uid.clone(),
             Hosted {
                 service,
                 factory: factory.clone(),
                 startup_shutdown,
-                startup: Some(startup),
+                startup,
                 running: None,
                 data_root,
                 _route: route,
+                process,
                 network: network.clone(),
                 uid: uid.clone(),
             },
@@ -1387,6 +1576,7 @@ impl Topology {
 #[derive(Clone, Copy, Debug)]
 pub enum SupportResource {
     PeerService,
+    WriteService,
     CredentialsSecret,
 }
 
@@ -1462,6 +1652,7 @@ impl<F: ApplicationFactory> ClusterBuilder<F> {
             core,
             nonce: uuid::Uuid::new_v4(),
             paused: None,
+            stopped_processes: BTreeMap::new(),
         })
     }
 }
@@ -1471,6 +1662,7 @@ pub struct TestCluster<F: ApplicationFactory> {
     core: Harness<F>,
     nonce: uuid::Uuid,
     paused: Option<uuid::Uuid>,
+    stopped_processes: BTreeMap<String, ReplicaRef>,
 }
 
 impl<F: ApplicationFactory> TestCluster<F> {
@@ -1516,33 +1708,20 @@ impl<F: ApplicationFactory> TestCluster<F> {
                 "replica is no longer live",
             ));
         }
-        let handle = {
+        let (report, endpoint) = {
             let state = self.core.supervisor.lock().await;
-            state
-                .hosts
-                .get(reference.instance_id())
-                .and_then(|host| host.running.as_ref())
-                .map(RunningReplica::handle)
-                .ok_or_else(|| {
-                    TestError::new(
-                        ErrorKind::InvalidReference,
-                        "replica startup/session is not live",
-                    )
-                })?
+            let host = state.hosts.get(reference.instance_id()).ok_or_else(|| {
+                TestError::new(
+                    ErrorKind::InvalidReference,
+                    "replica startup/session is not live",
+                )
+            })?;
+            tokio::time::timeout_at(self.core.deadline, host.local_identity())
+                .await
+                .map_err(anyhow::Error::from)??
         };
         // Exact-reference validation is a local identity read, not healthy
         // transport evidence. Readiness still observes every agent over RPC.
-        let report = tokio::time::timeout_at(self.core.deadline, handle.public_v1_report())
-            .await
-            .map_err(anyhow::Error::from)?
-            .map_err(anyhow::Error::from)?;
-        let endpoint = tokio::time::timeout_at(
-            self.core.deadline,
-            handle.public_v1_process_endpoint(ReplicaRole::None),
-        )
-        .await
-        .map_err(anyhow::Error::from)?
-        .map_err(anyhow::Error::from)?;
         if endpoint.identity != reference.identity
             || endpoint.storage_incarnation != reference.storage
             || endpoint.process_session_id != reference.session
@@ -1697,7 +1876,74 @@ impl<F: ApplicationFactory> TestCluster<F> {
             .hosts
             .get(reference.instance_id())
             .context("native host missing")?;
-        host._route.inspect_native().map_err(TestError::from)
+        host.inspect_native().map_err(TestError::from)
+    }
+
+    /// Exact supervisor-owned reaps, recorded only after runtime-cause validation.
+    pub async fn reaped_member_observations(&self) -> Vec<serde_json::Value> {
+        self.core.supervisor.lock().await.reaped_members.clone()
+    }
+
+    /// Read-only native routing counters; these never supply admission evidence.
+    pub async fn native_route_counts(&self) -> BTreeMap<String, u64> {
+        self.core.network.native_route_counts().await
+    }
+
+    /// Exercise the ordinary read-only sampled snapshot RPC for an exact member.
+    pub async fn sample_replica(
+        &self,
+        reference: &ReplicaRef,
+    ) -> super::Result<ReplicaAgentSnapshot> {
+        use kuberic_runtime::protocol::public_operations::{
+            ORDINARY_ACTION_FORMAT, ReplicaAgentQueryResult,
+        };
+        self.validate(reference).await?;
+        let endpoint = self
+            .core
+            .api
+            .snapshot(Kind::Pod)
+            .into_iter()
+            .find(|pod| pod["metadata"]["uid"].as_str() == Some(reference.instance_id()))
+            .and_then(|pod| {
+                pod["metadata"]["annotations"][CONTROL_ADDRESS_ANNOTATION]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .context("member control endpoint missing")?;
+        let response = GrpcAgentApi::new(pod::RPC_DEADLINE)
+            .get_snapshot(
+                &endpoint,
+                "local-test-token",
+                kuberic_runtime::control::proto::ReplicaSnapshotRequest {
+                    protocol_version: ORDINARY_ACTION_FORMAT,
+                    resource_uid: reference.resource_uid.clone(),
+                    target: Some(reference.identity.clone().into()),
+                    expected_process_session_id: reference.session.to_string(),
+                    sample_native_progress: true,
+                },
+            )
+            .await
+            .map_err(crate::cluster_api::map_agent_effect_error)
+            .map_err(anyhow::Error::from)?;
+        let observed: kuberic_runtime::protocol::public_operations::ReplicaAgentQueryResult =
+            serde_json::from_slice(&response.canonical_json).map_err(anyhow::Error::from)?;
+        let ReplicaAgentQueryResult::Initialized(snapshot) = observed else {
+            return Err(TestError::new(
+                ErrorKind::Fatal,
+                "sample lost initialized member",
+            ));
+        };
+        if response.protocol_version != ORDINARY_ACTION_FORMAT
+            || snapshot.storage != reference.storage
+            || snapshot.process_session_id != reference.session
+            || snapshot.creation_id != reference.creation
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "sample crossed member scope",
+            ));
+        }
+        Ok(*snapshot)
     }
     pub async fn application_root(&self, reference: &ReplicaRef) -> super::Result<PathBuf> {
         self.validate(reference).await?;
@@ -1950,7 +2196,10 @@ impl<F: ApplicationFactory> TestCluster<F> {
             ));
         }
         self.core.stop(reference.instance_id()).await?;
-        self.check().await
+        self.check().await?;
+        self.stopped_processes
+            .insert(reference.instance_id().to_owned(), reference.clone());
+        Ok(())
     }
     pub async fn restart(&mut self, reference: &ReplicaRef) -> super::Result<ReplicaRef> {
         let expected = self.core.set().await?.spec.replicas as usize;
@@ -1966,7 +2215,49 @@ impl<F: ApplicationFactory> TestCluster<F> {
     /// Reopens the process without driving controller admission. Call settle
     /// explicitly after observing the fresh process's closed access.
     pub async fn request_restart(&mut self, reference: &ReplicaRef) -> super::Result<ReplicaRef> {
-        self.stop(reference).await?;
+        self.driving()?;
+        if let Some(stopped) = self.stopped_processes.get(reference.instance_id()) {
+            if stopped != reference
+                || reference.cluster != self.nonce
+                || self.core.set().await?.uid().as_deref() != Some(&reference.resource_uid)
+                || !self.core.api.snapshot(Kind::Pod).iter().any(|pod| {
+                    pod["metadata"]["uid"].as_str() == Some(reference.instance_id())
+                        && pod["metadata"]["deletionTimestamp"].is_null()
+                })
+                || !match &reference.storage.storage {
+                    kuberic_runtime::protocol::types::ReplicaStorageIdentity::Persistent {
+                        pod_uid,
+                        pvc_uid,
+                    } => {
+                        pod_uid.as_str() == reference.instance_id()
+                            && self.core.api.snapshot(Kind::Pvc).iter().any(|pvc| {
+                                pvc["metadata"]["uid"].as_str() == Some(pvc_uid.as_str())
+                                    && pvc["metadata"]["deletionTimestamp"].is_null()
+                            })
+                    }
+                    _ => false,
+                }
+            {
+                return Err(TestError::new(
+                    ErrorKind::InvalidReference,
+                    "stopped process receipt no longer names its exact live resources",
+                ));
+            }
+            self.core.finish_controller_call().await?;
+            self.check().await?;
+            let state = self.core.supervisor.lock().await;
+            if !state.stopped.contains(reference.instance_id())
+                || state.hosts.contains_key(reference.instance_id())
+            {
+                return Err(TestError::new(
+                    ErrorKind::InvalidReference,
+                    "stopped process was already reopened or is still owned",
+                ));
+            }
+        } else {
+            self.stop(reference).await?;
+        }
+        self.stopped_processes.remove(reference.instance_id());
         self.core
             .supervisor
             .lock()
@@ -1979,6 +2270,9 @@ impl<F: ApplicationFactory> TestCluster<F> {
             if let Some((fresh, _)) = observation.snapshots.iter().find(|(fresh, _)| {
                 fresh.replica_id() == reference.replica_id()
                     && fresh.process_session_id() != reference.process_session_id()
+                    && fresh.identity == reference.identity
+                    && fresh.storage == reference.storage
+                    && fresh.creation != reference.creation
             }) {
                 return Ok(fresh.clone());
             }
@@ -2069,6 +2363,7 @@ impl<F: ApplicationFactory> TestCluster<F> {
         self.check().await?;
         let (kind, name) = match kind {
             SupportResource::PeerService => (Kind::Service, format!("{}-peer", self.core.name)),
+            SupportResource::WriteService => (Kind::Service, format!("{}-write", self.core.name)),
             SupportResource::CredentialsSecret => (
                 Kind::Secret,
                 format!("{}-agent-credentials", self.core.name),
@@ -2316,10 +2611,17 @@ impl<F: ApplicationFactory> TestCluster<F> {
         }
         for reference in replicas {
             self.validate(reference).await?;
-            if !kuberic_runtime::replicator::TestingTcpRoute::supports(
-                &reference.session,
-                &reference.creation,
-            ) {
+            let supported = self
+                .core
+                .supervisor
+                .lock()
+                .await
+                .hosts
+                .get(reference.instance_id())
+                .map(|host| host.supports(&reference.session, &reference.creation))
+                .transpose()?
+                .unwrap_or(false);
+            if !supported {
                 return Err(TestError::new(
                     ErrorKind::UnsupportedCapability,
                     "selected engine did not acknowledge built-in routed transport",
@@ -2359,10 +2661,17 @@ impl<F: ApplicationFactory> TestCluster<F> {
                     source,
                 )
             })?;
-        if !kuberic_runtime::replicator::TestingTcpRoute::supports(
-            &report.process_session_id,
-            &report.replicator_creation_id,
-        ) {
+        let supported = self
+            .core
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .get(resource.uid())
+            .map(|host| host.supports(&report.process_session_id, &report.replicator_creation_id))
+            .transpose()?
+            .unwrap_or(false);
+        if !supported {
             return Err(TestError::new(
                 ErrorKind::UnsupportedCapability,
                 "Build participant did not acknowledge built-in routed transport",

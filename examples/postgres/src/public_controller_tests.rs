@@ -1126,6 +1126,8 @@ async fn public_v1_postgres_lost_inbound_join_is_sticky_across_close() {
 async fn terminal(fault: u8) {
     let factory = Factory::default();
     let mut cluster = cluster(&factory).await;
+    let mut stage = "formation";
+    let mut last_observation = serde_json::Value::Null;
     let result: TestResult = async {
         let topology = cluster.settle_members(1).await?;
         let source = cluster.service(topology.primary()).await?;
@@ -1143,10 +1145,20 @@ async fn terminal(fault: u8) {
                 kuberic_runtime::protocol::public_operations::PublicV1CallKind::Close,
             )
             .await?;
+        stage = "initial terminal completion";
         let completion = loop {
             cluster.step().await?;
             let observed = cluster.observe().await?;
-            let snapshot = observed.snapshot(topology.primary()).unwrap();
+            last_observation = serde_json::json!({
+                "stage": stage,
+                "status": observed.set().status,
+                "snapshots": observed.snapshots().map(|(reference, snapshot)| {
+                    (format!("{reference:?}"), snapshot)
+                }).collect::<Vec<_>>(),
+            });
+            let Some(snapshot) = observed.snapshot(topology.primary()) else {
+                continue;
+            };
             if let Some(completion) = snapshot.goals.iter().find(|entry| entry.goal == goal)
                 && completion.status != ReplicaGoalStatus::Pending
             {
@@ -1164,17 +1176,34 @@ async fn terminal(fault: u8) {
             (completion.status == ReplicaGoalStatus::Achieved) == (fault == 0),
             "ordinary terminal hid native/application join failure",
         )?;
+        stage = "native process reaping";
         probe.assert_gone().await;
+        stage = "repeated native Close";
         let repeated = source.native_driver().public_close().await;
         check(
             repeated.is_ok() == (fault != 2),
             "repeated native Close lost sticky actual-join outcome",
         )?;
+        stage = "controller recreation";
         cluster.recreate_controller().await?;
         for _ in 0..3 {
             cluster.step().await?;
         }
-        let observed = cluster.observe().await?;
+        stage = "same-reference terminal replay";
+        let observed = loop {
+            cluster.step().await?;
+            let observed = cluster.observe().await?;
+            last_observation = serde_json::json!({
+                "stage": stage,
+                "status": observed.set().status,
+                "snapshots": observed.snapshots().map(|(reference, snapshot)| {
+                    (format!("{reference:?}"), snapshot)
+                }).collect::<Vec<_>>(),
+            });
+            if observed.snapshot(topology.primary()).is_some() {
+                break observed;
+            }
+        };
         check(
             observed
                 .snapshot(topology.primary())
@@ -1184,6 +1213,7 @@ async fn terminal(fault: u8) {
                 .any(|entry| entry == &completion),
             "terminal replay changed the retained actual result",
         )?;
+        stage = "native fault-owner joins";
         check(
             source.native_driver().fault_owners_joined(),
             "ordinary terminal lost the actual retained fault reporter join",
@@ -1192,7 +1222,27 @@ async fn terminal(fault: u8) {
     }
     .await;
     let passed = result.is_ok();
+    if let Err(error) = &result {
+        eprintln!("PG terminal first scenario failure at {stage}: {error}");
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            eprintln!("PG terminal scenario cause: {cause}");
+            source = cause.source();
+        }
+        eprintln!("PG terminal last actual observation: {last_observation}");
+    }
     let outcome = cluster.finish(result).await;
+    if let Err(error) = &outcome {
+        eprintln!("PG terminal finish result: {error}");
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            eprintln!("PG terminal finish cause: {cause}");
+            source = cause.source();
+        }
+        if let Some(diagnostics) = error.diagnostics() {
+            eprintln!("PG terminal failure diagnostics: {diagnostics}");
+        }
+    }
     assert!(passed, "native terminal fault={fault}: {outcome:?}");
     if fault != 0 {
         assert!(outcome.is_err());

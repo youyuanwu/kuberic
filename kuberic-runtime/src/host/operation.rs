@@ -1585,6 +1585,21 @@ impl PartitionOperationRegistry {
                 "public-operation preview or process session changed".into(),
             ));
         }
+        let retained_restore =
+            if let Some(goal) =
+                intent.goal().filter(|goal| {
+                    matches!(goal.desired,
+            crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. })
+                })
+            {
+                crate::host::ordinary_goal::retained::validate_restore(
+                    &self.store.load_state().await?,
+                    goal,
+                )?;
+                true
+            } else {
+                false
+            };
         let renewal_configuration =
             if !intent.class.is_terminal() && !self.terminal_admission_is_fenced() {
                 self.prepare_fenced_session_renewal_configuration(&intent)
@@ -1593,7 +1608,8 @@ impl PartitionOperationRegistry {
                 false
             };
         if !intent.class.is_terminal()
-            && (self.terminal_admission_is_fenced() || (self.is_fenced() && !renewal_configuration))
+            && (self.terminal_admission_is_fenced()
+                || (self.is_fenced() && !renewal_configuration && !retained_restore))
         {
             return Err(HostError::CommandRejected(
                 "preview is synchronously fenced".into(),
@@ -1751,8 +1767,20 @@ impl PartitionOperationRegistry {
         } else {
             None
         };
+        let retained_state_for_goal = self.store.load_state().await?;
         for operation in existing {
             let record = operation.snapshot();
+            if retained_restore
+                && intent.goal().is_some_and(|goal| {
+                    crate::host::ordinary_goal::retained::supersedes_fault(
+                        &retained_state_for_goal,
+                        goal,
+                        &record,
+                    )
+                })
+            {
+                continue;
+            }
             if intent.goal().is_some_and(|goal| {
                 matches!(
                     goal.desired,
@@ -1843,6 +1871,26 @@ impl PartitionOperationRegistry {
             | BeginPublicOperation::Pending(record)
             | BeginPublicOperation::Completed(record) => record,
         };
+        if retained_restore {
+            let durable = self.store.load_state().await?;
+            crate::host::ordinary_goal::retained::validate_receipt(&durable, &record)?;
+            let mut registry = self.state.lock().await;
+            for retained in durable
+                .public_v1_operation_state
+                .as_ref()
+                .unwrap()
+                .operations
+                .values()
+            {
+                if retained.superseded_by.as_ref() == Some(&intent.operation_id)
+                    && let Some(owner) = registry.operations.get_mut(&retained.intent.operation_id)
+                {
+                    owner.record.send_replace(retained.clone());
+                }
+            }
+            self.renewal_fence
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         for displaced in &superseded {
             displaced.mark_superseded_by(&intent.operation_id)?;
         }
@@ -2052,7 +2100,7 @@ impl PartitionOperationRegistry {
         let drain_result = if ordinary && let Some(callbacks) = self.terminal_recovery.get() {
             let mut callbacks = callbacks()?;
             callbacks.aborted = self.abort_guard();
-            (callbacks.revoke_access)()?;
+            (callbacks.revoke_access)(true)?;
             callbacks.abort_once();
             let drain = callbacks.terminal_drain.clone();
             let (completed, result) = oneshot::channel();

@@ -530,6 +530,7 @@ async fn supporting_resources_are_repaired_without_losing_quorum() -> Result<()>
                             == Some("sample")
                     );
                 }
+
                 let spec = service.spec.context("service spec missing")?;
                 ensure!(
                     spec.cluster_ip.as_deref() == Some("None")
@@ -567,6 +568,79 @@ async fn supporting_resources_are_repaired_without_losing_quorum() -> Result<()>
             .await?;
         harness.write("repair-after", "quorum").await?;
         harness.assert_values("repair-after", "quorum").await
+    }
+    .await;
+    harness.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn m3_support_repair_after_replacement_preserves_only_admitted_physical_pvcs() -> Result<()> {
+    let mut harness = Harness::new().await?;
+    let result = async {
+        harness.write("physical-support", "acknowledged").await?;
+        let old = harness.report(2).await?;
+        delete_secondary(&mut harness).await?;
+        harness.ready().await?;
+        let replacement = harness.report(2).await?;
+        ensure!(replacement.storage_incarnation != old.storage_incarnation);
+        let pvcs = harness
+            .api
+            .snapshot(Kind::Pvc)
+            .iter()
+            .map(|pvc| pvc["metadata"]["uid"].as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let service = harness
+            .api
+            .get(Kind::Service, "sample-write")
+            .context("write Service missing")?;
+        let uid = service["metadata"]["uid"].as_str().unwrap().to_owned();
+        harness
+            .cluster
+            .delete_support_resource(SupportResource::WriteService)
+            .await?;
+        loop {
+            harness.step().await?;
+            if harness
+                .api
+                .get(Kind::Service, "sample-write")
+                .is_some_and(|service| {
+                    service["metadata"]["uid"]
+                        .as_str()
+                        .is_some_and(|repaired| repaired != uid)
+                })
+            {
+                break;
+            }
+        }
+        harness.ready().await?;
+        ensure!(
+            harness
+                .api
+                .get(Kind::Service, "sample-write")
+                .context("write Service was not repaired")?["metadata"]["uid"]
+                .as_str()
+                != Some(uid.as_str())
+        );
+        let repaired = harness
+            .api
+            .snapshot(Kind::Pvc)
+            .iter()
+            .map(|pvc| pvc["metadata"]["uid"].as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(
+            repaired == pvcs,
+            "shared support repair created unselected physical storage"
+        );
+        harness
+            .assert_values("physical-support", "acknowledged")
+            .await?;
+        harness
+            .write("physical-support-after", "still-quorum")
+            .await?;
+        harness
+            .assert_values("physical-support-after", "still-quorum")
+            .await?;
+        Ok(())
     }
     .await;
     harness.finish(result).await

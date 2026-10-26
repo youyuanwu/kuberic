@@ -22,6 +22,8 @@ use crate::replicator::v1::operation_stream::StreamEvent;
 use crate::replicator::v1::received_operation::AckState;
 use crate::replicator::v1::sender::SenderConfig;
 
+mod retained;
+
 #[derive(Default)]
 struct WakeCount(AtomicUsize);
 
@@ -119,6 +121,8 @@ struct Provider {
     fail_context_next: bool,
     fail_epoch: bool,
     epoch_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    retained_progress: Option<Lsn>,
+    progress_calls: AtomicUsize,
 }
 
 impl Provider {
@@ -132,6 +136,8 @@ impl Provider {
             fail_context_next: false,
             fail_epoch: false,
             epoch_hook: None,
+            retained_progress: None,
+            progress_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -168,7 +174,10 @@ impl StateProvider for Provider {
         Ok(Box::pin(stream::iter(items)))
     }
     async fn last_committed_lsn(&self) -> crate::Result<Lsn> {
-        panic!("secondary lifetime does not query provider commitment")
+        self.progress_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .retained_progress
+            .expect("ordinary secondary lifetime does not query provider commitment"))
     }
     async fn get_copy_state(
         &self,

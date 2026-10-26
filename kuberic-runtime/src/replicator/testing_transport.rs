@@ -208,6 +208,20 @@ impl TestingTcpRoute {
         })
     }
 
+    /// Exact child-local attachment evidence, not a routing capability claim.
+    /// Only an acknowledged, live, disarmed actual native creation is observable.
+    /// A process supervisor must separately bind this to its owned child generation.
+    pub fn attachment(&self) -> Option<(ProcessSessionId, ReplicatorCreationId)> {
+        let registrations = routes().lock().unwrap();
+        let registration = registrations.get(&self.instance)?;
+        let (session, owner) = registration.evidence.as_ref()?;
+        let owner = owner.upgrade()?;
+        if owner.armed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        Some((session.clone(), owner.identity.get()?.to_public_id()))
+    }
+
     /// Lose the real retained V1 driver task for one exactly attached creation.
     /// This is negative native fault setup, not terminal execution or drainage.
     pub async fn lose_native_driver(
@@ -392,14 +406,17 @@ mod tests {
         let session = ProcessSessionId::new(instance.clone());
         let creation = creation();
         let id = creation.identity.get().unwrap().to_public_id();
+        assert!(owner.attachment().is_none());
         assert!(!TestingTcpRoute::supports(&session, &id));
         let candidate = before_attachment(&instance, &session).unwrap();
         acknowledge(candidate, &creation);
+        assert!(owner.attachment().is_none());
         assert!(!TestingTcpRoute::supports(&session, &id));
         creation
             .armed
             .store(false, std::sync::atomic::Ordering::Release);
         assert!(TestingTcpRoute::supports(&session, &id));
+        assert_eq!(owner.attachment(), Some((session.clone(), id.clone())));
         assert!(!TestingTcpRoute::supports(
             &ProcessSessionId::new("other"),
             &id
@@ -427,7 +444,12 @@ mod tests {
         let first_id = first.identity.get().unwrap().to_public_id();
         acknowledge(before_attachment(&instance, &session).unwrap(), &first);
         assert!(TestingTcpRoute::supports(&session, &first_id));
+        assert_eq!(
+            _route.attachment(),
+            Some((session.clone(), first_id.clone()))
+        );
         let _failed_attempt = before_attachment(&instance, &session).unwrap();
+        assert!(_route.attachment().is_none());
         assert!(!TestingTcpRoute::supports(&session, &first_id));
         let next = creation();
         next.armed
@@ -438,6 +460,7 @@ mod tests {
         assert!(!TestingTcpRoute::supports(&session, &first_id));
         assert!(TestingTcpRoute::supports(&next_session, &next_id));
         drop(next);
+        assert!(_route.attachment().is_none());
         assert!(!TestingTcpRoute::supports(&next_session, &next_id));
     }
 

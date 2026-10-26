@@ -35,7 +35,8 @@ use super::ingress::{
 };
 use super::primary::{Primary, PrimaryConfig, PrimaryError, PrimaryHandle};
 use super::secondary::{
-    Secondary, SecondaryCallbacks, SecondaryConfig, SecondaryError, SecondaryHandle,
+    RetainedCheckpoint, RetainedProgress, Secondary, SecondaryCallbacks, SecondaryConfig,
+    SecondaryError, SecondaryHandle,
 };
 use super::transport::Route;
 
@@ -109,6 +110,8 @@ struct DataLossRecovery {
 enum Step {
     OpenedProgress,
     InitialPrimary(Epoch),
+    RetainedProgress,
+    RestoreRetainedSecondary,
     Promote(Epoch),
     Demote(Epoch),
     ActivateSecondary,
@@ -127,6 +130,8 @@ pub(super) struct RoleReplicator {
     status: RoleStatus,
     pending: Option<Step>,
     provider_call: Option<BoxFuture<'static, crate::Result<Lsn>>>,
+    retained_progress_call: Option<BoxFuture<'static, Result<RetainedProgress, SecondaryError>>>,
+    retained_call: Option<BoxFuture<'static, Result<RetainedCheckpoint, SecondaryError>>>,
     opened_progress: Option<Result<Lsn, RoleError>>,
     data_loss_call: Option<BoxFuture<'static, DataLossRecovery>>,
     data_loss_failure: Option<RoleError>,
@@ -178,6 +183,8 @@ impl RoleReplicator {
             status: RoleStatus::Created,
             pending: None,
             provider_call: None,
+            retained_progress_call: None,
+            retained_call: None,
             opened_progress: None,
             data_loss_call: None,
             data_loss_failure: None,
@@ -301,6 +308,39 @@ impl RoleReplicator {
         } else {
             Ok(())
         }
+    }
+
+    /// Only a host-qualified, physically exclusive retained creation may select
+    /// this cold path. Neither a cached LSN nor a previous remote ACK is input.
+    pub(super) fn begin_restore_retained_secondary(
+        &mut self,
+        epoch: Epoch,
+    ) -> Result<(), RoleError> {
+        self.check_idle()?;
+        if self.status != RoleStatus::Opened
+            || self.primary.is_some()
+            || self.secondary.is_some()
+            || !self.retired_primaries.is_empty()
+            || !self.retired_secondaries.is_empty()
+        {
+            return Err(RoleError::InvalidState);
+        }
+        if epoch.data_loss_number < 0
+            || epoch.configuration_number < 0
+            || !self.config.secondary.replication.has_persisted_state
+            || self.config.secondary.copy.copy_done
+        {
+            return Err(RoleError::InvalidConfig);
+        }
+        self.opened_progress = None;
+        self.retained_progress_call = Some(Box::pin(Secondary::read_retained_progress(
+            self.provider.clone(),
+            epoch,
+        )));
+        self.pending = Some(Step::RetainedProgress);
+        self.status = RoleStatus::Changing(Role::ActiveSecondary);
+        self.refresh_ingress();
+        Ok(())
     }
 
     pub(super) fn begin_change_role(&mut self, role: Role, epoch: Epoch) -> Result<(), RoleError> {
@@ -650,6 +690,28 @@ impl RoleReplicator {
                     self.primary = Some(Primary::new(config, self.clock.clone())?);
                     self.prepare_primary_epoch(epoch, Some(Role::Primary))?;
                 }
+                Step::RetainedProgress => {
+                    let progress = self.retained_progress_call.as_mut().unwrap().await;
+                    self.retained_progress_call = None;
+                    self.retained_call =
+                        Some(Box::pin(Secondary::confirm_retained_checkpoint(progress?)));
+                    self.pending = Some(Step::RestoreRetainedSecondary);
+                }
+                Step::RestoreRetainedSecondary => {
+                    let checkpoint = self.retained_call.as_mut().unwrap().await;
+                    self.retained_call = None;
+                    self.secondary = Some(Secondary::from_retained(
+                        self.config.secondary_route.clone(),
+                        self.config.secondary,
+                        checkpoint?,
+                        self.config.secondary_callbacks.clone(),
+                        self.clock.clone(),
+                    )?);
+                    self.status = RoleStatus::Ready(Role::ActiveSecondary);
+                    self.pending = None;
+                    self.refresh_ingress();
+                    return Ok(());
+                }
                 Step::Promote(epoch) => {
                     let secondary = self.secondary.as_mut().unwrap();
                     secondary.run().await?.result?;
@@ -748,6 +810,20 @@ impl RoleReplicator {
                 }
                 Step::DataLoss => return self.run_data_loss().await,
                 Step::Abort => {
+                    if let Some(call) = self.retained_progress_call.as_mut() {
+                        let result = call.await;
+                        self.retained_progress_call = None;
+                        if let Err(error) = result {
+                            self.fault.get_or_insert(error.into());
+                        }
+                    }
+                    if let Some(call) = self.retained_call.as_mut() {
+                        let result = call.await;
+                        self.retained_call = None;
+                        if let Err(error) = result {
+                            self.fault.get_or_insert(error.into());
+                        }
+                    }
                     if let Some(call) = self.provider_call.as_mut() {
                         let result = call.await;
                         self.provider_call = None;

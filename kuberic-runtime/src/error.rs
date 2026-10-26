@@ -35,6 +35,8 @@ pub enum RuntimeError {
     Application(String),
     #[error("control-plane error: {0}")]
     ControlPlane(String),
+    #[error("native peer observation is unavailable: {0}")]
+    PeerUnavailable(String),
     #[error("effect sequence {observed} is out of order; expected {expected}")]
     EffectOutOfOrder { expected: u64, observed: u64 },
     #[error("effect sequence {sequence} was reused with a different operation ID")]

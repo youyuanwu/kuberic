@@ -109,7 +109,7 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
     pub(crate) application_control_match: Option<ApplicationControlMatch>,
-    pub(crate) revoke_access: Arc<dyn Fn() -> crate::Result<()> + Send + Sync>,
+    pub(crate) revoke_access: Arc<dyn Fn(bool) -> crate::Result<()> + Send + Sync>,
     pub(crate) capabilities: ReplicatorCapabilities,
     pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,
@@ -222,7 +222,7 @@ impl PublicLifecycleCallbacks {
         let mut aborted = self.aborted.lock().expect("preview abort lock");
         if !*aborted {
             if self.ordinary {
-                let _ = (self.revoke_access)();
+                let _ = (self.revoke_access)(true);
             }
             *aborted = true;
             if self.ordinary
@@ -937,7 +937,10 @@ fn public_v1_call_kind(record: &PublicOperationRecord) -> Result<PublicV1CallKin
     match intent.program.as_ref() {
         Some(PublicOperationProgram::AgentGoal(goal)) => Ok(match goal.desired {
             crate::protocol::public_operations::ReplicaGoalKind::Discover => PublicV1CallKind::Open,
-            crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. } => {
+            crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
+            | crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember {
+                ..
+            } => {
                 if record
                     .ordinary
                     .as_ref()
@@ -948,7 +951,8 @@ fn public_v1_call_kind(record: &PublicOperationRecord) -> Result<PublicV1CallKin
                     PublicV1CallKind::Open
                 }
             }
-            crate::protocol::public_operations::ReplicaGoalKind::Reconfigure { .. } => {
+            crate::protocol::public_operations::ReplicaGoalKind::Reconfigure { .. }
+            | crate::protocol::public_operations::ReplicaGoalKind::RefreshPrimary { .. } => {
                 PublicV1CallKind::Configuration
             }
             crate::protocol::public_operations::ReplicaGoalKind::Build { .. } => {
@@ -1288,13 +1292,11 @@ pub(crate) async fn public_v1_report(
             )
         })
         .and_then(|record| {
-            record.lifecycle.outcomes.iter().find_map(|outcome| {
-                if let PublicInstructionOutcome::Endpoint(address) = outcome {
-                    Some(address.clone())
-                } else {
-                    None
-                }
-            })
+            record
+                .lifecycle
+                .outcomes
+                .iter()
+                .find_map(|outcome| outcome.endpoint().map(str::to_owned))
         });
     let service_location = if projection.role == ReplicaRole::Primary
         && projection.write_status == AccessStatus::Granted

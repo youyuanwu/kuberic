@@ -3,6 +3,10 @@
 use super::*;
 
 impl Production {
+    pub(in crate::replicator::v1::service_adapter) fn retained_service(&self) -> ServiceHandle {
+        self.facade.service()
+    }
+
     pub(in crate::replicator::v1::service_adapter) fn changing_role(&self) -> bool {
         self.role_changing.load(Ordering::Acquire)
     }
@@ -65,6 +69,10 @@ pub(crate) fn test_control(
         recover_on_epoch: std::sync::atomic::AtomicBool::new(false),
         role_transition_pending: std::sync::atomic::AtomicBool::new(false),
         role_changing: Arc::new(AtomicBool::new(false)),
+        quorum_observation: Mutex::new(0),
+        retained: None,
+        retained_initialized: Arc::new(AtomicBool::new(false)),
+        retained_achieved: Mutex::new(None),
         #[cfg(feature = "testing")]
         recovery_spawned: std::sync::atomic::AtomicUsize::new(0),
     })

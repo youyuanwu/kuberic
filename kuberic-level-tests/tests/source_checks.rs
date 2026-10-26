@@ -117,7 +117,10 @@ impl Cargo {
             .current_dir(directory)
             .env_remove("KUBERIC_WORKSPACE_TESTS")
             .env("RUSTUP_TOOLCHAIN", &self.toolchain);
-        if matches!(subcommand, "check" | "clippy" | "package" | "test") {
+        if matches!(
+            subcommand,
+            "build" | "check" | "clippy" | "package" | "test"
+        ) {
             command.arg("--target-dir").arg(&self.target);
         }
         if std::env::var_os("CARGO_BUILD_JOBS").is_none() {
@@ -400,6 +403,37 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
         "--no-run",
         "--offline",
         "--quiet",
+    ]))?;
+    checked_output(cargo.packaged_command(&consumer, "build")?.args([
+        "--bin",
+        "kuberic-counter-member",
+        "--bin",
+        "kuberic-retained-counter-member",
+        "--features",
+        "process-members",
+        "--offline",
+        "--quiet",
+    ]))?;
+    checked_output(cargo.packaged_command(&consumer, "test")?.args([
+        "--lib",
+        "--features",
+        "process-members",
+        "--offline",
+        "--quiet",
+        "process_tests::",
+        "--",
+        "--nocapture",
+    ]))?;
+    checked_output(cargo.packaged_command(&consumer, "test")?.args([
+        "--lib",
+        "--features",
+        "process-members",
+        "--offline",
+        "--quiet",
+        "journeys::stopped_primary_failover_preserves_receipts_and_fences_the_old_service",
+        "--",
+        "--exact",
+        "--nocapture",
     ]))?;
     Ok(())
 }

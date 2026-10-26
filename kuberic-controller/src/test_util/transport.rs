@@ -280,6 +280,7 @@ struct State {
     owners: BTreeMap<String, String>,
     isolated: BTreeSet<String>,
     proxies: BTreeMap<(String, String), Proxy>,
+    native_routes: BTreeMap<String, u64>,
     closed: bool,
     next_owner: u64,
     fault: Option<Fault>,
@@ -515,6 +516,14 @@ impl Network {
         destination: &str,
         endpoint: &str,
     ) -> Result<String> {
+        *self
+            .0
+            .state
+            .lock()
+            .await
+            .native_routes
+            .entry(format!("{kind:?}"))
+            .or_default() += 1;
         // These engine cuts observe local work; unlike the control/data kinds,
         // their endpoint is local and their return value is not a socket dial.
         if matches!(
@@ -536,6 +545,10 @@ impl Network {
         }
         self.route_inner(Some(kind), source, destination, endpoint)
             .await
+    }
+
+    pub async fn native_route_counts(&self) -> BTreeMap<String, u64> {
+        self.0.state.lock().await.native_routes.clone()
     }
 
     async fn route_inner(

@@ -94,6 +94,8 @@ pub(super) fn facade_config<P: StateProvider + 'static>(
             let (build, callbacks) = node.build_parts(id, persisted);
             PeerBinding {
                 information: information(id),
+                conservative_progress: false,
+                fresh_checkpoint: None,
                 build,
                 callbacks,
             }

@@ -117,7 +117,13 @@ async fn main() -> Result<()> {
     });
 
     let mut host_finished = false;
+    let recovery = replica.handle();
     let result: Result<()> = tokio::select! {
+        result = recovery.wait_for_retained_recovery_exit() => {
+            result?;
+            eprintln!("durable retained-member recovery requires physical process exit");
+            std::process::exit(70);
+        },
         result = replica.wait() => {
             host_finished = true;
             result.map_err(Into::into)

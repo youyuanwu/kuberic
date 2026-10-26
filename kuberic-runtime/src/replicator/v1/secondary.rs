@@ -61,7 +61,7 @@ pub(super) enum SecondaryError {
     Fault(String),
     #[error("secondary progress is unavailable before copy completes")]
     NotReady,
-    #[error("StateProvider EndUpdateEpoch: {0}")]
+    #[error("StateProvider callback: {0}")]
     Provider(Arc<RuntimeError>),
     #[error("provider epoch callback is already outstanding")]
     EpochPending,
@@ -69,6 +69,12 @@ pub(super) enum SecondaryError {
     IncompleteCopy,
     #[error("queue transfer requires a successfully drained promotion")]
     InvalidTransfer,
+    #[error("retained initialization requires valid persisted provider progress and epoch")]
+    InvalidRetainedState,
+    #[error("retained receiver has no fresh transport binding, or the binding does not match")]
+    RetainedTransport,
+    #[error("retained local initialization does not admit remote copy/context work")]
+    RetainedCopy,
     #[error(transparent)]
     Establish(#[from] EstablishError),
     #[error("replication receiver: {0}")]
@@ -182,6 +188,22 @@ struct State {
     external_epoch: bool,
     transferred: bool,
     transport_generation: u64,
+    // None is the existing remote-copy/live-transfer path, not a restored owner.
+    retained_bound: Option<bool>,
+}
+
+pub(super) struct RetainedProgress {
+    provider: Arc<dyn StateProvider>,
+    epoch: Epoch,
+    prefix: Lsn,
+}
+
+pub(super) struct RetainedCheckpoint(RetainedProgress);
+
+enum Initialization {
+    Copy,
+    Primary(Epoch, QueueTransfer),
+    Retained(Epoch, Lsn),
 }
 
 // Cleanup callbacks retain the real provider, but not a root->receiver->root
@@ -221,6 +243,9 @@ impl Root {
     fn force_ack(&self, error: i32) {
         let action = {
             let mut state = self.state.lock().unwrap();
+            if state.retained_bound == Some(false) {
+                return;
+            }
             if error != 0 && !state.copy.is_copy_in_progress() {
                 return;
             }
@@ -238,6 +263,9 @@ impl Root {
     fn send_ack(&self, trace: bool) -> bool {
         let ack = {
             let mut state = self.state.lock().unwrap();
+            if state.retained_bound == Some(false) {
+                return false;
+            }
             SecondaryAck {
                 replication: self.replication.lock().unwrap().capture_ack(),
                 copy: state.copy.capture_ack(),
@@ -253,6 +281,9 @@ impl Root {
     fn schedule(&self, check_pending: bool) -> Result<(), SecondaryError> {
         let action = {
             let mut state = self.state.lock().unwrap();
+            if state.retained_bound == Some(false) {
+                return Ok(());
+            }
             let pending = state
                 .copy
                 .pending_ack_progress()
@@ -358,7 +389,50 @@ impl SecondaryHandle {
         let root = self.root()?;
         let state = root.state.lock().unwrap();
         Root::admit(&state)?;
+        if state.retained_bound == Some(false) {
+            return Err(SecondaryError::RetainedTransport);
+        }
         Ok((root.transport_owner, state.transport_generation))
+    }
+
+    /// The caller must first authenticate the new session and its selected source.
+    /// This installs only native routing, never source ACK credit or admission.
+    pub(super) fn bind_retained_transport(
+        &self,
+        route: &Route,
+        epoch: Epoch,
+    ) -> Result<(), SecondaryError> {
+        route.validate().map_err(EstablishError::from)?;
+        let root = self.root()?;
+        let mut state = root.state.lock().unwrap();
+        Root::admit(&state)?;
+        let replication = root.replication.lock().unwrap();
+        let progress = replication
+            .queue()
+            .ok_or(SecondaryError::NotReady)?
+            .progress();
+        let mut bound = root.reply_route.get().unwrap().lock().unwrap();
+        if state.retained_bound != Some(false)
+            || state.external_epoch
+            || state.pending_epoch.is_some()
+            || state.running_epoch.is_some()
+            || replication.minimum_sending_epoch() != Some(epoch)
+            || progress.commit_head != progress.complete_head
+            || progress.tail != progress.commit_head
+            || bound.source != route.source
+            || bound.sender_address != route.sender_address
+            || route.source.partition != route.destination.partition
+            || route.source == route.destination
+        {
+            return Err(SecondaryError::RetainedTransport);
+        }
+        state.transport_generation = state
+            .transport_generation
+            .checked_add(1)
+            .ok_or(SecondaryError::Closed)?;
+        *bound = route.clone();
+        state.retained_bound = Some(true);
+        Ok(())
     }
 
     pub(super) fn continue_transport(
@@ -402,6 +476,9 @@ impl SecondaryHandle {
         let root = self.root()?;
         let mut state = root.state.lock().unwrap();
         Root::admit(&state)?;
+        if state.retained_bound == Some(false) {
+            return Err(SecondaryError::RetainedTransport);
+        }
         let replication = root.replication.lock().unwrap();
         let progress = replication
             .queue()
@@ -468,6 +545,7 @@ impl SecondaryHandle {
             "copyAllReceived": state.copy.all_operations_received(),
             "copyEpoch": replication.copy_epoch(),
             "minimumSendingEpoch": replication.minimum_sending_epoch(),
+            "retainedTransportBound": state.retained_bound,
             "contextRequested": state.context_requested,
             "replicationDispatch": format!("{:?}", root.replication_dispatch.snapshot()),
             "copyDispatch": format!("{:?}", root.copy_dispatch.snapshot()),
@@ -520,7 +598,13 @@ impl SecondaryHandle {
 
     fn start(&self, envelope: &wire::Envelope, bound: bool) -> Result<bool, SecondaryError> {
         let root = self.root()?;
-        Root::admit(&root.state.lock().unwrap())?;
+        {
+            let state = root.state.lock().unwrap();
+            Root::admit(&state)?;
+            if state.retained_bound.is_some() {
+                return Err(SecondaryError::RetainedCopy);
+            }
+        }
         let establishment = root.establishment.get().unwrap();
         let initialized = if bound {
             establishment.process_start(envelope)?
@@ -541,7 +625,13 @@ impl SecondaryHandle {
         envelope: &wire::Envelope,
     ) -> Result<(), SecondaryError> {
         let root = self.root()?;
-        Root::admit(&root.state.lock().unwrap())?;
+        {
+            let state = root.state.lock().unwrap();
+            Root::admit(&state)?;
+            if state.retained_bound.is_some() {
+                return Err(SecondaryError::RetainedCopy);
+            }
+        }
         Ok(root
             .establishment
             .get()
@@ -569,6 +659,21 @@ impl SecondaryHandle {
         let effects = {
             let state = root.state.lock().unwrap();
             Root::admit(&state)?;
+            if state.retained_bound == Some(false) {
+                return Err(SecondaryError::RetainedTransport);
+            }
+            if state.retained_bound == Some(true)
+                && let Some(primary) = &primary
+            {
+                let bound = root.reply_route.get().unwrap().lock().unwrap();
+                if primary.source != bound.source
+                    || primary.destination != bound.destination
+                    || primary.sender_address != bound.sender_address
+                    || primary.remote_address != bound.remote_address
+                {
+                    return Err(SecondaryError::RetainedTransport);
+                }
+            }
             let effects =
                 root.replication
                     .lock()
@@ -595,6 +700,9 @@ impl SecondaryHandle {
         let effects = {
             let mut state = root.state.lock().unwrap();
             Root::admit(&state)?;
+            if state.retained_bound.is_some() {
+                return Err(SecondaryError::RetainedCopy);
+            }
             if root.replication.lock().unwrap().queue().is_none() {
                 return Err(ReceiverError::NotInitialized.into());
             }
@@ -833,6 +941,59 @@ pub(super) struct Secondary {
 }
 
 impl Secondary {
+    pub(super) async fn read_retained_progress(
+        provider: Arc<dyn StateProvider>,
+        epoch: Epoch,
+    ) -> Result<RetainedProgress, SecondaryError> {
+        if epoch.data_loss_number < 0 || epoch.configuration_number < 0 {
+            return Err(SecondaryError::InvalidRetainedState);
+        }
+        let prefix = provider
+            .last_committed_lsn()
+            .await
+            .map_err(|error| SecondaryError::Provider(Arc::new(error)))?;
+        if !(0..Lsn::MAX - 1).contains(&prefix) {
+            return Err(SecondaryError::InvalidRetainedState);
+        }
+        Ok(RetainedProgress {
+            provider,
+            epoch,
+            prefix,
+        })
+    }
+
+    pub(super) async fn confirm_retained_checkpoint(
+        progress: RetainedProgress,
+    ) -> Result<RetainedCheckpoint, SecondaryError> {
+        progress
+            .provider
+            .update_epoch(progress.epoch, progress.prefix)
+            .await
+            .map_err(|error| SecondaryError::Provider(Arc::new(error)))?;
+        Ok(RetainedCheckpoint(progress))
+    }
+
+    pub(super) fn from_retained(
+        route: Route,
+        config: SecondaryConfig,
+        checkpoint: RetainedCheckpoint,
+        callbacks: SecondaryCallbacks,
+        clock: Clock,
+    ) -> Result<Self, SecondaryError> {
+        if !config.replication.has_persisted_state || config.copy.copy_done {
+            return Err(SecondaryError::InvalidRetainedState);
+        }
+        let RetainedCheckpoint(checkpoint) = checkpoint;
+        Self::create(
+            route,
+            config,
+            checkpoint.provider,
+            callbacks,
+            clock,
+            Initialization::Retained(checkpoint.epoch, checkpoint.prefix),
+        )
+    }
+
     pub(super) fn new(
         route: Route,
         config: SecondaryConfig,
@@ -840,7 +1001,14 @@ impl Secondary {
         callbacks: SecondaryCallbacks,
         clock: Clock,
     ) -> Result<Self, SecondaryError> {
-        Self::create(route, config, provider, callbacks, clock, None)
+        Self::create(
+            route,
+            config,
+            provider,
+            callbacks,
+            clock,
+            Initialization::Copy,
+        )
     }
 
     fn create(
@@ -849,18 +1017,26 @@ impl Secondary {
         provider: Arc<dyn StateProvider>,
         callbacks: SecondaryCallbacks,
         clock: Clock,
-        transfer: Option<(Epoch, QueueTransfer)>,
+        initialization: Initialization,
     ) -> Result<Self, SecondaryError> {
         if !config.is_valid() {
             return Err(SecondaryError::InvalidConfig);
         }
-        let replication = Arc::new(Mutex::new(match transfer {
-            Some((epoch, transfer)) => {
+        let retained = matches!(initialization, Initialization::Retained(..));
+        let replication = Arc::new(Mutex::new(match initialization {
+            Initialization::Primary(epoch, transfer) => {
                 SecondaryReceiver::from_primary(config.replication, epoch, transfer)?
             }
-            None => SecondaryReceiver::new(config.replication),
+            Initialization::Retained(epoch, prefix) => {
+                SecondaryReceiver::from_retained(config.replication, epoch, prefix)?
+            }
+            Initialization::Copy => SecondaryReceiver::new(config.replication),
         }));
-        let copy = SecondaryCopyReceiver::new(config.copy)?;
+        let copy = if retained {
+            SecondaryCopyReceiver::for_retained_state(config.copy)?
+        } else {
+            SecondaryCopyReceiver::new(config.copy)?
+        };
         let root = Arc::new_cyclic(|weak: &Weak<Root>| {
             let callback_root = weak.clone();
             let mut ack = AckSender::new(
@@ -903,6 +1079,7 @@ impl Secondary {
                     external_epoch: false,
                     transferred: false,
                     transport_generation: 0,
+                    retained_bound: retained.then_some(false),
                 }),
                 establishment: OnceLock::new(),
                 reply_route: OnceLock::new(),
@@ -974,7 +1151,7 @@ impl Secondary {
             provider,
             callbacks,
             clock,
-            Some((epoch, transfer)),
+            Initialization::Primary(epoch, transfer),
         )
     }
 

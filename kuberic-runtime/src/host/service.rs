@@ -614,6 +614,9 @@ pub(crate) async fn replay_role_at_epoch(
             LifecycleObservation::Closed | LifecycleObservation::Faulted => {
                 return Err(RuntimeError::Closed);
             }
+            LifecycleObservation::TransportQuorum { .. } => {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
         }
     }
     replicator.update_epoch(epoch).await?;
@@ -1171,7 +1174,7 @@ where
             ProtocolCommand::PublicV1History(command) => {
                 if !matches!(command.as_ref(), PublicV1HistoryCommand::Initialize { .. }) {
                     return Err(Status::failed_precondition(
-                        "legacy renewal dispatch is unavailable in ordinary hosting format 17",
+                        "legacy renewal dispatch is unavailable in ordinary hosting format 18",
                     ));
                 }
                 self.execute_history(*command)
@@ -1791,7 +1794,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("unavailable in ordinary hosting format 17")
+                .contains("unavailable in ordinary hosting format 18")
         );
         assert_eq!(store.load_state().await.unwrap(), before);
         service

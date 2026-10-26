@@ -38,6 +38,14 @@ pub struct OpenContext {
     pub partition: StatefulServicePartition,
 }
 
+impl OpenContext {
+    /// One-way Existing-mode startup instructions, not native initialization,
+    /// membership, readiness or access authority.
+    pub fn restoring_retained_member(&self) -> bool {
+        self.mode == OpenMode::Existing && self.partition.restoring_retained_member()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleChange {
     pub service_address: Option<String>,

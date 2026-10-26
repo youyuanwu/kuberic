@@ -42,6 +42,7 @@ use super::session::{ReplicationSession, SessionIdentity, SessionSendBatch};
 use super::transport::Route;
 
 mod policy;
+mod replacement;
 pub(super) use policy::QueuePolicyConfig;
 
 #[derive(Clone)]
@@ -100,6 +101,7 @@ pub(super) enum ConfigurationError {
     IdleNotFound(i64),
     InvalidCopyTarget(i64),
     FaultedIdlePromotion(i64),
+    ReplacementPending(i64),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -254,6 +256,7 @@ pub(super) struct ReplicaManager {
     previous: Option<ReplicaSet>,
     idle: Vec<EstablishedIdle>,
     builds: BTreeMap<i64, BuildIdleHandle>,
+    replacement: Option<replacement::Replacement>,
     build_fault: Option<CopyFault>,
     catchup_configuration: bool,
     // Native majorityReplicasApplyAckedLSNinCC_/allReplicasApplyAckedLSNinCC_.
@@ -263,13 +266,45 @@ pub(super) struct ReplicaManager {
     catchup_wait: Option<CatchupWait>,
 }
 
+pub(super) struct TransportQuorumSnapshot {
+    pub(super) epoch: Epoch,
+    pub(super) write_quorum: usize,
+    pub(super) members: Vec<(i64, super::session::SessionIdentity, bool)>,
+}
+
 impl ReplicaManager {
+    pub(super) fn current_transport_sessions(&self) -> Option<TransportQuorumSnapshot> {
+        self.current
+            .as_ref()
+            .map(|current| TransportQuorumSnapshot {
+                epoch: self.epoch,
+                write_quorum: current.write_quorum,
+                members: current
+                    .members
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.replica_id,
+                            member.session.identity(),
+                            member.session.transport_active(),
+                        )
+                    })
+                    .collect(),
+            })
+    }
     #[cfg(feature = "testing")]
     pub(super) fn inspect_recoveries(&self) -> serde_json::Value {
         serde_json::json!(
             self.builds
                 .iter()
                 .filter_map(|(id, transfer)| {
+                    if self
+                        .replacement
+                        .as_ref()
+                        .is_some_and(|replacement| replacement.replica_id == *id)
+                    {
+                        return None;
+                    }
                     let member = self
                         .current
                         .as_ref()?
@@ -324,7 +359,7 @@ impl ReplicaManager {
         }
         self.check_reported_fault()?;
         self.epoch = epoch;
-        for session in self.established_sessions().into_values() {
+        for (_, session) in self.session_roots() {
             session.update_sending_epoch(epoch);
         }
         Ok(self.queue.last_sequence_number())
@@ -393,6 +428,7 @@ impl ReplicaManager {
             previous: None,
             idle: Vec::new(),
             builds: BTreeMap::new(),
+            replacement: None,
             build_fault: None,
             catchup_configuration: false,
             cached_current: None,
@@ -541,6 +577,33 @@ impl ReplicaManager {
         sessions
     }
 
+    pub(super) fn session_roots(&self) -> Vec<(i64, ReplicationSession)> {
+        let mut roots = Vec::new();
+        for set in self.current.iter().chain(self.previous.iter()) {
+            for member in &set.members {
+                Self::push_root(&mut roots, member.replica_id, member.session.clone());
+            }
+        }
+        for idle in &self.idle {
+            Self::push_root(&mut roots, idle.replica_id, idle.session.clone());
+        }
+        for (id, build) in &self.builds {
+            Self::push_root(&mut roots, *id, build.session());
+        }
+        roots
+    }
+
+    #[cfg(test)]
+    pub(super) fn configuration_roots(&self) -> (Option<ReplicaSet>, Option<ReplicaSet>) {
+        (self.current.clone(), self.previous.clone())
+    }
+
+    fn push_root(roots: &mut Vec<(i64, ReplicationSession)>, id: i64, session: ReplicationSession) {
+        if !roots.iter().any(|(_, known)| known.same_instance(&session)) {
+            roots.push((id, session));
+        }
+    }
+
     fn validate_session(
         &self,
         replica_id: i64,
@@ -632,6 +695,9 @@ impl ReplicaManager {
         configuration: EstablishedConfiguration,
     ) -> Result<ManagerEffects, ManagerError> {
         self.ensure_active()?;
+        if self.replacement.is_some() {
+            return self.configure_replacement(configuration);
+        }
         for member in &configuration.current.members {
             if self.has_idle_membership(member.replica_id) && member.session.idle_faulted() {
                 return Err(ConfigurationError::FaultedIdlePromotion(member.replica_id).into());
@@ -774,6 +840,9 @@ impl ReplicaManager {
 
     fn prepare_idle(&self, idle: &EstablishedIdle) -> Result<(Lsn, ManagerEffects), ManagerError> {
         self.ensure_active()?;
+        if let Some(replacement) = &self.replacement {
+            return Err(ConfigurationError::ReplacementPending(replacement.replica_id).into());
+        }
         self.validate_session(idle.replica_id, &idle.session)?;
         let sessions = self.established_sessions();
         if sessions.contains_key(&idle.replica_id) {
@@ -848,6 +917,13 @@ impl ReplicaManager {
         before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
     ) -> Result<ManagerEffects, ManagerError> {
         self.ensure_active()?;
+        if self
+            .replacement
+            .as_ref()
+            .is_some_and(|replacement| replacement.replica_id == replica_id)
+        {
+            return Err(ConfigurationError::IdleNotFound(replica_id).into());
+        }
         if exclude_voters
             && self.current.iter().chain(self.previous.iter()).any(|set| {
                 set.members
@@ -911,7 +987,10 @@ impl ReplicaManager {
         self.ensure_active()?;
         self.check_reported_fault()?;
         self.validate_session(member.replica_id, &member.session)?;
-        if self.previous.is_some() || self.has_idle_membership(member.replica_id) {
+        if self.replacement.is_some()
+            || self.previous.is_some()
+            || self.has_idle_membership(member.replica_id)
+        {
             return Err(ConfigurationError::InvalidCopyTarget(member.replica_id).into());
         }
         let old = self
@@ -960,7 +1039,7 @@ impl ReplicaManager {
         };
         // Validate observations before admission; an invalid ACK cannot consume
         // an LSN and then hide the admitted operation behind an error.
-        let sessions = self.established_sessions();
+        let sessions = self.session_roots();
         for (replica_id, session) in &sessions {
             self.sample_progress(*replica_id, session)?;
         }
@@ -986,13 +1065,7 @@ impl ReplicaManager {
             self.evaluate_wait(&mut effects);
         }
         let hint = self.queue.first_lsn_in_replication_queue() - 1;
-        let recovering = self
-            .builds
-            .values()
-            .map(|build| build.session())
-            .filter(|session| !sessions.values().any(|known| known.same_instance(session)))
-            .collect::<Vec<_>>();
-        for session in sessions.into_values().chain(recovering) {
+        for (_, session) in sessions {
             effects.sessions.push(SessionEffect::Send {
                 session,
                 operation: operation.clone(),
@@ -1184,6 +1257,12 @@ impl ReplicaManager {
         };
         if achieved {
             let wait = self.catchup_wait.take().unwrap();
+            if wait.mode == CatchupMode::WriteQuorum
+                && let Some(replacement) = &mut self.replacement
+                && replacement.joint.is_some()
+            {
+                replacement.caught_up = true;
+            }
             effects.completions.push((wait.completion, Ok(())));
         }
     }
@@ -1260,9 +1339,9 @@ impl ReplicaManager {
                 .push((wait.completion, Err(CompletionError::ObjectClosed)));
         }
         effects.sessions.extend(
-            self.established_sessions()
-                .into_values()
-                .map(SessionEffect::Close),
+            self.session_roots()
+                .into_iter()
+                .map(|(_, session)| SessionEffect::Close(session)),
         );
         if creating_secondary {
             self.idle.clear();

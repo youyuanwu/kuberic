@@ -10,7 +10,7 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 17;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 19;
 
 #[path = "replica_goal.rs"]
 mod replica_goal;
@@ -501,6 +501,13 @@ impl PublicConfiguration {
                     .members
                     .iter()
                     .map(|m| &m.identity)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != configuration.members.len()
+                || configuration
+                    .members
+                    .iter()
+                    .map(|member| member.identity.replica_id)
                     .collect::<std::collections::BTreeSet<_>>()
                     .len()
                     != configuration.members.len()

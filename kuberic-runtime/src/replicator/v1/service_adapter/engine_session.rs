@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::protocol::public_operations::{
-    RemoteReplicaSelection, ReplicaPublication, ReplicaPublicationStage,
+    RemoteReplicaSelection, ReplicaPeerDescription, ReplicaPublication, ReplicaPublicationStage,
 };
 use crate::protocol::types::{
     Epoch, HistoryContext, ProcessSessionId, ReplicaIdentity, ReplicaRole,
@@ -18,6 +18,10 @@ use crate::protocol::types::{
 use crate::{Result, RuntimeError};
 
 const MAX_SESSIONS: usize = 256;
+
+#[cfg(test)]
+#[path = "engine_session_replacement_tests.rs"]
+pub(super) mod replacement_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -82,16 +86,64 @@ fn guid(domain: &[u8], bytes: &[u8]) -> [u8; 16] {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(try_from = "WireBinding", into = "WireBinding")]
 pub(in crate::replicator::v1) struct Binding {
     pub(super) nonce: String,
     pub(super) source: ReplicaPublication,
     pub(super) target: ReplicaPublication,
     pub(super) recovery: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) continuation: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) reformation: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireBinding {
+    nonce: String,
+    source: ReplicaPublication,
+    target: ReplicaPublication,
+    recovery: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reformation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replacement: Option<ReplicaPeerDescription>,
+}
+
+impl From<Binding> for WireBinding {
+    fn from(binding: Binding) -> Self {
+        let replacement = binding.replacement();
+        Self {
+            nonce: binding.nonce,
+            source: binding.source,
+            target: binding.target,
+            recovery: binding.recovery,
+            continuation: binding.continuation,
+            reformation: binding.reformation,
+            replacement,
+        }
+    }
+}
+
+impl TryFrom<WireBinding> for Binding {
+    type Error = String;
+
+    fn try_from(wire: WireBinding) -> std::result::Result<Self, Self::Error> {
+        let binding = Self {
+            nonce: wire.nonce,
+            source: wire.source,
+            target: wire.target,
+            recovery: wire.recovery,
+            continuation: wire.continuation,
+            reformation: wire.reformation,
+        };
+        if binding.replacement() != wire.replacement {
+            return Err("replacement tag differs from the frozen exact predecessor".into());
+        }
+        binding.validate().map_err(|error| error.to_string())?;
+        Ok(binding)
+    }
 }
 
 impl Binding {
@@ -131,7 +183,83 @@ impl Binding {
         Ok(binding)
     }
 
+    pub(super) fn replacement(&self) -> Option<ReplicaPeerDescription> {
+        self.source
+            .scope
+            .configuration
+            .replicas
+            .iter()
+            .find(|peer| {
+                peer.identity.replica_id == self.target.scope.storage.replica.replica_id
+                    && peer.identity != self.target.scope.storage.replica
+                    && self
+                        .source
+                        .scope
+                        .configuration
+                        .current
+                        .members
+                        .iter()
+                        .any(|member| {
+                            member.identity == peer.identity
+                                && member.role == ReplicaRole::ActiveSecondary
+                        })
+            })
+            .cloned()
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
+        if let Some(old) = &self.replacement() {
+            let source = &self.source;
+            let target = &self.target;
+            let configuration = &source.scope.configuration;
+            if self.recovery
+                || self.reformation
+                || self.continuation.is_some()
+                || source.stage != ReplicaPublicationStage::AchievedScope
+                || source.role != ReplicaRole::Primary
+                || target.stage != ReplicaPublicationStage::AchievedScope
+                || target.role != ReplicaRole::IdleSecondary
+                || source.scope.history != target.scope.history
+                || source.scope.epoch != target.scope.epoch
+                || configuration.previous.is_some()
+                || target.scope.configuration.previous.is_some()
+                || configuration.current != target.scope.configuration.current
+                || configuration.current.epoch != source.scope.epoch
+                || configuration.current.write_quorum <= 1
+                || configuration.current.primary_id != source.scope.storage.replica.replica_id
+                || !configuration.replicas.contains(old)
+                || old.identity.replica_id != target.scope.storage.replica.replica_id
+                || old.identity == target.scope.storage.replica
+                || old.storage_incarnation == target.scope.storage
+                || old.process_session_id == target.scope.process_session_id
+                || old.replication_address == target.replication_address
+                || old.role != ReplicaRole::ActiveSecondary
+                || old.is_up
+                || old.is_ready
+                || old.must_catchup
+                || old.current_progress != crate::application::INVALID_LSN
+                || old.catch_up_capability != crate::application::INVALID_LSN
+                || !configuration.current.members.iter().any(|member| {
+                    member.identity == old.identity && member.role == ReplicaRole::ActiveSecondary
+                })
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+        }
+        let overlaps_physical =
+            self.source
+                .scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .any(|member| {
+                    member.identity.replica_id == self.target.scope.storage.replica.replica_id
+                        && member.identity != self.target.scope.storage.replica
+                });
+        if overlaps_physical != self.replacement().is_some() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         if uuid::Uuid::parse_str(&self.nonce).is_err()
             || (self.reformation
                 && (self.recovery
@@ -463,7 +591,49 @@ impl Fence {
     }
 }
 
+pub(super) fn endpoint_matches_peer(endpoint: &Endpoint, peer: &ReplicaPeerDescription) -> bool {
+    endpoint.identity == peer.identity
+        && endpoint.storage == peer.storage_incarnation
+        && endpoint.process_session_id == peer.process_session_id
+        && endpoint.address == peer.replication_address
+}
+
 impl Sessions {
+    pub(super) fn vacant_receiver(&self) -> bool {
+        let state = self.0.lock().unwrap();
+        !state.closed && state.receiver.is_none() && state.entries.is_empty()
+    }
+
+    pub(super) fn restore_receiver(
+        &self,
+        binding: &Binding,
+        native: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        binding.validate()?;
+        let mut state = self.0.lock().unwrap();
+        if state.closed
+            || !binding.reformation
+            || state.receiver.is_some()
+            || !state.entries.is_empty()
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        native()?;
+        state.entries.insert(
+            binding.nonce.clone(),
+            Entry {
+                binding: binding.clone(),
+                phase: Phase::Reserved,
+                admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: false,
+                predecessor: None,
+                proposed: true,
+            },
+        );
+        state.receiver = Some(binding.nonce.clone());
+        Ok(())
+    }
+
     pub(super) fn reformation_predecessor(&self, binding: &Binding) -> Result<Binding> {
         binding.validate()?;
         let state = self.0.lock().unwrap();
@@ -779,12 +949,17 @@ impl Sessions {
                 && entry.binding.target.scope == binding.target.scope
                 && entry.binding.primary() == binding.primary()
                 && entry.binding.secondary() == binding.secondary()
-                && matches!(
+                && (matches!(
                     entry.phase,
                     Phase::Proposed | Phase::Active | Phase::Completed
-                )
+                ) || (entry.phase == Phase::Recovering
+                    && binding.replacement().is_some()
+                    && entry.binding.replacement() == binding.replacement()))
         }) {
             return Ok(entry.binding.clone());
+        }
+        if binding.replacement().is_some() {
+            return Self::replacement_reservation(&mut state, binding);
         }
         if state.entries.len() >= MAX_SESSIONS
             || state
@@ -806,6 +981,145 @@ impl Sessions {
             },
         );
         Ok(binding)
+    }
+
+    fn replacement_reservation(state: &mut State, binding: Binding) -> Result<Binding> {
+        let selected = binding.replacement().unwrap();
+        let mut old = state.entries.values().filter(|entry| {
+            endpoint_matches_peer(&entry.binding.secondary(), &selected)
+                && entry.binding.primary() == binding.primary()
+                && entry.binding.history() == binding.history()
+                && entry.copy_completed
+                && matches!(
+                    entry.phase,
+                    Phase::Completed | Phase::Retiring | Phase::SourceRetired
+                )
+        });
+        let predecessor = old.next().map(|entry| entry.binding.clone());
+        if old.next().is_some()
+            || state.entries.len() >= MAX_SESSIONS
+            || state.entries.values().any(|entry| {
+                predecessor
+                    .as_ref()
+                    .is_none_or(|old| old.nonce != entry.binding.nonce)
+                    && entry.conflicts_with(&binding)
+            })
+            || predecessor.as_ref().is_some_and(|old| {
+                old.secondary().creation_id == binding.secondary().creation_id
+                    || old.epoch().data_loss_number != binding.epoch().data_loss_number
+                    || old.epoch().configuration_number > binding.epoch().configuration_number
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        state.entries.insert(
+            binding.nonce.clone(),
+            Entry {
+                binding: binding.clone(),
+                phase: Phase::Recovering,
+                admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: false,
+                predecessor: predecessor.map(|old| old.nonce),
+                proposed: false,
+            },
+        );
+        Ok(binding)
+    }
+
+    pub(super) fn replacement_predecessor(&self, binding: &Binding) -> Result<Option<Binding>> {
+        let state = self.0.lock().unwrap();
+        let entry = state
+            .entries
+            .get(&binding.nonce)
+            .filter(|entry| {
+                !state.closed
+                    && entry.binding == *binding
+                    && binding.replacement().is_some()
+                    && entry.phase == Phase::Recovering
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        Ok(entry
+            .predecessor
+            .as_ref()
+            .map(|nonce| state.entries[nonce].binding.clone()))
+    }
+
+    /// The caller has joined only source carrier/ACK work, not the old receiver.
+    pub(super) fn replacement_source_settled(&self, binding: &Binding) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        let predecessor = state
+            .entries
+            .get(&binding.nonce)
+            .filter(|entry| {
+                !state.closed
+                    && entry.binding == *binding
+                    && binding.replacement().is_some()
+                    && entry.phase == Phase::Recovering
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?
+            .predecessor
+            .clone();
+        if let Some(nonce) = predecessor {
+            let old = state
+                .entries
+                .get_mut(&nonce)
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if !matches!(old.phase, Phase::Retiring | Phase::SourceRetired) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            old.admitted.store(false, Ordering::Release);
+            old.phase = Phase::SourceRetired;
+            old.proposed = false;
+        }
+        let entry = state.entries.get_mut(&binding.nonce).unwrap();
+        entry.phase = Phase::Proposed;
+        entry.proposed = true;
+        Ok(())
+    }
+
+    pub(super) fn metadata_for_peer(&self, peer: &ReplicaPeerDescription) -> Option<Binding> {
+        let state = self.0.lock().unwrap();
+        let rank = |entry: &Entry| {
+            let phase = match entry.phase {
+                Phase::Proposed | Phase::Active | Phase::Completed => 3,
+                Phase::SourceRetired => 2,
+                Phase::Recovering | Phase::Reserved | Phase::Retiring | Phase::RetiringSource => 1,
+                Phase::Retired => 0,
+            };
+            (entry.binding.epoch(), phase)
+        };
+        let best = state
+            .entries
+            .values()
+            .filter(|entry| endpoint_matches_peer(&entry.binding.secondary(), peer))
+            .map(&rank)
+            .max()?;
+        let mut selected = state.entries.values().filter(|entry| {
+            endpoint_matches_peer(&entry.binding.secondary(), peer) && rank(entry) == best
+        });
+        let binding = selected.next()?.binding.clone();
+        selected.next().is_none().then_some(binding)
+    }
+
+    pub(super) fn completed_replacement_for(&self, binding: &Binding) -> Option<Binding> {
+        let state = self.0.lock().unwrap();
+        if state.closed {
+            return None;
+        }
+        let mut selected = state.entries.values().filter(|entry| {
+            entry.phase == Phase::Completed
+                && entry.copy_completed
+                && entry.binding.replacement().as_ref().is_some_and(|old| {
+                    old.identity.replica_id != binding.secondary().identity.replica_id
+                })
+                && entry.binding.primary() == binding.primary()
+                && entry.binding.history() == binding.history()
+                && entry.binding.epoch() == binding.epoch()
+                && entry.binding.source.scope.configuration.current
+                    == binding.source.scope.configuration.current
+        });
+        let binding = selected.next()?.binding.clone();
+        selected.next().is_none().then_some(binding)
     }
 
     pub(super) fn reserve_recovery(&self, binding: &Binding) -> Result<Binding> {
@@ -989,17 +1303,14 @@ impl Sessions {
     }
 
     pub(super) fn binding_for(&self, replica: i64) -> Option<Binding> {
-        self.0
-            .lock()
-            .unwrap()
-            .entries
-            .values()
-            .find(|entry| {
-                entry.binding.secondary().identity.replica_id.value() == replica
-                    && !matches!(entry.phase, Phase::Retired | Phase::SourceRetired)
-                    && entry.proposed
-            })
-            .map(|entry| entry.binding.clone())
+        let state = self.0.lock().unwrap();
+        let mut selected = state.entries.values().filter(|entry| {
+            entry.binding.secondary().identity.replica_id.value() == replica
+                && !matches!(entry.phase, Phase::Retired | Phase::SourceRetired)
+                && entry.proposed
+        });
+        let binding = selected.next()?.binding.clone();
+        selected.next().is_none().then_some(binding)
     }
 
     pub(super) fn inbound(&self) -> Option<Binding> {
@@ -1013,6 +1324,52 @@ impl Sessions {
 
     pub(super) fn retire(&self, binding: &Binding) -> Result<()> {
         self.retire_with(binding, || Ok(()))
+    }
+
+    pub(super) fn retire_unavailable_receiver_credit(
+        &self,
+        binding: &Binding,
+        credit: impl FnOnce() -> Result<()>,
+    ) -> Result<Result<()>> {
+        let mut state = self.0.lock().unwrap();
+        if state.closed || state.receiver.as_ref() != Some(&binding.nonce) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let entry = state
+            .entries
+            .get_mut(&binding.nonce)
+            .filter(|entry| {
+                entry.binding == *binding
+                    && entry.copy_completed
+                    && matches!(
+                        entry.phase,
+                        Phase::Active | Phase::Completed | Phase::Retiring
+                    )
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        entry.phase = Phase::Retiring;
+        entry.admitted.store(false, Ordering::Release);
+        Ok(credit())
+    }
+
+    pub(super) fn drain_retiring_receiver_credit(
+        &self,
+        binding: &Binding,
+        credit: impl FnOnce() -> Result<()>,
+    ) -> Result<Result<()>> {
+        let state = self.0.lock().unwrap();
+        if state.closed
+            || state.receiver.as_ref() != Some(&binding.nonce)
+            || !state.entries.get(&binding.nonce).is_some_and(|entry| {
+                entry.binding == *binding
+                    && entry.phase == Phase::Retiring
+                    && entry.copy_completed
+                    && !entry.admitted.load(Ordering::Acquire)
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(credit())
     }
 
     pub(super) fn quarantine(&self, binding: &Binding, contain: impl FnOnce(bool)) {
@@ -1163,6 +1520,38 @@ impl Sessions {
                 .entries
                 .get(&binding.nonce)
                 .is_some_and(|entry| entry.binding == *binding && entry.phase == Phase::Retiring)
+    }
+
+    pub(super) fn retiring_receiver_successor(&self, origin: &Binding) -> Option<Binding> {
+        let state = self.0.lock().unwrap();
+        if state.closed {
+            return None;
+        }
+        let receiver = state
+            .receiver
+            .as_ref()
+            .and_then(|nonce| state.entries.get(nonce))?;
+        if receiver.phase != Phase::Retiring
+            || !receiver.copy_completed
+            || receiver.binding.secondary() != origin.secondary()
+            || receiver.binding.history() != origin.history()
+        {
+            return None;
+        }
+        let mut ancestor = Some(receiver);
+        while let Some(entry) = ancestor {
+            if entry.binding == *origin {
+                return Some(receiver.binding.clone());
+            }
+            if !entry.binding.retained_receiver() {
+                return None;
+            }
+            ancestor = entry
+                .predecessor
+                .as_ref()
+                .and_then(|nonce| state.entries.get(nonce));
+        }
+        None
     }
 
     pub(super) fn role_receiver_settled(&self) -> Result<()> {

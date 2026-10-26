@@ -91,7 +91,7 @@ pub(crate) async fn recover(
     callbacks.aborted = registry.abort_guard();
     // Recovery cannot execute the uncertain instruction program. It still
     // owns Abort and actual drain, independently of any replay observer.
-    let revoked = (callbacks.revoke_access)();
+    let revoked = (callbacks.revoke_access)(true);
     callbacks.abort_once();
     let (cleanup, owner) = bind(callbacks);
     let operation = operation.clone();

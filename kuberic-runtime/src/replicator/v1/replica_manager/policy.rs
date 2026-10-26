@@ -43,9 +43,24 @@ impl QueuePolicyConfig {
 }
 
 impl ReplicaManager {
+    fn policy_idles(&self) -> Vec<EstablishedIdle> {
+        let mut idles = self.idle.clone();
+        if let Some(replacement) = &self.replacement
+            && replacement.joint.is_none()
+            && let Some(build) = self.builds.get(&replacement.replica_id)
+        {
+            idles.push(EstablishedIdle {
+                replica_id: replacement.replica_id,
+                session: build.session(),
+                finish_copy_target: None,
+            });
+        }
+        idles
+    }
+
     fn retarget_idles(&self, target: Lsn) -> Result<bool, ManagerError> {
         let mut changed = false;
-        for idle in &self.idle {
+        for idle in self.policy_idles() {
             if idle.session.idle_faulted() {
                 continue;
             }
@@ -92,7 +107,7 @@ impl ReplicaManager {
                 let first = self.queue.first_lsn_in_replication_queue();
                 let last = self.queue.last_sequence_number();
                 let mut faulted = false;
-                for idle in &self.idle {
+                for idle in self.policy_idles() {
                     if idle.session.idle_faulted() {
                         continue;
                     }

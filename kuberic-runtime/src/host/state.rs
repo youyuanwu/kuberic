@@ -18,7 +18,7 @@ use crate::protocol::types::{
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_V1_PHASE6_SCHEMA_VERSION: u32 = 11;
-pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 17;
+pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 19;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +98,19 @@ pub(crate) struct OrdinaryGoalRecord {
     pub(crate) logically_retired: bool,
     pub(crate) host_settled: bool,
     pub(crate) ready_admissions: Vec<crate::protocol::public_operations::RemoteReplicaSelection>,
+    #[serde(default)]
+    pub(crate) retained: Option<RetainedMemberReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetainedMemberReceipt {
+    pub(crate) qualification: crate::protocol::public_operations::RetainedMemberQualification,
+    pub(crate) successor_process: crate::protocol::types::ProcessSessionId,
+    pub(crate) successor_creation: crate::protocol::types::ReplicatorCreationId,
+    pub(crate) owner_process_id: u32,
+    pub(crate) predecessor_process_id: u32,
+    pub(crate) owner_process_lifetime: String,
+    pub(crate) predecessor_process_lifetime: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +200,14 @@ pub(crate) enum PublicInstructionOutcome {
     ApplicationRole(Option<String>),
     DataLoss(DataLossOutcome),
     Endpoint(String),
+    BuiltinNativeEndpoint {
+        endpoint: String,
+        process_id: u32,
+        process_lifetime: String,
+        storage_owner: Option<crate::protocol::types::ProcessSessionId>,
+    },
+    RetainedNativeInitialized(Box<crate::protocol::public_operations::ReplicaScope>),
+    RecoveryExitRequired(Box<crate::protocol::public_operations::RetainedRecoveryExitNotice>),
     Progress(i64),
     CloseFailure {
         child: PublicCloseChild,
@@ -195,6 +216,16 @@ pub(crate) enum PublicInstructionOutcome {
     RebuildRequired(Box<crate::protocol::public_operations::CanonicalReplicaRebuildRequired>),
 }
 
+impl PublicInstructionOutcome {
+    pub(crate) fn endpoint(&self) -> Option<&str> {
+        match self {
+            Self::Endpoint(endpoint) | Self::BuiltinNativeEndpoint { endpoint, .. } => {
+                Some(endpoint)
+            }
+            _ => None,
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PublicCloseChild {
     Replicator,

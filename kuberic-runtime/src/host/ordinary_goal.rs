@@ -3,6 +3,9 @@ use super::{HostError, Result};
 use crate::protocol::public_operations::*;
 use crate::protocol::types::*;
 
+#[path = "retained.rs"]
+pub(crate) mod retained;
+
 fn reject(message: &str) -> HostError {
     HostError::CommandRejected(message.into())
 }
@@ -77,6 +80,87 @@ fn retained_source_member(
         })
 }
 
+fn retained_election_member(
+    state: &AgentState,
+    goal: &ReplicaGoal,
+    peer: &ReplicaPeerDescription,
+) -> bool {
+    let Some(previous) = goal.scope.configuration.previous.as_ref() else {
+        return false;
+    };
+    let current = &goal.scope.configuration.current;
+    if !matches!(
+        goal.desired,
+        ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::Primary,
+            catch_up: Some(_)
+        }
+    ) || current.primary_id != goal.scope.storage.replica.replica_id
+        || current.primary_id == previous.primary_id
+        || current.write_quorum != previous.write_quorum
+        || current.epoch.data_loss_number != previous.epoch.data_loss_number
+        || current.epoch.configuration_number <= previous.epoch.configuration_number
+        || !previous.members.iter().any(|member| {
+            member.identity == goal.scope.storage.replica
+                && member.role == ReplicaRole::ActiveSecondary
+        })
+        || !current.members.iter().all(|member| {
+            previous
+                .members
+                .iter()
+                .any(|old| old.identity == member.identity)
+                && (member.identity == goal.scope.storage.replica
+                    || member.role == ReplicaRole::ActiveSecondary)
+        })
+        || !current.members.iter().any(|member| {
+            member.identity == peer.identity && member.role == ReplicaRole::ActiveSecondary
+        })
+        || !previous.members.iter().any(|member| {
+            member.identity == peer.identity && member.role == ReplicaRole::ActiveSecondary
+        })
+        || peer.role != ReplicaRole::ActiveSecondary
+    {
+        return false;
+    }
+    state
+        .public_v1_operation_state
+        .as_ref()
+        .is_some_and(|preview| {
+            preview.operations.values().any(|record| {
+                let Some(old) = record.intent.goal() else {
+                    return false;
+                };
+                record.intent.revision < goal.revision
+                    && record.stage == PublicOperationStage::Completed
+                    && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                    && record.lifecycle.in_flight.is_none()
+                    && record
+                        .ordinary
+                        .as_ref()
+                        .is_some_and(|ordinary| ordinary.accepted)
+                    && record.accepted_history.as_ref() == Some(&goal.scope.history)
+                    && record.accepted_storage.as_ref() == Some(&goal.scope.storage)
+                    && old.scope.process_session_id == goal.scope.process_session_id
+                    && old.scope.creation_id == goal.scope.creation_id
+                    && old.scope.configuration.current == *previous
+                    && old.scope.configuration.previous.is_none()
+                    && old.role() == Some(ReplicaRole::ActiveSecondary)
+                    && super::public_action_state::achieved_role(record, false)
+                        == Some(ReplicaRole::ActiveSecondary)
+                    && super::public_action_state::achieved_role(record, true)
+                        == Some(ReplicaRole::ActiveSecondary)
+                    && super::public_lifecycle::achieved_configuration_from_record(record)
+                        == Some(old.scope.configuration.ordinary())
+                    && old.scope.configuration.replicas.iter().any(|known| {
+                        known.identity == peer.identity
+                            && known.storage_incarnation == peer.storage_incarnation
+                            && known.role == ReplicaRole::ActiveSecondary
+                            && known.process_session_id != peer.process_session_id
+                    })
+            })
+        })
+}
+
 fn new_voters<'a>(
     state: &AgentState,
     goal: &'a ReplicaGoal,
@@ -84,7 +168,10 @@ fn new_voters<'a>(
     // Initial Prepare recovers the bootstrap topology without granting access.
     // Subsequent voting additions must cross the accepted idle-Ready boundary.
     if goal.role() != Some(ReplicaRole::Primary)
-        || !matches!(goal.desired, ReplicaGoalKind::Reconfigure { .. })
+        || !matches!(
+            goal.desired,
+            ReplicaGoalKind::Reconfigure { .. } | ReplicaGoalKind::RefreshPrimary { .. }
+        )
     {
         return Ok(Vec::new());
     }
@@ -134,6 +221,14 @@ fn new_voters<'a>(
                 .into_iter()
                 .filter(|peer| {
                     if retained_source_member(state, goal, peer) {
+                        return false;
+                    }
+                    // This is an original same-storage voter, not an idle
+                    // addition. Only an attempt is admitted here: the actual
+                    // native higher-epoch reformation still requires fresh
+                    // checked target receipts/binding/ACKs before any quorum,
+                    // successful configuration or serving publication.
+                    if retained_election_member(state, goal, peer) {
                         return false;
                     }
                     previous.as_ref().is_none_or(|old| {
@@ -327,6 +422,18 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
             ))
         };
     }
+    if preview
+        .operations
+        .values()
+        .any(|record| record.intent.revision >= goal.revision)
+    {
+        return Err(reject(
+            "goal revision or epoch is stale: revision does not exceed the complete journal high-watermark",
+        ));
+    }
+    if matches!(goal.desired, ReplicaGoalKind::RestoreRetainedMember { .. }) {
+        retained::validate_restore(state, goal)?;
+    }
     if goal.class().is_terminal()
         && preview.operations.values().any(|record| {
             record.intent.goal().is_some()
@@ -382,6 +489,70 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
             {
                 return Err(reject("selected ordinary call remains uncertain"));
             }
+        }
+    }
+    if matches!(goal.desired, ReplicaGoalKind::RefreshPrimary { .. }) {
+        let mut completed = preview
+            .operations
+            .values()
+            .filter(|record| {
+                record.intent.process_session_id == goal.scope.process_session_id
+                    && record.accepted_history.as_ref() == Some(&goal.scope.history)
+                    && record.accepted_storage.as_ref() == Some(&goal.scope.storage)
+                    && record
+                        .intent
+                        .goal()
+                        .is_some_and(|old| old.scope.creation_id == goal.scope.creation_id)
+                    && record.stage == PublicOperationStage::Completed
+                    && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                    && record.lifecycle.in_flight.is_none()
+            })
+            .collect::<Vec<_>>();
+        completed.sort_by_key(|record| record.intent.revision);
+        for application in [false, true] {
+            if completed
+                .iter()
+                .rev()
+                .find_map(|record| super::public_action_state::achieved_role(record, application))
+                != Some(ReplicaRole::Primary)
+            {
+                return Err(reject(
+                    "Primary refresh requires actual unchanged native and application Primary roles",
+                ));
+            }
+        }
+        if matches!(
+            goal.desired,
+            ReplicaGoalKind::RefreshPrimary { catch_up: Some(_) }
+        ) && goal.scope.configuration.previous.is_none()
+            && !completed.iter().any(|record| {
+                record.intent.goal().is_some_and(|old| {
+                    matches!(
+                        old.desired,
+                        ReplicaGoalKind::RefreshPrimary {
+                            catch_up: Some(PublicCatchUpMode::WriteQuorum),
+                        }
+                    ) && old.scope.configuration.previous.is_some()
+                        && old.scope.epoch == goal.scope.epoch
+                        && old.scope.configuration.current == goal.scope.configuration.current
+                        && goal.scope.configuration.replicas.iter().all(|peer| {
+                            old.scope.configuration.replicas.iter().any(|prior| {
+                                prior.identity == peer.identity
+                                    && prior.storage_incarnation == peer.storage_incarnation
+                                    && prior.process_session_id == peer.process_session_id
+                                    && prior.replication_address == peer.replication_address
+                                    && prior.role == peer.role
+                            })
+                        })
+                }) && record.ordinary.as_ref().is_some_and(|ordinary| {
+                    ordinary.actions.contains(&PublicInstruction::FirstCatchUp)
+                        && record.lifecycle.outcomes.len() == ordinary.actions.len()
+                })
+            })
+        {
+            return Err(reject(
+                "current-only Primary refresh lacks its exact completed joint WriteQuorum",
+            ));
         }
     }
     if matches!(goal.desired, ReplicaGoalKind::Prepare { .. })
@@ -568,6 +739,13 @@ pub(crate) fn terminal_for_process(
         .values()
         .filter(|record| record.intent.class.is_terminal())
         .collect::<Vec<_>>();
+    if !terminals.is_empty()
+        && terminals
+            .iter()
+            .all(|record| retained::fault_dependency_replaced(preview, record, process))
+    {
+        return false;
+    }
     // An older clean Close cannot clear a later preparation or join failure.
     let settled_boundary = terminals
         .iter()
@@ -582,6 +760,9 @@ pub(crate) fn terminal_for_process(
                     || record.lifecycle.in_flight.is_some())
         })
         || terminals.iter().any(|record| {
+            if retained::fault_dependency_replaced(preview, record, process) {
+                return false;
+            }
             record.intent.goal().is_none()
                 || &record.intent.process_session_id == process
                 || record.stage != PublicOperationStage::Completed
@@ -635,7 +816,9 @@ pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryG
         actions,
         open_existing: matches!(
             goal.desired,
-            ReplicaGoalKind::Discover | ReplicaGoalKind::Prepare { .. }
+            ReplicaGoalKind::Discover
+                | ReplicaGoalKind::Prepare { .. }
+                | ReplicaGoalKind::RestoreRetainedMember { .. }
         )
         .then_some(state.application_open_mode() == crate::application::OpenMode::Existing),
         already_open,
@@ -643,6 +826,7 @@ pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryG
         logically_retired: false,
         host_settled: false,
         ready_admissions: admission_ready(state, goal)?,
+        retained: None,
     })
 }
 
@@ -666,7 +850,7 @@ pub(crate) fn opened_creation(state: &AgentState, goal: &ReplicaGoal) -> bool {
                         .lifecycle
                         .outcomes
                         .iter()
-                        .any(|outcome| matches!(outcome, PublicInstructionOutcome::Endpoint(_)))
+                        .any(|outcome| outcome.endpoint().is_some())
             })
         })
 }
@@ -700,10 +884,7 @@ pub(crate) fn publication(
             .lifecycle
             .outcomes
             .iter()
-            .find_map(|outcome| match outcome {
-                PublicInstructionOutcome::Endpoint(endpoint) => Some(endpoint.clone()),
-                _ => None,
-            })
+            .find_map(|outcome| outcome.endpoint().map(str::to_owned))
     })?;
     let record = records.last()?;
     let goal = record.intent.goal()?;
@@ -726,9 +907,27 @@ pub(crate) fn publication(
             record.lifecycle.outcomes.len() == ordinary.actions.len()
                 && record.lifecycle.in_flight.is_none()
         });
+    let mut scope = goal.scope.clone();
+    if !achieved
+        && let Some(PublicOperationProgram::Swap { refreshed, .. }) =
+            super::public_lifecycle::program::ordinary_handoff(goal)
+    {
+        scope.configuration.current = refreshed.current;
+        for peer in &mut scope.configuration.replicas {
+            if let Some(member) = scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .find(|member| member.identity == peer.identity)
+            {
+                peer.role = member.role;
+            }
+        }
+    }
     Some(ReplicaPublication {
         format: ORDINARY_ACTION_FORMAT,
-        scope: goal.scope.clone(),
+        scope,
         replication_address: opened,
         generation: goal.revision,
         stage: if achieved {
@@ -818,7 +1017,7 @@ pub(crate) fn snapshot(
         write_status: AccessStatus::NotPrimary,
         withdrawn,
         provider_writer_held: false,
-        process_session_id: process,
+        process_session_id: process.clone(),
         creation_id: creation,
         publication,
         goals,
@@ -827,6 +1026,16 @@ pub(crate) fn snapshot(
         capability: ProgressQueryResult::NotQueried(
             "ordinary capability has not been sampled".into(),
         ),
+        accepted_revision_high_watermark: state
+            .public_v1_operation_state
+            .as_ref()
+            .into_iter()
+            .flat_map(|preview| preview.operations.values())
+            .map(|record| record.intent.revision)
+            .max()
+            .unwrap_or(0),
+        retained_recovery_exit: retained::status(state, &process),
+        retained_member_qualification: retained::qualification_for_process(state, &process),
     }
 }
 
@@ -917,6 +1126,12 @@ pub(crate) fn validate_acknowledgement(
         .ordinary
         .as_ref()
         .ok_or_else(|| HostError::Corrupt("ordinary goal lacks frozen actions".into()))?;
+    if matches!(goal.desired, ReplicaGoalKind::RestoreRetainedMember { .. }) {
+        retained::validate_receipt(state, record)?;
+        if record.superseded_by.is_some() {
+            return Err(reject("restored endpoint was superseded before acceptance"));
+        }
+    }
     if acknowledgement.logically_retired && !ordinary.logically_retired {
         return Err(reject(
             "controller acknowledgement cannot invent local idle retirement",

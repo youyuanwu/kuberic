@@ -222,6 +222,22 @@ impl SecondaryReceiver {
         Ok(receiver)
     }
 
+    pub(super) fn from_retained(
+        config: ReceiverConfig,
+        epoch: Epoch,
+        prefix: Lsn,
+    ) -> Result<Self, ReceiverError> {
+        if !(0..Lsn::MAX - 1).contains(&prefix) || !config.queue.is_valid() {
+            return Err(ReceiverError::InvalidStart);
+        }
+        let mut receiver = Self::new(config);
+        receiver.initialize(prefix + 1, epoch)?;
+        receiver.callback.lock().unwrap().provider_epoch = Some(epoch);
+        // The checkpoint is not pending ACK work from a previous connection.
+        receiver.last_completed_ack = prefix;
+        Ok(receiver)
+    }
+
     pub(super) fn take_for_primary(&mut self) -> Result<QueueTransfer, ReceiverError> {
         let queue = self.queue.as_ref().ok_or(ReceiverError::NotInitialized)?;
         if queue.progress().commit_head != queue.progress().complete_head {
