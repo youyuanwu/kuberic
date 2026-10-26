@@ -37,7 +37,7 @@ pub const SCALE_UP_ALLOCATION_ANNOTATION: &str =
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetSpec {
-    #[schemars(range(min = 16, max = 16))]
+    #[schemars(range(min = 17, max = 17))]
     pub hosting_format: u32,
     #[schemars(range(min = 1))]
     pub replicas: u32,
@@ -117,7 +117,7 @@ impl KubericSet {
         use kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT;
         if self.spec.hosting_format != ORDINARY_ACTION_FORMAT {
             return Err(
-                "incompatible KubericSet hosting format; fresh format 16 is required".into(),
+                "incompatible KubericSet hosting format; fresh format 17 is required".into(),
             );
         }
         let Some(status) = self.status.as_ref() else {

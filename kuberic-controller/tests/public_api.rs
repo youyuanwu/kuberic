@@ -83,18 +83,18 @@ fn shipped_sample_matches_ordinary_hosting_format() {
     let sample: KubericSet =
         serde_yaml_ng::from_str(include_str!("../../examples/kvstore2/deploy/sample.yaml"))
             .unwrap();
-    assert_eq!(ORDINARY_ACTION_FORMAT, 16);
+    assert_eq!(ORDINARY_ACTION_FORMAT, 17);
     assert_eq!(sample.spec.hosting_format, ORDINARY_ACTION_FORMAT);
     assert_eq!(sample.spec.hosting_format, PUBLIC_V1_PROTOCOL_VERSION);
     let schema = serde_json::to_value(KubericSet::crd()).unwrap();
     let format = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
         ["properties"]["hostingFormat"];
-    assert_eq!(format["minimum"].as_f64(), Some(16.0));
-    assert_eq!(format["maximum"].as_f64(), Some(16.0));
+    assert_eq!(format["minimum"].as_f64(), Some(17.0));
+    assert_eq!(format["maximum"].as_f64(), Some(17.0));
     sample.validate_ordinary_hosting().unwrap();
 
     let mut old = sample.clone();
-    old.spec.hosting_format = 15;
+    old.spec.hosting_format = 16;
     let before = old.clone();
     assert!(old.validate_ordinary_hosting().is_err());
     assert_eq!(old, before);

@@ -188,6 +188,7 @@ impl Node {
                 resource_uid: resource.to_string(),
                 target: Some(identity.clone().into()),
                 expected_process_session_id: String::new(),
+                sample_native_progress: false,
             }))
             .await
             .unwrap()
@@ -212,6 +213,10 @@ impl Node {
     }
 
     async fn snapshot(&self) -> ReplicaAgentSnapshot {
+        self.snapshot_sampling(false).await
+    }
+
+    async fn snapshot_sampling(&self, sample_native_progress: bool) -> ReplicaAgentSnapshot {
         let mut client =
             control::agent_control_client::AgentControlClient::connect(self.address.clone())
                 .await
@@ -222,6 +227,7 @@ impl Node {
                 resource_uid: self.history.resource_uid.to_string(),
                 target: Some(self.identity.clone().into()),
                 expected_process_session_id: self.running.handle().process_session_id().to_string(),
+                sample_native_progress,
             }))
             .await
             .unwrap()
@@ -329,7 +335,19 @@ impl Node {
     }
 
     async fn descriptor(&self, role: ReplicaRole) -> ReplicaPeerDescription {
-        let publication = self.snapshot().await.publication.unwrap();
+        let sampled = self.snapshot_sampling(true).await;
+        let publication = sampled.publication.unwrap();
+        if matches!(
+            publication.role,
+            ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+        ) {
+            assert!(sampled.progress.value().is_some(), "{:?}", sampled.progress);
+            assert!(
+                sampled.capability.value().is_some(),
+                "{:?}",
+                sampled.capability
+            );
+        }
         ReplicaPeerDescription {
             is_up: true,
             is_ready: true,
@@ -338,8 +356,8 @@ impl Node {
             process_session_id: publication.scope.process_session_id,
             storage_incarnation: self.storage.clone(),
             role,
-            current_progress: 0,
-            catch_up_capability: 0,
+            current_progress: sampled.progress.value().unwrap_or(INVALID_LSN),
+            catch_up_capability: sampled.capability.value().unwrap_or(INVALID_LSN),
             must_catchup: false,
         }
     }
@@ -397,6 +415,15 @@ impl Node {
     }
 
     async fn pair(&mut self, target: &mut Self, epoch: Epoch) -> ConfigurationDescriptor {
+        self.pair_with_activation(target, epoch, true).await
+    }
+
+    async fn pair_with_activation(
+        &mut self,
+        target: &mut Self,
+        epoch: Epoch,
+        activate: bool,
+    ) -> ConfigurationDescriptor {
         let current = ConfigurationDescriptor::new(
             epoch,
             self.identity.replica_id,
@@ -432,11 +459,17 @@ impl Node {
         let previous = self.scope.as_ref().unwrap().configuration.current.clone();
         let source_peer = self.descriptor(ReplicaRole::Primary).await;
         let target_peer = target.descriptor(ReplicaRole::ActiveSecondary).await;
-        for previous in [Some(previous), None] {
+        let stages = if previous == current {
+            vec![None]
+        } else {
+            vec![Some(previous), None]
+        };
+        for previous in stages {
             self.goal(
                 ReplicaGoalKind::Reconfigure {
                     role: ReplicaRole::Primary,
-                    catch_up: previous.is_none().then_some(PublicCatchUpMode::WriteQuorum),
+                    catch_up: (activate && previous.is_none())
+                        .then_some(PublicCatchUpMode::WriteQuorum),
                 },
                 ReplicaConfigurationScope {
                     current: current.clone(),
@@ -478,6 +511,29 @@ impl Node {
         self.running.wait().await.unwrap();
         let diagnostic = self.service.shutdown_and_drain().await.err();
         (self.revision, diagnostic)
+    }
+
+    async fn stop_failed_publication(mut self) -> (String, RuntimeError) {
+        self.running.shutdown();
+        let host = self
+            .running
+            .wait()
+            .await
+            .expect_err("failed publication must remain failed in the actual host join")
+            .to_string();
+        let service = self
+            .service
+            .shutdown_and_drain()
+            .await
+            .expect_err("failed publication must remain failed in the actual service join");
+        assert!(host.contains("injected SQLite service cut"), "{host}");
+        assert!(
+            service.to_string().contains("injected SQLite service cut"),
+            "{service}"
+        );
+        let repeated = self.service.shutdown_and_drain().await.unwrap_err();
+        assert_eq!(repeated.to_string(), service.to_string());
+        (host, service)
     }
 }
 
@@ -751,6 +807,12 @@ fn old_service_identity(root: &Path, id: i64) -> ReplicaIdentity {
 #[tokio::test]
 async fn sqlite_real_provider_restart_settlement_and_handoff() {
     use sqlite_replicated::v1_test_bridge::FailureCut;
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    }
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = root();
         let a = root.path().join("source");
@@ -834,7 +896,7 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 },
             )
             .await;
-        let current = target.pair(&mut source, epoch).await;
+        let current = target.pair_with_activation(&mut source, epoch, false).await;
         assert_eq!(
             target
                 .running
@@ -910,8 +972,12 @@ async fn sqlite_real_provider_restart_settlement_and_handoff() {
                 .await
                 .is_err()
         );
-        let (_, diagnostic) = target.stop().await;
-        let Some(RuntimeError::Application(diagnostic)) = diagnostic else {
+        let (host_diagnostic, diagnostic) = target.stop_failed_publication().await;
+        assert!(
+            host_diagnostic.contains("Application Close failed"),
+            "{host_diagnostic}"
+        );
+        let RuntimeError::Application(diagnostic) = diagnostic else {
             panic!("publication failure lost its application diagnostic: {diagnostic:?}");
         };
         assert!(

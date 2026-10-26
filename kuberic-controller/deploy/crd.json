@@ -44,8 +44,8 @@
                   },
                   "hostingFormat": {
                     "format": "uint32",
-                    "maximum": 16.0,
-                    "minimum": 16.0,
+                    "maximum": 17.0,
+                    "minimum": 17.0,
                     "type": "integer"
                   },
                   "image": {
@@ -1777,8 +1777,8 @@
                             },
                             "format": {
                               "format": "uint32",
-                              "maximum": 16.0,
-                              "minimum": 16.0,
+                              "maximum": 17.0,
+                              "minimum": 17.0,
                               "type": "integer"
                             },
                             "identity": {
@@ -3228,8 +3228,8 @@
                                 },
                                 "format": {
                                   "format": "uint32",
-                                  "maximum": 16.0,
-                                  "minimum": 16.0,
+                                  "maximum": 17.0,
+                                  "minimum": 17.0,
                                   "type": "integer"
                                 },
                                 "identity": {

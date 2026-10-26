@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -232,6 +233,9 @@ async fn compose(
         close: Mutex::new(None),
         builds: Mutex::new(BTreeMap::new()),
         recovery_tasks: tokio_util::task::TaskTracker::new(),
+        recover_on_epoch: std::sync::atomic::AtomicBool::new(false),
+        role_transition_pending: std::sync::atomic::AtomicBool::new(false),
+        role_changing: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "testing")]
         recovery_spawned: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -249,6 +253,53 @@ async fn compose(
 }
 
 type CloseResult = std::result::Result<(), String>;
+
+struct RoleChangeGuard(Arc<AtomicBool>);
+
+impl Drop for RoleChangeGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+pub(super) fn role_drainage_operation(
+    transport: Arc<Transport>,
+    role_changing: Arc<AtomicBool>,
+    binding: Binding,
+    operation: super::ServiceOperation,
+    kind: OperationKind,
+) -> Option<ReceivedOperation> {
+    let admitted =
+        |transport: &Transport, changing: &AtomicBool, operation: &super::ServiceOperation| {
+            changing.load(Ordering::Acquire)
+                && operation.is_end_of_stream()
+                && operation.lsn() == 0
+                && operation.epoch() == Epoch::new(0, 0)
+                && operation.data().is_empty()
+                && transport.selected_lifecycle().is_none()
+                && transport.sessions.retiring_receiver(&binding)
+        };
+    if !admitted(&transport, &role_changing, &operation) {
+        return None;
+    }
+    let receiver = binding.clone();
+    Some(ReceivedOperation::new(
+        kind,
+        operation.lsn(),
+        operation.epoch(),
+        operation.data().clone(),
+        true,
+        Arc::new(move || {
+            if !role_changing.load(Ordering::Acquire)
+                || transport.selected_lifecycle().is_some()
+                || !transport.sessions.retiring_receiver(&receiver)
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            operation.acknowledge().map_err(error)
+        }),
+    ))
+}
 
 struct SessionProvider {
     provider: Arc<dyn StateProvider>,
@@ -321,11 +372,26 @@ pub(super) struct Production {
     close: Mutex<Option<watch::Receiver<Option<CloseResult>>>>,
     builds: Mutex<BTreeMap<String, watch::Receiver<Option<CloseResult>>>>,
     recovery_tasks: tokio_util::task::TaskTracker,
+    recover_on_epoch: std::sync::atomic::AtomicBool,
+    role_transition_pending: std::sync::atomic::AtomicBool,
+    role_changing: Arc<AtomicBool>,
     #[cfg(feature = "testing")]
     recovery_spawned: std::sync::atomic::AtomicUsize,
 }
 
 impl Production {
+    async fn settle_changed_role(&self) -> Result<()> {
+        if self
+            .role_transition_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.transport.settle_role_sessions().await?;
+            self.role_transition_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "testing")]
     async fn configuration_cut(
         &self,
@@ -587,6 +653,79 @@ impl Production {
         if current.configuration.primary_id != self.transport.local().identity.replica_id {
             return Err(RuntimeError::NotPrimary);
         }
+        self.settle_changed_role().await?;
+        let mut recoveries = Vec::new();
+        for information in current.replicas.iter().chain(
+            previous
+                .into_iter()
+                .flat_map(|configuration| &configuration.replicas),
+        ) {
+            if self
+                .transport
+                .sessions
+                .binding_for(information.identity.replica_id.value())
+                .is_none()
+            {
+                let source = self.transport.publication().await?;
+                let target = self
+                    .transport
+                    .discover(
+                        &information.identity,
+                        &information.process_session_id,
+                        &source.scope.history,
+                    )
+                    .await?;
+                let binding = Binding::new(source, target)?;
+                if !binding.admitted_reconfiguration() {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                let binding = self.transport.sessions.proposal(binding)?;
+                let incarnation = self.transport.establish(&binding).await?;
+                let fence = self.transport.fence(&binding);
+                let persisted = self.context.public_v1_binding().state_persistence
+                    == StatePersistence::Persisted;
+                self.transport.sessions.effect(&binding, || {
+                    Self::prepare(
+                        &self.transport,
+                        &self.peers,
+                        persisted,
+                        information,
+                        binding.clone(),
+                        fence,
+                        incarnation,
+                    )
+                })??;
+                recoveries.push(binding);
+            }
+        }
+        if !recoveries.is_empty() {
+            if let Some(previous) = previous {
+                self.facade
+                    .update_catch_up_replica_set_configuration(current.clone(), previous.clone())
+                    .await?;
+            } else {
+                self.facade
+                    .update_catch_up_replica_set_configuration(
+                        current.clone(),
+                        ReplicaSetConfiguration {
+                            configuration: crate::protocol::types::ConfigurationDescriptor::new(
+                                current.configuration.epoch,
+                                current.configuration.primary_id,
+                                Vec::new(),
+                                0,
+                            ),
+                            replicas: Vec::new(),
+                        },
+                    )
+                    .await?;
+            }
+            for binding in recoveries {
+                self.transport.authorize_completion(&binding).await?;
+                self.transport.control(&binding, Control::Complete).await?;
+                self.transport.authorize_completion(&binding).await?;
+                self.transport.sessions.complete(&binding)?;
+            }
+        }
         for information in current.replicas.iter().chain(
             previous
                 .into_iter()
@@ -646,12 +785,32 @@ impl Production {
         };
         let transport = self.transport.clone();
         let acknowledgements = transport.acknowledgements();
+        let role_changing = self.role_changing.clone();
+        let stream_binding = Arc::new(Mutex::new(transport.sessions.inbound()));
         Ok(OperationStream::new(
             Box::pin(stream.then(move |operation| {
                 let transport = transport.clone();
                 let acknowledgements = acknowledgements.clone();
+                let role_changing = role_changing.clone();
+                let stream_binding = stream_binding.clone();
                 async move {
                     let operation = operation.map_err(error)?;
+                    let binding = {
+                        let mut origin = stream_binding.lock().unwrap();
+                        if origin.is_none() {
+                            *origin = transport.sessions.inbound();
+                        }
+                        origin.clone().ok_or(RuntimeError::AuthorityNotAdmitted)?
+                    };
+                    if let Some(drainage) = role_drainage_operation(
+                        transport.clone(),
+                        role_changing,
+                        binding.clone(),
+                        operation.clone(),
+                        kind,
+                    ) {
+                        return Ok(drainage);
+                    }
                     // Reserve before delivery: held operations backpressure the native
                     // stream, not an unbounded set of retained confirmation tasks.
                     let permit = acknowledgements
@@ -660,10 +819,6 @@ impl Production {
                         .await
                         .map_err(|_| RuntimeError::Closed)?;
                     let permit = Mutex::new(Some(permit));
-                    let binding = transport
-                        .sessions
-                        .inbound()
-                        .ok_or(RuntimeError::AuthorityNotAdmitted)?;
                     #[cfg(feature = "testing")]
                     transport
                         .test_cut(
@@ -780,21 +935,43 @@ impl Replicator for Production {
         self.facade.open().await
     }
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        tracing::debug!(?epoch, ?role, prior = ?self.transport.selected_lifecycle(), "ordinary native role selected");
         if *self.epoch.lock().unwrap() == Some(epoch)
             && self.transport.selected_lifecycle() == Some((epoch, role))
         {
             return self.transport.check_health();
         }
+        let prior = self.transport.selected_lifecycle();
+        let recovering = prior.is_none() && role == ReplicaRole::ActiveSecondary;
+        let transition = prior.is_some_and(|(_, old_role)| {
+            old_role != role
+                && !(old_role == ReplicaRole::IdleSecondary && role == ReplicaRole::ActiveSecondary)
+        });
+        self.role_changing.store(transition, Ordering::Release);
+        let _role_change = RoleChangeGuard(self.role_changing.clone());
         self.transport.begin_role_change(epoch, role);
-        self.facade.change_role(epoch, role).await?;
+        self.facade
+            .change_role(epoch, role)
+            .await
+            .inspect_err(|error| {
+                tracing::debug!(?epoch, ?role, %error, "ordinary native role failed");
+            })?;
+        self.recover_on_epoch
+            .store(recovering, std::sync::atomic::Ordering::Release);
+        self.role_transition_pending
+            .store(transition, std::sync::atomic::Ordering::Release);
         self.transport.selected_role(epoch, role);
         *self.epoch.lock().unwrap() = Some(epoch);
         Ok(())
     }
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        tracing::debug!(?epoch, selected = ?self.transport.selected_lifecycle(), "ordinary native epoch selected");
         let selected = self.transport.selected_lifecycle();
         if selected == Some((epoch, ReplicaRole::ActiveSecondary))
             && self.transport.sessions.inbound().is_none()
+            && self
+                .recover_on_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
         {
             self.recover_secondary(epoch).await?;
         }
@@ -808,7 +985,12 @@ impl Replicator for Production {
         if let Some((_, role)) = selected {
             self.transport.begin_role_change(epoch, role);
         }
-        self.facade.update_epoch(epoch).await?;
+        self.facade.update_epoch(epoch).await.inspect_err(|error| {
+            tracing::debug!(?epoch, %error, "ordinary native epoch failed");
+        })?;
+        self.settle_changed_role().await.inspect_err(|error| {
+            tracing::debug!(?epoch, %error, "ordinary native role session settlement failed");
+        })?;
         if let Some((_, role)) = selected {
             self.transport.selected_role(epoch, role);
         }

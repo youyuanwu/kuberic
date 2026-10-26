@@ -1,5 +1,5 @@
 use super::super::super::transport::{Carrier, CarrierLimits, ExchangeService, connect};
-use super::super::engine_session::{Binding, Endpoint};
+use super::super::engine_session::{Binding, Endpoint, Sessions};
 use super::super::production_transport::Transport;
 use super::facade::{config, facade_config, information, until};
 use super::*;
@@ -153,6 +153,103 @@ fn owner(registry: MessageRegistry, pause: bool) -> (Arc<Transport>, Arc<Access>
     );
     owner.selected_role(epoch(1), ReplicaRole::Primary);
     (owner, access, native)
+}
+
+#[tokio::test]
+async fn m3_admitted_session_is_exact_not_fresh_build_authority_and_retirement_is_monotonic() {
+    let (_, _, fresh) = owner(MessageRegistry::default(), false);
+    assert!(!fresh.admitted_reconfiguration());
+    let mut source = fresh.source;
+    let mut target = fresh.target;
+    let configuration = ConfigurationDescriptor::new(
+        source.scope.epoch,
+        source.scope.storage.replica.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.scope.storage.replica.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.scope.storage.replica.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        2,
+    );
+    let peer = |publication: &ReplicaPublication, role| ReplicaPeerDescription {
+        identity: publication.scope.storage.replica.clone(),
+        replication_address: publication.replication_address.clone(),
+        process_session_id: publication.scope.process_session_id.clone(),
+        storage_incarnation: publication.scope.storage.clone(),
+        role,
+        current_progress: 5,
+        catch_up_capability: 3,
+        is_up: true,
+        is_ready: true,
+        must_catchup: false,
+    };
+    source.scope.configuration.current = configuration.clone();
+    target.scope.configuration.current = configuration;
+    source.scope.configuration.replicas = vec![peer(&target, ReplicaRole::ActiveSecondary)];
+    target.scope.configuration.replicas = vec![peer(&source, ReplicaRole::Primary)];
+    source.stage = ReplicaPublicationStage::DiscoveryPending;
+    source.role = ReplicaRole::None;
+    target.role = ReplicaRole::ActiveSecondary;
+    let binding = Binding::new(source, target).unwrap();
+    assert!(binding.admitted_reconfiguration());
+    assert!(
+        RemoteReplicaSelection {
+            source: binding.source.clone(),
+            target: binding.target.clone(),
+            target_control_address: "http://localhost:1".into(),
+            generation: 1,
+        }
+        .validate()
+        .is_err()
+    );
+    for crossed in [
+        "history", "process", "storage", "address", "epoch", "previous",
+    ] {
+        let mut invalid = binding.clone();
+        match crossed {
+            "history" => invalid.target.scope.history.history_id = HistoryId::new("other"),
+            "process" => invalid.target.scope.process_session_id = ProcessSessionId::new("other"),
+            "storage" => {
+                invalid.target.scope.storage.storage_generation = StorageGeneration::new("other")
+            }
+            "address" => invalid.target.replication_address.push_str("other"),
+            "epoch" => invalid.target.scope.epoch.configuration_number += 1,
+            "previous" => {
+                invalid.target.scope.configuration.previous =
+                    Some(invalid.target.scope.configuration.current.clone())
+            }
+            _ => unreachable!(),
+        }
+        assert!(invalid.validate().is_err(), "{crossed}");
+    }
+    let sessions = Sessions::default();
+    sessions.reserve(&binding).unwrap();
+    sessions.activate_target(&binding).unwrap();
+    sessions.complete(&binding).unwrap();
+    let old_fence = sessions.fence(&binding);
+    sessions.retire_all();
+    assert!(sessions.retiring_receiver(&binding));
+    assert!(old_fence.check().is_err());
+    sessions.role_receiver_settled().unwrap();
+    assert_eq!(sessions.inbound(), Some(binding.clone()));
+    sessions.settled(&binding).unwrap();
+    sessions.role_receiver_settled().unwrap();
+    assert!(sessions.inbound().is_none());
+    assert!(sessions.reserve(&binding).is_err());
+    assert!(sessions.active(&binding).is_err());
+    assert!(old_fence.check().is_err());
+    let mut successor = binding.clone();
+    successor.nonce = uuid::Uuid::new_v4().to_string();
+    sessions.reserve(&successor).unwrap();
+    sessions.activate_target(&successor).unwrap();
+    sessions.abort();
+    assert!(!sessions.retiring_receiver(&successor));
+    assert!(sessions.active(&binding).is_err());
 }
 
 struct Pump {

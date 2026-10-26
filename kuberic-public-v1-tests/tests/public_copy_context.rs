@@ -208,6 +208,7 @@ impl Node {
                 resource_uid: resource.to_string(),
                 target: Some(identity.clone().into()),
                 expected_process_session_id: String::new(),
+                sample_native_progress: false,
             }))
             .await?
             .into_inner();
@@ -238,6 +239,7 @@ impl Node {
                 resource_uid: self.resource.to_string(),
                 target: Some(self.identity.clone().into()),
                 expected_process_session_id: self.session.to_string(),
+                sample_native_progress: false,
             }))
             .await?
             .into_inner();

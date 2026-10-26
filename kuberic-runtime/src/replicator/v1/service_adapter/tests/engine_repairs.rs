@@ -1,5 +1,5 @@
 use super::super::super::engine_session::Control;
-use super::super::super::production::{test_compose, test_provider};
+use super::super::super::production::{role_drainage_operation, test_compose, test_provider};
 use super::*;
 use crate::replicator::ReplicatorInterfaces;
 
@@ -68,6 +68,78 @@ impl Pair {
             binding,
         }
     }
+}
+
+#[tokio::test]
+async fn m3_role_drainage_refuses_numbered_eos_data_stale_binding_and_epoch_only_credit() {
+    use super::super::super::super::operation_queue::QueueOperation;
+    use super::super::super::super::received_operation::{
+        AckState, ReceivedOperation as NativeOperation,
+    };
+    use super::super::super::{ServiceOperation, StreamKind};
+    use crate::replicator::stream::OperationKind;
+
+    let pair = Pair::new().await;
+    let (source, target) = pair
+        .engines(Arc::new(Provider::new()), Arc::new(Provider::new()))
+        .await;
+    pair.establish().await;
+    let secondary = pair.target.test_production().drainage_secondary();
+    pair.target
+        .begin_role_change(epoch(2), ReplicaRole::Primary);
+    let changing = Arc::new(AtomicBool::new(true));
+    let source_before = pair.source.sessions.inspect();
+    let wrap = |native: NativeOperation, binding: Binding, active: Arc<AtomicBool>| {
+        role_drainage_operation(
+            pair.target.clone(),
+            active,
+            binding,
+            ServiceOperation {
+                operation: native,
+                secondary: secondary.clone(),
+                kind: StreamKind::Copy,
+            },
+            OperationKind::Copy,
+        )
+    };
+    for native in [
+        NativeOperation::copy_end_of_stream(4, true).unwrap(),
+        NativeOperation::new(
+            QueueOperation::new(1, OperationData::new(), true),
+            epoch(1),
+            true,
+        ),
+        NativeOperation::new(
+            QueueOperation::new(0, OperationData::new(), true),
+            Epoch::new(0, 0),
+            true,
+        ),
+    ] {
+        assert!(wrap(native.clone(), pair.binding.clone(), changing.clone()).is_none());
+        assert_eq!(native.ack_state(), AckState::NotCalled);
+        assert_eq!(pair.source.sessions.inspect(), source_before);
+    }
+    let mut stale = pair.binding.clone();
+    stale.nonce = uuid::Uuid::new_v4().to_string();
+    let local = NativeOperation::end_of_stream(true);
+    assert!(wrap(local.clone(), stale, changing.clone()).is_none());
+    assert_eq!(local.ack_state(), AckState::NotCalled);
+    changing.store(false, Ordering::Release);
+    assert!(
+        wrap(local.clone(), pair.binding.clone(), changing.clone()).is_none(),
+        "epoch-only retirement cannot grant native drainage acknowledgement"
+    );
+    changing.store(true, Ordering::Release);
+    let late = wrap(local.clone(), pair.binding.clone(), changing.clone()).unwrap();
+    changing.store(false, Ordering::Release);
+    assert!(late.acknowledge().is_err());
+    assert_eq!(local.ack_state(), AckState::NotCalled);
+    assert_eq!(pair.source.sessions.inspect(), source_before);
+    source.replicator().abort();
+    target.replicator().abort();
+    source.replicator().close().await.unwrap();
+    target.replicator().close().await.unwrap();
+    pair.finish().await;
 }
 
 #[tokio::test]

@@ -306,6 +306,7 @@ fn replica_ordinary_snapshot(
                 resource_uid: value["metadata"]["uid"].as_str().context("set UID")?.into(),
                 target: Some(target.identity.clone().into()),
                 expected_process_session_id: String::new(),
+                sample_native_progress: false,
             },
         ))
         .map_err(|_| anyhow::anyhow!("authenticated ordinary snapshot failed"))?;

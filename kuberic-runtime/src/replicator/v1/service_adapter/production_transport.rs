@@ -526,7 +526,11 @@ impl Transport {
     pub(super) async fn join_predecessor(&self, binding: &Binding) -> Result<()> {
         let peer = self.sessions.retire_with(binding, || {
             let mut peers = self.peers.lock().unwrap();
-            let replica = binding.secondary().identity.replica_id.value();
+            let replica = if self.local == binding.primary() {
+                binding.secondary().identity.replica_id.value()
+            } else {
+                binding.primary().identity.replica_id.value()
+            };
             if peers
                 .get(&replica)
                 .is_some_and(|peer| peer.binding != *binding)
@@ -558,6 +562,14 @@ impl Transport {
         // Authenticated fresh publication on this exact storage is possible
         // only after the agent's predecessor writer/creation containment barrier.
         Ok(())
+    }
+
+    pub(super) async fn settle_role_sessions(&self) -> Result<()> {
+        for binding in self.sessions.retiring() {
+            self.join_predecessor(&binding).await?;
+            self.sessions.settled(&binding)?;
+        }
+        self.sessions.role_receiver_settled()
     }
 
     pub(super) fn begin_role_change(&self, epoch: Epoch, role: ReplicaRole) {
@@ -919,7 +931,9 @@ impl Transport {
                     origin,
                     binding,
                     is_source,
-                    completion && !(binding.recovery && !is_source),
+                    completion
+                        && !binding.admitted_reconfiguration()
+                        && !(binding.recovery && !is_source),
                 )
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);

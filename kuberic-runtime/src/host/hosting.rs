@@ -955,6 +955,20 @@ impl PodRuntime {
         })
     }
 
+    pub(crate) async fn ordinary_native_progress(
+        &self,
+    ) -> Result<(
+        crate::protocol::public_operations::ProgressQueryResult,
+        crate::protocol::public_operations::ProgressQueryResult,
+    )> {
+        let registered = self
+            .host
+            .registered
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        Ok(registered.native_progress().await)
+    }
+
     pub(crate) async fn bind_public_fault_runtime(
         &self,
         store: Arc<dyn crate::host::store::AgentStore>,

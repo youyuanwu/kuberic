@@ -694,6 +694,7 @@ message ReplicaSnapshotRequest {
   string resource_uid = 2;
   ReplicaIdentity target = 3;
   string expected_process_session_id = 4;
+  bool sample_native_progress = 5;
 }
 
 message ReplicaDiscoveryRequest {

@@ -1171,7 +1171,7 @@ where
             ProtocolCommand::PublicV1History(command) => {
                 if !matches!(command.as_ref(), PublicV1HistoryCommand::Initialize { .. }) {
                     return Err(Status::failed_precondition(
-                        "legacy renewal dispatch is unavailable in ordinary hosting format 16",
+                        "legacy renewal dispatch is unavailable in ordinary hosting format 17",
                     ));
                 }
                 self.execute_history(*command)
@@ -1232,11 +1232,16 @@ where
     ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
         self.authorize(&request)?;
         self.validate_snapshot_request(request.get_ref()).await?;
+        let snapshot = if request.get_ref().sample_native_progress {
+            self.sampled_ordinary_snapshot().await?
+        } else {
+            self.ordinary_snapshot().await?
+        };
         Ok(Response::new(proto::ReplicaSnapshotResponse {
             protocol_version: crate::protocol::public_operations::ORDINARY_ACTION_FORMAT,
             canonical_json: serde_json::to_vec(
                 &crate::protocol::public_operations::ReplicaAgentQueryResult::Initialized(
-                    Box::new(self.ordinary_snapshot().await?),
+                    Box::new(snapshot),
                 ),
             )
             .map_err(|error| Status::internal(error.to_string()))?,
@@ -1786,7 +1791,7 @@ mod tests {
         assert!(
             error
                 .message()
-                .contains("unavailable in ordinary hosting format 16")
+                .contains("unavailable in ordinary hosting format 17")
         );
         assert_eq!(store.load_state().await.unwrap(), before);
         service

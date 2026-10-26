@@ -10,7 +10,7 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 16;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 17;
 
 #[path = "replica_goal.rs"]
 mod replica_goal;

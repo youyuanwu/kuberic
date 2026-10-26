@@ -143,6 +143,7 @@ impl Fixture {
                     resource_uid: resource_uid.to_string(),
                     target: Some(identity.into()),
                     expected_process_session_id: handle.process_session_id().to_string(),
+                    sample_native_progress: false,
                 },
             ))
             .await

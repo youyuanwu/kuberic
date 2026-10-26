@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::public_operations::*;
+use crate::protocol::types::ReplicaRole;
 
 fn version(format: u32) -> std::result::Result<(), Status> {
     if format != ORDINARY_ACTION_FORMAT {
@@ -68,6 +69,32 @@ impl<S: AgentStore + 'static> AgentService<S> {
         &self,
     ) -> std::result::Result<proto::ReplicaSnapshotResponse, Status> {
         response(&self.ordinary_snapshot().await?)
+    }
+
+    pub(super) async fn sampled_ordinary_snapshot(
+        &self,
+    ) -> std::result::Result<ReplicaAgentSnapshot, Status> {
+        let snapshot = self.ordinary_snapshot().await?;
+        let Some(publication) = snapshot.publication.as_ref().filter(|publication| {
+            publication.stage == ReplicaPublicationStage::AchievedScope
+                && matches!(
+                    publication.role,
+                    ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                )
+        }) else {
+            return Ok(snapshot);
+        };
+        let (progress, capability) = self
+            .runtime
+            .ordinary_native_progress()
+            .await
+            .map_err(status_from_runtime)?;
+        let mut current = self.ordinary_snapshot().await?;
+        if current.publication.as_ref() == Some(publication) && !current.withdrawn {
+            current.progress = progress;
+            current.capability = capability;
+        }
+        Ok(current)
     }
 
     pub(super) async fn validate_snapshot_request(

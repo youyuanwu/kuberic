@@ -251,6 +251,13 @@ async fn until(mut check: impl FnMut() -> bool) {
 }
 
 pub(super) async fn snapshot<A: Sample>(node: &Node<A>) -> ReplicaAgentSnapshot {
+    snapshot_sampling(node, false).await
+}
+
+pub(super) async fn snapshot_sampling<A: Sample>(
+    node: &Node<A>,
+    sample_native_progress: bool,
+) -> ReplicaAgentSnapshot {
     let mut client =
         proto::agent_control_client::AgentControlClient::connect(node.control_address.clone())
             .await
@@ -261,6 +268,7 @@ pub(super) async fn snapshot<A: Sample>(node: &Node<A>) -> ReplicaAgentSnapshot 
             resource_uid: node.history.resource_uid.to_string(),
             target: Some(node.identity.clone().into()),
             expected_process_session_id: node.session.to_string(),
+            sample_native_progress,
         }))
         .await
         .unwrap()

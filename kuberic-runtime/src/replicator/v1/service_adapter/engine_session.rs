@@ -91,6 +91,21 @@ pub(in crate::replicator::v1) struct Binding {
 }
 
 impl Binding {
+    pub(super) fn admitted_reconfiguration(&self) -> bool {
+        !self.recovery
+            && self
+                .source
+                .scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .any(|member| {
+                    member.identity == self.target.scope.storage.replica
+                        && member.role == ReplicaRole::ActiveSecondary
+                })
+    }
+
     pub(super) fn new(source: ReplicaPublication, target: ReplicaPublication) -> Result<Self> {
         let binding = Self {
             nonce: uuid::Uuid::new_v4().to_string(),
@@ -105,6 +120,56 @@ impl Binding {
     pub(super) fn validate(&self) -> Result<()> {
         if uuid::Uuid::parse_str(&self.nonce).is_err() {
             return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if self.admitted_reconfiguration() {
+            for publication in [&self.source, &self.target] {
+                publication
+                    .validate()
+                    .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
+            }
+            let source = &self.source.scope;
+            let target = &self.target.scope;
+            let configuration = &source.configuration;
+            let selected = |publication: &ReplicaPublication, role| {
+                (publication.stage == ReplicaPublicationStage::DiscoveryPending
+                    && publication.role == ReplicaRole::None)
+                    || (publication.stage == ReplicaPublicationStage::AchievedScope
+                        && publication.role == role)
+            };
+            if !selected(&self.source, ReplicaRole::Primary)
+                || !selected(&self.target, ReplicaRole::ActiveSecondary)
+                || source.storage.replica == target.storage.replica
+                || source.history != target.history
+                || source.epoch != target.epoch
+                || configuration.current != target.configuration.current
+                || configuration.previous != target.configuration.previous
+                || configuration.current.primary_id != source.storage.replica.replica_id
+                || !configuration.current.members.iter().any(|member| {
+                    member.identity == source.storage.replica && member.role == ReplicaRole::Primary
+                })
+                || ![
+                    (&self.source, &self.target, ReplicaRole::ActiveSecondary),
+                    (&self.target, &self.source, ReplicaRole::Primary),
+                ]
+                .into_iter()
+                .all(|(local, peer, role)| {
+                    local
+                        .scope
+                        .configuration
+                        .replicas
+                        .iter()
+                        .any(|description| {
+                            description.identity == peer.scope.storage.replica
+                                && description.storage_incarnation == peer.scope.storage
+                                && description.process_session_id == peer.scope.process_session_id
+                                && description.replication_address == peer.replication_address
+                                && description.role == role
+                        })
+                })
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            return Ok(());
         }
         if self.recovery {
             self.source
@@ -186,7 +251,8 @@ impl Binding {
             return false;
         };
         (publication.stage == ReplicaPublicationStage::AchievedScope
-            || (self.recovery && publication == &self.target))
+            || (self.recovery && publication == &self.target)
+            || (self.admitted_reconfiguration() && publication == origin))
             && publication.scope == origin.scope
             && publication.role == origin.role
     }
@@ -736,8 +802,8 @@ impl Sessions {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         entry.phase = Phase::Retired;
-        // A retired native receiver is never reinitialized in this creation.
-        // Its reservation and all tombstones stay until the creation is dropped.
+        // The exact binding and its fence stay retired. Only a settled native
+        // role transition may release the receiver slot for a different binding.
         Ok(())
     }
 
@@ -749,6 +815,41 @@ impl Sessions {
 
     pub(super) fn retire_all(&self) {
         Self::retire_entries(&mut self.0.lock().unwrap());
+    }
+
+    pub(super) fn retiring(&self) -> Vec<Binding> {
+        self.0
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .filter(|entry| entry.phase == Phase::Retiring)
+            .map(|entry| entry.binding.clone())
+            .collect()
+    }
+
+    pub(super) fn retiring_receiver(&self, binding: &Binding) -> bool {
+        let state = self.0.lock().unwrap();
+        !state.closed
+            && state.receiver.as_ref() == Some(&binding.nonce)
+            && state
+                .entries
+                .get(&binding.nonce)
+                .is_some_and(|entry| entry.binding == *binding && entry.phase == Phase::Retiring)
+    }
+
+    pub(super) fn role_receiver_settled(&self) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if let Some(receiver) = &state.receiver {
+            let entry = state
+                .entries
+                .get(receiver)
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if entry.phase == Phase::Retired {
+                state.receiver = None;
+            }
+        }
+        Ok(())
     }
 
     fn retire_entries(state: &mut State) {

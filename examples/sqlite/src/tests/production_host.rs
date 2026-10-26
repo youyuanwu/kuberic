@@ -237,6 +237,7 @@ async fn production_host_new_existing_and_invalid_storage() -> Result<(), Box<dy
                     resource_uid: resource.to_string(),
                     target: Some(identity.clone().into()),
                     expected_process_session_id: report.process_session_id.to_string(),
+                    sample_native_progress: false,
                 })
             };
             let response = client.get_snapshot(query()).await?.into_inner();

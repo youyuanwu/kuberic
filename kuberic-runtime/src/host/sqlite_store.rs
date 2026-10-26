@@ -2719,6 +2719,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m3_predecessor_format_16_rejects_before_retained_data_or_metadata_mutation() {
+        use crate::protocol::public_operations::*;
+        let directory = crate::host::tests::tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let application = directory.path().join("acknowledged-application-data");
+        std::fs::write(&application, b"acknowledged-prefix-and-history").unwrap();
+        let binding = PublicV1LifecycleBinding {
+            identity: PublicV1Identity::new(1),
+            resource_uid: identity().resource_uid,
+            spec_generation: 1,
+            state_persistence: StatePersistence::Persisted,
+        };
+        let store = SqliteStore::create_replacement_authorized(
+            &path,
+            AgentState::new(identity()),
+            binding.clone(),
+        )
+        .unwrap();
+        let mut state = store.load_state().await.unwrap();
+        drop(store);
+        state.identity.schema_version = 16;
+        state
+            .public_v1_operation_state
+            .as_mut()
+            .unwrap()
+            .identity
+            .protocol_version = 16;
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                [serde_json::to_string(&state).unwrap()],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 16).unwrap();
+        drop(connection);
+        let before_database = std::fs::read(&path).unwrap();
+        let before_application = std::fs::read(&application).unwrap();
+        let before_names = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        for _ in 0..2 {
+            assert!(
+                SqliteStore::open_replacement_bound_existing(&path, Some(&identity()), &binding)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before_database);
+            assert_eq!(std::fs::read(&application).unwrap(), before_application);
+            assert_eq!(
+                std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                before_names
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn removed_ingress_fields_reject_before_metadata_mutation() {
         let directory = crate::host::tests::tempdir().unwrap();
         let path = SqliteStore::metadata_database_path(directory.path());

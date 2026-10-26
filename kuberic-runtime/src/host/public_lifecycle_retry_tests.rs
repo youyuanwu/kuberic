@@ -1289,7 +1289,7 @@ async fn schema13_current_cancelled_and_partial_records_reject_without_changing_
                     &binding
                 ),
                 Err(HostError::SchemaMismatch {
-                    expected: 16,
+                    expected: crate::host::state::PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION,
                     observed: 13
                 })
             ),

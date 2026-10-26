@@ -12,6 +12,16 @@ impl Production {
             _ => panic!("actual primary required"),
         }
     }
+
+    #[cfg(test)]
+    pub(in crate::replicator::v1::service_adapter) fn drainage_secondary(
+        &self,
+    ) -> crate::replicator::v1::secondary::SecondaryHandle {
+        match self.facade.service().target().unwrap() {
+            super::super::Target::Secondary(secondary) => secondary,
+            _ => panic!("actual secondary required"),
+        }
+    }
 }
 
 pub(crate) async fn test_compose(
@@ -48,6 +58,9 @@ pub(crate) fn test_control(
         close: Mutex::new(None),
         builds: Mutex::new(BTreeMap::new()),
         recovery_tasks: tokio_util::task::TaskTracker::new(),
+        recover_on_epoch: std::sync::atomic::AtomicBool::new(false),
+        role_transition_pending: std::sync::atomic::AtomicBool::new(false),
+        role_changing: Arc::new(AtomicBool::new(false)),
         #[cfg(feature = "testing")]
         recovery_spawned: std::sync::atomic::AtomicUsize::new(0),
     })

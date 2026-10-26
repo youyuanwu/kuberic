@@ -48,6 +48,11 @@ struct Probe {
     remove_calls: AtomicUsize,
     close_calls: AtomicUsize,
     progress_calls: AtomicUsize,
+    progress_result: StdMutex<Option<crate::Result<i64>>>,
+    capability_result: StdMutex<Option<crate::Result<i64>>>,
+    block_progress: AtomicBool,
+    progress_entered: Semaphore,
+    progress_gate: Semaphore,
     aborts: AtomicUsize,
     aborted: Semaphore,
     on_abort: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -98,6 +103,11 @@ impl Probe {
             remove_calls: AtomicUsize::new(0),
             close_calls: AtomicUsize::new(0),
             progress_calls: AtomicUsize::new(0),
+            progress_result: StdMutex::new(None),
+            capability_result: StdMutex::new(None),
+            block_progress: AtomicBool::new(false),
+            progress_entered: Semaphore::new(0),
+            progress_gate: Semaphore::new(0),
             aborts: AtomicUsize::new(0),
             aborted: Semaphore::new(0),
             on_abort: StdMutex::new(None),
@@ -276,10 +286,20 @@ impl Replicator for Probe {
     }
     async fn current_progress(&self) -> crate::Result<i64> {
         self.progress_calls.fetch_add(1, Ordering::AcqRel);
+        self.progress_entered.add_permits(1);
+        if self.block_progress.load(Ordering::Acquire) {
+            self.progress_gate.acquire().await.unwrap().forget();
+        }
+        if let Some(result) = self.progress_result.lock().unwrap().take() {
+            return result;
+        }
         std::future::pending().await
     }
     async fn catch_up_capability(&self) -> crate::Result<i64> {
         self.progress_calls.fetch_add(1, Ordering::AcqRel);
+        if let Some(result) = self.capability_result.lock().unwrap().take() {
+            return result;
+        }
         std::future::pending().await
     }
 }
@@ -563,6 +583,10 @@ impl Fixture {
     }
 
     async fn snapshot(&self) -> ReplicaAgentSnapshot {
+        self.snapshot_sampling(false).await
+    }
+
+    async fn snapshot_sampling(&self, sample_native_progress: bool) -> ReplicaAgentSnapshot {
         let mut client =
             proto::agent_control_client::AgentControlClient::connect(self.address.clone())
                 .await
@@ -573,6 +597,7 @@ impl Fixture {
                 resource_uid: self.goal.scope.history.resource_uid.to_string(),
                 target: Some(self.goal.scope.storage.replica.clone().into()),
                 expected_process_session_id: self.goal.scope.process_session_id.to_string(),
+                sample_native_progress,
             }))
             .await
             .unwrap()
@@ -718,7 +743,7 @@ async fn ordinary_goal_pending_discovery_is_receipted_callback_free_and_access_c
     entered(&source.probe.role_entered).await;
     entered(&target.probe.role_entered).await;
     for (local, peer) in [(&source, &target), (&target, &source)] {
-        let snapshot = local.snapshot().await;
+        let snapshot = local.snapshot_sampling(true).await;
         let publication = snapshot.publication.unwrap();
         assert_eq!(publication.stage, ReplicaPublicationStage::DiscoveryPending);
         assert_eq!(publication.role, ReplicaRole::None);
@@ -1203,6 +1228,202 @@ async fn ordinary_goal_discovery_and_snapshot_require_authentication_before_muta
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
     assert_eq!(fixture.store.load_state().await.unwrap(), before);
     assert_eq!(fixture.probe.progress_calls.load(Ordering::Acquire), 0);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn m3_ordinary_primary_change_requires_strict_epoch_and_exact_creation() {
+    let source = Fixture::new(1, false).await;
+    let target = Fixture::new(2, false).await;
+    let prior = source.goal.scope.clone();
+    let mut next = prior.clone();
+    let members = vec![
+        ConfigurationMember {
+            identity: prior.storage.replica.clone(),
+            role: ReplicaRole::ActiveSecondary,
+        },
+        ConfigurationMember {
+            identity: target.goal.scope.storage.replica.clone(),
+            role: ReplicaRole::Primary,
+        },
+    ];
+    next.configuration.current = ConfigurationDescriptor::new(
+        prior.epoch,
+        target.goal.scope.storage.replica.replica_id,
+        members.clone(),
+        2,
+    );
+    assert!(!prior.compatible_with(&next));
+    next.epoch.configuration_number += 1;
+    next.configuration.current = ConfigurationDescriptor::new(
+        next.epoch,
+        target.goal.scope.storage.replica.replica_id,
+        members,
+        2,
+    );
+    assert!(prior.compatible_with(&next));
+    assert!(!next.compatible_with(&prior));
+    for crossed in ["history", "storage", "process", "creation", "data-loss"] {
+        let mut invalid = next.clone();
+        match crossed {
+            "history" => invalid.history.history_id = HistoryId::new("crossed-history"),
+            "storage" => {
+                invalid.storage.storage_generation = StorageGeneration::new("crossed-storage")
+            }
+            "process" => invalid.process_session_id = ProcessSessionId::new("other-process"),
+            "creation" => invalid.creation_id = ReplicatorCreationId::new("other-creation"),
+            "data-loss" => invalid.epoch.data_loss_number += 1,
+            _ => unreachable!(),
+        }
+        assert!(!prior.compatible_with(&invalid), "{crossed}");
+    }
+    source.finish().await;
+    target.finish().await;
+}
+
+#[tokio::test]
+async fn m3_ordinary_explicit_sampling_preserves_native_query_outcomes_without_access() {
+    let fixture = Fixture::new(1, false).await;
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.achieved(&fixture.goal).await;
+    for (progress, capability, expected_progress, expected_capability) in [
+        (
+            Ok(7),
+            Ok(3),
+            ProgressQueryResult::Value(7),
+            ProgressQueryResult::Value(3),
+        ),
+        (
+            Err(RuntimeError::ProgressNotReady),
+            Err(RuntimeError::Application("capability failed".into())),
+            ProgressQueryResult::NotReady,
+            ProgressQueryResult::Failed("application error: capability failed".into()),
+        ),
+        (
+            Ok(INVALID_LSN),
+            Ok(INVALID_LSN),
+            ProgressQueryResult::Value(INVALID_LSN),
+            ProgressQueryResult::Value(INVALID_LSN),
+        ),
+    ] {
+        *fixture.probe.progress_result.lock().unwrap() = Some(progress);
+        *fixture.probe.capability_result.lock().unwrap() = Some(capability);
+        let before = fixture.store.load_state().await.unwrap();
+        let snapshot = fixture.snapshot_sampling(true).await;
+        assert_eq!(snapshot.progress, expected_progress);
+        assert_eq!(snapshot.capability, expected_capability);
+        assert_ne!(snapshot.read_status, AccessStatus::Granted);
+        assert_ne!(snapshot.write_status, AccessStatus::Granted);
+        assert!(!snapshot.withdrawn);
+        assert_eq!(fixture.store.load_state().await.unwrap(), before);
+        let unsampled = fixture.snapshot().await;
+        assert!(matches!(
+            unsampled.progress,
+            ProgressQueryResult::NotQueried(_)
+        ));
+        assert!(matches!(
+            unsampled.capability,
+            ProgressQueryResult::NotQueried(_)
+        ));
+    }
+    assert_eq!(fixture.probe.progress_calls.load(Ordering::Acquire), 6);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn m3_ordinary_sampling_discards_results_when_publication_changes_during_query() {
+    let fixture = Fixture::new(1, false).await;
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.achieved(&fixture.goal).await;
+    while let Ok(permit) = fixture.probe.role_entered.try_acquire() {
+        permit.forget();
+    }
+    fixture.probe.block_progress.store(true, Ordering::Release);
+    *fixture.probe.progress_result.lock().unwrap() = Some(Ok(41));
+    *fixture.probe.capability_result.lock().unwrap() = Some(Ok(40));
+    let mut next = fixture.goal.clone();
+    next.operation_id = OperationId::new("m3-query-superseded-scope");
+    next.revision += 1;
+    next.scope.epoch.configuration_number += 1;
+    next.scope.configuration.current = ConfigurationDescriptor::new(
+        next.scope.epoch,
+        fixture.goal.scope.storage.replica.replica_id,
+        fixture.goal.scope.configuration.current.members.clone(),
+        fixture.goal.scope.configuration.current.write_quorum,
+    );
+    next.desired = ReplicaGoalKind::Reconfigure {
+        role: ReplicaRole::Primary,
+        catch_up: None,
+    };
+    let change = async {
+        entered(&fixture.probe.progress_entered).await;
+        fixture.probe.block_role.store(true, Ordering::Release);
+        fixture.submit(&next).await.unwrap();
+        entered(&fixture.probe.role_entered).await;
+        fixture.probe.progress_gate.add_permits(1);
+    };
+    let (snapshot, ()) = tokio::join!(fixture.snapshot_sampling(true), change);
+    assert_eq!(
+        snapshot.publication.as_ref().unwrap().stage,
+        ReplicaPublicationStage::DiscoveryPending
+    );
+    assert!(matches!(
+        snapshot.progress,
+        ProgressQueryResult::NotQueried(_)
+    ));
+    assert!(matches!(
+        snapshot.capability,
+        ProgressQueryResult::NotQueried(_)
+    ));
+    assert_ne!(snapshot.write_status, AccessStatus::Granted);
+    fixture.probe.role_gate.add_permits(1);
+    fixture.achieved(&next).await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn m3_ordinary_sampling_auth_identity_and_predecessor_format_reject_before_callbacks() {
+    let fixture = Fixture::new(1, false).await;
+    fixture.submit(&fixture.goal).await.unwrap();
+    fixture.achieved(&fixture.goal).await;
+    let before = fixture.store.load_state().await.unwrap();
+    let request = proto::ReplicaSnapshotRequest {
+        protocol_version: ORDINARY_ACTION_FORMAT,
+        resource_uid: fixture.goal.scope.history.resource_uid.to_string(),
+        target: Some(fixture.goal.scope.storage.replica.clone().into()),
+        expected_process_session_id: fixture.goal.scope.process_session_id.to_string(),
+        sample_native_progress: true,
+    };
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(fixture.address.clone())
+            .await
+            .unwrap();
+    assert_eq!(
+        client
+            .get_snapshot(request.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let mut stale = request.clone();
+    stale.expected_process_session_id = "predecessor-process".into();
+    assert_eq!(
+        client.get_snapshot(auth(stale)).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut predecessor_format = request;
+    predecessor_format.protocol_version = 16;
+    assert_eq!(
+        client
+            .get_snapshot(auth(predecessor_format))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(fixture.probe.progress_calls.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.store.load_state().await.unwrap(), before);
     fixture.finish().await;
 }
 

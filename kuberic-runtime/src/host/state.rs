@@ -18,7 +18,7 @@ use crate::protocol::types::{
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_V1_PHASE6_SCHEMA_VERSION: u32 = 11;
-pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 16;
+pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 17;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

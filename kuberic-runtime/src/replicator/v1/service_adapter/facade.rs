@@ -337,9 +337,11 @@ impl Facade {
 
     async fn call(&self, command: Command) -> crate::Result<Value> {
         if self.abort.closed.load(Ordering::Acquire) {
+            tracing::debug!("native facade call rejected after driver Close");
             return Err(FacadeError::Closed.into());
         }
         if self.abort.requested() {
+            tracing::debug!("native facade call rejected after Abort");
             return Err(FacadeError::Aborted.into());
         }
         let (reply, receiver) = oneshot::channel();
@@ -350,6 +352,7 @@ impl Facade {
         receiver
             .await
             .map_err(|_| RuntimeError::from(FacadeError::Stopped))?
+            .inspect_err(|error| tracing::debug!(?error, "native facade command failed"))
             .map_err(RuntimeError::from)
     }
 
@@ -767,6 +770,7 @@ async fn run(
                     }).map_err(FacadeError::from));
                     if closed { break; }
                 } else if let Err(error) = result {
+                    tracing::debug!(?error, "native steady owner failed before Abort");
                     failure = Some(error.into());
                     abort.request();
                 }
@@ -777,12 +781,14 @@ async fn run(
                     Ok(()) => std::future::pending().await,
                 }
             }, if failure.is_none() => {
+                tracing::debug!(?error, "native retired owner failed before Abort");
                 failure = Some(error.into());
                 abort.request();
             }
             Some(()) = waits.next(), if !waits.is_empty() => {}
             Some(result) = contexts.next(), if !contexts.is_empty() => {
                 if let Err(error) = result {
+                    tracing::debug!(?error, "native context owner failed before Abort");
                     failure.get_or_insert(FacadeError::from(error));
                     abort.request();
                 }

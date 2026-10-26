@@ -1,6 +1,6 @@
 use super::*;
 
-pub const ORDINARY_ACTION_FORMAT: u32 = 16;
+pub const ORDINARY_ACTION_FORMAT: u32 = 17;
 pub const MAX_REMOTE_SELECTIONS: usize = 256;
 pub const MAX_REMOTE_GENERATIONS: usize = 64;
 
@@ -71,7 +71,8 @@ impl ReplicaScope {
             && self.creation_id == next.creation_id
             && self.epoch.data_loss_number == next.epoch.data_loss_number
             && self.epoch.configuration_number <= next.epoch.configuration_number
-            && self.configuration.current.primary_id == next.configuration.current.primary_id
+            && (self.configuration.current.primary_id == next.configuration.current.primary_id
+                || self.epoch.configuration_number < next.epoch.configuration_number)
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -213,7 +214,7 @@ enum ReplicaGoalKindTag {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaGoal {
-    #[schemars(range(min = 16, max = 16))]
+    #[schemars(range(min = 17, max = 17))]
     pub format: u32,
     pub identity: PublicV1Identity,
     pub operation_id: OperationId,

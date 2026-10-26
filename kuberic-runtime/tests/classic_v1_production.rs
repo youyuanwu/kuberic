@@ -53,6 +53,7 @@ async fn legacy_callback_program_rejects_without_mutating_ordinary_host() {
             resource_uid: resource.to_string(),
             target: Some(identity.clone().into()),
             expected_process_session_id: session.to_string(),
+            sample_native_progress: false,
         })
     };
     let response = client.get_snapshot(query()).await.unwrap().into_inner();
@@ -1112,15 +1113,27 @@ impl<A: Sample> Node<A> {
     }
 
     async fn peer(&self, role: ReplicaRole) -> ReplicaPeerDescription {
-        let publication = m2_builtin::snapshot(self).await.publication.unwrap();
+        let sampled = m2_builtin::snapshot_sampling(self, true).await;
+        let publication = sampled.publication.unwrap();
+        if matches!(
+            publication.role,
+            ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+        ) {
+            assert!(sampled.progress.value().is_some(), "{:?}", sampled.progress);
+            assert!(
+                sampled.capability.value().is_some(),
+                "{:?}",
+                sampled.capability
+            );
+        }
         ReplicaPeerDescription {
             identity: self.identity.clone(),
             replication_address: publication.replication_address,
             process_session_id: self.session.clone(),
             storage_incarnation: self.storage.clone(),
             role,
-            current_progress: 0,
-            catch_up_capability: 0,
+            current_progress: sampled.progress.value().unwrap_or(INVALID_LSN),
+            catch_up_capability: sampled.capability.value().unwrap_or(INVALID_LSN),
             is_up: true,
             is_ready: true,
             must_catchup: false,

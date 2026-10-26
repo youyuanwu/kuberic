@@ -973,6 +973,7 @@ where
                 .into(),
             ),
             expected_process_session_id: String::new(),
+            sample_native_progress: false,
         };
         match self
             .agents
