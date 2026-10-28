@@ -959,14 +959,13 @@ async fn m3_continuation_waits_for_real_epoch_provider_and_current_only_callback
     publish_configuration(&pair, &next, None, 1);
     let source_state = pair.source.sessions.inspect();
     let target_state = pair.target.sessions.inspect();
-    assert!(
-        source
-            .primary_replicator()
-            .unwrap()
-            .update_current_replica_set_configuration(next.clone())
-            .await
-            .is_err()
-    );
+    let selected_failure = source
+        .primary_replicator()
+        .unwrap()
+        .update_current_replica_set_configuration(next.clone())
+        .await
+        .unwrap_err()
+        .to_string();
     assert_eq!(pair.source.sessions.inspect(), source_state);
     assert_eq!(pair.target.sessions.inspect(), target_state);
     provider.epoch_gate.add_permits(1);
@@ -992,6 +991,24 @@ async fn m3_continuation_waits_for_real_epoch_provider_and_current_only_callback
         .change_role(epoch(2), ReplicaRole::ActiveSecondary)
         .await
         .unwrap();
+    assert_eq!(
+        source
+            .primary_replicator()
+            .unwrap()
+            .update_current_replica_set_configuration(next.clone())
+            .await
+            .unwrap_err()
+            .to_string(),
+        selected_failure,
+        "later native readiness cannot rewrite the failed selected Configuration"
+    );
+    // The host-context fixture selects a new invocation after both real epoch
+    // owners are ready; it does not clear the old owner's retained failure.
+    let mut selected_source = pair.source_access.publication.lock().unwrap().clone();
+    let mut selected_target = pair.target_access.publication.lock().unwrap().clone();
+    selected_source.generation += 1;
+    selected_target.generation += 1;
+    pair.publish(selected_source, selected_target);
     source
         .primary_replicator()
         .unwrap()
@@ -1061,11 +1078,12 @@ async fn m3_continuation_retains_ack_join_after_configuration_caller_drop_withou
             .update_current_replica_set_configuration(selected)
             .await
     });
-    until(|| pair.source.native_incarnation(&old).is_err()).await;
+    until(|| pair.source.predecessor_carrier_withdrawn(&old)).await;
     assert!(
         !callback.is_finished(),
         "actual ACK settlement still owns the continuation join"
     );
+    assert!(pair.source.sessions.active(&old).is_err());
     assert_eq!(pair.source.sessions.binding_for(2), Some(old.clone()));
     assert_eq!(pair.target.sessions.inbound(), Some(old.clone()));
     callback.abort();

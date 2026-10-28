@@ -13,7 +13,20 @@ pub mod session;
 pub mod sqlite_store;
 pub mod state;
 
-pub use crate::host::public_lifecycle::{PublicCutPosition, PublicOperationCut};
+pub use crate::host::public_lifecycle::{
+    PublicBuildFailure, PublicCutPosition, PublicOperationCut,
+};
+
+/// Testing-only custody of an actual successful host/root/native/application
+/// join. It is not a successful receipt for any interrupted ordinary callback.
+pub struct JoinedReplicaExclusion {
+    pub(crate) history: crate::protocol::types::HistoryContext,
+    pub(crate) storage: crate::protocol::types::ReplicaStorageIncarnationContext,
+    pub(crate) process: crate::protocol::types::ProcessSessionId,
+    pub(crate) creation: crate::protocol::types::ReplicatorCreationId,
+    pub(crate) lifetime: String,
+    pub(crate) application_paths: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
 
 use serde::{Serialize, de::DeserializeOwned};
 

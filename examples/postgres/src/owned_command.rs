@@ -9,6 +9,8 @@ use tokio::process::Command;
 use crate::instance::PgError;
 use crate::owned_process::OwnedProcess;
 
+pub(crate) mod helper_receipt;
+
 #[derive(Default)]
 struct Commands {
     next_id: u64,
@@ -87,7 +89,31 @@ impl OwnedCommands {
     }
 
     pub(crate) async fn output(&self, command: &mut Command) -> Result<Output, PgError> {
-        let (id, mut stdout, mut stderr, started) = {
+        self.output_inner(command, None).await
+    }
+
+    pub(crate) async fn output_selected(
+        &self,
+        command: &mut Command,
+        store: &crate::durable::PgDurableStore,
+        intent: helper_receipt::HelperIntent,
+    ) -> Result<Output, PgError> {
+        let selection = store.helper_lock.lock().await;
+        let launch = store.helper_launch(intent).await?;
+        self.output_inner(command, Some((store, launch, selection)))
+            .await
+    }
+
+    async fn output_inner(
+        &self,
+        command: &mut Command,
+        selected: Option<(
+            &crate::durable::PgDurableStore,
+            helper_receipt::HelperLaunch,
+            tokio::sync::MutexGuard<'_, ()>,
+        )>,
+    ) -> Result<Output, PgError> {
+        let (id, mut stdout, mut stderr, started, helper_selection) = {
             let mut commands = self.0.lock().unwrap();
             if commands.closed {
                 return Err(PgError::Process("owned commands are closed".into()));
@@ -103,7 +129,11 @@ impl OwnedCommands {
                 return Err(error);
             };
             commands.next_id = next;
-            let mut process = match OwnedProcess::spawn(command) {
+            let spawned = match &selected {
+                Some((_, launch, _)) => OwnedProcess::spawn_helper(command, launch),
+                None => OwnedProcess::spawn(command),
+            };
+            let mut process = match spawned {
                 Ok(process) => process,
                 Err(error) => {
                     // Retaining a spawn/identity failure also covers the rare
@@ -113,12 +143,45 @@ impl OwnedCommands {
                 }
             };
             let (stdout, stderr) = process.take_output();
+            let helper_selection = process.helper_selection().cloned();
             commands.running.insert(id, process);
             // Ownership is registered before the supervisor may launch.
-            let started = commands.running.get(&id).unwrap().start();
-            (id, stdout, stderr, started)
+            let started = if selected.is_none() {
+                commands.running.get(&id).unwrap().start()
+            } else {
+                Ok(())
+            };
+            (id, stdout, stderr, started, helper_selection)
         };
         let guard = CommandGuard { owner: self, id };
+        if let Some((store, _, selection_lock)) = selected {
+            let selection = helper_selection.expect("selected supervisor");
+            let dispatch = async {
+                store.select_helper(selection.clone()).await?;
+                // Revalidate pinned objects after durable selection, before START.
+                selection
+                    .launch
+                    .intent
+                    .revalidate(command)
+                    .map_err(|error| {
+                        PgError::Process(format!("native helper changed before START: {error}"))
+                    })?;
+                self.0
+                    .lock()
+                    .unwrap()
+                    .running
+                    .get(&id)
+                    .ok_or_else(|| {
+                        PgError::Process("selected helper cancelled before START".into())
+                    })?
+                    .start()
+            }
+            .await;
+            drop(selection_lock);
+            if let Err(error) = dispatch {
+                return Err(error.with_cleanup(guard.finish()));
+            }
+        }
         if let Err(error) = started {
             return Err(error.with_cleanup(guard.finish()));
         }

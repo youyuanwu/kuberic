@@ -4,12 +4,198 @@ use kuberic_runtime::protocol::public_operations::{
     ORDINARY_ACTION_FORMAT, RemoteReplicaSelection, ReplicaDiscoveryQuery, ReplicaPublication,
     ReplicaPublicationStage,
 };
+#[path = "public_session/repair.rs"]
+pub(crate) mod repair;
 
-pub(super) const SESSION_LIMIT: usize = 256;
+pub(crate) const SESSION_LIMIT: usize = 256;
+pub(crate) const NATIVE_SESSION_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PgSessionMode {
+    Copy,
+    Reformation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum PgReformationStage {
+    Selected,
+    Following,
+    Replayed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PgNativeReformation {
+    session: PgSessionId,
+    source_lineage: PgLineage,
+    retained_lineage: Option<PgLineage>,
+    required_certified_lsn: Option<i64>,
+    required_replay_lsn: Option<i64>,
+    source_boundary: i64,
+    stage: PgReformationStage,
+    evidence: Option<PgReplicationEvidence>,
+    repair: Option<repair::PgNativeRepair>,
+}
+
+impl PgNativeReformation {
+    pub(crate) fn continues(&self, old: &Self) -> bool {
+        let mut expected = old.clone();
+        expected.stage = self.stage;
+        expected.evidence = self.evidence.clone();
+        expected.repair = self.repair.clone();
+        self.stage >= old.stage
+            && expected == *self
+            && old
+                .evidence
+                .as_ref()
+                .is_none_or(|evidence| self.evidence.as_ref() == Some(evidence))
+            && match (&old.repair, &self.repair) {
+                (Some(old), Some(next)) => next.continues(old),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(crate) fn completes_installed_repair(
+        &self,
+        previous: &PgDurableState,
+        next: &PgDurableState,
+    ) -> bool {
+        let Some(old) = previous
+            .native_reformations
+            .iter()
+            .find(|old| old.session == self.session)
+        else {
+            return false;
+        };
+        let (Some(before), Some(after), Some(evidence)) =
+            (&old.repair, &self.repair, &self.evidence)
+        else {
+            return false;
+        };
+        let mut expected = old.clone();
+        expected.stage = PgReformationStage::Replayed;
+        expected.evidence = Some(evidence.clone());
+        expected.repair = Some(after.clone());
+        before.is_installed_successor_of(after)
+            && expected == *self
+            && previous.quiescence.is_some()
+            && next.quiescence.is_none()
+            && previous.external_access_closed
+            && next.external_access_closed
+            && previous.postgres_stopped
+            && !next.postgres_stopped
+            && previous.role == PgDurableRole::Primary
+            && next.role == PgDurableRole::Standby
+            && next.system_identifier.as_ref() == Some(&self.source_lineage.system_identifier)
+            && next.timeline_id == Some(self.source_lineage.timeline)
+            && next.policy_certified_lsn == previous.policy_certified_lsn
+            && next.flush_lsn >= previous.policy_certified_lsn
+            && evidence.in_recovery
+            && !evidence.wal_receiver_stopped
+    }
+
+    pub(crate) fn nonce(&self) -> [u8; 32] {
+        self.session.nonce
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn replayed(&self) -> bool {
+        self.stage == PgReformationStage::Replayed
+    }
+
+    pub(crate) fn validate(
+        &self,
+        identity: &crate::durable::PgDurableIdentity,
+    ) -> std::result::Result<(), String> {
+        self.session.validate().map_err(|error| error.to_string())?;
+        self.source_lineage.validate()?;
+        let target = identity.replica == self.session.target.scope.storage.replica;
+        if self.session.mode != PgSessionMode::Reformation
+            || identity.resource_uid != self.session.source.scope.history.resource_uid
+            || (!target && identity.replica != self.session.source.scope.storage.replica)
+            || self.source_boundary < 0
+        {
+            return Err("invalid native reformation scope".into());
+        }
+        match (
+            &self.retained_lineage,
+            self.required_certified_lsn,
+            self.required_replay_lsn,
+        ) {
+            (Some(lineage), Some(certified), Some(retained)) if target => {
+                if certified < 0
+                    || retained < certified
+                    || !lineage.prefix_is_contained_by(
+                        &self.source_lineage,
+                        if self.repair.is_some() {
+                            certified
+                        } else {
+                            retained
+                        },
+                        self.source_boundary,
+                    )
+                {
+                    return Err(
+                        "native reformation does not preserve the retained certified prefix".into(),
+                    );
+                }
+                if let Some(repair) = &self.repair {
+                    if !target {
+                        return Err("source cannot own target repair paths".into());
+                    }
+                    repair.validate(&self.session)?;
+                    let (lineage, certified, retained) = repair.retained_prefix();
+                    if self.retained_lineage.as_ref() != Some(lineage)
+                        || self.required_certified_lsn != Some(certified)
+                        || self.required_replay_lsn != Some(retained)
+                    {
+                        return Err(
+                            "repair changed the physically retained certified prefix".into()
+                        );
+                    }
+                    if repair.replayed() != (self.stage == PgReformationStage::Replayed) {
+                        return Err("repair and reformation completion stages differ".into());
+                    }
+                }
+            }
+            (None, None, None) if !target => {}
+            _ => return Err("native reformation lacks its exact local retained prefix".into()),
+        }
+        if self.stage == PgReformationStage::Replayed {
+            let evidence = self
+                .evidence
+                .as_ref()
+                .ok_or("reformation lacks actual native replay evidence")?;
+            evidence.validate()?;
+            if evidence.system_identifier != self.source_lineage.system_identifier
+                || evidence.timeline_id != self.source_lineage.timeline
+                || evidence.in_recovery != target
+                || (target
+                    && (evidence.wal_receiver_stopped
+                        || evidence
+                            .received_lsn
+                            .is_none_or(|lsn| lsn < self.source_boundary)
+                        || evidence
+                            .replay_lsn
+                            .is_none_or(|lsn| lsn < self.source_boundary)))
+            {
+                return Err("native reformation evidence differs from the selected source".into());
+            }
+        } else if self.evidence.is_some() {
+            return Err("unreplayed native reformation has completion evidence".into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PgSessionId {
+    pub(super) version: u32,
+    pub(super) mode: PgSessionMode,
     pub(super) nonce: [u8; 32],
     pub(super) generation: u64,
     pub(super) source: ReplicaPublication,
@@ -17,11 +203,15 @@ pub(crate) struct PgSessionId {
 }
 
 impl PgSessionId {
-    fn validate(&self) -> Result<()> {
-        if self.generation == 0 || self.nonce == [0; 32] {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.version != NATIVE_SESSION_VERSION || self.generation == 0 || self.nonce == [0; 32] {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
+        if self.mode == PgSessionMode::Reformation {
+            return self.validate_reformation();
+        }
         RemoteReplicaSelection {
+            original_member: None,
             source: self.source.clone(),
             target: self.target.clone(),
             target_control_address: self.target.replication_address.clone(),
@@ -29,6 +219,53 @@ impl PgSessionId {
         }
         .validate()
         .map_err(application_error)
+    }
+
+    fn validate_reformation(&self) -> Result<()> {
+        self.source.validate().map_err(application_error)?;
+        self.target.validate().map_err(application_error)?;
+        let current = &self.source.scope.configuration.current;
+        if self.source.scope.history != self.target.scope.history
+            || self.source.scope.epoch != self.target.scope.epoch
+            || current != &self.target.scope.configuration.current
+            || self.source.scope.configuration.previous != self.target.scope.configuration.previous
+            || self.source.scope.storage.replica == self.target.scope.storage.replica
+            || current.primary_id != self.source.scope.storage.replica.replica_id
+            || !current.members.iter().any(|member| {
+                member.identity == self.source.scope.storage.replica
+                    && member.role == ReplicaRole::Primary
+            })
+            || !current.members.iter().any(|member| {
+                member.identity == self.target.scope.storage.replica
+                    && member.role == ReplicaRole::ActiveSecondary
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        for (local, peer) in [(&self.source, &self.target), (&self.target, &self.source)] {
+            if !local.scope.configuration.replicas.iter().any(|candidate| {
+                candidate.identity == peer.scope.storage.replica
+                    && candidate.storage_incarnation == peer.scope.storage
+                    && candidate.process_session_id == peer.scope.process_session_id
+                    && candidate.replication_address == peer.replication_address
+            }) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+        }
+        Ok(())
+    }
+
+    fn membership_previous(&self) -> &ConfigurationDescriptor {
+        match self.mode {
+            PgSessionMode::Copy => &self.source.scope.configuration.current,
+            PgSessionMode::Reformation => self
+                .source
+                .scope
+                .configuration
+                .previous
+                .as_ref()
+                .unwrap_or(&self.source.scope.configuration.current),
+        }
     }
 }
 
@@ -93,6 +330,8 @@ struct Session {
     remote_retirement: Option<CloseOwner>,
     remote_settled: bool,
     native_copy_complete: bool,
+    native_reformation_complete: bool,
+    reformation: Option<CloseOwner>,
     membership: Option<NativeMembership>,
     native_owner: Option<Arc<InboundOwner>>,
     source_generation: u64,
@@ -102,6 +341,12 @@ struct Session {
     native_lineage: Option<PgLineage>,
     native_gateway: Option<Arc<std::sync::atomic::AtomicBool>>,
     publication_serial: Arc<Mutex<()>>,
+    repair_serial: Arc<Mutex<()>>,
+    repair_grant: Option<(
+        repair::RepairOffer,
+        NativeCredential,
+        Arc<std::sync::atomic::AtomicBool>,
+    )>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +373,15 @@ struct Sessions {
     generation: u64,
     entries: BTreeMap<[u8; 32], Session>,
     receiver: Option<[u8; 32]>,
+}
+
+impl Session {
+    fn native_established(&self) -> bool {
+        match self.id.mode {
+            PgSessionMode::Copy => self.native_copy_complete,
+            PgSessionMode::Reformation => self.native_reformation_complete,
+        }
+    }
 }
 
 impl PgSessions {
@@ -188,6 +442,8 @@ impl PgSessions {
                 remote_retirement: None,
                 remote_settled: false,
                 native_copy_complete: false,
+                native_reformation_complete: false,
+                reformation: None,
                 membership: None,
                 native_owner: None,
                 source_generation: id.source.generation,
@@ -197,12 +453,15 @@ impl PgSessions {
                 native_lineage: None,
                 native_gateway: None,
                 publication_serial: Arc::new(Mutex::new(())),
+                repair_serial: Arc::new(Mutex::new(())),
+                repair_grant: None,
             },
         );
         Ok(state.entries.get_mut(&id.nonce).unwrap())
     }
 
     pub(super) fn lease(&self, id: &PgSessionId) -> Result<(u64, CancellationToken)> {
+        id.validate()?;
         let mut state = self.gate.lock().unwrap();
         if state.fenced || state.blocked {
             return Err(RuntimeError::AuthorityNotAdmitted);
@@ -237,6 +496,513 @@ impl PgSessions {
 }
 
 impl PgReplicator {
+    pub(super) async fn pg_record_reformation(
+        &self,
+        id: &PgSessionId,
+        source_lineage: &PgLineage,
+        retained: Option<(&PgLineage, &PgDurableState)>,
+        boundary: i64,
+        stage: PgReformationStage,
+        evidence: Option<PgReplicationEvidence>,
+    ) -> Result<()> {
+        let record = PgNativeReformation {
+            session: id.clone(),
+            source_lineage: source_lineage.clone(),
+            retained_lineage: retained.map(|(lineage, _)| lineage.clone()),
+            required_certified_lsn: retained.map(|(_, state)| state.policy_certified_lsn),
+            required_replay_lsn: retained.map(|(_, state)| state.flush_lsn),
+            source_boundary: boundary,
+            stage,
+            evidence,
+            repair: self
+                .durable
+                .snapshot()
+                .await
+                .native_reformations
+                .iter()
+                .find(|record| record.session == *id)
+                .and_then(|record| record.repair.clone()),
+        };
+        self.durable
+            .update(|state| {
+                if let Some(previous) = state
+                    .native_reformations
+                    .iter_mut()
+                    .find(|previous| previous.session.nonce == id.nonce)
+                {
+                    if previous.session != record.session
+                        || previous.source_lineage != record.source_lineage
+                        || previous.retained_lineage != record.retained_lineage
+                        || previous.required_certified_lsn != record.required_certified_lsn
+                        || previous.required_replay_lsn != record.required_replay_lsn
+                        || previous.source_boundary != record.source_boundary
+                    {
+                        return Err(crate::durable::PgDurableError::Invalid(
+                            "native reformation selection changed".into(),
+                        ));
+                    }
+                    if previous.stage < stage {
+                        *previous = record;
+                    }
+                } else {
+                    state.native_reformations.push(record);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(application_error)?;
+        Ok(())
+    }
+
+    pub(super) fn pg_native_established(&self, id: &PgSessionId) -> Result<bool> {
+        self.public_owner().sessions.lease(id)?;
+        Ok(
+            self.public_owner().sessions.gate.lock().unwrap().entries[&id.nonce]
+                .native_established(),
+        )
+    }
+
+    pub(super) fn pg_native_reformation_pending(&self) -> bool {
+        let sessions = self.public_owner().sessions.gate.lock().unwrap();
+        sessions.receiver.is_some_and(|nonce| {
+            let entry = &sessions.entries[&nonce];
+            entry.id.mode == PgSessionMode::Reformation && !entry.native_established()
+        })
+    }
+
+    async fn pg_reformation_publications(&self, id: &PgSessionId) -> Result<()> {
+        id.validate()?;
+        self.public_attempt_live(&self.public_owner().work.lock().unwrap().clone())?;
+        let context = self.public_owner().fence.context()?;
+        let source_local = context.identity == id.source.scope.storage.replica;
+        let origin = if source_local { &id.source } else { &id.target };
+        if context.identity != origin.scope.storage.replica
+            || context.epoch != origin.scope.epoch
+            || context.role
+                != if source_local {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                }
+            || self.public_owner().fence.local.process_session_id != origin.scope.process_session_id
+            || self.public_owner().fence.local.replication_address != origin.replication_address
+        {
+            tracing::warn!(local_role = ?context.role, local_epoch = ?context.epoch,
+                selected_epoch = ?origin.scope.epoch, source_local,
+                "PG reformation refused: local physical/role/epoch binding");
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let host = self
+            .public_owner()
+            .host
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let local = host
+            .local_publication()
+            .await?
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let remote_origin = if source_local { &id.target } else { &id.source };
+        let remote = host
+            .discover_peer(&ReplicaDiscoveryQuery {
+                format: ORDINARY_ACTION_FORMAT,
+                history: remote_origin.scope.history.clone(),
+                replica: remote_origin.scope.storage.replica.clone(),
+                process_session_id: Some(remote_origin.scope.process_session_id.clone()),
+            })
+            .await?
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let (source, target) = if source_local {
+            (&local, &remote)
+        } else {
+            (&remote, &local)
+        };
+        let prior = self
+            .public_owner()
+            .sessions
+            .gate
+            .lock()
+            .unwrap()
+            .entries
+            .get(&id.nonce)
+            .and_then(|entry| entry.membership.clone());
+        for (observed, expected, source_endpoint) in
+            [(source, &id.source, true), (target, &id.target, false)]
+        {
+            observed.validate().map_err(application_error)?;
+            let original_configuration = &expected.scope.configuration;
+            let configuration = &observed.scope.configuration;
+            let current_seen = prior.as_ref().is_some_and(|membership| {
+                if source_endpoint {
+                    membership.source_current_seen
+                } else {
+                    membership.target_current_seen
+                }
+            });
+            if observed.scope.storage != expected.scope.storage
+                || observed.scope.process_session_id != expected.scope.process_session_id
+                || observed.scope.creation_id != expected.scope.creation_id
+                || observed.scope.history != expected.scope.history
+                || observed.scope.epoch != expected.scope.epoch
+                || observed.replication_address != expected.replication_address
+                || observed.generation < expected.generation
+                || configuration.current != original_configuration.current
+                || !(configuration.previous == original_configuration.previous
+                    || configuration.previous.is_none())
+                || (current_seen && configuration.previous.is_some())
+                || !configuration.replicas.iter().all(|peer| {
+                    original_configuration.replicas.iter().any(|original| {
+                        peer.identity == original.identity
+                            && peer.storage_incarnation == original.storage_incarnation
+                            && peer.process_session_id == original.process_session_id
+                            && peer.replication_address == original.replication_address
+                            && peer.role == original.role
+                    })
+                })
+                || !original_configuration.replicas.iter().all(|original| {
+                    configuration.replicas.iter().any(|peer| {
+                        peer.identity == original.identity
+                            && peer.storage_incarnation == original.storage_incarnation
+                            && peer.process_session_id == original.process_session_id
+                            && peer.replication_address == original.replication_address
+                            && peer.role == original.role
+                    }) || (configuration.previous.is_none()
+                        && !configuration
+                            .current
+                            .members
+                            .iter()
+                            .any(|member| member.identity == original.identity))
+                })
+                || (observed.stage == ReplicaPublicationStage::AchievedScope
+                    && observed.role
+                        != if source_endpoint {
+                            ReplicaRole::Primary
+                        } else {
+                            ReplicaRole::ActiveSecondary
+                        })
+            {
+                tracing::warn!(
+                    source_endpoint,
+                    observed_epoch = ?observed.scope.epoch,
+                    selected_epoch = ?expected.scope.epoch,
+                    observed_current = ?configuration.current.configuration_id,
+                    selected_current = ?original_configuration.current.configuration_id,
+                    observed_previous = ?configuration.previous.as_ref().map(|previous| &previous.configuration_id),
+                    selected_previous = ?original_configuration.previous.as_ref().map(|previous| &previous.configuration_id),
+                    current_seen,
+                    physical_matches = (observed.scope.storage == expected.scope.storage
+                        && observed.scope.process_session_id == expected.scope.process_session_id
+                        && observed.scope.creation_id == expected.scope.creation_id),
+                    "PG reformation refused: selected publication continuity"
+                );
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+        }
+        let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
+        if let Some(entry) = sessions.entries.get_mut(&id.nonce) {
+            if entry.id != *id || !entry.stage.live() || entry.cancellation.is_cancelled() {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let established = entry.native_established();
+            if let Some(membership) = entry.membership.as_mut() {
+                membership.source_current_seen |= source.scope.configuration.previous.is_none();
+                membership.target_current_seen |= target.scope.configuration.previous.is_none();
+                membership.achieved |= established
+                    && [source, target].iter().all(|publication| {
+                        publication.stage == ReplicaPublicationStage::AchievedScope
+                            && publication.scope.configuration.previous.is_none()
+                    });
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn pg_prepare_reformation_session(
+        &self,
+        replica: &ReplicaInformation,
+        current: &ConfigurationDescriptor,
+        previous: Option<&ConfigurationDescriptor>,
+    ) -> Result<PgSessionId> {
+        let host = self
+            .public_owner()
+            .host
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let source = host.local_publication().await?.ok_or_else(|| {
+            tracing::warn!("PG reformation refused: local publication absent");
+            RuntimeError::AuthorityNotAdmitted
+        })?;
+        let target = host
+            .discover_peer(&ReplicaDiscoveryQuery {
+                format: ORDINARY_ACTION_FORMAT,
+                history: source.scope.history.clone(),
+                replica: replica.identity.clone(),
+                process_session_id: Some(replica.process_session_id.clone()),
+            })
+            .await?
+            .ok_or_else(|| {
+                tracing::warn!(peer = ?replica.identity,
+                    "PG reformation refused: target publication absent");
+                RuntimeError::AuthorityNotAdmitted
+            })?;
+        if source.scope.configuration.current != *current
+            || source.scope.configuration.previous.as_ref() != previous
+            || replica.role != ReplicaRole::ActiveSecondary
+            || target.scope.storage.replica != replica.identity
+            || target.scope.process_session_id != replica.process_session_id
+            || target.replication_address != replica.replication_address
+            || replica.storage_incarnation.as_ref() != Some(&target.scope.storage)
+        {
+            tracing::warn!(
+                source_matches = (source.scope.configuration.current == *current
+                    && source.scope.configuration.previous.as_ref() == previous),
+                target_matches = (target.scope.storage.replica == replica.identity
+                    && target.scope.process_session_id == replica.process_session_id
+                    && target.replication_address == replica.replication_address
+                    && replica.storage_incarnation.as_ref() == Some(&target.scope.storage)),
+                "PG reformation refused: selected endpoint/configuration binding"
+            );
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let existing = {
+            let sessions = self.public_owner().sessions.gate.lock().unwrap();
+            sessions
+                .entries
+                .values()
+                .find(|entry| {
+                    entry.id.mode == PgSessionMode::Reformation
+                        && entry.stage.live()
+                        && entry.id.source.scope.storage == source.scope.storage
+                        && entry.id.source.scope.process_session_id
+                            == source.scope.process_session_id
+                        && entry.id.source.scope.creation_id == source.scope.creation_id
+                        && entry.id.source.scope.configuration.current == *current
+                        && entry.id.target.scope.storage == target.scope.storage
+                        && entry.id.target.scope.process_session_id
+                            == target.scope.process_session_id
+                        && entry.id.target.scope.creation_id == target.scope.creation_id
+                })
+                .map(|entry| entry.id.clone())
+        };
+        let id = match existing {
+            Some(id) => id,
+            None => self
+                .pg_propose_mode_session(source, target, PgSessionMode::Reformation)
+                .await
+                .inspect_err(|error| {
+                    tracing::warn!(%error,
+                        "PG reformation refused: propose two-ended session")
+                })?,
+        };
+        self.pg_establish_session(&id).await.inspect_err(
+            |error| tracing::warn!(%error, "PG reformation refused: establish two-ended session"),
+        )?;
+        self.pg_install_membership(&id, current, previous, false)?;
+        Ok(id)
+    }
+
+    pub(super) async fn pg_receive_reformation(&self, binding: PeerBinding) -> Result<()> {
+        let id = binding
+            .session
+            .as_deref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if id.mode != PgSessionMode::Reformation
+            || id.target.scope.storage.replica != self.public_owner().fence.local.identity
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.pg_session_publications(id).await?;
+        let original_previous = id.source.scope.configuration.previous.as_ref();
+        let previous = if binding.previous_configuration_id
+            == original_previous.map(|previous| previous.configuration_id.clone())
+        {
+            original_previous
+        } else if binding.previous_configuration_id.is_none()
+            && self
+                .pg_native_membership(id)?
+                .is_some_and(|membership| membership.source_current_seen)
+        {
+            None
+        } else {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        };
+        self.pg_install_membership(id, &id.source.scope.configuration.current, previous, true)?;
+        self.pg_validate_native_session(&TransportBinding::Peer(binding.clone()), true)
+            .await?;
+        let operation = {
+            let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
+            let entry = sessions
+                .entries
+                .get_mut(&id.nonce)
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if let Some(owner) = &entry.reformation {
+                owner.clone()
+            } else {
+                let driver = self
+                    .public_owner()
+                    .driver
+                    .get()
+                    .and_then(Weak::upgrade)
+                    .ok_or(RuntimeError::Closed)?;
+                let binding = binding.clone();
+                let id = id.clone();
+                let cancellation = entry.cancellation.clone();
+                let generation = entry.effect_generation;
+                let (sender, result) = tokio::sync::watch::channel(None);
+                let task = tokio::spawn(async move {
+                    let result = driver
+                        .pg_reform_retained_standby(binding, generation, cancellation)
+                        .await;
+                    if let Err(error) = &result {
+                        driver.pg_quarantine_session(&id);
+                        driver
+                            .public_owner()
+                            .sessions
+                            .gate
+                            .lock()
+                            .unwrap()
+                            .entries
+                            .get_mut(&id.nonce)
+                            .unwrap()
+                            .native_failure = Some(error.to_string());
+                    }
+                    sender.send_replace(Some(result.map_err(|error| error.to_string())));
+                });
+                let owner = CloseOwner {
+                    result,
+                    task: crate::owned_task::PgTask::new(task),
+                };
+                entry.joins.push(owner.task.clone());
+                entry.reformation = Some(owner.clone());
+                owner
+            }
+        };
+        operation
+            .wait("lost PostgreSQL retained reformation owner")
+            .await
+    }
+
+    async fn pg_reform_retained_standby(
+        &self,
+        binding: PeerBinding,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<()> {
+        let id = binding
+            .session
+            .as_deref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let transport = TransportBinding::Peer(binding.clone());
+        let _serial = self.public_owner().inbound_serial.lock().await;
+        self.public_owner().sessions.revalidate(id, generation)?;
+        let durable = self.durable.revalidate().await.map_err(application_error)?;
+        if durable.quiescence.is_some() {
+            return self
+                .pg_repair_retained_primary(binding, generation, cancellation)
+                .await;
+        }
+        let mut state = self.public_owner().state.lock().await;
+        let durable = self.public_validate_history().await?;
+        if durable.role != PgDurableRole::Standby
+            || durable.system_identifier.is_none()
+            || durable.quiescence.is_some()
+        {
+            return Err(application_error(
+                "retained writable/quiescent PostgreSQL requires staged scoped rewind; streaming reformation refused",
+            ));
+        }
+        let retained = self.public_lineage().await?;
+        let (credential, lineage, boundary) = self.public_source_for_admission(&transport).await?;
+        if !retained.prefix_is_contained_by(&lineage, durable.flush_lsn, boundary) {
+            return Err(application_error(
+                "selected PostgreSQL source does not contain the retained native prefix; staged scoped rewind required",
+            ));
+        }
+        self.pg_record_reformation(
+            id,
+            &lineage,
+            Some((&retained, &durable)),
+            boundary,
+            PgReformationStage::Selected,
+            None,
+        )
+        .await?;
+        self.public_owned_with(cancellation.clone(), async {
+            self.pg_validate_native_session(&transport, true).await?;
+            self.instance.stop().await.map_err(application_error)?;
+            self.public_owner().sessions.revalidate(id, generation)?;
+            if self.public_lineage().await? != retained {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            self.public_owner().fence.admit_peer(&binding)?;
+            self.instance
+                .config()
+                .public_receiver(
+                    self.instance.data_dir(),
+                    &credential.conninfo()?,
+                    &crate::native::replication_slot_name(transport.target()),
+                    &lineage,
+                )
+                .await
+                .map_err(application_error)?;
+            self.pg_record_reformation(
+                id,
+                &lineage,
+                Some((&retained, &durable)),
+                boundary,
+                PgReformationStage::Following,
+                None,
+            )
+            .await?;
+            self.pg_validate_native_session(&transport, true).await?;
+            self.public_start_with_credential(Some(&credential)).await?;
+            loop {
+                self.pg_validate_native_session(&transport, true).await?;
+                let snapshot = self.observer.snapshot().await.map_err(application_error)?;
+                if snapshot.evidence.as_ref().is_some_and(|evidence| {
+                    evidence.in_recovery
+                        && evidence.system_identifier == lineage.system_identifier
+                        && evidence.timeline_id == lineage.timeline
+                        && !evidence.wal_receiver_stopped
+                        && evidence.received_lsn.is_some_and(|lsn| lsn >= boundary)
+                        && evidence.replay_lsn.is_some_and(|lsn| lsn >= boundary)
+                }) {
+                    self.public_source_for_admission(&transport).await?;
+                    let completed = self.public_snapshot_and_persist().await?;
+                    self.pg_validate_native_session(&transport, true).await?;
+                    self.pg_record_reformation(
+                        id,
+                        &lineage,
+                        Some((&retained, &durable)),
+                        boundary,
+                        PgReformationStage::Replayed,
+                        completed.evidence,
+                    )
+                    .await?;
+                    state.receiver = Some(transport.clone());
+                    state.receiver_boundary = Some(boundary);
+                    self.pg_native_reformation_completed(id)?;
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+    }
+
+    pub(super) fn pg_native_reformation_completed(&self, id: &PgSessionId) -> Result<()> {
+        if id.mode != PgSessionMode::Reformation {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.public_owner().sessions.lease(id)?;
+        let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
+        let entry = sessions.entries.get_mut(&id.nonce).unwrap();
+        entry.native_reformation_complete = true;
+        if id.target.scope.storage.replica == self.public_owner().fence.local.identity {
+            entry.stage = SessionStage::Completed;
+        }
+        Ok(())
+    }
+
     pub(super) fn pg_bind_native_gateway(
         &self,
         id: &PgSessionId,
@@ -298,6 +1064,17 @@ impl PgReplicator {
         entry.native_lineage = Some(lineage.clone());
         Ok(())
     }
+    #[cfg(all(test, feature = "testing"))]
+    pub(super) fn pg_native_establishment(&self, id: &PgSessionId) -> (PgSessionMode, bool, bool) {
+        let sessions = self.public_owner().sessions.gate.lock().unwrap();
+        let entry = &sessions.entries[&id.nonce];
+        (
+            id.mode,
+            entry.native_copy_complete,
+            entry.native_reformation_complete,
+        )
+    }
+
     #[cfg(all(test, feature = "testing"))]
     pub(super) fn pg_session_ownership(&self, id: &PgSessionId) -> (SessionStage, bool, bool) {
         let sessions = self.public_owner().sessions.gate.lock().unwrap();
@@ -391,8 +1168,19 @@ impl PgReplicator {
                 .entries
                 .get(&id.nonce)
                 .and_then(|entry| entry.native_owner.clone());
-            if let Some(owner) = native {
-                if let Err(error) = self.public_join_inbound_owner(&owner).await {
+            let reforming = self
+                .public_owner()
+                .sessions
+                .gate
+                .lock()
+                .unwrap()
+                .entries
+                .get(&id.nonce)
+                .is_some_and(|entry| entry.reformation.is_some());
+            if native.is_some() || reforming {
+                if let Some(owner) = native
+                    && let Err(error) = self.public_join_inbound_owner(&owner).await
+                {
                     failures.push(error.to_string());
                 }
                 let _serial = self.public_owner().inbound_serial.lock().await;
@@ -446,6 +1234,9 @@ impl PgReplicator {
         }
     }
     pub(super) fn pg_native_copy_completed(&self, id: &PgSessionId) -> Result<()> {
+        if id.mode != PgSessionMode::Copy {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
         if sessions.fenced || sessions.blocked {
             return Err(RuntimeError::Closed);
@@ -477,7 +1268,7 @@ impl PgReplicator {
             .values()
             .find(|entry| {
                 entry.stage == SessionStage::Active
-                    && entry.native_copy_complete
+                    && entry.native_established()
                     && entry.id.target.scope.storage.replica == replica.identity
                     && entry.id.target.scope.process_session_id == replica.process_session_id
                     && entry.id.target.replication_address == replica.replication_address
@@ -495,7 +1286,7 @@ impl PgReplicator {
         self.public_owner().sessions.lease(id)?;
         let sessions = self.public_owner().sessions.gate.lock().unwrap();
         let entry = &sessions.entries[&id.nonce];
-        if !entry.native_copy_complete {
+        if !entry.native_established() && id.mode != PgSessionMode::Reformation {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         Ok(entry.membership.clone())
@@ -511,12 +1302,14 @@ impl PgReplicator {
         self.public_owner().sessions.lease(id)?;
         let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
         let entry = sessions.entries.get_mut(&id.nonce).unwrap();
-        if !entry.native_copy_complete || !entry.stage.live() {
+        if (!entry.native_established() && id.mode != PgSessionMode::Reformation)
+            || !entry.stage.live()
+        {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        let predecessor = &id.source.scope.configuration.current;
+        let predecessor = id.membership_previous();
         let valid = current.epoch == id.source.scope.epoch
-            && current.primary_id == predecessor.primary_id
+            && current.primary_id == id.source.scope.storage.replica.replica_id
             && current.members.iter().any(|member| {
                 member.identity == id.target.scope.storage.replica
                     && member.role == ReplicaRole::ActiveSecondary
@@ -526,14 +1319,25 @@ impl PgReplicator {
                     && member.role == ReplicaRole::Primary
             });
         if !valid {
+            tracing::warn!(
+                mode = ?id.mode,
+                current_primary = ?current.primary_id,
+                predecessor_primary = ?predecessor.primary_id,
+                selected_source = ?id.source.scope.storage.replica.replica_id,
+                "PG native membership refused: selected source/current member binding"
+            );
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         match &mut entry.membership {
-            None if previous == Some(predecessor) => {
+            None if previous == Some(predecessor)
+                || (id.mode == PgSessionMode::Reformation
+                    && current == &id.source.scope.configuration.current
+                    && previous == id.source.scope.configuration.previous.as_ref()) =>
+            {
                 entry.membership = Some(NativeMembership {
                     current: current.clone(),
                     previous: predecessor.clone(),
-                    current_only: false,
+                    current_only: previous.is_none(),
                     installed,
                     achieved: false,
                     source_current_seen: false,
@@ -564,7 +1368,7 @@ impl PgReplicator {
             && sessions.receiver.is_some_and(|nonce| {
                 let entry = &sessions.entries[&nonce];
                 entry.stage == SessionStage::Completed
-                    && entry.native_copy_complete
+                    && entry.native_established()
                     && entry.id.target.scope.epoch == epoch
                     && !entry.cancellation.is_cancelled()
             })
@@ -575,10 +1379,42 @@ impl PgReplicator {
         binding: &TransportBinding,
         continuation: bool,
     ) -> Result<()> {
+        self.pg_validate_native_session_kind(binding, continuation, false)
+            .await
+    }
+
+    pub(super) async fn pg_validate_native_gateway(
+        &self,
+        binding: &TransportBinding,
+    ) -> Result<()> {
+        self.pg_validate_native_session_kind(binding, true, true)
+            .await
+    }
+
+    async fn pg_validate_native_session_kind(
+        &self,
+        binding: &TransportBinding,
+        continuation: bool,
+        private_gateway: bool,
+    ) -> Result<()> {
         let id = binding
             .session()
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if id.mode == PgSessionMode::Reformation && matches!(binding, TransportBinding::Build(_)) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let (generation, cancellation) = self.public_owner().sessions.lease(id)?;
+        #[cfg(all(test, feature = "testing"))]
+        if private_gateway
+            && id.mode == PgSessionMode::Reformation
+            && self.pg_native_established(id)?
+            && self
+                .pg_native_membership(id)?
+                .is_some_and(|membership| !membership.current_only)
+        {
+            self.native_cut("gateway-joint-before-membership-validation")
+                .await;
+        }
         {
             let sessions = self.public_owner().sessions.gate.lock().unwrap();
             let entry = &sessions.entries[&id.nonce];
@@ -592,6 +1428,8 @@ impl PgReplicator {
                     )
                 };
             if !expected {
+                tracing::warn!(mode = ?id.mode, stage = ?entry.stage, private_gateway,
+                    "PG native validation refused: session owner stage");
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
             if !continuation && entry.membership.is_some() {
@@ -602,11 +1440,29 @@ impl PgReplicator {
                     .membership
                     .as_ref()
                     .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let expected_previous = (!membership.current_only)
+                    .then(|| membership.previous.configuration_id.clone());
+                let frozen_gateway_previous = private_gateway
+                    && id.mode == PgSessionMode::Reformation
+                    && peer.previous_configuration_id
+                        == id
+                            .source
+                            .scope
+                            .configuration
+                            .previous
+                            .as_ref()
+                            .map(|previous| previous.configuration_id.clone());
                 if peer.current_configuration_id != membership.current.configuration_id
-                    || peer.previous_configuration_id
-                        != (!membership.current_only)
-                            .then(|| membership.previous.configuration_id.clone())
+                    || (peer.previous_configuration_id != expected_previous
+                        && !frozen_gateway_previous)
                 {
+                    tracing::warn!(private_gateway, current_only = membership.current_only,
+                        peer_current = ?peer.current_configuration_id,
+                        native_current = ?membership.current.configuration_id,
+                        peer_previous = ?peer.previous_configuration_id,
+                        expected_previous = ?expected_previous,
+                        frozen_gateway_previous,
+                        "PG native validation refused: membership projection");
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
             }
@@ -715,6 +1571,9 @@ impl PgReplicator {
     }
 
     async fn pg_exact_session_publications(&self, id: &PgSessionId) -> Result<()> {
+        if id.mode == PgSessionMode::Reformation {
+            return Box::pin(self.pg_session_publications(id)).await;
+        }
         id.validate()?;
         self.public_attempt_live(&self.public_owner().work.lock().unwrap().clone())?;
         let context = self.public_owner().fence.context()?;
@@ -792,6 +1651,9 @@ impl PgReplicator {
             Some(serial) => Some(serial.lock().await),
             None => None,
         };
+        if id.mode == PgSessionMode::Reformation {
+            return self.pg_reformation_publications(id).await;
+        }
         let continuing = self
             .public_owner()
             .sessions
@@ -970,7 +1832,7 @@ impl PgReplicator {
             sessions.receiver.and_then(|nonce| {
                 let entry = &sessions.entries[&nonce];
                 (entry.stage == SessionStage::Completed
-                    && entry.native_copy_complete
+                    && entry.native_established()
                     && entry.membership_worker.is_none()
                     && !entry.cancellation.is_cancelled())
                 .then(|| (entry.id.clone(), entry.effect_generation))
@@ -1013,7 +1875,7 @@ impl PgReplicator {
         if entry.id != id
             || entry.effect_generation != generation
             || entry.stage != SessionStage::Completed
-            || !entry.native_copy_complete
+            || !entry.native_established()
             || entry.cancellation.is_cancelled()
             || entry.retirement.is_some()
             || entry.remote_retirement.is_some()
@@ -1094,7 +1956,7 @@ impl PgReplicator {
         if session.as_ref() != id
             || binding.session.as_deref() != Some(id)
             || !membership.installed
-            || membership.previous != id.source.scope.configuration.current
+            || membership.previous != *id.membership_previous()
             || boundary < 0
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
@@ -1103,6 +1965,16 @@ impl PgReplicator {
         {
             let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
             let entry = sessions.entries.get_mut(&id.nonce).unwrap();
+            if id.mode == PgSessionMode::Reformation {
+                membership.source_current_seen = entry
+                    .membership
+                    .as_ref()
+                    .is_some_and(|local| local.source_current_seen);
+                membership.target_current_seen = entry
+                    .membership
+                    .as_ref()
+                    .is_some_and(|local| local.target_current_seen);
+            }
             if let Some(old) = &entry.membership {
                 if old.current != membership.current
                     || old.previous != membership.previous
@@ -1154,7 +2026,7 @@ impl PgReplicator {
                 .map_err(application_error)?;
             self.pg_validate_native_session(&transport, true).await?;
             self.public_owner().fence.admit_peer(&binding)?;
-            self.public_start().await?;
+            self.public_start_with_credential(Some(&credential)).await?;
             self.pg_validate_native_session(&transport, true).await?;
             state.receiver = Some(transport);
             state.receiver_boundary = Some(boundary);
@@ -1194,8 +2066,20 @@ impl PgReplicator {
         source: ReplicaPublication,
         target: ReplicaPublication,
     ) -> Result<PgSessionId> {
+        self.pg_propose_mode_session(source, target, PgSessionMode::Copy)
+            .await
+    }
+
+    async fn pg_propose_mode_session(
+        &self,
+        source: ReplicaPublication,
+        target: ReplicaPublication,
+        mode: PgSessionMode,
+    ) -> Result<PgSessionId> {
         let nonce = super::super::public_transport::random_bytes()?;
         let mut id = PgSessionId {
+            version: NATIVE_SESSION_VERSION,
+            mode,
             nonce,
             generation: 1,
             source,
@@ -1205,6 +2089,22 @@ impl PgReplicator {
         if id.source.scope.storage.replica != self.public_owner().fence.local.identity {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
+        let native_generation = self
+            .durable
+            .update(|state| {
+                state.native_session_generation = state
+                    .native_session_generation
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        crate::durable::PgDurableError::Invalid(
+                            "native session generation exhausted".into(),
+                        )
+                    })?;
+                Ok(())
+            })
+            .await
+            .map_err(application_error)?
+            .native_session_generation;
         let mut sessions = self.public_owner().sessions.gate.lock().unwrap();
         if sessions.fenced || sessions.blocked {
             return Err(RuntimeError::Closed);
@@ -1220,10 +2120,10 @@ impl PgReplicator {
                 "PostgreSQL target already has an unsettled session owner",
             ));
         }
-        sessions.generation = sessions
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| application_error("PostgreSQL session generation exhausted"))?;
+        if native_generation <= sessions.generation {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        sessions.generation = native_generation;
         id.generation = sessions.generation;
         PgSessions::record(&mut sessions, &id, SessionStage::Proposed)?;
         Ok(id)

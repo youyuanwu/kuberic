@@ -29,7 +29,7 @@ async fn m2_pg_matching_format_reopen_preserves_data() {
     source.driver.public_close().await.unwrap();
     let identity = source.driver.durable.snapshot().await.identity;
     drop(source);
-    let metadata = std::fs::read(root.join("a/state-v2.json")).unwrap();
+    let metadata = std::fs::read(root.join("a/state-v3.json")).unwrap();
     let clock = std::fs::read(root.join("a/process-generation-v2")).unwrap();
     let control = std::fs::read(root.join("d/global/pg_control")).unwrap();
     let version = std::fs::read(root.join("d/PG_VERSION")).unwrap();
@@ -41,7 +41,7 @@ async fn m2_pg_matching_format_reopen_preserves_data() {
             .is_err()
     );
     assert_eq!(
-        std::fs::read(root.join("a/state-v2.json")).unwrap(),
+        std::fs::read(root.join("a/state-v3.json")).unwrap(),
         metadata
     );
     assert_eq!(

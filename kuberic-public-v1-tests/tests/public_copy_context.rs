@@ -374,7 +374,7 @@ async fn public_build_consumes_target_context_and_installs_nonempty_snapshot() {
     };
     let mut copied_snapshot = None;
     let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(90), async {
-        source.goal(configuration.clone(), ReplicaGoalKind::Prepare { role: ReplicaRole::Primary }).await?;
+        source.goal(configuration.clone(), ReplicaGoalKind::Prepare { role: ReplicaRole::Primary, rebuild: None }).await?;
         let before_access = source.snapshot().await?;
         assert_ne!(before_access.write_status, AccessStatus::Granted);
         assert!(source.service.begin_write(Bytes::from_static(b"forbidden-before-access")).await.is_err());
@@ -388,7 +388,7 @@ async fn public_build_consumes_target_context_and_installs_nonempty_snapshot() {
         }
         assert!(committed > 0);
         assert_eq!(source.service.values().await?, expected_values);
-        target.goal(configuration.clone(), ReplicaGoalKind::Prepare { role: ReplicaRole::IdleSecondary }).await?;
+        target.goal(configuration.clone(), ReplicaGoalKind::Prepare { role: ReplicaRole::IdleSecondary, rebuild: None }).await?;
         assert_eq!(ExternalService::read_persisted_snapshot(&target_application)?, PersistedSnapshot { committed_lsn: 0, values: Vec::new() });
         assert_eq!(target.service.copy_context_observations(), CopyContextObservations::default());
         let source_publication = source.snapshot().await?.publication.unwrap();
@@ -396,6 +396,7 @@ async fn public_build_consumes_target_context_and_installs_nonempty_snapshot() {
         assert_eq!(source_publication.stage, ReplicaPublicationStage::AchievedScope);
         assert_eq!(target_publication.stage, ReplicaPublicationStage::AchievedScope);
         let remote = RemoteReplicaSelection {
+            original_member: None,
             source: source_publication, target: target_publication,
             target_control_address: target.control_address.clone(), generation: 1,
         };

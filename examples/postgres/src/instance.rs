@@ -27,6 +27,21 @@ fn increment_generation(generation: &AtomicU64) -> Option<u64> {
     }
 }
 
+async fn helper_lease_invalid(
+    valid: &crate::adapter::public_transport::GatewayValidity,
+    cancellation: &CancellationToken,
+) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
+    loop {
+        tick.tick().await;
+        if !crate::adapter::public_transport::rewind_candidate_lease_valid(valid, cancellation)
+            .await
+        {
+            return;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgProcessFault {
     Transient,
@@ -47,6 +62,7 @@ pub enum PgProcessState {
 struct StartParameters {
     fault_tx: mpsc::Sender<kuberic_runtime::protocol::types::FaultType>,
     cancellation: Option<(Weak<PgInstanceManager>, CancellationToken)>,
+    native_password: Option<String>,
 }
 
 pub(crate) struct GenerationFault {
@@ -237,6 +253,7 @@ pub struct PgInstanceManager {
     port: u16,
     current: Arc<ProcessMutex<Arc<ProcessGeneration>>>,
     next_generation: Arc<GenerationClock>,
+    helper_store: ProcessMutex<Option<Weak<crate::durable::PgDurableStore>>>,
     launches_closed: Arc<AtomicBool>,
     abort_generation: AtomicU64,
     config: PgConfig,
@@ -347,6 +364,7 @@ impl PgInstanceManager {
             launches_closed: Arc::new(AtomicBool::new(false)),
             abort_generation: AtomicU64::new(0),
             config,
+            helper_store: ProcessMutex::new(None),
             lifecycle_lock: Arc::new(Mutex::new(())),
             fault_sink: ProcessMutex::new(None),
             start_parameters: Mutex::new(None),
@@ -424,10 +442,47 @@ impl PgInstanceManager {
         store: &Arc<crate::durable::PgDurableStore>,
     ) -> Result<(), PgError> {
         let _lifecycle = self.lifecycle().await;
+        *self.helper_store.lock().unwrap() = Some(Arc::downgrade(store));
+        store.ensure_helpers_complete().await?;
         self.next_generation.bind(store).await?;
         let id = self.next_generation.allocate()?;
         let mut current = self.current.lock().unwrap();
         *current = Arc::new(ProcessGeneration::new(id, current.tasks.clone()));
+        Ok(())
+    }
+
+    fn native_helper_store(&self) -> Result<Option<Arc<crate::durable::PgDurableStore>>, PgError> {
+        self.helper_store
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|store| {
+                store
+                    .upgrade()
+                    .ok_or_else(|| PgError::Process("native helper store retired".into()))
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn ensure_native_helpers_complete(&self) -> Result<(), PgError> {
+        if let Some(store) = self.native_helper_store()? {
+            let generation = self.generation();
+            let current = {
+                let child = generation.child.lock().unwrap();
+                match child.as_ref() {
+                    Some(child) if !child.exited()? => child.postmaster_selection().cloned(),
+                    _ => None,
+                }
+            };
+            if current.as_ref().is_some_and(|selection| {
+                selection.launch.intent.process_generation != generation.id
+            }) {
+                return Err(PgError::Process(
+                    "current postmaster generation changed".into(),
+                ));
+            }
+            store.ensure_executions_complete(current.as_ref()).await?;
+        }
         Ok(())
     }
 
@@ -499,6 +554,7 @@ impl PgInstanceManager {
         command: &mut Command,
         deadline: Option<(std::time::Duration, &'static str)>,
     ) -> Result<std::process::Output, PgError> {
+        self.ensure_native_helpers_complete().await?;
         let result = match deadline {
             Some((duration, name)) => {
                 generation
@@ -696,6 +752,7 @@ impl PgInstanceManager {
         self.start_with_parameters(StartParameters {
             fault_tx,
             cancellation: None,
+            native_password: None,
         })
         .await
     }
@@ -757,6 +814,24 @@ impl PgInstanceManager {
         self.start_with_parameters(StartParameters {
             fault_tx,
             cancellation: Some((Arc::downgrade(self), cancellation)),
+            native_password: None,
+        })
+        .await
+    }
+
+    pub(crate) async fn start_public_receiver(
+        self: &Arc<Self>,
+        fault_tx: mpsc::Sender<kuberic_runtime::protocol::types::FaultType>,
+        cancellation: CancellationToken,
+        credential: &crate::adapter::public_transport::NativeCredential,
+    ) -> Result<(), PgError> {
+        credential
+            .helper_conninfo()
+            .map_err(|error| PgError::Configuration(error.to_string()))?;
+        self.start_with_parameters(StartParameters {
+            fault_tx,
+            cancellation: Some((Arc::downgrade(self), cancellation)),
+            native_password: Some(credential.secret.clone()),
         })
         .await
     }
@@ -809,6 +884,54 @@ impl PgInstanceManager {
         }
         .await;
         self.complete_generation(&generation, result)
+    }
+
+    pub(crate) async fn clean_primary_shutdown_identity(&self) -> Result<(String, u32), PgError> {
+        let _lifecycle = self.lifecycle().await;
+        let generation = self.generation();
+        if generation.running() || self.data_dir.join("postmaster.pid").exists() {
+            return Err(PgError::Process(
+                "quiescent PostgreSQL still has a postmaster owner".into(),
+            ));
+        }
+        let output = self
+            .command_output(
+                &generation,
+                Command::new(self.pg_bin.join("pg_controldata"))
+                    .arg(&self.data_dir)
+                    .env("LC_ALL", "C"),
+                Some((
+                    std::time::Duration::from_secs(2),
+                    "quiescent pg_controldata",
+                )),
+            )
+            .await?;
+        if !output.status.success() {
+            return Err(PgError::command_failed(
+                "cannot inspect quiescent PostgreSQL",
+                &output,
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(str::trim)
+                .ok_or_else(|| PgError::Process(format!("missing control field {name}")))
+        };
+        if field("Database cluster state:")? != "shut down"
+            || field("Data page checksum version:")? != "1"
+            || field("Latest checkpoint's full_page_writes:")? != "on"
+        {
+            return Err(PgError::Process(
+                "retained primary is not cleanly shut down with checksums/full-page writes".into(),
+            ));
+        }
+        let system = field("Database system identifier:")?.to_owned();
+        let timeline = field("Latest checkpoint's TimeLineID:")?
+            .parse()
+            .map_err(|_| PgError::Process("invalid quiescent control timeline".into()))?;
+        self.complete_generation(&generation, Ok((system, timeline)))
     }
 
     pub(crate) async fn retained_wal_boundary(&self) -> Result<i64, PgError> {
@@ -877,6 +1000,111 @@ impl PgInstanceManager {
         self.complete_generation(&generation, result)
     }
 
+    pub(crate) async fn retained_standby_identity(&self) -> Result<(String, u32), PgError> {
+        let _lifecycle = self.lifecycle().await;
+        let generation = self.generation();
+        let result = async {
+            if generation.running()
+                || self
+                    .data_dir
+                    .join("postmaster.pid")
+                    .try_exists()
+                    .map_err(|error| {
+                        PgError::Process(format!("inspect retained postmaster: {error}"))
+                    })?
+                || self
+                    .data_dir
+                    .join("recovery.signal")
+                    .try_exists()
+                    .map_err(|error| {
+                        PgError::Process(format!("inspect retained recovery signal: {error}"))
+                    })?
+            {
+                return Err(PgError::Process(
+                    "retained standby still has a postmaster or non-standby recovery owner".into(),
+                ));
+            }
+            let signal = tokio::fs::symlink_metadata(self.data_dir.join("standby.signal"))
+                .await
+                .map_err(|error| PgError::Process(format!("inspect retained standby: {error}")))?;
+            if !signal.is_file() {
+                return Err(PgError::Process(
+                    "retained standby signal is not a file".into(),
+                ));
+            }
+            let version = tokio::fs::read_to_string(self.data_dir.join("PG_VERSION"))
+                .await
+                .map_err(|error| {
+                    PgError::Process(format!("read retained data version: {error}"))
+                })?;
+            let binary = self
+                .command_output(
+                    &generation,
+                    Command::new(self.pg_bin.join("postgres"))
+                        .arg("--version")
+                        .env("LC_ALL", "C"),
+                    Some((
+                        std::time::Duration::from_secs(2),
+                        "retained postgres version",
+                    )),
+                )
+                .await?;
+            let binary_version = String::from_utf8_lossy(&binary.stdout);
+            let major = binary_version
+                .strip_prefix("postgres (PostgreSQL) ")
+                .and_then(|version| version.split('.').next());
+            if !binary.status.success() || major != Some(version.trim()) {
+                return Err(PgError::Process(
+                    "retained standby data format differs from the native binary".into(),
+                ));
+            }
+            let output = self
+                .command_output(
+                    &generation,
+                    Command::new(self.pg_bin.join("pg_controldata"))
+                        .arg(&self.data_dir)
+                        .env("LC_ALL", "C"),
+                    Some((
+                        std::time::Duration::from_secs(2),
+                        "retained standby pg_controldata",
+                    )),
+                )
+                .await?;
+            if !output.status.success() {
+                return Err(PgError::command_failed(
+                    "cannot inspect retained standby",
+                    &output,
+                ));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .map(str::trim)
+                    .ok_or_else(|| PgError::Process(format!("missing control field {name}")))
+            };
+            if field("Database cluster state:")? != "shut down in recovery"
+                || field("Data page checksum version:")? != "1"
+                || field("Latest checkpoint's full_page_writes:")? != "on"
+            {
+                return Err(PgError::Process(
+                    "retained native data is not a stopped standby with checksums/full-page writes"
+                        .into(),
+                ));
+            }
+            let system = field("Database system identifier:")?.to_owned();
+            let checkpoint: u32 = field("Latest checkpoint's TimeLineID:")?
+                .parse()
+                .map_err(|_| PgError::Process("invalid retained standby timeline".into()))?;
+            let recovery: u32 = field("Min recovery ending loc's timeline:")?
+                .parse()
+                .map_err(|_| PgError::Process("invalid retained recovery timeline".into()))?;
+            Ok((system, checkpoint.max(recovery)))
+        }
+        .await;
+        self.complete_generation(&generation, result)
+    }
+
     async fn start_with_parameters(&self, parameters: StartParameters) -> Result<(), PgError> {
         let _lifecycle = self.lifecycle().await;
         let expected_abort = self.abort_generation.load(Ordering::Acquire);
@@ -891,12 +1119,21 @@ impl PgInstanceManager {
         if let Some(Err(error)) = existing.cleanup_result.lock().unwrap().clone() {
             return Err(error.with_generation(existing.id));
         }
+        self.ensure_native_helpers_complete().await?;
         if existing.running() && *existing.state.lock().unwrap() == PgProcessState::Running {
             return Ok(());
         }
         *self.start_parameters.lock().await = Some(parameters.clone());
         self.finish_owned().await?;
         let generation = self.replace_retired(expected_abort)?;
+        let store = self.native_helper_store()?;
+        let _selection = match &store {
+            Some(store) => Some(store.helper_lock.lock().await),
+            None => None,
+        };
+        if let Some(store) = &store {
+            store.ensure_helpers_complete().await?;
+        }
         let fault_reporter = self.fault_reporter(parameters.fault_tx.clone(), &generation);
         *generation.state.lock().unwrap() = PgProcessState::Starting;
         let prepared = async {
@@ -917,14 +1154,23 @@ impl PgInstanceManager {
             return Err(error.with_generation(generation.id));
         }
 
-        let (stdout, stderr) = match self.spawn_owned(&generation) {
+        let (stdout, stderr) = match self
+            .spawn_owned(
+                &generation,
+                parameters.native_password.as_deref(),
+                store.as_deref(),
+            )
+            .await
+        {
             Ok(streams) => streams,
             Err(error) => {
                 fault_reporter(PgProcessFault::Permanent);
                 *generation.state.lock().unwrap() = PgProcessState::Faulted;
-                return Err(error.with_generation(generation.id));
+                let cleanup = self.retire_owned(false).await;
+                return Err(error.with_cleanup(cleanup).with_generation(generation.id));
             }
         };
+        drop(_selection);
 
         // Forward stdout + stderr through tracing in one task
         let stdout = BufReader::new(stdout);
@@ -1102,27 +1348,81 @@ impl PgInstanceManager {
         Ok(())
     }
 
-    fn spawn_owned(
+    async fn spawn_owned(
         &self,
         generation: &Arc<ProcessGeneration>,
+        native_password: Option<&str>,
+        store: Option<&crate::durable::PgDurableStore>,
     ) -> Result<(tokio::process::ChildStdout, tokio::process::ChildStderr), PgError> {
-        // Registration and spawn are indivisible with respect to synchronous abort.
+        let mut command = Command::new(self.pg_bin.join("postgres"));
+        command.args(["-D", &self.data_dir.to_string_lossy()]);
+        if let Some(password) = native_password {
+            command.env("PGPASSWORD", password);
+        } else {
+            command.env_remove("PGPASSWORD");
+        }
+        let launch = match store {
+            Some(store) => Some(
+                store
+                    .postmaster_launch(
+                        crate::owned_command::helper_receipt::PostmasterIntent::new(
+                            generation.id,
+                            &self.data_dir,
+                            &command,
+                        )
+                        .map_err(|error| PgError::Process(error.to_string()))?,
+                    )
+                    .await?,
+            ),
+            None => None,
+        };
+        // Register before awaiting durable selection so cancellation retains the
+        // undispatched supervisor and its actual STOP/ECHILD responsibility.
+        let (streams, selected) = {
+            let _cleanup = generation.cleanup_lock.lock().unwrap();
+            if self.launches_closed.load(Ordering::Acquire)
+                || generation.cleanup_result.lock().unwrap().is_some()
+            {
+                return Err(PgError::Process(
+                    "owned PostgreSQL generation is closed".into(),
+                ));
+            }
+            let mut process = match &launch {
+                Some(launch) => OwnedProcess::spawn_postmaster(&command, launch)?,
+                None => OwnedProcess::spawn(&command)?,
+            };
+            let streams = process.take_output();
+            let selected = process.postmaster_selection().cloned();
+            *generation.child.lock().unwrap() = Some(process);
+            (streams, selected)
+        };
+        if let Some(store) = store {
+            store
+                .select_postmaster(selected.clone().expect("selected postmaster"))
+                .await?;
+            launch
+                .as_ref()
+                .unwrap()
+                .intent
+                .revalidate(&command)
+                .map_err(|error| PgError::Process(error.to_string()))?;
+        }
         let _cleanup = generation.cleanup_lock.lock().unwrap();
         if self.launches_closed.load(Ordering::Acquire)
             || generation.cleanup_result.lock().unwrap().is_some()
         {
+            return Err(PgError::Process("postmaster cancelled before START".into()));
+        }
+        let owned = generation.child.lock().unwrap();
+        let process = owned
+            .as_ref()
+            .ok_or_else(|| PgError::Process("postmaster retired before START".into()))?;
+        if process.postmaster_selection() != selected.as_ref() {
             return Err(PgError::Process(
-                "owned PostgreSQL generation is closed".into(),
+                "postmaster selection changed before START".into(),
             ));
         }
-        let mut owned = generation.child.lock().unwrap();
-        let mut process = OwnedProcess::spawn(
-            Command::new(self.pg_bin.join("postgres"))
-                .args(["-D", &self.data_dir.to_string_lossy()]),
-        )?;
-        let streams = process.take_output();
-        *owned = Some(process);
-        owned.as_mut().unwrap().start()?;
+        process.start()?;
         Ok(streams)
     }
 
@@ -1299,24 +1599,38 @@ impl PgInstanceManager {
         Ok(())
     }
 
-    pub(crate) async fn public_base_backup(&self, conninfo: &str) -> Result<(), PgError> {
+    pub(crate) async fn public_base_backup(
+        &self,
+        credential: &crate::adapter::public_transport::NativeCredential,
+    ) -> Result<(), PgError> {
+        let conninfo = format!(
+            "{} password={}",
+            credential
+                .conninfo()
+                .map_err(|error| PgError::Configuration(error.to_string()))?,
+            credential.secret
+        );
+        let helper_conninfo = credential
+            .helper_conninfo()
+            .map_err(|error| PgError::Configuration(error.to_string()))?;
         let generation = self.generation();
         let output = self
             .command_output(
                 &generation,
-                Command::new(self.pg_bin.join("pg_basebackup")).args([
-                    "-D",
-                    &self.data_dir.to_string_lossy(),
-                    "-d",
-                    conninfo,
-                    "-Fp",
-                    "-Xs",
-                    "-c",
-                    "fast",
-                    "-R",
-                    "-w",
-                    "--no-clean",
-                ]),
+                Command::new(self.pg_bin.join("pg_basebackup"))
+                    .args([
+                        "-D",
+                        &self.data_dir.to_string_lossy(),
+                        "-d",
+                        &helper_conninfo,
+                        "-Fp",
+                        "-Xs",
+                        "-c",
+                        "fast",
+                        "-w",
+                        "--no-clean",
+                    ])
+                    .env("PGPASSWORD", &credential.secret),
                 Some((std::time::Duration::from_secs(60), "public pg_basebackup")),
             )
             .await?;
@@ -1325,7 +1639,7 @@ impl PgInstanceManager {
             let secret = conninfo
                 .split_whitespace()
                 .find_map(|field| field.strip_prefix("password="))
-                .unwrap_or(conninfo);
+                .unwrap_or(&conninfo);
             let diagnostic = String::from_utf8_lossy(&output.stderr).replace(secret, "[redacted]");
             return Err(
                 PgError::Process(format!("public pg_basebackup failed: {diagnostic}"))
@@ -1369,6 +1683,267 @@ impl PgInstanceManager {
         self.finish_owned().await?;
         self.replace_retired(expected_abort)?;
         Ok(())
+    }
+
+    pub(crate) fn repair_candidate(&self, path: PathBuf) -> Self {
+        let candidate = Self::new(path, self.pg_bin.clone(), self.port);
+        *candidate.helper_store.lock().unwrap() = self.helper_store.lock().unwrap().clone();
+        candidate
+    }
+
+    pub(crate) async fn clone_stopped_repair_candidate(
+        &self,
+        destination: &Path,
+        candidate_nonce: &[u8; 16],
+        valid: crate::adapter::public_transport::GatewayValidity,
+        cancellation: CancellationToken,
+    ) -> Result<(), PgError> {
+        let _lifecycle = self.lifecycle().await;
+        let destination_present = match std::fs::symlink_metadata(destination) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(PgError::Process(error.to_string())),
+        };
+        if self.process_state().await != PgProcessState::Stopped
+            || self.is_running().await
+            || self.data_dir.join("postmaster.pid").exists()
+            || destination_present
+        {
+            return Err(PgError::Process(
+                "repair clone requires exclusive stopped trees".into(),
+            ));
+        }
+        let generation = self.generation();
+        let mut command = Command::new("cp");
+        command
+            .arg("-R")
+            .arg("--preserve=mode,timestamps")
+            .arg("--")
+            .arg(&self.data_dir)
+            .arg(destination);
+        let store = self.native_helper_store()?.ok_or_else(|| {
+            PgError::Process("native repair clone requires selected native3 ownership".into())
+        })?;
+        let intent = crate::owned_command::helper_receipt::HelperIntent::new(
+            generation.id,
+            *candidate_nonce,
+            &self.data_dir,
+            destination,
+            &command,
+        )
+        .map_err(|error| PgError::Process(error.to_string()))?;
+        let output = {
+            let operation = generation
+                .helpers
+                .output_selected(&mut command, &store, intent);
+            tokio::pin!(operation);
+            // Selection can hold the native state lock across durable IO.
+            // Keep polling it while the lease callback reads that same state.
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                result = &mut operation => Some(result),
+                _ = helper_lease_invalid(&valid, &cancellation) => None,
+            }
+        };
+        let Some(output) = output else {
+            let cleanup = generation.helpers.capture().terminate();
+            return Err(PgError::Process("owned repair clone cancelled".into())
+                .with_cleanup(cleanup)
+                .with_generation(generation.id));
+        };
+        let output = self.complete_generation(&generation, output)?;
+        if !output.status.success() {
+            return Err(PgError::Process("owned stopped repair clone failed".into()));
+        }
+        self.complete_generation(&generation, Ok(()))
+    }
+
+    // This is only the owned helper boundary. The native repair owner must prove
+    // selected two-ended authority, certified ancestry and a faithful stopped copy,
+    // and must retain both trees; success does not install or admit the candidate.
+    pub(crate) async fn rewind_owned_candidate(
+        &self,
+        retained: &Self,
+        candidate_nonce: &[u8; 16],
+        credential: &crate::adapter::public_transport::NativeCredential,
+        valid: crate::adapter::public_transport::GatewayValidity,
+        cancellation: CancellationToken,
+    ) -> Result<(), PgError> {
+        use crate::adapter::public_transport::{
+            check_rewind_candidate_layout, rewind_candidate_lease_valid,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        let conninfo = credential
+            .rewind_conninfo()
+            .map_err(|error| PgError::Configuration(error.to_string()))?;
+        let nonce: String = candidate_nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let name = retained
+            .data_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| PgError::Configuration("invalid retained PGDATA name".into()))?;
+        let expected = retained.data_dir.with_file_name(format!("{name}-{nonce}"));
+        if self.data_dir != expected || self.data_dir == retained.data_dir {
+            return Err(PgError::Configuration(
+                "not the exact retained sibling candidate".into(),
+            ));
+        }
+        let _candidate_lifecycle = self.lifecycle().await;
+        let _retained_lifecycle = retained.lifecycle().await;
+        let generation = self.generation();
+        let original_generation = retained.generation();
+        for owner in [self, retained] {
+            if owner.process_state().await != PgProcessState::Stopped
+                || owner.is_running().await
+                || owner.data_dir.join("postmaster.pid").exists()
+            {
+                return Err(PgError::Process(
+                    "rewind requires stopped owned trees".into(),
+                ));
+            }
+            check_rewind_candidate_layout(owner.data_dir.clone())
+                .map_err(|error| PgError::Configuration(error.to_string()))?;
+        }
+        let candidate_root = std::fs::symlink_metadata(&self.data_dir)
+            .map_err(|error| PgError::Process(error.to_string()))?;
+        let original_root = std::fs::symlink_metadata(&retained.data_dir)
+            .map_err(|error| PgError::Process(error.to_string()))?;
+        if candidate_root.dev() != original_root.dev()
+            || candidate_root.ino() == original_root.ino()
+        {
+            return Err(PgError::Configuration(
+                "candidate is not a distinct same-volume tree".into(),
+            ));
+        }
+        let read_control = |root: &Path| -> Result<Vec<u8>, PgError> {
+            let path = root.join("global/pg_control");
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| PgError::Process(error.to_string()))?;
+            if !metadata.is_file() || metadata.len() != 8192 || metadata.nlink() != 1 {
+                return Err(PgError::Configuration(
+                    "unsafe retained control file".into(),
+                ));
+            }
+            std::fs::read(path).map_err(|error| PgError::Process(error.to_string()))
+        };
+        let original_control = read_control(&retained.data_dir)?;
+        if read_control(&self.data_dir)? != original_control {
+            return Err(PgError::Configuration(
+                "candidate control differs from stopped retained tree".into(),
+            ));
+        }
+        let control = self
+            .command_output(
+                &generation,
+                Command::new(self.pg_bin.join("pg_controldata"))
+                    .arg(&self.data_dir)
+                    .env("LC_ALL", "C"),
+                Some((
+                    std::time::Duration::from_secs(2),
+                    "candidate pg_controldata",
+                )),
+            )
+            .await?;
+        let text = String::from_utf8_lossy(&control.stdout);
+        let field = |key| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::trim)
+        };
+        if !control.status.success()
+            || field("Database cluster state:") != Some("shut down")
+            || field("Data page checksum version:") != Some("1")
+            || field("Latest checkpoint's full_page_writes:") != Some("on")
+        {
+            return Err(PgError::Process(
+                "candidate is not a checksum/full-page clean primary copy".into(),
+            ));
+        }
+        if !rewind_candidate_lease_valid(&valid, &cancellation).await {
+            return Err(PgError::Process(
+                "candidate lease revoked before rewind".into(),
+            ));
+        }
+        let mut command = Command::new(self.pg_bin.join("pg_rewind"));
+        command
+            .arg("--target-pgdata")
+            .arg(&self.data_dir)
+            .arg("--source-server")
+            .arg(conninfo)
+            .arg("--no-ensure-shutdown")
+            .env("PGPASSWORD", &credential.secret)
+            .env("LC_ALL", "C");
+        let store = retained.native_helper_store()?.ok_or_else(|| {
+            PgError::Process("native candidate rewind requires selected native3 ownership".into())
+        })?;
+        let intent = crate::owned_command::helper_receipt::HelperIntent::new(
+            original_generation.id,
+            *candidate_nonce,
+            &retained.data_dir,
+            &self.data_dir,
+            &command,
+        )
+        .map_err(|error| PgError::Process(error.to_string()))?;
+        let output = {
+            let operation = generation
+                .helpers
+                .output_selected(&mut command, &store, intent);
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                result = &mut operation => Some(result),
+                _ = helper_lease_invalid(&valid, &cancellation) => None,
+            }
+        };
+        let Some(output) = output else {
+            // The dropped command future has joined its exact child tree. Keep
+            // any retained reap failure sticky in the generation owner.
+            let cleanup = generation.helpers.capture().terminate();
+            return Err(PgError::Process("candidate rewind cancelled".into())
+                .with_cleanup(cleanup)
+                .with_generation(generation.id));
+        };
+        let output = self.complete_generation(&generation, output)?;
+        #[cfg(test)]
+        eprintln!(
+            "owned normal pg_rewind exit={}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).replace(&credential.secret, "[redacted]"),
+            String::from_utf8_lossy(&output.stderr).replace(&credential.secret, "[redacted]")
+        );
+        if !output.status.success() {
+            let diagnostic =
+                String::from_utf8_lossy(&output.stderr).replace(&credential.secret, "[redacted]");
+            return Err(PgError::Process(format!(
+                "owned candidate pg_rewind failed: {diagnostic}"
+            ))
+            .with_generation(generation.id));
+        }
+        if !rewind_candidate_lease_valid(&valid, &cancellation).await
+            || !self.generation_is_current(&GenerationLease(generation.clone()))
+            || !retained.generation_is_current(&GenerationLease(original_generation))
+        {
+            return Err(PgError::Process(
+                "candidate scope changed during rewind".into(),
+            ));
+        }
+        for (root, pinned) in [
+            (&self.data_dir, candidate_root),
+            (&retained.data_dir, original_root),
+        ] {
+            let current = std::fs::symlink_metadata(root)
+                .map_err(|error| PgError::Process(error.to_string()))?;
+            if !current.is_dir() || current.dev() != pinned.dev() || current.ino() != pinned.ino() {
+                return Err(PgError::Process("rewind tree identity changed".into()));
+            }
+        }
+        if read_control(&retained.data_dir)? != original_control {
+            return Err(PgError::Process("original retained control changed".into()));
+        }
+        self.complete_generation(&generation, Ok(()))
     }
 
     pub(crate) async fn clear_pgdata(&self) -> Result<(), PgError> {

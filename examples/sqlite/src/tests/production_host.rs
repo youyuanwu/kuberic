@@ -274,6 +274,7 @@ async fn production_host_new_existing_and_invalid_storage() -> Result<(), Box<dy
                 },
                 desired: ReplicaGoalKind::Prepare {
                     role: ReplicaRole::Primary,
+                    rebuild: None,
                 },
             };
             client

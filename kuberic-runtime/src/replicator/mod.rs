@@ -265,6 +265,7 @@ struct BoundReplicatorSettings {
 }
 
 struct ReplicatorCreation {
+    builtin: OnceLock<()>,
     identity: OnceLock<ReplicatorCreationIdentity>,
     guarded_control: StdMutex<Arc<dyn Replicator>>,
     capabilities: ReplicatorCapabilities,
@@ -288,6 +289,7 @@ impl ReplicatorCreation {
                 .expect("new creation identity is unset");
         }
         Self {
+            builtin: OnceLock::new(),
             identity: creation_identity,
             guarded_control: StdMutex::new(guarded_control),
             capabilities,
@@ -642,6 +644,8 @@ pub struct ReplicatorFactoryContext {
     native_factory_started: Arc<AtomicBool>,
     ordinary_contract: bool,
     retained_member_instructions: bool,
+    contained_reconstruction_instructions: bool,
+    builtin_history_bound: bool,
     builtin_factory_created: Arc<OnceLock<std::sync::Weak<ReplicatorCreation>>>,
     builtin_registered: Arc<OnceLock<crate::protocol::types::ReplicatorCreationId>>,
 }
@@ -650,6 +654,41 @@ pub struct ReplicatorFactoryContext {
 pub(crate) struct CheckedRetainedMember {
     scope: crate::protocol::public_operations::ReplicaScope,
     qualification: crate::protocol::public_operations::RetainedMemberQualification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedCreationReconstruction {
+    goal: crate::protocol::public_operations::ReplicaGoal,
+}
+
+impl CheckedCreationReconstruction {
+    pub(crate) fn new(goal: crate::protocol::public_operations::ReplicaGoal) -> Self {
+        Self { goal }
+    }
+
+    pub(crate) fn scope(&self) -> &crate::protocol::public_operations::ReplicaScope {
+        &self.goal.scope
+    }
+
+    pub(crate) fn addition(
+        &self,
+    ) -> Option<&crate::protocol::public_operations::MembershipAdditionRecovery> {
+        match &self.goal.desired {
+            crate::protocol::public_operations::ReplicaGoalKind::RecoverContainedCreation {
+                recovery,
+            } => recovery.addition.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn role(&self) -> crate::protocol::types::ReplicaRole {
+        match &self.goal.desired {
+            crate::protocol::public_operations::ReplicaGoalKind::RecoverContainedCreation {
+                recovery,
+            } => recovery.role,
+            _ => unreachable!("checked reconstruction"),
+        }
+    }
 }
 
 impl CheckedRetainedMember {
@@ -683,6 +722,46 @@ impl CheckedRetainedMember {
 }
 
 impl ReplicatorFactoryContext {
+    /// Historical engine provenance is not a restriction on service factory choice.
+    pub(crate) fn bind_builtin_history(&mut self) {
+        self.builtin_history_bound = true;
+    }
+
+    pub(crate) fn builtin_history_bound(&self) -> bool {
+        self.builtin_history_bound
+    }
+
+    pub(crate) async fn creation_reconstruction(
+        &self,
+    ) -> Result<Option<CheckedCreationReconstruction>> {
+        if !self.ordinary_contract {
+            return Ok(None);
+        }
+        self.access.creation_reconstruction(self.reservation).await
+    }
+
+    pub(crate) async fn confirm_reconstructed_native_initialization(
+        &self,
+        selected: &CheckedCreationReconstruction,
+    ) -> Result<()> {
+        if self.creation_reconstruction().await?.as_ref() != Some(selected)
+            || self
+                .builtin_factory_created
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .is_none()
+            || self.builtin_registered.get() != Some(&selected.scope().creation_id)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.access
+            .confirm_reconstructed_native_initialization(
+                self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                selected,
+            )
+            .await
+    }
+
     fn builtin_creation_matches(&self, creation: &Arc<ReplicatorCreation>) -> bool {
         self.builtin_factory_created
             .get()
@@ -769,6 +848,22 @@ impl ReplicatorFactoryContext {
         crate::control::resolve_replica_publication(&address, &credentials, query).await
     }
 
+    pub(crate) async fn native_operation_snapshot(
+        &self,
+        history: &crate::protocol::types::HistoryContext,
+        replica: &ReplicaIdentity,
+    ) -> Result<crate::protocol::public_operations::ReplicaAgentSnapshot> {
+        if !self.ordinary_contract
+            || history.resource_uid != self.public_v1_binding.resource_uid
+            || self.builtin_registered.get() != Some(&self.creation_id()?)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let credentials = self.access.native_credentials().await?;
+        let address = self.access.peer_control_endpoint(replica)?;
+        crate::control::resolve_native_snapshot(&address, &credentials, history, replica).await
+    }
+
     #[doc(hidden)]
     pub(crate) fn new(
         _token: RuntimeHostToken,
@@ -788,6 +883,8 @@ impl ReplicatorFactoryContext {
             native_factory_started: Arc::new(AtomicBool::new(false)),
             ordinary_contract: false,
             retained_member_instructions: false,
+            contained_reconstruction_instructions: false,
+            builtin_history_bound: false,
             builtin_factory_created: Arc::new(OnceLock::new()),
             builtin_registered: Arc::new(OnceLock::new()),
         }
@@ -882,6 +979,25 @@ impl ReplicatorFactoryContext {
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
+    fn reconstructed_native_initialization(&self) -> Option<CheckedCreationReconstruction> {
+        None
+    }
+
+    async fn creation_reconstruction(
+        &self,
+        _reservation: Option<ReplicatorCreationReservation>,
+    ) -> Result<Option<CheckedCreationReconstruction>> {
+        Ok(None)
+    }
+
+    async fn confirm_reconstructed_native_initialization(
+        &self,
+        _reservation: ReplicatorCreationReservation,
+        _selected: &CheckedCreationReconstruction,
+    ) -> Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+
     fn retained_native_initialization(&self) -> Option<CheckedRetainedMember> {
         None
     }
@@ -1002,10 +1118,42 @@ pub(crate) trait ReplicatorRegistration: Send + Sync {
 pub struct StatefulServicePartition {
     context: ReplicatorFactoryContext,
     registration: Arc<dyn ReplicatorRegistration>,
-    factory: Option<Arc<dyn ReplicatorFactory>>,
+    factory: Option<ReplicatorFactorySelection>,
+}
+
+#[derive(Clone)]
+enum ReplicatorFactorySelection {
+    Builtin,
+    Override(Arc<dyn ReplicatorFactory>),
 }
 
 impl StatefulServicePartition {
+    pub fn reconstructing_contained_creation(&self) -> bool {
+        self.context.contained_reconstruction_instructions
+    }
+
+    pub(crate) fn with_contained_reconstruction_instructions(mut self) -> Self {
+        self.context.contained_reconstruction_instructions = true;
+        self
+    }
+
+    pub(crate) fn with_builtin_history(mut self) -> Self {
+        self.context.bind_builtin_history();
+        self
+    }
+
+    pub(crate) async fn creation_reconstruction(
+        &self,
+    ) -> Result<Option<CheckedCreationReconstruction>> {
+        self.context.creation_reconstruction().await
+    }
+
+    pub(crate) fn reconstructed_native_initialization(
+        &self,
+    ) -> Option<CheckedCreationReconstruction> {
+        self.context.access.reconstructed_native_initialization()
+    }
+
     pub fn restoring_retained_member(&self) -> bool {
         self.context.retained_member_instructions
     }
@@ -1045,12 +1193,29 @@ impl StatefulServicePartition {
         }
     }
 
-    /// Select an implementation during service Open, not in the PodRuntime constructor.
+    /// Select the SDK-owned builtin during service Open.
+    ///
+    /// Construction uses the private builtin manifest. Applications may also
+    /// select a factory that delegates to the builtin; actual registration,
+    /// not the selected route, establishes provenance. Selection grants no access.
+    pub fn with_builtin_replicator(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            registration: self.registration.clone(),
+            factory: Some(ReplicatorFactorySelection::Builtin),
+        }
+    }
+
+    /// Select an arbitrary implementation during service Open.
+    ///
+    /// The selected factory is invoked even when historical engine provenance
+    /// is builtin. Returned interfaces are checked separately; generic Open
+    /// does not grant builtin-private recovery eligibility.
     pub fn with_factory(&self, factory: Arc<dyn ReplicatorFactory>) -> Self {
         Self {
             context: self.context.clone(),
             registration: self.registration.clone(),
-            factory: Some(factory),
+            factory: Some(ReplicatorFactorySelection::Override(factory)),
         }
     }
 
@@ -1096,7 +1261,8 @@ impl StatefulServicePartition {
     /// its interfaces and optional state provider, and returns the interfaces
     /// to the service replica.
     ///
-    /// Select a factory with [`Self::with_factory`] during service open.
+    /// Explicitly select [`Self::with_builtin_replicator`] or
+    /// [`Self::with_factory`] during service Open. No selection is an error.
     pub async fn create_replicator(
         &self,
         state_provider: Option<Arc<dyn StateProvider>>,
@@ -1114,16 +1280,57 @@ impl StatefulServicePartition {
             &self.context.process_session_id,
         );
         let settings = settings.unwrap_or_default();
-        let interfaces = match factory
-            .create_replicator(context, state_provider.clone(), settings.clone())
-            .await
-        {
+        let constructed = match factory {
+            ReplicatorFactorySelection::Builtin => {
+                PUBLIC_V1_FACTORIES
+                    .construct_default()
+                    .create_replicator(context, state_provider.clone(), settings.clone())
+                    .await
+            }
+            ReplicatorFactorySelection::Override(factory) => {
+                factory
+                    .create_replicator(context, state_provider.clone(), settings.clone())
+                    .await
+            }
+        };
+        let interfaces = match constructed {
             Ok(interfaces) => interfaces,
             Err(error) => {
                 self.registration.cancel_replicator_creation(reservation);
                 return Err(error);
             }
         };
+        let interfaces = self
+            .register_created_replicator(
+                interfaces,
+                provenance,
+                state_provider,
+                settings,
+                reservation,
+            )
+            .await?;
+        #[cfg(feature = "testing")]
+        if let Some(route) = testing_route
+            .filter(|route| testing_transport::has_native_transport(route, reservation))
+        {
+            testing_transport::acknowledge(route, &interfaces.creation);
+        }
+        Ok(interfaces)
+    }
+
+    async fn register_created_replicator(
+        &self,
+        interfaces: ReplicatorInterfaces,
+        provenance: ReplicatorFactoryContext,
+        state_provider: Option<Arc<dyn StateProvider>>,
+        settings: ReplicatorSettings,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<ReplicatorInterfaces> {
+        tracing::debug!(
+            historical_builtin = provenance.builtin_history_bound(),
+            actual_builtin = interfaces.creation.builtin.get().is_some(),
+            "ordinary selected factory returned its interface bundle"
+        );
         let attachment = match interfaces.prepare_attachment(reservation) {
             Ok(attachment) => attachment,
             Err(error) => {
@@ -1133,14 +1340,17 @@ impl StatefulServicePartition {
                     .await);
             }
         };
-        if self.restoring_retained_member()
+        if (interfaces.creation.builtin.get().is_some()
+            || self.restoring_retained_member()
+            || self.reconstructing_contained_creation())
             && !provenance.builtin_creation_matches(&interfaces.creation)
         {
             self.registration.cancel_replicator_creation(reservation);
             return Err(interfaces
                 .failed_creation(
                     RuntimeError::AuthorityMismatch(
-                        "independent factory cannot inherit builtin retained restoration".into(),
+                        "replicator bundle does not match its actual builtin recovery provenance"
+                            .into(),
                     ),
                     self.registration.as_ref(),
                 )
@@ -1172,12 +1382,6 @@ impl StatefulServicePartition {
                 .builtin_registered
                 .set(reservation.identity(RuntimeHostToken::new()).to_public_id());
         }
-        #[cfg(feature = "testing")]
-        if let Some(route) = testing_route
-            .filter(|route| testing_transport::has_native_transport(route, reservation))
-        {
-            testing_transport::acknowledge(route, &interfaces.creation);
-        }
         Ok(interfaces)
     }
 }
@@ -1202,10 +1406,561 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         validate_public_v1_factories(PUBLIC_V1_FACTORIES)?;
         let provenance = context.clone();
         let interfaces = v1::create_production(context, state_provider, settings).await?;
+        interfaces
+            .creation
+            .builtin
+            .set(())
+            .map_err(|_| RuntimeError::AuthorityNotAdmitted)?;
         provenance
             .builtin_factory_created
             .set(Arc::downgrade(&interfaces.creation))
             .map_err(|_| RuntimeError::AuthorityNotAdmitted)?;
         Ok(interfaces)
+    }
+}
+
+#[cfg(test)]
+mod factory_selection_tests {
+    use super::*;
+    use crate::application::OperationDataStream;
+    use crate::protocol::public_operations::{PublicV1Identity, StatePersistence};
+    use crate::protocol::types::{
+        AgentGeneration, Epoch, PartitionId, PodUid, PublicProtocolGeneration, PvcUid, ReplicaId,
+        ReplicaInstanceId, ReplicaStorageIdentity, ResourceUid, StorageGeneration,
+        derive_bootstrap_history, derive_history_initialization_id,
+    };
+    use std::sync::atomic::AtomicUsize;
+
+    // The existing attachment fixture's actual context/reservation seam, without
+    // testing routes or any projection of host readiness, role or progress.
+    #[derive(Default)]
+    struct Fixture {
+        binding: StdMutex<Option<(ReplicaIdentity, ProcessSessionId)>>,
+        creation: StdMutex<Creation>,
+        write_admission: Arc<StdMutex<()>>,
+        reservations: AtomicUsize,
+        cancellations: AtomicUsize,
+        registrations: AtomicUsize,
+        native_endpoints: AtomicUsize,
+        lifecycle_observations: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct Creation {
+        reserved: Option<ReplicatorCreationReservation>,
+        retained: Vec<Arc<dyn Replicator>>,
+    }
+
+    impl Fixture {
+        async fn drain(&self) {
+            let owners = {
+                let mut creation = self.creation.lock().unwrap();
+                assert!(creation.reserved.is_none());
+                std::mem::take(&mut creation.retained)
+            };
+            for owner in owners {
+                owner.abort();
+                owner.close().await.unwrap();
+            }
+        }
+
+        fn assert_no_construction(&self) {
+            assert_eq!(self.reservations.load(Ordering::SeqCst), 0);
+            assert_eq!(self.cancellations.load(Ordering::SeqCst), 0);
+            assert_eq!(self.registrations.load(Ordering::SeqCst), 0);
+            assert_eq!(self.native_endpoints.load(Ordering::SeqCst), 0);
+            let creation = self.creation.lock().unwrap();
+            assert!(creation.reserved.is_none());
+            assert!(creation.retained.is_empty());
+        }
+    }
+
+    #[async_trait]
+    impl ReplicatorRegistration for Fixture {
+        fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
+            self.reservations.fetch_add(1, Ordering::SeqCst);
+            let mut creation = self.creation.lock().unwrap();
+            if creation.reserved.is_some() {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
+            creation.reserved = Some(reservation);
+            Ok(reservation)
+        }
+
+        fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation) {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            let mut creation = self.creation.lock().unwrap();
+            assert_eq!(creation.reserved, Some(reservation));
+            creation.reserved = None;
+        }
+
+        fn record_creation_cleanup_failure(&self, error: String) {
+            panic!("unexpected factory boundary cleanup failure: {error}");
+        }
+
+        async fn register_interfaces(
+            &self,
+            attachment: &ReplicatorAttachment,
+            _: Option<Arc<dyn StateProvider>>,
+            reservation: ReplicatorCreationReservation,
+        ) -> Result<()> {
+            self.registrations.fetch_add(1, Ordering::SeqCst);
+            let mut creation = self.creation.lock().unwrap();
+            if creation.reserved != Some(reservation)
+                || attachment.identity(RuntimeHostToken::new())
+                    != reservation.identity(RuntimeHostToken::new())
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            creation.reserved = None;
+            creation
+                .retained
+                .push(attachment.replicator(RuntimeHostToken::new()));
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PartitionAccessView for Fixture {
+        fn validate_native_creation(
+            &self,
+            reservation: ReplicatorCreationReservation,
+        ) -> Result<()> {
+            if self.creation.lock().unwrap().reserved == Some(reservation) {
+                Ok(())
+            } else {
+                Err(RuntimeError::AuthorityNotAdmitted)
+            }
+        }
+
+        fn native_write_admission(&self) -> Result<Arc<StdMutex<()>>> {
+            Ok(self.write_admission.clone())
+        }
+
+        async fn native_credentials(&self) -> Result<Arc<str>> {
+            Ok(Arc::from("factory-selection-fixture"))
+        }
+
+        async fn native_local_endpoint(
+            &self,
+            address: String,
+        ) -> Result<(
+            crate::protocol::types::HistoryContext,
+            crate::host::native_transport::NativeEndpoint,
+        )> {
+            self.native_endpoints.fetch_add(1, Ordering::SeqCst);
+            let (identity, process_session_id) = self.binding.lock().unwrap().clone().unwrap();
+            let resource = ResourceUid::new(identity.instance_id.as_str());
+            let generation = PublicProtocolGeneration::new(1);
+            let initialization = derive_history_initialization_id(&resource, generation);
+            let history = derive_bootstrap_history(&resource, generation, &initialization);
+            let endpoint = crate::host::native_transport::NativeEndpoint {
+                storage: ReplicaStorageIncarnationContext {
+                    replica: identity.clone(),
+                    storage: ReplicaStorageIdentity::Persistent {
+                        pod_uid: PodUid::new(identity.instance_id.as_str()),
+                        pvc_uid: PvcUid::new(identity.instance_id.as_str()),
+                    },
+                    storage_generation: StorageGeneration::new(identity.instance_id.as_str()),
+                },
+                identity,
+                process_session_id,
+                address,
+            };
+            Ok((history, endpoint))
+        }
+
+        fn observe_native_lifecycle(
+            &self,
+            _: ReplicatorCreationReservation,
+            _: v1::LifecycleObservation,
+        ) {
+            self.lifecycle_observations.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn partition_information(&self) -> PartitionInformation {
+            PartitionInformation {
+                partition_id: PartitionId::new("factory-selection"),
+            }
+        }
+
+        async fn read_status(&self) -> Result<AccessStatus> {
+            Ok(AccessStatus::NotPrimary)
+        }
+
+        async fn write_status(&self) -> Result<AccessStatus> {
+            Ok(AccessStatus::NotPrimary)
+        }
+
+        async fn report_load(&self, _: Vec<LoadMetric>) -> Result<()> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn report_fault(&self, _: FaultType) -> Result<()> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+    }
+
+    #[async_trait]
+    impl StateProvider for Fixture {
+        async fn update_epoch(&self, _: Epoch, _: Lsn) -> Result<()> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn last_committed_lsn(&self) -> Result<Lsn> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn get_copy_context(&self) -> Result<OperationDataStream> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn get_copy_state(
+            &self,
+            _: Lsn,
+            _: OperationDataStream,
+        ) -> Result<OperationDataStream> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn on_data_loss(&self) -> Result<bool> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+    }
+
+    #[derive(Default)]
+    struct IndependentControl {
+        aborts: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Replicator for IndependentControl {
+        async fn open(&self) -> Result<String> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn change_role(&self, _: Epoch, _: ReplicaRole) -> Result<()> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn update_epoch(&self, _: Epoch) -> Result<()> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        fn abort(&self) {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn current_progress(&self) -> Result<Lsn> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+
+        async fn catch_up_capability(&self) -> Result<Lsn> {
+            Err(RuntimeError::AuthorityNotAdmitted)
+        }
+    }
+
+    include!("factory_selection_test_factories.rs");
+
+    fn partition(fixture: Arc<Fixture>) -> StatefulServicePartition {
+        let instance = uuid::Uuid::new_v4().to_string();
+        let identity = ReplicaIdentity {
+            replica_id: ReplicaId::new(1),
+            instance_id: ReplicaInstanceId::new(&instance),
+            agent_generation: AgentGeneration::new(&instance),
+        };
+        let session = ProcessSessionId::new(&instance);
+        *fixture.binding.lock().unwrap() = Some((identity.clone(), session.clone()));
+        StatefulServicePartition::new(
+            RuntimeHostToken::new(),
+            fixture.clone(),
+            ReplicatorFactoryContext::new(
+                RuntimeHostToken::new(),
+                identity,
+                session,
+                fixture,
+                PublicV1LifecycleBinding {
+                    identity: PublicV1Identity::new(1),
+                    resource_uid: ResourceUid::new(instance),
+                    spec_generation: 1,
+                    state_persistence: StatePersistence::Persisted,
+                },
+                "127.0.0.1:0".parse().unwrap(),
+            ),
+        )
+    }
+
+    fn settings() -> ReplicatorSettings {
+        ReplicatorSettings {
+            replication_address: "http://127.0.0.1:0".into(),
+        }
+    }
+
+    #[test]
+    fn builtin_history_defaults_false_and_survives_context_and_per_creation_clones() {
+        let fixture = Arc::new(Fixture::default());
+        let mut partition = partition(fixture.clone());
+        assert!(!partition.context.builtin_history_bound());
+        partition.context.bind_builtin_history();
+        partition.context.bind_builtin_history();
+        let context = partition.context.clone();
+        assert!(context.builtin_history_bound());
+        assert!(partition.clone().context.builtin_history_bound());
+        for _ in 0..2 {
+            let reservation = fixture.reserve_replicator_creation().unwrap();
+            let creation = context.for_creation(reservation);
+            assert!(creation.builtin_history_bound());
+            assert!(creation.clone().builtin_history_bound());
+            assert_eq!(creation.reservation, Some(reservation));
+            assert!(!creation.retained_member_instructions);
+            assert!(!creation.contained_reconstruction_instructions);
+            assert!(!creation.ordinary_hosting());
+            assert!(!creation.native_factory_started.load(Ordering::SeqCst));
+            assert!(creation.builtin_factory_created.get().is_none());
+            fixture.cancel_replicator_creation(reservation);
+        }
+        assert_eq!(fixture.native_endpoints.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.lifecycle_observations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bound_concrete_builtin_constructs_and_registers_actual_bundle_without_role_credit() {
+        let fixture = Arc::new(Fixture::default());
+        let mut partition = partition(fixture.clone());
+        partition.context.bind_builtin_history();
+        let partition = partition.with_builtin_replicator().clone();
+        assert!(!partition.restoring_retained_member());
+        assert!(!partition.reconstructing_contained_creation());
+        let interfaces = partition
+            .create_replicator(Some(fixture.clone()), Some(settings()))
+            .await
+            .unwrap();
+        assert_eq!(
+            partition.builtin_native_registration(),
+            Some(interfaces.creation.identity.get().unwrap().to_public_id())
+        );
+        assert!(interfaces.primary_replicator().is_some());
+        assert!(interfaces.state_replicator().is_some());
+        assert_eq!(fixture.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.native_endpoints.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.lifecycle_observations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            partition.get_read_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            partition.get_write_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(partition.get_read_status_now(), AccessStatus::NotPrimary);
+        assert_eq!(partition.get_write_status_now(), AccessStatus::NotPrimary);
+        fixture.drain().await;
+    }
+
+    async fn assert_history_bound_factory_is_invoked(
+        factory: Arc<dyn ReplicatorFactory>,
+        calls: Arc<AtomicUsize>,
+        bind_before_selection: bool,
+        actual_builtin: bool,
+    ) {
+        let fixture = Arc::new(Fixture::default());
+        let mut partition = partition(fixture.clone());
+        if bind_before_selection {
+            partition.context.bind_builtin_history();
+        }
+        partition = partition
+            .with_builtin_replicator()
+            .with_factory(factory.clone());
+        if !bind_before_selection {
+            partition.context.bind_builtin_history();
+        }
+        let selected = partition.clone().with_factory(factory);
+        assert!(selected.context.builtin_history_bound());
+        let interfaces = selected
+            .create_replicator(Some(fixture.clone()), Some(settings()))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            selected.builtin_native_registration().is_some(),
+            actual_builtin
+        );
+        assert_eq!(interfaces.creation.builtin.get().is_some(), actual_builtin);
+        assert_eq!(
+            fixture.native_endpoints.load(Ordering::SeqCst),
+            usize::from(actual_builtin)
+        );
+        assert_eq!(fixture.lifecycle_observations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            selected.get_read_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        assert_eq!(
+            selected.get_write_status().await.unwrap(),
+            AccessStatus::NotPrimary
+        );
+        fixture.drain().await;
+    }
+
+    #[tokio::test]
+    async fn history_bound_independent_factory_is_invoked_in_either_builder_order_or_clone() {
+        for bind_before_selection in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            assert_history_bound_factory_is_invoked(
+                Arc::new(independent_factory(calls.clone())),
+                calls,
+                bind_before_selection,
+                false,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn history_bound_default_wrapper_is_invoked_and_registers_actual_builtin() {
+        for bind_before_selection in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            assert_history_bound_factory_is_invoked(
+                Arc::new(DefaultWrapper {
+                    calls: calls.clone(),
+                }),
+                calls,
+                bind_before_selection,
+                true,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_factory_invocation_does_not_grant_builtin_private_recovery() {
+        for reconstructing in [false, true] {
+            let fixture = Arc::new(Fixture::default());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory = Arc::new(independent_factory(calls.clone()));
+            let mut selected = partition(fixture.clone()).with_factory(factory.clone());
+            selected.context.bind_builtin_history();
+            selected = if reconstructing {
+                selected.with_contained_reconstruction_instructions()
+            } else {
+                selected.with_retained_member_instructions()
+            };
+            assert!(matches!(
+                selected.create_replicator(None, None).await,
+                Err(RuntimeError::AuthorityMismatch(_))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*factory.requirements.lock().unwrap(), [true]);
+            assert_eq!(fixture.reservations.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.registrations.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.native_endpoints.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.lifecycle_observations.load(Ordering::SeqCst), 0);
+            assert_eq!(factory.control.aborts.load(Ordering::SeqCst), 1);
+            assert_eq!(factory.control.closes.load(Ordering::SeqCst), 1);
+            assert!(selected.builtin_native_registration().is_none());
+            assert_eq!(
+                selected.get_read_status().await.unwrap(),
+                AccessStatus::NotPrimary
+            );
+            assert_eq!(
+                selected.get_write_status().await.unwrap(),
+                AccessStatus::NotPrimary
+            );
+            fixture.drain().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unselected_partition_still_errors_without_consuming_a_reservation() {
+        for required in [false, true] {
+            let fixture = Arc::new(Fixture::default());
+            let mut partition = partition(fixture.clone());
+            if required {
+                partition.context.bind_builtin_history();
+            }
+            assert!(matches!(
+                partition.clone().create_replicator(None, None).await,
+                Err(RuntimeError::Application(message))
+                    if message == "select a replicator factory during Open"
+            ));
+            fixture.assert_no_construction();
+        }
+    }
+
+    #[tokio::test]
+    async fn unbound_independent_override_remains_usable_after_builtin_selection() {
+        let fixture = Arc::new(Fixture::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(independent_factory(calls.clone()));
+        let partition = partition(fixture.clone())
+            .with_builtin_replicator()
+            .with_factory(factory.clone())
+            .clone();
+        let interfaces = partition.create_replicator(None, None).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*factory.requirements.lock().unwrap(), [false]);
+        assert!(interfaces.primary_replicator().is_none());
+        assert!(interfaces.state_replicator().is_none());
+        assert_eq!(
+            interfaces.capabilities(),
+            ReplicatorCapabilities::conservative()
+        );
+        assert!(partition.builtin_native_registration().is_none());
+        assert_eq!(fixture.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.native_endpoints.load(Ordering::SeqCst), 0);
+        fixture.drain().await;
+        assert_eq!(factory.control.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(factory.control.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn actual_builtin_bundle_from_a_different_per_creation_context_is_rejected() {
+        let fixture = Arc::new(Fixture::default());
+        let mut partition = partition(fixture.clone());
+        partition.context.bind_builtin_history();
+        let partition = partition.with_builtin_replicator();
+        assert!(!partition.restoring_retained_member());
+        assert!(!partition.reconstructing_contained_creation());
+        let reservation = fixture.reserve_replicator_creation().unwrap();
+        let provenance = partition.context.for_creation(reservation);
+        let foreign = partition.context.for_creation(reservation);
+        let interfaces = default_factory()
+            .create_replicator(foreign.clone(), Some(fixture.clone()), settings())
+            .await
+            .unwrap();
+        assert!(foreign.builtin_creation_matches(&interfaces.creation));
+        assert!(!provenance.builtin_creation_matches(&interfaces.creation));
+        assert!(matches!(
+            partition
+                .register_created_replicator(
+                    interfaces,
+                    provenance,
+                    Some(fixture.clone()),
+                    settings(),
+                    reservation,
+                )
+                .await,
+            Err(RuntimeError::AuthorityMismatch(_))
+        ));
+        assert_eq!(fixture.native_endpoints.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.cancellations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.registrations.load(Ordering::SeqCst), 0);
+        assert!(partition.builtin_native_registration().is_none());
+        fixture.drain().await;
     }
 }

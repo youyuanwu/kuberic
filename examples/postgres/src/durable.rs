@@ -8,15 +8,16 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use crate::native::AcknowledgementPolicy;
 use kuberic_runtime::protocol::types::{
-    BuildAuthority, Epoch, OperationId, ReplicaIdentity, ResourceUid,
+    BuildAuthority, ConfigurationDescriptor, Epoch, OperationId, ProcessSessionId, ReplicaIdentity,
+    ReplicaRole, ReplicaStorageIncarnationContext, ResourceUid,
 };
 use kuberic_runtime::replicator::ReplicaSetConfiguration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-const STATE_VERSION: u32 = 1;
-const STATE_FILE: &str = "state-v2.json";
+pub const STATE_VERSION: u32 = 3;
+const STATE_FILE: &str = "state-v3.json";
 pub const MAX_RETAINED_BUILD_IDS: usize = 64;
 pub const MAX_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BUILD_ID_BYTES: usize = 512;
@@ -55,6 +56,86 @@ pub enum PgRecoveryState {
 pub struct PgDurableIdentity {
     pub resource_uid: ResourceUid,
     pub replica: ReplicaIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PgNativeParticipant {
+    pub identity: ReplicaIdentity,
+    pub process_session_id: ProcessSessionId,
+    pub storage_incarnation: Option<ReplicaStorageIncarnationContext>,
+    pub replication_address: String,
+    pub role: ReplicaRole,
+}
+
+impl From<&kuberic_runtime::replicator::ReplicaInformation> for PgNativeParticipant {
+    fn from(peer: &kuberic_runtime::replicator::ReplicaInformation) -> Self {
+        Self {
+            identity: peer.identity.clone(),
+            process_session_id: peer.process_session_id.clone(),
+            storage_incarnation: peer.storage_incarnation.clone(),
+            replication_address: peer.replication_address.clone(),
+            role: peer.role,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PgNativeConfiguration {
+    pub current: ConfigurationDescriptor,
+    pub previous: Option<ConfigurationDescriptor>,
+    pub current_participants: Vec<PgNativeParticipant>,
+    pub previous_participants: Vec<PgNativeParticipant>,
+}
+
+impl PgNativeConfiguration {
+    fn validate(&self) -> Result<(), PgDurableError> {
+        for descriptor in std::iter::once(&self.current).chain(self.previous.iter()) {
+            kuberic_runtime::protocol::validation::validate_configuration(descriptor, None)
+                .map_err(|error| PgDurableError::Invalid(error.to_string()))?;
+        }
+        for peers in [&self.current_participants, &self.previous_participants] {
+            if peers.len() > crate::build::MAX_BUILDS * 2 {
+                return Err(PgDurableError::Invalid(
+                    "native participant bound exceeded".into(),
+                ));
+            }
+            let mut identities = BTreeSet::new();
+            for peer in peers {
+                if peer.process_session_id.is_empty()
+                    || peer.replication_address.is_empty()
+                    || !identities.insert(&peer.identity)
+                    || peer.storage_incarnation.as_ref().is_some_and(|storage| {
+                        storage.replica != peer.identity || storage.validate().is_err()
+                    })
+                    || !std::iter::once(&self.current)
+                        .chain(self.previous.iter())
+                        .flat_map(|configuration| &configuration.members)
+                        .any(|member| member.identity == peer.identity && member.role == peer.role)
+                {
+                    return Err(PgDurableError::Invalid(
+                        "invalid exact native participant".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Physical exclusion only, never running-standby or admission evidence.
+pub struct PgNativeQuiescence {
+    pub predecessor_epoch: Epoch,
+    pub selected_epoch: Epoch,
+    pub process_session_id: ProcessSessionId,
+    pub stopped_process_generation: u64,
+    pub lineage: crate::build::PgLineage,
+    pub required_certified_lsn: i64,
+    pub retained_flush_lsn: i64,
+    pub configuration: Option<PgNativeConfiguration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +182,13 @@ pub struct PgDurableState {
     pub build_epoch: Option<Epoch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_build_epoch: Option<Epoch>,
+    pub native_configuration: Option<PgNativeConfiguration>,
+    pub quiescence: Option<PgNativeQuiescence>,
+    pub native_session_generation: u64,
+    pub(crate) native_reformations: Vec<crate::adapter::public_v1::session::PgNativeReformation>,
+    pub(crate) helper_executions: Vec<crate::owned_command::helper_receipt::HelperSelection>,
+    pub(crate) postmaster_executions:
+        Vec<crate::owned_command::helper_receipt::PostmasterSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recovery: Option<crate::adapter::recovery::Recovery>,
 }
@@ -137,6 +225,12 @@ impl PgDurableState {
             outbound_attempts: BTreeMap::new(),
             build_epoch: None,
             retired_build_epoch: None,
+            native_configuration: None,
+            quiescence: None,
+            native_session_generation: 0,
+            native_reformations: Vec::new(),
+            helper_executions: Vec::new(),
+            postmaster_executions: Vec::new(),
             recovery: None,
         }
     }
@@ -171,6 +265,85 @@ impl PgDurableState {
         }
         if let Some(synchronous) = &self.synchronous {
             synchronous.validate().map_err(PgDurableError::Invalid)?;
+        }
+        if let Some(configuration) = &self.native_configuration {
+            configuration.validate()?;
+        }
+        if let Some(quiescence) = &self.quiescence {
+            quiescence
+                .lineage
+                .validate()
+                .map_err(PgDurableError::Invalid)?;
+            if quiescence.predecessor_epoch > quiescence.selected_epoch
+                || quiescence.process_session_id.is_empty()
+                || quiescence.required_certified_lsn < 0
+                || quiescence.retained_flush_lsn < quiescence.required_certified_lsn
+                || self.system_identifier.as_ref() != Some(&quiescence.lineage.system_identifier)
+                || self.timeline_id != Some(quiescence.lineage.timeline)
+                || !self.external_access_closed
+                || !self.postgres_stopped
+                || self.role != PgDurableRole::Primary
+            {
+                return Err(PgDurableError::Invalid(
+                    "invalid physically quiescent native owner".into(),
+                ));
+            }
+            if let Some(configuration) = &quiescence.configuration {
+                configuration.validate()?;
+            }
+        }
+        if self.native_reformations.len() > crate::adapter::public_v1::session::SESSION_LIMIT {
+            return Err(PgDurableError::Invalid(
+                "native reformation history exhausted".into(),
+            ));
+        }
+        if self.helper_executions.len() > crate::owned_command::helper_receipt::MAX_EXECUTIONS {
+            return Err(PgDurableError::Invalid(
+                "native helper execution history exhausted".into(),
+            ));
+        }
+        for (index, selection) in self.helper_executions.iter().enumerate() {
+            selection
+                .validate()
+                .map_err(|error| PgDurableError::Invalid(error.to_string()))?;
+            if selection.launch.execution_generation != index as u64 + 1 {
+                return Err(PgDurableError::Invalid(
+                    "native helper execution generations are not consecutive".into(),
+                ));
+            }
+        }
+        if self.postmaster_executions.len() > crate::owned_command::helper_receipt::MAX_EXECUTIONS {
+            return Err(PgDurableError::Invalid(
+                "native postmaster history exhausted".into(),
+            ));
+        }
+        for (index, selection) in self.postmaster_executions.iter().enumerate() {
+            selection
+                .validate()
+                .map_err(|error| PgDurableError::Invalid(error.to_string()))?;
+            if selection.launch.execution_generation != index as u64 + 1
+                || index > 0
+                    && selection.launch.intent.process_generation
+                        <= self.postmaster_executions[index - 1]
+                            .launch
+                            .intent
+                            .process_generation
+            {
+                return Err(PgDurableError::Invalid(
+                    "crossed postmaster execution history".into(),
+                ));
+            }
+        }
+        let mut reformation_ids = BTreeSet::new();
+        for reformation in &self.native_reformations {
+            reformation
+                .validate(expected)
+                .map_err(PgDurableError::Invalid)?;
+            if !reformation_ids.insert(reformation.nonce()) {
+                return Err(PgDurableError::Invalid(
+                    "duplicate native reformation".into(),
+                ));
+            }
         }
         if let Some(recovery) = &self.recovery {
             recovery
@@ -374,6 +547,7 @@ pub struct PgDurableStore {
     ownership: Arc<File>,
     pub(crate) policy_lock: Arc<Mutex<()>>,
     pub(crate) policy_fence: std::sync::atomic::AtomicU64,
+    pub(crate) helper_lock: Mutex<()>,
     #[cfg(feature = "testing")]
     commit_hook: std::sync::Mutex<Option<CommitHook>>,
 }
@@ -597,6 +771,7 @@ impl PgDurableStore {
         mode: StorageMode,
     ) -> Result<Self, PgDurableError> {
         let root = root.as_ref().to_path_buf();
+        classify_metadata_root(&root, mode)?;
         if mode == StorageMode::Fresh {
             tokio::fs::create_dir_all(&root)
                 .await
@@ -615,12 +790,32 @@ impl PgDurableStore {
             (true, StorageMode::Established) => read_state(&path).await?,
         };
         state.validate(&expected)?;
+        crate::owned_command::helper_receipt::validate_cells(&root, &state.helper_executions)
+            .map_err(|error| PgDurableError::Invalid(error.to_string()))?;
+        // A newly opening durable owner has no live OwnedProcess capability.
+        // Refuse before writable acquisition, including pre-bind repair moves.
+        let postmasters_excluded = |state: &PgDurableState| -> Result<(), PgDurableError> {
+            crate::owned_command::helper_receipt::validate_cells(
+                &root,
+                &state.postmaster_executions,
+            )
+            .map_err(|error| PgDurableError::Invalid(error.to_string()))?;
+            for selected in &state.postmaster_executions {
+                selected.completed().map_err(|error| {
+                    PgDurableError::Invalid(format!(
+                        "old native postmaster exclusion unproven: {error}"
+                    ))
+                })?;
+            }
+            Ok(())
+        };
+        postmasters_excluded(&state)?;
         let ownership = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(root.join("state-v2.owner"))
+            .open(root.join("state-v3.owner"))
             .map_err(PgDurableError::Io)?;
         ownership.try_lock().map_err(|error| {
             let error: std::io::Error = error.into();
@@ -633,6 +828,7 @@ impl PgDurableStore {
         let state = if mode == StorageMode::Established {
             let current = read_state(&path).await?;
             current.validate(&expected)?;
+            postmasters_excluded(&current)?;
             current
         } else {
             state
@@ -645,6 +841,7 @@ impl PgDurableStore {
             ownership: Arc::new(ownership),
             policy_lock: Arc::new(Mutex::new(())),
             policy_fence: std::sync::atomic::AtomicU64::new(policy_generation),
+            helper_lock: Mutex::new(()),
             #[cfg(feature = "testing")]
             commit_hook: std::sync::Mutex::new(None),
         };
@@ -670,6 +867,147 @@ impl PgDurableStore {
         Ok(actual)
     }
 
+    pub(crate) async fn helper_launch(
+        &self,
+        intent: crate::owned_command::helper_receipt::HelperIntent,
+    ) -> Result<crate::owned_command::helper_receipt::HelperLaunch, crate::instance::PgError> {
+        self.ensure_helpers_complete().await?;
+        let state = self.snapshot().await;
+        crate::owned_command::helper_receipt::HelperLaunch::new(
+            &self.root,
+            state.helper_executions.len() as u64 + 1,
+            intent,
+        )
+        .map_err(|error| crate::instance::PgError::Process(error.to_string()))
+    }
+
+    pub(crate) async fn select_helper(
+        &self,
+        selection: crate::owned_command::helper_receipt::HelperSelection,
+    ) -> Result<(), crate::instance::PgError> {
+        selection
+            .validate_cell()
+            .map_err(|error| crate::instance::PgError::Process(error.to_string()))?;
+        self.update(|state| {
+            if selection.launch.root != self.root.canonicalize().map_err(PgDurableError::Io)?
+                || selection.launch.execution_generation != state.helper_executions.len() as u64 + 1
+            {
+                return Err(PgDurableError::Invalid(
+                    "crossed helper execution selection".into(),
+                ));
+            }
+            for previous in &state.helper_executions {
+                previous.completed().map_err(|error| {
+                    PgDurableError::Invalid(format!(
+                        "old native helper exclusion unproven: {error}"
+                    ))
+                })?;
+            }
+            for previous in &state.postmaster_executions {
+                previous.completed().map_err(|error| {
+                    PgDurableError::Invalid(format!(
+                        "old native postmaster exclusion unproven: {error}"
+                    ))
+                })?;
+            }
+            state.helper_executions.push(selection);
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| crate::instance::PgError::Process(error.to_string()))
+    }
+
+    pub(crate) async fn ensure_helpers_complete(&self) -> Result<(), crate::instance::PgError> {
+        self.ensure_executions_complete(None).await
+    }
+
+    pub(crate) async fn postmaster_launch(
+        &self,
+        intent: crate::owned_command::helper_receipt::PostmasterIntent,
+    ) -> Result<crate::owned_command::helper_receipt::PostmasterLaunch, crate::instance::PgError>
+    {
+        self.ensure_helpers_complete().await?;
+        crate::owned_command::helper_receipt::PostmasterLaunch::new(
+            &self.root,
+            self.snapshot().await.postmaster_executions.len() as u64 + 1,
+            intent,
+        )
+        .map_err(|error| crate::instance::PgError::Process(error.to_string()))
+    }
+
+    pub(crate) async fn select_postmaster(
+        &self,
+        selection: crate::owned_command::helper_receipt::PostmasterSelection,
+    ) -> Result<(), crate::instance::PgError> {
+        selection
+            .validate_cell()
+            .map_err(|error| crate::instance::PgError::Process(error.to_string()))?;
+        self.update(|state| {
+            if selection.launch.root != self.root.canonicalize().map_err(PgDurableError::Io)?
+                || selection.launch.execution_generation
+                    != state.postmaster_executions.len() as u64 + 1
+            {
+                return Err(PgDurableError::Invalid(
+                    "crossed postmaster execution selection".into(),
+                ));
+            }
+            for previous in &state.helper_executions {
+                previous
+                    .completed()
+                    .map_err(|error| PgDurableError::Invalid(error.to_string()))?;
+            }
+            for previous in &state.postmaster_executions {
+                previous
+                    .completed()
+                    .map_err(|error| PgDurableError::Invalid(error.to_string()))?;
+            }
+            state.postmaster_executions.push(selection);
+            Ok(())
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| crate::instance::PgError::Process(error.to_string()))
+    }
+
+    pub(crate) async fn ensure_executions_complete(
+        &self,
+        current: Option<&crate::owned_command::helper_receipt::PostmasterSelection>,
+    ) -> Result<(), crate::instance::PgError> {
+        let state = self.revalidate().await.map_err(|error| {
+            crate::instance::PgError::Process(format!("native helper selection: {error}"))
+        })?;
+        crate::owned_command::helper_receipt::validate_cells(&self.root, &state.helper_executions)
+            .map_err(|error| crate::instance::PgError::Process(error.to_string()))?;
+        for selection in &state.helper_executions {
+            selection.completed().map_err(|error| {
+                crate::instance::PgError::Process(format!(
+                    "old native helper exclusion unproven: {error}"
+                ))
+            })?;
+        }
+        crate::owned_command::helper_receipt::validate_cells(
+            &self.root,
+            &state.postmaster_executions,
+        )
+        .map_err(|error| crate::instance::PgError::Process(error.to_string()))?;
+        if current.is_some_and(|current| state.postmaster_executions.last() != Some(current)) {
+            return Err(crate::instance::PgError::Process(
+                "current postmaster selection changed".into(),
+            ));
+        }
+        for selection in &state.postmaster_executions {
+            if Some(selection) != current {
+                selection.completed().map_err(|error| {
+                    crate::instance::PgError::Process(format!(
+                        "old native postmaster exclusion unproven: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn update(
         &self,
         update: impl FnOnce(&mut PgDurableState) -> Result<(), PgDurableError>,
@@ -677,6 +1015,37 @@ impl PgDurableStore {
         let mut state = self.state.clone().lock_owned().await;
         let mut next = state.clone();
         update(&mut next)?;
+        if next.helper_executions.len() < state.helper_executions.len()
+            || !next.helper_executions.starts_with(&state.helper_executions)
+        {
+            return Err(PgDurableError::Invalid(
+                "native helper selection history is immutable".into(),
+            ));
+        }
+        if !next
+            .postmaster_executions
+            .starts_with(&state.postmaster_executions)
+        {
+            return Err(PgDurableError::Invalid(
+                "native postmaster history is immutable".into(),
+            ));
+        }
+        if next.native_reformations.len() < state.native_reformations.len()
+            || next
+                .native_reformations
+                .iter()
+                .zip(&state.native_reformations)
+                .any(|(next, previous)| !next.continues(previous))
+        {
+            return Err(PgDurableError::Invalid(
+                "native reformation history cannot regress or erase uncertainty".into(),
+            ));
+        }
+        if next.native_session_generation < state.native_session_generation {
+            return Err(PgDurableError::Invalid(
+                "native session generation cannot regress".into(),
+            ));
+        }
         next.generation = state
             .generation
             .checked_add(1)
@@ -684,6 +1053,10 @@ impl PgDurableStore {
         next.validate(&state.identity)?;
         if next.system_identifier == state.system_identifier
             && next.recovery_state != PgRecoveryState::Rebuilding
+            && !next
+                .native_reformations
+                .iter()
+                .any(|record| record.completes_installed_repair(&state, &next))
             && (next.current_lsn < state.current_lsn
                 || next.flush_lsn < state.flush_lsn
                 || next.received_lsn.zip(state.received_lsn).is_some_and(
@@ -831,6 +1204,19 @@ fn decode_state(bytes: &[u8]) -> Result<PgDurableState, PgDurableError> {
             "metadata byte bound exceeded".into(),
         ));
     }
+    let header: serde_json::Value = serde_json::from_slice(bytes).map_err(PgDurableError::Json)?;
+    let observed = header
+        .get("state")
+        .and_then(|state| state.get("version"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| PgDurableError::Invalid("native metadata has no explicit version".into()))?;
+    if observed != STATE_VERSION {
+        return Err(PgDurableError::Version {
+            expected: STATE_VERSION,
+            observed,
+        });
+    }
     let envelope: StateEnvelope = serde_json::from_slice(bytes).map_err(PgDurableError::Json)?;
     let checksum = checksum(&envelope.state)?;
     if checksum != envelope.checksum {
@@ -908,6 +1294,63 @@ fn write_state(
     Ok(())
 }
 
+fn classify_metadata_root(root: &Path, mode: StorageMode) -> Result<(), PgDurableError> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(PgDurableError::Io(error)),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(PgDurableError::Invalid(
+                "native metadata root is not an owned directory".into(),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let mut nonempty = false;
+    for entry in std::fs::read_dir(root).map_err(PgDurableError::Io)? {
+        let entry = entry.map_err(PgDurableError::Io)?;
+        nonempty = true;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(PgDurableError::Invalid(
+                "native metadata filename is not UTF-8".into(),
+            ));
+        };
+        let Some(version) = name.strip_prefix("state-v") else {
+            continue;
+        };
+        if let Some(observed) = version
+            .split('.')
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            && observed != STATE_VERSION
+        {
+            return Err(PgDurableError::Version {
+                expected: STATE_VERSION,
+                observed,
+            });
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).map_err(PgDurableError::Io)?;
+        if !matches!(
+            name,
+            STATE_FILE | "state-v3.owner" | "state-v3.lock" | "state-v3.json.tmp"
+        ) && !crate::owned_command::helper_receipt::is_cell_name(name)
+            || !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.nlink() != 1
+        {
+            return Err(PgDurableError::Invalid(
+                "unrecognized or aliased native metadata object".into(),
+            ));
+        }
+    }
+    if mode == StorageMode::Fresh && nonempty {
+        return Err(PgDurableError::AlreadyExists);
+    }
+    Ok(())
+}
+
 fn checksum(state: &PgDurableState) -> Result<String, PgDurableError> {
     let bytes = serde_json::to_vec(state).map_err(PgDurableError::Json)?;
     let digest = Sha256::digest(bytes);
@@ -953,6 +1396,146 @@ mod tests {
                 agent_generation: AgentGeneration::new("generation-1"),
             },
         }
+    }
+
+    #[cfg(feature = "testing")]
+    fn metadata_tree(root: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let bytes = if entry.file_type().unwrap().is_symlink() {
+                    std::fs::read_link(entry.path())
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes()
+                } else {
+                    std::fs::read(entry.path()).unwrap()
+                };
+                (entry.file_name(), bytes)
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn m3_native_metadata_three_rejects_legacy_unknown_and_mixed_roots_before_mutation() {
+        for observed in [1, 2, 9] {
+            for mode in [StorageMode::Fresh, StorageMode::Established] {
+                for mixed in [false, true] {
+                    let directory = crate::testing::TestDataDir::new("native-three-incompatible");
+                    let root = directory.path().join("metadata");
+                    std::fs::create_dir(&root).unwrap();
+                    std::fs::write(
+                        root.join(format!("state-v{observed}.json")),
+                        b"retained incompatible bytes, not a fresh-store invitation",
+                    )
+                    .unwrap();
+                    std::fs::write(root.join("process-generation-v2"), b"73").unwrap();
+                    if mixed {
+                        write_state(
+                            &root.join(STATE_FILE),
+                            &PgDurableState::new(identity()),
+                            &mut false,
+                            || Ok(()),
+                            |_| {},
+                        )
+                        .unwrap();
+                    }
+                    let before = metadata_tree(&root);
+                    assert!(matches!(
+                        PgDurableStore::open(&root, identity(), mode).await,
+                        Err(PgDurableError::Version {
+                            expected: 3,
+                            observed: version
+                        }) if version == observed
+                    ));
+                    assert_eq!(metadata_tree(&root), before);
+                    assert!(!root.join("state-v3.owner").exists());
+                    assert!(!root.join("state-v3.lock").exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn m3_native_metadata_three_refuses_aliased_missing_and_unknown_heads() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["symlink", "dangling", "hardlink", "unknown", "missing"] {
+            for mode in [StorageMode::Fresh, StorageMode::Established] {
+                let directory = crate::testing::TestDataDir::new("native-three-head");
+                let root = directory.path().join("metadata");
+                std::fs::create_dir(&root).unwrap();
+                let foreign = directory.path().join("foreign");
+                write_state(
+                    &foreign,
+                    &PgDurableState::new(identity()),
+                    &mut false,
+                    || Ok(()),
+                    |_| {},
+                )
+                .unwrap();
+                let head = root.join(STATE_FILE);
+                match kind {
+                    "symlink" => symlink(&foreign, &head).unwrap(),
+                    "dangling" => symlink(directory.path().join("absent"), &head).unwrap(),
+                    "hardlink" => std::fs::hard_link(&foreign, &head).unwrap(),
+                    "unknown" => {
+                        std::fs::write(root.join("state-v3.unsupported"), b"unknown").unwrap();
+                    }
+                    "missing" => {
+                        std::fs::write(root.join("process-generation-v2"), b"73").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let before = metadata_tree(&root);
+                let foreign_before = std::fs::read(&foreign).unwrap();
+                assert!(PgDurableStore::open(&root, identity(), mode).await.is_err());
+                assert_eq!(metadata_tree(&root), before);
+                assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
+                assert!(!root.join("state-v3.owner").exists());
+                assert!(!root.join("state-v3.lock").exists());
+            }
+        }
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn m3_pg_metadata_one_rejected_before_exclusive_owner_or_clock_mutation() {
+        let directory = crate::testing::TestDataDir::new("native-metadata-one");
+        let root = directory.path().join("metadata");
+        std::fs::create_dir(&root).unwrap();
+        let mut state = PgDurableState::new(identity());
+        state.version = 1;
+        let path = root.join(STATE_FILE);
+        write_state(&path, &state, &mut false, || Ok(()), |_| {}).unwrap();
+        std::fs::write(
+            root.join("retained-native-input"),
+            b"do not migrate or reset",
+        )
+        .unwrap();
+        let tree = |root: &Path| {
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = tree(&root);
+        assert!(matches!(
+            PgDurableStore::open(&root, identity(), StorageMode::Established).await,
+            Err(PgDurableError::Version {
+                expected: 3,
+                observed: 1
+            }),
+        ));
+        assert_eq!(tree(&root), before);
+        assert!(!root.join("state-v3.owner").exists());
+        assert!(!root.join("process-generation-v2").exists());
     }
 
     #[cfg(feature = "testing")]

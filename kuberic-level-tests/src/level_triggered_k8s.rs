@@ -201,7 +201,8 @@ fn secondary_reconstructed_authority(
             && matches!(
                 entry.goal.desired,
                 ReplicaGoalKind::Prepare {
-                    role: ReplicaRole::ActiveSecondary
+                    role: ReplicaRole::ActiveSecondary,
+                    ..
                 } | ReplicaGoalKind::Reconfigure {
                     role: ReplicaRole::ActiveSecondary,
                     ..
@@ -685,6 +686,7 @@ fn secondary_restart_requires_current_accepted_configuration_not_legacy_diagnost
         scope: scope.clone(),
         desired: ReplicaGoalKind::Prepare {
             role: ReplicaRole::ActiveSecondary,
+            rebuild: None,
         },
     })
     .map_err(anyhow::Error::msg)?;
@@ -693,6 +695,8 @@ fn secondary_restart_requires_current_accepted_configuration_not_legacy_diagnost
         status: ReplicaGoalStatus::Achieved,
         selected_call: None,
         receipts: 2,
+        host_settled: true,
+        completed_handoff: None,
     };
     retained.outcome = Some(observation.clone());
     let status = serde_json::json!({"status": {
@@ -701,6 +705,8 @@ fn secondary_restart_requires_current_accepted_configuration_not_legacy_diagnost
         "replicaGoals": [retained],
     }});
     let after = ReplicaAgentSnapshot {
+        native_status: None,
+        native_lifecycle: None,
         format: ORDINARY_ACTION_FORMAT,
         identity: accepted.identity.clone(),
         history,
@@ -723,6 +729,7 @@ fn secondary_restart_requires_current_accepted_configuration_not_legacy_diagnost
         accepted_revision_high_watermark: observation.goal.revision,
         retained_member_qualification: None,
         retained_recovery_exit: None,
+        reconstruction_dependencies: Vec::new(),
         goals: vec![observation],
         remote_operations: Vec::new(),
         progress: ProgressQueryResult::Value(10),

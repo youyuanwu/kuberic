@@ -268,6 +268,12 @@ impl PartitionOperation {
             let failure = returned_failure.and_then(|failure| failure.lock().unwrap().take());
             let recorded = operation.record_root_result(result, failure).await;
             if let Err(error) = &recorded {
+                #[cfg(feature = "testing")]
+                if operation.intent().goal().is_some_and(|goal| {
+                    crate::host::ordinary_goal::addition::selection(goal).is_some()
+                }) {
+                    eprintln!("ordered addition root result could not be receipted: {error}");
+                }
                 operation.record_failure(error);
             }
             #[cfg(all(test, feature = "testing"))]
@@ -371,6 +377,14 @@ impl PartitionOperation {
                 .await?;
             self.record.send_replace(pending);
             self.bump_revision();
+            #[cfg(feature = "testing")]
+            if let Some(cut) = self.cut.lock().await.clone() {
+                cut.pause_result(
+                    crate::host::public_lifecycle::PublicCutPosition::FailureRecorded,
+                    &current.intent,
+                )
+                .await;
+            }
             return Ok(());
         }
 
@@ -1561,7 +1575,41 @@ impl PartitionOperationRegistry {
             .get(id)
             .cloned()
             .ok_or_else(|| HostError::CommandRejected("ordinary goal owner unavailable".into()))?;
-        operation.join_ordinary_root().await
+        operation.join_ordinary_root().await?;
+        let record = operation.snapshot();
+        if record.stage == PublicOperationStage::Completed
+            && record.disposition == Some(PublicOperationDisposition::Succeeded)
+            && let Some(goal) = record
+                .intent
+                .goal()
+                .filter(|goal| crate::host::ordinary_goal::reconstruction::claim(goal).is_some())
+        {
+            self.store.validate_creation_reconstruction(goal).await?;
+            let durable = self.store.load_state().await?;
+            let preview = durable.public_v1_operation_state.as_ref().ok_or_else(|| {
+                HostError::CommandRejected("reconstruction journal disappeared after join".into())
+            })?;
+            if crate::host::ordinary_goal::terminal_for_process(preview, &self.process_session_id)
+                || self.terminal_admission_is_fenced()
+            {
+                return Err(HostError::CommandRejected(
+                    "current creation was fenced after reconstruction".into(),
+                ));
+            }
+            let mut registry = self.state.lock().await;
+            for old in preview
+                .operations
+                .values()
+                .filter(|old| old.superseded_by.as_ref() == Some(id))
+            {
+                if let Some(owner) = registry.operations.get_mut(&old.intent.operation_id) {
+                    owner.record.send_replace(old.clone());
+                }
+            }
+            self.renewal_fence
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
     }
 
     pub(crate) async fn admit(
@@ -1600,6 +1648,23 @@ impl PartitionOperationRegistry {
             } else {
                 false
             };
+        let contained_reconstruction = if let Some(goal) = intent
+            .goal()
+            .filter(|goal| crate::host::ordinary_goal::reconstruction::claim(goal).is_some())
+        {
+            crate::host::ordinary_goal::reconstruction::validate(
+                &self.store.load_state().await?,
+                goal,
+            )?;
+            true
+        } else {
+            false
+        };
+        let inspection_state = self.store.load_state().await?;
+        let inspection_dependencies = intent.goal().and_then(|goal| {
+            crate::host::ordinary_goal::reconstruction::inspection_custody(&inspection_state, goal)
+                .or_else(|| super::original_member::custody(&inspection_state, goal))
+        });
         let renewal_configuration =
             if !intent.class.is_terminal() && !self.terminal_admission_is_fenced() {
                 self.prepare_fenced_session_renewal_configuration(&intent)
@@ -1609,7 +1674,11 @@ impl PartitionOperationRegistry {
             };
         if !intent.class.is_terminal()
             && (self.terminal_admission_is_fenced()
-                || (self.is_fenced() && !renewal_configuration && !retained_restore))
+                || (self.is_fenced()
+                    && !renewal_configuration
+                    && !retained_restore
+                    && !contained_reconstruction
+                    && inspection_dependencies.is_none()))
         {
             return Err(HostError::CommandRejected(
                 "preview is synchronously fenced".into(),
@@ -1770,6 +1839,26 @@ impl PartitionOperationRegistry {
         let retained_state_for_goal = self.store.load_state().await?;
         for operation in existing {
             let record = operation.snapshot();
+            if inspection_dependencies
+                .as_ref()
+                .is_some_and(|custody| custody.dependencies.contains(&record.intent.operation_id))
+            {
+                continue;
+            }
+            if intent.goal().is_some_and(|goal| {
+                crate::host::ordinary_goal::addition::permits_attempt(
+                    &retained_state_for_goal,
+                    goal,
+                    &record,
+                ) || contained_reconstruction
+                    && crate::host::ordinary_goal::reconstruction::permits_attempt(
+                        &retained_state_for_goal,
+                        goal,
+                        &record,
+                    )
+            }) {
+                continue;
+            }
             if retained_restore
                 && intent.goal().is_some_and(|goal| {
                     crate::host::ordinary_goal::retained::supersedes_fault(

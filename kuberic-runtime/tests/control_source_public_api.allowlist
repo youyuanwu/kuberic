@@ -18,16 +18,61 @@ private-path documented fn crate::protocol::validation::scale_up::fn validate_sc
 private-path hidden const crate::protocol::public_operations::replica_goal::MAX_REMOTE_GENERATIONS: usize
 private-path hidden const crate::protocol::public_operations::replica_goal::MAX_REMOTE_SELECTIONS: usize
 private-path hidden const crate::protocol::public_operations::replica_goal::ORDINARY_ACTION_FORMAT: u32
+private-path hidden enum crate::protocol::public_operations::native_observation::NativeInspectionEpoch
+private-path hidden enum crate::protocol::public_operations::native_observation::NativeReplicaState
+private-path hidden enum crate::protocol::public_operations::replica_goal::MembershipAdditionPhase
 private-path hidden enum crate::protocol::public_operations::replica_goal::RemoteReplicaState
 private-path hidden enum crate::protocol::public_operations::replica_goal::ReplicaAgentQueryResult
 private-path hidden enum crate::protocol::public_operations::replica_goal::ReplicaGoalKind
 private-path hidden enum crate::protocol::public_operations::replica_goal::ReplicaGoalStatus
 private-path hidden enum crate::protocol::public_operations::replica_goal::ReplicaPublicationStage
+private-path hidden enum crate::protocol::public_operations::replica_goal::SourceHandoffReceipt
+private-path hidden field crate::protocol::public_operations::native_observation::NativeDeactivationInfo::catch_up_lsn: i64
+private-path hidden field crate::protocol::public_operations::native_observation::NativeDeactivationInfo::primary_fence: Epoch
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::application_role: Option < ReplicaRole >
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::applied_primary_fence: Option < Epoch >
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::deactivation: Option < NativeDeactivationInfo >
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::native_role: ReplicaRole
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::operation_id: OperationId
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::revision: u64
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::scope: ReplicaScope
+private-path hidden field crate::protocol::public_operations::native_observation::NativeLifecycleFacts::state: NativeReplicaState
+private-path hidden field crate::protocol::public_operations::native_observation::NativeStatusObservation::capability: ProgressQueryResult
+private-path hidden field crate::protocol::public_operations::native_observation::NativeStatusObservation::epoch: NativeInspectionEpoch
+private-path hidden field crate::protocol::public_operations::native_observation::NativeStatusObservation::input: NativeLifecycleFacts
+private-path hidden field crate::protocol::public_operations::native_observation::NativeStatusObservation::progress: ProgressQueryResult
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedCreationRecovery::addition: Option < Box < MembershipAdditionRecovery > >
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedCreationRecovery::catch_up: Option < PublicCatchUpMode >
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedCreationRecovery::predecessor_creation_id: ReplicatorCreationId
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedCreationRecovery::predecessor_operations: Vec < OperationId >
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedCreationRecovery::predecessor_process_session_id: ProcessSessionId
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedCreationRecovery::receiver_settlements: Vec < ContainedReceiverSettlement >
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedCreationRecovery::role: ReplicaRole
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedReceiverSettlement::source_operation_id: OperationId
+private-path hidden field crate::protocol::public_operations::replica_goal::ContainedReceiverSettlement::terminal_goal: Box < ReplicaGoal >
+private-path hidden field crate::protocol::public_operations::replica_goal::CreationRecoveryDependencies::creation_id: ReplicatorCreationId
+private-path hidden field crate::protocol::public_operations::replica_goal::CreationRecoveryDependencies::operations: Vec < OperationId >
+private-path hidden field crate::protocol::public_operations::replica_goal::CreationRecoveryDependencies::process_session_id: ProcessSessionId
+private-path hidden field crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery::admitted: Box < ReplicaGoal >
+private-path hidden field crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery::bootstrap_epoch: Epoch
+private-path hidden field crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery::interrupted: Box < ReplicaGoal >
+private-path hidden field crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery::phase: MembershipAdditionPhase
+private-path hidden field crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery::receiver: ProcessSessionEndpoint
+private-path hidden field crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery::source: ProcessSessionEndpoint
+private-path hidden field crate::protocol::public_operations::replica_goal::NativeOutOfRangeRebuild::source: ReplicaPublication
+private-path hidden field crate::protocol::public_operations::replica_goal::NativeOutOfRangeRebuild::source_first: i64
+private-path hidden field crate::protocol::public_operations::replica_goal::NativeOutOfRangeRebuild::source_inspection: Box < ReplicaGoal >
+private-path hidden field crate::protocol::public_operations::replica_goal::NativeOutOfRangeRebuild::source_last: i64
+private-path hidden field crate::protocol::public_operations::replica_goal::NativeOutOfRangeRebuild::target_inspection: Box < ReplicaGoal >
+private-path hidden field crate::protocol::public_operations::replica_goal::NativeOutOfRangeRebuild::target_last: i64
+private-path hidden field crate::protocol::public_operations::replica_goal::OriginalMemberRebuild::inspection: Box < ReplicaGoal >
+private-path hidden field crate::protocol::public_operations::replica_goal::OriginalMemberRebuild::source: ReplicaPublication
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaObservation::accepted: bool
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaObservation::operation_id: OperationId
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaObservation::selection: RemoteReplicaSelection
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaObservation::state: RemoteReplicaState
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaSelection::generation: u64
+private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaSelection::original_member: Option < Box < ReplicaGoal > >
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaSelection::source: ReplicaPublication
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaSelection::target: ReplicaPublication
 private-path hidden field crate::protocol::public_operations::replica_goal::RemoteReplicaSelection::target_control_address: String
@@ -38,12 +83,15 @@ private-path hidden field crate::protocol::public_operations::replica_goal::Repl
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::goals: Vec < ReplicaGoalObservation >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::history: HistoryContext
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::identity: PublicV1Identity
+private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::native_lifecycle: Option < NativeLifecycleFacts >
+private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::native_status: Option < NativeStatusObservation >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::open_mode: OpenMode
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::process_session_id: ProcessSessionId
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::progress: ProgressQueryResult
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::provider_writer_held: bool
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::publication: Option < ReplicaPublication >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::read_status: AccessStatus
+private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::reconstruction_dependencies: Vec < CreationRecoveryDependencies >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::remote_operations: Vec < RemoteReplicaObservation >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::retained_member_qualification: Option < RetainedMemberQualification >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot::retained_recovery_exit: Option < RetainedRecoveryExitNotice >
@@ -65,7 +113,9 @@ private-path hidden field crate::protocol::public_operations::replica_goal::Repl
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoal::scope: ReplicaScope
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalAcknowledgement::goal: ReplicaGoal
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalAcknowledgement::logically_retired: bool
+private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalObservation::completed_handoff: Option < Vec < SourceHandoffReceipt > >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalObservation::goal: ReplicaGoal
+private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalObservation::host_settled: bool
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalObservation::receipts: usize
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalObservation::selected_call: Option < String >
 private-path hidden field crate::protocol::public_operations::replica_goal::ReplicaGoalObservation::status: ReplicaGoalStatus
@@ -99,16 +149,29 @@ private-path hidden field crate::protocol::public_operations::replica_goal::Reta
 private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::fault_operation_id: OperationId
 private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::fault_revision: u64
 private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::history: HistoryContext
+private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::native_rebuild: Option < Box < NativeOutOfRangeRebuild > >
 private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::process_id: u32
 private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::process_lifetime: String
 private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::qualification: RetainedMemberQualification
 private-path hidden field crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice::storage: ReplicaStorageIncarnationContext
+private-path hidden impl crate::protocol::public_operations::native_observation::ReplicaAgentSnapshot::fn normal_handoff_result (& self) -> Option < & ReplicaGoalObservation >
+private-path hidden impl crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery::fn configuration (& self , phase : MembershipAdditionPhase ,) -> Result < ReplicaConfigurationScope , & 'static str >
 private-path hidden impl crate::protocol::public_operations::replica_goal::RemoteReplicaSelection::fn validate (& self) -> Result < () , & 'static str >
 private-path hidden impl crate::protocol::public_operations::replica_goal::ReplicaGoal::fn intent (& self) -> PublicOperationIntent
 private-path hidden impl crate::protocol::public_operations::replica_goal::ReplicaGoal::fn validate (& self) -> Result < () , & 'static str >
 private-path hidden impl crate::protocol::public_operations::replica_goal::ReplicaPublication::fn validate (& self) -> Result < () , & 'static str >
 private-path hidden impl crate::protocol::public_operations::replica_goal::ReplicaScope::fn compatible_with (& self , next : & Self) -> bool
 private-path hidden impl crate::protocol::public_operations::replica_goal::ReplicaScope::fn validate (& self) -> Result < () , & 'static str >
+private-path hidden impl crate::protocol::public_operations::replica_goal::SourceHandoffReceipt::const ORDERED: [Self ; 6]
+private-path hidden struct crate::protocol::public_operations::native_observation::NativeDeactivationInfo
+private-path hidden struct crate::protocol::public_operations::native_observation::NativeLifecycleFacts
+private-path hidden struct crate::protocol::public_operations::native_observation::NativeStatusObservation
+private-path hidden struct crate::protocol::public_operations::replica_goal::ContainedCreationRecovery
+private-path hidden struct crate::protocol::public_operations::replica_goal::ContainedReceiverSettlement
+private-path hidden struct crate::protocol::public_operations::replica_goal::CreationRecoveryDependencies
+private-path hidden struct crate::protocol::public_operations::replica_goal::MembershipAdditionRecovery
+private-path hidden struct crate::protocol::public_operations::replica_goal::NativeOutOfRangeRebuild
+private-path hidden struct crate::protocol::public_operations::replica_goal::OriginalMemberRebuild
 private-path hidden struct crate::protocol::public_operations::replica_goal::RemoteReplicaObservation
 private-path hidden struct crate::protocol::public_operations::replica_goal::RemoteReplicaSelection
 private-path hidden struct crate::protocol::public_operations::replica_goal::ReplicaAgentSnapshot
@@ -122,6 +185,17 @@ private-path hidden struct crate::protocol::public_operations::replica_goal::Rep
 private-path hidden struct crate::protocol::public_operations::replica_goal::ReplicaScope
 private-path hidden struct crate::protocol::public_operations::replica_goal::RetainedMemberQualification
 private-path hidden struct crate::protocol::public_operations::replica_goal::RetainedRecoveryExitNotice
+private-path hidden variant crate::protocol::public_operations::native_observation::NativeInspectionEpoch::AlreadyApplied
+private-path hidden variant crate::protocol::public_operations::native_observation::NativeInspectionEpoch::Applied
+private-path hidden variant crate::protocol::public_operations::native_observation::NativeInspectionEpoch::Failed((String))
+private-path hidden variant crate::protocol::public_operations::native_observation::NativeInspectionEpoch::StandBy
+private-path hidden variant crate::protocol::public_operations::native_observation::NativeReplicaState::InBuild
+private-path hidden variant crate::protocol::public_operations::native_observation::NativeReplicaState::Ready
+private-path hidden variant crate::protocol::public_operations::native_observation::NativeReplicaState::StandBy
+private-path hidden variant crate::protocol::public_operations::replica_goal::MembershipAdditionPhase::Bootstrap
+private-path hidden variant crate::protocol::public_operations::replica_goal::MembershipAdditionPhase::Current
+private-path hidden variant crate::protocol::public_operations::replica_goal::MembershipAdditionPhase::Joint
+private-path hidden variant crate::protocol::public_operations::replica_goal::MembershipAdditionPhase::Receiver
 private-path hidden variant crate::protocol::public_operations::replica_goal::RemoteReplicaState::Absent
 private-path hidden variant crate::protocol::public_operations::replica_goal::RemoteReplicaState::Dropped
 private-path hidden variant crate::protocol::public_operations::replica_goal::RemoteReplicaState::InBuild
@@ -134,8 +208,9 @@ private-path hidden variant crate::protocol::public_operations::replica_goal::Re
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Build { { remote : Box < RemoteReplicaSelection > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Close
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Discover
-private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Prepare { { role : ReplicaRole , } }
+private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Prepare { { role : ReplicaRole , # [serde (default , skip_serializing_if = "Option::is_none")] rebuild : Option < Box < OriginalMemberRebuild > > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Reconfigure { { role : ReplicaRole , # [serde (rename = "catchUp" , skip_serializing_if = "Option::is_none")] catch_up : Option < PublicCatchUpMode > , } }
+private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::RecoverContainedCreation { { recovery : Box < ContainedCreationRecovery > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::RefreshPrimary { { # [serde (rename = "catchUp" , skip_serializing_if = "Option::is_none")] catch_up : Option < PublicCatchUpMode > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::Remove { { remote : Box < RemoteReplicaSelection > , } }
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalKind::RestoreRetainedMember { { qualification : Box < RetainedMemberQualification > , } }
@@ -145,6 +220,12 @@ private-path hidden variant crate::protocol::public_operations::replica_goal::Re
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaGoalStatus::Uncertain((String))
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaPublicationStage::AchievedScope
 private-path hidden variant crate::protocol::public_operations::replica_goal::ReplicaPublicationStage::DiscoveryPending
+private-path hidden variant crate::protocol::public_operations::replica_goal::SourceHandoffReceipt::All
+private-path hidden variant crate::protocol::public_operations::replica_goal::SourceHandoffReceipt::ApplicationDemotion
+private-path hidden variant crate::protocol::public_operations::replica_goal::SourceHandoffReceipt::Epoch
+private-path hidden variant crate::protocol::public_operations::replica_goal::SourceHandoffReceipt::RefreshedConfiguration
+private-path hidden variant crate::protocol::public_operations::replica_goal::SourceHandoffReceipt::ReplicatorDemotion
+private-path hidden variant crate::protocol::public_operations::replica_goal::SourceHandoffReceipt::Revoke
 public-path documented const crate::protocol::PROTOCOL_VERSION: u32
 public-path documented enum crate::control::convert::WireError
 public-path documented enum crate::protocol::command::EffectClass
@@ -1283,6 +1364,7 @@ public-path hidden struct crate::protocol::public_operations::PublicV1SessionRen
 public-path hidden struct crate::protocol::public_operations::RemoteBuildTargetRebuildRequired
 public-path hidden struct crate::protocol::public_operations::RestartActionRecord
 public-path hidden struct crate::protocol::public_operations::ServiceLocation
+public-path hidden use crate::protocol::public_operations::native_observation :: *
 public-path hidden use crate::protocol::public_operations::replica_goal :: *
 public-path hidden variant crate::protocol::public_operations::CanonicalOperationInputDigest::V1((CanonicalOperationInputDigestV1))
 public-path hidden variant crate::protocol::public_operations::CanonicalReplicaRebuildRequired::LocalProvider { { reason : ReplicaRebuildReason , provider : ProviderReplicaIdentity , operation : CapturedPublicOperationIdentity , local_replica : ReplicaIdentity , local_storage : PvcUid , } }

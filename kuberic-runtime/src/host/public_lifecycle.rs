@@ -31,6 +31,38 @@ pub(super) mod program;
 #[path = "public_lifecycle_terminal.rs"]
 mod terminal;
 pub(crate) use program::{operation_instructions, repeatable, replayable};
+
+pub(crate) fn selected_replica_sets(
+    goal: &crate::protocol::public_operations::ReplicaGoal,
+    call: &str,
+) -> crate::Result<(
+    crate::replicator::ReplicaSetConfiguration,
+    Option<crate::replicator::ReplicaSetConfiguration>,
+)> {
+    let instruction: crate::host::state::PublicInstruction =
+        serde_json::from_value(serde_json::Value::String(call.to_owned()))
+            .map_err(|_| crate::RuntimeError::AuthorityNotAdmitted)?;
+    if !matches!(
+        instruction,
+        crate::host::state::PublicInstruction::Configuration
+            | crate::host::state::PublicInstruction::CurrentConfiguration
+            | crate::host::state::PublicInstruction::StartingConfiguration
+            | crate::host::state::PublicInstruction::RefreshedConfiguration
+    ) {
+        return Err(crate::RuntimeError::AuthorityNotAdmitted);
+    }
+    let selected = program::selected_program(&goal.intent(), instruction)
+        .ok_or(crate::RuntimeError::AuthorityNotAdmitted)?;
+    let input = program::configuration(&selected, instruction);
+    Ok((
+        program::replica_set(input, &input.current, true),
+        input
+            .previous
+            .as_ref()
+            .filter(|_| instruction != crate::host::state::PublicInstruction::CurrentConfiguration)
+            .map(|previous| program::replica_set(input, previous, false)),
+    ))
+}
 pub(crate) use terminal::recover as recover_terminal;
 
 pub(crate) fn record_instructions(record: &PublicOperationRecord) -> Vec<PublicInstruction> {
@@ -106,6 +138,8 @@ impl PublicCallbackRetryProof {
 #[derive(Clone)]
 pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) application: Arc<dyn StatefulServiceReplica>,
+    pub(crate) native: Option<Arc<super::native_history::NativeLifecycleOwner>>,
+    pub(crate) peer_address: Option<super::native_history::PeerAddress>,
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
     pub(crate) application_control_match: Option<ApplicationControlMatch>,
@@ -167,9 +201,19 @@ pub enum PublicCutPosition {
     BeforeInstruction,
     InstructionSelected,
     CallbackSuccess,
+    BuildReturned,
+    CallbackFailure,
+    FailureRecorded,
     InstructionApplied,
     CallbackApplied,
     Completed,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicBuildFailure {
+    TypedRemote,
+    UntypedPostEffect,
 }
 
 #[cfg(feature = "testing")]
@@ -178,14 +222,195 @@ pub struct PublicOperationCut {
     pub index: usize,
     pub entered: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+    expected: Option<(PublicOperationIntent, String)>,
+    build_failure: Option<PublicBuildFailure>,
+    addition_current_failure: bool,
+    disarmed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "testing")]
 impl PublicOperationCut {
+    pub fn new(position: PublicCutPosition, index: usize) -> Self {
+        Self {
+            position,
+            index,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            expected: None,
+            build_failure: None,
+            addition_current_failure: false,
+            disarmed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn for_instruction(
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+        instruction: &str,
+        position: PublicCutPosition,
+        index: usize,
+    ) -> Self {
+        let mut cut = Self::new(position, index);
+        cut.expected = Some((goal.intent(), instruction.to_owned()));
+        cut
+    }
+
+    /// Inject only a returned error, after the exact real native Build has
+    /// succeeded. Neither this seam nor its scheduling holds can mint Ready.
+    pub fn for_build_failure(
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+        failure: PublicBuildFailure,
+        position: PublicCutPosition,
+        index: usize,
+    ) -> Self {
+        let mut cut = Self::for_instruction(goal, "Build", position, index);
+        cut.build_failure = Some(failure);
+        cut
+    }
+
+    /// Return an error after the real final application callback, without
+    /// recording its success or changing any native completion/readiness.
+    pub fn for_addition_current_failure(
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+        index: usize,
+    ) -> Self {
+        let mut cut = Self::for_instruction(
+            goal,
+            "ApplicationRole",
+            PublicCutPosition::CallbackFailure,
+            index,
+        );
+        cut.addition_current_failure = true;
+        cut
+    }
+
+    pub(crate) fn addition_current_result<T>(
+        &self,
+        intent: &PublicOperationIntent,
+        index: usize,
+        result: crate::Result<T>,
+    ) -> crate::Result<T> {
+        if result.is_ok()
+            && self.addition_current_failure
+            && !self.disarmed.load(std::sync::atomic::Ordering::Acquire)
+            && self.index == index
+            && self
+                .expected
+                .as_ref()
+                .is_some_and(|(expected, name)| expected == intent && name == "ApplicationRole")
+            && intent.goal().is_some_and(|goal| {
+                super::ordinary_goal::addition::selection(goal).is_some_and(|addition| {
+                    addition.phase
+                        == crate::protocol::public_operations::MembershipAdditionPhase::Current
+                })
+            })
+        {
+            return Err(crate::RuntimeError::Application(
+                "injected owner-bound post-effect addition Current application error".into(),
+            ));
+        }
+        result
+    }
+
+    pub(crate) fn build_result(
+        &self,
+        intent: &PublicOperationIntent,
+        index: usize,
+        result: crate::Result<()>,
+    ) -> crate::Result<()> {
+        if result.is_err()
+            || self.disarmed.load(std::sync::atomic::Ordering::Acquire)
+            || self.index != index
+            || self
+                .expected
+                .as_ref()
+                .is_none_or(|(expected, name)| expected != intent || name != "Build")
+        {
+            return result;
+        }
+        let Some(failure) = self.build_failure else {
+            return result;
+        };
+        let Some(crate::protocol::public_operations::ReplicaGoal {
+            desired: crate::protocol::public_operations::ReplicaGoalKind::Build { remote },
+            ..
+        }) = intent.goal()
+        else {
+            return result;
+        };
+        match failure {
+            PublicBuildFailure::UntypedPostEffect => Err(crate::RuntimeError::Application(
+                "injected owner-bound post-effect Build error".into(),
+            )),
+            PublicBuildFailure::TypedRemote => {
+                use crate::protocol::public_operations::{
+                    RemoteBuildTargetRebuildRequired, ReplicaRebuildReason, ReplicaRebuildRequired,
+                };
+                Err(crate::RuntimeError::ReplicaRebuildRequired(Box::new(
+                    ReplicaRebuildRequired::RemoteBuildTarget(Box::new(
+                        RemoteBuildTargetRebuildRequired {
+                            reason: ReplicaRebuildReason::RemoteCopyConflict,
+                            epoch: remote.source.scope.epoch,
+                            target: remote.target.scope.storage.replica.clone(),
+                            target_session: remote.target.scope.process_session_id.clone(),
+                        },
+                    )),
+                )))
+            }
+        }
+    }
+
+    pub(crate) async fn pause_result(
+        &self,
+        position: PublicCutPosition,
+        intent: &PublicOperationIntent,
+    ) {
+        if self
+            .expected
+            .as_ref()
+            .is_some_and(|(expected, name)| expected == intent && name == "Build")
+        {
+            self.pause_matched(position, self.index).await;
+        }
+    }
+
+    /// Disarm every captured or future waiter. Scheduling release is not a
+    /// callback/root join, a terminal receipt or physical exclusion.
+    pub fn release_all(&self) {
+        self.disarmed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.release.notify_waiters();
+    }
+
     pub(crate) async fn pause(&self, position: PublicCutPosition, index: usize) {
+        if self.expected.is_none() {
+            self.pause_matched(position, index).await;
+        }
+    }
+
+    pub(crate) async fn pause_instruction(
+        &self,
+        position: PublicCutPosition,
+        index: usize,
+        intent: &PublicOperationIntent,
+        instruction: PublicInstruction,
+    ) {
+        if self.expected.as_ref().is_none_or(|(expected, name)| {
+            expected == intent && name == &format!("{instruction:?}")
+        }) {
+            self.pause_matched(position, index).await;
+        }
+    }
+
+    async fn pause_matched(&self, position: PublicCutPosition, index: usize) {
         if self.position == position && self.index == index {
+            let release = self.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            if self.disarmed.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
             self.entered.notify_one();
-            self.release.notified().await;
+            release.await;
         }
     }
 }
@@ -376,6 +601,7 @@ pub(crate) async fn launch_bound_attempt<T>(
         matches!(
             goal.desired,
             crate::protocol::public_operations::ReplicaGoalKind::Build { .. }
+                | crate::protocol::public_operations::ReplicaGoalKind::Discover
         )
     }) && matches!(
         operation.snapshot().stage,
@@ -522,7 +748,13 @@ async fn execute(
     for (index, instruction) in instructions(&input).into_iter().enumerate().skip(start) {
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
-            cut.pause(PublicCutPosition::BeforeInstruction, index).await;
+            cut.pause_instruction(
+                PublicCutPosition::BeforeInstruction,
+                index,
+                &intent,
+                instruction,
+            )
+            .await;
         }
         store
             .public_instruction(&intent, index, instruction, None)
@@ -725,7 +957,13 @@ async fn execute(
         };
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
-            cut.pause(PublicCutPosition::CallbackSuccess, index).await;
+            cut.pause_instruction(
+                PublicCutPosition::CallbackSuccess,
+                index,
+                &intent,
+                instruction,
+            )
+            .await;
         }
         if let Some(owner) = &callbacks.access_owner {
             owner.callback_succeeded(instruction);
@@ -738,8 +976,13 @@ async fn execute(
         }
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
-            cut.pause(PublicCutPosition::InstructionApplied, index)
-                .await;
+            cut.pause_instruction(
+                PublicCutPosition::InstructionApplied,
+                index,
+                &intent,
+                instruction,
+            )
+            .await;
         }
         if let PublicInstructionOutcome::DataLoss(DataLossOutcome::Error(error)) = outcome {
             return Err(HostError::CommandRejected(error));
@@ -939,6 +1182,9 @@ fn public_v1_call_kind(record: &PublicOperationRecord) -> Result<PublicV1CallKin
             crate::protocol::public_operations::ReplicaGoalKind::Discover => PublicV1CallKind::Open,
             crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
             | crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember {
+                ..
+            }
+            | crate::protocol::public_operations::ReplicaGoalKind::RecoverContainedCreation {
                 ..
             } => {
                 if record

@@ -17,6 +17,73 @@ fn retained(progress: Lsn, eos: bool) -> Rig {
     )
 }
 
+#[tokio::test]
+async fn reconstructed_primary_reads_actual_checkpoint_and_epoch_without_copy_or_data_loss() {
+    let mut rig = retained(7, true);
+    rig.owner.begin_reconstruct_primary(epoch(3)).unwrap();
+    rig.owner.run().await.unwrap();
+    assert_eq!(rig.owner.status(), RoleStatus::Ready(Role::Primary));
+    assert_eq!(rig.owner.primary().unwrap().current_progress().unwrap(), 7);
+    assert_eq!(rig.provider.progress_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *rig.provider.epochs.lock().unwrap(),
+        [EpochBarrier {
+            epoch: epoch(3),
+            previous_epoch_last_lsn: 7,
+        }]
+    );
+    assert_eq!(rig.provider.context_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.provider.copy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.provider.data_loss_calls.load(Ordering::SeqCst), 0);
+    assert!(rig.sent.lock().unwrap().is_empty());
+    assert!(rig.owner.begin_reconstruct_primary(epoch(3)).is_err());
+    rig.owner.abort().unwrap();
+    assert!(matches!(rig.owner.run().await, Err(RoleError::Aborted)));
+}
+
+#[tokio::test]
+async fn reconstructed_primary_rejects_invalid_or_failed_provider_checkpoint_without_epoch_effect()
+{
+    for progress in [Lsn::MIN, -1, Lsn::MAX - 1, Lsn::MAX] {
+        let mut rig = retained(progress, true);
+        rig.owner.begin_reconstruct_primary(epoch(3)).unwrap();
+        assert!(rig.owner.run().await.is_err());
+        assert_eq!(rig.owner.status(), RoleStatus::Faulted);
+        assert!(rig.owner.primary().is_err());
+        assert!(rig.provider.epochs.lock().unwrap().is_empty());
+    }
+    let mut rig = retained(7, true);
+    rig.provider.fail_progress.store(true, Ordering::SeqCst);
+    rig.owner.begin_reconstruct_primary(epoch(3)).unwrap();
+    assert!(rig.owner.run().await.is_err());
+    assert!(rig.owner.primary().is_err());
+    assert!(rig.provider.epochs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reconstructed_primary_holds_native_admission_until_actual_epoch_completion() {
+    let provider = Arc::new(Provider {
+        progress: 7,
+        epochs_gate: Semaphore::new(0),
+        ..Provider::new()
+    });
+    let mut rig = Rig::with_provider(true, true, provider, Some(2));
+    rig.owner.begin_reconstruct_primary(epoch(3)).unwrap();
+    assert!(rig.owner.run().now_or_never().is_none());
+    assert!(rig.owner.primary().is_err());
+    assert_eq!(rig.provider.progress_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.provider.epochs.lock().unwrap().len(), 1);
+    assert!(matches!(
+        rig.owner.begin_reconstruct_primary(epoch(3)),
+        Err(RoleError::Busy)
+    ));
+    rig.provider.epochs_gate.add_permits(1);
+    rig.owner.run().await.unwrap();
+    assert_eq!(rig.owner.primary().unwrap().current_progress().unwrap(), 7);
+    rig.owner.abort().unwrap();
+    assert!(matches!(rig.owner.run().await, Err(RoleError::Aborted)));
+}
+
 async fn restore(rig: &mut Rig) -> SecondaryHandle {
     rig.owner
         .begin_restore_retained_secondary(epoch(1))

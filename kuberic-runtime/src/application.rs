@@ -44,6 +44,10 @@ impl OpenContext {
     pub fn restoring_retained_member(&self) -> bool {
         self.mode == OpenMode::Existing && self.partition.restoring_retained_member()
     }
+
+    pub fn reconstructing_contained_creation(&self) -> bool {
+        self.mode == OpenMode::Existing && self.partition.reconstructing_contained_creation()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

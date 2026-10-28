@@ -55,6 +55,34 @@ impl<S: AgentStore + 'static> AgentService<S> {
         snapshot.read_status = read;
         snapshot.write_status = write;
         snapshot.provider_writer_held = self.runtime.provider_writer_lease_count() != 0;
+        if !snapshot.withdrawn {
+            // Only observations for this exact live creation are current. Old
+            // journal history remains stored, but cannot recreate a warm owner.
+            if let Some(scope) = snapshot
+                .goals
+                .iter()
+                .filter(|observation| {
+                    observation.goal.scope.process_session_id == snapshot.process_session_id
+                        && observation.goal.scope.creation_id == snapshot.creation_id
+                })
+                .max_by_key(|observation| observation.goal.revision)
+                .map(|observation| &observation.goal.scope)
+            {
+                snapshot.native_status = crate::host::native_history::status_for(&state, scope)
+                    .filter(|status| self.runtime.native_status_is_live(status));
+                let prefix = self
+                    .runtime
+                    .native_configuration_prefix(&state, scope)
+                    .filter(|facts| self.runtime.native_facts_are_live(facts));
+                if let Some(facts) = &prefix {
+                    snapshot.native_status =
+                        crate::host::native_history::configuration_status(&state, facts);
+                }
+                snapshot.native_lifecycle = prefix
+                    .or_else(|| crate::host::native_history::lifecycle_for(&state, scope))
+                    .filter(|facts| self.runtime.native_facts_are_live(facts));
+            }
+        }
         for remote in &mut snapshot.remote_operations {
             if remote.state == RemoteReplicaState::Ready
                 && self.validate_remote_peer(&remote.selection).await.is_err()
@@ -75,6 +103,16 @@ impl<S: AgentStore + 'static> AgentService<S> {
         &self,
     ) -> std::result::Result<ReplicaAgentSnapshot, Status> {
         let snapshot = self.ordinary_snapshot().await?;
+        if self.runtime.has_native_lifecycle() {
+            let mut snapshot = snapshot;
+            if let Some(status) = &snapshot.native_status {
+                snapshot.progress = status.progress.clone();
+                snapshot.capability = status.capability.clone();
+            }
+            // Native epoch/status is an explicitly selected Discover program.
+            // Sampling metadata must never hide an unjournaled epoch effect.
+            return Ok(snapshot);
+        }
         let Some(publication) = snapshot.publication.as_ref().filter(|publication| {
             publication.stage == ReplicaPublicationStage::AchievedScope
                 && matches!(
@@ -140,7 +178,116 @@ impl<S: AgentStore + 'static> AgentService<S> {
     async fn validate_goal_target(&self, goal: &ReplicaGoal) -> std::result::Result<(), Status> {
         self.validate_goal_creation(goal)?;
         let state = self.store.load_state().await.map_err(status_from_agent)?;
-        crate::host::ordinary_goal::validate_admission(&state, goal).map_err(status_from_agent)
+        crate::host::ordinary_goal::validate_admission(&state, goal).map_err(status_from_agent)?;
+        crate::host::ordinary_goal::validate_live_normal_current(&state, goal, |facts| {
+            self.runtime.native_facts_are_live(facts)
+        })
+        .map_err(status_from_agent)?;
+        if crate::host::ordinary_goal::normal_current_owner(&state, goal).is_some() {
+            let callbacks = self
+                .runtime
+                .public_lifecycle_callbacks()
+                .map_err(status_from_runtime)?;
+            crate::host::native_history::validate_normal_current_source(&state, goal, &callbacks)
+                .await
+                .map_err(status_from_agent)?;
+        }
+        if let ReplicaGoalKind::Prepare {
+            rebuild: Some(rebuild),
+            ..
+        } = &goal.desired
+        {
+            let source = &rebuild.source;
+            let address = self
+                .runtime
+                .peer_control_endpoint(&source.scope.storage.replica)
+                .map_err(status_from_runtime)?;
+            let snapshot = crate::control::resolve_native_snapshot(
+                &address,
+                &self.bearer_token,
+                &source.scope.history,
+                &source.scope.storage.replica,
+            )
+            .await
+            .map_err(status_from_runtime)?;
+            if snapshot.withdrawn
+                || snapshot.publication.as_ref() != Some(source)
+                || snapshot.native_lifecycle.as_ref().is_none_or(|facts| {
+                    facts.scope != source.scope
+                        || facts.state != NativeReplicaState::Ready
+                        || facts.native_role != ReplicaRole::Primary
+                        || facts.application_role != Some(ReplicaRole::Primary)
+                        || facts.applied_primary_fence != Some(source.scope.epoch)
+                })
+            {
+                return Err(Status::failed_precondition(
+                    "rebuild source is not actual configured Ready Primary",
+                ));
+            }
+        }
+        if let Some(addition) = crate::host::ordinary_goal::addition::selection(goal)
+            .filter(|addition| addition.phase == MembershipAdditionPhase::Bootstrap)
+        {
+            for settlement in &crate::host::ordinary_goal::addition::recovery(goal)
+                .unwrap()
+                .receiver_settlements
+            {
+                let address = self
+                    .runtime
+                    .peer_control_endpoint(&settlement.terminal_goal.scope.storage.replica)
+                    .map_err(status_from_runtime)?;
+                let receiver = crate::control::resolve_receiver_settlement(
+                    &address,
+                    &self.bearer_token,
+                    settlement,
+                )
+                .await
+                .map_err(status_from_runtime)?;
+                if !crate::host::ordinary_goal::reconstruction::receiver_settled(
+                    settlement, &receiver,
+                ) || receiver.storage != addition.receiver.storage_incarnation
+                    || receiver.process_session_id != addition.receiver.process_session_id
+                    || receiver.creation_id != addition.receiver.replicator_creation_id
+                {
+                    return Err(Status::failed_precondition(
+                        "addition selection lacks exact settled new receiver",
+                    ));
+                }
+            }
+        }
+        if let Some(addition) = crate::host::ordinary_goal::addition::selection(goal)
+            .filter(|addition| addition.phase == MembershipAdditionPhase::Receiver)
+        {
+            let source = &addition.source;
+            let address = self
+                .runtime
+                .peer_control_endpoint(&source.identity)
+                .map_err(status_from_runtime)?;
+            let observed = crate::control::resolve_replica_publication(
+                &address,
+                &self.bearer_token,
+                &ReplicaDiscoveryQuery {
+                    format: ORDINARY_ACTION_FORMAT,
+                    history: goal.scope.history.clone(),
+                    replica: source.identity.clone(),
+                    process_session_id: Some(source.process_session_id.clone()),
+                },
+            )
+            .await
+            .map_err(status_from_runtime)?;
+            if !observed.is_some_and(|publication| {
+                publication.stage == ReplicaPublicationStage::AchievedScope
+                    && publication.role == ReplicaRole::Primary
+                    && publication.scope.storage == source.storage_incarnation
+                    && publication.scope.creation_id == source.replicator_creation_id
+                    && publication.scope.configuration == goal.scope.configuration
+            }) {
+                return Err(Status::failed_precondition(
+                    "addition receiver requires actual exact achieved P0 source",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn submit_ordinary_goal(
@@ -149,6 +296,12 @@ impl<S: AgentStore + 'static> AgentService<S> {
     ) -> std::result::Result<proto::ReplicaSnapshotResponse, Status> {
         version(request.protocol_version)?;
         let goal: ReplicaGoal = decode(&request.canonical_json)?;
+        if std::env::var_os("KUBERIC_M3_NATIVE_SCOPE_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "ordinary actual submitted goal: {}",
+                serde_json::to_string(&goal).unwrap()
+            );
+        }
         self.validate_goal_target(&goal).await?;
         let registry = self
             .registry
@@ -214,6 +367,7 @@ impl<S: AgentStore + 'static> AgentService<S> {
             ReplicaGoalKind::Discover
                 | ReplicaGoalKind::Prepare { .. }
                 | ReplicaGoalKind::RestoreRetainedMember { .. }
+                | ReplicaGoalKind::RecoverContainedCreation { .. }
         ) {
             let state = self.store.load_state().await.map_err(status_from_agent)?;
             let mut context = self
@@ -227,6 +381,16 @@ impl<S: AgentStore + 'static> AgentService<S> {
                     ));
                 }
                 context.partition = context.partition.with_retained_member_instructions();
+            }
+            if crate::host::ordinary_goal::reconstruction::claim(&goal).is_some() {
+                if context.mode != crate::application::OpenMode::Existing {
+                    return Err(Status::failed_precondition(
+                        "contained reconstruction cannot initialize storage",
+                    ));
+                }
+                context.partition = context
+                    .partition
+                    .with_contained_reconstruction_instructions();
             }
             callbacks.open_context = Some(context);
         }
@@ -289,6 +453,7 @@ impl<S: AgentStore + 'static> AgentService<S> {
         &self,
         remote: &RemoteReplicaSelection,
     ) -> std::result::Result<(), Status> {
+        remote.validate().map_err(Status::invalid_argument)?;
         if self
             .runtime
             .peer_control_endpoint(&remote.target.scope.storage.replica)
@@ -312,10 +477,30 @@ impl<S: AgentStore + 'static> AgentService<S> {
         )
         .await
         .map_err(status_from_runtime)?;
-        if publication.as_ref() != Some(&remote.target) {
+        if publication.as_ref() != Some(&remote.target) && remote.original_member.is_none() {
             return Err(Status::failed_precondition(
                 "remote target publication changed",
             ));
+        }
+        if remote.original_member.is_some() {
+            let snapshot = crate::control::resolve_native_snapshot(
+                &remote.target_control_address,
+                &self.bearer_token,
+                &remote.target.scope.history,
+                &remote.target.scope.storage.replica,
+            )
+            .await
+            .map_err(status_from_runtime)?;
+            let state = self.store.load_state().await.map_err(status_from_agent)?;
+            if !crate::host::original_member::target_admitted(
+                remote,
+                &snapshot,
+                crate::host::original_member::accepted_build(&state, remote),
+            ) {
+                return Err(Status::failed_precondition(
+                    "original-member target lost exact actual Idle preparation",
+                ));
+            }
         }
         Ok(())
     }
@@ -361,6 +546,53 @@ impl<S: AgentStore + 'static> AgentService<S> {
             .acknowledge_ordinary_goal(&acknowledgement)
             .await
             .map_err(status_from_agent)?;
+        if crate::host::ordinary_goal::addition::selection(&acknowledgement.goal)
+            .is_some_and(|addition| addition.phase == MembershipAdditionPhase::Current)
+        {
+            self.runtime
+                .accept_addition_access(self.store.as_ref(), &acknowledgement.goal)
+                .await
+                .map_err(status_from_agent)?;
+        }
+        let state = self.store.load_state().await.map_err(status_from_agent)?;
+        let goal = &acknowledgement.goal;
+        if crate::host::original_member::successful_final(&state, goal) {
+            let mut settled = true;
+            for member in goal
+                .scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .filter(|member| member.identity != goal.scope.storage.replica)
+            {
+                let address = self
+                    .runtime
+                    .peer_control_endpoint(&member.identity)
+                    .map_err(status_from_runtime)?;
+                let peer = crate::control::resolve_native_snapshot(
+                    &address,
+                    &self.bearer_token,
+                    &goal.scope.history,
+                    &member.identity,
+                )
+                .await
+                .map_err(status_from_runtime)?;
+                settled &= crate::host::original_member::final_peer(goal, &peer);
+            }
+            if settled {
+                self.store
+                    .finish_original_member_rebuild(goal)
+                    .await
+                    .map_err(status_from_agent)?;
+                if goal.role() == Some(ReplicaRole::Primary) {
+                    self.runtime
+                        .accept_addition_access(self.store.as_ref(), goal)
+                        .await
+                        .map_err(status_from_agent)?;
+                }
+            }
+        }
         self.ordinary_snapshot_response().await
     }
 

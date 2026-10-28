@@ -181,3 +181,123 @@ fn m3_cold_replacement_reservation_has_no_invented_completed_predecessor_or_read
     competing.target.scope.creation_id = ReplicatorCreationId::new("another-creation");
     assert!(sessions.proposal(competing).is_err());
 }
+
+fn live_target_fixture() -> (Binding, Binding) {
+    let seed = fixture();
+    let old = seed.replacement().unwrap();
+    let mut source = seed.source.clone();
+    let mut target = seed.target.clone();
+    target.scope.storage = old.storage_incarnation.clone();
+    target.scope.process_session_id = old.process_session_id.clone();
+    target.scope.creation_id = ReplicatorCreationId::new("original-target-creation");
+    target.replication_address = old.replication_address.clone();
+    target.role = ReplicaRole::ActiveSecondary;
+    target.scope.configuration.replicas = vec![description(&source, ReplicaRole::Primary)];
+    source.scope.configuration.replicas = vec![description(&target, ReplicaRole::ActiveSecondary)];
+    let predecessor = Binding::new(source.clone(), target.clone()).unwrap();
+    let previous = source.scope.configuration.current.clone();
+    let mut current = previous.clone();
+    current.epoch.configuration_number += 1;
+    current.configuration_id = current.expected_id();
+    for publication in [&mut source, &mut target] {
+        publication.scope.epoch = current.epoch;
+        publication.scope.configuration.current = current.clone();
+        publication.scope.configuration.previous = Some(previous.clone());
+    }
+    target.scope.process_session_id = ProcessSessionId::new("reconstructed-process");
+    target.scope.creation_id = ReplicatorCreationId::new("reconstructed-creation");
+    target.replication_address = "http://reconstructed:1".into();
+    source.scope.configuration.replicas = vec![description(&target, ReplicaRole::ActiveSecondary)];
+    target.scope.configuration.replicas = vec![description(&source, ReplicaRole::Primary)];
+    let mut next = Binding::new(source, target).unwrap();
+    next.reformation = true;
+    next.live_target = Some(LiveTarget {
+        predecessor: predecessor.nonce.clone(),
+        previous,
+        source: predecessor.primary(),
+        target: predecessor.secondary(),
+    });
+    next.validate().unwrap();
+    (predecessor, next)
+}
+
+#[test]
+fn live_target_relation_is_not_continuation_idle_credit_or_a_competing_proposal() {
+    let (old, next) = live_target_fixture();
+    let sessions = Sessions::default();
+    sessions.propose(&old).unwrap();
+    sessions.activate_source(&old).unwrap();
+    sessions.complete(&old).unwrap();
+    assert!(sessions.proposal(next.clone()).is_err());
+    let reserved = sessions.live_target_proposal(next.clone()).unwrap();
+    assert_eq!(sessions.binding_for(2), Some(old.clone()));
+    assert!(sessions.live_target_joined(&reserved).is_err());
+    assert!(sessions.active(&reserved).is_err());
+    let mut retry = next.clone();
+    retry.nonce = uuid::Uuid::new_v4().to_string();
+    assert_eq!(sessions.live_target_proposal(retry).unwrap(), reserved);
+    let mut competitor = next.clone();
+    competitor.nonce = uuid::Uuid::new_v4().to_string();
+    competitor.target.scope.creation_id = ReplicatorCreationId::new("competing-creation");
+    assert!(sessions.live_target_proposal(competitor).is_err());
+    sessions.retire(&old).unwrap();
+    sessions.live_target_joined(&reserved).unwrap();
+    assert_eq!(sessions.binding_for(2), Some(reserved.clone()));
+    assert!(sessions.active(&old).is_err());
+    assert!(sessions.active(&reserved).is_err());
+    assert!(!sessions.completed(&reserved));
+    let mut continued = next;
+    continued.live_target = None;
+    continued.reformation = false;
+    continued.continuation = Some(old.nonce);
+    assert!(sessions.continuation_predecessor(&continued).is_err());
+}
+
+#[test]
+fn live_target_relation_rejects_source_storage_history_epoch_and_original_quorum_changes() {
+    let (_, binding) = live_target_fixture();
+    assert_eq!(
+        serde_json::from_slice::<Binding>(&serde_json::to_vec(&binding).unwrap()).unwrap(),
+        binding
+    );
+    for fault in 0..9 {
+        let mut crossed = binding.clone();
+        match fault {
+            0 => {
+                crossed.source.scope.creation_id =
+                    ReplicatorCreationId::new("different-source-creation")
+            }
+            1 => {
+                crossed.source.scope.process_session_id =
+                    ProcessSessionId::new("different-source-process")
+            }
+            2 => {
+                crossed.target.scope.storage.storage_generation =
+                    StorageGeneration::new("different-storage")
+            }
+            3 => crossed.target.scope.history.history_id = HistoryId::new("different-history"),
+            4 => crossed.live_target.as_mut().unwrap().previous.write_quorum = 1,
+            5 => {
+                crossed.target.scope.process_session_id = crossed
+                    .live_target
+                    .as_ref()
+                    .unwrap()
+                    .target
+                    .process_session_id
+                    .clone()
+            }
+            6 => {
+                crossed.target.scope.creation_id = crossed
+                    .live_target
+                    .as_ref()
+                    .unwrap()
+                    .target
+                    .creation_id
+                    .clone()
+            }
+            7 => crossed.source.scope.configuration.previous = None,
+            _ => crossed.live_target.as_mut().unwrap().previous.epoch = binding.epoch(),
+        }
+        assert!(crossed.validate().is_err(), "fault {fault}");
+    }
+}

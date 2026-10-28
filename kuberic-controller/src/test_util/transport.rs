@@ -275,12 +275,28 @@ impl Drop for Isolation {
     }
 }
 
+/// Holds the existing receiver BeforeDispatch observation, without faulting its socket.
+pub struct NativeIngressHold(watch::Sender<bool>);
+
+impl NativeIngressHold {
+    pub fn release(self) {
+        self.0.send_replace(true);
+    }
+}
+
+impl Drop for NativeIngressHold {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
 #[derive(Default)]
 struct State {
     owners: BTreeMap<String, String>,
     isolated: BTreeSet<String>,
     proxies: BTreeMap<(String, String), Proxy>,
     native_routes: BTreeMap<String, u64>,
+    ingress_holds: BTreeMap<String, watch::Sender<bool>>,
     closed: bool,
     next_owner: u64,
     fault: Option<Fault>,
@@ -516,14 +532,16 @@ impl Network {
         destination: &str,
         endpoint: &str,
     ) -> Result<String> {
-        *self
-            .0
-            .state
-            .lock()
-            .await
-            .native_routes
-            .entry(format!("{kind:?}"))
-            .or_default() += 1;
+        let hold = {
+            let mut state = self.0.state.lock().await;
+            *state.native_routes.entry(format!("{kind:?}")).or_default() += 1;
+            (kind == TestingTcpRouteKind::BeforeDispatch)
+                .then(|| state.ingress_holds.get(source).map(|hold| hold.subscribe()))
+                .flatten()
+        };
+        if let Some(mut hold) = hold {
+            hold.wait_for(|released| *released).await?;
+        }
         // These engine cuts observe local work; unlike the control/data kinds,
         // their endpoint is local and their return value is not a socket dial.
         if matches!(
@@ -540,6 +558,12 @@ impl Network {
                 | TestingTcpRouteKind::ConfigurationValidated
                 | TestingTcpRouteKind::ConfigurationAdmitted
                 | TestingTcpRouteKind::RemoveAdmitted
+                | TestingTcpRouteKind::TargetActivated
+                | TestingTcpRouteKind::ReceiverReplaced
+                | TestingTcpRouteKind::PeerCreating
+                | TestingTcpRouteKind::PeerInstalled
+                | TestingTcpRouteKind::ReserveResponse
+                | TestingTcpRouteKind::ContinuationChecked
         ) {
             return Ok(endpoint.to_owned());
         }
@@ -549,6 +573,22 @@ impl Network {
 
     pub async fn native_route_counts(&self) -> BTreeMap<String, u64> {
         self.0.state.lock().await.native_routes.clone()
+    }
+
+    pub async fn hold_native_ingress(&self, instance: &str) -> Result<NativeIngressHold> {
+        let mut state = self.0.state.lock().await;
+        ensure!(
+            state
+                .ingress_holds
+                .get(instance)
+                .is_none_or(|hold| *hold.borrow()),
+            "native ingress already held"
+        );
+        let hold = watch::channel(false).0;
+        state
+            .ingress_holds
+            .insert(instance.to_owned(), hold.clone());
+        Ok(NativeIngressHold(hold))
     }
 
     async fn route_inner(
@@ -677,6 +717,10 @@ impl Network {
     pub async fn finish(&self) -> Result<()> {
         let mut state = self.0.state.lock().await;
         state.closed = true;
+        for hold in state.ingress_holds.values() {
+            hold.send_replace(true);
+        }
+        state.ingress_holds.clear();
         state.isolated.clear();
         let mut errors = Vec::new();
         for proxy in state.proxies.values_mut() {
@@ -721,6 +765,45 @@ impl Network {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn native_ingress_hold_is_scoped_observation_not_socket_fault_or_ack() -> Result<()> {
+        let network = Network::default();
+        let hold = network.hold_native_ingress("receiver").await?;
+        assert!(network.hold_native_ingress("receiver").await.is_err());
+        let endpoint = "http://127.0.0.1:23456";
+        let mut pending = tokio::spawn({
+            let network = network.clone();
+            async move {
+                network
+                    .route_data(
+                        TestingTcpRouteKind::BeforeDispatch,
+                        "receiver",
+                        "source",
+                        endpoint,
+                    )
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut pending)
+                .await
+                .is_err()
+        );
+        for (kind, source) in [
+            (TestingTcpRouteKind::BeforeDispatch, "other-receiver"),
+            (TestingTcpRouteKind::ConfirmReceived, "receiver"),
+        ] {
+            assert_eq!(
+                network.route_data(kind, source, "source", endpoint).await?,
+                endpoint
+            );
+        }
+        assert!(network.0.state.lock().await.isolated.is_empty());
+        hold.release();
+        assert_eq!(pending.await??, endpoint);
+        network.finish().await
+    }
 
     #[tokio::test]
     async fn m2_ordinary_local_engine_cuts_do_not_reassign_socket_endpoint_ownership() -> Result<()>

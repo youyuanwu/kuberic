@@ -589,6 +589,12 @@ fn route_kind(value: &Value) -> Result<TestingTcpRouteKind> {
         "ConfigurationValidated" => ConfigurationValidated,
         "ConfigurationAdmitted" => ConfigurationAdmitted,
         "RemoveAdmitted" => RemoveAdmitted,
+        "TargetActivated" => TargetActivated,
+        "ReceiverReplaced" => ReceiverReplaced,
+        "PeerCreating" => PeerCreating,
+        "PeerInstalled" => PeerInstalled,
+        "ReserveResponse" => ReserveResponse,
+        "ContinuationChecked" => ContinuationChecked,
         _ => bail!("unsupported native route kind"),
     })
 }
@@ -708,6 +714,7 @@ unsafe extern "C" {
 }
 
 pub(super) fn member_main<F: ApplicationFactory>(factory: F) -> Result<()> {
+    crate::test_util::native_trace();
     #[cfg(not(target_os = "linux"))]
     bail!("test member parent-death containment requires Linux");
     #[cfg(target_os = "linux")]
@@ -771,11 +778,19 @@ async fn run_member<F: ApplicationFactory>(factory: F, bootstrap: Bootstrap) -> 
         move |kind, destination, endpoint| {
             let generation = route_generation.clone();
             Box::pin(async move {
-                let value = call(router, Request {
+                let request = Request {
                     generation,
                     operation: "route".into(),
                     payload: json!({"kind":format!("{kind:?}"),"destination":destination,"endpoint":endpoint}),
-                }).await.map_err(std::io::Error::other)?;
+                };
+                let value = if kind == TestingTcpRouteKind::BeforeDispatch {
+                    // This is a local scheduling observation, not a control
+                    // request. Its native owner and scenario retain the wait.
+                    call_data(router, request).await
+                } else {
+                    call(router, request).await
+                }
+                .map_err(std::io::Error::other)?;
                 value
                     .as_str()
                     .map(str::to_owned)
@@ -1059,6 +1074,22 @@ async fn serve_member_lifecycle(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn physical_router_preserves_actual_private_effect_observation_kinds() -> Result<()> {
+        for kind in [
+            TestingTcpRouteKind::TargetActivated,
+            TestingTcpRouteKind::ReceiverReplaced,
+            TestingTcpRouteKind::PeerCreating,
+            TestingTcpRouteKind::PeerInstalled,
+            TestingTcpRouteKind::ReserveResponse,
+            TestingTcpRouteKind::ContinuationChecked,
+        ] {
+            assert_eq!(route_kind(&json!(format!("{kind:?}")))?, kind);
+        }
+        assert!(route_kind(&json!("invented-native-control")).is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn native_data_observer_keeps_its_caller_budget_beyond_control_rpc_timeout() -> Result<()>

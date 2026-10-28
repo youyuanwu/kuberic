@@ -380,9 +380,35 @@ impl SecondaryHandle {
         }
     }
 
-    #[cfg(all(test, feature = "testing"))]
     pub(super) fn same_instance(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(super) fn check_demotion_root(&self, epoch: Epoch) -> Result<(), SecondaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::admit(&state)?;
+        let replication = root.replication.lock().unwrap();
+        let progress = replication
+            .queue()
+            .ok_or(SecondaryError::NotReady)?
+            .progress();
+        if state.fault.is_some()
+            || state.copy.is_copy_in_progress()
+            || state.context_acquiring
+            || state.context_requested
+            || (state.context_active && !matches!(state.context_result, Some(Ok(()))))
+            || state.external_epoch
+            || state.pending_epoch.is_some()
+            || state.running_epoch.is_some()
+            || state.retained_bound.is_some()
+            || replication.minimum_sending_epoch() != Some(epoch)
+            || progress.tail != progress.commit_head
+            || progress.commit_head != progress.complete_head
+        {
+            return Err(SecondaryError::EpochPending);
+        }
+        Ok(())
     }
 
     pub(super) fn transport_identity(&self) -> Result<(uuid::Uuid, u64), SecondaryError> {
@@ -523,6 +549,7 @@ impl SecondaryHandle {
         };
         let state = root.state.lock().unwrap();
         let replication = root.replication.lock().unwrap();
+        let reply = root.reply_route.get().unwrap().lock().unwrap().clone();
         let queue = |queue: Option<&super::operation_queue::OperationQueue>| {
             queue.map(|queue| {
                 let progress = queue.progress();
@@ -537,6 +564,11 @@ impl SecondaryHandle {
             })
         };
         serde_json::json!({
+            "owner": Arc::as_ptr(&root) as usize,
+            "transportOwner": root.transport_owner.to_string(),
+            "primaryRoute": format!("{:?}", root.establishment.get().unwrap().primary_route()),
+            "replySource": reply.source.replica,
+            "replyDestination": reply.destination.replica,
             "phase": format!("{:?}", state.phase),
             "fault": state.fault.as_ref().map(ToString::to_string),
             "replication": queue(replication.queue()),

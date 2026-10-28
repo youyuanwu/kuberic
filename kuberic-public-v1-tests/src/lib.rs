@@ -24,8 +24,7 @@ use kuberic_runtime::PrimaryReplicator;
 use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange};
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
-    StatefulServicePartition,
+    Replicator, ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
 
@@ -689,7 +688,7 @@ impl StatefulServiceReplica for ExternalService {
         *self.partition.lock().unwrap() = Some(context.partition.clone());
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
+            .with_builtin_replicator()
             .create_replicator(
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {

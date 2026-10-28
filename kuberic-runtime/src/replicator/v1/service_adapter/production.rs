@@ -17,8 +17,8 @@ use crate::protocol::public_operations::StatePersistence;
 use crate::protocol::types::{Epoch, ReplicaId, ReplicaRole};
 use crate::replicator::stream::{OperationKind, OperationStream, ReceivedOperation};
 use crate::replicator::{
-    CheckedRetainedMember, PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration,
-    ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities,
+    CheckedCreationReconstruction, CheckedRetainedMember, PrimaryReplicator, ReplicaInformation,
+    ReplicaSetConfiguration, ReplicaSetQuorumMode, Replication, Replicator, ReplicatorCapabilities,
     ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorSettings, StateReplicator,
 };
 use crate::{Result, RuntimeError};
@@ -109,8 +109,15 @@ async fn compose(
     transport: Arc<Transport>,
 ) -> Result<ReplicatorInterfaces> {
     let retained = context.retained_member_restore().await?;
+    let reconstruction = context.creation_reconstruction().await?;
+    if retained.is_some() && reconstruction.is_some() {
+        return Err(RuntimeError::AuthorityNotAdmitted);
+    }
     if let Some(selected) = &retained {
         validate_retained_selection(selected, &transport)?;
+    }
+    if let Some(selected) = &reconstruction {
+        validate_reconstruction_selection(selected, &transport)?;
     }
     let provider: Arc<dyn StateProvider> = Arc::new(SessionProvider {
         provider,
@@ -240,12 +247,14 @@ async fn compose(
         settings_address: local.address.clone(),
         close: Mutex::new(None),
         builds: Mutex::new(BTreeMap::new()),
+        configurations: Mutex::new(Vec::new()),
         recovery_tasks: tokio_util::task::TaskTracker::new(),
         recover_on_epoch: std::sync::atomic::AtomicBool::new(false),
         role_transition_pending: std::sync::atomic::AtomicBool::new(false),
         role_changing: Arc::new(AtomicBool::new(false)),
         quorum_observation: Mutex::new(0),
         retained,
+        reconstruction,
         retained_initialized: Arc::new(AtomicBool::new(false)),
         retained_achieved: Mutex::new(None),
         #[cfg(feature = "testing")]
@@ -267,6 +276,14 @@ async fn compose(
 type CloseResult = std::result::Result<(), String>;
 type PeerBindings = BTreeMap<ReplicaId, Vec<PeerBinding>>;
 
+struct ConfigurationWork {
+    publication: crate::protocol::public_operations::ReplicaPublication,
+    current: ReplicaSetConfiguration,
+    previous: Option<ReplicaSetConfiguration>,
+    current_only: bool,
+    result: watch::Receiver<Option<CloseResult>>,
+}
+
 fn validate_retained_selection(
     selected: &CheckedRetainedMember,
     transport: &Transport,
@@ -284,6 +301,29 @@ fn validate_retained_selection(
         || !configuration.current.members.iter().any(|member| {
             member.identity == local.identity && member.role == ReplicaRole::ActiveSecondary
         })
+    {
+        return Err(RuntimeError::AuthorityNotAdmitted);
+    }
+    Ok(())
+}
+
+fn validate_reconstruction_selection(
+    selected: &CheckedCreationReconstruction,
+    transport: &Transport,
+) -> Result<()> {
+    let scope = selected.scope();
+    let local = transport.local();
+    if scope.history != *transport.history()
+        || scope.storage != local.storage
+        || scope.process_session_id != local.process_session_id
+        || scope.creation_id != local.creation_id
+        || scope.configuration.current.epoch != scope.epoch
+        || !scope
+            .configuration
+            .current
+            .members
+            .iter()
+            .any(|member| member.identity == local.identity && member.role == selected.role())
     {
         return Err(RuntimeError::AuthorityNotAdmitted);
     }
@@ -526,12 +566,14 @@ pub(super) struct Production {
     settings_address: String,
     close: Mutex<Option<watch::Receiver<Option<CloseResult>>>>,
     builds: Mutex<BTreeMap<String, watch::Receiver<Option<CloseResult>>>>,
+    configurations: Mutex<Vec<ConfigurationWork>>,
     recovery_tasks: tokio_util::task::TaskTracker,
     recover_on_epoch: std::sync::atomic::AtomicBool,
     role_transition_pending: std::sync::atomic::AtomicBool,
     role_changing: Arc<AtomicBool>,
     quorum_observation: Mutex<u64>,
     retained: Option<CheckedRetainedMember>,
+    reconstruction: Option<CheckedCreationReconstruction>,
     retained_initialized: Arc<AtomicBool>,
     retained_achieved: Mutex<Option<crate::protocol::public_operations::ReplicaPublication>>,
     #[cfg(feature = "testing")]
@@ -539,8 +581,22 @@ pub(super) struct Production {
 }
 
 impl Production {
+    fn retained_secondary_scope(
+        &self,
+    ) -> Option<&crate::protocol::public_operations::ReplicaScope> {
+        self.retained
+            .as_ref()
+            .map(CheckedRetainedMember::scope)
+            .or_else(|| {
+                self.reconstruction
+                    .as_ref()
+                    .filter(|selected| selected.role() == ReplicaRole::ActiveSecondary)
+                    .map(CheckedCreationReconstruction::scope)
+            })
+    }
+
     async fn observe_retained_publication(&self) -> Result<()> {
-        let Some(selected) = &self.retained else {
+        let Some(scope) = self.retained_secondary_scope() else {
             return Ok(());
         };
         if !self.retained_initialized.load(Ordering::Acquire)
@@ -549,12 +605,12 @@ impl Production {
             return Ok(());
         }
         let publication = self.transport.publication().await?;
-        if publication.scope == *selected.scope()
+        if publication.scope == *scope
             && publication.stage
                 == crate::protocol::public_operations::ReplicaPublicationStage::AchievedScope
             && publication.role == ReplicaRole::ActiveSecondary
             && self.transport.selected_lifecycle()
-                == Some((selected.epoch(), ReplicaRole::ActiveSecondary))
+                == Some((scope.epoch, ReplicaRole::ActiveSecondary))
         {
             *self.retained_achieved.lock().unwrap() = Some(publication);
         }
@@ -562,7 +618,7 @@ impl Production {
     }
 
     pub(super) fn requires_retained_reformation(&self) -> bool {
-        self.retained.is_some()
+        self.retained_secondary_scope().is_some()
             && (!self.retained_initialized.load(Ordering::Acquire)
                 || self
                     .facade
@@ -574,105 +630,10 @@ impl Production {
                     .is_some_and(|receiver| !receiver.bound.load(Ordering::Acquire)))
     }
 
-    pub(super) fn retained_receiver_for_reformation(
-        &self,
-        binding: &Binding,
-    ) -> Result<SecondaryHandle> {
-        binding.validate()?;
-        let selected = self
-            .retained
-            .as_ref()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        let historical = &selected.qualification().configuration;
-        let current = &binding.target.scope.configuration.current;
-        if !self.retained_initialized.load(Ordering::Acquire)
-            || self.retained_achieved.lock().unwrap().as_ref().is_none_or(|publication| {
-                publication.scope != *selected.scope()
-                    || publication.stage != crate::protocol::public_operations::ReplicaPublicationStage::AchievedScope
-                    || publication.role != ReplicaRole::ActiveSecondary
-            })
-            || !binding.reformation
-            || binding.secondary() != *self.transport.local()
-            || binding.target.scope.storage != selected.scope().storage
-            || binding.target.scope.process_session_id != selected.scope().process_session_id
-            || binding.target.scope.creation_id != selected.scope().creation_id
-            || binding.history() != selected.history()
-            || binding.epoch().data_loss_number != selected.epoch().data_loss_number
-            || binding.epoch().configuration_number <= selected.epoch().configuration_number
-            || self.transport.selected_lifecycle() != Some((binding.epoch(), ReplicaRole::ActiveSecondary))
-            || current.write_quorum != historical.write_quorum
-            || !current.members.iter().any(|member| {
-                member.identity == self.transport.local().identity
-                    && member.role == ReplicaRole::ActiveSecondary
-            })
-            || current.members.iter().any(|member| !historical.members.iter()
-                .any(|old| old.identity == member.identity))
-            || binding.target.scope.configuration.previous.as_ref().is_some_and(|previous| previous != historical)
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        let service = self.facade.service();
-        let receiver = service
-            .retained_receiver
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        if !matches!(service.target().map_err(error)?, Target::Secondary(_))
-            || receiver.bound.load(Ordering::Acquire)
-            || !matches!(
-                receiver.secondary.transport_identity(),
-                Err(SecondaryError::RetainedTransport)
-            )
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        let progress = receiver
-            .secondary
-            .current_progress()
-            .map_err(|failure| error(failure.into()))?;
-        let capability = receiver
-            .secondary
-            .catchup_capability()
-            .map_err(|failure| error(failure.into()))?;
-        if !binding
-            .source
-            .scope
-            .configuration
-            .replicas
-            .iter()
-            .any(|peer| {
-                peer.identity == binding.secondary().identity
-                    && peer.storage_incarnation == binding.secondary().storage
-                    && peer.process_session_id == binding.secondary().process_session_id
-                    && peer.replication_address == binding.secondary().address
-                    && peer.role == ReplicaRole::ActiveSecondary
-                    && peer.is_up
-                    && peer.is_ready
-                    && peer.current_progress == progress
-                    && peer.catch_up_capability == capability
-            })
-        {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
-        Ok(receiver.secondary.clone())
-    }
-
-    pub(super) fn bind_retained_receiver(&self, binding: &Binding) -> Result<()> {
-        let secondary = self.retained_receiver_for_reformation(binding)?;
-        let native_route = route(binding, self.transport.local())?;
-        secondary
-            .bind_retained_transport(&native_route, binding.epoch())
-            .map_err(|failure| error(failure.into()))?;
-        let service = self.facade.service();
-        let receiver = service
-            .retained_receiver
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        receiver.bound.store(true, Ordering::Release);
-        Ok(())
+    pub(super) fn native_primary_at(&self, epoch: Epoch) -> bool {
+        *self.epoch.lock().unwrap() == Some(epoch)
+            && self.transport.selected_lifecycle() == Some((epoch, ReplicaRole::Primary))
+            && matches!(self.facade.service().target(), Ok(Target::Primary(_)))
     }
 
     pub(super) fn observe_transport_quorum(&self) {
@@ -953,6 +914,7 @@ impl Production {
             recovery: true,
             continuation: None,
             reformation: false,
+            live_target: None,
         };
         binding.validate()?;
         self.transport.sessions.reserve(&binding)?;
@@ -983,12 +945,8 @@ impl Production {
             &mut peers.lock().unwrap(),
             PeerBinding {
                 information: information.clone(),
-                conservative_progress: binding.reformation,
-                fresh_checkpoint: if binding.reformation {
-                    Some(transport.reformation_checkpoint(&binding)?)
-                } else {
-                    None
-                },
+                conservative_progress: false,
+                fresh_checkpoint: None,
                 build: BuildConfig {
                     route: native_route,
                     remote_incarnation: incarnation,
@@ -1017,6 +975,107 @@ impl Production {
         Ok(())
     }
 
+    async fn owned_configuration(
+        &self,
+        current: ReplicaSetConfiguration,
+        previous: Option<ReplicaSetConfiguration>,
+        current_only: bool,
+    ) -> Result<()> {
+        let publication = self.transport.publication().await?;
+        let (mut result, work) = {
+            let mut selected = self.configurations.lock().unwrap();
+            if let Some(work) = selected.iter().find(|work| {
+                work.publication == publication
+                    && work.current == current
+                    && work.previous == previous
+                    && work.current_only == current_only
+            }) {
+                (work.result.clone(), None)
+            } else {
+                let (sender, receiver) = watch::channel(None);
+                selected.push(ConfigurationWork {
+                    publication,
+                    current: current.clone(),
+                    previous: previous.clone(),
+                    current_only,
+                    result: receiver.clone(),
+                });
+                (receiver, Some(sender))
+            }
+        };
+        if let Some(sender) = work {
+            let owner = self.transport.production_owner()?;
+            self.transport.spawn(async move {
+                let outcome = owner
+                    .install_configuration(current, previous, current_only)
+                    .await;
+                sender.send_replace(Some(outcome.map_err(|error| error.to_string())));
+                Ok(())
+            });
+        }
+        loop {
+            let outcome = result.borrow().clone();
+            if let Some(outcome) = outcome {
+                outcome.map_err(RuntimeError::ControlPlane)?;
+                return self.transport.check_health();
+            }
+            result.changed().await.map_err(|_| {
+                RuntimeError::ControlPlane("native configuration owner was lost".into())
+            })?;
+        }
+    }
+
+    async fn install_configuration(
+        &self,
+        current: ReplicaSetConfiguration,
+        previous: Option<ReplicaSetConfiguration>,
+        current_only: bool,
+    ) -> Result<()> {
+        let logical_previous = previous
+            .as_ref()
+            .filter(|previous| !empty_previous(previous));
+        self.transport
+            .register_configuration(&current, logical_previous)
+            .await?;
+        let restored = self.configuration(&current, logical_previous).await?;
+        #[cfg(feature = "testing")]
+        self.configuration_cut(
+            crate::replicator::TestingTcpRouteKind::ConfigurationValidated,
+            &current.configuration,
+        )
+        .await?;
+        let selected = (
+            current.configuration.clone(),
+            logical_previous.map(|previous| previous.configuration.clone()),
+        );
+        if !restored {
+            if current_only {
+                self.facade
+                    .update_current_replica_set_configuration(current)
+                    .await?;
+            } else {
+                let previous = self.native_previous(
+                    previous
+                        .as_ref()
+                        .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                )?;
+                self.facade
+                    .update_catch_up_replica_set_configuration(current, previous)
+                    .await?;
+            }
+        }
+        #[cfg(feature = "testing")]
+        self.configuration_cut(
+            crate::replicator::TestingTcpRouteKind::ConfigurationAdmitted,
+            &selected.0,
+        )
+        .await?;
+        self.transport
+            .selected_configuration(selected.0, selected.1);
+        self.observe_transport_quorum();
+        Ok(())
+    }
+
     async fn configuration(
         &self,
         current: &ReplicaSetConfiguration,
@@ -1026,6 +1085,20 @@ impl Production {
             return Err(RuntimeError::NotPrimary);
         }
         self.settle_changed_role().await?;
+        for information in &current.replicas {
+            if let Some(old) = self
+                .transport
+                .sessions
+                .binding_for(information.identity.replica_id.value())
+                && self.transport.sessions.predecessor_completed(&old)
+                && old.secondary().identity == information.identity
+                && Some(&old.secondary().storage) == information.storage_incarnation.as_ref()
+                && old.secondary().process_session_id != information.process_session_id
+            {
+                self.reform_live_target(&old, information, current, previous)
+                    .await?;
+            }
+        }
         if let Some(previous) = previous {
             for information in &previous.replicas {
                 self.retained_previous(information, current, Some(previous))
@@ -1135,10 +1208,25 @@ impl Production {
                 .binding_for(information.identity.replica_id.value())
                 .filter(|binding| {
                     planned.is_none()
-                        && binding.reformation
+                        && (binding.reformation || binding.continuation.is_some())
                         && !self.transport.sessions.completed(binding)
                 })
             {
+                if binding.continuation.is_some()
+                    && (binding.source.scope.epoch != current.configuration.epoch
+                        || binding.source.scope.configuration.current != current.configuration
+                        || binding.source.scope.configuration.previous
+                            != previous.map(|set| set.configuration.clone())
+                        || binding.secondary().identity != information.identity
+                        || binding.secondary().process_session_id != information.process_session_id
+                        || Some(&binding.secondary().storage)
+                            != information.storage_incarnation.as_ref()
+                        || binding.secondary().address != information.replication_address
+                        || self.transport.selected_lifecycle()
+                            != Some((binding.epoch(), ReplicaRole::Primary)))
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
                 let mut result = self
                     .builds
                     .lock()
@@ -1152,13 +1240,14 @@ impl Production {
                         break;
                     }
                     result.changed().await.map_err(|_| {
-                        RuntimeError::ControlPlane("native reformation owner was lost".into())
+                        RuntimeError::ControlPlane("native configuration owner was lost".into())
                     })?;
                 }
+                if binding.continuation.is_some() {
+                    self.transport.confirm_effect(&binding).await?;
+                    continue;
+                }
                 self.transport.validate_publications(&binding).await?;
-                self.transport
-                    .wait_for_reformation_checkpoint(&binding)
-                    .await?;
                 if !recoveries
                     .iter()
                     .any(|known: &Binding| known.nonce == binding.nonce)
@@ -1188,9 +1277,6 @@ impl Production {
                                 information.identity.replica_id,
                             ))
                         })?;
-                    self.transport
-                        .wait_for_reformation_checkpoint(&binding)
-                        .await?;
                     recoveries.push(binding);
                     continue;
                 }
@@ -1222,7 +1308,10 @@ impl Production {
                 recoveries.push(binding);
             }
         }
-        let unavailable_current = if previous.is_none() && !current.replicas.is_empty() {
+        let unavailable_current = if self.reconstruction.is_none()
+            && previous.is_none()
+            && !current.replicas.is_empty()
+        {
             let publication = self.transport.publication().await?;
             current
                 .replicas
@@ -1258,7 +1347,7 @@ impl Production {
                     self.facade
                         .update_catch_up_replica_set_configuration(
                             current.clone(),
-                            previous.clone(),
+                            self.native_previous(previous)?,
                         )
                         .await?;
                 } else {
@@ -1279,11 +1368,6 @@ impl Production {
                 }
             }
             for binding in recoveries {
-                if binding.reformation {
-                    self.transport
-                        .wait_for_fresh_reformation_ack(&binding)
-                        .await?;
-                }
                 self.transport.authorize_completion(&binding).await?;
                 self.transport.control(&binding, Control::Complete).await?;
                 self.transport.authorize_completion(&binding).await?;
@@ -1354,12 +1438,12 @@ impl Production {
                 &source.scope.history,
             )
             .await?;
-        let binding = Binding::new(source, target)?;
-        if !binding.admitted_reconfiguration() {
-            return Err(RuntimeError::AuthorityNotAdmitted);
-        }
+        let binding = Binding::candidate(source, target)?;
         let mut candidate = binding.clone();
         candidate.reformation = true;
+        if !candidate.admitted_reconfiguration() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         let reformation = self
             .transport
             .control(&candidate, Control::CheckReformation)
@@ -1387,7 +1471,174 @@ impl Production {
             }
             Err(_) => binding,
         };
-        self.transport.sessions.proposal(binding)
+        let binding = self.transport.sessions.proposal(binding)?;
+        if binding.reformation {
+            self.transport.associate_configuration(&binding).await?;
+        }
+        Ok(binding)
+    }
+
+    fn native_previous(
+        &self,
+        previous: &ReplicaSetConfiguration,
+    ) -> Result<ReplicaSetConfiguration> {
+        let mut native = previous.clone();
+        for information in &mut native.replicas {
+            let Some(binding) = self
+                .transport
+                .sessions
+                .binding_for(information.identity.replica_id.value())
+            else {
+                continue;
+            };
+            let Some(relation) = &binding.live_target else {
+                continue;
+            };
+            information.validate_public_progress()?;
+            let fresh = binding.secondary();
+            if previous.configuration != relation.previous
+                || information.identity != relation.target.identity
+                || information.storage_incarnation.as_ref() != Some(&relation.target.storage)
+                || !((information.process_session_id == relation.target.process_session_id
+                    && information.replication_address == relation.target.address)
+                    || (information.process_session_id == fresh.process_session_id
+                        && information.replication_address == fresh.address))
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            information.process_session_id = relation.target.process_session_id.clone();
+            information.replication_address = relation.target.address.clone();
+            information.current_progress = crate::application::INVALID_LSN;
+            information.catch_up_capability = crate::application::INVALID_LSN;
+        }
+        Ok(native)
+    }
+
+    async fn reform_live_target(
+        &self,
+        old: &Binding,
+        information: &ReplicaInformation,
+        current: &ReplicaSetConfiguration,
+        previous: Option<&ReplicaSetConfiguration>,
+    ) -> Result<()> {
+        let source = self.transport.publication().await?;
+        if source.scope.configuration.current != current.configuration
+            || source.scope.configuration.previous != previous.map(|set| set.configuration.clone())
+            || self.transport.selected_lifecycle()
+                != Some((source.scope.epoch, ReplicaRole::Primary))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let target = self
+            .transport
+            .discover(
+                &information.identity,
+                &information.process_session_id,
+                &source.scope.history,
+            )
+            .await?;
+        if target.replication_address != information.replication_address
+            || information.storage_incarnation.as_ref() != Some(&target.scope.storage)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let relation = self.transport.live_target_relation(old, &source, &target)?;
+        let mut binding = Binding::candidate(source, target)?;
+        binding.reformation = true;
+        binding.live_target = Some(relation);
+        binding.validate()?;
+        // This is a distinct checked path, never a fallback for a rejected
+        // ordinary CheckReformation/continuation or an idle admission.
+        self.transport
+            .control(&binding, Control::CheckReformation)
+            .await?;
+        let binding = self.transport.sessions.live_target_proposal(binding)?;
+        let persisted =
+            self.context.public_v1_binding().state_persistence == StatePersistence::Persisted;
+        let transport = self.transport.clone();
+        let peers = self.peers.clone();
+        let primary = match self.facade.service().target().map_err(error)? {
+            Target::Primary(primary) => primary,
+            _ => return Err(RuntimeError::NotPrimary),
+        };
+        let old_route = route(old, transport.local())?;
+        let identity = super::super::session::SessionIdentity {
+            primary_endpoint: old_route.sender_address.clone(),
+            remote_endpoint: old_route.remote_address.clone(),
+            remote_incarnation: transport.native_incarnation(old)?,
+        };
+        let old = old.clone();
+        let information = information.clone();
+        let (mut receiver, work) = {
+            let mut builds = self.builds.lock().unwrap();
+            if let Some(existing) = builds.get(&binding.nonce) {
+                (existing.clone(), None)
+            } else {
+                let (result, receiver) = watch::channel(None);
+                builds.insert(binding.nonce.clone(), receiver.clone());
+                (receiver, Some(result))
+            }
+        };
+        if let Some(result) = work {
+            transport.clone().spawn(async move {
+                let outcome: Result<()> = async {
+                    let _continuation = transport.continuations.lock().await;
+                    let sender = primary
+                        .freeze_live_target(&old_route, &identity, binding.epoch())
+                        .map_err(|failure| error(failure.into()))?;
+                    transport.join_predecessor(&old).await?;
+                    while sender.is_processing() {
+                        transport.check_health()?;
+                        tokio::task::yield_now().await;
+                    }
+                    transport.sessions.live_target_joined(&binding)?;
+                    transport.validate_publications(&binding).await?;
+                    transport.control(&binding, Control::Reform).await?;
+                    let incarnation = transport.admit(binding.clone(), true).await?;
+                    let fence = transport.fence(&binding);
+                    transport.sessions.effect(&binding, || {
+                        Self::prepare(
+                            &transport,
+                            &peers,
+                            persisted,
+                            &information,
+                            binding.clone(),
+                            fence,
+                            incarnation,
+                        )
+                    })??;
+                    transport.wait_for_reformation_checkpoint(&binding).await?;
+                    let checkpoint = transport
+                        .reformation_checkpoint(&binding)?
+                        .load(Ordering::Acquire);
+                    transport.sessions.effect(&binding, || {
+                        primary
+                            .install_live_target(
+                                &old_route,
+                                &identity,
+                                route(&binding, transport.local())?,
+                                incarnation,
+                                binding.epoch(),
+                                checkpoint,
+                            )
+                            .map_err(|failure| error(failure.into()))?;
+                        transport.live_target_native_installed(&binding)
+                    })??;
+                    Ok(())
+                }
+                .await;
+                result.send_replace(Some(outcome.map_err(|failure| failure.to_string())));
+                Ok(())
+            });
+        }
+        loop {
+            if let Some(outcome) = receiver.borrow().clone() {
+                return outcome.map_err(RuntimeError::ControlPlane);
+            }
+            receiver.changed().await.map_err(|_| {
+                RuntimeError::ControlPlane("live-source target reformation owner was lost".into())
+            })?;
+        }
     }
 
     async fn retained_previous(
@@ -1671,8 +1922,8 @@ impl Production {
                     Ok(())
                 }
                 .await;
-                if outcome.is_err() {
-                    transport.sessions.retire(&binding)?;
+                if let Err(error) = &outcome {
+                    transport.fail_effect(&binding, error).await;
                 }
                 result.send_replace(Some(outcome.map_err(|failure| failure.to_string())));
                 Ok(())
@@ -1727,10 +1978,29 @@ impl Production {
             .map_err(|failure| {
                 RuntimeError::ControlPlane(format!("continuation peer discovery: {failure}",))
             })?;
-        let mut binding = Binding::new(source, target).map_err(|failure| {
+        let mut binding = Binding::candidate(source, target).map_err(|failure| {
             RuntimeError::ControlPlane(format!("continuation candidate: {failure}"))
         })?;
         binding.continuation = Some(old.nonce.clone());
+        binding.nonce = uuid::Uuid::from_bytes(super::engine_session::guid(
+            b"kuberic-ordinary23-native-warm-continuation",
+            &serde_json::to_vec(&(&old.nonce, &binding.source, &binding.target))
+                .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?,
+        ))
+        .to_string();
+        let retained = self.builds.lock().unwrap().get(&binding.nonce).cloned();
+        if let Some(mut observer) = retained {
+            loop {
+                let observed = observer.borrow().clone();
+                if let Some(result) = observed {
+                    result.map_err(RuntimeError::ControlPlane)?;
+                    return self.transport.confirm_effect(&binding).await;
+                }
+                observer.changed().await.map_err(|_| {
+                    RuntimeError::ControlPlane("native continuation owner lost".into())
+                })?;
+            }
+        }
         if self
             .transport
             .sessions
@@ -1751,9 +2021,29 @@ impl Production {
             })?,
         };
         let native = match self.facade.service().target().map_err(error)? {
-            Target::Primary(primary) => primary
-                .continuation_session(&native_route, &identity, binding.epoch())
-                .map_err(|failure| error(failure.into()))?,
+            Target::Primary(primary) => {
+                let addition = self.reconstruction.as_ref()
+                    .and_then(CheckedCreationReconstruction::addition)
+                    .filter(|addition| {
+                        use crate::protocol::public_operations::MembershipAdditionPhase as Phase;
+                        addition.configuration(Phase::Joint).is_ok_and(|projection|
+                            projection.current == current.configuration
+                                && projection.previous.as_ref() == previous.map(|set| &set.configuration))
+                            && old.source.scope == *self.reconstruction.as_ref().unwrap().scope()
+                            && old.target.scope.storage == addition.receiver.storage_incarnation
+                            && old.target.scope.process_session_id == addition.receiver.process_session_id
+                            && old.target.scope.creation_id == addition.receiver.replicator_creation_id
+                            && old.target.role == ReplicaRole::IdleSecondary
+                            && binding.target.stage == crate::protocol::public_operations::ReplicaPublicationStage::AchievedScope
+                            && binding.target.role == ReplicaRole::ActiveSecondary
+                    });
+                if addition.is_some() {
+                    primary.copied_addition_session(&native_route, &identity, binding.epoch())
+                } else {
+                    primary.continuation_session(&native_route, &identity, binding.epoch())
+                }
+                .map_err(|failure| error(failure.into()))?
+            }
             _ => return Err(RuntimeError::NotPrimary),
         };
         self.transport
@@ -1762,125 +2052,148 @@ impl Production {
             .map_err(|failure| {
                 RuntimeError::ControlPlane(format!("continuation receiver preflight: {failure}",))
             })?;
+        #[cfg(feature = "testing")]
+        self.transport
+            .test_cut(
+                crate::replicator::TestingTcpRouteKind::ContinuationChecked,
+                &binding,
+            )
+            .await?;
         let persisted =
             self.context.public_v1_binding().state_persistence == StatePersistence::Persisted;
         let transport = self.transport.clone();
         let peers = self.peers.clone();
         let old = old.clone();
         let information = information.clone();
-        let (result, mut receiver) = watch::channel(None);
-        self.builds
-            .lock()
-            .unwrap()
-            .insert(binding.nonce.clone(), receiver.clone());
-        transport.clone().spawn(async move {
-            let outcome = async {
-                let _continuation = transport.continuations.lock().await;
-                transport
-                    .sessions
-                    .continuation_predecessor(&binding)
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!(
-                            "continuation retained predecessor: {failure}"
-                        ))
-                    })?;
-                transport.join_predecessor(&old).await.map_err(|failure| {
-                    RuntimeError::ControlPlane(format!("continuation predecessor join: {failure}"))
-                })?;
-                transport
-                    .validate_publications(&binding)
-                    .await
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!("continuation publications: {failure}"))
-                    })?;
-                transport
-                    .sessions
-                    .continue_session(&binding, false, || Ok(()))
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!(
-                            "continuation source reservation: {failure}"
-                        ))
-                    })?;
-                transport
-                    .control(&binding, Control::Continue)
-                    .await
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!("continuation receiver: {failure}"))
-                    })?;
-                let incarnation =
+        let (mut receiver, work) = {
+            let mut builds = self.builds.lock().unwrap();
+            if let Some(existing) = builds.get(&binding.nonce) {
+                (existing.clone(), None)
+            } else {
+                let (result, receiver) = watch::channel(None);
+                builds.insert(binding.nonce.clone(), receiver.clone());
+                (receiver, Some(result))
+            }
+        };
+        let observed_binding = binding.clone();
+        if let Some(result) = work {
+            transport.clone().spawn(async move {
+                let outcome = async {
+                    let _continuation = transport.continuations.lock().await;
                     transport
-                        .admit(binding.clone(), true)
+                        .sessions
+                        .continuation_predecessor(&binding)
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!(
+                                "continuation retained predecessor: {failure}"
+                            ))
+                        })?;
+                    transport.join_predecessor(&old).await.map_err(|failure| {
+                        RuntimeError::ControlPlane(format!(
+                            "continuation predecessor join: {failure}"
+                        ))
+                    })?;
+                    transport
+                        .validate_publications(&binding)
                         .await
                         .map_err(|failure| {
                             RuntimeError::ControlPlane(format!(
-                                "continuation carrier admission: {failure}"
+                                "continuation publications: {failure}"
                             ))
                         })?;
-                let fence = transport.fence(&binding);
-                transport
-                    .sessions
-                    .effect(&binding, || {
-                        if !native.continue_transport(&identity, binding.epoch(), incarnation) {
-                            return Err(RuntimeError::AuthorityNotAdmitted);
-                        }
-                        Self::prepare(
-                            &transport,
-                            &peers,
-                            persisted,
-                            &information,
-                            binding.clone(),
-                            fence,
-                            incarnation,
-                        )
+                    transport
+                        .sessions
+                        .continue_session(&binding, false, || Ok(()))
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!(
+                                "continuation source reservation: {failure}"
+                            ))
+                        })?;
+                    transport
+                        .control(&binding, Control::Continue)
+                        .await
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!("continuation receiver: {failure}"))
+                        })?;
+                    let incarnation =
+                        transport
+                            .admit(binding.clone(), true)
+                            .await
+                            .map_err(|failure| {
+                                RuntimeError::ControlPlane(format!(
+                                    "continuation carrier admission: {failure}"
+                                ))
+                            })?;
+                    let fence = transport.fence(&binding);
+                    transport
+                        .sessions
+                        .effect(&binding, || {
+                            if !native.continue_transport(&identity, binding.epoch(), incarnation) {
+                                return Err(RuntimeError::AuthorityNotAdmitted);
+                            }
+                            Self::prepare(
+                                &transport,
+                                &peers,
+                                persisted,
+                                &information,
+                                binding.clone(),
+                                fence,
+                                incarnation,
+                            )
+                        })
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!(
+                                "continuation effect selection: {failure}",
+                            ))
+                        })?
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!(
+                                "continuation native effect: {failure}",
+                            ))
+                        })?;
+                    transport
+                        .authorize_completion(&binding)
+                        .await
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!(
+                                "continuation completion preflight: {failure}"
+                            ))
+                        })?;
+                    transport
+                        .control(&binding, Control::Complete)
+                        .await
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!(
+                                "continuation receiver completion: {failure}"
+                            ))
+                        })?;
+                    transport
+                        .authorize_completion(&binding)
+                        .await
+                        .map_err(|failure| {
+                            RuntimeError::ControlPlane(format!(
+                                "continuation completion recheck: {failure}"
+                            ))
+                        })?;
+                    transport.sessions.complete(&binding).map_err(|failure| {
+                        RuntimeError::ControlPlane(format!(
+                            "continuation source completion: {failure}"
+                        ))
                     })
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!(
-                            "continuation effect selection: {failure}",
-                        ))
-                    })?
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(
-                            format!("continuation native effect: {failure}",),
-                        )
-                    })?;
-                transport
-                    .authorize_completion(&binding)
-                    .await
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!(
-                            "continuation completion preflight: {failure}"
-                        ))
-                    })?;
-                transport
-                    .control(&binding, Control::Complete)
-                    .await
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!(
-                            "continuation receiver completion: {failure}"
-                        ))
-                    })?;
-                transport
-                    .authorize_completion(&binding)
-                    .await
-                    .map_err(|failure| {
-                        RuntimeError::ControlPlane(format!(
-                            "continuation completion recheck: {failure}"
-                        ))
-                    })?;
-                transport.sessions.complete(&binding).map_err(|failure| {
-                    RuntimeError::ControlPlane(format!("continuation source completion: {failure}"))
-                })
-            }
-            .await;
-            if outcome.is_err() {
-                transport.sessions.retire(&binding)?;
-            }
-            result.send_replace(Some(outcome.map_err(|failure| failure.to_string())));
-            Ok(())
-        });
+                }
+                .await;
+                if let Err(error) = &outcome {
+                    transport.fail_effect(&binding, error).await;
+                }
+                result.send_replace(Some(outcome.map_err(|failure| failure.to_string())));
+                Ok(())
+            });
+        }
         loop {
-            if let Some(result) = receiver.borrow().clone() {
-                return result.map_err(RuntimeError::ControlPlane);
+            let observed = receiver.borrow().clone();
+            if let Some(result) = observed {
+                result.map_err(RuntimeError::ControlPlane)?;
+                return self.transport.confirm_effect(&observed_binding).await;
             }
             receiver.changed().await.map_err(|_| {
                 RuntimeError::ControlPlane("native continuation owner was lost".into())
@@ -1942,6 +2255,32 @@ impl Production {
                     let binding = match binding {
                         Some(binding) => binding,
                         None => {
+                            if kind == OperationKind::Copy
+                                && operation.is_end_of_stream()
+                                && operation.lsn() == 0
+                                && operation.data().is_empty()
+                                && let Some((epoch, ReplicaRole::ActiveSecondary)) =
+                                    transport.selected_lifecycle()
+                                && let Ok(root) = retained_service.demotion_receiver(epoch)
+                                && root.same_instance(&operation.secondary)
+                            {
+                                let service = retained_service.clone();
+                                return Ok(ReceivedOperation::new(
+                                    kind,
+                                    operation.lsn(),
+                                    operation.epoch(),
+                                    operation.data().clone(),
+                                    true,
+                                    Arc::new(move || {
+                                        let current =
+                                            service.demotion_receiver(epoch).map_err(error)?;
+                                        if !current.same_instance(&operation.secondary) {
+                                            return Err(RuntimeError::AuthorityNotAdmitted);
+                                        }
+                                        operation.acknowledge().map_err(error)
+                                    }),
+                                ));
+                            }
                             return retained_role_drain_operation(
                                 transport,
                                 retained_service,
@@ -2169,7 +2508,23 @@ impl Replicator for Production {
             }
             validate_retained_selection(selected, &self.transport)?;
         }
-        let recovering = prior.is_none() && role == ReplicaRole::ActiveSecondary && !restoring;
+        let reconstructing = prior.is_none()
+            && self.reconstruction.is_some()
+            && !self.retained_initialized.load(Ordering::Acquire);
+        if reconstructing {
+            let selected = self.reconstruction.as_ref().unwrap();
+            if selected.role() != role
+                || selected.scope().epoch != epoch
+                || self.context.creation_reconstruction().await?.as_ref() != Some(selected)
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            validate_reconstruction_selection(selected, &self.transport)?;
+        }
+        let recovering = prior.is_none()
+            && role == ReplicaRole::ActiveSecondary
+            && !restoring
+            && !reconstructing;
         let transition = prior.is_some_and(|(_, old_role)| {
             old_role != role
                 && !(old_role == ReplicaRole::IdleSecondary && role == ReplicaRole::ActiveSecondary)
@@ -2177,7 +2532,9 @@ impl Replicator for Production {
         self.role_changing.store(transition, Ordering::Release);
         let _role_change = RoleChangeGuard(self.role_changing.clone());
         self.transport.begin_role_change(epoch, role);
-        let result = if restoring {
+        let result = if reconstructing && role == ReplicaRole::Primary {
+            self.facade.reconstruct_primary(epoch).await
+        } else if restoring || reconstructing {
             self.facade.restore_retained_secondary(epoch).await
         } else {
             self.facade.change_role(epoch, role).await
@@ -2214,12 +2571,51 @@ impl Replicator for Production {
             }
             self.retained_initialized.store(true, Ordering::Release);
         }
+        if reconstructing {
+            let selected = self.reconstruction.as_ref().unwrap();
+            if self.context.creation_reconstruction().await?.as_ref() != Some(selected) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            match self.facade.service().target().map_err(error)? {
+                Target::Primary(primary) if role == ReplicaRole::Primary => {
+                    primary
+                        .current_progress()
+                        .map_err(|failure| error(failure.into()))?;
+                }
+                Target::Secondary(secondary)
+                    if role == ReplicaRole::ActiveSecondary
+                        && matches!(
+                            secondary.transport_identity(),
+                            Err(SecondaryError::RetainedTransport)
+                        ) =>
+                {
+                    secondary
+                        .current_progress()
+                        .map_err(|failure| error(failure.into()))?;
+                    secondary
+                        .catchup_capability()
+                        .map_err(|failure| error(failure.into()))?;
+                }
+                _ => return Err(RuntimeError::AuthorityNotAdmitted),
+            }
+            self.context
+                .confirm_reconstructed_native_initialization(selected)
+                .await?;
+            if self.context.creation_reconstruction().await?.as_ref() != Some(selected) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            self.retained_initialized.store(true, Ordering::Release);
+        }
         self.recover_on_epoch
             .store(recovering, std::sync::atomic::Ordering::Release);
         self.role_transition_pending
             .store(transition, std::sync::atomic::Ordering::Release);
         self.transport.selected_role(epoch, role);
         *self.epoch.lock().unwrap() = Some(epoch);
+        if role == ReplicaRole::Primary {
+            self.context
+                .observe_native_lifecycle(LifecycleObservation::EpochApplied(epoch));
+        }
         self.observe_transport_quorum();
         Ok(())
     }
@@ -2234,13 +2630,6 @@ impl Replicator for Production {
         {
             self.recover_secondary(epoch).await?;
         }
-        if selected == Some((epoch, ReplicaRole::IdleSecondary)) {
-            // Initial idle selection has no replication queue yet. StartCopy
-            // initializes its native epoch/boundary; repeating that selected
-            // epoch is not an external epoch advance through incomplete copy.
-            self.transport.check_health()?;
-            return Ok(());
-        }
         if let Some((_, role)) = selected {
             self.transport.begin_role_change(epoch, role);
         }
@@ -2254,6 +2643,8 @@ impl Replicator for Production {
             self.transport.selected_role(epoch, role);
         }
         *self.epoch.lock().unwrap() = Some(epoch);
+        self.context
+            .observe_native_lifecycle(LifecycleObservation::EpochApplied(epoch));
         self.observe_transport_quorum();
         Ok(())
     }
@@ -2289,34 +2680,8 @@ impl PrimaryReplicator for Production {
         current: ReplicaSetConfiguration,
         previous: ReplicaSetConfiguration,
     ) -> Result<()> {
-        let restored = self
-            .configuration(&current, (!empty_previous(&previous)).then_some(&previous))
-            .await?;
-        #[cfg(feature = "testing")]
-        self.configuration_cut(
-            crate::replicator::TestingTcpRouteKind::ConfigurationValidated,
-            &current.configuration,
-        )
-        .await?;
-        let selected = (
-            current.configuration.clone(),
-            (!empty_previous(&previous)).then(|| previous.configuration.clone()),
-        );
-        if !restored {
-            self.facade
-                .update_catch_up_replica_set_configuration(current, previous)
-                .await?;
-        }
-        #[cfg(feature = "testing")]
-        self.configuration_cut(
-            crate::replicator::TestingTcpRouteKind::ConfigurationAdmitted,
-            &selected.0,
-        )
-        .await?;
-        self.transport
-            .selected_configuration(selected.0, selected.1);
-        self.observe_transport_quorum();
-        Ok(())
+        self.owned_configuration(current, Some(previous), false)
+            .await
     }
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
         self.facade.wait_for_catch_up_quorum(mode).await
@@ -2325,28 +2690,7 @@ impl PrimaryReplicator for Production {
         &self,
         current: ReplicaSetConfiguration,
     ) -> Result<()> {
-        let restored = self.configuration(&current, None).await?;
-        #[cfg(feature = "testing")]
-        self.configuration_cut(
-            crate::replicator::TestingTcpRouteKind::ConfigurationValidated,
-            &current.configuration,
-        )
-        .await?;
-        let selected = current.configuration.clone();
-        if !restored {
-            self.facade
-                .update_current_replica_set_configuration(current)
-                .await?;
-        }
-        #[cfg(feature = "testing")]
-        self.configuration_cut(
-            crate::replicator::TestingTcpRouteKind::ConfigurationAdmitted,
-            &selected,
-        )
-        .await?;
-        self.transport.selected_configuration(selected, None);
-        self.observe_transport_quorum();
-        Ok(())
+        self.owned_configuration(current, None, true).await
     }
     async fn build_replica(&self, information: ReplicaInformation) -> Result<()> {
         information.validate_public_progress()?;
@@ -2364,10 +2708,17 @@ impl PrimaryReplicator for Production {
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        let binding = self
-            .transport
-            .sessions
-            .proposal(Binding::new(source, target)?)?;
+        let mut binding = Binding::new(source, target)
+            .map_err(|error| RuntimeError::ControlPlane(format!("Build binding: {error}")))?;
+        self.transport
+            .select_build(&mut binding)
+            .await
+            .map_err(|error| {
+                RuntimeError::ControlPlane(format!("Build operation provenance: {error}"))
+            })?;
+        let binding = self.transport.sessions.proposal(binding).map_err(|error| {
+            RuntimeError::ControlPlane(format!("Build source proposal: {error}"))
+        })?;
         if binding.retained_receiver() {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -2414,7 +2765,11 @@ impl PrimaryReplicator for Production {
                         } else {
                             None
                         };
-                        let incarnation = transport.establish(&binding).await?;
+                        let incarnation = transport.establish(&binding).await.map_err(|error| {
+                            RuntimeError::ControlPlane(format!(
+                                "Build session establishment: {error}"
+                            ))
+                        })?;
                         let fence = transport.fence(&binding);
                         transport.sessions.effect(&binding, || {
                             Self::prepare(
@@ -2431,7 +2786,9 @@ impl PrimaryReplicator for Production {
                         if let Some(predecessor) = predecessor {
                             facade.build_replacement(predecessor, information).await?;
                         } else {
-                            facade.build_replica(information).await?;
+                            facade.build_replica(information).await.map_err(|error| {
+                                RuntimeError::ControlPlane(format!("native Build: {error}"))
+                            })?;
                         }
                         transport.authorize_completion(&binding).await?;
                         transport.control(&binding, Control::Complete).await?;

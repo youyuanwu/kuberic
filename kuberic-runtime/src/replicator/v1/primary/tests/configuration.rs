@@ -462,6 +462,57 @@ async fn idle_promotion_resets_sender_averages_once_not_on_duplicate_configurati
 }
 
 #[tokio::test(start_paused = true)]
+async fn ordered_addition_continues_only_actual_completed_nonvoting_build_root() {
+    let mut rig = rig();
+    let provider = Arc::new(Provider::new(0));
+    let pending = rig.begin(30, false, provider.clone());
+    let identity = pending.session().identity();
+    assert!(matches!(
+        rig.handle
+            .copied_addition_session(&route(30), &identity, Epoch::new(1, 7)),
+        Err(PrimaryError::InvalidBinding(30))
+    ));
+    let completed = rig.finish_build(20);
+    let identity = completed.session().identity();
+    let actual = rig
+        .handle
+        .copied_addition_session(&route(20), &identity, Epoch::new(1, 7))
+        .unwrap();
+    assert!(actual.same_instance(&completed.session()));
+    assert!(!actual.is_promoted());
+    assert!(matches!(
+        rig.handle
+            .continuation_session(&route(20), &identity, Epoch::new(1, 7)),
+        Err(PrimaryError::InvalidBinding(20))
+    ));
+    let mut crossed = identity.clone();
+    crossed.remote_incarnation += 1;
+    assert!(
+        rig.handle
+            .copied_addition_session(&route(20), &crossed, Epoch::new(1, 7))
+            .is_err()
+    );
+    assert!(
+        rig.handle
+            .copied_addition_session(&route(20), &identity, Epoch::new(1, 8))
+            .is_err()
+    );
+    rig.handle
+        .update_current_configuration(set(2, vec![replica(20, None)]))
+        .unwrap();
+    assert!(actual.is_promoted());
+    assert!(
+        rig.handle
+            .copied_addition_session(&route(20), &identity, Epoch::new(1, 7))
+            .is_err()
+    );
+    rig.handle.close(Duration::ZERO).unwrap();
+    rig.primary.run().await.unwrap().result.unwrap();
+    pending.cancel_for_removal().unwrap();
+    rig.primary.drain_builds().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn pending_provider_build_is_not_fabricated_success_by_session_promotion() {
     let mut rig = rig();
     let provider = Arc::new(Provider::new(0));

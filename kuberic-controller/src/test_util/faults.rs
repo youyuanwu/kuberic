@@ -14,6 +14,96 @@ pub enum BarrierStage {
     Completion,
 }
 
+/// Actor-local durable selection, returned effect, or instruction receipt.
+/// These are distinct from controller Intent/Completion barriers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstructionPosition {
+    Selected,
+    Effect,
+    Receipt,
+    BuildReturned,
+    FailureBeforeReceipt,
+    FailureRecorded,
+}
+
+impl InstructionPosition {
+    pub(super) fn runtime(self) -> kuberic_runtime::testing::PublicCutPosition {
+        use kuberic_runtime::testing::PublicCutPosition;
+        match self {
+            Self::Selected => PublicCutPosition::InstructionSelected,
+            Self::Effect => PublicCutPosition::CallbackSuccess,
+            Self::Receipt => PublicCutPosition::InstructionApplied,
+            Self::BuildReturned => PublicCutPosition::BuildReturned,
+            Self::FailureBeforeReceipt => PublicCutPosition::CallbackFailure,
+            Self::FailureRecorded => PublicCutPosition::FailureRecorded,
+        }
+    }
+}
+
+/// A scheduling hold on one owned actor, not a callback join or recovery grant.
+pub struct InstructionCut {
+    pub(super) cluster: uuid::Uuid,
+    pub(super) participant: ReplicaRef,
+    pub(super) goal: ReplicaGoal,
+    pub(super) instruction: String,
+    pub(super) position: InstructionPosition,
+    pub(super) index: usize,
+    pub(super) recipe: Vec<String>,
+    pub(super) build_failure: Option<kuberic_runtime::testing::PublicBuildFailure>,
+    pub(super) cut: Arc<kuberic_runtime::testing::PublicOperationCut>,
+    pub(super) handle: kuberic_runtime::host::ReplicaHandle,
+    pub(super) _owner: Arc<()>,
+    pub(super) evidence: Mutex<Option<InstructionEvidence>>,
+}
+
+impl InstructionCut {
+    /// Release only the scheduling hold. Actual roots/cleanup remain owned and
+    /// must still be observed or joined through their ordinary owners.
+    pub fn release(self) {}
+}
+
+impl Drop for InstructionCut {
+    fn drop(&mut self) {
+        self.handle.set_public_operation_cut(None);
+        self.cut.release_all();
+    }
+}
+
+/// Detached evidence read from the exact held actor and canonical goal.
+#[derive(Clone, Debug)]
+pub struct InstructionEvidence {
+    pub goal: ReplicaGoal,
+    pub instruction: String,
+    pub position: InstructionPosition,
+    pub index: usize,
+    pub recipe: Vec<String>,
+    pub selected_call: Option<String>,
+    pub receipts: usize,
+}
+
+/// Matching-format metadata captured at an authenticated held instruction.
+/// This is not application data, a process clone or an exclusion certificate.
+pub struct InstructionImage {
+    pub(super) cluster: uuid::Uuid,
+    pub(super) participant: ReplicaRef,
+    pub(super) bytes: Vec<u8>,
+    pub(super) evidence: InstructionEvidence,
+}
+
+impl InstructionImage {
+    pub fn evidence(&self) -> &InstructionEvidence {
+        &self.evidence
+    }
+}
+
+/// Consistent metadata after an actual no-callback remove-before-Build.
+/// There is deliberately no local instruction index or callback cut.
+pub struct TombstoneImage {
+    pub(super) cluster: uuid::Uuid,
+    pub(super) participant: ReplicaRef,
+    pub(super) bytes: Vec<u8>,
+}
+
 /// A semantic operation selector. No operation-id encoding is part of this API.
 #[derive(Clone, Debug)]
 pub enum Barrier {
@@ -124,7 +214,7 @@ impl Barrier {
             }
         }
         let role = match &entry.goal.desired {
-            ReplicaGoalKind::Prepare { role } | ReplicaGoalKind::Reconfigure { role, .. } => {
+            ReplicaGoalKind::Prepare { role, .. } | ReplicaGoalKind::Reconfigure { role, .. } => {
                 Some(*role)
             }
             _ => None,
@@ -134,7 +224,8 @@ impl Barrier {
                 (kind == PublicV1CallKind::Role && role.is_some())
                     || matches!(
                         (&entry.goal.desired, kind),
-                        (ReplicaGoalKind::Build { .. }, PublicV1CallKind::Build)
+                        (ReplicaGoalKind::Discover, PublicV1CallKind::Open)
+                            | (ReplicaGoalKind::Build { .. }, PublicV1CallKind::Build)
                             | (ReplicaGoalKind::Remove { .. }, PublicV1CallKind::Remove)
                             | (ReplicaGoalKind::Close, PublicV1CallKind::Close)
                             | (ReplicaGoalKind::Abort, PublicV1CallKind::Abort)

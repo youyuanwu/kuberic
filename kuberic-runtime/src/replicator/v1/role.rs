@@ -138,6 +138,7 @@ pub(super) struct RoleReplicator {
     data_loss_end: Option<DataLossEnd>,
     primary: Option<Primary>,
     secondary: Option<Secondary>,
+    demotion_secondary: Option<SecondaryHandle>,
     retired_primaries: Vec<Primary>,
     retired_secondaries: Vec<Secondary>,
     fault: Option<RoleError>,
@@ -191,6 +192,7 @@ impl RoleReplicator {
             data_loss_end: None,
             primary: None,
             secondary: None,
+            demotion_secondary: None,
             retired_primaries: Vec::new(),
             retired_secondaries: Vec::new(),
             fault: None,
@@ -302,6 +304,19 @@ impl RoleReplicator {
             .handle())
     }
 
+    pub(super) fn demotion_secondary(&self) -> Option<SecondaryHandle> {
+        let current = self.secondary().ok()?;
+        self.demotion_secondary
+            .as_ref()
+            .filter(|root| root.same_instance(&current))
+            .filter(|_| {
+                self.status == RoleStatus::Ready(Role::ActiveSecondary)
+                    && self.fault.is_none()
+                    && self.pending.is_none()
+            })
+            .cloned()
+    }
+
     fn check_idle(&self) -> Result<(), RoleError> {
         if self.pending.is_some() {
             Err(RoleError::Busy)
@@ -339,6 +354,39 @@ impl RoleReplicator {
         )));
         self.pending = Some(Step::RetainedProgress);
         self.status = RoleStatus::Changing(Role::ActiveSecondary);
+        self.refresh_ingress();
+        Ok(())
+    }
+
+    pub(super) fn begin_reconstruct_primary(&mut self, epoch: Epoch) -> Result<(), RoleError> {
+        self.check_idle()?;
+        if self.status != RoleStatus::Opened
+            || self.primary.is_some()
+            || self.secondary.is_some()
+            || !self.retired_primaries.is_empty()
+            || !self.retired_secondaries.is_empty()
+        {
+            return Err(RoleError::InvalidState);
+        }
+        if epoch.data_loss_number < 0
+            || epoch.configuration_number < 0
+            || !self.config.secondary.replication.has_persisted_state
+        {
+            return Err(RoleError::InvalidConfig);
+        }
+        let provider = self.provider.clone();
+        self.opened_progress = None;
+        self.provider_call = Some(Box::pin(async move {
+            let progress = provider.last_committed_lsn().await?;
+            if !(0..Lsn::MAX - 1).contains(&progress) {
+                return Err(RuntimeError::Application(
+                    "invalid retained primary provider checkpoint".into(),
+                ));
+            }
+            Ok(progress)
+        }));
+        self.status = RoleStatus::Changing(Role::Primary);
+        self.pending = Some(Step::InitialPrimary(epoch));
         self.refresh_ingress();
         Ok(())
     }
@@ -742,6 +790,7 @@ impl RoleReplicator {
                         self.clock.clone(),
                     )?);
                     self.retired_primaries.push(self.primary.take().unwrap());
+                    self.demotion_secondary = Some(self.secondary.as_ref().unwrap().handle());
                     self.status = RoleStatus::Ready(Role::ActiveSecondary);
                     self.pending = None;
                     self.refresh_ingress();

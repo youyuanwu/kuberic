@@ -49,10 +49,16 @@ pub(super) struct SelectedAccess {
     valid: bool,
     active: bool,
     admitted: bool,
+    addition_pending: bool,
     status: Option<Status>,
 }
 
 impl SelectedAccess {
+    #[cfg(feature = "testing")]
+    pub(super) fn addition_pending(&self) -> bool {
+        self.addition_pending
+    }
+
     pub(super) fn epoch(&self) -> Option<Epoch> {
         self.epoch
     }
@@ -206,12 +212,20 @@ impl SelectedAccess {
         })
     }
 
+    pub(super) fn serving_role(&self) -> Option<ReplicaRole> {
+        (self.paired_primary()
+            && self.status().is_some_and(|(read, write)| {
+                read == AccessStatus::Granted || write == AccessStatus::Granted
+            }))
+        .then_some(ReplicaRole::Primary)
+    }
+
     fn calculate(&mut self) {
         self.status = Some(self.access());
     }
 
     fn access(&self) -> Status {
-        if self.demoted || !self.admitted {
+        if self.demoted || !self.admitted || self.addition_pending {
             return DENIED;
         }
         if self.promotion
@@ -398,7 +412,24 @@ impl AccessOwner {
                         access.caught_up = retained;
                     }
                     Some(P::AgentGoal(goal)) if goal.role() == Some(ReplicaRole::Primary) => {
-                        access.begin_promotion();
+                        let addition = super::super::ordinary_goal::addition::selection(goal);
+                        if addition.is_some_and(|addition| matches!(addition.phase,
+                            crate::protocol::public_operations::MembershipAdditionPhase::Joint
+                                | crate::protocol::public_operations::MembershipAdditionPhase::Current))
+                        {
+                            access.promotion = true;
+                            access.revoked = true;
+                            access.caught_up = false;
+                        } else {
+                            access.begin_promotion();
+                        }
+                        access.addition_pending = access.addition_pending
+                            || addition.is_some()
+                            || host.native_history.is_native() && matches!(goal.desired,
+                                crate::protocol::public_operations::ReplicaGoalKind::Reconfigure {
+                                    role: ReplicaRole::Primary, catch_up: None
+                                }) && goal.scope.configuration.previous.as_ref().is_some_and(|previous|
+                                    previous.primary_id != goal.scope.configuration.current.primary_id);
                     }
                     Some(P::Role {
                         role: ReplicaRole::Primary,
@@ -668,6 +699,17 @@ impl AccessOwner {
             .clone()
             .zip(preview.storage_incarnation.clone())
             .map(|(history, storage)| (history, storage, registered.identity));
+        let sourced_current = self.operation.upgrade().is_some_and(|operation| {
+            let record = operation.snapshot();
+            record.intent.goal().is_some_and(|goal| {
+                (super::super::original_member::round(&state, goal)
+                    || super::super::ordinary_goal::normal_current_owner(&state, goal).is_some())
+                    && record.ordinary.as_ref().is_some_and(|ordinary| {
+                        ordinary.actions == super::super::original_member::final_actions(goal)
+                            && ordinary.actions.contains(&I::CurrentConfiguration)
+                    })
+            })
+        });
         self.update(|access, intent| {
             let selected =
                 super::super::public_lifecycle::program::selected_program(intent, instruction);
@@ -704,7 +746,8 @@ impl AccessOwner {
                 | I::CatchUpConfiguration => {
                     let configuration =
                         super::super::public_action_state::configuration_at(intent, instruction);
-                    let retained_catchup = instruction == I::Configuration
+                    let retained_catchup = (instruction == I::Configuration
+                        || instruction == I::CurrentConfiguration && sourced_current)
                         && access.caught_up
                         && configuration.as_ref().is_some_and(|next| {
                             next.previous.is_none()
@@ -800,19 +843,38 @@ pub(super) fn complete(host: &Arc<RuntimeHost>, operation: &Arc<PartitionOperati
     }
     let activates = match record.intent.program.as_ref() {
         Some(P::AgentGoal(goal)) => {
-            matches!(
-                goal.desired,
-                crate::protocol::public_operations::ReplicaGoalKind::Reconfigure {
-                    role: ReplicaRole::Primary,
-                    catch_up: Some(_),
-                } | crate::protocol::public_operations::ReplicaGoalKind::RefreshPrimary {
-                    catch_up: Some(_),
-                }
-            ) && goal.scope.configuration.previous.is_none()
+            let reconstructed = matches!(&goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::RecoverContainedCreation { recovery }
+                    if recovery.role == ReplicaRole::Primary && recovery.catch_up.is_some())
+                && host
+                    .reconstructed_native_initialized
+                    .get()
+                    .is_some_and(|initialized| initialized.scope() == &goal.scope)
+                && record.lifecycle.outcomes.iter().any(|outcome| {
+                    matches!(outcome,
+                    PublicInstructionOutcome::ReconstructedNativeInitialized(scope)
+                        if scope.as_ref() == &goal.scope)
+                });
+            (reconstructed
+                || super::super::ordinary_goal::addition::selection(goal).is_some_and(|addition| {
+                    addition.phase
+                        == crate::protocol::public_operations::MembershipAdditionPhase::Current
+                })
+                || matches!(
+                    goal.desired,
+                    crate::protocol::public_operations::ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        catch_up: Some(_),
+                    } | crate::protocol::public_operations::ReplicaGoalKind::RefreshPrimary {
+                        catch_up: Some(_),
+                    }
+                ))
+                && goal.scope.configuration.previous.is_none()
                 && access.caught_up
                 && record.ordinary.as_ref().is_some_and(|ordinary| {
-                    ordinary.actions
+                    (ordinary.actions
                         == super::super::public_lifecycle::operation_instructions(&record.intent)
+                        || super::super::original_member::finished_current(&record))
                         && record.lifecycle.outcomes.len() == ordinary.actions.len()
                         && record.lifecycle.in_flight.is_none()
                 })
@@ -841,6 +903,57 @@ pub(super) fn complete(host: &Arc<RuntimeHost>, operation: &Arc<PartitionOperati
     access.calculate();
     host.replacement_authority_fenced
         .store(false, Ordering::Release);
+}
+
+pub(super) async fn accept_addition(
+    host: &Arc<RuntimeHost>,
+    store: &dyn AgentStore,
+    goal: &crate::protocol::public_operations::ReplicaGoal,
+) -> crate::host::Result<()> {
+    let state = store.load_state().await?;
+    let original = super::super::original_member::successful_final(&state, goal);
+    if !original
+        && super::super::ordinary_goal::addition::selection(goal).is_none_or(|addition| {
+            addition.phase != crate::protocol::public_operations::MembershipAdditionPhase::Current
+        })
+    {
+        return Err(crate::host::HostError::CommandRejected(
+            "only final addition acceptance can release application access".into(),
+        ));
+    }
+    if !original {
+        super::super::ordinary_goal::addition::validate(&state, goal)?;
+    }
+    let accepted = original
+        || state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| preview.operations.get(&goal.operation_id))
+            .is_some_and(|record| {
+                record.intent == goal.intent()
+                    && super::super::ordinary_goal::addition::successful_final(record, true)
+            });
+    if !accepted {
+        return Err(crate::host::HostError::CommandRejected(
+            "addition final acceptance missing".into(),
+        ));
+    }
+    let owner = {
+        let _admission = host.write_admission.lock().unwrap();
+        let mut access = host.selected_access.lock().unwrap();
+        let owner = access
+            .owner
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .filter(|owner| owner.intent().goal() == Some(goal))
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected("addition lost final access owner".into())
+            })?;
+        access.addition_pending = false;
+        owner
+    };
+    complete(host, &owner);
+    Ok(())
 }
 
 pub(super) fn completion_guard(
@@ -931,6 +1044,22 @@ mod tests {
             replicas: vec![],
         });
         access
+    }
+
+    #[test]
+    fn serving_report_role_requires_actual_live_access_owner_not_only_role_receipts() {
+        let mut access = primary_receipts();
+        access.valid = true;
+        access.active = true;
+        access.status = Some((AccessStatus::Granted, AccessStatus::Granted));
+        assert_eq!(access.serving_role(), None);
+        access.replicator_role = None;
+        assert_eq!(access.serving_role(), None);
+        access.replicator_role = Some(ReplicaRole::Primary);
+        access.application_role = Some(ReplicaRole::ActiveSecondary);
+        assert_eq!(access.serving_role(), None);
+        access.invalidate();
+        assert_eq!(access.serving_role(), None);
     }
 
     #[test]

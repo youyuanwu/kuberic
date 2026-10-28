@@ -11,8 +11,7 @@ use kuberic_runtime::application::{OpenContext, OperationDataStream, RoleChange}
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, ReplicaRole};
 use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
-    StatefulServicePartition,
+    Replicator, ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
 use tokio::sync::{Mutex as AsyncMutex, watch};
@@ -102,6 +101,7 @@ pub struct SqliteService {
     active: Arc<AtomicBool>,
     role: Mutex<ReplicaRole>,
     restoring_retained: AtomicBool,
+    reconstructing_contained: AtomicBool,
     replication_address: String,
     stop: watch::Sender<bool>,
     consumers: AsyncMutex<Consumers>,
@@ -143,6 +143,7 @@ impl SqliteService {
             active: Arc::new(AtomicBool::new(false)),
             role: Mutex::new(ReplicaRole::None),
             restoring_retained: AtomicBool::new(false),
+            reconstructing_contained: AtomicBool::new(false),
             replication_address,
             stop: watch::channel(false).0,
             consumers: AsyncMutex::new(Consumers::default()),
@@ -430,8 +431,14 @@ impl StatefulServiceReplica for SqliteService {
         self.persistence
             .authorize_open(context.mode)
             .map_err(persistence_error)?;
-        self.restoring_retained
-            .store(context.restoring_retained_member(), Ordering::Release);
+        self.reconstructing_contained.store(
+            context.reconstructing_contained_creation(),
+            Ordering::Release,
+        );
+        self.restoring_retained.store(
+            context.restoring_retained_member() || context.reconstructing_contained_creation(),
+            Ordering::Release,
+        );
         *self.partition.lock().unwrap() = Some(context.partition.clone());
         let partitions = self.partition.clone();
         let active = self.active.clone();
@@ -486,7 +493,7 @@ impl StatefulServiceReplica for SqliteService {
         });
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
+            .with_builtin_replicator()
             .create_replicator(
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
@@ -513,6 +520,8 @@ impl StatefulServiceReplica for SqliteService {
         if previous == ReplicaRole::None
             && self.restoring_retained.load(Ordering::Acquire)
             && role != ReplicaRole::ActiveSecondary
+            && !(role == ReplicaRole::Primary
+                && self.reconstructing_contained.load(Ordering::Acquire))
         {
             return Err(RuntimeError::InvalidReplication(
                 "retained SQLite initialization requires secondary role".into(),

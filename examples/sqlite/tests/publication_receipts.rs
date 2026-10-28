@@ -175,6 +175,7 @@ impl Fixture {
             },
             desired: ReplicaGoalKind::Prepare {
                 role: ReplicaRole::Primary,
+                rebuild: None,
             },
         };
         for goal in [

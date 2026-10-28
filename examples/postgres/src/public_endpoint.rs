@@ -112,13 +112,14 @@ impl PgEndpoint {
         let accept = sockets_cancel.clone();
         let incoming =
             tokio_stream::wrappers::TcpListenerStream::new(listener).map(move |stream| {
-                stream.map(|stream| {
+                stream.and_then(|stream| {
+                    stream.set_nodelay(true)?;
                     live.fetch_add(1, Ordering::AcqRel);
-                    PgSocket {
+                    Ok(PgSocket {
                         stream,
                         cancelled: Box::pin(accept.clone().cancelled_owned()),
                         sockets: live.clone(),
-                    }
+                    })
                 })
             });
         let requests = Arc::new(crate::data_service::RequestTracker::default());

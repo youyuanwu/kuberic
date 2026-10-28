@@ -1,11 +1,50 @@
 use super::cluster::Harness;
 use super::*;
+
+#[tokio::test]
+async fn explicit_storage_parent_refuses_noncanonical_unowned_placements_before_creation() {
+    use std::os::unix::fs::symlink;
+    let root = std::mem::ManuallyDrop::new(tempfile::tempdir().unwrap());
+    let directory = root.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let alias = root.path().join("alias");
+    symlink(&directory, &alias).unwrap();
+    let file = root.path().join("file");
+    std::fs::write(&file, b"preserved fixture bytes").unwrap();
+    let names = || {
+        let mut names = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = names();
+    for rejected in [
+        std::path::PathBuf::from("relative-parent"),
+        root.path().join("missing"),
+        alias,
+        file.clone(),
+        std::path::PathBuf::from("/"),
+    ] {
+        assert!(
+            TestCluster::builder(EmptyFactory)
+                .storage_parent(rejected)
+                .start()
+                .await
+                .is_err()
+        );
+        assert_eq!(names(), before);
+        assert!(std::fs::read_dir(&directory).unwrap().next().is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"preserved fixture bytes");
+    }
+}
 use anyhow::{Context, Result, ensure};
 use kuberic_runtime::{
     StateProvider, StatefulServiceReplica,
     application::{OpenContext, OperationDataStream, RoleChange},
     protocol::{public_operations::*, types::*},
-    replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator},
+    replicator::{Replicator, ReplicatorSettings, StateReplicator},
 };
 use std::sync::Arc;
 
@@ -62,7 +101,8 @@ async fn ordinary_role_barriers_match_exact_scope_role_stage_and_request() -> Re
                 matches!(
                     entry.goal.desired,
                     ReplicaGoalKind::Prepare {
-                        role: ReplicaRole::Primary
+                        role: ReplicaRole::Primary,
+                        ..
                     }
                 )
             })
@@ -290,7 +330,7 @@ impl StatefulServiceReplica for EmptyApplication {
         }
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
+            .with_builtin_replicator()
             .create_replicator(
                 Some(Arc::new(EmptyState)),
                 Some(ReplicatorSettings {

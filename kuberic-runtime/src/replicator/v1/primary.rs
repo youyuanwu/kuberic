@@ -184,6 +184,7 @@ struct State {
     phase: Phase,
     bindings: BTreeMap<i64, Binding>,
     replacement_predecessor: Option<Binding>,
+    live_target_reformation: bool,
     queued: Vec<BuildIdle>,
     activities: usize,
     aborted: bool,
@@ -342,6 +343,42 @@ impl Root {
 pub(super) struct PrimaryHandle(Weak<Root>);
 
 impl PrimaryHandle {
+    pub(super) fn completed_copy_transport(
+        &self,
+        route: &Route,
+        identity: &super::session::SessionIdentity,
+        epoch: Epoch,
+    ) -> Result<(), PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        let manager = root.manager.lock().unwrap();
+        manager.check_reported_fault()?;
+        let id = route.destination.replica;
+        let binding = state
+            .bindings
+            .get(&id)
+            .ok_or(PrimaryError::UnknownSession(id))?;
+        let replacement_build = state.replacement_predecessor.as_ref().is_some_and(|old| {
+            old.route.destination.replica == id
+                && !replacement::same_route(&old.route, route)
+                && manager
+                    .current_root(id)
+                    .is_some_and(|current| current.same_instance(&old.session))
+        });
+        if manager.epoch() != epoch
+            || !(binding.idle || replacement_build)
+            || !matches!(&binding.owner, SessionOwner::Build(build)
+                if build.result().is_some_and(|end| end.result.is_ok() && end.fault.is_none()))
+            || !replacement::same_route(&binding.route, route)
+            || binding.session.identity() != *identity
+            || !binding.session.transport_active()
+        {
+            return Err(PrimaryError::InvalidBinding(id));
+        }
+        Ok(())
+    }
+
     pub(super) fn current_transport_sessions(
         &self,
     ) -> Result<Option<super::replica_manager::TransportQuorumSnapshot>, PrimaryError> {
@@ -381,6 +418,42 @@ impl PrimaryHandle {
         {
             return Err(PrimaryError::InvalidBinding(id));
         }
+        Ok(binding.session.clone())
+    }
+
+    pub(super) fn copied_addition_session(
+        &self,
+        route: &Route,
+        identity: &super::session::SessionIdentity,
+        epoch: Epoch,
+    ) -> Result<ReplicationSession, PrimaryError> {
+        let root = self.root()?;
+        let state = root.state.lock().unwrap();
+        Root::check_open(&state)?;
+        let id = route.destination.replica;
+        let binding = state
+            .bindings
+            .get(&id)
+            .ok_or(PrimaryError::UnknownSession(id))?;
+        let (_, native_epoch) = root
+            .manager
+            .lock()
+            .unwrap()
+            .build_identity(route, identity.remote_incarnation)?;
+        if !binding.idle
+            || !matches!(&binding.owner, SessionOwner::Build(build)
+                if build.result().is_some_and(|end| end.result.is_ok() && end.fault.is_none()))
+            || binding.route.source != route.source
+            || binding.route.destination != route.destination
+            || binding.route.sender_address != route.sender_address
+            || binding.route.remote_address != route.remote_address
+            || binding.session.identity() != *identity
+            || native_epoch != epoch
+        {
+            return Err(PrimaryError::InvalidBinding(id));
+        }
+        // This is still the actual nonvoting Build root. Only the subsequent
+        // native joint configuration can move it into current membership.
         Ok(binding.session.clone())
     }
 
@@ -954,6 +1027,14 @@ impl PrimaryHandle {
                     return Err(PrimaryError::InvalidBinding(id));
                 }
             };
+            if state.live_target_reformation
+                && state
+                    .replacement_predecessor
+                    .as_ref()
+                    .is_some_and(|old| old.session.same_instance(&binding.session))
+            {
+                return Err(PrimaryError::InvalidBinding(id));
+            }
             if matching.next().is_some() {
                 return Err(PrimaryError::InvalidBinding(id));
             }
@@ -1172,6 +1253,7 @@ impl Primary {
                     phase: Phase::Open,
                     bindings: BTreeMap::new(),
                     replacement_predecessor: None,
+                    live_target_reformation: false,
                     queued: Vec::new(),
                     activities: 0,
                     aborted: false,

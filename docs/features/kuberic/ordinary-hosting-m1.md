@@ -53,11 +53,106 @@ Authenticated discovery/recovery can resolve that real endpoint while ordinary
 copy, voting and serving remain closed. **AchievedScope** requires the matching
 ordinary callback receipts; accepted role intent is not achieved role.
 
-[Snapshots/discovery](../../../kuberic-runtime/src/host/ordinary_goal_service.rs#L28)
-do not invoke engine progress, capability or diagnostic callbacks. Ordinary
-progress/capability are explicitly **NotQueried** at this checkpoint; they are
-not zero or a recovery certificate. Retained-history election cannot infer safe
-progress from such observations.
+Routine [snapshots/discovery](../../../kuberic-runtime/src/host/ordinary_goal_service.rs)
+do not invoke engine progress, capability or diagnostic callbacks. Independent
+implementations retain explicit read-only progress sampling; normal Open does
+not require a native-specific facet.
+
+The bounded ordinary23 native inspection component uses a newly selected
+**Discover** goal as a GetLSN round, reusing an already opened creation instead
+of calling Open again. Its existing operation journal captures the exact
+history, logical configuration, primary fence, revision and process/creation
+before effects. Actual InBuild/Ready selects UpdateEpoch (unless that fence was
+actually applied), current progress, then capability. Actual Opened/StandBy
+selects inspection only, with zero capability: it never constructs a secondary
+or supplies copy completion, remote ACKs, voting or access. Metadata sampling
+returns the retained native observation, not an unjournaled epoch effect.
+Opened→ActiveSecondary and copied Idle→Active role completion do not themselves
+confirm the requested fence; the explicit native epoch program must still
+succeed. Incomplete secondary preparation retains its real epoch failure.
+
+Optional `nativeStatus` and `nativeLifecycle` snapshot fields distinguish
+inspection, actual lifecycle state and the lifecycle-produced deactivation
+pair. Missing fields/history are not valid election evidence. Native/application
+Primary and epoch alone leave the proxy InBuild; the actual selected PC/CC
+ReportAnyDataLoss decision produces Ready without calling user OnDataLoss when
+its predicate is false. Callback-required cases remain explicit errors on this
+bounded path. Normal promotion retains its selected GetLSN input boundary;
+configured-source achievement alone does not advance that boundary's history:
+the selected native quorum wait must actually complete first.
+source demotion captures actual final GetStatus, never a boundary from EndWait
+or a later moving sample. These facts are persisted before acceptance and do
+not restore a warm native owner after recreation.
+Normal source handoff selects local input without requiring the successor
+already be Primary. Idle/secondary history inheritance still requires the
+actual matching Ready Primary source and its configuration.
+Warm secondary preparation does not inherit from a future, not-yet-configured
+Primary; genuine new Idle and copied Idle activation keep the source check.
+
+A successful same-live normal preparation may reach current-only admission
+only through its exact completed joint operation: original PC, selected CC,
+membership/quorum, primary fence, native query/source boundary and current
+process/creation must agree. The complete native recipe, acceptance and host
+settlement remain required. Every other historical conflict, unresolved call
+and sticky failure is still checked. Final admission is not completion: the
+same owned final attempt performs catch-up, actual native current/end and
+NativeComplete before access and exact request-target acceptance. A later
+current-only result does not replace the original source-demotion result.
+
+The former Primary's first incoming transport uses the actual root retained
+inside native demotion, after real old local transport/ACK/task joins. It is
+neither an Idle Build nor a reopened/copied-state marker. Copied same-fence
+normal continuation and strict higher-fence general recovery remain separate.
+Selected native member progress initializes the sender, not a fresh wire ACK.
+At tail, configuration needs no invented traffic; RequestAck cannot establish
+an unknown primary route. Real replication installs that route and subsequent
+writes require native consumer ACKs and quorum. A healthy unmarked copied
+member behind the boundary retains its root and replays the available range;
+WriteQuorum does not become an implicit All-follower wait.
+
+Stopped-Primary reconciliation persists canonical Discover goals before
+inspection and retains their exact native results in the existing
+`replicaGoals` status journal. The result is canonical JSON in `nativeStatus`
+(distinct from the typed snapshot field), validated against its accepted goal,
+history, process/creation, configuration and primary fence. PC and CC read
+quorums, deactivation/catch-up eligibility, highest-down evidence and the
+positive-first-LSN lagger optimization determine the candidate. A requested
+handoff target cannot override that decision; an accepted different target
+remains pending. A changed nominee is inspected under its exact configuration
+without incrementing the primary fence again. Current-only continuation also
+keeps that fence. The source's achieved binding scope is not replaced by the
+inspection's requested native epoch.
+
+An excluded original member uses genuine Existing Open, not retained-secondary
+initialization to obtain progress. The narrow journal-derived inspection
+permission requires actual storage custody and old-owner exclusion; it neither
+clears terminal/failure records nor permits serving, copying or voting.
+Opened replies remain non-Ready in the selected native peer descriptions.
+Original-member recovery separately achieves a configured Ready Primary with
+application access closed. Full logical PC/CC membership and write quorums
+remain intact while only actual up/Ready owners enter native peer vectors.
+Configuration installation with insufficient peers is not quorum completion.
+The excluded member achieves typed Idle preparation, then uses the existing
+Build call, real context/copy/EOS/replication ACKs and BuildEnd before activation.
+Joint catch-up, Ready history propagation, final current/end and accepted,
+host-settled peer receipts precede serving and exact old-dependency linking.
+The primary fence does not advance for those configuration-only steps.
+
+A higher eligible Opened prefix can win over a lower warm nominee. Its actual
+initial-Primary path still owes explicit epoch, application role and the
+no-data-loss decision before Ready. A warm follower outside that source's
+retained range takes an ordinary Close with a creation-owned, typed native
+GetLSN rebuild cause. Successful local Cleanup is not physical exclusion:
+the existing executable/supervisor must really exit and reap that owner before
+Existing Open and the original-member Idle/Build path. This is not an
+application fault, provider reset or permission to turn failed Close into
+success. The old operation results remain unchanged, including lost controller
+observations; only the exact accepted final native chain resolves their veto.
+
+Pre-component ordinary23 frozen roots remain unchanged and report absent
+facts; predecessor formats still reject without migration/reset. This is not
+qualification of broader M3 recovery, interrupted handoff or PostgreSQL
+recovery integration.
 
 Generic publication binds resource/history, exact replica/storage/process/
 creation, actual endpoint, epoch/primary/configuration and monotonic publication
@@ -90,6 +185,27 @@ New nonlocal voters need exact accepted Ready; missing/substituted peer
 descriptors, removed targets and remove-before-Build tombstones cannot bypass it.
 Successful admission retires logical idle ownership without destroying admitted
 replication. Later voter withdrawal never resurrects old Ready.
+
+The builtin private carrier retains each binding/control effect in the
+creation-owned transport task lifetime. An RPC observes that operation; it
+does not own or restart it. An Active registry slot is not a completed Peer:
+success requires its live carrier, ingress task and exact native ACK owner/
+generation. Partial failures fence the binding and retain actual handles and
+join errors. Exact retry reuses the result and rechecks present health and
+scope. Recreating a process loses these in-memory roots; a journal receipt
+cannot manufacture a warm receiver. Reform/Continue require a genuinely
+completed native root, not a vacant provider-seeded secondary.
+
+Ordinary Build nonce identity binds the canonical operation/digest, remote
+generation and exact publications. Both ends read the existing authenticated
+operation snapshots before activation. A typed original-member selection names
+the exact retained inspection and achieved Idle preparation; logical quorum
+membership is not an Active session or a copy receipt. The normal outside-
+membership validator remains strict. Configured-source and copied-root
+admission use the same journal, authenticated snapshots and actual native
+owners; a publication or provenance nonce alone supplies no copy or vote.
+Same-primary configuration changes retain an authorized actual root and ACK
+generation; removed roots are fenced, not continued with an artificial epoch.
 
 Ready removal on a still valid Open/Primary source calls ordinary Remove and
 retires **local** idle ownership only. It is not proof of target receiver
@@ -160,9 +276,9 @@ M3 recovery evidence.
 ## Fresh-deployment format
 
 Host schema, control identity/envelopes and required
-`KubericSet.spec.hostingFormat` are **16**, including generated CRD, shipped
-sample and fixtures. M1's original format-15 acceptance is historical, not a
-supported reader. Retained CRD goals/outcomes are
+`KubericSet.spec.hostingFormat` are **23**, including generated CRD, shipped
+sample and fixtures. The earlier M1/M2 format acceptances are historical, not
+supported predecessor readers. Retained CRD goals/outcomes are
 structurally typed and canonically validated. Old/missing/mixed formats and
 legacy retained commands reject before authoritative mutation.
 

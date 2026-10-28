@@ -7,11 +7,20 @@ use crate::replicator::stream::OperationStream;
 use crate::replicator::*;
 use crate::{StateProvider, StatefulServiceReplica};
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
 struct Probe {
+    native_events: StdMutex<Vec<String>>,
+    provider_progress: AtomicI64,
+    fail_provider_progress: AtomicBool,
+    provider_data_loss_calls: AtomicUsize,
+    fail_provider_epoch: AtomicBool,
+    block_provider_epoch: AtomicBool,
+    provider_epoch_entered: Semaphore,
+    provider_epoch_gate: Semaphore,
+    native_writer: StdMutex<Option<Arc<dyn StateReplicator>>>,
     context: StdMutex<Option<ReplicatorFactoryContext>>,
     listener: StdMutex<Option<TcpListener>>,
     block_role: AtomicBool,
@@ -57,6 +66,7 @@ struct Probe {
     aborted: Semaphore,
     on_abort: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
     use_default_factory: AtomicBool,
+    native_primary: StdMutex<Option<Arc<dyn PrimaryReplicator>>>,
     block_factory: AtomicBool,
     factory_gate: Semaphore,
     factory_entered: Semaphore,
@@ -67,6 +77,15 @@ struct Probe {
 impl Probe {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            native_events: StdMutex::new(Vec::new()),
+            provider_progress: AtomicI64::new(0),
+            fail_provider_progress: AtomicBool::new(false),
+            provider_data_loss_calls: AtomicUsize::new(0),
+            fail_provider_epoch: AtomicBool::new(false),
+            block_provider_epoch: AtomicBool::new(false),
+            provider_epoch_entered: Semaphore::new(0),
+            provider_epoch_gate: Semaphore::new(0),
+            native_writer: StdMutex::new(None),
             context: StdMutex::new(None),
             listener: StdMutex::new(None),
             block_role: AtomicBool::new(false),
@@ -112,6 +131,7 @@ impl Probe {
             aborted: Semaphore::new(0),
             on_abort: StdMutex::new(None),
             use_default_factory: AtomicBool::new(false),
+            native_primary: StdMutex::new(None),
             block_factory: AtomicBool::new(false),
             factory_gate: Semaphore::new(0),
             factory_entered: Semaphore::new(0),
@@ -121,14 +141,41 @@ impl Probe {
     }
 }
 
-struct Provider;
+#[path = "inspection_history_tests.rs"]
+mod inspection_history;
+
+struct Provider(Arc<Probe>);
 #[async_trait::async_trait]
 impl StateProvider for Provider {
-    async fn update_epoch(&self, _: Epoch, _: i64) -> crate::Result<()> {
+    async fn update_epoch(&self, epoch: Epoch, _: i64) -> crate::Result<()> {
+        self.0
+            .native_events
+            .lock()
+            .unwrap()
+            .push(format!("provider.epoch:{epoch:?}"));
+        self.0.provider_epoch_entered.add_permits(1);
+        if self.0.block_provider_epoch.load(Ordering::Acquire) {
+            self.0.provider_epoch_gate.acquire().await.unwrap().forget();
+        }
+        if self.0.fail_provider_epoch.load(Ordering::Acquire) {
+            return Err(RuntimeError::Application(
+                "actual native provider epoch failed".into(),
+            ));
+        }
         Ok(())
     }
     async fn last_committed_lsn(&self) -> crate::Result<i64> {
-        Ok(0)
+        self.0
+            .native_events
+            .lock()
+            .unwrap()
+            .push("provider.progress".into());
+        if self.0.fail_provider_progress.load(Ordering::Acquire) {
+            return Err(RuntimeError::Application(
+                "actual native provider progress failed".into(),
+            ));
+        }
+        Ok(self.0.provider_progress.load(Ordering::Acquire))
     }
     async fn get_copy_context(&self) -> crate::Result<OperationDataStream> {
         Ok(Box::pin(futures::stream::empty()))
@@ -141,6 +188,9 @@ impl StateProvider for Provider {
         Ok(Box::pin(futures::stream::empty()))
     }
     async fn on_data_loss(&self) -> crate::Result<bool> {
+        self.0
+            .provider_data_loss_calls
+            .fetch_add(1, Ordering::AcqRel);
         Ok(false)
     }
 }
@@ -194,7 +244,7 @@ impl StatefulServiceReplica for Application {
     async fn open(self: Arc<Self>, context: OpenContext) -> crate::Result<Arc<dyn Replicator>> {
         let factory: Arc<dyn ReplicatorFactory> =
             if self.0.use_default_factory.load(Ordering::Acquire) {
-                Arc::new(DefaultReplicatorFactory::new())
+                Arc::new(inspection_history::NativeFactory(self.0.clone()))
             } else {
                 Arc::new(OrdinaryFactory(self.0.clone()))
             };
@@ -202,12 +252,15 @@ impl StatefulServiceReplica for Application {
             .partition
             .with_factory(factory)
             .create_replicator(
-                Some(Arc::new(Provider)),
+                Some(Arc::new(Provider(self.0.clone()))),
                 Some(ReplicatorSettings {
                     replication_address: "http://127.0.0.1:0".into(),
                 }),
             )
             .await?;
+        if self.0.use_default_factory.load(Ordering::Acquire) {
+            *self.0.native_writer.lock().unwrap() = interfaces.state_replicator();
+        }
         let replacement = self.0.replacement_return.lock().unwrap().clone();
         if let Some(replacement) = replacement {
             replacement.open().await?;
@@ -216,7 +269,12 @@ impl StatefulServiceReplica for Application {
             Ok(interfaces.replicator())
         }
     }
-    async fn change_role(&self, _: ReplicaRole) -> crate::Result<RoleChange> {
+    async fn change_role(&self, role: ReplicaRole) -> crate::Result<RoleChange> {
+        self.0
+            .native_events
+            .lock()
+            .unwrap()
+            .push(format!("application.role:{role:?}"));
         Ok(RoleChange {
             service_address: None,
         })
@@ -462,12 +520,14 @@ async fn m3_ordinary_primary_recovery_drains_native_all_before_reentering_applic
             I::Configuration,
             I::FirstCatchUp,
             I::ApplicationRole,
+            I::NativeDataLossDecision,
+            I::NativeComplete,
         ]
     );
     goal.scope.configuration.previous.as_mut().unwrap().epoch = goal.scope.epoch;
     let ordinary = crate::host::public_lifecycle::program::operation_instructions(&goal.intent());
     assert_eq!(
-        ordinary[1],
+        ordinary[2],
         I::ApplicationRole,
         "same-epoch configuration is not retained epoch recovery"
     );
@@ -479,6 +539,8 @@ async fn m3_ordinary_handoff_freezes_swap_and_revocation_does_not_withdraw_creat
     use crate::host::state::PublicInstruction as I;
     let fixture = Fixture::new(1, false).await;
     let mut goal = fixture.goal.clone();
+    goal.operation_id = OperationId::new("source-handoff-projection");
+    goal.revision += 1;
     goal.scope.configuration = m3_pair_configuration(&fixture, 2, 2);
     goal.scope.configuration.previous = Some(m3_pair_configuration(&fixture, 1, 1).current);
     goal.scope.epoch = Epoch::new(0, 2);
@@ -497,6 +559,7 @@ async fn m3_ordinary_handoff_freezes_swap_and_revocation_does_not_withdraw_creat
             I::SecondCatchUp,
             I::ReplicatorRole,
             I::ApplicationRole,
+            I::NativeComplete,
         ]
     );
     let PublicOperationProgram::Swap {
@@ -516,6 +579,52 @@ async fn m3_ordinary_handoff_freezes_swap_and_revocation_does_not_withdraw_creat
     );
     fixture.submit(&fixture.goal).await.unwrap();
     fixture.achieved(&fixture.goal).await;
+    // Pure projection validation uses a controlled completed journal record;
+    // the real PostgreSQL controller positives prove the physical effects.
+    let state = fixture.store.load_state().await.unwrap();
+    let mut record = state.public_v1_operation_state.as_ref().unwrap().operations
+        [&fixture.goal.operation_id]
+        .clone();
+    let owner = record.ordinary.as_ref().unwrap().creation_owner.clone();
+    record.intent = goal.intent();
+    let mut frozen = crate::host::ordinary_goal::freeze(&state, &goal).unwrap();
+    frozen.creation_owner = owner;
+    frozen.accepted = true;
+    frozen.host_settled = true;
+    record.ordinary = Some(frozen);
+    record.lifecycle.in_flight = None;
+    record.lifecycle.outcomes = vec![
+        crate::host::state::PublicInstructionOutcome::Done,
+        crate::host::state::PublicInstructionOutcome::Done,
+        crate::host::state::PublicInstructionOutcome::Done,
+        crate::host::state::PublicInstructionOutcome::Done,
+        crate::host::state::PublicInstructionOutcome::Done,
+        crate::host::state::PublicInstructionOutcome::ApplicationRole(None),
+        crate::host::state::PublicInstructionOutcome::NativeUnavailable,
+    ];
+    assert_eq!(
+        crate::host::ordinary_goal::completed_handoff_receipts(&record),
+        Some(SourceHandoffReceipt::ORDERED.to_vec())
+    );
+    let reject_projection = |change: fn(&mut crate::host::state::PublicOperationRecord)| {
+        let mut changed = record.clone();
+        change(&mut changed);
+        assert!(crate::host::ordinary_goal::completed_handoff_receipts(&changed).is_none());
+    };
+    reject_projection(|record| record.ordinary.as_mut().unwrap().accepted = false);
+    reject_projection(|record| record.ordinary.as_mut().unwrap().host_settled = false);
+    reject_projection(|record| record.ordinary.as_mut().unwrap().action_format = 20);
+    reject_projection(|record| record.lifecycle.in_flight = Some(I::SecondCatchUp));
+    reject_projection(|record| {
+        record.lifecycle.outcomes.pop();
+    });
+    reject_projection(|record| record.ordinary.as_mut().unwrap().actions.swap(3, 4));
+    reject_projection(|record| {
+        record.disposition = Some(crate::host::state::PublicOperationDisposition::Failed(
+            "actual child effect failed".into(),
+        ))
+    });
+    reject_projection(|record| record.superseded_by = Some(OperationId::new("later-owner")));
     let callbacks = fixture.runtime.public_lifecycle_callbacks().unwrap();
     (callbacks.revoke_access)(false).unwrap();
     assert!(!fixture.runtime.ordinary_withdrawn());
@@ -628,15 +737,23 @@ impl Fixture {
         let store = Arc::new(
             SqliteStore::create_replacement_authorized(
                 root.path().join("agent.sqlite3"),
-                AgentState::new(StorageIdentity {
-                    schema_version: SCHEMA_VERSION,
-                    resource_uid: uid.clone(),
-                    pod_uid: PodUid::new(format!("pod-{id}")),
-                    pvc_uid: PvcUid::new(format!("pvc-{id}")),
-                    initialization_id: InitializationId::new(format!("init-{id}")),
-                    local_identity: local.clone(),
-                    effective_policy: policy,
-                }),
+                {
+                    let mut state = AgentState::new(StorageIdentity {
+                        schema_version: SCHEMA_VERSION,
+                        resource_uid: uid.clone(),
+                        pod_uid: PodUid::new(format!("pod-{id}")),
+                        pvc_uid: PvcUid::new(format!("pvc-{id}")),
+                        initialization_id: InitializationId::new(format!("init-{id}")),
+                        local_identity: local.clone(),
+                        effective_policy: policy,
+                    });
+                    state.application_storage =
+                        Some(crate::host::state::ApplicationStorageBinding {
+                            paths: BTreeMap::new(),
+                            initializing: true,
+                        });
+                    state
+                },
                 binding.clone(),
             )
             .unwrap(),
@@ -693,6 +810,7 @@ impl Fixture {
                 configuration: configuration(),
             },
             desired: ReplicaGoalKind::Prepare {
+                rebuild: None,
                 role: if id == 1 {
                     ReplicaRole::Primary
                 } else {
@@ -813,6 +931,7 @@ impl Fixture {
     }
 
     async fn finish(self) {
+        self.probe.provider_epoch_gate.add_permits(100);
         self.probe.role_gate.add_permits(100);
         self.probe.factory_gate.add_permits(100);
         self.probe.close_gate.add_permits(100);
@@ -906,6 +1025,178 @@ async fn entered(semaphore: &Semaphore) {
 }
 
 #[tokio::test]
+async fn ordinary_goal_actual_owner_is_durable_before_the_first_open_selection() {
+    let fixture = Fixture::new(1, false).await;
+    let intent = fixture.goal.intent();
+    let selected = fixture
+        .store
+        .begin_public_operation(&intent, &[], &[])
+        .await
+        .unwrap();
+    let crate::host::store::BeginPublicOperation::Ready(record) = selected else {
+        panic!("initial ordinary goal was not selected Ready");
+    };
+    let owner = record
+        .ordinary
+        .as_ref()
+        .unwrap()
+        .creation_owner
+        .as_ref()
+        .unwrap();
+    assert_eq!(owner.process_id, std::process::id());
+    assert_eq!(
+        owner.process_lifetime,
+        crate::host::ordinary_goal::retained::process_lifetime_id()
+    );
+    assert_eq!(
+        owner.process_session_id,
+        fixture.goal.scope.process_session_id
+    );
+    assert_eq!(owner.creation_id, fixture.goal.scope.creation_id);
+    assert!(owner.builtin_factory.is_none());
+    assert!(record.lifecycle.in_flight.is_none() && record.lifecycle.outcomes.is_empty());
+    assert_eq!(fixture.probe.open_calls.load(Ordering::Acquire), 0);
+    fixture
+        .store
+        .advance_public_operation(
+            &intent.operation_id,
+            intent.revision,
+            &intent.process_session_id,
+            PublicOperationStage::Ready,
+            PublicOperationStage::Running,
+            None,
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .public_instruction(
+            &intent,
+            0,
+            crate::host::state::PublicInstruction::ApplicationOpen,
+            None,
+        )
+        .await
+        .unwrap();
+    let state = fixture.store.load_state().await.unwrap();
+    let applied =
+        &state.public_v1_operation_state.as_ref().unwrap().operations[&intent.operation_id];
+    assert_eq!(
+        applied.ordinary.as_ref().unwrap().creation_owner.as_ref(),
+        Some(owner)
+    );
+    assert_eq!(
+        applied.lifecycle.in_flight,
+        Some(crate::host::state::PublicInstruction::ApplicationOpen)
+    );
+    assert_eq!(fixture.probe.open_calls.load(Ordering::Acquire), 0);
+    let durable =
+        SqliteStore::read_retained_recovery_state(&fixture._root.path().join("agent.sqlite3"))
+            .unwrap();
+    assert_eq!(
+        durable
+            .public_v1_operation_state
+            .as_ref()
+            .unwrap()
+            .operations[&intent.operation_id]
+            .ordinary
+            .as_ref()
+            .unwrap()
+            .creation_owner
+            .as_ref(),
+        Some(owner)
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn ordinary_goal_missing_or_crossed_owner_rejects_reopen_without_mutation() {
+    let fixture = Fixture::new(1, false).await;
+    let intent = fixture.goal.intent();
+    fixture
+        .store
+        .begin_public_operation(&intent, &[], &[])
+        .await
+        .unwrap();
+    let original = fixture.store.load_state().await.unwrap();
+    let mut cases = Vec::new();
+    for kind in 0..6 {
+        let mut state = original.clone();
+        let ordinary = state
+            .public_v1_operation_state
+            .as_mut()
+            .unwrap()
+            .operations
+            .get_mut(&intent.operation_id)
+            .unwrap()
+            .ordinary
+            .as_mut()
+            .unwrap();
+        match kind {
+            0 => ordinary.creation_owner = None,
+            1 => ordinary.creation_owner.as_mut().unwrap().process_id = 0,
+            2 => ordinary
+                .creation_owner
+                .as_mut()
+                .unwrap()
+                .process_lifetime
+                .clear(),
+            3 => {
+                ordinary.creation_owner.as_mut().unwrap().process_session_id =
+                    ProcessSessionId::new("foreign-process")
+            }
+            4 => {
+                ordinary.creation_owner.as_mut().unwrap().creation_id =
+                    ReplicatorCreationId::new("foreign-creation")
+            }
+            _ => {
+                ordinary.creation_owner.as_mut().unwrap().builtin_factory =
+                    Some(OperationId::new("foreign-factory-source"))
+            }
+        }
+        cases.push(state);
+    }
+    let path = fixture._root.path().join("agent.sqlite3");
+    let binding = PublicV1LifecycleBinding {
+        identity: fixture.goal.identity.clone(),
+        resource_uid: fixture.goal.scope.history.resource_uid.clone(),
+        spec_generation: 1,
+        state_persistence: StatePersistence::Persisted,
+    };
+    let write = |state: &AgentState| {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE agent_state SET state_json = ?1 WHERE singleton = 1",
+                [serde_json::to_string(state).unwrap()],
+            )
+            .unwrap();
+    };
+    for state in cases {
+        write(&state);
+        let bytes = std::fs::read(&path).unwrap();
+        let files = std::fs::read_dir(fixture._root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            SqliteStore::open_replacement_bound_existing(path.clone(), None, &binding,).is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read_dir(fixture._root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            files
+        );
+        assert_eq!(fixture.probe.open_calls.load(Ordering::Acquire), 0);
+    }
+    write(&original);
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn ordinary_goal_pending_discovery_is_receipted_callback_free_and_access_closed() {
     let source = Fixture::new(1, true).await;
     let target = Fixture::new(2, true).await;
@@ -959,6 +1250,7 @@ async fn ordinary_goal_pending_discovery_is_receipted_callback_free_and_access_c
         build.revision = 2;
         build.desired = ReplicaGoalKind::Build {
             remote: Box::new(RemoteReplicaSelection {
+                original_member: None,
                 source: publication,
                 target: discovery,
                 target_control_address: peer.address.clone(),
@@ -992,6 +1284,121 @@ async fn ordinary_goal_pending_discovery_is_receipted_callback_free_and_access_c
     target.finish().await;
 }
 
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn m3_scoped_instruction_cut_cannot_credit_another_remote_build_on_the_same_actor() {
+    use crate::host::public_lifecycle::{PublicCutPosition, PublicOperationCut};
+    use futures::FutureExt;
+    let (source, target, remote) = remote_pair().await;
+    let other = Fixture::new(3, false).await;
+    source.link(&other);
+    other.link(&source);
+    other.submit(&other.goal).await.unwrap();
+    let other_publication = other.achieved(&other.goal).await.publication.unwrap();
+    let mut first = source.goal.clone();
+    first.operation_id = OperationId::new("already-pending-build-a");
+    first.revision = 2;
+    first.desired = ReplicaGoalKind::Build {
+        remote: Box::new(remote.clone()),
+    };
+    source.probe.block_build.store(true, Ordering::Release);
+    source.submit(&first).await.unwrap();
+    entered(&source.probe.build_entered).await;
+    // A already owns a live callback. B will capture the newly installed cut.
+    let cut = Arc::new(PublicOperationCut::for_instruction(
+        &first,
+        "Build",
+        PublicCutPosition::InstructionSelected,
+        0,
+    ));
+    source.runtime.set_public_operation_cut(Some(cut.clone()));
+    source.probe.block_build.store(false, Ordering::Release);
+    let mut second = source.goal.clone();
+    second.operation_id = OperationId::new("different-remote-build-b");
+    second.revision = 3;
+    second.desired = ReplicaGoalKind::Build {
+        remote: Box::new(RemoteReplicaSelection {
+            original_member: None,
+            source: remote.source,
+            target: other_publication,
+            target_control_address: other.address.clone(),
+            generation: 1,
+        }),
+    };
+    source.submit(&second).await.unwrap();
+    source.achieved(&second).await;
+    let snapshot = source.snapshot().await;
+    let pending = snapshot
+        .goals
+        .iter()
+        .find(|entry| entry.goal == first)
+        .unwrap();
+    assert_eq!(pending.status, ReplicaGoalStatus::Pending);
+    assert_eq!(pending.selected_call.as_deref(), Some("Build"));
+    assert_eq!(pending.receipts, 0);
+    assert!(
+        cut.entered.notified().now_or_never().is_none(),
+        "B's identical name/index/prefix must not be attributed to pending A"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        cut.pause_instruction(
+            PublicCutPosition::InstructionSelected,
+            0,
+            &first.intent(),
+            crate::host::state::PublicInstruction::Remove,
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(cut.entered.notified().now_or_never().is_none());
+    assert_eq!(source.probe.build_calls.load(Ordering::Acquire), 2);
+    cut.release_all();
+    source.runtime.set_public_operation_cut(None);
+    source.probe.build_gate.add_permits(1);
+    source.achieved(&first).await;
+    source.finish().await;
+    target.finish().await;
+    other.finish().await;
+}
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn m3_instruction_cut_disarm_releases_all_captured_and_late_waiters() {
+    use crate::host::public_lifecycle::{PublicCutPosition, PublicOperationCut};
+    let cut = Arc::new(PublicOperationCut::new(
+        PublicCutPosition::InstructionSelected,
+        0,
+    ));
+    let first = tokio::spawn({
+        let cut = cut.clone();
+        async move { cut.pause(PublicCutPosition::InstructionSelected, 0).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), cut.entered.notified())
+        .await
+        .unwrap();
+    let second = tokio::spawn({
+        let cut = cut.clone();
+        async move { cut.pause(PublicCutPosition::InstructionSelected, 0).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), cut.entered.notified())
+        .await
+        .unwrap();
+    cut.release_all();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        first.await.unwrap();
+        second.await.unwrap();
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        cut.pause(PublicCutPosition::InstructionSelected, 0),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn ordinary_goal_build_is_retained_exact_two_ended_and_remove_is_local_only() {
     let source = Fixture::new(1, false).await;
@@ -1003,6 +1410,7 @@ async fn ordinary_goal_build_is_retained_exact_two_ended_and_remove_is_local_onl
     let source_publication = source.achieved(&source.goal).await.publication.unwrap();
     let target_publication = target.achieved(&target.goal).await.publication.unwrap();
     let selection = RemoteReplicaSelection {
+        original_member: None,
         source: source_publication,
         target: target_publication,
         target_control_address: target.address.clone(),
@@ -1378,7 +1786,7 @@ async fn ordinary_goal_builtin_factory_opens_actual_engine_listener_and_writer()
 #[tokio::test]
 async fn m3_retained_builtin_provenance_comes_from_registered_native_bundle_not_capabilities() {
     assert_eq!(
-        ORDINARY_ACTION_FORMAT, 19,
+        ORDINARY_ACTION_FORMAT, 23,
         "requires the coordinated final matched format"
     );
     for builtin in [true, false] {
@@ -1633,12 +2041,10 @@ async fn m3_ordinary_sampling_auth_identity_and_predecessor_format_reject_before
 async fn ordinary_goal_open_return_without_durable_receipt_is_not_discoverable() {
     use crate::host::public_lifecycle::{PublicCutPosition, PublicOperationCut};
     let fixture = Fixture::new(1, true).await;
-    let cut = Arc::new(PublicOperationCut {
-        position: PublicCutPosition::CallbackSuccess,
-        index: 1,
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
+    let cut = Arc::new(PublicOperationCut::new(
+        PublicCutPosition::CallbackSuccess,
+        1,
+    ));
     fixture.runtime.set_public_operation_cut(Some(cut.clone()));
     fixture.submit(&fixture.goal).await.unwrap();
     cut.entered.notified().await;
@@ -1870,6 +2276,7 @@ async fn ordinary_goal_creation_budget_never_reclaims_unaccepted_remote_outcomes
         let record = PublicOperationRecord {
             intent: intent.clone(),
             ordinary: Some(OrdinaryGoalRecord {
+                native_input: None,
                 action_format: ORDINARY_ACTION_FORMAT,
                 actions: Vec::new(),
                 open_existing: None,
@@ -1879,6 +2286,10 @@ async fn ordinary_goal_creation_budget_never_reclaims_unaccepted_remote_outcomes
                 host_settled: true,
                 ready_admissions: Vec::new(),
                 retained: None,
+                reconstruction: None,
+                creation_owner: Some(crate::host::ordinary_goal::capture_creation_owner(
+                    &state, &goal,
+                )),
             }),
             attempt: 1,
             attempt_results: Default::default(),
@@ -2940,6 +3351,7 @@ async fn ordinary_goal_discovery_stage_opens_unknown_peer_endpoints_before_froze
             must_catchup: false,
         }];
         prepare.desired = ReplicaGoalKind::Prepare {
+            rebuild: None,
             role: if index == 0 {
                 ReplicaRole::Primary
             } else {
@@ -2982,12 +3394,10 @@ async fn ordinary_goal_discovery_stage_opens_unknown_peer_endpoints_before_froze
 async fn ordinary_goal_lost_rpc_before_callback_launch_still_executes_one_retained_creation() {
     use crate::host::public_lifecycle::{PublicCutPosition, PublicOperationCut};
     let fixture = Fixture::new(1, true).await;
-    let cut = Arc::new(PublicOperationCut {
-        position: PublicCutPosition::BeforeAccessReservation,
-        index: 0,
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
+    let cut = Arc::new(PublicOperationCut::new(
+        PublicCutPosition::BeforeAccessReservation,
+        0,
+    ));
     fixture.runtime.set_public_operation_cut(Some(cut.clone()));
     let mut client =
         proto::agent_control_client::AgentControlClient::connect(fixture.address.clone())
@@ -3032,6 +3442,7 @@ async fn remote_pair() -> (Fixture, Fixture, RemoteReplicaSelection) {
     source.submit(&source.goal).await.unwrap();
     target.submit(&target.goal).await.unwrap();
     let selection = RemoteReplicaSelection {
+        original_member: None,
         source: source.achieved(&source.goal).await.publication.unwrap(),
         target: target.achieved(&target.goal).await.publication.unwrap(),
         target_control_address: target.address.clone(),
@@ -3088,12 +3499,10 @@ async fn m2_ordinary_rebuild_error_preserves_exact_goal_wire_and_reopen() {
         assert_eq!(source.store.load_state().await.unwrap(), before);
     }
     *source.probe.build_rebuild.lock().unwrap() = Some(failure);
-    let cut = Arc::new(crate::host::public_lifecycle::PublicOperationCut {
-        position: crate::host::public_lifecycle::PublicCutPosition::InstructionApplied,
-        index: 0,
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
+    let cut = Arc::new(crate::host::public_lifecycle::PublicOperationCut::new(
+        crate::host::public_lifecycle::PublicCutPosition::InstructionApplied,
+        0,
+    ));
     source.runtime.set_public_operation_cut(Some(cut.clone()));
     source.submit(&goal).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), cut.entered.notified())

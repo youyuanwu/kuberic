@@ -52,7 +52,7 @@ async fn ordinary_reopen_role_address_scenario() {
                     process_session_id: fresh.process_session_id, creation_id: fresh.creation_id,
                     epoch, configuration: current.configuration(epoch),
                 },
-                desired: ReplicaGoalKind::Prepare { role: ReplicaRole::Primary },
+                desired: ReplicaGoalKind::Prepare { role: ReplicaRole::Primary, rebuild: None },
             };
             m2_builtin::submit(&current, &goal).await.unwrap();
             tokio::time::timeout(Duration::from_secs(5), current.service.primary_entered.notified()).await.unwrap();
@@ -514,6 +514,7 @@ async fn m2_application_scope_withdrawal_waits_for_actual_kv_consumer_close() {
         incompatible.scope.epoch = Epoch::new(0, 9);
         incompatible.desired = ReplicaGoalKind::Prepare {
             role: ReplicaRole::IdleSecondary,
+            rebuild: None,
         };
         assert!(m2_builtin::submit(&target, &incompatible).await.is_err());
         exit.release();

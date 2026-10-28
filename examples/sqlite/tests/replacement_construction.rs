@@ -301,7 +301,8 @@ impl Node {
         if matches!(
             goal.desired,
             ReplicaGoalKind::Prepare {
-                role: ReplicaRole::Primary
+                role: ReplicaRole::Primary,
+                ..
             } | ReplicaGoalKind::Reconfigure {
                 role: ReplicaRole::Primary,
                 ..
@@ -330,8 +331,14 @@ impl Node {
         } else {
             current_scope().lock().unwrap().clone().unwrap()
         };
-        self.goal(ReplicaGoalKind::Prepare { role }, configuration)
-            .await;
+        self.goal(
+            ReplicaGoalKind::Prepare {
+                role,
+                rebuild: None,
+            },
+            configuration,
+        )
+        .await;
     }
 
     async fn descriptor(&self, role: ReplicaRole) -> ReplicaPeerDescription {
@@ -401,6 +408,7 @@ impl Node {
             .goal(
                 ReplicaGoalKind::Build {
                     remote: Box::new(RemoteReplicaSelection {
+                        original_member: None,
                         source: source.clone(),
                         target: target_publication,
                         target_control_address: target.address.clone(),

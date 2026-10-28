@@ -20,6 +20,7 @@ use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::error::RuntimeError;
 use crate::protocol::types::{AccessStatus, ReplicaId, ReplicaIdentity, ReplicaRole};
@@ -180,6 +181,7 @@ enum Command {
     Open,
     ChangeRole(Epoch, Role),
     RestoreRetained(Epoch),
+    ReconstructPrimary(Epoch),
     UpdateEpoch(Epoch),
     Progress,
     Capability,
@@ -254,6 +256,10 @@ pub(crate) struct Facade {
 }
 
 impl Facade {
+    pub(super) async fn reconstruct_primary(&self, epoch: Epoch) -> crate::Result<()> {
+        self.completed(Command::ReconstructPrimary(epoch)).await
+    }
+
     pub(super) async fn restore_retained_secondary(&self, epoch: Epoch) -> crate::Result<()> {
         self.completed(Command::RestoreRetained(epoch)).await
     }
@@ -308,13 +314,21 @@ impl Facade {
         });
         let (requests, receiver) = mpsc::channel(64);
         let signal = abort.clone();
-        let task = tokio::spawn(async move {
-            let result = run(adapter, config, receiver, signal).await;
-            if let Err(error) = &result {
-                tracing::warn!(%error, "private V1 facade driver failed");
+        let span = tracing::debug_span!(
+            "native_facade",
+            replica = config.local.replica_id.value(),
+            instance = %config.local.instance_id,
+        );
+        let task = tokio::spawn(
+            async move {
+                let result = run(adapter, config, receiver, signal).await;
+                if let Err(error) = &result {
+                    tracing::warn!(%error, "private V1 facade driver failed");
+                }
+                result
             }
-            result
-        });
+            .instrument(span),
+        );
         Ok(Arc::new(Self {
             requests,
             abort,
@@ -513,11 +527,15 @@ impl FacadeConfig {
             if member.identity == self.local {
                 continue;
             }
-            let info = input
+            let Some(info) = input
                 .replicas
                 .iter()
                 .find(|info| info.identity == member.identity)
-                .ok_or_else(|| FacadeError::Input("missing exact replica description".into()))?;
+            else {
+                // Logical quorum includes unavailable/InBuild members, but
+                // only actual Ready owners have native session descriptors.
+                continue;
+            };
             if info.role != member.role || (final_configuration && info.must_catchup) {
                 return Err(FacadeError::Input("remote voting role/MustCatchup".into()));
             }
@@ -629,6 +647,22 @@ fn handle(
                 }
                 adapter.select(Control::RestoreRetained(epoch), |owner| {
                     owner.begin_restore_retained_secondary(epoch)
+                })?;
+            }
+            Command::ReconstructPrimary(epoch) => {
+                if adapter.status() == RoleStatus::Ready(Role::Primary)
+                    && adapter.reconstructed_primary_epoch == Some(epoch)
+                {
+                    adapter
+                        .owner
+                        .primary()
+                        .map_err(AdapterError::from)?
+                        .current_progress()
+                        .map_err(AdapterError::from)?;
+                    return Ok(Some(Value::Completed));
+                }
+                adapter.select(Control::ReconstructPrimary(epoch), |owner| {
+                    owner.begin_reconstruct_primary(epoch)
                 })?;
             }
             Command::UpdateEpoch(epoch) => adapter.select(Control::UpdateEpoch, |owner| {

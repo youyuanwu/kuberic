@@ -139,7 +139,9 @@ impl fmt::Display for ReplicaId {
     Default,
 )]
 #[serde(rename_all = "camelCase")]
-/// Monotonic replication authority version, ordered by data loss then configuration.
+/// Compact primary fence, ordered by data loss then primary attempt.
+/// Configuration identity and goal revision order changes within a fence.
+/// This is not Service Fabric's packed configuration-version wire integer.
 pub struct Epoch {
     #[schemars(range(min = 0))]
     pub data_loss_number: i64,

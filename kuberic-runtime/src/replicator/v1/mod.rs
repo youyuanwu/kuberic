@@ -20,6 +20,8 @@ mod secondary_copy_receiver;
 mod secondary_receiver;
 mod sender;
 mod service_adapter;
+#[cfg(test)]
+pub(crate) use service_adapter::check_build_binding_context;
 mod session;
 mod transport;
 

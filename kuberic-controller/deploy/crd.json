@@ -44,8 +44,8 @@
                   },
                   "hostingFormat": {
                     "format": "uint32",
-                    "maximum": 19.0,
-                    "minimum": 19.0,
+                    "maximum": 23.0,
+                    "minimum": 23.0,
                     "type": "integer"
                   },
                   "image": {
@@ -442,7 +442,7 @@
                         "type": "string"
                       },
                       "epoch": {
-                        "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                        "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                         "properties": {
                           "configurationNumber": {
                             "format": "int64",
@@ -807,6 +807,7 @@
                                   "enum": [
                                     "discover",
                                     "restoreRetainedMember",
+                                    "recoverContainedCreation",
                                     "prepare",
                                     "reconfigure",
                                     "refreshPrimary",
@@ -836,7 +837,7 @@
                                           "type": "string"
                                         },
                                         "epoch": {
-                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                           "properties": {
                                             "configurationNumber": {
                                               "format": "int64",
@@ -921,13 +922,12 @@
                                   ],
                                   "type": "object"
                                 },
-                                "remote": {
+                                "rebuild": {
+                                  "description": "Selected retained inspection and source, not a copy or exclusion certificate.",
                                   "nullable": true,
                                   "properties": {
-                                    "generation": {
-                                      "format": "uint64",
-                                      "minimum": 0.0,
-                                      "type": "integer"
+                                    "inspection": {
+                                      "$ref": "#/components/schemas/ReplicaGoal"
                                     },
                                     "source": {
                                       "properties": {
@@ -965,7 +965,7 @@
                                                       "type": "string"
                                                     },
                                                     "epoch": {
-                                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                      "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                       "properties": {
                                                         "configurationNumber": {
                                                           "format": "int64",
@@ -1042,7 +1042,7 @@
                                                       "type": "string"
                                                     },
                                                     "epoch": {
-                                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                      "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                       "properties": {
                                                         "configurationNumber": {
                                                           "format": "int64",
@@ -1255,7 +1255,818 @@
                                               "type": "string"
                                             },
                                             "epoch": {
-                                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                              "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                              "properties": {
+                                                "configurationNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                },
+                                                "dataLossNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "configurationNumber",
+                                                "dataLossNumber"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "history": {
+                                              "properties": {
+                                                "dataLossNumber": {
+                                                  "format": "int64",
+                                                  "type": "integer"
+                                                },
+                                                "historyId": {
+                                                  "type": "string"
+                                                },
+                                                "protocolGeneration": {
+                                                  "format": "uint64",
+                                                  "minimum": 1.0,
+                                                  "type": "integer"
+                                                },
+                                                "resourceUid": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "dataLossNumber",
+                                                "historyId",
+                                                "protocolGeneration",
+                                                "resourceUid"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "processSessionId": {
+                                              "type": "string"
+                                            },
+                                            "storage": {
+                                              "properties": {
+                                                "replica": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storage": {
+                                                  "properties": {
+                                                    "identity": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "kind": {
+                                                      "type": "string"
+                                                    },
+                                                    "pod_uid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "pvc_uid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "kind"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storageGeneration": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "replica",
+                                                "storage",
+                                                "storageGeneration"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "configuration",
+                                            "creationId",
+                                            "epoch",
+                                            "history",
+                                            "processSessionId",
+                                            "storage"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "stage": {
+                                          "enum": [
+                                            "DiscoveryPending",
+                                            "AchievedScope"
+                                          ],
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "format",
+                                        "generation",
+                                        "replicationAddress",
+                                        "role",
+                                        "scope",
+                                        "stage"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "inspection",
+                                    "source"
+                                  ],
+                                  "type": "object"
+                                },
+                                "recovery": {
+                                  "description": "Exact journal dependencies, not certificates of death, drainage or readiness.",
+                                  "nullable": true,
+                                  "properties": {
+                                    "addition": {
+                                      "description": "A closed addition template. Historical goals are immutable root references,\nnot caller-selected instructions or claims of native completion.",
+                                      "nullable": true,
+                                      "properties": {
+                                        "admitted": {
+                                          "$ref": "#/components/schemas/ReplicaGoal"
+                                        },
+                                        "bootstrapEpoch": {
+                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                          "properties": {
+                                            "configurationNumber": {
+                                              "format": "int64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            },
+                                            "dataLossNumber": {
+                                              "format": "int64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            }
+                                          },
+                                          "required": [
+                                            "configurationNumber",
+                                            "dataLossNumber"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "interrupted": {
+                                          "$ref": "#/components/schemas/ReplicaGoal"
+                                        },
+                                        "phase": {
+                                          "enum": [
+                                            "Bootstrap",
+                                            "Receiver",
+                                            "Joint",
+                                            "Current"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "receiver": {
+                                          "properties": {
+                                            "identity": {
+                                              "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                              "properties": {
+                                                "agentGeneration": {
+                                                  "type": "string"
+                                                },
+                                                "instanceId": {
+                                                  "type": "string"
+                                                },
+                                                "replicaId": {
+                                                  "format": "int64",
+                                                  "minimum": 1.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "agentGeneration",
+                                                "instanceId",
+                                                "replicaId"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "processSessionId": {
+                                              "type": "string"
+                                            },
+                                            "replicatorCreationId": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "storageIncarnation": {
+                                              "properties": {
+                                                "replica": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storage": {
+                                                  "properties": {
+                                                    "identity": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "kind": {
+                                                      "type": "string"
+                                                    },
+                                                    "pod_uid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "pvc_uid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "kind"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storageGeneration": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "replica",
+                                                "storage",
+                                                "storageGeneration"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "identity",
+                                            "processSessionId",
+                                            "replicatorCreationId",
+                                            "role",
+                                            "storageIncarnation"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "source": {
+                                          "properties": {
+                                            "identity": {
+                                              "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                              "properties": {
+                                                "agentGeneration": {
+                                                  "type": "string"
+                                                },
+                                                "instanceId": {
+                                                  "type": "string"
+                                                },
+                                                "replicaId": {
+                                                  "format": "int64",
+                                                  "minimum": 1.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "agentGeneration",
+                                                "instanceId",
+                                                "replicaId"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "processSessionId": {
+                                              "type": "string"
+                                            },
+                                            "replicatorCreationId": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "storageIncarnation": {
+                                              "properties": {
+                                                "replica": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storage": {
+                                                  "properties": {
+                                                    "identity": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "kind": {
+                                                      "type": "string"
+                                                    },
+                                                    "pod_uid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    },
+                                                    "pvc_uid": {
+                                                      "nullable": true,
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "kind"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "storageGeneration": {
+                                                  "type": "string"
+                                                }
+                                              },
+                                              "required": [
+                                                "replica",
+                                                "storage",
+                                                "storageGeneration"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "identity",
+                                            "processSessionId",
+                                            "replicatorCreationId",
+                                            "role",
+                                            "storageIncarnation"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "admitted",
+                                        "bootstrapEpoch",
+                                        "interrupted",
+                                        "phase",
+                                        "receiver",
+                                        "source"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "catchUp": {
+                                      "description": "Captures the caller's selection, not the predicate or value policy.",
+                                      "enum": [
+                                        "WriteQuorum",
+                                        "All",
+                                        null
+                                      ],
+                                      "nullable": true,
+                                      "type": "string"
+                                    },
+                                    "predecessorCreationId": {
+                                      "type": "string"
+                                    },
+                                    "predecessorOperations": {
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "type": "array"
+                                    },
+                                    "predecessorProcessSessionId": {
+                                      "type": "string"
+                                    },
+                                    "receiverSettlements": {
+                                      "items": {
+                                        "description": "Names an independently joined receiver goal. The receiver is queried again\nby the host; carrying this claim never proves its execution or acceptance.",
+                                        "properties": {
+                                          "sourceOperationId": {
+                                            "type": "string"
+                                          },
+                                          "terminalGoal": {
+                                            "$ref": "#/components/schemas/ReplicaGoal"
+                                          }
+                                        },
+                                        "required": [
+                                          "sourceOperationId",
+                                          "terminalGoal"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "type": "array"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "predecessorCreationId",
+                                    "predecessorOperations",
+                                    "predecessorProcessSessionId",
+                                    "receiverSettlements",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "remote": {
+                                  "nullable": true,
+                                  "properties": {
+                                    "generation": {
+                                      "format": "uint64",
+                                      "minimum": 0.0,
+                                      "type": "integer"
+                                    },
+                                    "originalMember": {
+                                      "$ref": "#/components/schemas/ReplicaGoal",
+                                      "nullable": true
+                                    },
+                                    "source": {
+                                      "properties": {
+                                        "format": {
+                                          "format": "uint32",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "generation": {
+                                          "format": "uint64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "replicationAddress": {
+                                          "type": "string"
+                                        },
+                                        "role": {
+                                          "description": "Runtime role of one exact replica incarnation.",
+                                          "enum": [
+                                            "primary",
+                                            "activeSecondary",
+                                            "idleSecondary",
+                                            "none"
+                                          ],
+                                          "type": "string"
+                                        },
+                                        "scope": {
+                                          "properties": {
+                                            "configuration": {
+                                              "properties": {
+                                                "current": {
+                                                  "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                                  "properties": {
+                                                    "configurationId": {
+                                                      "type": "string"
+                                                    },
+                                                    "epoch": {
+                                                      "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                                      "properties": {
+                                                        "configurationNumber": {
+                                                          "format": "int64",
+                                                          "minimum": 0.0,
+                                                          "type": "integer"
+                                                        },
+                                                        "dataLossNumber": {
+                                                          "format": "int64",
+                                                          "minimum": 0.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "configurationNumber",
+                                                        "dataLossNumber"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "members": {
+                                                      "items": {
+                                                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                        "properties": {
+                                                          "agentGeneration": {
+                                                            "type": "string"
+                                                          },
+                                                          "instanceId": {
+                                                            "type": "string"
+                                                          },
+                                                          "replicaId": {
+                                                            "format": "int64",
+                                                            "minimum": 1.0,
+                                                            "type": "integer"
+                                                          },
+                                                          "role": {
+                                                            "description": "Runtime role of one exact replica incarnation.",
+                                                            "enum": [
+                                                              "primary",
+                                                              "activeSecondary",
+                                                              "idleSecondary",
+                                                              "none"
+                                                            ],
+                                                            "type": "string"
+                                                          }
+                                                        },
+                                                        "required": [
+                                                          "agentGeneration",
+                                                          "instanceId",
+                                                          "replicaId",
+                                                          "role"
+                                                        ],
+                                                        "type": "object"
+                                                      },
+                                                      "type": "array"
+                                                    },
+                                                    "writeQuorum": {
+                                                      "format": "uint32",
+                                                      "minimum": 0.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "configurationId",
+                                                    "epoch",
+                                                    "members",
+                                                    "writeQuorum"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "previous": {
+                                                  "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                                  "nullable": true,
+                                                  "properties": {
+                                                    "configurationId": {
+                                                      "type": "string"
+                                                    },
+                                                    "epoch": {
+                                                      "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                                      "properties": {
+                                                        "configurationNumber": {
+                                                          "format": "int64",
+                                                          "minimum": 0.0,
+                                                          "type": "integer"
+                                                        },
+                                                        "dataLossNumber": {
+                                                          "format": "int64",
+                                                          "minimum": 0.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "configurationNumber",
+                                                        "dataLossNumber"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "members": {
+                                                      "items": {
+                                                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                        "properties": {
+                                                          "agentGeneration": {
+                                                            "type": "string"
+                                                          },
+                                                          "instanceId": {
+                                                            "type": "string"
+                                                          },
+                                                          "replicaId": {
+                                                            "format": "int64",
+                                                            "minimum": 1.0,
+                                                            "type": "integer"
+                                                          },
+                                                          "role": {
+                                                            "description": "Runtime role of one exact replica incarnation.",
+                                                            "enum": [
+                                                              "primary",
+                                                              "activeSecondary",
+                                                              "idleSecondary",
+                                                              "none"
+                                                            ],
+                                                            "type": "string"
+                                                          }
+                                                        },
+                                                        "required": [
+                                                          "agentGeneration",
+                                                          "instanceId",
+                                                          "replicaId",
+                                                          "role"
+                                                        ],
+                                                        "type": "object"
+                                                      },
+                                                      "type": "array"
+                                                    },
+                                                    "writeQuorum": {
+                                                      "format": "uint32",
+                                                      "minimum": 0.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "configurationId",
+                                                    "epoch",
+                                                    "members",
+                                                    "writeQuorum"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "replicas": {
+                                                  "items": {
+                                                    "properties": {
+                                                      "catchUpCapability": {
+                                                        "format": "int64",
+                                                        "type": "integer"
+                                                      },
+                                                      "currentProgress": {
+                                                        "format": "int64",
+                                                        "type": "integer"
+                                                      },
+                                                      "identity": {
+                                                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                        "properties": {
+                                                          "agentGeneration": {
+                                                            "type": "string"
+                                                          },
+                                                          "instanceId": {
+                                                            "type": "string"
+                                                          },
+                                                          "replicaId": {
+                                                            "format": "int64",
+                                                            "minimum": 1.0,
+                                                            "type": "integer"
+                                                          }
+                                                        },
+                                                        "required": [
+                                                          "agentGeneration",
+                                                          "instanceId",
+                                                          "replicaId"
+                                                        ],
+                                                        "type": "object"
+                                                      },
+                                                      "isReady": {
+                                                        "type": "boolean"
+                                                      },
+                                                      "isUp": {
+                                                        "type": "boolean"
+                                                      },
+                                                      "mustCatchup": {
+                                                        "type": "boolean"
+                                                      },
+                                                      "processSessionId": {
+                                                        "type": "string"
+                                                      },
+                                                      "replicationAddress": {
+                                                        "type": "string"
+                                                      },
+                                                      "role": {
+                                                        "description": "Runtime role of one exact replica incarnation.",
+                                                        "enum": [
+                                                          "primary",
+                                                          "activeSecondary",
+                                                          "idleSecondary",
+                                                          "none"
+                                                        ],
+                                                        "type": "string"
+                                                      },
+                                                      "storageIncarnation": {
+                                                        "properties": {
+                                                          "replica": {
+                                                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                            "properties": {
+                                                              "agentGeneration": {
+                                                                "type": "string"
+                                                              },
+                                                              "instanceId": {
+                                                                "type": "string"
+                                                              },
+                                                              "replicaId": {
+                                                                "format": "int64",
+                                                                "minimum": 1.0,
+                                                                "type": "integer"
+                                                              }
+                                                            },
+                                                            "required": [
+                                                              "agentGeneration",
+                                                              "instanceId",
+                                                              "replicaId"
+                                                            ],
+                                                            "type": "object"
+                                                          },
+                                                          "storage": {
+                                                            "properties": {
+                                                              "identity": {
+                                                                "nullable": true,
+                                                                "type": "string"
+                                                              },
+                                                              "kind": {
+                                                                "type": "string"
+                                                              },
+                                                              "pod_uid": {
+                                                                "nullable": true,
+                                                                "type": "string"
+                                                              },
+                                                              "pvc_uid": {
+                                                                "nullable": true,
+                                                                "type": "string"
+                                                              }
+                                                            },
+                                                            "required": [
+                                                              "kind"
+                                                            ],
+                                                            "type": "object"
+                                                          },
+                                                          "storageGeneration": {
+                                                            "type": "string"
+                                                          }
+                                                        },
+                                                        "required": [
+                                                          "replica",
+                                                          "storage",
+                                                          "storageGeneration"
+                                                        ],
+                                                        "type": "object"
+                                                      }
+                                                    },
+                                                    "required": [
+                                                      "catchUpCapability",
+                                                      "currentProgress",
+                                                      "identity",
+                                                      "isReady",
+                                                      "isUp",
+                                                      "mustCatchup",
+                                                      "processSessionId",
+                                                      "replicationAddress",
+                                                      "role",
+                                                      "storageIncarnation"
+                                                    ],
+                                                    "type": "object"
+                                                  },
+                                                  "type": "array"
+                                                }
+                                              },
+                                              "required": [
+                                                "current",
+                                                "replicas"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "creationId": {
+                                              "type": "string"
+                                            },
+                                            "epoch": {
+                                              "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                               "properties": {
                                                 "configurationNumber": {
                                                   "format": "int64",
@@ -1426,7 +2237,7 @@
                                                       "type": "string"
                                                     },
                                                     "epoch": {
-                                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                      "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                       "properties": {
                                                         "configurationNumber": {
                                                           "format": "int64",
@@ -1503,7 +2314,7 @@
                                                       "type": "string"
                                                     },
                                                     "epoch": {
-                                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                      "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                       "properties": {
                                                         "configurationNumber": {
                                                           "format": "int64",
@@ -1716,7 +2527,7 @@
                                               "type": "string"
                                             },
                                             "epoch": {
-                                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                              "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                               "properties": {
                                                 "configurationNumber": {
                                                   "format": "int64",
@@ -1883,8 +2694,8 @@
                             },
                             "format": {
                               "format": "uint32",
-                              "maximum": 19.0,
-                              "minimum": 19.0,
+                              "maximum": 23.0,
+                              "minimum": 23.0,
                               "type": "integer"
                             },
                             "identity": {
@@ -1925,7 +2736,7 @@
                                           "type": "string"
                                         },
                                         "epoch": {
-                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                           "properties": {
                                             "configurationNumber": {
                                               "format": "int64",
@@ -2002,7 +2813,7 @@
                                           "type": "string"
                                         },
                                         "epoch": {
-                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                           "properties": {
                                             "configurationNumber": {
                                               "format": "int64",
@@ -2215,7 +3026,7 @@
                                   "type": "string"
                                 },
                                 "epoch": {
-                                  "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                  "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                   "properties": {
                                     "configurationNumber": {
                                       "format": "int64",
@@ -2343,9 +3154,30 @@
                           ],
                           "type": "object"
                         },
+                        "nativeStatus": {
+                          "minLength": 2,
+                          "nullable": true,
+                          "type": "string"
+                        },
                         "outcome": {
                           "nullable": true,
                           "properties": {
+                            "completedHandoff": {
+                              "description": "Ordered completed transfer effects, not current native availability.",
+                              "items": {
+                                "enum": [
+                                  "revoke",
+                                  "epoch",
+                                  "refreshedConfiguration",
+                                  "all",
+                                  "replicatorDemotion",
+                                  "applicationDemotion"
+                                ],
+                                "type": "string"
+                              },
+                              "nullable": true,
+                              "type": "array"
+                            },
                             "goal": {
                               "properties": {
                                 "desired": {
@@ -2364,6 +3196,7 @@
                                       "enum": [
                                         "discover",
                                         "restoreRetainedMember",
+                                        "recoverContainedCreation",
                                         "prepare",
                                         "reconfigure",
                                         "refreshPrimary",
@@ -2393,7 +3226,7 @@
                                               "type": "string"
                                             },
                                             "epoch": {
-                                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                              "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                               "properties": {
                                                 "configurationNumber": {
                                                   "format": "int64",
@@ -2478,13 +3311,12 @@
                                       ],
                                       "type": "object"
                                     },
-                                    "remote": {
+                                    "rebuild": {
+                                      "description": "Selected retained inspection and source, not a copy or exclusion certificate.",
                                       "nullable": true,
                                       "properties": {
-                                        "generation": {
-                                          "format": "uint64",
-                                          "minimum": 0.0,
-                                          "type": "integer"
+                                        "inspection": {
+                                          "$ref": "#/components/schemas/ReplicaGoal"
                                         },
                                         "source": {
                                           "properties": {
@@ -2522,7 +3354,7 @@
                                                           "type": "string"
                                                         },
                                                         "epoch": {
-                                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                           "properties": {
                                                             "configurationNumber": {
                                                               "format": "int64",
@@ -2599,7 +3431,7 @@
                                                           "type": "string"
                                                         },
                                                         "epoch": {
-                                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                           "properties": {
                                                             "configurationNumber": {
                                                               "format": "int64",
@@ -2812,7 +3644,818 @@
                                                   "type": "string"
                                                 },
                                                 "epoch": {
-                                                  "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                  "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                                  "properties": {
+                                                    "configurationNumber": {
+                                                      "format": "int64",
+                                                      "minimum": 0.0,
+                                                      "type": "integer"
+                                                    },
+                                                    "dataLossNumber": {
+                                                      "format": "int64",
+                                                      "minimum": 0.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "configurationNumber",
+                                                    "dataLossNumber"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "history": {
+                                                  "properties": {
+                                                    "dataLossNumber": {
+                                                      "format": "int64",
+                                                      "type": "integer"
+                                                    },
+                                                    "historyId": {
+                                                      "type": "string"
+                                                    },
+                                                    "protocolGeneration": {
+                                                      "format": "uint64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    },
+                                                    "resourceUid": {
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "dataLossNumber",
+                                                    "historyId",
+                                                    "protocolGeneration",
+                                                    "resourceUid"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "processSessionId": {
+                                                  "type": "string"
+                                                },
+                                                "storage": {
+                                                  "properties": {
+                                                    "replica": {
+                                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                      "properties": {
+                                                        "agentGeneration": {
+                                                          "type": "string"
+                                                        },
+                                                        "instanceId": {
+                                                          "type": "string"
+                                                        },
+                                                        "replicaId": {
+                                                          "format": "int64",
+                                                          "minimum": 1.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "agentGeneration",
+                                                        "instanceId",
+                                                        "replicaId"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storage": {
+                                                      "properties": {
+                                                        "identity": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "kind": {
+                                                          "type": "string"
+                                                        },
+                                                        "pod_uid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "pvc_uid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "kind"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storageGeneration": {
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "replica",
+                                                    "storage",
+                                                    "storageGeneration"
+                                                  ],
+                                                  "type": "object"
+                                                }
+                                              },
+                                              "required": [
+                                                "configuration",
+                                                "creationId",
+                                                "epoch",
+                                                "history",
+                                                "processSessionId",
+                                                "storage"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "stage": {
+                                              "enum": [
+                                                "DiscoveryPending",
+                                                "AchievedScope"
+                                              ],
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "format",
+                                            "generation",
+                                            "replicationAddress",
+                                            "role",
+                                            "scope",
+                                            "stage"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "inspection",
+                                        "source"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "recovery": {
+                                      "description": "Exact journal dependencies, not certificates of death, drainage or readiness.",
+                                      "nullable": true,
+                                      "properties": {
+                                        "addition": {
+                                          "description": "A closed addition template. Historical goals are immutable root references,\nnot caller-selected instructions or claims of native completion.",
+                                          "nullable": true,
+                                          "properties": {
+                                            "admitted": {
+                                              "$ref": "#/components/schemas/ReplicaGoal"
+                                            },
+                                            "bootstrapEpoch": {
+                                              "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                              "properties": {
+                                                "configurationNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                },
+                                                "dataLossNumber": {
+                                                  "format": "int64",
+                                                  "minimum": 0.0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "configurationNumber",
+                                                "dataLossNumber"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "interrupted": {
+                                              "$ref": "#/components/schemas/ReplicaGoal"
+                                            },
+                                            "phase": {
+                                              "enum": [
+                                                "Bootstrap",
+                                                "Receiver",
+                                                "Joint",
+                                                "Current"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "receiver": {
+                                              "properties": {
+                                                "identity": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "processSessionId": {
+                                                  "type": "string"
+                                                },
+                                                "replicatorCreationId": {
+                                                  "type": "string"
+                                                },
+                                                "role": {
+                                                  "description": "Runtime role of one exact replica incarnation.",
+                                                  "enum": [
+                                                    "primary",
+                                                    "activeSecondary",
+                                                    "idleSecondary",
+                                                    "none"
+                                                  ],
+                                                  "type": "string"
+                                                },
+                                                "storageIncarnation": {
+                                                  "properties": {
+                                                    "replica": {
+                                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                      "properties": {
+                                                        "agentGeneration": {
+                                                          "type": "string"
+                                                        },
+                                                        "instanceId": {
+                                                          "type": "string"
+                                                        },
+                                                        "replicaId": {
+                                                          "format": "int64",
+                                                          "minimum": 1.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "agentGeneration",
+                                                        "instanceId",
+                                                        "replicaId"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storage": {
+                                                      "properties": {
+                                                        "identity": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "kind": {
+                                                          "type": "string"
+                                                        },
+                                                        "pod_uid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "pvc_uid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "kind"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storageGeneration": {
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "replica",
+                                                    "storage",
+                                                    "storageGeneration"
+                                                  ],
+                                                  "type": "object"
+                                                }
+                                              },
+                                              "required": [
+                                                "identity",
+                                                "processSessionId",
+                                                "replicatorCreationId",
+                                                "role",
+                                                "storageIncarnation"
+                                              ],
+                                              "type": "object"
+                                            },
+                                            "source": {
+                                              "properties": {
+                                                "identity": {
+                                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                  "properties": {
+                                                    "agentGeneration": {
+                                                      "type": "string"
+                                                    },
+                                                    "instanceId": {
+                                                      "type": "string"
+                                                    },
+                                                    "replicaId": {
+                                                      "format": "int64",
+                                                      "minimum": 1.0,
+                                                      "type": "integer"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "agentGeneration",
+                                                    "instanceId",
+                                                    "replicaId"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "processSessionId": {
+                                                  "type": "string"
+                                                },
+                                                "replicatorCreationId": {
+                                                  "type": "string"
+                                                },
+                                                "role": {
+                                                  "description": "Runtime role of one exact replica incarnation.",
+                                                  "enum": [
+                                                    "primary",
+                                                    "activeSecondary",
+                                                    "idleSecondary",
+                                                    "none"
+                                                  ],
+                                                  "type": "string"
+                                                },
+                                                "storageIncarnation": {
+                                                  "properties": {
+                                                    "replica": {
+                                                      "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                      "properties": {
+                                                        "agentGeneration": {
+                                                          "type": "string"
+                                                        },
+                                                        "instanceId": {
+                                                          "type": "string"
+                                                        },
+                                                        "replicaId": {
+                                                          "format": "int64",
+                                                          "minimum": 1.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "agentGeneration",
+                                                        "instanceId",
+                                                        "replicaId"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storage": {
+                                                      "properties": {
+                                                        "identity": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "kind": {
+                                                          "type": "string"
+                                                        },
+                                                        "pod_uid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        },
+                                                        "pvc_uid": {
+                                                          "nullable": true,
+                                                          "type": "string"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "kind"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "storageGeneration": {
+                                                      "type": "string"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "replica",
+                                                    "storage",
+                                                    "storageGeneration"
+                                                  ],
+                                                  "type": "object"
+                                                }
+                                              },
+                                              "required": [
+                                                "identity",
+                                                "processSessionId",
+                                                "replicatorCreationId",
+                                                "role",
+                                                "storageIncarnation"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "admitted",
+                                            "bootstrapEpoch",
+                                            "interrupted",
+                                            "phase",
+                                            "receiver",
+                                            "source"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "catchUp": {
+                                          "description": "Captures the caller's selection, not the predicate or value policy.",
+                                          "enum": [
+                                            "WriteQuorum",
+                                            "All",
+                                            null
+                                          ],
+                                          "nullable": true,
+                                          "type": "string"
+                                        },
+                                        "predecessorCreationId": {
+                                          "type": "string"
+                                        },
+                                        "predecessorOperations": {
+                                          "items": {
+                                            "type": "string"
+                                          },
+                                          "type": "array"
+                                        },
+                                        "predecessorProcessSessionId": {
+                                          "type": "string"
+                                        },
+                                        "receiverSettlements": {
+                                          "items": {
+                                            "description": "Names an independently joined receiver goal. The receiver is queried again\nby the host; carrying this claim never proves its execution or acceptance.",
+                                            "properties": {
+                                              "sourceOperationId": {
+                                                "type": "string"
+                                              },
+                                              "terminalGoal": {
+                                                "$ref": "#/components/schemas/ReplicaGoal"
+                                              }
+                                            },
+                                            "required": [
+                                              "sourceOperationId",
+                                              "terminalGoal"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "type": "array"
+                                        },
+                                        "role": {
+                                          "description": "Runtime role of one exact replica incarnation.",
+                                          "enum": [
+                                            "primary",
+                                            "activeSecondary",
+                                            "idleSecondary",
+                                            "none"
+                                          ],
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "predecessorCreationId",
+                                        "predecessorOperations",
+                                        "predecessorProcessSessionId",
+                                        "receiverSettlements",
+                                        "role"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "remote": {
+                                      "nullable": true,
+                                      "properties": {
+                                        "generation": {
+                                          "format": "uint64",
+                                          "minimum": 0.0,
+                                          "type": "integer"
+                                        },
+                                        "originalMember": {
+                                          "$ref": "#/components/schemas/ReplicaGoal",
+                                          "nullable": true
+                                        },
+                                        "source": {
+                                          "properties": {
+                                            "format": {
+                                              "format": "uint32",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            },
+                                            "generation": {
+                                              "format": "uint64",
+                                              "minimum": 0.0,
+                                              "type": "integer"
+                                            },
+                                            "replicationAddress": {
+                                              "type": "string"
+                                            },
+                                            "role": {
+                                              "description": "Runtime role of one exact replica incarnation.",
+                                              "enum": [
+                                                "primary",
+                                                "activeSecondary",
+                                                "idleSecondary",
+                                                "none"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "scope": {
+                                              "properties": {
+                                                "configuration": {
+                                                  "properties": {
+                                                    "current": {
+                                                      "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                                      "properties": {
+                                                        "configurationId": {
+                                                          "type": "string"
+                                                        },
+                                                        "epoch": {
+                                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                                          "properties": {
+                                                            "configurationNumber": {
+                                                              "format": "int64",
+                                                              "minimum": 0.0,
+                                                              "type": "integer"
+                                                            },
+                                                            "dataLossNumber": {
+                                                              "format": "int64",
+                                                              "minimum": 0.0,
+                                                              "type": "integer"
+                                                            }
+                                                          },
+                                                          "required": [
+                                                            "configurationNumber",
+                                                            "dataLossNumber"
+                                                          ],
+                                                          "type": "object"
+                                                        },
+                                                        "members": {
+                                                          "items": {
+                                                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                            "properties": {
+                                                              "agentGeneration": {
+                                                                "type": "string"
+                                                              },
+                                                              "instanceId": {
+                                                                "type": "string"
+                                                              },
+                                                              "replicaId": {
+                                                                "format": "int64",
+                                                                "minimum": 1.0,
+                                                                "type": "integer"
+                                                              },
+                                                              "role": {
+                                                                "description": "Runtime role of one exact replica incarnation.",
+                                                                "enum": [
+                                                                  "primary",
+                                                                  "activeSecondary",
+                                                                  "idleSecondary",
+                                                                  "none"
+                                                                ],
+                                                                "type": "string"
+                                                              }
+                                                            },
+                                                            "required": [
+                                                              "agentGeneration",
+                                                              "instanceId",
+                                                              "replicaId",
+                                                              "role"
+                                                            ],
+                                                            "type": "object"
+                                                          },
+                                                          "type": "array"
+                                                        },
+                                                        "writeQuorum": {
+                                                          "format": "uint32",
+                                                          "minimum": 0.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "configurationId",
+                                                        "epoch",
+                                                        "members",
+                                                        "writeQuorum"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "previous": {
+                                                      "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                                                      "nullable": true,
+                                                      "properties": {
+                                                        "configurationId": {
+                                                          "type": "string"
+                                                        },
+                                                        "epoch": {
+                                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
+                                                          "properties": {
+                                                            "configurationNumber": {
+                                                              "format": "int64",
+                                                              "minimum": 0.0,
+                                                              "type": "integer"
+                                                            },
+                                                            "dataLossNumber": {
+                                                              "format": "int64",
+                                                              "minimum": 0.0,
+                                                              "type": "integer"
+                                                            }
+                                                          },
+                                                          "required": [
+                                                            "configurationNumber",
+                                                            "dataLossNumber"
+                                                          ],
+                                                          "type": "object"
+                                                        },
+                                                        "members": {
+                                                          "items": {
+                                                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                            "properties": {
+                                                              "agentGeneration": {
+                                                                "type": "string"
+                                                              },
+                                                              "instanceId": {
+                                                                "type": "string"
+                                                              },
+                                                              "replicaId": {
+                                                                "format": "int64",
+                                                                "minimum": 1.0,
+                                                                "type": "integer"
+                                                              },
+                                                              "role": {
+                                                                "description": "Runtime role of one exact replica incarnation.",
+                                                                "enum": [
+                                                                  "primary",
+                                                                  "activeSecondary",
+                                                                  "idleSecondary",
+                                                                  "none"
+                                                                ],
+                                                                "type": "string"
+                                                              }
+                                                            },
+                                                            "required": [
+                                                              "agentGeneration",
+                                                              "instanceId",
+                                                              "replicaId",
+                                                              "role"
+                                                            ],
+                                                            "type": "object"
+                                                          },
+                                                          "type": "array"
+                                                        },
+                                                        "writeQuorum": {
+                                                          "format": "uint32",
+                                                          "minimum": 0.0,
+                                                          "type": "integer"
+                                                        }
+                                                      },
+                                                      "required": [
+                                                        "configurationId",
+                                                        "epoch",
+                                                        "members",
+                                                        "writeQuorum"
+                                                      ],
+                                                      "type": "object"
+                                                    },
+                                                    "replicas": {
+                                                      "items": {
+                                                        "properties": {
+                                                          "catchUpCapability": {
+                                                            "format": "int64",
+                                                            "type": "integer"
+                                                          },
+                                                          "currentProgress": {
+                                                            "format": "int64",
+                                                            "type": "integer"
+                                                          },
+                                                          "identity": {
+                                                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                            "properties": {
+                                                              "agentGeneration": {
+                                                                "type": "string"
+                                                              },
+                                                              "instanceId": {
+                                                                "type": "string"
+                                                              },
+                                                              "replicaId": {
+                                                                "format": "int64",
+                                                                "minimum": 1.0,
+                                                                "type": "integer"
+                                                              }
+                                                            },
+                                                            "required": [
+                                                              "agentGeneration",
+                                                              "instanceId",
+                                                              "replicaId"
+                                                            ],
+                                                            "type": "object"
+                                                          },
+                                                          "isReady": {
+                                                            "type": "boolean"
+                                                          },
+                                                          "isUp": {
+                                                            "type": "boolean"
+                                                          },
+                                                          "mustCatchup": {
+                                                            "type": "boolean"
+                                                          },
+                                                          "processSessionId": {
+                                                            "type": "string"
+                                                          },
+                                                          "replicationAddress": {
+                                                            "type": "string"
+                                                          },
+                                                          "role": {
+                                                            "description": "Runtime role of one exact replica incarnation.",
+                                                            "enum": [
+                                                              "primary",
+                                                              "activeSecondary",
+                                                              "idleSecondary",
+                                                              "none"
+                                                            ],
+                                                            "type": "string"
+                                                          },
+                                                          "storageIncarnation": {
+                                                            "properties": {
+                                                              "replica": {
+                                                                "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                                                "properties": {
+                                                                  "agentGeneration": {
+                                                                    "type": "string"
+                                                                  },
+                                                                  "instanceId": {
+                                                                    "type": "string"
+                                                                  },
+                                                                  "replicaId": {
+                                                                    "format": "int64",
+                                                                    "minimum": 1.0,
+                                                                    "type": "integer"
+                                                                  }
+                                                                },
+                                                                "required": [
+                                                                  "agentGeneration",
+                                                                  "instanceId",
+                                                                  "replicaId"
+                                                                ],
+                                                                "type": "object"
+                                                              },
+                                                              "storage": {
+                                                                "properties": {
+                                                                  "identity": {
+                                                                    "nullable": true,
+                                                                    "type": "string"
+                                                                  },
+                                                                  "kind": {
+                                                                    "type": "string"
+                                                                  },
+                                                                  "pod_uid": {
+                                                                    "nullable": true,
+                                                                    "type": "string"
+                                                                  },
+                                                                  "pvc_uid": {
+                                                                    "nullable": true,
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "required": [
+                                                                  "kind"
+                                                                ],
+                                                                "type": "object"
+                                                              },
+                                                              "storageGeneration": {
+                                                                "type": "string"
+                                                              }
+                                                            },
+                                                            "required": [
+                                                              "replica",
+                                                              "storage",
+                                                              "storageGeneration"
+                                                            ],
+                                                            "type": "object"
+                                                          }
+                                                        },
+                                                        "required": [
+                                                          "catchUpCapability",
+                                                          "currentProgress",
+                                                          "identity",
+                                                          "isReady",
+                                                          "isUp",
+                                                          "mustCatchup",
+                                                          "processSessionId",
+                                                          "replicationAddress",
+                                                          "role",
+                                                          "storageIncarnation"
+                                                        ],
+                                                        "type": "object"
+                                                      },
+                                                      "type": "array"
+                                                    }
+                                                  },
+                                                  "required": [
+                                                    "current",
+                                                    "replicas"
+                                                  ],
+                                                  "type": "object"
+                                                },
+                                                "creationId": {
+                                                  "type": "string"
+                                                },
+                                                "epoch": {
+                                                  "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                   "properties": {
                                                     "configurationNumber": {
                                                       "format": "int64",
@@ -2983,7 +4626,7 @@
                                                           "type": "string"
                                                         },
                                                         "epoch": {
-                                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                           "properties": {
                                                             "configurationNumber": {
                                                               "format": "int64",
@@ -3060,7 +4703,7 @@
                                                           "type": "string"
                                                         },
                                                         "epoch": {
-                                                          "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                          "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                           "properties": {
                                                             "configurationNumber": {
                                                               "format": "int64",
@@ -3273,7 +4916,7 @@
                                                   "type": "string"
                                                 },
                                                 "epoch": {
-                                                  "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                                  "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                                   "properties": {
                                                     "configurationNumber": {
                                                       "format": "int64",
@@ -3440,8 +5083,8 @@
                                 },
                                 "format": {
                                   "format": "uint32",
-                                  "maximum": 19.0,
-                                  "minimum": 19.0,
+                                  "maximum": 23.0,
+                                  "minimum": 23.0,
                                   "type": "integer"
                                 },
                                 "identity": {
@@ -3482,7 +5125,7 @@
                                               "type": "string"
                                             },
                                             "epoch": {
-                                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                              "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                               "properties": {
                                                 "configurationNumber": {
                                                   "format": "int64",
@@ -3559,7 +5202,7 @@
                                               "type": "string"
                                             },
                                             "epoch": {
-                                              "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                              "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                               "properties": {
                                                 "configurationNumber": {
                                                   "format": "int64",
@@ -3772,7 +5415,7 @@
                                       "type": "string"
                                     },
                                     "epoch": {
-                                      "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                      "description": "Compact primary fence, ordered by data loss then primary attempt.\nConfiguration identity and goal revision order changes within a fence.\nThis is not Service Fabric's packed configuration-version wire integer.",
                                       "properties": {
                                         "configurationNumber": {
                                           "format": "int64",
@@ -3899,6 +5542,10 @@
                                 "scope"
                               ],
                               "type": "object"
+                            },
+                            "hostSettled": {
+                              "default": false,
+                              "type": "boolean"
                             },
                             "receipts": {
                               "format": "uint",

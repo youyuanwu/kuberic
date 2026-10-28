@@ -54,6 +54,47 @@ pub struct PgLineage {
 }
 
 impl PgLineage {
+    pub(crate) fn prefix_is_contained_by(
+        &self,
+        source: &Self,
+        required_lsn: i64,
+        source_flush_lsn: i64,
+    ) -> bool {
+        if self.validate().is_err()
+            || source.validate().is_err()
+            || self.system_identifier != source.system_identifier
+            || required_lsn < 0
+            || source_flush_lsn < required_lsn
+        {
+            return false;
+        }
+        let target_segments = self
+            .history
+            .iter()
+            .map(|fork| (fork.timeline, fork.end_lsn))
+            .chain(std::iter::once((self.timeline, i64::MAX)));
+        let source_segments = source
+            .history
+            .iter()
+            .map(|fork| (fork.timeline, fork.end_lsn))
+            .chain(std::iter::once((source.timeline, i64::MAX)));
+        // Equal system IDs/LSNs cannot prove inclusion across a timeline fork.
+        for ((target_timeline, target_end), (source_timeline, source_end)) in
+            target_segments.zip(source_segments)
+        {
+            if target_timeline != source_timeline {
+                return false;
+            }
+            if required_lsn <= target_end.min(source_end) {
+                return true;
+            }
+            if target_end != source_end {
+                return false;
+            }
+        }
+        false
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self
             .system_identifier
@@ -292,4 +333,53 @@ pub fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Resul
         return Err("native envelope must use canonical encoding".into());
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+
+    fn lineage(timeline: u32, forks: &[(u32, i64)]) -> PgLineage {
+        PgLineage {
+            system_identifier: "12345".into(),
+            timeline,
+            history: forks
+                .iter()
+                .map(|(timeline, end_lsn)| TimelineFork {
+                    timeline: *timeline,
+                    end_lsn: *end_lsn,
+                })
+                .collect(),
+            history_text: forks
+                .iter()
+                .map(|(timeline, end_lsn)| format!("{timeline}\t0/{end_lsn:X}\ttest fork\n"))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn m3_pg_native_prefix_proof_requires_fork_inclusion_not_just_system_identifier() {
+        let retained = lineage(1, &[]);
+        let source = lineage(2, &[(1, 200)]);
+        assert!(retained.prefix_is_contained_by(&source, 200, 300));
+        assert!(!retained.prefix_is_contained_by(&source, 201, 300));
+        assert!(!retained.prefix_is_contained_by(&source, 200, 199));
+
+        let diverged = lineage(3, &[(1, 100)]);
+        assert!(diverged.prefix_is_contained_by(&source, 100, 300));
+        assert!(!diverged.prefix_is_contained_by(&source, 101, 300));
+        assert!(!source.prefix_is_contained_by(&diverged, 201, 300));
+
+        let child = lineage(4, &[(1, 200), (2, 400)]);
+        assert!(source.prefix_is_contained_by(&child, 400, 500));
+        assert!(!source.prefix_is_contained_by(&child, 401, 500));
+        assert!(child.prefix_is_contained_by(&child, 500, 500));
+        let mut foreign = child.clone();
+        foreign.system_identifier = "98765".into();
+        assert!(!child.prefix_is_contained_by(&foreign, 300, 500));
+        assert!(!child.prefix_is_contained_by(&child, -1, 500));
+        let mut inconsistent = child.clone();
+        inconsistent.history_text.clear();
+        assert!(!inconsistent.prefix_is_contained_by(&child, 300, 500));
+    }
 }

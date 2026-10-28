@@ -10,11 +10,14 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 19;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 23;
 
 #[path = "replica_goal.rs"]
 mod replica_goal;
 pub use replica_goal::*;
+#[path = "native_observation.rs"]
+mod native_observation;
+pub use native_observation::*;
 pub(crate) const PUBLIC_V1_PROTOCOL_REGISTRATIONS: &[&str] = &["PUBLIC_V1_PROTOCOL_VERSION"];
 pub const INVALID_LSN: i64 = -1;
 

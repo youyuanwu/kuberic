@@ -275,7 +275,8 @@ impl PartitionAccess {
     fn observe(&self, observation: LifecycleObservation) {
         let mut state = self.state.lock().unwrap();
         match observation {
-            LifecycleObservation::TransportQuorum { .. } => {}
+            LifecycleObservation::TransportQuorum { .. }
+            | LifecycleObservation::EpochApplied(_) => {}
             LifecycleObservation::Ready(role) => {
                 state.replicator_open = true;
                 if state.replicator_role != role && role != ReplicaRole::Primary {

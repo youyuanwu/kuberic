@@ -315,6 +315,8 @@ impl Fixture {
         let replication = Arc::new(Replication(probe.clone()));
         let drain_probe = probe.clone();
         let callbacks = PublicLifecycleCallbacks {
+            native: None,
+            peer_address: None,
             peer_credentials: None,
             ordinary: false,
             abort_creation: None,
@@ -1454,12 +1456,7 @@ async fn native_observer_between_receipted_callbacks_does_not_require_runtime_sh
         let mut fixture = Fixture::new().await;
         let (_contained, witness) = tokio::sync::watch::channel(false);
         fixture.callbacks.containment = Some(witness);
-        let cut = Arc::new(PublicOperationCut {
-            position,
-            index,
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
+        let cut = Arc::new(PublicOperationCut::new(position, index));
         fixture.callbacks.cut = Some(cut.clone());
         let operation = fixture
             .launch(
@@ -1530,12 +1527,10 @@ async fn native_observer_selected_host_revoke_does_not_require_runtime_shutdown(
             refreshed.current.members.clone(),
             refreshed.current.write_quorum,
         );
-        let cut = Arc::new(PublicOperationCut {
-            position: PublicCutPosition::InstructionSelected,
-            index: if composed { 0 } else { 2 },
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-        });
+        let cut = Arc::new(PublicOperationCut::new(
+            PublicCutPosition::InstructionSelected,
+            if composed { 0 } else { 2 },
+        ));
         fixture.callbacks.cut = Some(cut.clone());
         let operation = fixture
             .launch(
@@ -2089,12 +2084,7 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let cut = Arc::new(PublicOperationCut {
-            position,
-            index,
-            entered: Notify::new(),
-            release: Notify::new(),
-        });
+        let cut = Arc::new(PublicOperationCut::new(position, index));
         let mut callbacks = self.callbacks.clone();
         callbacks.aborted = self.registry.abort_guard();
         callbacks.cut = Some(cut.clone());

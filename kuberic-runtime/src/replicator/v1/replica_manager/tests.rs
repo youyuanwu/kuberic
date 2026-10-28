@@ -114,6 +114,177 @@ fn member(id: i64) -> SessionMember {
     member_with_send(id, Arc::new(|_| true))
 }
 
+#[test]
+fn live_retained_target_keeps_frozen_pc_and_pending_commitment_until_fresh_root_ack() {
+    let mut manager = manager(64, true);
+    let old = member(2);
+    let original = set(2, std::slice::from_ref(&old));
+    configure(&mut manager, original.clone(), None, false)
+        .dispatch(now())
+        .unwrap();
+    let (lsn, mut completion) = enqueue(&mut manager);
+    assert_eq!(lsn, 1);
+    assert_eq!(completion.try_recv(), Err(TryRecvError::Empty));
+    old.session.close();
+    let fresh = member_with_identity(
+        2,
+        SessionIdentity {
+            primary_endpoint: "primary".into(),
+            remote_endpoint: "fresh-same-retained-member".into(),
+            remote_incarnation: 8,
+        },
+        Arc::new(|_| true),
+    );
+    manager
+        .admit_live_target(2, &old.session, fresh.session.clone())
+        .unwrap()
+        .dispatch(now())
+        .unwrap();
+    assert_eq!(completion.try_recv(), Err(TryRecvError::Empty));
+    let joint = set(2, std::slice::from_ref(&fresh));
+    configure(&mut manager, joint.clone(), Some(original.clone()), true)
+        .dispatch(now())
+        .unwrap();
+    let (current, previous) = manager.configuration_roots();
+    assert!(
+        current.unwrap().members[0]
+            .session
+            .same_instance(&fresh.session)
+    );
+    assert!(
+        previous.unwrap().members[0]
+            .session
+            .same_instance(&old.session)
+    );
+    assert!(!old.session.same_instance(&fresh.session));
+    assert_eq!(completion.try_recv(), Err(TryRecvError::Empty));
+    ack(&mut manager, &fresh, 1, 1);
+    assert_eq!(completion.try_recv(), Ok(Ok(())));
+    assert_eq!(
+        old.session.progress(0).applied,
+        0,
+        "fresh logical support must not rewrite old physical credit"
+    );
+    assert_eq!(manager.queue().current_progress(), 1);
+    let (caught_up, effects) = manager.begin_catchup(CatchupMode::All).unwrap();
+    effects.dispatch(now()).unwrap();
+    assert_eq!(caught_up.blocking_recv().unwrap(), Ok(()));
+    configure(&mut manager, joint, None, false)
+        .dispatch(now())
+        .unwrap();
+    assert!(manager.configuration_roots().1.is_none());
+    let (lsn, mut next) = enqueue(&mut manager);
+    assert_eq!(lsn, 2);
+    assert_eq!(next.try_recv(), Err(TryRecvError::Empty));
+    ack(&mut manager, &fresh, 2, 2);
+    assert_eq!(next.try_recv(), Ok(Ok(())));
+}
+
+#[test]
+fn live_retained_target_preserves_true_missing_replay_and_original_root() {
+    let mut manager = manager(64, true);
+    let old = member(2);
+    configure(
+        &mut manager,
+        set(2, std::slice::from_ref(&old)),
+        None,
+        false,
+    )
+    .dispatch(now())
+    .unwrap();
+    let (_, mut completion) = enqueue(&mut manager);
+    ack(&mut manager, &old, 1, 1);
+    assert_eq!(completion.try_recv(), Ok(Ok(())));
+    old.session.close();
+    let fresh = member_with_identity(
+        2,
+        SessionIdentity {
+            primary_endpoint: "primary".into(),
+            remote_endpoint: "retained-but-missing-prefix".into(),
+            remote_incarnation: 8,
+        },
+        Arc::new(|_| true),
+    );
+    assert!(matches!(
+        manager.admit_live_target(2, &old.session, fresh.session),
+        Err(ManagerError::Configuration(
+            ConfigurationError::MissingCurrentReplay(2)
+        ))
+    ));
+    assert!(manager.live_reformation.is_none());
+    assert!(manager.current_root(2).unwrap().same_instance(&old.session));
+    assert_eq!(manager.queue().current_progress(), 1);
+}
+
+#[test]
+fn live_retained_target_does_not_replace_or_alias_other_original_member_roots() {
+    let mut manager = manager(64, true);
+    let old = member(2);
+    let unchanged = member(3);
+    let original = set(3, &[old.clone(), unchanged.clone()]);
+    configure(&mut manager, original.clone(), None, false)
+        .dispatch(now())
+        .unwrap();
+    let (_, mut completion) = enqueue(&mut manager);
+    old.session.close();
+    let fresh = member_with_identity(
+        2,
+        SessionIdentity {
+            primary_endpoint: "primary".into(),
+            remote_endpoint: "fresh-retained-target".into(),
+            remote_incarnation: 8,
+        },
+        Arc::new(|_| true),
+    );
+    manager
+        .admit_live_target(2, &old.session, fresh.session.clone())
+        .unwrap()
+        .dispatch(now())
+        .unwrap();
+    let impostor = member_with_identity(
+        3,
+        SessionIdentity {
+            primary_endpoint: "primary".into(),
+            remote_endpoint: "changed-unselected-peer".into(),
+            remote_incarnation: 9,
+        },
+        Arc::new(|_| true),
+    );
+    assert!(
+        manager
+            .configure_established(EstablishedConfiguration {
+                current: set(3, &[fresh.clone(), impostor]),
+                previous: Some(original.clone()),
+                catchup_configuration: true,
+            })
+            .is_err()
+    );
+    assert!(manager.live_reformation.as_ref().unwrap().joint.is_none());
+    configure(
+        &mut manager,
+        set(3, &[fresh.clone(), unchanged.clone()]),
+        Some(original),
+        true,
+    )
+    .dispatch(now())
+    .unwrap();
+    let (current, previous) = manager.configuration_roots();
+    for set in [current.unwrap(), previous.unwrap()] {
+        assert!(
+            set.members
+                .iter()
+                .find(|member| member.replica_id == 3)
+                .unwrap()
+                .session
+                .same_instance(&unchanged.session)
+        );
+    }
+    ack(&mut manager, &fresh, 1, 1);
+    assert_eq!(completion.try_recv(), Err(TryRecvError::Empty));
+    ack(&mut manager, &unchanged, 1, 1);
+    assert_eq!(completion.try_recv(), Ok(Ok(())));
+}
+
 fn enqueue(manager: &mut ReplicaManager) -> (Lsn, CompletionReceiver) {
     let admission = manager
         .enqueue(

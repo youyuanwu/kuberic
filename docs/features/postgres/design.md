@@ -307,6 +307,16 @@ Generic hosting journals only successful callback/effect receipts; access grant
 is separate. Restart can resume the same evidence or stay closed, never infer
 success from a role flag.
 
+Classic configuration callbacks omit stopped replicas. Selected native repair
+recovers only the quiescent former Primary's exact endpoint from the existing
+host publication, with matching PC/CC and unavailable progress/readiness.
+This is not a vote or an acknowledgement: the two-ended session, retained
+lineage, owned clone/rewind and actual replay must still establish eligibility.
+A running standby without an established native receiver is joined and
+reinitialized from retained WAL, not accepted as a live receiver by role alone.
+These native operations do not supply the independent-engine history contract
+required for general ordinary recovery/election.
+
 ## Scaling, Replacement and Restart
 
 Fresh sequential growth is qualified through ordinary production goals.
@@ -377,6 +387,15 @@ Success requires reaping every owned identity, not merely observing exit.
 Helpers (`initdb`, control-data/readiness probes, promotion, backup and rewind)
 share cancellation-safe ownership. Abort, signals, dropped futures and partial
 startup join cleanup; unrelated processes are never targets.
+
+Selected clone/rewind fixtures bind the same durable native owner and retain it
+through helper and postmaster cleanup. Preparing a candidate alone does not
+select ownership. Helper completion requires the selected supervisor's actual
+lineage-reaping receipt; failed launcher status and cancellation remain distinct.
+The controller keeps an exact selected terminal or a selected new-creation
+inspection observable past its outage cutoff, including before the first
+result. Observing that result does not restore serving access or make the old
+Primary an election candidate.
 
 Durable process-generation high-water marks prevent reuse after reopen; delayed
 cleanup/results/faults cannot affect a successor generation. Exhaustion is

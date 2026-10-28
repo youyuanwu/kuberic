@@ -364,15 +364,14 @@ impl StatefulServiceReplica for Application {
         *self.0.service_root.lock().await = Some(tokio::spawn(async move {
             let _ = stop.wait_for(|stopped| *stopped).await;
         }));
-        let factory: Arc<dyn ReplicatorFactory> = if self.0.default_factory.load(Ordering::Acquire)
-        {
-            Arc::new(DefaultReplicatorFactory::new())
+        let partition = if self.0.default_factory.load(Ordering::Acquire) {
+            context.partition.with_builtin_replicator()
         } else {
-            Arc::new(OrdinaryFactory(self.0.clone()))
+            context
+                .partition
+                .with_factory(Arc::new(OrdinaryFactory(self.0.clone())))
         };
-        let interfaces = context
-            .partition
-            .with_factory(factory)
+        let interfaces = partition
             .create_replicator(
                 Some(Arc::new(Provider)),
                 Some(ReplicatorSettings {
@@ -2617,6 +2616,7 @@ async fn production_ordinary_retained_remove_before_build_survives_recreation_an
     tombstone.operation_id = OperationId::new("retained-remove-before-build");
     tombstone.desired = ReplicaGoalKind::Remove {
         remote: Box::new(RemoteReplicaSelection {
+            original_member: None,
             source: source.publication.clone().unwrap(),
             target: target.publication.clone().unwrap(),
             target_control_address: crate::cluster_api::agent_endpoint(

@@ -36,6 +36,56 @@ impl PgConfig {
         Self::replace_config(&path, &(lines.join("\n") + "\n")).await
     }
 
+    pub(crate) async fn public_retained_standby(
+        &self,
+        data_dir: &Path,
+        timeline: u32,
+    ) -> Result<(), PgError> {
+        if timeline == 0 || !data_dir.join("standby.signal").is_file() {
+            return Err(PgError::Configuration(
+                "cold native initialization requires an existing retained standby".into(),
+            ));
+        }
+        let path = data_dir.join("postgresql.auto.conf");
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|error| PgError::Configuration(format!("read retained standby: {error}")))?;
+        let mut lines = content
+            .lines()
+            .filter(|line| {
+                !line.split_once('=').is_some_and(|(key, _)| {
+                    matches!(
+                        key.trim(),
+                        "primary_conninfo"
+                            | "primary_slot_name"
+                            | "restore_command"
+                            | "archive_cleanup_command"
+                            | "recovery_end_command"
+                            | "synchronous_standby_names"
+                    ) || key.trim().starts_with("recovery_target")
+                })
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // Only retained local WAL is available before fresh scoped reformation.
+        lines.extend([
+            "primary_conninfo = ''".into(),
+            "primary_slot_name = ''".into(),
+            "restore_command = ''".into(),
+            "archive_cleanup_command = ''".into(),
+            "recovery_end_command = ''".into(),
+            "synchronous_standby_names = ''".into(),
+            "recovery_target = ''".into(),
+            "recovery_target_name = ''".into(),
+            "recovery_target_time = ''".into(),
+            "recovery_target_xid = ''".into(),
+            "recovery_target_lsn = ''".into(),
+            "recovery_target_action = 'pause'".into(),
+            format!("recovery_target_timeline = '{timeline}'"),
+        ]);
+        Self::replace_config(&path, &(lines.join("\n") + "\n")).await
+    }
+
     pub fn new(port: u16, data_dir: &Path) -> Self {
         Self {
             port,
@@ -203,16 +253,40 @@ max_replication_slots = 32
     }
 
     pub(crate) async fn public_replication_fence(data_dir: &Path) -> Result<(), PgError> {
+        Self::public_rewind_peer_map(data_dir).await?;
         let path = data_dir.join("pg_hba.conf");
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|error| PgError::Configuration(error.to_string()))?;
-        let content = format!("# kuberic public-v1 native gateway\n{content}");
+        let content = if content.contains("# kuberic public-v1 native gateway") {
+            content
+        } else {
+            format!("# kuberic public-v1 native gateway\n{content}")
+        };
         Self::replace_config(
             &path,
             &replace_managed_hba(&content, false, "kuberic_app", "kuberic"),
         )
         .await
+    }
+
+    async fn public_rewind_peer_map(data_dir: &Path) -> Result<(), PgError> {
+        let user = whoami::username()
+            .map_err(|_| PgError::Configuration("cannot identify native Unix owner".into()))?;
+        let path = data_dir.join("pg_ident.conf");
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|error| PgError::Configuration(format!("read native peer map: {error}")))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(PgError::Configuration(
+                "native peer map must be an owned regular file".into(),
+            ));
+        }
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|error| PgError::Configuration(format!("read native peer map: {error}")))?;
+        let content = replace_rewind_peer_map(&content, &user)?;
+        Self::replace_config(&path, &content).await
     }
 
     pub(crate) async fn public_receiver(
@@ -252,7 +326,10 @@ max_replication_slots = 32
         // must not leave a background rename that can overwrite a later closed
         // HBA generation after its access lock has been released.
         let pending = path.with_extension("conf.pending");
-        let mut file = std::fs::File::create(&pending)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pending)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         std::fs::rename(&pending, path)?;
@@ -514,6 +591,11 @@ fn replace_managed_hba(
         "host postgres kuberic_rewind 127.0.0.1/32 trust\n\
          host postgres kuberic_rewind ::1/128 trust\n"
     };
+    let local_rewind = if existing.contains("# kuberic public-v1 native gateway") {
+        "local postgres kuberic_rewind peer map=kuberic_native_rewind\n"
+    } else {
+        ""
+    };
     let application = if granted {
         format!(
             "local   {application_database}   {application_role}                 trust\n\
@@ -528,6 +610,7 @@ fn replace_managed_hba(
          local   replication     all                                trust\n\
          {replication}\
          local   all             {internal_user}                    trust\n\
+         {local_rewind}\
          {application}\
          local   all             all                                reject\n\
          {rewind}\
@@ -537,6 +620,118 @@ fn replace_managed_hba(
         retained.join("\n")
     )
 }
+
+fn replace_rewind_peer_map(existing: &str, user: &str) -> Result<String, PgError> {
+    if user.is_empty()
+        || user.len() > 63
+        || user == "kuberic_rewind"
+        || !user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(PgError::Configuration(
+            "unsupported native Unix owner for exact rewind peer mapping".into(),
+        ));
+    }
+    const BEGIN: &str = "# --- kuberic native rewind peer begin ---";
+    const END: &str = "# --- kuberic native rewind peer end ---";
+    let mut retained = Vec::new();
+    let mut managed = false;
+    for line in existing.lines() {
+        if line == BEGIN {
+            if managed {
+                return Err(PgError::Configuration(
+                    "nested native rewind peer mapping".into(),
+                ));
+            }
+            managed = true;
+        } else if line == END {
+            if !managed {
+                return Err(PgError::Configuration(
+                    "unmatched native rewind peer mapping".into(),
+                ));
+            }
+            managed = false;
+        } else if !managed {
+            if rewind_ident_map_name(line)?.as_deref() == Some("kuberic_native_rewind") {
+                return Err(PgError::Configuration(
+                    "native rewind peer mapping collides with unmanaged identity rules".into(),
+                ));
+            }
+            retained.push(line);
+        }
+    }
+    if managed {
+        return Err(PgError::Configuration(
+            "unterminated native rewind peer mapping".into(),
+        ));
+    }
+    Ok(format!(
+        "{BEGIN}\nkuberic_native_rewind {user} kuberic_rewind\n{END}\n{}\n",
+        retained.join("\n").trim_end()
+    ))
+}
+
+fn rewind_ident_map_name(line: &str) -> Result<Option<String>, PgError> {
+    let unsupported = || {
+        PgError::Configuration(
+            "native rewind peer mapping cannot establish exclusivity through this ident record"
+                .into(),
+        )
+    };
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    if line.ends_with('\\') {
+        return Err(unsupported());
+    }
+    let mut characters = line.chars().peekable();
+    let mut name = String::new();
+    if characters.peek() == Some(&'"') {
+        characters.next();
+        loop {
+            match characters.next() {
+                Some('"') if characters.peek() == Some(&'"') => {
+                    characters.next();
+                    name.push('"');
+                }
+                Some('"') => break,
+                Some('\\') | None => return Err(unsupported()),
+                Some(character) => name.push(character),
+            }
+        }
+        if characters
+            .peek()
+            .is_some_and(|character| !character.is_whitespace() && *character != '#')
+        {
+            return Err(unsupported());
+        }
+    } else {
+        for character in characters {
+            if character.is_whitespace() || character == '#' {
+                break;
+            }
+            if !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.') {
+                return Err(unsupported());
+            }
+            name.push(character);
+        }
+    }
+    if name.is_empty()
+        || matches!(
+            name.as_str(),
+            "include" | "include_if_exists" | "include_dir"
+        )
+    {
+        return Err(unsupported());
+    }
+    Ok(Some(name))
+}
+
+#[cfg(all(test, feature = "testing"))]
+#[path = "public_rewind_peer_tests.rs"]
+mod public_rewind_peer_tests;
 
 #[cfg(any())]
 mod tests {

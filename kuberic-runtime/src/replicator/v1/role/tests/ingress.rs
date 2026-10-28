@@ -539,6 +539,75 @@ async fn promotion_and_demotion_seal_old_roles_then_publish_real_new_receiver() 
 }
 
 #[tokio::test]
+async fn actual_demotion_root_request_ack_cannot_initialize_first_route_or_ack_future_data() {
+    let mut rig = Rig::new(true, false);
+    let primary = rig.primary().await;
+    configuration(&primary, 1, &[]);
+    let write = enqueue(&primary);
+    assert_eq!(write.lsn, 1);
+    assert_eq!(write.completion.await.unwrap(), Ok(()));
+    rig.owner
+        .begin_change_role(Role::ActiveSecondary, epoch(2))
+        .unwrap();
+    rig.owner.run().await.unwrap();
+    let secondary = rig.owner.demotion_secondary().unwrap();
+    assert!(secondary.same_instance(&rig.owner.secondary().unwrap()));
+    assert!(secondary.check_demotion_root(epoch(3)).is_err());
+    secondary.check_demotion_root(epoch(2)).unwrap();
+    let ingress = rig.owner.ingress();
+    let before = secondary.inspect_receiver();
+    let probe = route(30)
+        .reversed()
+        .envelope(wire::envelope::Body::RequestAck(wire::RequestAck {}));
+    assert_eq!(
+        ingress.dispatch(&probe).unwrap(),
+        Disposition::Dropped(DropReason::WrongPrimary)
+    );
+    assert_eq!(
+        secondary.inspect_receiver(),
+        before,
+        "RequestAck is not the first native routing producer"
+    );
+    let mut stale = route(30)
+        .reversed()
+        .envelope(replication(2, 1, &[b"old-frame"]).body.unwrap());
+    assert!(matches!(
+        ingress.dispatch(&stale).unwrap(),
+        Disposition::Dropped(_)
+    ));
+    assert_eq!(secondary.inspect_receiver(), before);
+    let Some(wire::envelope::Body::ReplicationOperation(body)) = stale.body.as_mut() else {
+        unreachable!()
+    };
+    body.sending_epoch = Some(wire_epoch(2));
+    body.original_epoch = Some(wire_epoch(2));
+    let mut stream = secondary.replication_stream().unwrap();
+    assert_eq!(ingress.dispatch(&stale).unwrap(), Disposition::Processed);
+    let operation = take(&mut stream).await;
+    assert_eq!(operation.queue_operation().lsn(), 2);
+    assert_eq!(secondary.inspect_receiver()["replication"]["applied"], 1);
+    assert_eq!(ingress.dispatch(&probe).unwrap(), Disposition::Processed);
+    assert_eq!(
+        secondary.inspect_receiver()["replication"]["applied"],
+        1,
+        "real RequestAck still cannot manufacture the consumer ACK"
+    );
+    ack_replication(&secondary, &operation);
+    assert_eq!(secondary.inspect_receiver()["replication"]["applied"], 2);
+    rig.owner.abort().unwrap();
+    assert!(matches!(rig.owner.run().await, Err(RoleError::Aborted)));
+    assert!(rig.owner.demotion_secondary().is_none());
+    let mut fresh = Rig::new(true, false);
+    fresh.secondary();
+    assert!(
+        fresh.owner.demotion_secondary().is_none(),
+        "Idle-not-built cannot supply a demotion root"
+    );
+    fresh.owner.abort().unwrap();
+    assert!(matches!(fresh.owner.run().await, Err(RoleError::Aborted)));
+}
+
+#[tokio::test]
 async fn secondary_direct_close_and_reported_primary_fault_reject_fresh_messages() {
     let mut rig = Rig::new(false, false);
     rig.secondary();

@@ -47,6 +47,9 @@ fn check(condition: bool, message: &str) -> TestResult {
 
 fn finished(result: TestResult) {
     result.unwrap_or_else(|failure| {
+        if let Some(diagnostics) = failure.diagnostics() {
+            eprintln!("PG ordinary failure diagnostics: {diagnostics}");
+        }
         panic!(
             "{failure:?}; sources: {:?}",
             failure
@@ -60,11 +63,17 @@ fn finished(result: TestResult) {
 struct Listener {
     service: Arc<PgService>,
     address: std::net::SocketAddr,
-    alias: std::path::PathBuf,
+    alias: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Default)]
-struct Factory(Arc<StdMutex<Vec<Listener>>>);
+struct Factory(Arc<StdMutex<Vec<Listener>>>, bool);
+
+impl Factory {
+    fn canonical_native_storage() -> Self {
+        Self(Default::default(), true)
+    }
+}
 
 #[async_trait]
 impl ApplicationFactory for Factory {
@@ -87,7 +96,12 @@ impl ApplicationFactory for Factory {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::os::unix::fs::symlink(context.application_root(), &alias)?;
+        let (native_root, alias) = if self.1 {
+            (context.application_root().to_owned(), None)
+        } else {
+            std::os::unix::fs::symlink(context.application_root(), &alias)?;
+            (alias.clone(), Some(alias))
+        };
         let config = PgServiceConfig {
             resource_uid: ResourceUid::new(
                 context
@@ -98,7 +112,7 @@ impl ApplicationFactory for Factory {
                     })?,
             ),
             application_root: context.application_root().join("metadata"),
-            pg_data: alias.join("d"),
+            pg_data: native_root.join("d"),
             pg_bin: find_pg_bin(),
             pg_port: allocate_port().await,
             replication_address: format!("http://{address}"),
@@ -140,7 +154,9 @@ impl ApplicationFactory for Factory {
             {
                 failures.push("ordinary engine endpoint survived Close".into());
             }
-            if let Err(source) = std::fs::remove_file(listener.alias) {
+            if let Some(alias) = listener.alias
+                && let Err(source) = std::fs::remove_file(alias)
+            {
                 failures.push(source.to_string());
             }
         }
@@ -186,13 +202,35 @@ async fn administrative_database(
 }
 
 async fn cluster(factory: &Factory) -> TestCluster<Factory> {
-    TestCluster::builder(factory.clone())
-        .initial_replicas(1)
+    cluster_members(factory, 1).await
+}
+
+async fn cluster_members(factory: &Factory, members: u32) -> TestCluster<Factory> {
+    let mut builder = TestCluster::builder(factory.clone())
+        .initial_replicas(members)
         .scenario_timeout(Duration::from_secs(180))
-        .teardown_timeout(Duration::from_secs(30))
-        .start()
-        .await
-        .unwrap()
+        .teardown_timeout(Duration::from_secs(30));
+    if factory.1 {
+        use std::os::unix::fs::DirBuilderExt;
+        let random = crate::adapter::public_transport::random_bytes().unwrap();
+        let first = u16::from_be_bytes([random[0], random[1]]) & 0x0fff;
+        let mut selected = None;
+        for offset in 0..=0x0fff {
+            let suffix = (first + offset) & 0x0fff;
+            let root = std::path::PathBuf::from(format!("/dev/shm/p{suffix:03x}"));
+            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => {
+                    selected = Some(root);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("owned short native storage root: {error}"),
+            }
+        }
+        builder =
+            builder.storage_parent(selected.expect("short owned storage namespace exhausted"));
+    }
+    builder.start().await.unwrap()
 }
 
 async fn gate(cluster: &mut TestCluster<Factory>, gate: &BuildCompletionGate) -> TestResult {
@@ -470,7 +508,7 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
         let _ = lost_observer.await;
         let serialized = serde_json::to_value(&id).map_err(error)?;
         let before = target_driver.durable.snapshot().await.generation;
-        for change in 0..8 {
+        for change in 0..10 {
             let mut stale = serialized.clone();
             match change {
                 0 => stale["nonce"][0] = serde_json::json!(id.nonce[0] ^ 1),
@@ -491,9 +529,11 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
                     stale["source"]["scope"]["history"]["historyId"] =
                         serde_json::json!("stale-history")
                 }
-                _ => {
+                7 => {
                     stale["source"]["scope"]["epoch"]["configurationNumber"] = serde_json::json!(2)
                 }
+                8 => stale["version"] = serde_json::json!(1),
+                _ => stale["mode"] = serde_json::json!("reformation"),
             }
             let mut changed = binding.clone();
             changed.session = Some(Box::new(serde_json::from_value(stale).map_err(error)?));
@@ -509,6 +549,12 @@ async fn formation(cut: CopyCut, fail_cleanup: bool) {
             target_driver.durable.snapshot().await.generation == before
                 && !target.instance().data_dir().join("PG_VERSION").exists(),
             "rejected session mutated native data/metadata",
+        )?;
+        let mut without_version = serialized.clone();
+        without_version.as_object_mut().unwrap().remove("version");
+        check(
+            serde_json::from_value::<session::PgSessionId>(without_version).is_err(),
+            "native session without an explicit wire version was accepted",
         )?;
         if cut == CopyCut::TargetPreEffect {
             let slot = crate::native::replication_slot_name(target_ref.identity());
@@ -1113,6 +1159,660 @@ async fn public_v1_postgres_controller_delayed_build_invalidation() {
 
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[serial_test::serial]
+async fn m3_pg_ordinary_retained_restart_recovers_sql() {
+    use std::os::unix::fs::MetadataExt;
+
+    let factory = Factory::default();
+    let mut cluster = cluster(&factory).await;
+    let result: TestResult = async {
+        let topology = cluster.settle_members(1).await?;
+        let predecessor = topology.primary().clone();
+        let source = cluster.service(&predecessor).await?;
+        seed(&source).await?;
+        let observed_flush = source
+            .native_driver()
+            .current_progress()
+            .await
+            .map_err(error)?;
+        let before = source
+            .native_driver()
+            .durable
+            .revalidate()
+            .await
+            .map_err(error)?;
+        check(
+            before.system_identifier.is_some()
+                && before.timeline_id.is_some()
+                && before.timeline_history_digest.is_some()
+                && before.role == crate::durable::PgDurableRole::Primary,
+            "ordinary singleton did not establish real native history",
+        )?;
+        let pgdata = source.instance().data_dir().canonicalize()?;
+        let inode = std::fs::metadata(&pgdata)?.ino();
+        let version = std::fs::read(pgdata.join("PG_VERSION"))?;
+        let observed = cluster.observe().await?;
+        let ordinary = observed.snapshot(&predecessor).cloned().ok_or_else(|| {
+            TestError::new(
+                ErrorKind::Application,
+                "pre-restart ordinary snapshot absent",
+            )
+        })?;
+        let processes = ProcessProbe::postgres(source.instance().data_dir());
+        let (old_writer, old_connection) = application_connection(&source).await?;
+        check_value(&old_writer).await?;
+
+        cluster.stop(&predecessor).await?;
+        check(
+            old_writer.simple_query("SELECT 1").await.is_err()
+                && source.instance().connect_application().await.is_err(),
+            "stopped ordinary process retained old or new application SQL access",
+        )?;
+        drop(old_writer);
+        old_connection.await.map_err(error)?;
+        processes.assert_gone().await;
+        let stopped = source
+            .native_driver()
+            .durable
+            .revalidate()
+            .await
+            .map_err(error)?;
+        let fault_joined = source.native_driver().fault_owners_joined();
+        let factory_empty = factory.0.lock().unwrap().is_empty();
+        check(
+            stopped.postgres_stopped
+                && stopped.external_access_closed
+                && stopped.policy_certified_lsn >= before.policy_certified_lsn
+                && fault_joined
+                && factory_empty,
+            &format!(
+                "ordinary stop owner/tail mismatch: stopped={}, external_closed={}, certified={}, observed_flush={}, fault_joined={}, factory_empty={}",
+                stopped.postgres_stopped, stopped.external_access_closed,
+                stopped.policy_certified_lsn, observed_flush,
+                fault_joined, factory_empty,
+            ),
+        )?;
+        drop(source);
+
+        let fresh = cluster.request_restart(&predecessor).await?;
+        let reopened = cluster.service(&fresh).await?;
+        let pending = cluster.observe().await?;
+        let pending = pending.snapshot(&fresh).ok_or_else(|| {
+            TestError::new(
+                ErrorKind::Application,
+                "fresh closed ordinary snapshot absent",
+            )
+        })?;
+        check(
+            fresh.identity() == predecessor.identity()
+                && fresh.storage_incarnation() == predecessor.storage_incarnation()
+                && fresh.process_session_id() != predecessor.process_session_id()
+                && fresh.replicator_creation_id() != predecessor.replicator_creation_id()
+                && pending.format == ordinary.format
+                && pending.history == ordinary.history
+                && pending.open_mode == kuberic_runtime::protocol::types::OpenMode::Existing
+                && pending.publication.is_none()
+                && pending.read_status != AccessStatus::Granted
+                && pending.write_status != AccessStatus::Granted
+                && reopened.instance().connect_application().await.is_err(),
+            "retained restart changed storage/history or admitted SQL before fresh goals",
+        )?;
+        check(
+            reopened.instance().data_dir().canonicalize()? == pgdata
+                && std::fs::metadata(&pgdata)?.ino() == inode
+                && std::fs::read(pgdata.join("PG_VERSION"))? == version,
+            "ordinary restart substituted or reinitialized PGDATA",
+        )?;
+
+        let topology = cluster.settle_members(1).await?;
+        check(
+            topology.primary().identity() == fresh.identity()
+                && topology.primary().process_session_id() == fresh.process_session_id()
+                && topology.primary().replicator_creation_id() == fresh.replicator_creation_id(),
+            "fresh retained process was not the admitted ordinary primary",
+        )?;
+        let achieved = cluster.observe().await?;
+        let achieved = achieved.snapshot(topology.primary()).ok_or_else(|| {
+            TestError::new(ErrorKind::Application, "recovered ordinary snapshot absent")
+        })?;
+        check(
+            achieved.publication.as_ref().is_some_and(|publication| {
+                publication.stage == ReplicaPublicationStage::AchievedScope
+                    && publication.scope.history == ordinary.history
+                    && publication.scope.storage == *fresh.storage_incarnation()
+                    && publication.scope.process_session_id == *fresh.process_session_id()
+                    && publication.scope.creation_id == *fresh.replicator_creation_id()
+            }) && ordinary
+                .goals
+                .iter()
+                .all(|previous| achieved.goals.contains(previous)),
+            "fresh admission reused old scope or discarded retained goal outcomes",
+        )?;
+        checked_data(&reopened, true).await?;
+        let native = reopened
+            .native_driver()
+            .durable
+            .revalidate()
+            .await
+            .map_err(error)?;
+        check(
+            native.identity == before.identity
+                && native.system_identifier == before.system_identifier
+                && native.timeline_id == before.timeline_id
+                && native.timeline_history_digest == before.timeline_history_digest
+                && native.role == crate::durable::PgDurableRole::Primary
+                && native.policy_certified_lsn >= before.policy_certified_lsn,
+            "ordinary recovery lost the retained native lineage or certified prefix",
+        )?;
+        // A sampled flush includes bytes beyond the cached policy certificate;
+        // it must not be relabeled as certified progress. The actual restarted
+        // native engine must nevertheless retain this durable flush and the
+        // acknowledged SQL, without replacing PGDATA.
+        check(
+            reopened.native_driver().current_progress().await.map_err(error)? >= observed_flush,
+            "same-PGDATA restart regressed the actual durable native flush",
+        )?;
+        let (sql, connection) = application_connection(&reopened).await?;
+        check(
+            !sql.query_one("SELECT pg_is_in_recovery()", &[])
+                .await
+                .map_err(error)?
+                .get::<_, bool>(0),
+            "ordinary primary access was granted to a physical standby",
+        )?;
+        sql.execute(
+            "INSERT INTO m2_native_admission VALUES (2, 'acknowledged-after-retained-restart')",
+            &[],
+        )
+        .await
+        .map_err(error)?;
+        check_value(&sql).await?;
+        check(
+            sql.query_one("SELECT value FROM m2_native_admission WHERE id = 2", &[])
+                .await
+                .map_err(error)?
+                .get::<_, &str>(0)
+                == "acknowledged-after-retained-restart",
+            "fresh ordinary application did not acknowledge and read its new SQL write",
+        )?;
+        drop(sql);
+        connection.await.map_err(error)?;
+        check(
+            reopened
+                .native_driver()
+                .current_progress()
+                .await
+                .map_err(error)?
+                > observed_flush,
+            "post-restart acknowledged SQL did not advance real native progress",
+        )?;
+        Ok(())
+    }
+    .await;
+    finished(cluster.finish(result).await);
+    assert!(factory.0.lock().unwrap().is_empty());
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m3_pg_ordinary_failover_preserves_sql_and_original_quorum() {
+    ordinary_pg_failover(false).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m3_pg_native_gateway_current_only_race_preserves_live_replay_and_sql() {
+    ordinary_pg_failover(true).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m3_pg_ordinary_handoff_pair_repairs_quiescent_original_with_full_quorum() {
+    ordinary_pg_handoff(2).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
+async fn m3_pg_ordinary_handoff_group_repairs_quiescent_original_with_full_quorum() {
+    ordinary_pg_handoff(3).await;
+}
+
+async fn ordinary_pg_handoff(members: u32) {
+    use std::os::unix::fs::MetadataExt;
+    let factory = Factory::canonical_native_storage();
+    let mut cluster = cluster_members(&factory, members).await;
+    let result: TestResult = async {
+        let original = cluster.settle_members(members as usize).await?;
+        let original_source = original.primary().clone();
+        let original_service = cluster.service(&original_source).await?;
+        seed(&original_service).await?;
+        let target = original.secondaries().next().unwrap().clone();
+        let target_service = cluster.service(&target).await?;
+        let before = cluster.observe().await?;
+        let configuration = before
+            .snapshot(&original_source)
+            .unwrap()
+            .publication
+            .as_ref()
+            .unwrap()
+            .scope
+            .configuration
+            .current
+            .clone();
+        check(configuration.write_quorum > 1, "handoff requires its original quorum")?;
+        let inode = std::fs::metadata(original_service.instance().data_dir())?.ino();
+        let (sql, connection) = application_connection(&original_service).await?;
+        cluster
+            .probe(async {
+                sql.execute(
+                    "UPDATE m2_native_admission SET value = 'acknowledged-under-original-quorum' WHERE id = 1",
+                    &[],
+                )
+                .await
+                .map_err(error)
+            })
+            .await?;
+        drop(sql);
+        connection.await.map_err(error)?;
+        let request = cluster.submit_switchover(&target).await?;
+        let mut observed_stopped_transfer = false;
+        loop {
+            cluster.step().await?;
+            let observation = cluster.observe().await?;
+            if observation.snapshot(&original_source).is_some_and(|source| {
+                source.goals.iter().any(|goal| {
+                    goal.status == ReplicaGoalStatus::Achieved
+                        && goal.host_settled
+                        && goal.completed_handoff.as_deref()
+                            == Some(&kuberic_runtime::protocol::public_operations::SourceHandoffReceipt::ORDERED)
+                })
+            }) && !original_service.instance().is_running().await
+            {
+                observed_stopped_transfer = true;
+                check(
+                    original_service.instance().connect_application().await.is_err(),
+                    "completed transfer left the old writer accessible",
+                )?;
+            }
+            if observation
+                .set()
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_topology.as_ref())
+                .is_some_and(|topology| {
+                    topology.completed_switchover_request_id.as_deref() == Some(request.id())
+                })
+            {
+                break;
+            }
+        }
+        check(observed_stopped_transfer, "controller never observed the actual stopped transfer")?;
+        let settled = cluster.settle_members(members as usize).await?;
+        check(settled.primary() == &target, "controller promoted a different target")?;
+        let after = cluster.observe().await?;
+        for member in settled.members() {
+            let snapshot = after.snapshot(member).unwrap();
+            let publication = snapshot.publication.as_ref().unwrap();
+            check(
+                publication.stage == ReplicaPublicationStage::AchievedScope
+                    && publication.scope.configuration.previous.is_none()
+                    && publication.scope.configuration.current.write_quorum == configuration.write_quorum
+                    && publication.scope.configuration.current.members.iter().all(|member| {
+                        configuration.members.iter().any(|original| original.identity == member.identity)
+                    })
+                    && publication.scope.configuration.current.members.len() == configuration.members.len()
+                    && snapshot.storage == before.snapshot(member).unwrap().storage
+                    && snapshot.history == before.snapshot(member).unwrap().history,
+                "handoff changed original member/storage/history/quorum or left joint admission",
+            )?;
+        }
+        let (sql, connection) = application_connection(&target_service).await?;
+        check(
+            sql.query_one("SELECT value FROM m2_native_admission WHERE id = 1", &[])
+                .await
+                .map_err(error)?
+                .get::<_, &str>(0) == "acknowledged-under-original-quorum",
+            "handoff lost its acknowledged original-quorum prefix",
+        )?;
+        cluster
+            .probe(async {
+                sql.execute(
+                    "UPDATE m2_native_admission SET value = 'acknowledged-after-native-repair' WHERE id = 1",
+                    &[],
+                )
+                .await
+                .map_err(error)
+            })
+            .await?;
+        drop(sql);
+        connection.await.map_err(error)?;
+        let (old, old_connection) = administrative_database(&original_service).await?;
+        check(
+            old.query_one("SELECT pg_is_in_recovery()", &[])
+                .await
+                .map_err(error)?
+                .get::<_, bool>(0),
+            "old physical PostgreSQL is not a real following standby",
+        )?;
+        check(
+            old.query_one("SELECT value FROM m2_native_admission WHERE id = 1", &[])
+                .await
+                .map_err(error)?
+                .get::<_, &str>(0) == "acknowledged-after-native-repair",
+            "new original-quorum SQL did not replay on the repaired original member",
+        )?;
+        drop(old);
+        old_connection.await.map_err(error)?;
+        check(
+            original_service.instance().connect_application().await.is_err(),
+            "repaired secondary was granted application SQL access",
+        )?;
+        check(
+            std::fs::metadata(original_service.instance().data_dir())?.ino() != inode,
+            "handoff did not install its independently repaired candidate",
+        )?;
+        let parent = original_service.instance().data_dir().parent().unwrap();
+        let mut retained_original = false;
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("d-retained-")
+                && entry.metadata()?.ino() == inode
+            {
+                retained_original = true;
+            }
+        }
+        check(retained_original, "handoff did not retain the original native data inode")?;
+        Ok(())
+    }.await;
+    finished(cluster.finish(result).await);
+    assert!(factory.0.lock().unwrap().is_empty());
+}
+
+struct CurrentOnlyGatewayRace {
+    service: Arc<PgService>,
+    current: Arc<BuildCompletionGate>,
+    gateway: Arc<BuildCompletionGate>,
+    _release: ReleaseGate,
+    frozen: TransportBinding,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    entered: bool,
+}
+
+async fn notified_now(notify: &tokio::sync::Notify) -> bool {
+    tokio::select! {
+        biased;
+        _ = notify.notified() => true,
+        _ = std::future::ready(()) => false,
+    }
+}
+
+async fn ordinary_pg_failover(exercise_gateway_race: bool) {
+    let factory = Factory::default();
+    let mut cluster = cluster(&factory).await;
+    let result: TestResult = async {
+        let singleton = cluster.settle_members(1).await?;
+        let old = singleton.primary().clone();
+        let old_service = cluster.service(&old).await?;
+        seed(&old_service).await?;
+        cluster.scale_to(3).await?;
+        let original = cluster.settle_members(3).await?;
+        for member in original.members() {
+            let service = cluster.service(member).await?;
+            checked_data(&service, member == original.primary()).await?;
+        }
+        let before = cluster.observe().await?;
+        let configuration = before
+            .snapshot(&old)
+            .unwrap()
+            .publication
+            .as_ref()
+            .unwrap()
+            .scope
+            .configuration
+            .current
+            .clone();
+        check(
+            configuration.write_quorum > 1,
+            "failover fixture lacks its original quorum obligation",
+        )?;
+        let prior_native_sessions = original.secondaries().flat_map(|member| {
+            old_service.native_driver().pg_session_ids_for_target(member.identity().replica_id)
+        }).collect::<Vec<_>>();
+        check(!prior_native_sessions.is_empty(), "ordinary failover has no original native session roots")?;
+        let mut current_cuts = Vec::new();
+        if exercise_gateway_race {
+            for member in original.secondaries() {
+                let service = cluster.service(member).await?;
+                let gate = service.native_driver().pause_native_cut("source-current-before-policy");
+                current_cuts.push((service, gate.clone(), ReleaseGate(gate)));
+            }
+        }
+        let mut gateway_race: Option<CurrentOnlyGatewayRace> = None;
+        let mut race_completed = false;
+        let native = ProcessProbe::postgres(old_service.instance().data_dir());
+        cluster.stop(&old).await?;
+        native.assert_gone().await;
+        check(
+            old_service.instance().connect_application().await.is_err(),
+            "stopped old writer remained accessible",
+        )?;
+        let elected = loop {
+            cluster.step().await?;
+            if exercise_gateway_race && gateway_race.is_none() {
+                for (service, current, _) in &current_cuts {
+                    if notified_now(&current.entered).await {
+                        let driver = service.native_driver();
+                        let (frozen, running) = {
+                            let state = driver.public_owner().state.lock().await;
+                            let grant = state.grants.iter().find(|grant| {
+                                grant.binding.session().is_some_and(|id| {
+                                    id.mode == session::PgSessionMode::Reformation
+                                        && driver.pg_native_established(id).unwrap_or(false)
+                                })
+                            }).ok_or_else(|| TestError::new(ErrorKind::Application,
+                                "current-only race lacks an actually established mode2 gateway"))?;
+                            (grant.binding.clone(), grant.gateway.liveness())
+                        };
+                        let id = frozen.session().unwrap();
+                        check(driver.pg_native_membership(id).map_err(error)?
+                            .is_some_and(|membership| !membership.current_only),
+                            "gateway race did not start in real joint membership")?;
+                        let gateway = driver.pause_native_cut("gateway-joint-before-membership-validation");
+                        gateway_race = Some(CurrentOnlyGatewayRace {
+                            service: service.clone(),
+                            current: current.clone(),
+                            gateway: gateway.clone(),
+                            _release: ReleaseGate(gateway),
+                            frozen,
+                            running,
+                            entered: false,
+                        });
+                        break;
+                    }
+                }
+            }
+            if let Some(race) = gateway_race.as_mut() {
+                let driver = race.service.native_driver();
+                if !race.entered && notified_now(&race.gateway.entered).await {
+                    race.entered = true;
+                    race.current.release.notify_one();
+                }
+                let id = race.frozen.session().unwrap();
+                if race.entered && !race_completed
+                    && driver.pg_native_membership(id).map_err(error)?
+                        .is_some_and(|membership| membership.current_only)
+                {
+                    check(driver.pg_validate_native_session(&race.frozen, true).await.is_err(),
+                        "external frozen joint binding survived current-only advancement")?;
+                    check(driver.pg_install_membership(
+                        id,
+                        &id.source.scope.configuration.current,
+                        id.source.scope.configuration.previous.as_ref(),
+                        true,
+                    ).is_err(), "native current-only membership reinstalled backward PC")?;
+                    let mut crossed = race.frozen.clone();
+                    if let TransportBinding::Peer(peer) = &mut crossed {
+                        peer.epoch.configuration_number += 1;
+                    }
+                    check(driver.pg_validate_native_gateway(&crossed).await.is_err(),
+                        "private gateway accepted a crossed epoch")?;
+                    let mut crossed = race.frozen.clone();
+                    if let TransportBinding::Peer(peer) = &mut crossed {
+                        peer.secondary.process_session_id = ProcessSessionId::new("foreign-process");
+                    }
+                    check(driver.pg_validate_native_gateway(&crossed).await.is_err(),
+                        "private gateway accepted a foreign physical process")?;
+                    check(race.running.load(std::sync::atomic::Ordering::Acquire),
+                        "held real native gateway died before its validation resumed")?;
+                    race.gateway.release.notify_one();
+                    race_completed = true;
+                }
+            }
+            let observation = cluster.observe().await?;
+            for (_, snapshot) in observation.snapshots() {
+                if let Some(failed) = snapshot.goals.iter().find(|entry| {
+                    entry.goal.scope.epoch > configuration.epoch
+                        && matches!(
+                            entry.status,
+                            ReplicaGoalStatus::Failed(_) | ReplicaGoalStatus::Uncertain(_)
+                        )
+                }) {
+                    return Err(TestError::new(
+                        ErrorKind::Fatal,
+                        format!("ordinary PG failover actual first failed goal: {failed:?}"),
+                    ));
+                }
+            }
+            if observation
+                .set()
+                .status
+                .as_ref()
+                .and_then(|status| status.public_v1_topology.as_ref())
+                .is_some_and(|topology| {
+                    topology.primary_id != old.identity().replica_id && topology.member_count == 2
+                })
+            {
+                break cluster.settle_members(2).await?;
+            }
+        };
+        check(!exercise_gateway_race || race_completed,
+            "current-only race did not execute its exact held validation interleaving")?;
+        check(
+            elected.primary().identity() != old.identity(),
+            "old Primary was reused",
+        )?;
+        let observed = cluster.observe().await?;
+        let scope = &observed
+            .snapshot(elected.primary())
+            .unwrap()
+            .publication
+            .as_ref()
+            .unwrap()
+            .scope;
+        check(
+            scope.configuration.current.write_quorum == configuration.write_quorum,
+            "ordinary PG failover reduced quorum",
+        )?;
+        check(
+            scope.epoch > configuration.epoch && scope.configuration.previous.is_none(),
+            "ordinary PG failover did not finish its higher-epoch current-only obligation",
+        )?;
+        let primary = cluster.service(elected.primary()).await?;
+        checked_data(&primary, true).await?;
+        let (sql, connection) = application_connection(&primary).await?;
+        check(
+            !sql.query_one("SELECT pg_is_in_recovery()", &[])
+                .await
+                .map_err(error)?
+                .get::<_, bool>(0),
+            "ordinary PG Primary is not physically promoted",
+        )?;
+        sql.batch_execute(
+            "INSERT INTO m2_native_admission VALUES (2, 'acknowledged-after-ordinary-failover')",
+        )
+        .await
+        .map_err(error)?;
+        check_value(&sql).await?;
+        drop(sql);
+        connection.await.map_err(error)?;
+        for member in elected.secondaries() {
+            let service = cluster.service(member).await?;
+            let fresh = primary.native_driver().pg_session_ids_for_target(member.identity().replica_id)
+                .into_iter().find(|id| {
+                    id.mode == session::PgSessionMode::Reformation
+                        && primary.native_driver().pg_native_established(id).unwrap_or(false)
+                }).ok_or_else(|| TestError::new(ErrorKind::Application,
+                    "ordinary failover lacks an actually established fresh native reformation"))?;
+            check(
+                fresh.version == session::NATIVE_SESSION_VERSION
+                    && prior_native_sessions.iter().all(|previous| previous.nonce != fresh.nonce)
+                    && primary.native_driver().pg_native_establishment(&fresh)
+                        == (session::PgSessionMode::Reformation, false, true)
+                    && service.native_driver().pg_native_establishment(&fresh)
+                        == (session::PgSessionMode::Reformation, false, true)
+                    && primary.native_driver().durable.revalidate().await.map_err(error)?
+                        .native_reformations.iter().any(|receipt| receipt.nonce() == fresh.nonce && receipt.replayed())
+                    && service.native_driver().durable.revalidate().await.map_err(error)?
+                        .native_reformations.iter().any(|receipt| receipt.nonce() == fresh.nonce && receipt.replayed()),
+                "ordinary failover reused copy/nonce credit instead of actual two-ended native replay",
+            )?;
+            check(
+                fresh.source.scope.configuration.previous.as_ref().is_some_and(|previous| {
+                    previous.members.iter().any(|participant| {
+                        participant.identity == *old.identity()
+                            && participant.role == ReplicaRole::Primary
+                    })
+                }) && !primary.native_driver().public_owner().state.lock().await.grants
+                    .iter().any(|grant| grant.binding.target() == old.identity()),
+                "ordinary failover erased the old PC Primary or fabricated its live standby/ACK slot",
+            )?;
+            for previous in prior_native_sessions.iter().filter(|previous| {
+                previous.target.scope.storage.replica == *member.identity()
+            }) {
+                check(service.native_driver().pg_session_request(session::SessionRequest {
+                    session: previous.clone(),
+                    action: session::SessionAction::Complete,
+                }).await.is_err(), "old native ACK/copy session was resurrected after reformation")?;
+            }
+            checked_data(&service, false).await?;
+            let (sql, connection) = administrative_database(&service).await?;
+            let row = sql
+                .query_one("SELECT value FROM m2_native_admission WHERE id = 2", &[])
+                .await
+                .map_err(error)?;
+            check(
+                row.get::<_, &str>(0) == "acknowledged-after-ordinary-failover",
+                "ordinary PG secondary lost acknowledged post-failover SQL",
+            )?;
+            drop(sql);
+            connection.await.map_err(error)?;
+        }
+        if let Some(race) = gateway_race.as_ref() {
+            let driver = race.service.native_driver();
+            let id = race.frozen.session().unwrap();
+            let live = {
+                let state = driver.public_owner().state.lock().await;
+                state.grants.iter().find(|grant| grant.binding.session() == Some(id))
+                    .map(|grant| grant.gateway.liveness())
+                    .ok_or_else(|| TestError::new(ErrorKind::Application,
+                        "native gateway disappeared after the race and acknowledged SQL"))?
+            };
+            check(Arc::ptr_eq(&live, &race.running)
+                && live.load(std::sync::atomic::Ordering::Acquire),
+                "current-only race replaced or quarantined the actual established gateway")?;
+            driver.pg_retire_session(id).await.map_err(error)?;
+            check(driver.pg_validate_native_gateway(&race.frozen).await.is_err()
+                && !live.load(std::sync::atomic::Ordering::Acquire),
+                "retirement did not fence and drain the same private gateway")?;
+        }
+        Ok(())
+    }
+    .await;
+    finished(cluster.finish(result).await);
+    assert!(factory.0.lock().unwrap().is_empty());
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[serial_test::serial]
 async fn public_v1_postgres_graceful_close_cancels_source_inspect() {
     formation(CopyCut::Inspect, false).await;
 }
@@ -1169,12 +1869,22 @@ async fn terminal(fault: u8) {
                         && snapshot.write_status != AccessStatus::Granted,
                     "ordinary terminal retained publication or SQL access",
                 )?;
+                if fault == 0
+                    && completion.status == ReplicaGoalStatus::Achieved
+                    && !completion.host_settled
+                {
+                    continue;
+                }
                 break completion.clone();
             }
         };
         check(
             (completion.status == ReplicaGoalStatus::Achieved) == (fault == 0),
             "ordinary terminal hid native/application join failure",
+        )?;
+        check(
+            fault != 0 || completion.host_settled,
+            "ordinary terminal success preceded actual host-root acknowledgement/join",
         )?;
         stage = "native process reaping";
         probe.assert_gone().await;
@@ -1514,7 +2224,7 @@ async fn m2_pg_scope_withdrawal_waits_for_actual_settlement() {
             .parent()
             .unwrap()
             .join("metadata");
-        let metadata = std::fs::read(metadata_root.join("state-v2.json"))?;
+        let metadata = std::fs::read(metadata_root.join("state-v3.json"))?;
         let identity = source.native_driver().durable.snapshot().await.identity;
         check(
             PgDurableStore::open(&metadata_root, identity, StorageMode::Established)
@@ -1523,7 +2233,7 @@ async fn m2_pg_scope_withdrawal_waits_for_actual_settlement() {
             "unsettled ordinary creation released its native metadata writer",
         )?;
         check(
-            std::fs::read(metadata_root.join("state-v2.json"))? == metadata,
+            std::fs::read(metadata_root.join("state-v3.json"))? == metadata,
             "rejected writer reuse mutated durable metadata",
         )?;
         let driver = source.native_driver().clone();

@@ -5,9 +5,10 @@ use super::*;
 use crate::protocol::public_operations::*;
 use crate::protocol::types::*;
 use crate::replicator::{
-    CheckedRetainedMember, PartitionAccessView, PartitionInformation, ReplicaInformation,
-    ReplicaSetConfiguration, ReplicatorCreationReservation, ReplicatorFactoryContext,
-    ReplicatorInterfaces, RuntimeHostToken, TestingTcpRoute, TestingTcpRouteKind,
+    CheckedCreationReconstruction, CheckedRetainedMember, PartitionAccessView,
+    PartitionInformation, ReplicaInformation, ReplicaSetConfiguration,
+    ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorInterfaces,
+    RuntimeHostToken, TestingTcpRoute, TestingTcpRouteKind,
 };
 
 // These are checked-host fixtures, not evidence of OS exclusion or durable journal recovery.
@@ -15,6 +16,8 @@ struct Access {
     publication: Mutex<ReplicaPublication>,
     selected: Mutex<Option<CheckedRetainedMember>>,
     initialized: Mutex<Option<CheckedRetainedMember>>,
+    reconstruction: Mutex<Option<CheckedCreationReconstruction>>,
+    reconstructed: Mutex<Option<CheckedCreationReconstruction>>,
     confirmations: AtomicUsize,
     fail_confirmation: AtomicBool,
     withdrawn: AtomicBool,
@@ -22,6 +25,31 @@ struct Access {
 
 #[async_trait]
 impl PartitionAccessView for Access {
+    async fn creation_reconstruction(
+        &self,
+        _: Option<ReplicatorCreationReservation>,
+    ) -> crate::Result<Option<CheckedCreationReconstruction>> {
+        if self.withdrawn.load(Ordering::SeqCst) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(self.reconstruction.lock().unwrap().clone())
+    }
+
+    async fn confirm_reconstructed_native_initialization(
+        &self,
+        _: ReplicatorCreationReservation,
+        selected: &CheckedCreationReconstruction,
+    ) -> crate::Result<()> {
+        self.confirmations.fetch_add(1, Ordering::SeqCst);
+        if self.fail_confirmation.load(Ordering::SeqCst)
+            || self.reconstruction.lock().unwrap().as_ref() != Some(selected)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        *self.reconstructed.lock().unwrap() = Some(selected.clone());
+        Ok(())
+    }
+
     fn partition_information(&self) -> PartitionInformation {
         PartitionInformation {
             partition_id: PartitionId::new("retained-adapter"),
@@ -189,17 +217,54 @@ struct Member {
 
 impl Member {
     async fn new(id: i64, retained: bool, progress: Lsn) -> Self {
+        Self::new_selected(id, retained, progress, false).await
+    }
+
+    async fn new_selected(id: i64, retained: bool, progress: Lsn, reconstruct: bool) -> Self {
+        Self::new_scoped(id, retained, progress, reconstruct, None, None).await
+    }
+
+    async fn new_scoped(
+        id: i64,
+        retained: bool,
+        progress: Lsn,
+        reconstruct: bool,
+        predecessor: Option<ReplicaPublication>,
+        retained_provider: Option<Arc<Provider>>,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut publication = publication(id, format!("http://{}", listener.local_addr().unwrap()));
+        if let Some(old) = &predecessor {
+            publication.scope = old.scope.clone();
+            publication.scope.process_session_id =
+                ProcessSessionId::new(format!("reconstructed-process-{id}"));
+        }
         let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
         publication.scope.creation_id =
             reservation.identity(RuntimeHostToken::new()).to_public_id();
+        if reconstruct {
+            publication.scope.configuration.current = ConfigurationDescriptor::new(
+                epoch(1),
+                ReplicaId::new(id),
+                vec![ConfigurationMember {
+                    identity: identity(id),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            );
+        }
         let checked = retained.then(|| {
             CheckedRetainedMember::new(
                 publication.scope.clone(),
                 RetainedMemberQualification {
-                    predecessor_process_session_id: ProcessSessionId::new("excluded-process"),
-                    predecessor_creation_id: ReplicatorCreationId::new("excluded-creation"),
+                    predecessor_process_session_id: predecessor
+                        .as_ref()
+                        .map(|old| old.scope.process_session_id.clone())
+                        .unwrap_or_else(|| ProcessSessionId::new("excluded-process")),
+                    predecessor_creation_id: predecessor
+                        .as_ref()
+                        .map(|old| old.scope.creation_id.clone())
+                        .unwrap_or_else(|| ReplicatorCreationId::new("excluded-creation")),
                     admitted_operation_id: OperationId::new("historical-admission"),
                     admitted_revision: 1,
                     configuration: publication.scope.configuration.current.clone(),
@@ -210,6 +275,29 @@ impl Member {
             publication: Mutex::new(publication.clone()),
             selected: Mutex::new(checked.clone()),
             initialized: Mutex::new(None),
+            reconstruction: Mutex::new(reconstruct.then(|| {
+                CheckedCreationReconstruction::new(ReplicaGoal {
+                    format: ORDINARY_ACTION_FORMAT,
+                    identity: PublicV1Identity::new(1),
+                    operation_id: OperationId::new("checked-native-reconstruction"),
+                    revision: 2,
+                    scope: publication.scope.clone(),
+                    desired: ReplicaGoalKind::RecoverContainedCreation {
+                        recovery: Box::new(ContainedCreationRecovery {
+                            addition: None,
+                            predecessor_process_session_id: ProcessSessionId::new(
+                                "excluded-process",
+                            ),
+                            predecessor_creation_id: ReplicatorCreationId::new("excluded-creation"),
+                            predecessor_operations: vec![OperationId::new("old-native-effect")],
+                            receiver_settlements: Vec::new(),
+                            role: ReplicaRole::Primary,
+                            catch_up: Some(PublicCatchUpMode::All),
+                        }),
+                    },
+                })
+            })),
+            reconstructed: Mutex::new(None),
             confirmations: AtomicUsize::new(0),
             fail_confirmation: AtomicBool::new(false),
             withdrawn: AtomicBool::new(false),
@@ -238,8 +326,17 @@ impl Member {
             registry.clone(),
         );
         transport.test_listen(listener);
-        let provider = Arc::new(Provider::new());
-        provider.progress.store(progress, Ordering::SeqCst);
+        let provider = match retained_provider {
+            Some(provider) => {
+                assert_eq!(provider.progress.load(Ordering::SeqCst), progress);
+                provider
+            }
+            None => {
+                let provider = Arc::new(Provider::new());
+                provider.progress.store(progress, Ordering::SeqCst);
+                provider
+            }
+        };
         let interfaces = test_compose(
             context.clone(),
             provider.clone(),
@@ -267,7 +364,81 @@ impl Member {
             checked,
         }
     }
+}
 
+#[tokio::test]
+async fn reconstructed_primary_native_bundle_uses_actual_checkpoint_and_keeps_publication_pending()
+{
+    let member = Member::new_selected(1, false, 7, true).await;
+    member.interfaces.replicator().open().await.unwrap();
+    member
+        .interfaces
+        .replicator()
+        .change_role(epoch(1), ReplicaRole::Primary)
+        .await
+        .unwrap();
+    assert_eq!(
+        member
+            .interfaces
+            .replicator()
+            .current_progress()
+            .await
+            .unwrap(),
+        7
+    );
+    assert_eq!(member.provider.progress_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*member.provider.epochs.lock().unwrap(), vec![(epoch(1), 7)]);
+    assert_eq!(member.access.confirmations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *member.access.reconstructed.lock().unwrap(),
+        *member.access.reconstruction.lock().unwrap()
+    );
+    assert_eq!(
+        member.access.publication.lock().unwrap().stage,
+        ReplicaPublicationStage::DiscoveryPending
+    );
+    assert_eq!(
+        member.access.write_status().await.unwrap(),
+        AccessStatus::NotPrimary
+    );
+    member.finish().await;
+}
+
+#[tokio::test]
+async fn reconstructed_primary_rechecks_private_context_before_effect_and_after_native_callbacks() {
+    for before_effect in [true, false] {
+        let member = Member::new_selected(1, false, 7, true).await;
+        member.interfaces.replicator().open().await.unwrap();
+        if before_effect {
+            member.access.withdrawn.store(true, Ordering::SeqCst);
+        } else {
+            member
+                .access
+                .fail_confirmation
+                .store(true, Ordering::SeqCst);
+        }
+        assert!(
+            member
+                .interfaces
+                .replicator()
+                .change_role(epoch(1), ReplicaRole::Primary)
+                .await
+                .is_err()
+        );
+        assert!(member.access.reconstructed.lock().unwrap().is_none());
+        assert_eq!(
+            member.provider.progress_calls.load(Ordering::SeqCst),
+            usize::from(!before_effect)
+        );
+        assert_eq!(
+            member.access.publication.lock().unwrap().stage,
+            ReplicaPublicationStage::DiscoveryPending
+        );
+        member.finish().await;
+    }
+}
+
+impl Member {
     async fn restore(&self) {
         self.interfaces.replicator().open().await.unwrap();
         self.interfaces
@@ -890,6 +1061,521 @@ async fn production_retained_reformation_authenticates_fresh_native_binding_and_
         .await
         .unwrap()
         .unwrap();
+    source.finish().await;
+    target.finish().await;
+}
+
+#[tokio::test]
+async fn production_live_source_retained_target_preserves_pending_pair_roots_and_exact_retry() {
+    let source = Member::new(1, false, 0).await;
+    let old_target = Member::new(2, false, 0).await;
+    let mut source_publication = source.access.publication.lock().unwrap().clone();
+    let mut old_publication = old_target.access.publication.lock().unwrap().clone();
+    let bootstrap = ConfigurationDescriptor::new(
+        epoch(1),
+        ReplicaId::new(1),
+        vec![ConfigurationMember {
+            identity: identity(1),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    for publication in [&mut source_publication, &mut old_publication] {
+        publication.scope.configuration.current = bootstrap.clone();
+        publication.stage = ReplicaPublicationStage::AchievedScope;
+    }
+    source_publication.role = ReplicaRole::Primary;
+    old_publication.role = ReplicaRole::IdleSecondary;
+    old_publication.scope.configuration.replicas =
+        source_publication.scope.configuration.replicas.clone();
+    *source.access.publication.lock().unwrap() = source_publication.clone();
+    *old_target.access.publication.lock().unwrap() = old_publication.clone();
+    source.transport.test_publish(vec![old_publication.clone()]);
+    old_target
+        .transport
+        .test_publish(vec![source_publication.clone()]);
+    source.interfaces.replicator().open().await.unwrap();
+    source
+        .interfaces
+        .replicator()
+        .change_role(epoch(1), ReplicaRole::Primary)
+        .await
+        .unwrap();
+    old_target.interfaces.replicator().open().await.unwrap();
+    old_target
+        .interfaces
+        .replicator()
+        .change_role(epoch(1), ReplicaRole::IdleSecondary)
+        .await
+        .unwrap();
+    source
+        .interfaces
+        .primary_replicator()
+        .unwrap()
+        .update_current_replica_set_configuration(ReplicaSetConfiguration {
+            configuration: bootstrap.clone(),
+            replicas: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let primary = source.interfaces.primary_replicator().unwrap();
+    let mut idle = information(&old_publication, ReplicaRole::IdleSecondary, INVALID_LSN);
+    idle.catch_up_capability = INVALID_LSN;
+    let mut build = tokio::spawn(async move { primary.build_replica(idle).await });
+    let mut copy = old_target
+        .interfaces
+        .state_replicator()
+        .unwrap()
+        .copy_operations()
+        .unwrap();
+    loop {
+        let operation = tokio::select! {
+            operation = tokio::time::timeout(Duration::from_secs(5), copy.get_operation()) => {
+                operation.expect("initial actual native copy did not produce its next operation")
+                    .unwrap().unwrap()
+            }
+            result = &mut build => panic!("initial actual Build ended before its copy receipt: {result:?}"),
+        };
+        let last = operation.end_of_stream;
+        if !last {
+            assert_eq!(operation.data, Bytes::from_static(b"snapshot"));
+        }
+        operation.acknowledge().unwrap();
+        if last {
+            break;
+        }
+    }
+    build.await.unwrap().unwrap();
+    let old_binding = source.transport.sessions.binding_for(2).unwrap();
+    let original = configuration(1, &[1, 2], epoch(1));
+    source_publication.scope.configuration.current = original.clone();
+    source_publication.scope.configuration.previous = Some(bootstrap.clone());
+    source_publication.stage = ReplicaPublicationStage::DiscoveryPending;
+    source_publication.role = ReplicaRole::None;
+    source_publication.scope.configuration.replicas =
+        vec![peer(&old_publication, ReplicaRole::ActiveSecondary, 0)];
+    *source.access.publication.lock().unwrap() = source_publication.clone();
+    *old_target.access.publication.lock().unwrap() = old_publication.clone();
+    source.transport.test_publish(vec![old_publication.clone()]);
+    old_target
+        .transport
+        .test_publish(vec![source_publication.clone()]);
+    source
+        .interfaces
+        .primary_replicator()
+        .unwrap()
+        .update_catch_up_replica_set_configuration(
+            ReplicaSetConfiguration {
+                configuration: original.clone(),
+                replicas: vec![information(
+                    &old_publication,
+                    ReplicaRole::ActiveSecondary,
+                    0,
+                )],
+            },
+            ReplicaSetConfiguration {
+                configuration: bootstrap.clone(),
+                replicas: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    old_target
+        .interfaces
+        .replicator()
+        .change_role(epoch(1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    old_publication.scope.configuration.current = original.clone();
+    old_publication.scope.configuration.previous = Some(bootstrap);
+    old_publication.role = ReplicaRole::ActiveSecondary;
+    old_publication.scope.configuration.replicas =
+        vec![peer(&source_publication, ReplicaRole::Primary, 0)];
+    *old_target.access.publication.lock().unwrap() = old_publication.clone();
+    source.transport.test_publish(vec![old_publication.clone()]);
+    old_target
+        .transport
+        .test_publish(vec![source_publication.clone()]);
+    source
+        .interfaces
+        .primary_replicator()
+        .unwrap()
+        .wait_for_catch_up_quorum(crate::replicator::ReplicaSetQuorumMode::All)
+        .await
+        .unwrap();
+    source_publication.scope.configuration.previous = None;
+    *source.access.publication.lock().unwrap() = source_publication.clone();
+    *old_target.access.publication.lock().unwrap() = old_publication.clone();
+    source.transport.test_publish(vec![old_publication.clone()]);
+    old_target
+        .transport
+        .test_publish(vec![source_publication.clone()]);
+    source
+        .interfaces
+        .primary_replicator()
+        .unwrap()
+        .update_current_replica_set_configuration(ReplicaSetConfiguration {
+            configuration: original.clone(),
+            replicas: vec![information(
+                &old_publication,
+                ReplicaRole::ActiveSecondary,
+                0,
+            )],
+        })
+        .await
+        .unwrap();
+    source_publication.stage = ReplicaPublicationStage::AchievedScope;
+    source_publication.role = ReplicaRole::Primary;
+    old_publication.scope.configuration.previous = None;
+    *source.access.publication.lock().unwrap() = source_publication.clone();
+    *old_target.access.publication.lock().unwrap() = old_publication.clone();
+    source.transport.test_publish(vec![old_publication.clone()]);
+    old_target
+        .transport
+        .test_publish(vec![source_publication.clone()]);
+    let source_endpoint = source.transport.local().clone();
+    let old_endpoint = old_target.transport.local().clone();
+    let native = source.transport.test_production().removal_primary();
+    let old_route =
+        super::super::super::production_transport::route(&old_binding, &source_endpoint).unwrap();
+    let old_identity = super::super::super::super::session::SessionIdentity {
+        primary_endpoint: old_route.sender_address.clone(),
+        remote_endpoint: old_route.remote_address.clone(),
+        remote_incarnation: source.transport.native_incarnation(&old_binding).unwrap(),
+    };
+    let original_sender = native
+        .continuation_session(&old_route, &old_identity, epoch(1))
+        .unwrap();
+    let mut old_stream = old_target
+        .interfaces
+        .state_replicator()
+        .unwrap()
+        .replication_operations()
+        .unwrap();
+    let first = source
+        .interfaces
+        .state_replicator()
+        .unwrap()
+        .begin_replicate(Bytes::from_static(b"retained-prefix"))
+        .unwrap();
+    let operation = tokio::time::timeout(Duration::from_secs(5), old_stream.get_operation())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.lsn, 1);
+    old_target.provider.progress.store(1, Ordering::SeqCst);
+    operation.acknowledge().unwrap();
+    first.completion.await.unwrap();
+    source.provider.progress.store(1, Ordering::SeqCst);
+    let mut pending = source
+        .interfaces
+        .state_replicator()
+        .unwrap()
+        .begin_replicate(Bytes::from_static(b"pending-before-reformation"))
+        .unwrap();
+    let old_operation = tokio::time::timeout(Duration::from_secs(5), old_stream.get_operation())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_operation.lsn, 2);
+    assert!(pending.completion.as_mut().now_or_never().is_none());
+    let source_progress_queries = source.provider.progress_calls.load(Ordering::SeqCst);
+    let retained_provider = old_target.provider.clone();
+    let historical_copy_calls = retained_provider.copy_calls.load(Ordering::SeqCst);
+    let historical_context_calls = retained_provider.context_calls.load(Ordering::SeqCst);
+    // The target's actual old owners are joined; the source stays live.
+    drop(copy);
+    drop(old_stream);
+    old_target.finish().await;
+    let target = Member::new_scoped(
+        2,
+        true,
+        1,
+        false,
+        Some(old_publication.clone()),
+        Some(retained_provider.clone()),
+    )
+    .await;
+    assert!(Arc::ptr_eq(&target.provider, &retained_provider));
+    assert_eq!(target.transport.local().storage, old_endpoint.storage);
+    assert_ne!(
+        target.transport.local().process_session_id,
+        old_endpoint.process_session_id
+    );
+    assert_ne!(
+        target.transport.local().creation_id,
+        old_endpoint.creation_id
+    );
+    target.restore().await;
+    let mut target_publication = target.access.publication.lock().unwrap().clone();
+    target_publication.stage = ReplicaPublicationStage::AchievedScope;
+    target_publication.role = ReplicaRole::ActiveSecondary;
+    *target.access.publication.lock().unwrap() = target_publication.clone();
+    assert_eq!(
+        target
+            .interfaces
+            .replicator()
+            .current_progress()
+            .await
+            .unwrap(),
+        1
+    );
+    source
+        .interfaces
+        .replicator()
+        .update_epoch(epoch(2))
+        .await
+        .unwrap();
+    target
+        .interfaces
+        .replicator()
+        .update_epoch(epoch(2))
+        .await
+        .unwrap();
+    let next = configuration(1, &[1, 2], epoch(2));
+    for publication in [&mut source_publication, &mut target_publication] {
+        publication.scope.epoch = epoch(2);
+        publication.scope.configuration.current = next.clone();
+        publication.scope.configuration.previous = Some(original.clone());
+        publication.generation += 1;
+    }
+    source_publication.scope.configuration.replicas =
+        vec![peer(&target_publication, ReplicaRole::ActiveSecondary, 1)];
+    target_publication.scope.configuration.replicas =
+        vec![peer(&source_publication, ReplicaRole::Primary, 1)];
+    *source.access.publication.lock().unwrap() = source_publication.clone();
+    *target.access.publication.lock().unwrap() = target_publication.clone();
+    source
+        .transport
+        .test_publish(vec![target_publication.clone()]);
+    target
+        .transport
+        .test_publish(vec![source_publication.clone()]);
+    let mut attempted =
+        Binding::new(source_publication.clone(), target_publication.clone()).unwrap();
+    attempted.reformation = true;
+    attempted.live_target = Some(
+        source
+            .transport
+            .live_target_relation(&old_binding, &source_publication, &target_publication)
+            .unwrap(),
+    );
+    assert!(
+        source
+            .transport
+            .control(&attempted, Control::CheckReformation)
+            .await
+            .is_err(),
+        "initialized checkpoint/publication cannot substitute for a consuming application"
+    );
+    let mut stream = target
+        .interfaces
+        .state_replicator()
+        .unwrap()
+        .replication_operations()
+        .unwrap();
+    assert!(stream.get_operation().now_or_never().is_none());
+    let current = ReplicaSetConfiguration {
+        configuration: next,
+        replicas: vec![information(
+            &target_publication,
+            ReplicaRole::ActiveSecondary,
+            1,
+        )],
+    };
+    let previous = ReplicaSetConfiguration {
+        configuration: original.clone(),
+        // The public scope describes the fresh physical endpoint. Native PC
+        // resolution must still select the exact frozen old sender root.
+        replicas: current.replicas.clone(),
+    };
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let probes = Arc::new(AtomicUsize::new(0));
+    let cut = TestingTcpRoute::register_with_kind(identity(1).instance_id.to_string(), {
+        let entered = entered.clone();
+        let release = release.clone();
+        let probes = probes.clone();
+        move |kind, _, address| {
+            let entered = entered.clone();
+            let release = release.clone();
+            let probes = probes.clone();
+            Box::pin(async move {
+                if kind == TestingTcpRouteKind::EngineReserve
+                    && probes.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    entered.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                }
+                Ok(address)
+            })
+        }
+    });
+    let primary = source.interfaces.primary_replicator().unwrap();
+    let selected = current.clone();
+    let frozen = previous.clone();
+    let observer = tokio::spawn(async move {
+        primary
+            .update_catch_up_replica_set_configuration(selected, frozen)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let fresh_binding = source.transport.sessions.binding_for(2).unwrap();
+    assert!(fresh_binding.live_target.is_some());
+    assert_ne!(fresh_binding.nonce, old_binding.nonce);
+    assert!(source.transport.sessions.active(&old_binding).is_err());
+    assert!(!original_sender.transport_active());
+    assert!(!original_sender.is_processing());
+    assert_eq!(source.transport.pending_sends(&old_binding), None);
+    assert!(target.transport.sessions.vacant_receiver());
+    assert_eq!(source.transport.local(), &source_endpoint);
+    assert!(pending.completion.as_mut().now_or_never().is_none());
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    let primary = source.interfaces.primary_replicator().unwrap();
+    let selected = current.clone();
+    let retry = tokio::spawn(async move {
+        primary
+            .update_catch_up_replica_set_configuration(selected, previous)
+            .await
+    });
+    assert!(!retry.is_finished());
+    assert!(
+        source
+            .transport
+            .sessions
+            .effect(&old_binding, || panic!("old nonce regained authority"))
+            .is_err()
+    );
+    assert!(old_operation.acknowledge().is_err());
+    release.add_permits(1);
+    let replay = tokio::time::timeout(Duration::from_secs(5), stream.get_operation())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.lsn, 2);
+    assert_eq!(
+        replay.data,
+        Bytes::from_static(b"pending-before-reformation")
+    );
+    assert!(pending.completion.as_mut().now_or_never().is_none());
+    target.provider.progress.store(2, Ordering::SeqCst);
+    replay.acknowledge().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), pending.completion)
+        .await
+        .unwrap()
+        .unwrap();
+    source.provider.progress.store(2, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(cut);
+    assert_eq!(
+        source.provider.progress_calls.load(Ordering::SeqCst),
+        source_progress_queries
+    );
+    assert_eq!(original_sender.progress(0).applied, 1);
+    let roots = native.inspect_configuration();
+    assert_eq!(roots["current"]["writeQuorum"], 2);
+    assert_eq!(roots["previous"]["writeQuorum"], 2);
+    assert_eq!(
+        roots["previous"]["members"][0]["incarnation"],
+        old_identity.remote_incarnation
+    );
+    assert_ne!(
+        roots["current"]["members"][0]["incarnation"],
+        roots["previous"]["members"][0]["incarnation"]
+    );
+    let delayed_old_ack = old_route
+        .reversed()
+        .envelope(wire::envelope::Body::ReplicationAck(wire::ReplicationAck {
+            replication_received: 2,
+            replication_applied: 2,
+            copy_received: -1,
+            copy_applied: -1,
+            ..Default::default()
+        }));
+    assert!(native.receive_ack(&delayed_old_ack).is_err());
+    let mut crossed_nonce = fresh_binding.clone();
+    crossed_nonce.nonce = uuid::Uuid::new_v4().to_string();
+    assert!(
+        target
+            .transport
+            .control(&crossed_nonce, Control::Confirm)
+            .await
+            .is_err()
+    );
+    assert_eq!(original_sender.progress(0).applied, 1);
+    assert!(source.transport.sessions.completed(&fresh_binding));
+    assert!(target.transport.sessions.completed(&fresh_binding));
+    source
+        .interfaces
+        .primary_replicator()
+        .unwrap()
+        .wait_for_catch_up_quorum(crate::replicator::ReplicaSetQuorumMode::All)
+        .await
+        .unwrap();
+    for publication in [&mut source_publication, &mut target_publication] {
+        publication.scope.configuration.previous = None;
+        publication.generation += 1;
+    }
+    *source.access.publication.lock().unwrap() = source_publication.clone();
+    *target.access.publication.lock().unwrap() = target_publication.clone();
+    source.transport.test_publish(vec![target_publication]);
+    target.transport.test_publish(vec![source_publication]);
+    source
+        .interfaces
+        .primary_replicator()
+        .unwrap()
+        .update_current_replica_set_configuration(current)
+        .await
+        .unwrap();
+    let write = source
+        .interfaces
+        .state_replicator()
+        .unwrap()
+        .begin_replicate(Bytes::from_static(b"new-write-after-reformation"))
+        .unwrap();
+    let operation = tokio::time::timeout(Duration::from_secs(5), stream.get_operation())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.lsn, 3);
+    assert_eq!(
+        operation.data,
+        Bytes::from_static(b"new-write-after-reformation")
+    );
+    target.provider.progress.store(3, Ordering::SeqCst);
+    operation.acknowledge().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), write.completion)
+        .await
+        .unwrap()
+        .unwrap();
+    source.provider.progress.store(3, Ordering::SeqCst);
+    assert_eq!(
+        source.provider.progress.load(Ordering::SeqCst),
+        target.provider.progress.load(Ordering::SeqCst)
+    );
+    assert!(native.inspect_configuration()["previous"].is_null());
+    assert_eq!(
+        target.provider.copy_calls.load(Ordering::SeqCst),
+        historical_copy_calls
+    );
+    assert_eq!(
+        target.provider.context_calls.load(Ordering::SeqCst),
+        historical_context_calls
+    );
+    drop(stream);
     source.finish().await;
     target.finish().await;
 }

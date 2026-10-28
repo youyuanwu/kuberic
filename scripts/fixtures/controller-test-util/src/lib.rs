@@ -16,8 +16,7 @@ use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
 use kuberic_runtime::protocol::types::{AccessStatus, Epoch, FaultType, OperationId, ReplicaRole};
 use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
-    StatefulServicePartition,
+    Replicator, ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError, StateProvider, StatefulServiceReplica};
 use serde::{Deserialize, Serialize};
@@ -456,6 +455,7 @@ pub struct CounterService {
     write_gate: Arc<AsyncMutex<()>>,
     role: Mutex<ReplicaRole>,
     restoring_retained: AtomicBool,
+    contained_reconstruction: AtomicBool,
     drain: AsyncMutex<DrainOutcome>,
     aborted: AtomicBool,
     close_after_abort: OnceLock<bool>,
@@ -509,6 +509,7 @@ impl CounterService {
             write_gate: Arc::new(AsyncMutex::new(())),
             role: Mutex::new(ReplicaRole::None),
             restoring_retained: AtomicBool::new(false),
+            contained_reconstruction: AtomicBool::new(false),
             drain: AsyncMutex::new(DrainOutcome::default()),
             aborted: AtomicBool::new(false),
             close_after_abort: OnceLock::new(),
@@ -786,9 +787,13 @@ impl StatefulServiceReplica for CounterService {
         self.local_store().authorize_open(context.mode)?;
         self.restoring_retained
             .store(context.restoring_retained_member(), Ordering::Release);
+        self.contained_reconstruction.store(
+            context.reconstructing_contained_creation(),
+            Ordering::Release,
+        );
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
+            .with_builtin_replicator()
             .create_replicator(
                 Some(self.local_store().clone()),
                 Some(ReplicatorSettings {
@@ -821,6 +826,31 @@ impl StatefulServiceReplica for CounterService {
                 "retained counter initialization requires secondary role",
             ));
         }
+        let contained = self.contained_reconstruction.load(Ordering::Acquire);
+        if previous == ReplicaRole::None
+            && contained
+            && !matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
+        {
+            return Err(app_error(
+                "contained counter initialization requires its selected native role",
+            ));
+        }
+        if previous == ReplicaRole::None
+            && (self.restoring_retained.load(Ordering::Acquire) || contained)
+        {
+            let control = self
+                .control
+                .read()
+                .await
+                .clone()
+                .ok_or(RuntimeError::NotOpen)?;
+            let boundary = control.current_progress().await?;
+            if boundary < 0 || self.local_store().state.lock().unwrap().committed != boundary {
+                return Err(app_error(
+                    "counter retained initialization differs from native checkpoint",
+                ));
+            }
+        }
         if trace_counter() {
             eprintln!(
                 "counter {} role {previous:?} -> {role:?}",
@@ -851,21 +881,7 @@ impl StatefulServiceReplica for CounterService {
                 .ok_or(RuntimeError::NotOpen)?;
             let retained = previous == ReplicaRole::None
                 && role == ReplicaRole::ActiveSecondary
-                && self.restoring_retained.load(Ordering::Acquire);
-            if retained {
-                let control = self
-                    .control
-                    .read()
-                    .await
-                    .clone()
-                    .ok_or(RuntimeError::NotOpen)?;
-                let boundary = control.current_progress().await?;
-                if boundary < 0 || self.local_store().state.lock().unwrap().committed != boundary {
-                    return Err(app_error(
-                        "counter retained initialization differs from native checkpoint",
-                    ));
-                }
-            }
+                && (self.restoring_retained.load(Ordering::Acquire) || contained);
             let copy = !retained
                 && (role == ReplicaRole::IdleSecondary || previous != ReplicaRole::Primary);
             let (copied, completion) = watch::channel(!copy);

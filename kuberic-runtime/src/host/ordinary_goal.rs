@@ -3,6 +3,10 @@ use super::{HostError, Result};
 use crate::protocol::public_operations::*;
 use crate::protocol::types::*;
 
+#[path = "ordered_addition.rs"]
+pub(crate) mod addition;
+#[path = "reconstruction.rs"]
+pub(crate) mod reconstruction;
 #[path = "retained.rs"]
 pub(crate) mod retained;
 
@@ -21,6 +25,399 @@ pub(crate) fn remote_key(remote: &RemoteReplicaSelection) -> String {
 
 fn voter(role: ReplicaRole) -> bool {
     matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
+}
+
+pub(crate) fn same_fence_swap(previous: &ReplicaGoal, goal: &ReplicaGoal) -> bool {
+    let Some(original) = previous.scope.configuration.previous.as_ref() else {
+        return false;
+    };
+    previous.scope.history == goal.scope.history
+        && previous.scope.storage == goal.scope.storage
+        && previous.scope.process_session_id == goal.scope.process_session_id
+        && previous.scope.creation_id == goal.scope.creation_id
+        && previous.scope.epoch == goal.scope.epoch
+        && original.epoch < goal.scope.epoch
+        && original.epoch.data_loss_number == goal.scope.epoch.data_loss_number
+        && previous.scope.configuration.current.primary_id == original.primary_id
+        && goal.scope.configuration.current.primary_id != original.primary_id
+        && goal.scope.configuration.current.write_quorum == original.write_quorum
+        && goal.scope.configuration.current.members.len() == original.members.len()
+        && original.members.iter().all(|member| {
+            goal.scope.configuration.current.members.iter().any(|next| {
+                next.identity == member.identity
+                    && next.role
+                        == if next.identity.replica_id
+                            == goal.scope.configuration.current.primary_id
+                        {
+                            ReplicaRole::Primary
+                        } else {
+                            ReplicaRole::ActiveSecondary
+                        }
+            })
+        })
+        && goal.scope.configuration.previous.as_ref() == Some(original)
+        && matches!(
+            previous.desired,
+            ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::ActiveSecondary,
+                catch_up: None,
+            }
+        )
+        && matches!(
+            goal.desired,
+            ReplicaGoalKind::Discover
+                | ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary | ReplicaRole::ActiveSecondary,
+                    ..
+                }
+        )
+}
+
+fn normal_current_bridge<'a>(
+    state: &'a AgentState,
+    preparation: &PublicOperationRecord,
+    goal: &ReplicaGoal,
+) -> Option<&'a NativeLifecycleFacts> {
+    use PublicInstruction as I;
+    use PublicInstructionOutcome as O;
+    if let Some(facts) = normal_secondary_bridge(state, preparation, goal) {
+        return Some(facts);
+    }
+    let previous = preparation.intent.goal()?;
+    let preview = state.public_v1_operation_state.as_ref()?;
+    if goal.scope.configuration.previous.is_some()
+        || goal.desired
+            != (ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                catch_up: Some(PublicCatchUpMode::WriteQuorum),
+            })
+        || goal.scope.configuration.current.primary_id != goal.scope.storage.replica.replica_id
+        || !settled_native_record(state, preparation)
+    {
+        return None;
+    }
+    preview.operations.values().find_map(|record| {
+        let joint = record.intent.goal()?;
+        let ordinary = record.ordinary.as_ref()?;
+        let input = ordinary.native_input.as_ref()?;
+        let source = input.source.as_ref()?;
+        let query = input.promotion.as_ref()?;
+        let original = joint.scope.configuration.previous.as_ref()?;
+        let O::NativeLifecycle(facts) = record.lifecycle.outcomes.last()? else {
+            return None;
+        };
+        let boundary = source.deactivation.as_ref()?;
+        let source_member = original.members.iter().find(|member| {
+            member.identity.replica_id == original.primary_id && member.role == ReplicaRole::Primary
+        })?;
+        let query_record = preview.operations.get(&query.input.operation_id)?;
+        (previous.revision < joint.revision
+            && joint.revision < goal.revision
+            && same_fence_swap(previous, joint)
+            && joint.identity == goal.identity
+            && joint.validate().is_ok()
+            && joint.scope.history == goal.scope.history
+            && joint.scope.storage == goal.scope.storage
+            && joint.scope.process_session_id == goal.scope.process_session_id
+            && joint.scope.creation_id == goal.scope.creation_id
+            && joint.scope.epoch == goal.scope.epoch
+            && joint.scope.configuration.current == goal.scope.configuration.current
+            && joint.desired == goal.desired
+            && settled_native_record(state, record)
+            && ordinary.actions
+                == [
+                    I::ReplicatorRole,
+                    I::ProgramEpoch,
+                    I::ApplicationRole,
+                    I::NativeDataLossDecision,
+                    I::Configuration,
+                    I::FirstCatchUp,
+                    I::NativeComplete,
+                ]
+            && matches!(
+                record.lifecycle.outcomes.as_slice(),
+                [
+                    O::Done,
+                    O::Done,
+                    O::ApplicationRole(_),
+                    O::Done,
+                    O::Done,
+                    O::Done,
+                    O::NativeLifecycle(_),
+                ]
+            )
+            && !input.fresh_initial_primary
+            && input.native_rebuild.is_none()
+            && input.lifecycle.state == NativeReplicaState::Ready
+            && input.lifecycle.native_role == ReplicaRole::ActiveSecondary
+            && input.lifecycle.application_role == Some(ReplicaRole::ActiveSecondary)
+            && input.lifecycle.applied_primary_fence == Some(goal.scope.epoch)
+            && input
+                .lifecycle
+                .deactivation
+                .as_ref()
+                .is_some_and(|history| {
+                    history.primary_fence < goal.scope.epoch
+                        && history.primary_fence.data_loss_number
+                            == goal.scope.epoch.data_loss_number
+                })
+            && settled_native_record(state, query_record)
+            && query_record.intent.goal().is_some_and(|selected| {
+                selected.desired == ReplicaGoalKind::Discover
+                    && previous.revision < selected.revision
+                    && selected.revision < joint.revision
+                    && selected.scope.history == joint.scope.history
+                    && selected.scope.storage == joint.scope.storage
+                    && selected.scope.process_session_id == joint.scope.process_session_id
+                    && selected.scope.creation_id == joint.scope.creation_id
+                    && selected.scope.epoch == joint.scope.epoch
+                    && selected.scope.configuration.current == joint.scope.configuration.current
+                    && selected.scope.configuration.previous == joint.scope.configuration.previous
+            })
+            && matches!(
+                query.epoch,
+                NativeInspectionEpoch::Applied | NativeInspectionEpoch::AlreadyApplied
+            )
+            && query.input.state == NativeReplicaState::Ready
+            && query.input.native_role == ReplicaRole::ActiveSecondary
+            && query.input.application_role == Some(ReplicaRole::ActiveSecondary)
+            && query.input.applied_primary_fence == Some(goal.scope.epoch)
+            && query.input.deactivation == input.lifecycle.deactivation
+            && query
+                .progress
+                .value()
+                .is_some_and(|last| last >= boundary.catch_up_lsn)
+            && query.capability.value().is_some_and(|first| first >= 0)
+            && source.scope.validate().is_ok()
+            && source.operation_id != joint.operation_id
+            && source.revision > 0
+            && source.scope.history == joint.scope.history
+            && source.scope.storage.replica == source_member.identity
+            && source.scope.epoch == joint.scope.epoch
+            && source.scope.configuration.current == joint.scope.configuration.current
+            && source.scope.configuration.previous == joint.scope.configuration.previous
+            && source.state == NativeReplicaState::Ready
+            && source.native_role == ReplicaRole::ActiveSecondary
+            && source.application_role == Some(ReplicaRole::ActiveSecondary)
+            && source.applied_primary_fence == Some(goal.scope.epoch)
+            && boundary.primary_fence == goal.scope.epoch
+            && boundary.catch_up_lsn >= 0
+            && joint.scope.configuration.replicas.iter().any(|peer| {
+                peer.identity == source.scope.storage.replica
+                    && peer.storage_incarnation == source.scope.storage
+                    && peer.process_session_id == source.scope.process_session_id
+                    && peer.is_up
+                    && peer.is_ready
+                    && peer.current_progress == boundary.catch_up_lsn
+            })
+            && facts.state == NativeReplicaState::Ready
+            && facts.native_role == ReplicaRole::Primary
+            && facts.application_role == Some(ReplicaRole::Primary)
+            && facts.applied_primary_fence == Some(goal.scope.epoch)
+            && facts.deactivation.as_ref().is_some_and(|history| {
+                history.primary_fence == goal.scope.epoch
+                    && Some(history.catch_up_lsn) == query.progress.value()
+                    && history.catch_up_lsn >= boundary.catch_up_lsn
+            }))
+        .then_some(facts.as_ref())
+    })
+}
+
+fn normal_secondary_bridge<'a>(
+    state: &'a AgentState,
+    preparation: &PublicOperationRecord,
+    goal: &ReplicaGoal,
+) -> Option<&'a NativeLifecycleFacts> {
+    use PublicInstruction as I;
+    use PublicInstructionOutcome as O;
+    let previous = preparation.intent.goal()?;
+    let preview = state.public_v1_operation_state.as_ref()?;
+    if goal.scope.configuration.previous.is_some()
+        || goal.desired
+            != (ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::ActiveSecondary,
+                catch_up: None,
+            })
+        || !settled_native_record(state, preparation)
+    {
+        return None;
+    }
+    preview.operations.values().find_map(|record| {
+        let joint = record.intent.goal()?;
+        let ordinary = record.ordinary.as_ref()?;
+        let input = ordinary.native_input.as_ref()?;
+        let query = input.promotion.as_ref()?;
+        let query_record = preview.operations.get(&query.input.operation_id)?;
+        let O::NativeLifecycle(facts) = record.lifecycle.outcomes.last()? else {
+            return None;
+        };
+        (previous.revision < joint.revision
+            && joint.revision < goal.revision
+            && same_fence_swap(previous, joint)
+            && joint.identity == goal.identity
+            && joint.scope.history == goal.scope.history
+            && joint.scope.storage == goal.scope.storage
+            && joint.scope.process_session_id == goal.scope.process_session_id
+            && joint.scope.creation_id == goal.scope.creation_id
+            && joint.scope.epoch == goal.scope.epoch
+            && joint.scope.configuration.current == goal.scope.configuration.current
+            && joint.desired == goal.desired
+            && settled_native_record(state, record)
+            && ordinary.actions
+                == [
+                    I::ReplicatorRole,
+                    I::ApplicationRole,
+                    I::ProgramEpoch,
+                    I::Configuration,
+                    I::NativeComplete,
+                ]
+            && matches!(
+                record.lifecycle.outcomes.as_slice(),
+                [
+                    O::Done,
+                    O::ApplicationRole(_),
+                    O::Done,
+                    O::Done,
+                    O::NativeLifecycle(_),
+                ]
+            )
+            && !input.fresh_initial_primary
+            && input.native_rebuild.is_none()
+            && input.source.is_none()
+            && input.lifecycle.state == NativeReplicaState::Ready
+            && input.lifecycle.native_role == ReplicaRole::ActiveSecondary
+            && input.lifecycle.application_role == Some(ReplicaRole::ActiveSecondary)
+            && input.lifecycle.applied_primary_fence == Some(goal.scope.epoch)
+            && settled_native_record(state, query_record)
+            && query_record.intent.goal().is_some_and(|selected| {
+                selected.desired == ReplicaGoalKind::Discover
+                    && previous.revision < selected.revision
+                    && selected.revision < joint.revision
+                    && selected.scope == query.input.scope
+                    && selected.scope.history == joint.scope.history
+                    && selected.scope.storage == joint.scope.storage
+                    && selected.scope.process_session_id == joint.scope.process_session_id
+                    && selected.scope.creation_id == joint.scope.creation_id
+                    && selected.scope.epoch == joint.scope.epoch
+                    && selected.scope.configuration.current == joint.scope.configuration.current
+                    && selected.scope.configuration.previous == joint.scope.configuration.previous
+            })
+            && matches!(
+                query.epoch,
+                NativeInspectionEpoch::Applied | NativeInspectionEpoch::AlreadyApplied
+            )
+            && query.input.state == NativeReplicaState::Ready
+            && query.input.native_role == ReplicaRole::ActiveSecondary
+            && query.input.application_role == Some(ReplicaRole::ActiveSecondary)
+            && query.input.applied_primary_fence == Some(goal.scope.epoch)
+            && query.input.deactivation == input.lifecycle.deactivation
+            && query.progress.value().is_some_and(|last| last >= 0)
+            && query.capability.value().is_some_and(|first| first >= 0)
+            && facts.state == NativeReplicaState::Ready
+            && facts.native_role == ReplicaRole::ActiveSecondary
+            && facts.application_role == Some(ReplicaRole::ActiveSecondary)
+            && facts.applied_primary_fence == Some(goal.scope.epoch)
+            && facts.deactivation == input.lifecycle.deactivation)
+            .then_some(facts.as_ref())
+    })
+}
+
+pub(super) fn normal_current_secondary<'a>(
+    state: &'a AgentState,
+    goal: &ReplicaGoal,
+) -> Option<&'a NativeLifecycleFacts> {
+    state
+        .public_v1_operation_state
+        .as_ref()?
+        .operations
+        .values()
+        .find_map(|record| normal_secondary_bridge(state, record, goal))
+}
+
+pub(super) fn normal_current_owner<'a>(
+    state: &'a AgentState,
+    goal: &ReplicaGoal,
+) -> Option<&'a NativeLifecycleFacts> {
+    state
+        .public_v1_operation_state
+        .as_ref()?
+        .operations
+        .values()
+        .find_map(|record| normal_current_bridge(state, record, goal))
+}
+
+fn settled_native_record(state: &AgentState, record: &PublicOperationRecord) -> bool {
+    record.intent.goal().is_some_and(|goal| {
+        goal.validate().is_ok()
+            && record.intent == goal.intent()
+            && record.accepted_history.as_ref() == Some(&goal.scope.history)
+            && record.accepted_storage.as_ref() == Some(&goal.scope.storage)
+    }) && record.stage == PublicOperationStage::Completed
+        && record.disposition == Some(PublicOperationDisposition::Succeeded)
+        && record.superseded_by.is_none()
+        && record.retry_failure.is_none()
+        && record.lifecycle.in_flight.is_none()
+        && record.ordinary.as_ref().is_some_and(|ordinary| {
+            ordinary.action_format == ORDINARY_ACTION_FORMAT
+                && ordinary.accepted
+                && ordinary.host_settled
+                && !ordinary.logically_retired
+                && ordinary.native_input.is_some()
+                && {
+                    let mut expected =
+                        super::public_lifecycle::operation_instructions(&record.intent);
+                    if ordinary.already_open {
+                        if record.intent.goal().is_none_or(|goal| {
+                            !matches!(
+                                goal.desired,
+                                ReplicaGoalKind::Prepare { .. } | ReplicaGoalKind::Discover
+                            ) || !opened_creation(state, goal)
+                        }) {
+                            return false;
+                        }
+                        expected.retain(|action| {
+                            !matches!(
+                                action,
+                                PublicInstruction::ApplicationOpen
+                                    | PublicInstruction::ReplicatorOpen
+                            )
+                        });
+                    }
+                    ordinary.actions == expected
+                }
+                && record.lifecycle.outcomes.len() == ordinary.actions.len()
+        })
+        && super::native_history::validate_record(state, record).is_ok()
+}
+
+pub(super) fn validate_live_normal_current(
+    state: &AgentState,
+    goal: &ReplicaGoal,
+    live: impl Fn(&NativeLifecycleFacts) -> bool,
+) -> Result<()> {
+    if goal.class().is_terminal() {
+        return Ok(());
+    }
+    let Some(preview) = state.public_v1_operation_state.as_ref() else {
+        return Ok(());
+    };
+    for record in preview.operations.values() {
+        let Some(previous) = record.intent.goal() else {
+            continue;
+        };
+        if previous.revision < goal.revision
+            && previous.scope.process_session_id == goal.scope.process_session_id
+            && !previous.scope.compatible_with(&goal.scope)
+            && !matches!(previous.desired, ReplicaGoalKind::Discover)
+            && !same_fence_swap(previous, goal)
+            && normal_current_bridge(state, record, goal).is_none_or(|facts| !live(facts))
+        {
+            return Err(reject(
+                "normal current-only continuation lost its actual joint native owner",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn retained_source_member(
@@ -161,6 +558,78 @@ fn retained_election_member(
         })
 }
 
+fn live_source_retained_member(
+    state: &AgentState,
+    goal: &ReplicaGoal,
+    peer: &ReplicaPeerDescription,
+) -> bool {
+    let Some(previous) = goal.scope.configuration.previous.as_ref() else {
+        return false;
+    };
+    let current = &goal.scope.configuration.current;
+    if !matches!(
+        goal.desired,
+        ReplicaGoalKind::Reconfigure {
+            role: ReplicaRole::Primary,
+            catch_up: Some(_)
+        }
+    ) || current.primary_id != goal.scope.storage.replica.replica_id
+        || current.primary_id != previous.primary_id
+        || current.members != previous.members
+        || current.write_quorum != previous.write_quorum
+        || current.epoch.data_loss_number != previous.epoch.data_loss_number
+        || current.epoch.configuration_number <= previous.epoch.configuration_number
+        || peer.role != ReplicaRole::ActiveSecondary
+    {
+        return false;
+    }
+    state
+        .public_v1_operation_state
+        .as_ref()
+        .is_some_and(|preview| {
+            preview.operations.values().any(|record| {
+                let Some(old) = record.intent.goal() else {
+                    return false;
+                };
+                record.intent.revision < goal.revision
+                    && record.stage == PublicOperationStage::Completed
+                    && record.disposition == Some(PublicOperationDisposition::Succeeded)
+                    && record.lifecycle.in_flight.is_none()
+                    && record
+                        .ordinary
+                        .as_ref()
+                        .is_some_and(|ordinary| ordinary.accepted)
+                    && record.accepted_history.as_ref() == Some(&goal.scope.history)
+                    && record.accepted_storage.as_ref() == Some(&goal.scope.storage)
+                    && old.scope.process_session_id == goal.scope.process_session_id
+                    && old.scope.creation_id == goal.scope.creation_id
+                    && old.role() == Some(ReplicaRole::Primary)
+                    && old.scope.configuration.previous.is_none()
+                    && old.scope.configuration.current == *previous
+                    && super::public_lifecycle::achieved_configuration_from_record(record)
+                        == Some(old.scope.configuration.ordinary())
+                    && old.scope.configuration.replicas.len()
+                        == goal.scope.configuration.replicas.len()
+                    && old.scope.configuration.replicas.iter().all(|known| {
+                        goal.scope.configuration.replicas.iter().any(|next| {
+                            next.identity == known.identity
+                                && next.storage_incarnation == known.storage_incarnation
+                                && next.role == known.role
+                                && (next.identity == peer.identity
+                                    || (next.process_session_id == known.process_session_id
+                                        && next.replication_address == known.replication_address))
+                        })
+                    })
+                    && old.scope.configuration.replicas.iter().any(|known| {
+                        known.identity == peer.identity
+                            && known.storage_incarnation == peer.storage_incarnation
+                            && known.role == ReplicaRole::ActiveSecondary
+                            && known.process_session_id != peer.process_session_id
+                    })
+            })
+        })
+}
+
 fn new_voters<'a>(
     state: &AgentState,
     goal: &'a ReplicaGoal,
@@ -171,7 +640,12 @@ fn new_voters<'a>(
         || !matches!(
             goal.desired,
             ReplicaGoalKind::Reconfigure { .. } | ReplicaGoalKind::RefreshPrimary { .. }
-        )
+        ) && !addition::selection(goal).is_some_and(|selected| {
+            matches!(
+                selected.phase,
+                MembershipAdditionPhase::Joint | MembershipAdditionPhase::Current
+            )
+        })
     {
         return Ok(Vec::new());
     }
@@ -220,7 +694,12 @@ fn new_voters<'a>(
             peers
                 .into_iter()
                 .filter(|peer| {
-                    if retained_source_member(state, goal, peer) {
+                    if !peer.is_up || !peer.is_ready {
+                        return false;
+                    }
+                    if retained_source_member(state, goal, peer)
+                        || live_source_retained_member(state, goal, peer)
+                    {
                         return false;
                     }
                     // This is an original same-storage voter, not an idle
@@ -229,7 +708,11 @@ fn new_voters<'a>(
                     // checked target receipts/binding/ACKs before any quorum,
                     // successful configuration or serving publication.
                     if retained_election_member(state, goal, peer) {
-                        return false;
+                        return previous.as_ref().is_some_and(|old| {
+                            old.replicas.iter().any(|known| {
+                                known.identity == peer.identity && (!known.is_up || !known.is_ready)
+                            })
+                        });
                     }
                     previous.as_ref().is_none_or(|old| {
                         !std::iter::once(&old.current)
@@ -297,7 +780,8 @@ pub(crate) fn admission_ready(
                     remote.state == RemoteReplicaState::Ready
                         && remote.accepted
                         && matches_peer(&remote.selection, peer)
-                        && matches_source(&remote.selection, goal)
+                        && (matches_source(&remote.selection, goal)
+                            || addition::matches_build(state, goal, &remote.selection))
                 })
                 .map(|remote| remote.selection.clone())
                 .ok_or_else(|| reject("new voter admission requires accepted exact Ready"))
@@ -328,7 +812,7 @@ pub(crate) fn validate_frozen_admissions(
                 != 1
         })
         || ordinary.ready_admissions.iter().any(|remote| {
-            if !matches_source(remote, goal) {
+            if !matches_source(remote, goal) && !addition::matches_build(state, goal, remote) {
                 return true;
             }
             let Some(preview) = state.public_v1_operation_state.as_ref() else {
@@ -434,6 +918,22 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
     if matches!(goal.desired, ReplicaGoalKind::RestoreRetainedMember { .. }) {
         retained::validate_restore(state, goal)?;
     }
+    if matches!(
+        goal.desired,
+        ReplicaGoalKind::RecoverContainedCreation { .. }
+    ) {
+        addition::validate(state, goal)?;
+        if reconstruction::claim(goal).is_some() {
+            reconstruction::validate(state, goal)?;
+        }
+    } else if addition::pending(state, &goal.scope.process_session_id)
+        && !goal.class().is_terminal()
+        && !addition::permits_copy(state, goal)
+    {
+        return Err(reject(
+            "ordered addition permits only its selected phase/copy continuation",
+        ));
+    }
     if goal.class().is_terminal()
         && preview.operations.values().any(|record| {
             record.intent.goal().is_some()
@@ -461,14 +961,20 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
             {
                 continue;
             }
-            if previous.class().is_terminal()
-                || terminal_for_process(preview, &goal.scope.process_session_id)
+            if (previous.class().is_terminal()
+                || terminal_for_process(preview, &goal.scope.process_session_id))
+                && reconstruction::inspection_custody(state, goal).is_none()
+                && super::original_member::custody(state, goal).is_none()
             {
                 return Err(reject(
                     "withdrawn creation requires contained process replacement",
                 ));
             }
-            if !previous.scope.compatible_with(&goal.scope) {
+            if !previous.scope.compatible_with(&goal.scope)
+                && !matches!(previous.desired, ReplicaGoalKind::Discover)
+                && !same_fence_swap(previous, goal)
+                && normal_current_bridge(state, record, goal).is_none()
+            {
                 return Err(reject(
                     "incompatible scope requires whole-creation withdrawal",
                 ));
@@ -555,6 +1061,7 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
             ));
         }
     }
+    super::original_member::validate_idle(state, goal)?;
     if matches!(goal.desired, ReplicaGoalKind::Prepare { .. })
         && preview.operations.values().any(|record| {
             record.intent.goal().is_some_and(|previous| {
@@ -564,21 +1071,6 @@ pub(crate) fn validate_admission(state: &AgentState, goal: &ReplicaGoal) -> Resu
         })
     {
         return Err(reject("creation already has a preparation goal"));
-    }
-    if matches!(goal.desired, ReplicaGoalKind::Discover)
-        && preview.operations.values().any(|record| {
-            record.intent.goal().is_some_and(|previous| {
-                previous.scope.process_session_id == goal.scope.process_session_id
-                    && matches!(
-                        previous.desired,
-                        ReplicaGoalKind::Discover | ReplicaGoalKind::Prepare { .. }
-                    )
-            })
-        })
-    {
-        return Err(reject(
-            "creation already has a discovery or preparation goal",
-        ));
     }
     if let Some(remote) = goal.remote() {
         let key = remote_key(remote);
@@ -734,15 +1226,20 @@ pub(crate) fn terminal_for_process(
     if !preview.terminal {
         return false;
     }
+    if reconstruction::attempting_process(preview, process) {
+        return false;
+    }
     let terminals = preview
         .operations
         .values()
         .filter(|record| record.intent.class.is_terminal())
         .collect::<Vec<_>>();
     if !terminals.is_empty()
-        && terminals
-            .iter()
-            .all(|record| retained::fault_dependency_replaced(preview, record, process))
+        && terminals.iter().all(|record| {
+            retained::fault_dependency_replaced(preview, record, process)
+                || reconstruction::dependency_replaced(preview, record, process)
+                || super::original_member::dependency_replaced(preview, record, process)
+        })
     {
         return false;
     }
@@ -760,7 +1257,9 @@ pub(crate) fn terminal_for_process(
                     || record.lifecycle.in_flight.is_some())
         })
         || terminals.iter().any(|record| {
-            if retained::fault_dependency_replaced(preview, record, process) {
+            if retained::fault_dependency_replaced(preview, record, process)
+                || reconstruction::dependency_replaced(preview, record, process)
+            {
                 return false;
             }
             record.intent.goal().is_none()
@@ -769,6 +1268,86 @@ pub(crate) fn terminal_for_process(
                 || record.disposition != Some(PublicOperationDisposition::Succeeded)
                 || record.lifecycle.in_flight.is_some()
         })
+}
+
+pub(crate) fn builtin_construction_source(
+    state: &AgentState,
+    goal: &ReplicaGoal,
+) -> Option<OperationId> {
+    state
+        .public_v1_operation_state
+        .as_ref()?
+        .operations
+        .values()
+        .filter(|record| {
+            record.intent.revision < goal.revision
+                && record.accepted_history.as_ref() == Some(&goal.scope.history)
+                && record.accepted_storage.as_ref() == Some(&goal.scope.storage)
+        })
+        .filter_map(|record| {
+            record
+                .ordinary
+                .as_ref()?
+                .actions
+                .iter()
+                .zip(&record.lifecycle.outcomes)
+                .find(|(instruction, _)| **instruction == PublicInstruction::ReplicatorOpen)
+                .map(|(_, outcome)| (record, outcome))
+        })
+        .max_by_key(|(record, _)| record.intent.revision)
+        .and_then(|(record, outcome)| {
+            matches!(outcome,
+                PublicInstructionOutcome::BuiltinNativeEndpoint {
+                    process_id, process_lifetime, storage_owner, ..
+                } if *process_id != 0 && !process_lifetime.is_empty()
+                    && storage_owner.as_ref() == Some(&record.intent.process_session_id)
+            )
+            .then(|| record.intent.operation_id.clone())
+        })
+}
+
+pub(crate) fn capture_creation_owner(
+    state: &AgentState,
+    goal: &ReplicaGoal,
+) -> super::state::OrdinaryCreationOwner {
+    super::state::OrdinaryCreationOwner {
+        process_id: std::process::id(),
+        process_lifetime: retained::process_lifetime_id().to_owned(),
+        process_session_id: goal.scope.process_session_id.clone(),
+        creation_id: goal.scope.creation_id.clone(),
+        builtin_factory: builtin_construction_source(state, goal),
+    }
+}
+
+pub(crate) fn validate_creation_owner<'a>(
+    state: &AgentState,
+    record: &'a PublicOperationRecord,
+) -> Result<&'a super::state::OrdinaryCreationOwner> {
+    let goal = record
+        .intent
+        .goal()
+        .ok_or_else(|| reject("owner stamp lacks an ordinary goal"))?;
+    let owner = record
+        .ordinary
+        .as_ref()
+        .and_then(|ordinary| ordinary.creation_owner.as_ref())
+        .ok_or_else(|| reject("ordinary21 goal lacks its pre-effect physical owner stamp"))?;
+    if owner.process_id == 0
+        || owner.process_lifetime.is_empty()
+        || owner.process_session_id != goal.scope.process_session_id
+        || owner.creation_id != goal.scope.creation_id
+        || owner.builtin_factory != builtin_construction_source(state, goal)
+        || record.lifecycle.outcomes.iter().any(|outcome| {
+            matches!(outcome, PublicInstructionOutcome::BuiltinNativeEndpoint {
+                process_id, process_lifetime, ..
+            } if *process_id != owner.process_id || *process_lifetime != owner.process_lifetime)
+        })
+    {
+        return Err(reject(
+            "ordinary owner or bound builtin provenance crossed its selected creation",
+        ));
+    }
+    Ok(owner)
 }
 
 pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryGoalRecord> {
@@ -784,8 +1363,22 @@ pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryG
             .ok_or_else(|| reject("goal lacks frozen local actions"));
     }
     let mut actions = super::public_lifecycle::operation_instructions(&goal.intent());
-    let already_open =
-        matches!(goal.desired, ReplicaGoalKind::Prepare { .. }) && opened_creation(state, goal);
+    if (super::original_member::round(state, goal) || normal_current_owner(state, goal).is_some())
+        && matches!(
+            goal.desired,
+            ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                catch_up: Some(PublicCatchUpMode::WriteQuorum)
+            }
+        )
+        && goal.scope.configuration.previous.is_none()
+    {
+        actions = super::original_member::final_actions(goal);
+    }
+    let already_open = matches!(
+        goal.desired,
+        ReplicaGoalKind::Prepare { .. } | ReplicaGoalKind::Discover
+    ) && opened_creation(state, goal);
     if already_open {
         actions.retain(|instruction| {
             !matches!(
@@ -819,6 +1412,7 @@ pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryG
             ReplicaGoalKind::Discover
                 | ReplicaGoalKind::Prepare { .. }
                 | ReplicaGoalKind::RestoreRetainedMember { .. }
+                | ReplicaGoalKind::RecoverContainedCreation { .. }
         )
         .then_some(state.application_open_mode() == crate::application::OpenMode::Existing),
         already_open,
@@ -827,6 +1421,9 @@ pub(crate) fn freeze(state: &AgentState, goal: &ReplicaGoal) -> Result<OrdinaryG
         host_settled: false,
         ready_admissions: admission_ready(state, goal)?,
         retained: None,
+        reconstruction: None,
+        creation_owner: None,
+        native_input: None,
     })
 }
 
@@ -838,7 +1435,14 @@ pub(crate) fn opened_creation(state: &AgentState, goal: &ReplicaGoal) -> bool {
             preview.operations.values().any(|record| {
                 record.intent.operation_id != goal.operation_id
                     && record.intent.goal().is_some_and(|previous| {
-                        previous.scope.compatible_with(&goal.scope)
+                        (previous.scope.compatible_with(&goal.scope)
+                            || matches!(previous.desired, ReplicaGoalKind::Discover)
+                                && previous.scope.history == goal.scope.history
+                                && previous.scope.storage == goal.scope.storage
+                                && previous.scope.process_session_id
+                                    == goal.scope.process_session_id
+                                && previous.scope.creation_id == goal.scope.creation_id
+                                && previous.scope.epoch <= goal.scope.epoch)
                             && matches!(
                                 previous.desired,
                                 ReplicaGoalKind::Discover | ReplicaGoalKind::Prepare { .. }
@@ -862,7 +1466,8 @@ pub(crate) fn publication(
     withdrawn: bool,
 ) -> Option<ReplicaPublication> {
     let preview = state.public_v1_operation_state.as_ref()?;
-    if withdrawn || terminal_for_process(preview, process) {
+    let inspection_only = terminal_for_process(preview, process);
+    if withdrawn {
         return None;
     }
     let mut records = preview
@@ -886,8 +1491,32 @@ pub(crate) fn publication(
             .iter()
             .find_map(|outcome| outcome.endpoint().map(str::to_owned))
     })?;
-    let record = records.last()?;
+    // A later inspection round cannot erase an actually achieved role/scope.
+    let record = records
+        .iter()
+        .rev()
+        .find(|record| {
+            (!inspection_only
+                || record
+                    .intent
+                    .goal()
+                    .is_some_and(|goal| super::original_member::custody(state, goal).is_some()))
+                && record
+                    .intent
+                    .goal()
+                    .is_some_and(|goal| goal.role().is_some())
+        })
+        .copied()
+        .or_else(|| records.last().copied())?;
     let goal = record.intent.goal()?;
+    if inspection_only
+        && super::original_member::custody(state, goal).is_none()
+        && (reconstruction::inspection_custody(state, goal).is_none()
+            || record.stage != PublicOperationStage::Completed
+            || record.disposition != Some(PublicOperationDisposition::Succeeded))
+    {
+        return None;
+    }
     if record.superseded_by.is_some()
         || matches!(
             record.disposition,
@@ -943,6 +1572,58 @@ pub(crate) fn publication(
     })
 }
 
+pub(super) fn completed_handoff_receipts(
+    record: &PublicOperationRecord,
+) -> Option<Vec<SourceHandoffReceipt>> {
+    use PublicInstruction as I;
+    use PublicInstructionOutcome as O;
+    let ordinary = record.ordinary.as_ref()?;
+    let goal = record.intent.goal()?;
+    super::public_lifecycle::program::ordinary_handoff(goal)?;
+    if !matches!(
+        goal.desired,
+        ReplicaGoalKind::Reconfigure {
+            catch_up: Some(PublicCatchUpMode::All),
+            ..
+        }
+    ) {
+        return None;
+    }
+    if record.stage != PublicOperationStage::Completed
+        || ordinary.action_format != ORDINARY_ACTION_FORMAT
+        || record.disposition != Some(PublicOperationDisposition::Succeeded)
+        || record.superseded_by.is_some()
+        || !ordinary.accepted
+        || !ordinary.host_settled
+        || record.lifecycle.in_flight.is_some()
+        || ordinary.actions
+            != [
+                I::Revoke,
+                I::ProgramEpoch,
+                I::RefreshedConfiguration,
+                I::SecondCatchUp,
+                I::ReplicatorRole,
+                I::ApplicationRole,
+                I::NativeComplete,
+            ]
+        || !matches!(
+            record.lifecycle.outcomes.as_slice(),
+            [
+                O::Done,
+                O::Done,
+                O::Done,
+                O::Done,
+                O::Done,
+                O::ApplicationRole(_),
+                O::NativeLifecycle(_) | O::NativeUnavailable
+            ]
+        )
+    {
+        return None;
+    }
+    Some(SourceHandoffReceipt::ORDERED.to_vec())
+}
+
 pub(crate) fn snapshot(
     state: &AgentState,
     process: ProcessSessionId,
@@ -979,6 +1660,7 @@ pub(crate) fn snapshot(
                 _ => ReplicaGoalStatus::Pending,
             };
             Some(ReplicaGoalObservation {
+                completed_handoff: completed_handoff_receipts(record),
                 goal,
                 status,
                 selected_call: record
@@ -986,6 +1668,10 @@ pub(crate) fn snapshot(
                     .in_flight
                     .map(|instruction| format!("{instruction:?}")),
                 receipts: record.lifecycle.outcomes.len(),
+                host_settled: record
+                    .ordinary
+                    .as_ref()
+                    .is_some_and(|ordinary| ordinary.host_settled),
             })
         })
         .collect();
@@ -1026,6 +1712,8 @@ pub(crate) fn snapshot(
         capability: ProgressQueryResult::NotQueried(
             "ordinary capability has not been sampled".into(),
         ),
+        native_status: None,
+        native_lifecycle: None,
         accepted_revision_high_watermark: state
             .public_v1_operation_state
             .as_ref()
@@ -1036,6 +1724,7 @@ pub(crate) fn snapshot(
             .unwrap_or(0),
         retained_recovery_exit: retained::status(state, &process),
         retained_member_qualification: retained::qualification_for_process(state, &process),
+        reconstruction_dependencies: reconstruction::journal_dependencies(state),
     }
 }
 
@@ -1130,6 +1819,14 @@ pub(crate) fn validate_acknowledgement(
         retained::validate_receipt(state, record)?;
         if record.superseded_by.is_some() {
             return Err(reject("restored endpoint was superseded before acceptance"));
+        }
+    }
+    if reconstruction::claim(goal).is_some() {
+        reconstruction::validate_receipt(state, record)?;
+        if record.superseded_by.is_some() {
+            return Err(reject(
+                "reconstructed endpoint was superseded before acceptance",
+            ));
         }
     }
     if acknowledgement.logically_retired && !ordinary.logically_retired {

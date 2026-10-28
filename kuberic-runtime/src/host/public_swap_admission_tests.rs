@@ -195,12 +195,10 @@ async fn swap_current_starting_context_executes_but_controller_composed_unused_c
 #[tokio::test]
 async fn successor_swap_starts_from_receipted_configuration_before_predecessor_role_handoff() {
     let (mut fixture, current) = installed_primary().await;
-    let cut = Arc::new(PublicOperationCut {
-        position: PublicCutPosition::BeforeInstruction,
-        index: 6,
-        entered: tokio::sync::Notify::new(),
-        release: tokio::sync::Notify::new(),
-    });
+    let cut = Arc::new(PublicOperationCut::new(
+        PublicCutPosition::BeforeInstruction,
+        6,
+    ));
     fixture.callbacks.cut = Some(cut.clone());
     let predecessor = fixture.launch(swap(current.clone(), false), 3).await;
     tokio::time::timeout(std::time::Duration::from_secs(5), cut.entered.notified())

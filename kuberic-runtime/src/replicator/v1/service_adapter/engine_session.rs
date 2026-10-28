@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::protocol::public_operations::{
-    RemoteReplicaSelection, ReplicaPeerDescription, ReplicaPublication, ReplicaPublicationStage,
+    RemoteReplicaSelection, ReplicaGoal, ReplicaPeerDescription, ReplicaPublication,
+    ReplicaPublicationStage,
 };
 use crate::protocol::types::{
-    Epoch, HistoryContext, ProcessSessionId, ReplicaIdentity, ReplicaRole,
+    ConfigurationDescriptor, Epoch, HistoryContext, ProcessSessionId, ReplicaIdentity, ReplicaRole,
     ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
 };
 use crate::{Result, RuntimeError};
@@ -75,7 +76,7 @@ pub(super) fn partition(resource: &ResourceUid) -> [u8; 16] {
     guid(b"kuberic-v1-engine-partition", resource.as_str().as_bytes())
 }
 
-fn guid(domain: &[u8], bytes: &[u8]) -> [u8; 16] {
+pub(super) fn guid(domain: &[u8], bytes: &[u8]) -> [u8; 16] {
     let mut hash = Sha256::new();
     hash.update((domain.len() as u64).to_be_bytes());
     hash.update(domain);
@@ -94,6 +95,16 @@ pub(in crate::replicator::v1) struct Binding {
     pub(super) recovery: bool,
     pub(super) continuation: Option<String>,
     pub(super) reformation: bool,
+    pub(super) live_target: Option<LiveTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct LiveTarget {
+    pub(super) predecessor: String,
+    pub(super) previous: ConfigurationDescriptor,
+    pub(super) source: Endpoint,
+    pub(super) target: Endpoint,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,6 +120,8 @@ struct WireBinding {
     reformation: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replacement: Option<ReplicaPeerDescription>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_target: Option<LiveTarget>,
 }
 
 impl From<Binding> for WireBinding {
@@ -122,6 +135,7 @@ impl From<Binding> for WireBinding {
             continuation: binding.continuation,
             reformation: binding.reformation,
             replacement,
+            live_target: binding.live_target,
         }
     }
 }
@@ -137,11 +151,14 @@ impl TryFrom<WireBinding> for Binding {
             recovery: wire.recovery,
             continuation: wire.continuation,
             reformation: wire.reformation,
+            live_target: wire.live_target,
         };
         if binding.replacement() != wire.replacement {
             return Err("replacement tag differs from the frozen exact predecessor".into());
         }
-        binding.validate().map_err(|error| error.to_string())?;
+        binding
+            .validate_structure()
+            .map_err(|error| error.to_string())?;
         Ok(binding)
     }
 }
@@ -149,6 +166,10 @@ impl TryFrom<WireBinding> for Binding {
 impl Binding {
     pub(super) fn admitted_reconfiguration(&self) -> bool {
         !self.recovery
+            && !self.original_member_idle()
+            && (self.retained_receiver()
+                || self.target.stage == ReplicaPublicationStage::AchievedScope
+                    && self.target.role == ReplicaRole::ActiveSecondary)
             && self
                 .source
                 .scope
@@ -171,6 +192,15 @@ impl Binding {
     }
 
     pub(super) fn new(source: ReplicaPublication, target: ReplicaPublication) -> Result<Self> {
+        let binding = Self::candidate(source, target)?;
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    pub(super) fn candidate(
+        source: ReplicaPublication,
+        target: ReplicaPublication,
+    ) -> Result<Self> {
         let binding = Self {
             nonce: uuid::Uuid::new_v4().to_string(),
             source,
@@ -178,8 +208,9 @@ impl Binding {
             recovery: false,
             continuation: None,
             reformation: false,
+            live_target: None,
         };
-        binding.validate()?;
+        binding.validate_structure()?;
         Ok(binding)
     }
 
@@ -208,6 +239,51 @@ impl Binding {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
+        self.validate_structure()?;
+        if self.original_member_idle() {
+            let source = &self.source.scope;
+            let target = &self.target.scope;
+            if self.recovery
+                || self.retained_receiver()
+                || source.history != target.history
+                || source.epoch != target.epoch
+                || source.configuration.current != target.configuration.current
+                || source.configuration.previous != target.configuration.previous
+                || self.source.stage != ReplicaPublicationStage::AchievedScope
+                || self.source.role != ReplicaRole::Primary
+                || source.configuration.current.primary_id != source.storage.replica.replica_id
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            return Ok(());
+        }
+        if let Some(old) = &self.live_target {
+            old.source.validate()?;
+            old.target.validate()?;
+            let current = &self.source.scope.configuration.current;
+            if !self.reformation
+                || self.recovery
+                || self.continuation.is_some()
+                || old.predecessor == self.nonce
+                || uuid::Uuid::parse_str(&old.predecessor).is_err()
+                || old.source != self.primary()
+                || old.target.identity != self.secondary().identity
+                || old.target.storage != self.secondary().storage
+                || old.target.process_session_id == self.secondary().process_session_id
+                || old.target.creation_id == self.secondary().creation_id
+                || old.previous.configuration_id != old.previous.expected_id()
+                || self.source.scope.configuration.previous.as_ref() != Some(&old.previous)
+                || self.target.scope.configuration.previous.as_ref() != Some(&old.previous)
+                || current.primary_id != old.previous.primary_id
+                || current.members != old.previous.members
+                || current.write_quorum != old.previous.write_quorum
+                || current.write_quorum <= 1
+                || current.epoch.data_loss_number != old.previous.epoch.data_loss_number
+                || current.epoch.configuration_number <= old.previous.epoch.configuration_number
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+        }
         if let Some(old) = &self.replacement() {
             let source = &self.source;
             let target = &self.target;
@@ -280,6 +356,7 @@ impl Binding {
                     .validate()
                     .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
             }
+
             let source = &self.source.scope;
             let target = &self.target.scope;
             let configuration = &source.configuration;
@@ -370,6 +447,7 @@ impl Binding {
             return Ok(());
         }
         RemoteReplicaSelection {
+            original_member: None,
             source: self.source.clone(),
             target: self.target.clone(),
             target_control_address: "engine-session".into(),
@@ -377,6 +455,43 @@ impl Binding {
         }
         .validate()
         .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))
+    }
+
+    pub(super) fn validate_structure(&self) -> Result<()> {
+        self.source
+            .validate()
+            .and_then(|_| self.target.validate())
+            .map_err(|error| RuntimeError::AuthorityMismatch(error.into()))?;
+        self.primary().validate()?;
+        self.secondary().validate()?;
+        if uuid::Uuid::parse_str(&self.nonce).is_err()
+            || self.primary() == self.secondary()
+            || self.source.scope.history != self.target.scope.history
+            || self
+                .continuation
+                .as_ref()
+                .is_some_and(|old| uuid::Uuid::parse_str(old).is_err() || old == &self.nonce)
+            || self.reformation && (self.recovery || self.continuation.is_some())
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+
+    pub(super) fn original_member_idle(&self) -> bool {
+        self.target.stage == ReplicaPublicationStage::AchievedScope
+            && self.target.role == ReplicaRole::IdleSecondary
+            && self
+                .source
+                .scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .any(|member| {
+                    member.identity == self.target.scope.storage.replica
+                        && member.role == ReplicaRole::ActiveSecondary
+                })
     }
 
     pub(super) fn primary(&self) -> Endpoint {
@@ -415,7 +530,7 @@ impl Binding {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Control {
     Reserve,
     Activate,
@@ -473,6 +588,11 @@ struct State {
     closed: bool,
     entries: BTreeMap<String, Entry>,
     receiver: Option<String>,
+    builds: BTreeMap<String, super::build_provenance::CheckedBuild>,
+    configuration_invocations: BTreeMap<
+        (crate::protocol::types::OperationId, String),
+        super::warm_source_transfer::ConfigurationInvocation,
+    >,
 }
 
 #[cfg(all(test, feature = "testing"))]
@@ -524,7 +644,9 @@ impl IdleRemoval<'_> {
                             && matches!(entry.phase, Phase::Proposed | Phase::Active))
                             || (self.binding.retained_receiver()
                                 && entry.copy_completed
-                                && entry.phase == Phase::Completed))
+                                && (entry.phase == Phase::Completed
+                                    || entry.phase == Phase::Retiring
+                                        && self.binding.epoch() == native_epoch)))
                 })
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
@@ -599,22 +721,91 @@ pub(super) fn endpoint_matches_peer(endpoint: &Endpoint, peer: &ReplicaPeerDescr
 }
 
 impl Sessions {
-    pub(super) fn vacant_receiver(&self) -> bool {
-        let state = self.0.lock().unwrap();
-        !state.closed && state.receiver.is_none() && state.entries.is_empty()
+    pub(super) fn register_configuration(
+        &self,
+        invocation: super::warm_source_transfer::ConfigurationInvocation,
+    ) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.closed {
+            return Err(RuntimeError::Closed);
+        }
+        let key = (invocation.operation().clone(), invocation.call().to_owned());
+        if let Some(old) = state.configuration_invocations.get(&key) {
+            return if old == &invocation {
+                Ok(())
+            } else {
+                Err(RuntimeError::AuthorityNotAdmitted)
+            };
+        }
+        if state.configuration_invocations.len() >= MAX_SESSIONS {
+            return Err(RuntimeError::QueueFull);
+        }
+        state.configuration_invocations.insert(key, invocation);
+        Ok(())
     }
 
-    pub(super) fn restore_receiver(
+    pub(super) fn associate_configuration(&self, binding: &Binding) -> Result<()> {
+        let state = self.0.lock().unwrap();
+        if state.closed
+            || !state
+                .configuration_invocations
+                .values()
+                .any(|invocation| invocation.matches(binding, invocation.goal()))
+            || !state
+                .entries
+                .get(&binding.nonce)
+                .is_some_and(|entry| entry.binding == *binding && entry.proposed)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_configuration(&self, binding: &Binding, goal: &ReplicaGoal) -> Result<()> {
+        let state = self.0.lock().unwrap();
+        if state.closed
+            || !state
+                .configuration_invocations
+                .values()
+                .any(|invocation| invocation.matches(binding, goal))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+
+    pub(super) fn first_demotion_receiver(&self, binding: &Binding) -> Result<()> {
+        let state = self.0.lock().unwrap();
+        if state.closed
+            || !binding.reformation
+            || state.receiver.is_some()
+            || state.entries.contains_key(&binding.nonce)
+            || state.entries.values().any(|entry| {
+                entry.binding.primary() != binding.secondary()
+                    || !matches!(entry.phase, Phase::Retiring | Phase::Retired)
+                    || entry.admitted.load(Ordering::Acquire)
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+
+    pub(super) fn associate_demotion_receiver(
         &self,
         binding: &Binding,
         native: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        binding.validate()?;
+        self.first_demotion_receiver(binding)?;
         let mut state = self.0.lock().unwrap();
         if state.closed
-            || !binding.reformation
             || state.receiver.is_some()
-            || !state.entries.is_empty()
+            || state.entries.contains_key(&binding.nonce)
+            || state.entries.len() >= MAX_SESSIONS
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.phase != Phase::Retired)
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
@@ -625,13 +816,221 @@ impl Sessions {
                 binding: binding.clone(),
                 phase: Phase::Reserved,
                 admitted: Arc::new(AtomicBool::new(false)),
-                copy_completed: false,
+                copy_completed: true,
                 predecessor: None,
                 proposed: true,
             },
         );
         state.receiver = Some(binding.nonce.clone());
         Ok(())
+    }
+    pub(super) fn normal_predecessor(
+        &self,
+        binding: &Binding,
+        checked: &super::warm_source_transfer::CheckedTransfer,
+    ) -> Result<Binding> {
+        let old = checked.predecessor(binding)?;
+        let state = self.0.lock().unwrap();
+        if state.closed
+            || state.receiver.as_ref() != Some(&old.nonce)
+            || state.entries.contains_key(&binding.nonce)
+            || !state.entries.get(&old.nonce).is_some_and(|entry| {
+                entry.binding == *old
+                    && entry.copy_completed
+                    && entry.phase == Phase::Completed
+                    && entry.admitted.load(Ordering::Acquire)
+            })
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.binding.nonce != old.nonce && entry.conflicts_with(binding))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(old.clone())
+    }
+
+    pub(super) fn retire_normal_predecessor(
+        &self,
+        binding: &Binding,
+        checked: &super::warm_source_transfer::CheckedTransfer,
+    ) -> Result<()> {
+        let old = self.normal_predecessor(binding, checked)?;
+        let mut state = self.0.lock().unwrap();
+        if state.closed
+            || state.receiver.as_ref() != Some(&old.nonce)
+            || !state.entries.get(&old.nonce).is_some_and(|entry| {
+                entry.binding == old && entry.copy_completed && entry.phase == Phase::Completed
+            })
+            || state
+                .entries
+                .values()
+                .any(|entry| entry.binding.nonce != old.nonce && entry.conflicts_with(binding))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let entry = state.entries.get_mut(&old.nonce).unwrap();
+        entry.admitted.store(false, Ordering::Release);
+        entry.phase = Phase::Retiring;
+        Ok(())
+    }
+
+    pub(super) fn reform_normal_receiver(
+        &self,
+        binding: &Binding,
+        checked: &super::warm_source_transfer::CheckedTransfer,
+        native: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let old = checked.predecessor(binding)?;
+        if old.epoch() != binding.epoch()
+            || old.history() != binding.history()
+            || old.secondary() != binding.secondary()
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        self.replace_receiver(binding, old, native)
+    }
+
+    pub(super) fn partial_effect(&self, binding: &Binding) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .entries
+            .get(&binding.nonce)
+            .is_some_and(|entry| {
+                entry.binding == *binding
+                    && matches!(
+                        entry.phase,
+                        Phase::Reserved | Phase::Active | Phase::Completed
+                    )
+            })
+    }
+    pub(super) fn all(&self) -> Vec<Binding> {
+        self.0
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .map(|entry| entry.binding.clone())
+            .collect()
+    }
+    pub(super) fn associate_build(
+        &self,
+        binding: &Binding,
+        checked: &super::build_provenance::CheckedBuild,
+    ) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.closed || checked.nonce()? != binding.nonce {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        if let Some(old) = state.builds.get(&binding.nonce) {
+            return if old == checked {
+                Ok(())
+            } else {
+                Err(RuntimeError::AuthorityNotAdmitted)
+            };
+        }
+        if state.builds.len() >= MAX_SESSIONS {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        state.builds.insert(binding.nonce.clone(), checked.clone());
+        Ok(())
+    }
+
+    pub(super) fn check_build(
+        &self,
+        binding: &Binding,
+        checked: &super::build_provenance::CheckedBuild,
+    ) -> Result<()> {
+        if self.0.lock().unwrap().builds.get(&binding.nonce) != Some(checked) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+    pub(super) fn live_target_proposal(&self, binding: Binding) -> Result<Binding> {
+        binding.validate()?;
+        let relation = binding
+            .live_target
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let mut state = self.0.lock().unwrap();
+        if state.closed {
+            return Err(RuntimeError::Closed);
+        }
+        if let Some(entry) = state.entries.values().find(|entry| {
+            entry.binding.live_target == binding.live_target
+                && entry.binding.source == binding.source
+                && entry.binding.target == binding.target
+        }) {
+            return Ok(entry.binding.clone());
+        }
+        if state.entries.contains_key(&binding.nonce)
+            || state.entries.len() >= MAX_SESSIONS
+            || !state
+                .entries
+                .get(&relation.predecessor)
+                .is_some_and(|entry| {
+                    entry.binding.primary() == relation.source
+                        && entry.binding.secondary() == relation.target
+                        && entry.binding.history() == binding.history()
+                        && entry.binding.epoch().data_loss_number
+                            == binding.epoch().data_loss_number
+                        && entry.binding.epoch().configuration_number
+                            < binding.epoch().configuration_number
+                        && entry.copy_completed
+                        && matches!(entry.phase, Phase::Completed | Phase::Retiring)
+                })
+            || state.entries.values().any(|entry| {
+                entry.binding.nonce != relation.predecessor && entry.conflicts_with(&binding)
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        state.entries.insert(
+            binding.nonce.clone(),
+            Entry {
+                binding: binding.clone(),
+                phase: Phase::Recovering,
+                admitted: Arc::new(AtomicBool::new(false)),
+                copy_completed: false,
+                predecessor: Some(relation.predecessor.clone()),
+                proposed: false,
+            },
+        );
+        Ok(binding)
+    }
+
+    pub(super) fn live_target_joined(&self, binding: &Binding) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        let old = &binding
+            .live_target
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?
+            .predecessor;
+        if state.closed
+            || !state.entries.get(&binding.nonce).is_some_and(|entry| {
+                entry.binding == *binding
+                    && entry.phase == Phase::Recovering
+                    && entry.predecessor.as_ref() == Some(old)
+            })
+            || !state.entries.get(old).is_some_and(|entry| {
+                entry.phase == Phase::Retiring && !entry.admitted.load(Ordering::Acquire)
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let predecessor = state.entries.get_mut(old).unwrap();
+        predecessor.phase = Phase::Retired;
+        predecessor.proposed = false;
+        let entry = state.entries.get_mut(&binding.nonce).unwrap();
+        entry.phase = Phase::Proposed;
+        entry.proposed = true;
+        Ok(())
+    }
+
+    pub(super) fn vacant_receiver(&self) -> bool {
+        let state = self.0.lock().unwrap();
+        !state.closed && state.receiver.is_none() && state.entries.is_empty()
     }
 
     pub(super) fn reformation_predecessor(&self, binding: &Binding) -> Result<Binding> {
@@ -891,6 +1290,9 @@ impl Sessions {
     fn insert(&self, binding: &Binding, phase: Phase, receiver: bool) -> Result<()> {
         binding.validate()?;
         let mut state = self.0.lock().unwrap();
+        if binding.original_member_idle() && !state.builds.contains_key(&binding.nonce) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         if state.closed {
             return Err(RuntimeError::Closed);
         }
@@ -937,15 +1339,19 @@ impl Sessions {
 
     pub(super) fn proposal(&self, binding: Binding) -> Result<Binding> {
         binding.validate()?;
-        if binding.continuation.is_some() {
+        if binding.continuation.is_some() || binding.live_target.is_some() {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
         let mut state = self.0.lock().unwrap();
+        if binding.original_member_idle() && !state.builds.contains_key(&binding.nonce) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
         if state.closed {
             return Err(RuntimeError::Closed);
         }
         if let Some(entry) = state.entries.values().find(|entry| {
-            entry.binding.source.scope == binding.source.scope
+            (!state.builds.contains_key(&binding.nonce) || entry.binding.nonce == binding.nonce)
+                && entry.binding.source.scope == binding.source.scope
                 && entry.binding.target.scope == binding.target.scope
                 && entry.binding.primary() == binding.primary()
                 && entry.binding.secondary() == binding.secondary()

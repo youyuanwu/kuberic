@@ -257,6 +257,7 @@ pub(super) struct ReplicaManager {
     idle: Vec<EstablishedIdle>,
     builds: BTreeMap<i64, BuildIdleHandle>,
     replacement: Option<replacement::Replacement>,
+    live_reformation: Option<replacement::LiveReformation>,
     build_fault: Option<CopyFault>,
     catchup_configuration: bool,
     // Native majorityReplicasApplyAckedLSNinCC_/allReplicasApplyAckedLSNinCC_.
@@ -429,6 +430,7 @@ impl ReplicaManager {
             idle: Vec::new(),
             builds: BTreeMap::new(),
             replacement: None,
+            live_reformation: None,
             build_fault: None,
             catchup_configuration: false,
             cached_current: None,
@@ -590,6 +592,13 @@ impl ReplicaManager {
         for (id, build) in &self.builds {
             Self::push_root(&mut roots, *id, build.session());
         }
+        if let Some(reformation) = &self.live_reformation {
+            Self::push_root(
+                &mut roots,
+                reformation.replica_id,
+                reformation.successor.clone(),
+            );
+        }
         roots
     }
 
@@ -697,6 +706,9 @@ impl ReplicaManager {
         self.ensure_active()?;
         if self.replacement.is_some() {
             return self.configure_replacement(configuration);
+        }
+        if self.live_reformation.is_some() {
+            return self.configure_live_reformation(configuration);
         }
         for member in &configuration.current.members {
             if self.has_idle_membership(member.replica_id) && member.session.idle_faulted() {
@@ -840,6 +852,9 @@ impl ReplicaManager {
 
     fn prepare_idle(&self, idle: &EstablishedIdle) -> Result<(Lsn, ManagerEffects), ManagerError> {
         self.ensure_active()?;
+        if let Some(reformation) = &self.live_reformation {
+            return Err(ConfigurationError::ReplacementPending(reformation.replica_id).into());
+        }
         if let Some(replacement) = &self.replacement {
             return Err(ConfigurationError::ReplacementPending(replacement.replica_id).into());
         }
@@ -987,7 +1002,8 @@ impl ReplicaManager {
         self.ensure_active()?;
         self.check_reported_fault()?;
         self.validate_session(member.replica_id, &member.session)?;
-        if self.replacement.is_some()
+        if self.live_reformation.is_some()
+            || self.replacement.is_some()
             || self.previous.is_some()
             || self.has_idle_membership(member.replica_id)
         {
@@ -1088,7 +1104,18 @@ impl ReplicaManager {
         let mut applied = Vec::with_capacity(set.members.len());
         let mut minimum_received = None;
         for member in &set.members {
-            let progress = self.sample_progress(member.replica_id, &member.session)?;
+            let mut progress = self.sample_progress(member.replica_id, &member.session)?;
+            // Fresh authenticated replay supports this same logical member's
+            // frozen obligation; it never mutates the retired sender's ACK root.
+            if let Some(reformation) = &self.live_reformation
+                && reformation.joint.is_some()
+                && member.replica_id == reformation.replica_id
+                && member.session.same_instance(&reformation.predecessor)
+            {
+                let fresh = self.sample_progress(member.replica_id, &reformation.successor)?;
+                progress.received = progress.received.max(fresh.received);
+                progress.applied = progress.applied.max(fresh.applied);
+            }
             let apply = progress.applied.max(0);
             applied.push(apply);
             if !member.session.active_faulted() {
@@ -1262,6 +1289,12 @@ impl ReplicaManager {
                 && replacement.joint.is_some()
             {
                 replacement.caught_up = true;
+            }
+            if wait.mode == CatchupMode::All
+                && let Some(reformation) = &mut self.live_reformation
+                && reformation.joint.is_some()
+            {
+                reformation.caught_up = true;
             }
             effects.completions.push((wait.completion, Ok(())));
         }

@@ -180,9 +180,9 @@ impl<S: StatefulServiceReplica + 'static> StatefulServiceReplica for WitnessServ
     }
 
     async fn change_role(&self, role: ReplicaRole) -> kuberic_runtime::Result<RoleChange> {
-        if self.restoring.load(Ordering::Acquire)
+        if self.open_modes.lock().unwrap().last() == Some(&OpenMode::Existing)
             && *self.role.lock().unwrap() == ReplicaRole::None
-            && role == ReplicaRole::ActiveSecondary
+            && role == ReplicaRole::IdleSecondary
         {
             self.role_entered.store(true, Ordering::Release);
             self.role_release
@@ -276,6 +276,9 @@ impl<F: ApplicationFactory> ApplicationFactory for WitnessFactory<F> {
         service: Arc<Self::Service>,
         notice: RetainedRecoveryExitNotice,
     ) -> kuberic_controller::test_util::Result<()> {
+        if notice.native_rebuild.is_some() {
+            return Ok(());
+        }
         *service.exit_notice.lock().unwrap() = Some(notice);
         let mut release = service.exit_release.subscribe();
         release
@@ -451,6 +454,19 @@ async fn wait_for_value<S>(service: &WitnessService<S>, value: i64, lsn: i64) ->
 pub async fn qualify_retained_secondary<F: WitnessApplication>(
     factory: WitnessFactory<F>,
 ) -> Result<()> {
+    qualify_retained_prefix(factory, false).await
+}
+
+pub async fn qualify_unequal_retained_prefix<F: WitnessApplication>(
+    factory: WitnessFactory<F>,
+) -> Result<()> {
+    qualify_retained_prefix(factory, true).await
+}
+
+async fn qualify_retained_prefix<F: WitnessApplication>(
+    factory: WitnessFactory<F>,
+    opened_winner: bool,
+) -> Result<()> {
     use kuberic_controller::test_util::TestCluster;
     use kuberic_runtime::protocol::public_operations::{
         ReplicaGoalKind, ReplicaGoalStatus, ReplicaPublicationStage,
@@ -461,8 +477,8 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
     let result: Result<()> = async {
         let topology = cluster.settle().await?;
         let old_primary = topology.primary().clone();
-        // Election chooses the smallest equally-current survivor. Fault the
-        // other one so promotion cannot conceal a broken restored consumer.
+        // Keep a genuinely warm eligible nominee; the separately reopened
+        // original member must later consume as a copied Secondary.
         let target = topology.secondaries().max_by_key(|member| member.replica_id())
             .context("secondary missing")?.clone();
         let healthy = topology.secondaries().min_by_key(|member| member.replica_id())
@@ -471,15 +487,26 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
         let writer = cluster.service(&old_primary).await?;
         let failed = cluster.service(&target).await?;
         let healthy_service = cluster.service(&healthy).await?;
+        let healthy_root = cluster.application_root(&healthy).await?;
         if let Some(request) = F::initialize_request() {
             F::write_lsn(cluster.probe(writer.request(request)).await?)?;
         }
         F::write_lsn(cluster.probe(writer.request(F::write_request(71))).await?)?;
+        let delivery = if opened_winner {
+            let first = application_progress(&writer.observation()?)?.1;
+            cluster.probe(wait_for_value(&failed, 71, first)).await?;
+            cluster.probe(wait_for_value(&healthy_service, 71, first)).await?;
+            Some(cluster.hold_native_ingress(&healthy).await?)
+        } else {
+            None
+        };
         let initial_lsn = F::write_lsn(
             cluster.probe(writer.request(F::write_request(79))).await?,
         )?;
         cluster.probe(wait_for_value(&failed, 79, initial_lsn)).await?;
-        cluster.probe(wait_for_value(&healthy_service, 79, initial_lsn)).await?;
+        if !opened_winner {
+            cluster.probe(wait_for_value(&healthy_service, 79, initial_lsn)).await?;
+        }
         ensure!(F::read_value(cluster.probe(writer.request(F::read_request())).await?)? == 79);
         let root = cluster.application_root(&target).await?;
         let initial_observation = failed.observation()?;
@@ -516,6 +543,10 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
         }
         let routes = cluster.native_route_counts().await;
         cluster.stop(&old_primary).await?;
+        if opened_winner {
+            ensure!(application_progress(&healthy_service.observation()?)?.1 < initial_lsn,
+                "unequal-prefix fixture lost its actual lagging survivor");
+        }
         failed.command("fail-worker").await?;
         let fault_observation = cluster.probe(async {
             loop {
@@ -580,6 +611,192 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
         }));
         failed.command("release-exit").await?;
 
+        if opened_winner {
+            let (fresh_ref, recovered, configured) = loop {
+                cluster.step().await?;
+                let observed = cluster.observe().await?;
+                let Some((reference, snapshot)) = observed.snapshots().find(|(reference, _)| {
+                    reference.identity() == target.identity()
+                        && reference.process_session_id() != target.process_session_id()
+                }) else { continue };
+                let Some(configured) = snapshot.goals.iter().find(|entry| {
+                    entry.goal.scope.process_session_id == *reference.process_session_id()
+                        && entry.status == ReplicaGoalStatus::Achieved && entry.host_settled
+                        && matches!(entry.goal.desired, ReplicaGoalKind::Reconfigure {
+                            role: ReplicaRole::Primary, catch_up: None
+                        })
+                }) else { continue };
+                ensure!(snapshot.native_lifecycle.as_ref().is_some_and(|facts| {
+                    facts.state == kuberic_runtime::protocol::public_operations::NativeReplicaState::Ready
+                        && facts.native_role == ReplicaRole::Primary
+                        && facts.application_role == Some(ReplicaRole::Primary)
+                        && facts.applied_primary_fence == Some(configured.goal.scope.epoch)
+                }));
+                ensure!(snapshot.read_status != AccessStatus::Granted && snapshot.write_status != AccessStatus::Granted);
+                let reference = reference.clone();
+                let goal = configured.goal.clone();
+                let service = cluster.service(&reference).await?;
+                break (reference, service, goal);
+            };
+            ensure!(fresh_ref.storage_incarnation() == target.storage_incarnation());
+            ensure!(cluster.application_root(&fresh_ref).await? == root);
+            let selected_journal = journal(&root)?;
+            let selected = operation(&selected_journal, configured.operation_id.as_str())?;
+            successful_receipts(selected)?;
+            ensure!(selected["ordinary"]["native_input"]["lifecycle"]["state"] == "StandBy");
+            ensure!(selected["ordinary"]["native_input"]["promotion"]["progress"]["detail"] == initial_lsn);
+            ensure!(selected["ordinary"]["native_input"]["promotion"]["capability"]["detail"] == 0);
+            ensure!(selected["ordinary"]["actions"] == json!([
+                "ReplicatorRole", "ProgramEpoch", "ApplicationRole", "NativeDataLossDecision",
+                "Configuration", "NativeComplete"
+            ]));
+            let source_native = cluster.native_transport_observation(&fresh_ref).await?;
+            ensure!(source_native["production"]["nativeConfiguration"]["current"]["writeQuorum"] == original.write_quorum);
+            ensure!(source_native["production"]["nativeConfiguration"]["previous"]["writeQuorum"] == original.write_quorum);
+            for kind in ["current", "previous"] {
+                ensure!(source_native["production"]["nativeConfiguration"][kind]["members"]
+                    .as_array().is_some_and(Vec::is_empty));
+            }
+            ensure!(operation(&selected_journal, notice.fault_operation_id.as_str())?["supersededBy"].is_null());
+            eprintln!("retained-witness unequal Opened configured source: {}", json!({
+                "goal": configured, "record": selected, "native": source_native,
+                "warm": cluster.sample_replica(&healthy).await?,
+                "oldFault": operation(&selected_journal, notice.fault_operation_id.as_str())?,
+            }));
+            delivery.context("unequal-prefix native delivery hold missing")?.release();
+            let mut successor_logged = false;
+            loop {
+                cluster.step().await?;
+                let observed = cluster.observe().await?;
+                let Some((reference, snapshot)) = observed.snapshots().find(|(reference, _)| {
+                    reference.identity() == healthy.identity()
+                        && reference.process_session_id() != healthy.process_session_id()
+                }) else { continue };
+                if !successor_logged {
+                    successor_logged = true;
+                    let status = observed.set().status.as_ref().unwrap();
+                    let close = status.replica_goals.iter().rev().find(|entry| {
+                        matches!(entry.goal.desired, ReplicaGoalKind::Close)
+                            && entry.goal.scope.storage == *healthy.storage_incarnation()
+                    }).context("native restart lost its actual selected Close")?;
+                    eprintln!("retained-witness unequal warm successor: {}", json!({
+                        "snapshot": snapshot, "reaps": cluster.reaped_member_observations().await,
+                        "close": close, "topology": status.public_v1_topology,
+                        "selectedCurrent": configured.scope.configuration.current,
+                        "source": observed.snapshot(&fresh_ref),
+                    }));
+                    ensure!(close.goal.scope.configuration.current == configured.scope.configuration.current);
+                    ensure!(close.goal.scope.configuration.previous.as_ref() == Some(&original));
+                    ensure!(snapshot.open_mode == OpenMode::Existing && !snapshot.withdrawn);
+                }
+                let reference = reference.clone();
+                let service = cluster.service(&reference).await?;
+                if service.observation()?["witness"]["roleEntered"] == true {
+                    ensure!(service.observation()?["witness"]["openModes"] == json!([OpenMode::Existing]));
+                    ensure!(service.observation()?["witness"]["workerFailure"].is_null());
+                    ensure!(application_progress(&service.observation()?)?.0 == 71);
+                    ensure!(application_progress(&service.observation()?)?.1 < initial_lsn);
+                    let native = cluster.native_transport_observation(&reference).await?;
+                    ensure!(native["production"]["retainedInitialized"] != true);
+                    ensure!(native["sessions"]["receiver"].is_null());
+                    ensure!(native["ackOwners"].as_array().is_some_and(Vec::is_empty));
+                    service.command("release-role").await?;
+                    break;
+                }
+            }
+            let elected = cluster.settle_members(2).await?;
+            ensure!(elected.primary().identity() == target.identity(),
+                "lower warm prefix replaced the actual higher Opened winner");
+            let follower = elected.secondaries().next().context("rebuilt original follower absent")?;
+            ensure!(follower.identity() == healthy.identity());
+            ensure!(follower.process_session_id() != healthy.process_session_id(),
+                "out-of-range warm owner was not actually recreated");
+            ensure!(cluster.application_root(follower).await? == healthy_root);
+            ensure!(follower.storage_incarnation() == healthy.storage_incarnation());
+            let scope = cluster.sample_replica(elected.primary()).await?.publication
+                .context("final unequal-prefix source publication missing")?.scope;
+            ensure!(scope.configuration.current.write_quorum == original.write_quorum);
+            ensure!(scope.configuration.previous.is_none());
+            ensure!(F::read_value(cluster.probe(recovered.request(F::read_request())).await?)? == 79);
+            let subsequent_lsn = F::write_lsn(cluster.probe(recovered.request(F::write_request(97))).await?)?;
+            ensure!(subsequent_lsn > initial_lsn);
+            let follower_service = cluster.service(follower).await?;
+            cluster.probe(wait_for_value(&follower_service, 97, subsequent_lsn)).await?;
+            ensure!(writer.observation().is_err() && failed.observation().is_err());
+            ensure!(cluster.reaped_member_observations().await.iter().any(|reap|
+                reap["pid"] == notice.process_id && reap["generation"] == failed_generation));
+            let final_journal = journal(&root)?;
+            ensure!(final_journal["reportedFault"] == json!(FaultType::Transient));
+            let retained_fault = operation(&final_journal, notice.fault_operation_id.as_str())?;
+            for field in ["lifecycle", "disposition", "containment", "stage"] {
+                ensure!(retained_fault[field] == old_fault[field], "recovery rewrote old failure {field}");
+            }
+            let source_snapshot = cluster.sample_replica(elected.primary()).await?;
+            let target_snapshot = cluster.sample_replica(follower).await?;
+            let source_final = source_snapshot.goals.iter().find(|entry| {
+                entry.goal.revision == source_snapshot.publication.as_ref().unwrap().generation
+            }).context("source final receipt absent")?;
+            let target_final = target_snapshot.goals.iter().find(|entry| {
+                entry.goal.revision == target_snapshot.publication.as_ref().unwrap().generation
+            }).context("target final receipt absent")?;
+            let source_record = operation(&final_journal, source_final.goal.operation_id.as_str())?;
+            successful_receipts(source_record)?;
+            ensure!(source_record["ordinary"]["host_settled"] == true);
+            ensure!(source_record["ordinary"]["actions"].as_array().is_some_and(|actions|
+                actions.iter().any(|action| action == "CurrentConfiguration")));
+            ensure!(retained_fault["supersededBy"] == json!(source_final.goal.operation_id));
+            let target_journal = journal(&healthy_root)?;
+            ensure!(target_journal["reportedFault"].is_null(),
+                "native rebuild fabricated an application fault");
+            let target_record = operation(&target_journal, target_final.goal.operation_id.as_str())?;
+            successful_receipts(target_record)?;
+            ensure!(target_record["ordinary"]["host_settled"] == true);
+            let native_close = target_journal["publicV1OperationState"]["operations"]
+                .as_object().unwrap().values().find(|record|
+                    record["intent"]["processSessionId"] == json!(healthy.process_session_id())
+                        && record["intent"]["program"]["AgentGoal"]["desired"]["kind"] == "close")
+                .context("actual native restart Close absent")?;
+            ensure!(native_close["stage"] == "completed" && native_close["disposition"]["kind"] == "succeeded");
+            ensure!(native_close["intent"]["class"]["kind"] == "close");
+            ensure!(native_close["containment"] == "pending");
+            let reason = &native_close["lifecycle"]["outcomes"][1]["RecoveryExitRequired"]["nativeRebuild"];
+            ensure!(reason["sourceLast"] == initial_lsn && reason["sourceFirst"] == 0);
+            ensure!(reason["targetLast"].as_i64().is_some_and(|last| last < initial_lsn));
+            ensure!(native_close["supersededBy"] == json!(target_final.goal.operation_id));
+            let status = cluster.observe().await?;
+            ensure!(!status.replicas().any(|reference|
+                reference.instance_id() == old_primary.instance_id()),
+                "original Primary was restarted");
+            let old_close = status.set().status.as_ref().unwrap().replica_goals.iter()
+                .find(|entry| json!(entry.goal.operation_id) == native_close["intent"]["operationId"])
+                .context("old native Close controller result missing")?;
+            if native_close["ordinary"]["accepted"] != true {
+                ensure!(matches!(old_close.outcome.as_ref().map(|outcome| &outcome.status),
+                    Some(ReplicaGoalStatus::Uncertain(_))), "lost old result was rewritten as success");
+            }
+            ensure!(source_snapshot.native_lifecycle.as_ref().unwrap().deactivation
+                == target_snapshot.native_lifecycle.as_ref().unwrap().deactivation);
+            let source_native = cluster.native_transport_observation(elected.primary()).await?;
+            let target_native = cluster.native_transport_observation(follower).await?;
+            ensure!(source_native["production"]["nativeConfiguration"]["previous"].is_null());
+            ensure!(source_native["production"]["nativeConfiguration"]["current"]["writeQuorum"] == original.write_quorum);
+            ensure!(target_native["ackOwners"].as_array().is_some_and(|owners| !owners.is_empty()));
+            let after_routes = cluster.native_route_counts().await;
+            for kind in ["Build", "AfterContext", "BuildResult"] {
+                ensure!(after_routes.get(kind).copied().unwrap_or(0) > routes.get(kind).copied().unwrap_or(0));
+            }
+            eprintln!("retained-witness unequal original quorum acknowledged suffix: {}", json!({
+                "sourceFinal": source_final.goal, "sourceRecord": source_record,
+                "targetFinal": target_final.goal, "targetRecord": target_record,
+                "nativeClose": native_close, "oldControllerClose": old_close,
+                "oldFault": retained_fault, "sourceNative": source_native, "targetNative": target_native,
+                "initialLsn": initial_lsn, "subsequentLsn": subsequent_lsn,
+                "sourceRoot": root, "targetRoot": healthy_root,
+                "reaps": cluster.reaped_member_observations().await,
+            }));
+            return Ok(());
+        }
+
         let (fresh_ref, restored, restore_goal, pending) = loop {
             cluster.drive(async {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -601,8 +818,10 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
             let snapshot = cluster.sample_replica(&reference).await?;
             let goal = snapshot.goals.iter().find(|entry| {
                 entry.goal.scope.process_session_id == *reference.process_session_id()
-                    && matches!(entry.goal.desired, ReplicaGoalKind::RestoreRetainedMember { .. })
-            }).context("fresh process did not select canonical restoration")?.goal.clone();
+                    && matches!(entry.goal.desired, ReplicaGoalKind::Prepare {
+                        role: ReplicaRole::IdleSecondary, rebuild: Some(_)
+                    })
+            }).context("fresh process did not select canonical original-member Idle")?.goal.clone();
             break (reference, service, goal, snapshot);
         };
         ensure!(fresh_ref.storage_incarnation() == target.storage_incarnation());
@@ -626,25 +845,61 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
         ensure!(F::read_value(restored.request(F::read_request()).await.unwrap_or(Value::Null)).is_err());
         ensure!(F::write_lsn(restored.request(F::write_request(83)).await.unwrap_or(Value::Null)).is_err());
         let native = cluster.native_transport_observation(&fresh_ref).await?;
-        ensure!(native["production"]["retainedInitialized"] == true);
+        ensure!(native["production"]["retainedInitialized"] != true);
         ensure!(native["sessions"]["receiver"].is_null());
         ensure!(native["sessions"]["entries"].as_array().is_some_and(Vec::is_empty));
         ensure!(native["ackOwners"].as_array().is_some_and(Vec::is_empty));
         let pending_journal = journal(&root)?;
         let selected = operation(&pending_journal, restore_goal.operation_id.as_str())?;
         ensure!(selected["lifecycle"]["in_flight"] == "ApplicationRole");
-        ensure!(selected["lifecycle"]["outcomes"].as_array().is_some_and(|outcomes| {
-            outcomes.iter().any(|outcome| {
-                outcome["RetainedNativeInitialized"] == serde_json::to_value(&restore_goal.scope).unwrap()
-            })
-        }));
-        let receipt = &selected["ordinary"]["retained"];
-        ensure!(receipt["predecessor_process_id"] == notice.process_id);
-        ensure!(receipt["predecessor_process_lifetime"] == notice.process_lifetime);
-        ensure!(receipt["owner_process_id"].as_u64().is_some_and(|pid| pid > 0 && pid != u64::from(notice.process_id)));
-        ensure!(receipt["owner_process_lifetime"] != receipt["predecessor_process_lifetime"]);
-        ensure!(receipt["successor_process"] == serde_json::to_value(fresh_ref.process_session_id())?);
-        ensure!(receipt["successor_creation"] == serde_json::to_value(fresh_ref.replicator_creation_id())?);
+        let ReplicaGoalKind::Prepare { rebuild: Some(rebuild), .. } = &restore_goal.desired else {
+            anyhow::bail!("missing canonical original-member provenance");
+        };
+        let inspection = operation(&pending_journal, rebuild.inspection.operation_id.as_str())?;
+        successful_receipts(inspection)?;
+        ensure!(inspection["ordinary"]["host_settled"] == true);
+        let status = inspection["lifecycle"]["outcomes"].as_array()
+            .context("missing actual inspection outcomes")?.iter()
+            .find_map(|outcome| outcome.get("NativeStatus"))
+            .context("missing actual native StandBy inspection")?;
+        ensure!(status["input"]["state"] == "StandBy");
+        ensure!(status["input"]["nativeRole"] == "none");
+        ensure!(status["epoch"] == "StandBy");
+        ensure!(status["progress"]["detail"] == initial_lsn);
+        ensure!(status["capability"]["detail"] == 0);
+        ensure!(!status["input"]["deactivation"].is_null());
+        let opened = pending_journal["publicV1OperationState"]["operations"]
+            .as_object().context("missing actual Open journal")?.values()
+            .find(|record| {
+                record["intent"]["processSessionId"] == json!(fresh_ref.process_session_id())
+                    && record["lifecycle"]["outcomes"].as_array().is_some_and(|outcomes|
+                        outcomes.iter().any(|outcome| outcome.get("BuiltinNativeEndpoint").is_some()))
+            }).context("missing actual fresh native Open")?;
+        successful_receipts(opened)?;
+        let endpoint = opened["lifecycle"]["outcomes"].as_array().unwrap().iter()
+            .find_map(|outcome| outcome.get("BuiltinNativeEndpoint")).unwrap();
+        ensure!(endpoint["process_id"].as_u64().is_some_and(|pid| pid > 0 && pid != u64::from(notice.process_id)));
+        ensure!(endpoint["process_lifetime"] != json!(notice.process_lifetime));
+        ensure!(endpoint["storage_owner"] == serde_json::to_value(fresh_ref.process_session_id())?);
+        ensure!(selected["ordinary"]["retained"].is_null());
+        ensure!(!selected["lifecycle"]["outcomes"].as_array().unwrap().iter().any(|outcome|
+            outcome.get("RetainedNativeInitialized").is_some()));
+        ensure!(operation(&pending_journal, notice.fault_operation_id.as_str())?["supersededBy"].is_null());
+        let configured_source = cluster.observe().await?;
+        let (source_ref, source_snapshot) = configured_source.snapshots().find(|(_, snapshot)|
+            snapshot.publication.as_ref() == Some(&rebuild.source))
+            .context("actual configured source disappeared before Idle")?;
+        ensure!(source_snapshot.read_status != AccessStatus::Granted && source_snapshot.write_status != AccessStatus::Granted);
+        ensure!(rebuild.source.scope.configuration.previous.as_ref() == Some(&original));
+        ensure!(rebuild.source.scope.configuration.current.write_quorum == original.write_quorum);
+        ensure!(source_snapshot.native_lifecycle.as_ref().is_some_and(|facts|
+            facts.state == kuberic_runtime::protocol::public_operations::NativeReplicaState::Ready
+                && facts.native_role == ReplicaRole::Primary && facts.application_role == Some(ReplicaRole::Primary)));
+        let source_native = cluster.native_transport_observation(source_ref).await?;
+        for kind in ["current", "previous"] {
+            ensure!(source_native["production"]["nativeConfiguration"][kind]["writeQuorum"] == original.write_quorum);
+            ensure!(source_native["production"]["nativeConfiguration"][kind]["members"].as_array().is_some_and(Vec::is_empty));
+        }
         ensure!(restored.observation()?["witness"]["openModes"] == json!([OpenMode::Existing]));
         ensure!(application_progress(&restored.observation()?)? == (79, initial_lsn));
         if let Some(image) = initial_observation["application"].get("imageSha256") {
@@ -673,23 +928,19 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
         ensure!(achieved.publication.as_ref().is_some_and(|publication| {
             publication.stage == ReplicaPublicationStage::AchievedScope
                 && publication.scope == restore_goal.scope
-                && publication.role == ReplicaRole::ActiveSecondary
+                && publication.role == ReplicaRole::IdleSecondary
         }));
-        ensure!(achieved.progress.value() == Some(initial_lsn));
-        ensure!(achieved.capability.value().is_some_and(|value| value >= 0));
+        ensure!(achieved.read_status != AccessStatus::Granted && achieved.write_status != AccessStatus::Granted);
         let before_adoption = cluster.observe().await?;
         ensure!(before_adoption.set().status.as_ref().unwrap().public_v1_topology.as_ref().unwrap()
             .sessions.iter().any(|session| session.process_session_id == *target.process_session_id()));
         loop {
             cluster.step().await?;
-            let observation = cluster.observe().await?;
-            let topology = observation.set().status.as_ref().unwrap().public_v1_topology.as_ref().unwrap();
-            if topology.sessions.iter().any(|session| {
-                session.identity == *fresh_ref.identity()
-                    && session.process_session_id == *fresh_ref.process_session_id()
-                    && session.replicator_creation_id == *fresh_ref.replicator_creation_id()
-            }) {
-                ensure!(topology.configuration().map_err(anyhow::Error::msg)? == original);
+            let state = journal(&root)?;
+            let record = operation(&state, restore_goal.operation_id.as_str())?;
+            if record["ordinary"]["accepted"] == true
+                && record["ordinary"]["host_settled"] == true
+            {
                 break;
             }
         }
@@ -697,17 +948,13 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
         let complete = operation(&complete_journal, restore_goal.operation_id.as_str())?;
         successful_receipts(complete)?;
         ensure!(complete["ordinary"]["actions"] == json!([
-            "ApplicationOpen", "ReplicatorOpen", "ReplicatorRole", "ApplicationRole", "ProgramEpoch", "Configuration",
+            "ReplicatorRole", "ApplicationRole", "NativeComplete",
         ]));
         let outcomes = &complete["lifecycle"]["outcomes"];
         ensure!(outcomes[0] == "Done");
-        ensure!(outcomes[1]["BuiltinNativeEndpoint"]["process_id"] == receipt["owner_process_id"]);
-        ensure!(outcomes[1]["BuiltinNativeEndpoint"]["process_lifetime"] == receipt["owner_process_lifetime"]);
-        ensure!(outcomes[1]["BuiltinNativeEndpoint"]["storage_owner"]
-            == serde_json::to_value(fresh_ref.process_session_id())?);
-        ensure!(outcomes[2]["RetainedNativeInitialized"] == serde_json::to_value(&restore_goal.scope)?);
-        ensure!(outcomes[3].get("ApplicationRole").is_some());
-        ensure!(outcomes[4] == "Done" && outcomes[5] == "Done");
+        ensure!(outcomes[1].get("ApplicationRole").is_some());
+        ensure!(outcomes[2]["NativeLifecycle"]["state"] == "InBuild");
+        ensure!(outcomes[2]["NativeLifecycle"]["nativeRole"] == "idleSecondary");
         eprintln!("retained-witness achieved sampled adoption: {}", json!({
             "goal": restore_goal, "record": complete, "sample": achieved,
         }));
@@ -739,19 +986,42 @@ pub async fn qualify_retained_secondary<F: WitnessApplication>(
         ensure!(F::read_value(cluster.probe(current_writer.request(F::read_request())).await?)? == 97);
         ensure!(writer.observation().is_err() && failed.observation().is_err());
         let final_journal = journal(&root)?;
+        ensure!(final_journal["reportedFault"] == json!(FaultType::Transient));
         let retained_fault = operation(&final_journal, notice.fault_operation_id.as_str())?;
         for field in ["lifecycle", "disposition", "containment", "stage"] {
             ensure!(retained_fault[field] == old_fault[field], "recovery rewrote old failure {field}");
         }
+        let final_snapshot = cluster.sample_replica(secondary).await?;
+        let final_goal = final_snapshot.goals.iter().find(|entry|
+            entry.goal.revision == final_snapshot.publication.as_ref().unwrap().generation)
+            .context("final copied-member goal missing")?;
+        successful_receipts(operation(&final_journal, final_goal.goal.operation_id.as_str())?)?;
+        ensure!(retained_fault["supersededBy"] == json!(final_goal.goal.operation_id));
+        let source_journal = journal(&cluster.application_root(elected.primary()).await?)?;
+        let source_snapshot = cluster.sample_replica(elected.primary()).await?;
+        let source_final = source_snapshot.goals.iter().find(|entry|
+            entry.goal.revision == source_snapshot.publication.as_ref().unwrap().generation)
+            .context("final copy source goal missing")?;
+        let source_record = operation(&source_journal, source_final.goal.operation_id.as_str())?;
+        successful_receipts(source_record)?;
+        ensure!(source_record["ordinary"]["actions"].as_array().is_some_and(|actions|
+            actions.iter().any(|action| action == "CurrentConfiguration")));
+        ensure!(source_snapshot.native_lifecycle.as_ref().unwrap().deactivation
+            == final_snapshot.native_lifecycle.as_ref().unwrap().deactivation);
+        let final_native = cluster.native_transport_observation(elected.primary()).await?;
+        ensure!(final_native["production"]["nativeConfiguration"]["previous"].is_null());
+        ensure!(final_native["production"]["nativeConfiguration"]["current"]["writeQuorum"] == original.write_quorum);
         let after_routes = cluster.native_route_counts().await;
         for kind in ["Build", "AfterContext", "BuildResult"] {
-            ensure!(after_routes.get(kind) == routes.get(kind), "restoration used source copy: {kind}");
+            ensure!(after_routes.get(kind).copied().unwrap_or(0) > routes.get(kind).copied().unwrap_or(0),
+                "original-member recovery lacks actual copy boundary: {kind}");
         }
         ensure!(initial_observation["witness"]["openModes"] != json!([OpenMode::Existing]));
         eprintln!("retained-witness secondary acknowledged suffix: {}", json!({
             "initialLsn": initial_lsn, "subsequentLsn": subsequent_lsn,
             "application": restored.observation()?, "native": cluster.native_transport_observation(secondary).await?,
             "oldFault": retained_fault, "routesBefore": routes, "routesAfter": after_routes,
+            "sourceRoot": cluster.application_root(elected.primary()).await?, "targetRoot": root,
         }));
         Ok(())
     }.await;

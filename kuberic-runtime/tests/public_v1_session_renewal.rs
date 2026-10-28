@@ -1056,7 +1056,7 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 
 #[tokio::test]
 async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 19);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 23);
     let root = test_root("replacement_schema-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicV1Identity::new(42);
@@ -1587,7 +1587,7 @@ async fn public_v1_replacement_schema_failed_build_containment_survives_reopen()
 #[test]
 fn public_v1_replacement_schema_rejects_prior_preview_stores() {
     let preview = PublicV1Identity::new(42);
-    for version in [6, 7, 8, 9, 10, 15, 16, 17] {
+    for version in [6, 7, 8, 9, 10, 15, 16, 17, 18, 19] {
         let root = test_root(&format!("replacement_schema-reject-{version}"));
         let path = SqliteStore::metadata_database_path(&root);
         let store = SqliteStore::create_public_v1(

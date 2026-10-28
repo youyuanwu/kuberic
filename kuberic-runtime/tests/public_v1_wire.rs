@@ -249,7 +249,14 @@ fn availability_is_required_canonical_evidence_for_every_configuration_input() {
     let required = schema.as_value()["required"].as_array().unwrap();
     assert!(required.iter().any(|field| field == "isUp"));
     assert!(required.iter().any(|field| field == "isReady"));
-    assert_eq!(PUBLIC_V1_PROTOCOL_VERSION, 19);
+    assert_eq!(PUBLIC_V1_PROTOCOL_VERSION, 23);
+    assert!(
+        !PublicV1Identity {
+            protocol_version: 20,
+            generation: 1
+        }
+        .is_valid()
+    );
     assert!(
         !PublicV1Identity {
             protocol_version: 12,

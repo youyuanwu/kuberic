@@ -46,7 +46,12 @@ pub(crate) fn achieved_role(
                     && matches!(outcome, O::ApplicationRole(_))
             } else {
                 matches!(instruction, I::ReplicatorRole | I::ReplicatorPrimary)
-                    && matches!(outcome, O::Done | O::RetainedNativeInitialized(_))
+                    && matches!(
+                        outcome,
+                        O::Done
+                            | O::RetainedNativeInitialized(_)
+                            | O::ReconstructedNativeInitialized(_)
+                    )
             };
             if !is_child {
                 return None;

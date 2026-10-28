@@ -139,7 +139,9 @@ struct RuntimeHost {
     discovery_resolver: OnceLock<Arc<dyn super::transport::ReplicaEndpointResolver>>,
     native_address: OnceLock<String>,
     native_lifecycle: StdMutex<Option<crate::replicator::v1::LifecycleObservation>>,
+    native_history: Arc<super::native_history::NativeLifecycleOwner>,
     retained_native_initialized: OnceLock<crate::replicator::CheckedRetainedMember>,
+    reconstructed_native_initialized: OnceLock<crate::replicator::CheckedCreationReconstruction>,
     native_transport_quorum: StdMutex<Option<(Epoch, u64, bool)>>,
     identity: ReplicaIdentity,
     application: Arc<dyn StatefulServiceReplica>,
@@ -167,6 +169,10 @@ struct RuntimeHost {
 
 impl RuntimeHost {
     fn selected_status(&self) -> Option<(AccessStatus, AccessStatus)> {
+        self.selected_observation().0
+    }
+
+    fn selected_observation(&self) -> (Option<(AccessStatus, AccessStatus)>, Option<ReplicaRole>) {
         if self.closed.load(Ordering::Acquire)
             || self.aborted.load(Ordering::Acquire)
             || self.replacement_fault_fenced.load(Ordering::Acquire)
@@ -178,11 +184,14 @@ impl RuntimeHost {
                 )
             )
         {
-            return Some((AccessStatus::NotPrimary, AccessStatus::NotPrimary));
+            return (
+                Some((AccessStatus::NotPrimary, AccessStatus::NotPrimary)),
+                None,
+            );
         }
-        let (mut selected, epoch) = {
+        let (mut selected, epoch, role) = {
             let access = self.selected_access.lock().unwrap();
-            (access.status(), access.epoch())
+            (access.status(), access.epoch(), access.serving_role())
         };
         if let Some(status) = &mut selected
             && status.1 == AccessStatus::Granted
@@ -198,13 +207,19 @@ impl RuntimeHost {
             && matches!(*self.native_lifecycle.lock().unwrap(),
                 Some(crate::replicator::v1::LifecycleObservation::Ready(role)) if role != ReplicaRole::Primary)
         {
-            return Some((AccessStatus::NotPrimary, AccessStatus::NotPrimary));
+            return (
+                Some((AccessStatus::NotPrimary, AccessStatus::NotPrimary)),
+                None,
+            );
         }
-        selected.or_else(|| {
-            self.replacement_authority_fenced
-                .load(Ordering::Acquire)
-                .then_some((AccessStatus::NotPrimary, AccessStatus::NotPrimary))
-        })
+        (
+            selected.or_else(|| {
+                self.replacement_authority_fenced
+                    .load(Ordering::Acquire)
+                    .then_some((AccessStatus::NotPrimary, AccessStatus::NotPrimary))
+            }),
+            role,
+        )
     }
 }
 
@@ -354,7 +369,9 @@ impl PodRuntime {
                 discovery_resolver: OnceLock::new(),
                 native_address: OnceLock::new(),
                 native_lifecycle: StdMutex::new(None),
+                native_history: Arc::new(Default::default()),
                 retained_native_initialized: OnceLock::new(),
+                reconstructed_native_initialized: OnceLock::new(),
                 native_transport_quorum: StdMutex::new(None),
             }),
         }
@@ -420,6 +437,14 @@ impl PodRuntime {
         &self,
     ) -> Result<crate::host::public_lifecycle::PublicLifecycleCallbacks> {
         let access_host = Arc::downgrade(&self.host);
+        let peer_host = Arc::downgrade(&self.host);
+        let peer_address: super::native_history::PeerAddress = Arc::new(move |identity| {
+            peer_host
+                .upgrade()
+                .and_then(|host| host.discovery_resolver.get().cloned())
+                .map(|resolver| resolver.control_endpoint(identity))
+                .ok_or(RuntimeError::AuthorityNotAdmitted)
+        });
         let access_factory: crate::host::public_lifecycle::AccessFactory =
             Arc::new(move |operation| AccessOwner::begin(access_host.clone(), operation));
         let drain_host = Arc::downgrade(&self.host);
@@ -452,6 +477,8 @@ impl PodRuntime {
         if let Some(registered) = self.host.registered.get() {
             return Ok(crate::host::public_lifecycle::PublicLifecycleCallbacks {
                 application: self.host.application.clone(),
+                native: Some(self.host.native_history.clone()),
+                peer_address: Some(peer_address),
                 replicator: registered.control.clone(),
                 primary: registered.primary().ok_or(RuntimeError::NotPrimary)?,
                 application_control_match: None,
@@ -505,6 +532,8 @@ impl PodRuntime {
         let host = Arc::downgrade(&self.host);
         Ok(crate::host::public_lifecycle::PublicLifecycleCallbacks {
             application: self.host.application.clone(),
+            native: Some(self.host.native_history.clone()),
+            peer_address: Some(peer_address),
             replicator,
             primary,
             application_control_match: Some(Arc::new(move |control| {
@@ -861,11 +890,24 @@ impl PodRuntime {
         selected_access::complete(&self.host, operation);
     }
 
+    pub(crate) async fn accept_addition_access(
+        &self,
+        store: &dyn super::store::AgentStore,
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+    ) -> super::Result<()> {
+        selected_access::accept_addition(&self.host, store, goal).await
+    }
+
     pub(crate) fn public_access_completion_guard(
         &self,
         operation: &Arc<crate::host::operation::PartitionOperation>,
     ) -> AccessRootGuard {
         selected_access::completion_guard(&self.host, operation)
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn addition_access_pending(&self) -> bool {
+        self.host.selected_access.lock().unwrap().addition_pending()
     }
 
     #[cfg(feature = "testing")]
@@ -938,10 +980,17 @@ impl PodRuntime {
         } else {
             state.projection.role
         };
-        let (read_status, write_status) = self
-            .host
-            .selected_status()
-            .unwrap_or((state.projection.read_status, state.projection.write_status));
+        let (selected, serving_role) = self.host.selected_observation();
+        let (read_status, write_status) =
+            selected.unwrap_or((state.projection.read_status, state.projection.write_status));
+        // A pending same-owner program is not an achieved publication. It can
+        // still retain the real paired Primary's existing reads/first-wait
+        // writes; report that actual serving role without granting a new scope.
+        let role = if role == ReplicaRole::None {
+            serving_role.unwrap_or(role)
+        } else {
+            role
+        };
         Ok(crate::host::public_lifecycle::PublicV1ReportProjection {
             catch_up_specific_quorum: self
                 .host
@@ -985,6 +1034,48 @@ impl PodRuntime {
             .get()
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
         Ok(registered.native_progress().await)
+    }
+
+    pub(crate) fn has_native_lifecycle(&self) -> bool {
+        self.host.native_history.is_native()
+    }
+
+    pub(crate) fn native_configuration_prefix(
+        &self,
+        state: &crate::host::state::AgentState,
+        scope: &crate::protocol::public_operations::ReplicaScope,
+    ) -> Option<crate::protocol::public_operations::NativeLifecycleFacts> {
+        crate::host::native_history::configuration_prefix(state, scope, &self.host.native_history)
+    }
+
+    pub(crate) fn native_facts_are_live(
+        &self,
+        facts: &crate::protocol::public_operations::NativeLifecycleFacts,
+    ) -> bool {
+        self.host.native_history.matches(facts)
+            && self.replacement_replicator_creation_id().ok().as_ref()
+                == Some(&facts.scope.creation_id)
+            && self
+                .host
+                .replica_session
+                .get()
+                .is_some_and(|(_, process)| process == &facts.scope.process_session_id)
+            && !self.ordinary_withdrawn()
+    }
+
+    pub(crate) fn native_status_is_live(
+        &self,
+        status: &crate::protocol::public_operations::NativeStatusObservation,
+    ) -> bool {
+        self.host.native_history.status_is_live(status)
+            && self.replacement_replicator_creation_id().ok().as_ref()
+                == Some(&status.input.scope.creation_id)
+            && self
+                .host
+                .replica_session
+                .get()
+                .is_some_and(|(_, process)| process == &status.input.scope.process_session_id)
+            && !self.ordinary_withdrawn()
     }
 
     pub(crate) async fn bind_public_fault_runtime(
@@ -1329,6 +1420,203 @@ impl ReplacementFaultBridge {
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
+    fn reconstructed_native_initialization(
+        &self,
+    ) -> Option<crate::replicator::CheckedCreationReconstruction> {
+        let host = self.host.upgrade()?;
+        if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
+            return None;
+        }
+        let selected = host.reconstructed_native_initialized.get()?;
+        let registered = host.registered.get()?;
+        (registered.identity.to_public_id() == selected.scope().creation_id)
+            .then(|| selected.clone())
+    }
+
+    async fn creation_reconstruction(
+        &self,
+        reservation: Option<ReplicatorCreationReservation>,
+    ) -> Result<Option<crate::replicator::CheckedCreationReconstruction>> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let identity = if let Some(reservation) = reservation {
+            reservation.identity(RuntimeHostToken::new())
+        } else if let Some(registered) = host.registered.get() {
+            registered.identity
+        } else {
+            match &*host
+                .replicator_creation
+                .lock()
+                .map_err(|_| RuntimeError::Closed)?
+            {
+                ReplicatorCreationState::Available(identity)
+                | ReplicatorCreationState::Reserved { identity, .. } => *identity,
+                ReplicatorCreationState::Registered => {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+            }
+        };
+        let current = host.registered.get().map_or_else(
+            || host.replicator_creation.lock().is_ok_and(|creation| {
+                matches!(&*creation, ReplicatorCreationState::Reserved { identity: actual, .. } if *actual == identity)
+                    || (reservation.is_none()
+                        && matches!(&*creation, ReplicatorCreationState::Available(actual) if *actual == identity))
+            }),
+            |registered| registered.identity == identity,
+        );
+        if !current
+            || host.closed.load(Ordering::Acquire)
+            || host.aborted.load(Ordering::Acquire)
+            || host.ordinary_withdrawn.load(Ordering::Acquire)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let bridge = self.bridge().await?;
+        let state = bridge
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let Some(record) = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| {
+                preview
+                    .current_operation
+                    .as_ref()
+                    .and_then(|id| preview.operations.get(id))
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(goal) = record.intent.goal() else {
+            return Ok(None);
+        };
+        let Some(recovery) = super::ordinary_goal::reconstruction::claim(goal) else {
+            return Ok(None);
+        };
+        if goal.scope.process_session_id != bridge.process_session
+            || goal.scope.creation_id != identity.to_public_id()
+            || record.stage != super::state::PublicOperationStage::Running
+            || record.superseded_by.is_some()
+            || record
+                .ordinary
+                .as_ref()
+                .and_then(|ordinary| ordinary.reconstruction.as_ref())
+                .is_none_or(|receipt| {
+                    receipt.owner_process_id != std::process::id()
+                        || receipt.owner_process_lifetime
+                            != super::ordinary_goal::retained::process_lifetime_id()
+                })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        bridge
+            .store
+            .validate_creation_reconstruction(goal)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        let credentials = host
+            .native_credentials
+            .get()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        for receiver in &recovery.receiver_settlements {
+            let address =
+                self.peer_control_endpoint(&receiver.terminal_goal.scope.storage.replica)?;
+            let observed =
+                crate::control::resolve_receiver_settlement(&address, credentials, receiver)
+                    .await?;
+            if !super::ordinary_goal::reconstruction::receiver_settled(receiver, &observed) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            if let Some(addition) = &recovery.addition
+                && (observed.storage != addition.receiver.storage_incarnation
+                    || observed.process_session_id != addition.receiver.process_session_id
+                    || observed.creation_id != addition.receiver.replicator_creation_id)
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+        }
+        let refreshed = bridge
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        if host.closed.load(Ordering::Acquire)
+            || host.aborted.load(Ordering::Acquire)
+            || host.ordinary_withdrawn.load(Ordering::Acquire)
+            || refreshed
+                .public_v1_operation_state
+                .as_ref()
+                .is_none_or(|preview| {
+                    preview.current_operation.as_ref() != Some(&goal.operation_id)
+                        || preview
+                            .operations
+                            .get(&goal.operation_id)
+                            .is_none_or(|current| {
+                                current.intent != record.intent
+                                    || current.stage != super::state::PublicOperationStage::Running
+                                    || current.superseded_by.is_some()
+                            })
+                })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        bridge
+            .store
+            .validate_creation_reconstruction(goal)
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        Ok(Some(crate::replicator::CheckedCreationReconstruction::new(
+            goal.clone(),
+        )))
+    }
+
+    async fn confirm_reconstructed_native_initialization(
+        &self,
+        reservation: ReplicatorCreationReservation,
+        selected: &crate::replicator::CheckedCreationReconstruction,
+    ) -> Result<()> {
+        let actual = self
+            .creation_reconstruction(Some(reservation))
+            .await?
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if &actual != selected {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let bridge = self.bridge().await?;
+        let state = bridge
+            .store
+            .load_state()
+            .await
+            .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        if state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| {
+                preview
+                    .current_operation
+                    .as_ref()
+                    .and_then(|id| preview.operations.get(id))
+            })
+            .is_none_or(|record| {
+                record.lifecycle.in_flight != Some(super::state::PublicInstruction::ReplicatorRole)
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        if let Some(previous) = host.reconstructed_native_initialized.get() {
+            return if previous == selected {
+                Ok(())
+            } else {
+                Err(RuntimeError::AuthorityNotAdmitted)
+            };
+        }
+        host.reconstructed_native_initialized
+            .set(actual)
+            .map_err(|_| RuntimeError::AuthorityNotAdmitted)
+    }
+
     fn retained_native_initialization(&self) -> Option<crate::replicator::CheckedRetainedMember> {
         let host = self.host.upgrade()?;
         if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
@@ -1640,6 +1928,13 @@ impl PartitionAccessView for HostAccessView {
             if !current {
                 return;
             }
+            host.native_history.observe(observation);
+            if matches!(
+                observation,
+                crate::replicator::v1::LifecycleObservation::EpochApplied(_)
+            ) {
+                return;
+            }
             if let crate::replicator::v1::LifecycleObservation::TransportQuorum {
                 epoch,
                 revision,
@@ -1712,6 +2007,9 @@ impl PartitionAccessView for HostAccessView {
             .1;
         if if host.ordinary_contract.load(Ordering::Acquire) {
             crate::host::ordinary_goal::terminal_for_process(preview, process)
+                && !crate::host::ordinary_goal::reconstruction::inspection_open_selected(
+                    &state, process,
+                )
         } else {
             preview.terminal && !crate::host::operation::contained_transient_reopen(&state, process)
         } {

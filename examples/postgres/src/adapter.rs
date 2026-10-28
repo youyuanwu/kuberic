@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 #[path = "public_endpoint.rs"]
 mod public_endpoint;
 #[path = "public_transport.rs"]
-mod public_transport;
+pub(crate) mod public_transport;
 #[path = "public_v1.rs"]
 pub(crate) mod public_v1;
 

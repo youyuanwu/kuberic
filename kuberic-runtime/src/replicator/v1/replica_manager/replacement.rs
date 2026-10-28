@@ -25,7 +25,155 @@ fn same_set(left: &ReplicaSet, right: &ReplicaSet) -> bool {
         })
 }
 
+pub(super) struct LiveReformation {
+    pub(super) replica_id: i64,
+    original: ReplicaSet,
+    pub(super) predecessor: ReplicationSession,
+    pub(super) successor: ReplicationSession,
+    pub(super) joint: Option<ReplicaSet>,
+    pub(super) caught_up: bool,
+}
+
 impl ReplicaManager {
+    pub(in crate::replicator::v1) fn admit_live_target(
+        &mut self,
+        id: i64,
+        predecessor: &ReplicationSession,
+        successor: ReplicationSession,
+    ) -> Result<ManagerEffects, ManagerError> {
+        self.ensure_active()?;
+        self.check_reported_fault()?;
+        self.validate_session(id, &successor)?;
+        let original = self
+            .current
+            .as_ref()
+            .ok_or(ConfigurationError::InvalidCopyTarget(id))?;
+        if self.previous.is_some()
+            || self.replacement.is_some()
+            || self.live_reformation.is_some()
+            || !self.idle.is_empty()
+            || self
+                .builds
+                .values()
+                .any(|build| !build.result().is_some_and(|end| end.result.is_ok()))
+            || original.write_quorum <= 1
+            || !Self::has_enough_replicas(original)
+            || original.members.iter().any(|member| member.must_catchup)
+            || !original
+                .members
+                .iter()
+                .any(|member| member.replica_id == id && member.session.same_instance(predecessor))
+            || original.members.iter().any(|member| {
+                member.session.same_instance(&successor)
+                    || member.session.identity() == successor.identity()
+            })
+            || predecessor.transport_active()
+            || predecessor.is_processing()
+            || !successor.transport_active()
+        {
+            return Err(ConfigurationError::InvalidCopyTarget(id).into());
+        }
+        let hint = self.queue.first_lsn_in_replication_queue() - 1;
+        let first = successor.apply_lsn(hint).checked_add(1);
+        let mut operations = Vec::new();
+        if !first.is_some_and(|first| self.queue.get_operations(first, &mut operations)) {
+            return Err(ConfigurationError::MissingCurrentReplay(id).into());
+        }
+        self.live_reformation = Some(LiveReformation {
+            replica_id: id,
+            original: original.clone(),
+            predecessor: predecessor.clone(),
+            successor: successor.clone(),
+            joint: None,
+            caught_up: false,
+        });
+        let mut effects = ManagerEffects::default();
+        if !operations.is_empty() {
+            effects.sessions.push(SessionEffect::Replay {
+                session: successor,
+                operations,
+                completed_hint: hint,
+            });
+        }
+        Ok(effects)
+    }
+
+    pub(super) fn configure_live_reformation(
+        &mut self,
+        configuration: EstablishedConfiguration,
+    ) -> Result<ManagerEffects, ManagerError> {
+        let reformation = self.live_reformation.as_ref().unwrap();
+        let id = reformation.replica_id;
+        let mut expected = reformation.original.clone();
+        expected
+            .members
+            .iter_mut()
+            .find(|member| member.replica_id == id)
+            .unwrap()
+            .session = reformation.successor.clone();
+        let final_cut = configuration.previous.is_none();
+        if !same_set(&configuration.current, &expected)
+            || if final_cut {
+                reformation.joint.is_none() || !reformation.caught_up
+            } else {
+                !configuration.catchup_configuration
+                    || !configuration
+                        .previous
+                        .as_ref()
+                        .is_some_and(|previous| same_set(previous, &reformation.original))
+            }
+        {
+            return Err(ConfigurationError::ReplacementPending(id).into());
+        }
+        let retry = reformation
+            .joint
+            .as_ref()
+            .is_some_and(|joint| same_set(joint, &configuration.current));
+        let mut checked = BTreeMap::new();
+        self.validate_set(
+            &configuration.current,
+            configuration.catchup_configuration,
+            &mut checked,
+        )?;
+        if let Some(previous) = &configuration.previous {
+            checked.insert(id, reformation.predecessor.clone());
+            self.validate_set(previous, false, &mut checked)?;
+        }
+        let prior_joint = self
+            .live_reformation
+            .as_mut()
+            .unwrap()
+            .joint
+            .replace(configuration.current.clone());
+        let observation = match self.observe_sets(
+            Some(&configuration.current),
+            configuration.previous.as_ref(),
+            &self.idle,
+        ) {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.live_reformation.as_mut().unwrap().joint = prior_joint;
+                return Err(error);
+            }
+        };
+        self.current = Some(configuration.current);
+        self.previous = configuration.previous;
+        self.catchup_configuration = configuration.catchup_configuration;
+        if !retry {
+            self.queue.update_catchup_completion_lsn();
+        }
+        let mut effects = ManagerEffects::default();
+        if final_cut {
+            let reformation = self.live_reformation.take().unwrap();
+            effects
+                .sessions
+                .push(SessionEffect::Close(reformation.predecessor));
+            self.builds.remove(&id);
+        }
+        self.advance(observation, &mut effects);
+        Ok(effects)
+    }
+
     pub(in crate::replicator::v1) fn verify_replacement_source(
         &self,
         current: &ReplicaSet,
@@ -34,6 +182,7 @@ impl ReplicaManager {
         self.check_reported_fault()?;
         if self.previous.is_some()
             || self.replacement.is_some()
+            || self.live_reformation.is_some()
             || !self.idle.is_empty()
             || !self.builds.is_empty()
             || self.catchup_wait.is_some()
@@ -69,6 +218,7 @@ impl ReplicaManager {
             && self.idle.is_empty()
             && self.builds.is_empty()
             && self.replacement.is_none()
+            && self.live_reformation.is_none()
     }
 
     pub(in crate::replicator::v1) fn restore_replacement_source(
@@ -149,6 +299,7 @@ impl ReplicaManager {
         }
         if self.previous.is_some()
             || self.replacement.is_some()
+            || self.live_reformation.is_some()
             || !self.idle.is_empty()
             || !self.builds.is_empty()
             || self.catchup_wait.is_some()

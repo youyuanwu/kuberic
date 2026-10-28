@@ -73,6 +73,7 @@ fn fixture() -> (AgentState, ReplicaGoal, PublicOperationIntent) {
         },
         desired: ReplicaGoalKind::Prepare {
             role: ReplicaRole::ActiveSecondary,
+            rebuild: None,
         },
     };
     let mut state = AgentState::new(StorageIdentity {
@@ -112,6 +113,7 @@ fn fixture() -> (AgentState, ReplicaGoal, PublicOperationIntent) {
         PublicOperationRecord {
             intent: old.intent(),
             ordinary: Some(OrdinaryGoalRecord {
+                native_input: None,
                 action_format: ORDINARY_ACTION_FORMAT,
                 actions,
                 open_existing: Some(true),
@@ -121,6 +123,14 @@ fn fixture() -> (AgentState, ReplicaGoal, PublicOperationIntent) {
                 host_settled: true,
                 ready_admissions: Vec::new(),
                 retained: None,
+                reconstruction: None,
+                creation_owner: Some(crate::host::state::OrdinaryCreationOwner {
+                    process_id: std::process::id(),
+                    process_lifetime: process_lifetime_id().to_owned(),
+                    process_session_id: old.scope.process_session_id.clone(),
+                    creation_id: old.scope.creation_id.clone(),
+                    builtin_factory: None,
+                }),
             }),
             attempt: 1,
             attempt_results: Default::default(),
@@ -173,6 +183,349 @@ fn fixture() -> (AgentState, ReplicaGoal, PublicOperationIntent) {
     (state, restore, fault)
 }
 
+fn contained_fixture() -> (AgentState, ReplicaGoal) {
+    let (mut state, mut goal, _) = fixture();
+    state.application_storage = Some(ApplicationStorageBinding {
+        paths: [(
+            "application".into(),
+            std::path::PathBuf::from("retained-validator-only"),
+        )]
+        .into_iter()
+        .collect(),
+        initializing: false,
+    });
+    let preview = state.public_v1_operation_state.as_mut().unwrap();
+    let old = preview.operations.values_mut().next().unwrap();
+    old.lifecycle.outcomes.truncate(4);
+    old.lifecycle.in_flight = Some(PublicInstruction::ProgramEpoch);
+    old.stage = PublicOperationStage::ContainmentPending;
+    old.containment = PublicOperationContainment::Pending;
+    old.disposition = Some(PublicOperationDisposition::Ambiguous(
+        "old native effect has no receipt".into(),
+    ));
+    goal.operation_id = OperationId::new("recover-contained");
+    goal.desired = ReplicaGoalKind::RecoverContainedCreation {
+        recovery: Box::new(ContainedCreationRecovery {
+            addition: None,
+            predecessor_process_session_id: old.intent.process_session_id.clone(),
+            predecessor_creation_id: old.intent.goal().unwrap().scope.creation_id.clone(),
+            predecessor_operations: vec![old.intent.operation_id.clone()],
+            receiver_settlements: Vec::new(),
+            role: ReplicaRole::ActiveSecondary,
+            catch_up: None,
+        }),
+    };
+    (state, goal)
+}
+
+#[test]
+fn m3_contained_reconstruction_is_distinct_from_narrow_retained_restoration() {
+    let (state, goal) = contained_fixture();
+    let before = state.clone();
+    super::super::reconstruction::validate(&state, &goal).unwrap();
+    let frozen = super::super::freeze(&state, &goal).unwrap();
+    assert_eq!(frozen.open_existing, Some(true));
+    assert!(frozen.reconstruction.is_none());
+    assert!(frozen.retained.is_none());
+    assert_eq!(
+        frozen.actions,
+        [
+            PublicInstruction::ApplicationOpen,
+            PublicInstruction::ReplicatorOpen,
+            PublicInstruction::ReplicatorRole,
+            PublicInstruction::ApplicationRole,
+            PublicInstruction::ProgramEpoch,
+            PublicInstruction::Configuration,
+            PublicInstruction::NativeComplete,
+        ]
+    );
+    let (_, mut restore, _) = fixture();
+    restore.scope = goal.scope.clone();
+    assert!(validate_restore(&state, &restore).is_err());
+    assert_eq!(
+        state, before,
+        "qualification cannot settle the old effect or mint a receipt"
+    );
+    assert!(
+        super::super::publication(
+            &state,
+            &goal.scope.process_session_id,
+            &goal.scope.creation_id,
+            false,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn m3_contained_reconstruction_rejects_crossed_missing_and_foreign_dependencies() {
+    let (state, goal) = contained_fixture();
+    for changed in 0..7 {
+        let mut state = state.clone();
+        let mut goal = goal.clone();
+        match changed {
+            0 => {
+                let ReplicaGoalKind::RecoverContainedCreation { recovery } = &mut goal.desired
+                else {
+                    unreachable!()
+                };
+                recovery
+                    .predecessor_operations
+                    .push(OperationId::new("unobserved"));
+            }
+            1 => goal.scope.epoch.configuration_number += 1,
+            2 => {
+                state.reported_fault = Some(FaultType::Permanent);
+            }
+            3 => state.application_storage = None,
+            4 => {
+                let old = state
+                    .public_v1_operation_state
+                    .as_mut()
+                    .unwrap()
+                    .operations
+                    .values_mut()
+                    .next()
+                    .unwrap();
+                old.lifecycle.outcomes[1] = PublicInstructionOutcome::Endpoint("unproven".into());
+            }
+            5 => {
+                let mut unrelated = state
+                    .public_v1_operation_state
+                    .as_ref()
+                    .unwrap()
+                    .operations
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                unrelated.intent.operation_id = OperationId::new("other-live-owner");
+                unrelated.intent.process_session_id = ProcessSessionId::new("other-process");
+                state
+                    .public_v1_operation_state
+                    .as_mut()
+                    .unwrap()
+                    .operations
+                    .insert(unrelated.intent.operation_id.clone(), unrelated);
+            }
+            _ => goal.scope.configuration.replicas[0].is_ready = true,
+        }
+        assert!(
+            super::super::reconstruction::validate(&state, &goal).is_err(),
+            "crossed reconstruction {changed} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn m3_contained_reconstruction_retains_frozen_pc_and_highest_epoch_without_sampling() {
+    let (mut state, mut goal) = contained_fixture();
+    let previous = goal.scope.configuration.current.clone();
+    goal.scope.configuration.previous = Some(previous);
+    let old = state
+        .public_v1_operation_state
+        .as_mut()
+        .unwrap()
+        .operations
+        .values_mut()
+        .next()
+        .unwrap();
+    let mut selected = old.intent.goal().unwrap().clone();
+    selected.scope.configuration = goal.scope.configuration.clone();
+    old.intent = selected.intent();
+    super::super::reconstruction::validate(&state, &goal).unwrap();
+    let mut dropped_pc = goal.clone();
+    dropped_pc.scope.configuration.previous = None;
+    assert!(super::super::reconstruction::validate(&state, &dropped_pc).is_err());
+    let mut lowered = goal;
+    lowered.scope.epoch.configuration_number -= 1;
+    assert!(super::super::reconstruction::validate(&state, &lowered).is_err());
+}
+
+#[test]
+fn m3_contained_claim_wire_cannot_carry_death_ready_or_progress_authority() {
+    let (_, goal) = contained_fixture();
+    let ReplicaGoalKind::RecoverContainedCreation { recovery } = &goal.desired else {
+        unreachable!()
+    };
+    for extra in [
+        "dead",
+        "ready",
+        "currentProgress",
+        "catchUpCapability",
+        "quorumGrant",
+    ] {
+        let mut encoded = serde_json::to_value(recovery).unwrap();
+        encoded[extra] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ContainedCreationRecovery>(encoded).is_err());
+    }
+    for format in [16, 17, 18, 19] {
+        let mut old = goal.clone();
+        old.format = format;
+        assert!(old.validate().is_err());
+        old = goal.clone();
+        old.identity.protocol_version = format;
+        assert!(old.validate().is_err());
+    }
+}
+
+#[test]
+fn m3_contained_receiver_settlement_requires_exact_independent_successful_join() {
+    let (state, mut terminal) = contained_fixture();
+    terminal.desired = ReplicaGoalKind::Close;
+    let claim = ContainedReceiverSettlement {
+        source_operation_id: OperationId::new("source-build-is-not-a-receiver-join"),
+        terminal_goal: Box::new(terminal.clone()),
+    };
+    let mut snapshot = super::super::snapshot(
+        &state,
+        terminal.scope.process_session_id.clone(),
+        terminal.scope.creation_id.clone(),
+        true,
+    );
+    snapshot.goals = vec![ReplicaGoalObservation {
+        goal: terminal,
+        status: ReplicaGoalStatus::Achieved,
+        selected_call: None,
+        receipts: 2,
+        host_settled: true,
+        completed_handoff: None,
+    }];
+    assert!(super::super::reconstruction::receiver_settled(
+        &claim, &snapshot
+    ));
+    for changed in 0..7 {
+        let mut current = snapshot.clone();
+        match changed {
+            0 => current.goals[0].host_settled = false,
+            1 => current.goals[0].status = ReplicaGoalStatus::Uncertain("lost root".into()),
+            2 => current.provider_writer_held = true,
+            3 => current.withdrawn = false,
+            4 => current.process_session_id = ProcessSessionId::new("successor-not-old-receiver"),
+            5 => current.goals[0].selected_call = Some("Cleanup".into()),
+            _ => current.goals[0].goal.operation_id = OperationId::new("source-remove"),
+        }
+        assert!(
+            !super::super::reconstruction::receiver_settled(&claim, &current),
+            "receiver join cannot be inferred from observation {changed}"
+        );
+    }
+    let mut successor = snapshot.clone();
+    successor.process_session_id = ProcessSessionId::new("unopened-successor");
+    successor.creation_id = ReplicatorCreationId::new("unopened-successor-creation");
+    successor.withdrawn = false;
+    assert!(super::super::reconstruction::receiver_settled(
+        &claim, &successor
+    ));
+    for changed in 0..8 {
+        let mut current = successor.clone();
+        match changed {
+            0 => current.goals[0].host_settled = false,
+            1 => current.goals[0].status = ReplicaGoalStatus::Failed("actual Close error".into()),
+            2 => current.provider_writer_held = true,
+            3 => current.read_status = AccessStatus::Granted,
+            4 => current.write_status = AccessStatus::Granted,
+            5 => current.creation_id = snapshot.creation_id.clone(),
+            6 => current.goals[0].selected_call = Some("Cleanup".into()),
+            _ => {
+                let mut live = current.goals[0].clone();
+                live.goal.scope.process_session_id = current.process_session_id.clone();
+                live.goal.scope.creation_id = current.creation_id.clone();
+                current.goals.push(live);
+            }
+        }
+        assert!(
+            !super::super::reconstruction::receiver_settled(&claim, &current),
+            "an opened/unsettled successor cannot settle its predecessor: {changed}"
+        );
+    }
+}
+
+#[test]
+fn m3_contained_dependency_relation_requires_exact_new_success_without_rewriting_old_failure() {
+    let (mut state, goal) = contained_fixture();
+    let mut ordinary = super::super::freeze(&state, &goal).unwrap();
+    ordinary.reconstruction = Some(CreationReconstructionReceipt {
+        predecessor_process_id: std::process::id(),
+        predecessor_process_lifetime: process_lifetime_id().into(),
+        owner_process_id: std::process::id(),
+        owner_process_lifetime: process_lifetime_id().into(),
+        exclusion: CreationExclusion::JoinedHost,
+    });
+    let preview = state.public_v1_operation_state.as_mut().unwrap();
+    let old_id = preview.operations.keys().next().unwrap().clone();
+    let original = preview.operations[&old_id].clone();
+    // A journal-validator vector only; actual host exclusion/native callbacks
+    // are independently required by the store and production constructor.
+    let mut record = PublicOperationRecord {
+        intent: goal.intent(),
+        ordinary: Some(ordinary),
+        attempt: 1,
+        attempt_results: Default::default(),
+        retry_failure: None,
+        accepted_history: Some(goal.scope.history.clone()),
+        accepted_storage: Some(goal.scope.storage.clone()),
+        stage: PublicOperationStage::Running,
+        disposition: None,
+        containment: PublicOperationContainment::NotRequired,
+        superseded_by: None,
+        blockers: Default::default(),
+        lifecycle: PublicLifecycleRecord {
+            in_flight: None,
+            outcomes: vec![
+                PublicInstructionOutcome::Done,
+                PublicInstructionOutcome::BuiltinNativeEndpoint {
+                    endpoint: "http://127.0.0.1:31002".into(),
+                    process_id: std::process::id(),
+                    process_lifetime: process_lifetime_id().into(),
+                    storage_owner: Some(goal.scope.process_session_id.clone()),
+                },
+            ],
+        },
+    };
+    super::super::reconstruction::validate_receipt(&state, &record).unwrap();
+    record
+        .lifecycle
+        .outcomes
+        .push(PublicInstructionOutcome::Done);
+    assert!(super::super::reconstruction::validate_receipt(&state, &record).is_err());
+    record.lifecycle.outcomes[2] =
+        PublicInstructionOutcome::ReconstructedNativeInitialized(Box::new(goal.scope.clone()));
+    record.lifecycle.outcomes.extend([
+        PublicInstructionOutcome::ApplicationRole(None),
+        PublicInstructionOutcome::Done,
+        PublicInstructionOutcome::Done,
+        PublicInstructionOutcome::NativeUnavailable,
+    ]);
+    super::super::reconstruction::validate_receipt(&state, &record).unwrap();
+    let preview = state.public_v1_operation_state.as_mut().unwrap();
+    preview.operations.insert(goal.operation_id.clone(), record);
+    preview.operations.get_mut(&old_id).unwrap().superseded_by = Some(goal.operation_id.clone());
+    assert!(!super::super::reconstruction::dependency_replaced(
+        preview,
+        &preview.operations[&old_id],
+        &goal.scope.process_session_id,
+    ));
+    let successor = preview.operations.get_mut(&goal.operation_id).unwrap();
+    successor.stage = PublicOperationStage::Completed;
+    successor.disposition = Some(PublicOperationDisposition::Succeeded);
+    assert!(super::super::reconstruction::dependency_replaced(
+        preview,
+        &preview.operations[&old_id],
+        &goal.scope.process_session_id,
+    ));
+    assert_eq!(preview.operations[&old_id].stage, original.stage);
+    assert_eq!(
+        preview.operations[&old_id].disposition,
+        original.disposition
+    );
+    assert_eq!(preview.operations[&old_id].lifecycle, original.lifecycle);
+    assert_eq!(
+        preview.operations[&old_id].containment,
+        original.containment
+    );
+}
+
 fn faulted() -> (AgentState, ReplicaGoal, RetainedRecoveryExitNotice) {
     let (mut state, goal, intent) = fixture();
     let notice = recovery_cause(&state, &intent, std::process::id()).unwrap();
@@ -209,6 +562,76 @@ fn faulted() -> (AgentState, ReplicaGoal, RetainedRecoveryExitNotice) {
 }
 
 #[test]
+fn synthetic_higher_current_only_native_receipts_cannot_resolve_fault_without_original_round() {
+    use crate::protocol::public_operations::{
+        NativeDeactivationInfo, NativeLifecycleFacts, NativeReplicaState,
+    };
+    let (mut state, mut goal, notice) = faulted();
+    goal.operation_id = OperationId::new("synthetic-unrelated-current-only");
+    goal.revision += 1;
+    goal.scope.epoch.configuration_number += 1;
+    goal.scope.configuration.current.epoch = goal.scope.epoch;
+    goal.scope.configuration.current.configuration_id =
+        goal.scope.configuration.current.expected_id();
+    goal.scope.configuration.previous = None;
+    goal.desired = ReplicaGoalKind::Reconfigure {
+        role: ReplicaRole::ActiveSecondary,
+        catch_up: None,
+    };
+    goal.validate().unwrap();
+    let facts = NativeLifecycleFacts {
+        operation_id: goal.operation_id.clone(),
+        revision: goal.revision,
+        scope: goal.scope.clone(),
+        state: NativeReplicaState::Ready,
+        native_role: ReplicaRole::ActiveSecondary,
+        application_role: Some(ReplicaRole::ActiveSecondary),
+        applied_primary_fence: Some(goal.scope.epoch),
+        deactivation: Some(NativeDeactivationInfo {
+            primary_fence: goal.scope.epoch,
+            catch_up_lsn: 0,
+        }),
+    };
+    let preview = state.public_v1_operation_state.as_mut().unwrap();
+    let mut record = preview.operations[&notice.qualification.admitted_operation_id].clone();
+    record.intent = goal.intent();
+    record.superseded_by = None;
+    let ordinary = record.ordinary.as_mut().unwrap();
+    ordinary.actions = crate::host::public_lifecycle::operation_instructions(&record.intent);
+    ordinary.accepted = true;
+    ordinary.host_settled = true;
+    record.lifecycle.in_flight = None;
+    record.lifecycle.outcomes = ordinary
+        .actions
+        .iter()
+        .map(|instruction| match instruction {
+            PublicInstruction::NativeComplete => {
+                PublicInstructionOutcome::NativeLifecycle(Box::new(facts.clone()))
+            }
+            PublicInstruction::ApplicationRole => PublicInstructionOutcome::ApplicationRole(None),
+            _ => PublicInstructionOutcome::Done,
+        })
+        .collect();
+    preview.operations.insert(goal.operation_id.clone(), record);
+    preview
+        .operations
+        .get_mut(&notice.fault_operation_id)
+        .unwrap()
+        .superseded_by = Some(goal.operation_id.clone());
+    let before = state.clone();
+    assert!(!crate::host::original_member::successful_final(
+        &state, &goal
+    ));
+    let preview = state.public_v1_operation_state.as_ref().unwrap();
+    assert!(!crate::host::original_member::dependency_replaced(
+        preview,
+        &preview.operations[&notice.fault_operation_id],
+        &goal.scope.process_session_id,
+    ));
+    assert_eq!(state, before);
+}
+
+#[test]
 fn retained_historical_eligibility_is_not_physical_custody_or_new_native_authority() {
     let (state, goal, _) = fixture();
     let before = state.clone();
@@ -227,6 +650,7 @@ fn retained_historical_eligibility_is_not_physical_custody_or_new_native_authori
             PublicInstruction::ApplicationRole,
             PublicInstruction::ProgramEpoch,
             PublicInstruction::Configuration,
+            PublicInstruction::NativeComplete,
         ]
     );
     assert!(
@@ -384,6 +808,7 @@ fn retained_notice_rejects_primary_explicit_close_opaque_fault_and_crossed_cause
     let mut old = record.intent.goal().unwrap().clone();
     old.desired = ReplicaGoalKind::Prepare {
         role: ReplicaRole::Primary,
+        rebuild: None,
     };
     record.intent = old.intent();
     assert!(recovery_cause(&state, &fault, std::process::id()).is_none());
@@ -462,9 +887,9 @@ fn retained_snapshot_surfaces_hidden_fault_revision_without_relabeling_it_as_a_g
 }
 
 #[test]
-fn retained_goal_wire_is_final_matched19_and_carries_no_historical_progress_claim() {
+fn retained_goal_wire_is_final_matched23_and_carries_no_historical_progress_claim() {
     assert_eq!(
-        ORDINARY_ACTION_FORMAT, 19,
+        ORDINARY_ACTION_FORMAT, 23,
         "requires the coordinated final matched format"
     );
     let (_, goal, _) = fixture();
@@ -479,9 +904,11 @@ fn retained_goal_wire_is_final_matched19_and_carries_no_historical_progress_clai
     assert!(json.get("catchUpCapability").is_none());
     json["currentProgress"] = serde_json::json!(37);
     assert!(serde_json::from_value::<RetainedMemberQualification>(json).is_err());
-    let mut crossed = goal.clone();
-    crossed.format = 18;
-    assert!(crossed.validate().is_err());
+    for predecessor in [22, 21, 20, 19, 18, 17, 16] {
+        let mut crossed = goal.clone();
+        crossed.format = predecessor;
+        assert!(crossed.validate().is_err());
+    }
     let mut sampled = goal;
     sampled.scope.configuration.replicas[0].current_progress = 37;
     assert!(sampled.validate().is_err());
@@ -492,7 +919,7 @@ async fn retained_store_refuses_same_physical_process_despite_new_session_and_re
     use crate::host::sqlite_store::SqliteStore;
     use crate::host::store::AgentStore;
     assert_eq!(
-        ORDINARY_ACTION_FORMAT, 19,
+        ORDINARY_ACTION_FORMAT, 23,
         "requires coordinated final matched format"
     );
     let (state, goal, _) = fixture();

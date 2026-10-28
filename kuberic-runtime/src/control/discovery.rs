@@ -1,6 +1,96 @@
 use super::proto;
 use crate::protocol::public_operations::*;
 
+pub(crate) async fn resolve_native_snapshot(
+    address: &str,
+    bearer_token: &str,
+    history: &crate::protocol::types::HistoryContext,
+    replica: &crate::protocol::types::ReplicaIdentity,
+) -> crate::Result<ReplicaAgentSnapshot> {
+    let mut client = proto::agent_control_client::AgentControlClient::connect(address.to_owned())
+        .await
+        .map_err(|error| crate::RuntimeError::PeerUnavailable(error.to_string()))?;
+    let mut request = tonic::Request::new(proto::ReplicaSnapshotRequest {
+        protocol_version: ORDINARY_ACTION_FORMAT,
+        resource_uid: history.resource_uid.to_string(),
+        target: Some(replica.clone().into()),
+        expected_process_session_id: String::new(),
+        sample_native_progress: false,
+    });
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {bearer_token}")
+            .parse()
+            .map_err(|_| crate::RuntimeError::AuthorityNotAdmitted)?,
+    );
+    let response = client
+        .get_snapshot(request)
+        .await
+        .map_err(peer_observation_error)?
+        .into_inner();
+    if response.protocol_version != ORDINARY_ACTION_FORMAT {
+        return Err(crate::RuntimeError::AuthorityNotAdmitted);
+    }
+    let observed: ReplicaAgentQueryResult = serde_json::from_slice(&response.canonical_json)
+        .map_err(|error| crate::RuntimeError::ControlPlane(error.to_string()))?;
+    let ReplicaAgentQueryResult::Initialized(snapshot) = observed else {
+        return Err(crate::RuntimeError::AuthorityNotAdmitted);
+    };
+    if snapshot.history != *history || snapshot.storage.replica != *replica {
+        return Err(crate::RuntimeError::AuthorityNotAdmitted);
+    }
+    Ok(*snapshot)
+}
+
+pub(crate) async fn resolve_receiver_settlement(
+    address: &str,
+    bearer_token: &str,
+    receiver: &ContainedReceiverSettlement,
+) -> crate::Result<ReplicaAgentSnapshot> {
+    let goal = &receiver.terminal_goal;
+    goal.validate()
+        .map_err(|error| crate::RuntimeError::AuthorityMismatch(error.into()))?;
+    if !matches!(
+        goal.desired,
+        ReplicaGoalKind::Close | ReplicaGoalKind::Abort
+    ) {
+        return Err(crate::RuntimeError::AuthorityNotAdmitted);
+    }
+    let mut client = proto::agent_control_client::AgentControlClient::connect(address.to_owned())
+        .await
+        .map_err(|error| crate::RuntimeError::PeerUnavailable(error.to_string()))?;
+    let mut request = tonic::Request::new(proto::ReplicaSnapshotRequest {
+        protocol_version: ORDINARY_ACTION_FORMAT,
+        resource_uid: goal.scope.history.resource_uid.to_string(),
+        target: Some(goal.scope.storage.replica.clone().into()),
+        // The exact terminal may now be retained by an unopened successor.
+        // Its immutable result and current closed custody are checked together
+        // by receiver_settled; this read-only query grants no native progress.
+        expected_process_session_id: String::new(),
+        sample_native_progress: false,
+    });
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {bearer_token}")
+            .parse()
+            .map_err(|_| crate::RuntimeError::AuthorityNotAdmitted)?,
+    );
+    let response = client
+        .get_snapshot(request)
+        .await
+        .map_err(peer_observation_error)?
+        .into_inner();
+    if response.protocol_version != ORDINARY_ACTION_FORMAT {
+        return Err(crate::RuntimeError::AuthorityNotAdmitted);
+    }
+    let observed: ReplicaAgentQueryResult = serde_json::from_slice(&response.canonical_json)
+        .map_err(|error| crate::RuntimeError::ControlPlane(error.to_string()))?;
+    let ReplicaAgentQueryResult::Initialized(snapshot) = observed else {
+        return Err(crate::RuntimeError::AuthorityNotAdmitted);
+    };
+    Ok(*snapshot)
+}
+
 pub(crate) async fn resolve_replica_publication(
     address: &str,
     bearer_token: &str,

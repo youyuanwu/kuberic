@@ -22,6 +22,25 @@ mod pod;
 mod tests;
 mod transport;
 
+fn native_trace() {
+    if std::env::var_os("KUBERIC_TEST_TRACE").is_some() {
+        use tracing_subscriber::prelude::*;
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                        metadata
+                            .target()
+                            .starts_with("kuberic_runtime::replicator::v1::service_adapter")
+                            && *metadata.level() <= tracing::Level::DEBUG
+                    })),
+            )
+            .try_init();
+    }
+}
+
 pub use application::{ApplicationFactory, CreatedApplication, ReplicaContext};
 pub use cluster::{
     ClusterBuilder, Observation, ObservationFailure, ObservationFailureKind, ReplicaRef,
@@ -29,7 +48,8 @@ pub use cluster::{
 };
 pub use error::{ErrorKind, Result, TestError};
 pub use faults::{
-    Barrier, BarrierStage, CompletionConflict, DeletionHold, OperationEvidence, Pause,
-    SwitchoverRequest,
+    Barrier, BarrierStage, CompletionConflict, DeletionHold, InstructionCut, InstructionEvidence,
+    InstructionImage, InstructionPosition, OperationEvidence, Pause, SwitchoverRequest,
+    TombstoneImage,
 };
-pub use transport::Isolation;
+pub use transport::{Isolation, NativeIngressHold};

@@ -510,7 +510,15 @@ fn factory_source_is_manifest_bound(sources: &ProductionSources<'_>) -> bool {
     let native = compact_source(sources.native_module_source);
     let adapter = compact_source(sources.service_adapter_source);
     let production = compact_source(sources.native_production_source);
-    occurrences(&factory, "PUBLIC_V1_FACTORIES.construct_default()") == 1
+    occurrences(&factory, "PUBLIC_V1_FACTORIES.construct_default()") == 2
+        && occurrences(
+            &factory,
+            "pubfnnew()->Self{PUBLIC_V1_FACTORIES.construct_default()}",
+        ) == 1
+        && occurrences(
+            &factory,
+            "ReplicatorFactorySelection::Builtin=>{PUBLIC_V1_FACTORIES.construct_default().create_replicator(context,state_provider.clone(),settings.clone()).await}",
+        ) == 1
         && occurrences(
             &factory,
             "v1::create_production(context,state_provider,settings).await",
@@ -821,7 +829,24 @@ fn replacement_ownership_gate() {
         native_production_source: &alternate_composition,
         ..production_sources()
     });
+    let concrete_sdk = compact_source(REPLICATOR);
+    let sdk_dispatch =
+        "ReplicatorFactorySelection::Builtin=>{PUBLIC_V1_FACTORIES.construct_default()";
+    let alternate_sdk = concrete_sdk.replacen(
+        sdk_dispatch,
+        "ReplicatorFactorySelection::Builtin=>{unmanifested_builtin()",
+        1,
+    );
+    assert_ne!(
+        alternate_sdk, concrete_sdk,
+        "SDK mutation must alter the actual concrete builtin constructor"
+    );
+    let alternate_sdk_factory = discover_inventory(&ProductionSources {
+        factory_source: &alternate_sdk,
+        ..production_sources()
+    });
     for (category, mutation) in [
+        ("unmanifested concrete SDK factory", alternate_sdk_factory),
         (
             "unmanifested native factory owner",
             alternate_native_factory,

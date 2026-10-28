@@ -614,7 +614,8 @@ pub(crate) async fn replay_role_at_epoch(
             LifecycleObservation::Closed | LifecycleObservation::Faulted => {
                 return Err(RuntimeError::Closed);
             }
-            LifecycleObservation::TransportQuorum { .. } => {
+            LifecycleObservation::TransportQuorum { .. }
+            | LifecycleObservation::EpochApplied(_) => {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
         }

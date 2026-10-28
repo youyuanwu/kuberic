@@ -31,6 +31,12 @@ pub enum TestingTcpRouteKind {
     ConfigurationValidated,
     ConfigurationAdmitted,
     RemoveAdmitted,
+    TargetActivated,
+    ReceiverReplaced,
+    PeerCreating,
+    PeerInstalled,
+    ReserveResponse,
+    ContinuationChecked,
 }
 
 type Route = Arc<

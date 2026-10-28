@@ -7,8 +7,7 @@ use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceRepli
 use kuberic_runtime::protocol::types::{AccessStatus, FaultType, ReplicaRole};
 use kuberic_runtime::replicator::stream::OperationStream;
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
-    StatefulServicePartition,
+    Replicator, ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
@@ -34,6 +33,7 @@ pub struct KvService {
     committer: Mutex<Option<Arc<Committer>>>,
     role: Mutex<ReplicaRole>,
     restoring_retained: std::sync::atomic::AtomicBool,
+    reconstructing_contained: std::sync::atomic::AtomicBool,
     stop: watch::Sender<bool>,
     streams: AsyncMutex<Consumers>,
     #[cfg(feature = "testing")]
@@ -93,6 +93,7 @@ impl KvService {
             committer: Mutex::new(None),
             role: Mutex::new(ReplicaRole::None),
             restoring_retained: std::sync::atomic::AtomicBool::new(false),
+            reconstructing_contained: std::sync::atomic::AtomicBool::new(false),
             stop: watch::channel(false).0,
             streams: AsyncMutex::new(Consumers::default()),
             #[cfg(feature = "testing")]
@@ -336,8 +337,12 @@ impl StatefulServiceReplica for KvService {
             return Ok(control);
         }
         self.persistence().authorize_open(context.mode)?;
+        self.reconstructing_contained.store(
+            context.reconstructing_contained_creation(),
+            std::sync::atomic::Ordering::Release,
+        );
         self.restoring_retained.store(
-            context.restoring_retained_member(),
+            context.restoring_retained_member() || context.reconstructing_contained_creation(),
             std::sync::atomic::Ordering::Release,
         );
         *self.partition.write().await = Some(context.partition.clone());
@@ -370,7 +375,7 @@ impl StatefulServiceReplica for KvService {
         });
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
+            .with_builtin_replicator()
             .create_replicator(
                 Some(self.provider.clone()),
                 Some(ReplicatorSettings {
@@ -411,6 +416,10 @@ impl StatefulServiceReplica for KvService {
                 .restoring_retained
                 .load(std::sync::atomic::Ordering::Acquire)
             && role != ReplicaRole::ActiveSecondary
+            && !(role == ReplicaRole::Primary
+                && self
+                    .reconstructing_contained
+                    .load(std::sync::atomic::Ordering::Acquire))
         {
             return Err(RuntimeError::InvalidReplication(
                 "retained KV initialization requires secondary role".into(),

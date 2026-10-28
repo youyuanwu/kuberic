@@ -13,6 +13,9 @@ use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use crate::instance::PgError;
+use crate::owned_command::helper_receipt::{
+    HelperLaunch, HelperSelection, OsIdentity, PostmasterLaunch, PostmasterSelection,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TREE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -86,6 +89,13 @@ pub(crate) struct OwnedProcess {
     processes: Vec<Process>,
     postmaster: Option<usize>,
     postmaster_ancestors: Vec<usize>,
+    helper: Option<HelperSelection>,
+    postmaster_execution: Option<PostmasterSelection>,
+}
+
+enum SelectedLaunch<'a> {
+    Helper(&'a HelperLaunch),
+    Postmaster(&'a PostmasterLaunch),
 }
 
 pub(crate) struct ProcessExitObserver {
@@ -115,20 +125,54 @@ impl OwnedProcess {
     }
 
     pub(crate) fn spawn(command: &Command) -> Result<Self, PgError> {
+        Self::spawn_inner(command, None)
+    }
+
+    pub(crate) fn spawn_helper(command: &Command, launch: &HelperLaunch) -> Result<Self, PgError> {
+        launch.intent.revalidate(command).map_err(|error| {
+            PgError::Process(format!("native helper selection changed: {error}"))
+        })?;
+        Self::spawn_inner(command, Some(SelectedLaunch::Helper(launch)))
+    }
+
+    pub(crate) fn spawn_postmaster(
+        command: &Command,
+        launch: &PostmasterLaunch,
+    ) -> Result<Self, PgError> {
+        launch.intent.revalidate(command).map_err(|error| {
+            PgError::Process(format!("native postmaster selection changed: {error}"))
+        })?;
+        Self::spawn_inner(command, Some(SelectedLaunch::Postmaster(launch)))
+    }
+
+    fn spawn_inner(command: &Command, launch: Option<SelectedLaunch<'_>>) -> Result<Self, PgError> {
         Self::check_support()?;
         let spawn = || -> io::Result<_> {
             let (channel, input) = UnixStream::pair()?;
             let source = command.as_std();
             let mut supervisor = Command::new(crate::process_supervisor::executable()?);
+            supervisor.arg(crate::process_supervisor::ARGUMENT);
+            match &launch {
+                Some(SelectedLaunch::Helper(launch)) => {
+                    supervisor
+                        .arg(crate::process_supervisor::COMPLETION_ARGUMENT)
+                        .arg(serde_json::to_string(launch).map_err(io::Error::other)?);
+                }
+                Some(SelectedLaunch::Postmaster(launch)) => {
+                    supervisor
+                        .arg(crate::process_supervisor::POSTMASTER_COMPLETION_ARGUMENT)
+                        .arg(serde_json::to_string(launch).map_err(io::Error::other)?);
+                }
+                None => {}
+            }
             supervisor
-                .arg(crate::process_supervisor::ARGUMENT)
                 .arg(source.get_program())
                 .args(source.get_args())
                 .stdin(Stdio::from(OwnedFd::from(input)))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0)
-                .kill_on_drop(true);
+                .kill_on_drop(false);
             for (key, value) in source.get_envs() {
                 match value {
                     Some(value) => supervisor.env(key, value),
@@ -142,7 +186,58 @@ impl OwnedProcess {
         };
         let (child, channel) =
             spawn().map_err(|error| PgError::Process(format!("owned command spawn: {error}")))?;
-        Self::new(child, channel)
+        let mut process = Self::new(child, channel)?;
+        if let Some(launch) = launch {
+            let received = (|| -> io::Result<_> {
+                process.channel.set_read_timeout(Some(EXIT_TIMEOUT))?;
+                let supervisor = match launch {
+                    SelectedLaunch::Helper(launch) => {
+                        let selection: HelperSelection =
+                            crate::owned_command::helper_receipt::receive_selection(
+                                &process.channel,
+                            )?;
+                        if selection.launch != *launch {
+                            return Err(io::Error::other("foreign helper rendezvous"));
+                        }
+                        selection.validate_cell()?;
+                        let supervisor = selection.supervisor.clone();
+                        process.helper = Some(selection);
+                        supervisor
+                    }
+                    SelectedLaunch::Postmaster(launch) => {
+                        let selection: PostmasterSelection =
+                            crate::owned_command::helper_receipt::receive_selection(
+                                &process.channel,
+                            )?;
+                        if selection.launch != *launch {
+                            return Err(io::Error::other("foreign postmaster rendezvous"));
+                        }
+                        selection.validate_cell()?;
+                        let supervisor = selection.supervisor.clone();
+                        process.postmaster_execution = Some(selection);
+                        supervisor
+                    }
+                };
+                process.channel.set_read_timeout(None)?;
+                if supervisor != OsIdentity::read(process.processes[0].pid)?
+                    || process.processes[0].exited()?
+                {
+                    return Err(io::Error::other("foreign native supervisor rendezvous"));
+                }
+                Ok(())
+            })();
+            match received {
+                Ok(()) => {}
+                Err(error) => {
+                    let cleanup = process.terminate();
+                    return Err(
+                        PgError::Process(format!("native helper rendezvous: {error}"))
+                            .with_cleanup(cleanup),
+                    );
+                }
+            }
+        }
+        Ok(process)
     }
 
     fn new(mut child: Child, channel: UnixStream) -> Result<Self, PgError> {
@@ -153,6 +248,8 @@ impl OwnedProcess {
                 processes: vec![process],
                 postmaster: None,
                 postmaster_ancestors: Vec::new(),
+                helper: None,
+                postmaster_execution: None,
             }),
             Err(error) => {
                 // The unreaped child reserves this PID. The supervisor cannot
@@ -187,6 +284,14 @@ impl OwnedProcess {
         )
     }
 
+    pub(crate) fn helper_selection(&self) -> Option<&HelperSelection> {
+        self.helper.as_ref()
+    }
+
+    pub(crate) fn postmaster_selection(&self) -> Option<&PostmasterSelection> {
+        self.postmaster_execution.as_ref()
+    }
+
     pub(crate) fn completion(&mut self) -> Result<Option<ExitStatus>, PgError> {
         let completed = (|| -> io::Result<Option<ExitStatus>> {
             if !self.wait_exited(Duration::ZERO)? {
@@ -197,7 +302,20 @@ impl OwnedProcess {
             self.channel.set_nonblocking(true)?;
             let mut bytes = [0; 4];
             self.channel.read_exact(&mut bytes)?;
-            Ok(Some(ExitStatus::from_raw(i32::from_ne_bytes(bytes))))
+            let status = i32::from_ne_bytes(bytes);
+            if let Some(selection) = &self.helper
+                && selection.completed()?.launcher_status != status
+            {
+                return Err(io::Error::other("native helper status receipt mismatch"));
+            }
+            if let Some(selection) = &self.postmaster_execution
+                && selection.completed()?.launcher_status != status
+            {
+                return Err(io::Error::other(
+                    "native postmaster status receipt mismatch",
+                ));
+            }
+            Ok(Some(ExitStatus::from_raw(status)))
         })();
         completed.map_err(|error| PgError::Process(format!("owned command completion: {error}")))
     }
@@ -252,73 +370,7 @@ impl OwnedProcess {
     }
 
     fn freeze_tree(&mut self) -> io::Result<()> {
-        let deadline = Instant::now() + TREE_TIMEOUT;
-        let mut known = HashSet::new();
-        for process in &self.processes {
-            if !process.exited()? {
-                known.insert(process.pid);
-            }
-        }
-        let mut index = 0;
-        let mut pass_size = 0;
-        while index < self.processes.len() {
-            if Instant::now() >= deadline {
-                return Err(io::Error::other(format!(
-                    "owned PostgreSQL tree discovery timed out at {index}/{} processes",
-                    self.processes.len()
-                )));
-            }
-            let process = &self.processes[index];
-            if !process.exited()? {
-                process.signal(Signal::STOP)?;
-                loop {
-                    if process.exited()? || matches!(process.stat()?.0, 'T' | 't' | 'Z') {
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(io::Error::other("owned PostgreSQL process did not stop"));
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                if !process.exited()? {
-                    // A stopped parent cannot fork or reap, so its children's
-                    // identities stay reserved while their pidfds are acquired.
-                    let mut children = Vec::new();
-                    for task in std::fs::read_dir(format!("/proc/{}/task", process.pid))? {
-                        let task = task?;
-                        let ids = std::fs::read_to_string(task.path().join("children"))?;
-                        for pid in ids.split_whitespace() {
-                            if Instant::now() >= deadline {
-                                return Err(io::Error::other(format!(
-                                    "owned PostgreSQL tree discovery timed out while scanning {} at {index}/{} processes",
-                                    process.pid,
-                                    self.processes.len()
-                                )));
-                            }
-                            let pid = pid.parse().map_err(io::Error::other)?;
-                            if known.insert(pid) {
-                                let child = Process::open(pid)?;
-                                if child.stat()?.1 != process.pid || process.exited()? {
-                                    return Err(io::Error::other(
-                                        "owned descendant identity changed",
-                                    ));
-                                }
-                                children.push(child);
-                            }
-                        }
-                    }
-                    self.processes.extend(children);
-                }
-            }
-            index += 1;
-            if index == self.processes.len() && pass_size != self.processes.len() {
-                // A launcher can exit while we stop it. Rescan the stopped
-                // subreaper for descendants adopted since its first scan.
-                pass_size = self.processes.len();
-                index = 0;
-            }
-        }
-        Ok(())
+        freeze_lineage(&mut self.processes, false)
     }
 
     fn signal_all(&self, signal: Signal) -> io::Result<()> {
@@ -489,6 +541,28 @@ impl OwnedProcess {
     }
 
     pub(crate) fn terminate(&mut self) -> Result<(), PgError> {
+        if self.helper.is_some() || self.postmaster_execution.is_some() {
+            let result = (|| -> io::Result<()> {
+                if !self.processes[0].exited()? {
+                    self.command(crate::process_supervisor::STOP)?;
+                }
+                if !self.wait_exited(TREE_TIMEOUT + EXIT_TIMEOUT)? {
+                    return Err(io::Error::other(
+                        "native helper supervisor did not complete",
+                    ));
+                }
+                if let Some(selection) = &self.helper {
+                    selection.completed()?;
+                }
+                if let Some(selection) = &self.postmaster_execution {
+                    selection.completed()?;
+                }
+                Ok(())
+            })();
+            return result.map_err(|error| {
+                PgError::Process(format!("terminate selected native execution: {error}"))
+            });
+        }
         let mut failures = Vec::new();
         // SIGQUIT lets the postmaster reap its backends, including when it is
         // behind a launcher. Escalation never depends on the async runtime.
@@ -533,6 +607,86 @@ impl OwnedProcess {
             "terminate owned PostgreSQL: {}",
             failures.join("; ")
         )))
+    }
+}
+
+/// Runs only inside the isolated single-lineage subreaper. Its direct children
+/// cannot be reaped/reused during discovery; every other parent is stopped
+/// before its child pidfds are opened.
+pub(crate) fn terminate_supervised_lineage() -> io::Result<()> {
+    let mut processes = vec![Process::open(std::process::id())?];
+    freeze_lineage(&mut processes, true)?;
+    for process in &processes[1..] {
+        process.signal(Signal::KILL)?;
+        process.signal(Signal::CONT)?;
+    }
+    Ok(())
+}
+
+fn freeze_lineage(processes: &mut Vec<Process>, resident_root: bool) -> io::Result<()> {
+    let mut known = HashSet::new();
+    for process in processes.iter() {
+        if !process.exited()? {
+            known.insert(process.pid);
+        }
+    }
+    let deadline = Instant::now() + TREE_TIMEOUT;
+    let mut index = 0;
+    let mut pass_size = 0;
+    while index < processes.len() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("supervisor lineage discovery timed out"));
+        }
+        let process = &processes[index];
+        if !(resident_root && index == 0) && !process.exited()? {
+            process.signal(Signal::STOP)?;
+            while !process.exited()? && !matches!(process.stat()?.0, 'T' | 't' | 'Z') {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other("supervisor descendant did not stop"));
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+        if !process.exited()? {
+            let mut children = Vec::new();
+            for task in std::fs::read_dir(format!("/proc/{}/task", process.pid))? {
+                for pid in
+                    std::fs::read_to_string(task?.path().join("children"))?.split_whitespace()
+                {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::other("supervisor lineage discovery timed out"));
+                    }
+                    let pid = pid.parse().map_err(io::Error::other)?;
+                    if known.insert(pid) {
+                        let child = Process::open(pid)?;
+                        if child.stat()?.1 != process.pid || process.exited()? {
+                            return Err(io::Error::other("supervisor descendant identity changed"));
+                        }
+                        children.push(child);
+                    }
+                }
+            }
+            processes.extend(children);
+        }
+        index += 1;
+        if index == processes.len() && pass_size != processes.len() {
+            pass_size = processes.len();
+            index = 0;
+        }
+    }
+    Ok(())
+}
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        // A selected supervisor owns the durable result. Closing its sole owner
+        // socket, rather than killing it on Drop, lets it reap and fsync even
+        // when this application dies without running destructors.
+        if self.helper.is_some() || self.postmaster_execution.is_some() {
+            let _ = self.channel.shutdown(std::net::Shutdown::Both);
+        } else if let Err(error) = self.terminate() {
+            tracing::error!(%error, "owned PostgreSQL process drop cleanup failed");
+        }
     }
 }
 

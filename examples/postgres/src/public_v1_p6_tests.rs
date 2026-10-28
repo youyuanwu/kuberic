@@ -219,6 +219,7 @@ pub(crate) async fn public_v1_postgres_orderly_progress() {
             );
             for replica in [&source, &target] {
                 assert!(!replica.driver.instance.is_running().await);
+                assert_eq!(replica.driver.catch_up_capability().await.unwrap(), -1);
                 assert!(replica.driver.instance.connect_application().await.is_err());
             }
             assert!(

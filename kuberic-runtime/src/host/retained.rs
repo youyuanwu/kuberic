@@ -15,7 +15,7 @@ fn complete(record: &PublicOperationRecord) -> bool {
             .is_some_and(|ordinary| record.lifecycle.outcomes.len() == ordinary.actions.len())
 }
 
-fn historical<'a>(
+pub(in crate::host) fn historical<'a>(
     state: &'a AgentState,
     history: &HistoryContext,
     storage: &ReplicaStorageIncarnationContext,
@@ -243,6 +243,9 @@ pub(crate) fn validate_notice(
     state: &AgentState,
     notice: &RetainedRecoveryExitNotice,
 ) -> Result<()> {
+    if notice.native_rebuild.is_some() {
+        return super::super::original_member::validate_restart_notice(state, notice, true);
+    }
     validate_persisted_notice(state, notice)?;
     if state.reported_fault != Some(FaultType::Transient)
         || state
@@ -261,6 +264,9 @@ pub(crate) fn validate_persisted_notice(
     state: &AgentState,
     notice: &RetainedRecoveryExitNotice,
 ) -> Result<()> {
+    if notice.native_rebuild.is_some() {
+        return super::super::original_member::validate_restart_notice(state, notice, false);
+    }
     let (_, process_id, lifetime) = historical(
         state,
         &notice.history,
@@ -503,6 +509,7 @@ pub(crate) fn recovery_cause(
         return None;
     }
     Some(RetainedRecoveryExitNotice {
+        native_rebuild: None,
         fault_operation_id: intent.operation_id.clone(),
         fault_revision: intent.revision,
         process_id,
@@ -526,7 +533,8 @@ pub(crate) fn status(
         .filter_map(notice_in)
         .filter(|notice| {
             validate_notice(state, notice).is_ok()
-                && dependencies(state, &notice.qualification, None).is_ok()
+                && (notice.native_rebuild.is_some()
+                    || dependencies(state, &notice.qualification, None).is_ok())
         })
         .max_by_key(|notice| notice.fault_revision)
         .cloned()

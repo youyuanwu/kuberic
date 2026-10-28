@@ -18,7 +18,7 @@ use crate::protocol::types::{
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 pub(crate) const PUBLIC_V1_PHASE6_SCHEMA_VERSION: u32 = 11;
-pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 19;
+pub(crate) const PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION: u32 = 23;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +100,47 @@ pub(crate) struct OrdinaryGoalRecord {
     pub(crate) ready_admissions: Vec<crate::protocol::public_operations::RemoteReplicaSelection>,
     #[serde(default)]
     pub(crate) retained: Option<RetainedMemberReceipt>,
+    #[serde(default)]
+    pub(crate) reconstruction: Option<CreationReconstructionReceipt>,
+    #[serde(default)]
+    pub(crate) creation_owner: Option<OrdinaryCreationOwner>,
+    #[serde(default)]
+    pub(crate) native_input: Option<NativeActionInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeActionInput {
+    pub(crate) lifecycle: crate::protocol::public_operations::NativeLifecycleFacts,
+    pub(crate) promotion: Option<crate::protocol::public_operations::NativeStatusObservation>,
+    pub(crate) source: Option<crate::protocol::public_operations::NativeLifecycleFacts>,
+    pub(crate) fresh_initial_primary: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_rebuild:
+        Option<Box<crate::protocol::public_operations::NativeOutOfRangeRebuild>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OrdinaryCreationOwner {
+    pub(crate) process_id: u32,
+    pub(crate) process_lifetime: String,
+    pub(crate) process_session_id: crate::protocol::types::ProcessSessionId,
+    pub(crate) creation_id: crate::protocol::types::ReplicatorCreationId,
+    pub(crate) builtin_factory: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CreationReconstructionReceipt {
+    pub(crate) predecessor_process_id: u32,
+    pub(crate) predecessor_process_lifetime: String,
+    pub(crate) owner_process_id: u32,
+    pub(crate) owner_process_lifetime: String,
+    pub(crate) exclusion: CreationExclusion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CreationExclusion {
+    ExclusiveProcessReacquisition,
+    JoinedHost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +233,9 @@ pub(crate) enum PublicInstruction {
     CatchUp,
     HistoryAdmission,
     Access,
+    NativeInspect,
+    NativeDataLossDecision,
+    NativeComplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,8 +251,12 @@ pub(crate) enum PublicInstructionOutcome {
         storage_owner: Option<crate::protocol::types::ProcessSessionId>,
     },
     RetainedNativeInitialized(Box<crate::protocol::public_operations::ReplicaScope>),
+    ReconstructedNativeInitialized(Box<crate::protocol::public_operations::ReplicaScope>),
     RecoveryExitRequired(Box<crate::protocol::public_operations::RetainedRecoveryExitNotice>),
     Progress(i64),
+    NativeStatus(Box<crate::protocol::public_operations::NativeStatusObservation>),
+    NativeLifecycle(Box<crate::protocol::public_operations::NativeLifecycleFacts>),
+    NativeUnavailable,
     CloseFailure {
         child: PublicCloseChild,
         error: String,

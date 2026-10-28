@@ -248,6 +248,52 @@ impl ReplicaHandle {
         self.runtime.set_public_operation_cut(cut);
     }
 
+    /// Capture consistent matching-format metadata only; application data and
+    /// process-local ownership are not cloned or certified by these bytes.
+    #[cfg(feature = "testing")]
+    pub fn public_v1_metadata_image(
+        &self,
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+        selected_call: Option<&str>,
+        receipts: usize,
+    ) -> Result<Vec<u8>> {
+        self.store.metadata_image(goal, selected_call, receipts)
+    }
+
+    /// Detached testing observation of the actual frozen ordinary recipe, or
+    /// the identical pure freeze used when this exact goal is first selected.
+    /// This does not select, execute, accept or settle an operation.
+    #[cfg(feature = "testing")]
+    pub async fn public_v1_instruction_recipe(
+        &self,
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+    ) -> Result<Vec<String>> {
+        goal.validate()
+            .map_err(|error| crate::host::HostError::CommandRejected(error.into()))?;
+        let state = self.store.load_state().await?;
+        let preview = state.public_v1_operation_state.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected("ordinary journal is unavailable".into())
+        })?;
+        if goal.scope.process_session_id.as_str() != self.process_session.as_ref()
+            || goal.scope.creation_id != self.runtime.replacement_replicator_creation_id()?
+            || preview.history.as_ref() != Some(&goal.scope.history)
+            || preview.storage_incarnation.as_ref() != Some(&goal.scope.storage)
+            || preview
+                .operations
+                .get(&goal.operation_id)
+                .is_some_and(|record| record.intent != goal.intent())
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "instruction recipe differs from the exact owned actor/goal".into(),
+            ));
+        }
+        Ok(crate::host::ordinary_goal::freeze(&state, goal)?
+            .actions
+            .iter()
+            .map(|instruction| format!("{instruction:?}"))
+            .collect())
+    }
+
     #[cfg(feature = "testing")]
     pub async fn execute_public_v1(
         &self,
@@ -598,13 +644,64 @@ impl ReplicaHandle {
     }
 }
 
+#[cfg(feature = "testing")]
+impl ReplicaHandle {
+    /// Read-only custody for negative-ACK tests; never changes the journal or
+    /// the process-local application gate.
+    pub async fn public_v1_addition_ack_observation(&self) -> Result<(serde_json::Value, bool)> {
+        let state = self.store.load_state().await?;
+        let journal = serde_json::to_value(state.public_v1_operation_state)
+            .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+        Ok((journal, self.runtime.addition_access_pending()))
+    }
+}
+
 pub struct RunningReplica {
     handle: ReplicaHandle,
     shutdown: watch::Sender<bool>,
     completion: tokio::task::JoinHandle<Result<()>>,
 }
 
+#[cfg(feature = "testing")]
+use crate::testing::JoinedReplicaExclusion;
+
 impl RunningReplica {
+    #[cfg(feature = "testing")]
+    pub async fn join_for_reconstruction(&mut self) -> Result<JoinedReplicaExclusion> {
+        self.wait().await?;
+        let state = self.handle.store.load_state().await?;
+        let preview = state.public_v1_operation_state.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected("joined owner lacks an ordinary journal".into())
+        })?;
+        Ok(JoinedReplicaExclusion {
+            history: preview.history.clone().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "joined owner lacks retained history".into(),
+                )
+            })?,
+            storage: preview.storage_incarnation.clone().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "joined owner lacks retained storage".into(),
+                )
+            })?,
+            process: crate::protocol::types::ProcessSessionId::new(
+                self.handle.process_session.as_ref(),
+            ),
+            creation: self.handle.runtime.replacement_replicator_creation_id()?,
+            lifetime: crate::host::ordinary_goal::retained::process_lifetime_id().to_owned(),
+            application_paths: state
+                .application_storage
+                .as_ref()
+                .ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "joined owner lacks actual bound application paths".into(),
+                    )
+                })?
+                .paths
+                .clone(),
+        })
+    }
+
     pub async fn recovery_exit_required(
         &self,
     ) -> Result<crate::protocol::public_operations::RetainedRecoveryExitNotice> {
@@ -647,6 +744,10 @@ pub struct ReplicaHost<A, R> {
     application_storage_paths: Option<BTreeMap<String, PathBuf>>,
     _resolver: Arc<R>,
     public_v1_binding: Option<PublicV1LifecycleBinding>,
+    #[cfg(feature = "testing")]
+    joined_predecessor: Option<JoinedReplicaExclusion>,
+    #[cfg(feature = "testing")]
+    testing_database_path: Option<PathBuf>,
 }
 
 impl<A, R> ReplicaHost<A, R>
@@ -672,6 +773,10 @@ where
             application_storage,
             application_storage_paths: None,
             _resolver: resolver,
+            #[cfg(feature = "testing")]
+            joined_predecessor: None,
+            #[cfg(feature = "testing")]
+            testing_database_path: None,
         }
     }
 
@@ -685,6 +790,39 @@ where
     pub fn with_application_storage_paths(mut self, paths: BTreeMap<String, PathBuf>) -> Self {
         self.application_storage_paths = Some(paths);
         self
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn with_joined_predecessor(mut self, witness: JoinedReplicaExclusion) -> Self {
+        self.joined_predecessor = Some(witness);
+        self
+    }
+
+    /// Open a captured metadata image in a distinct owned fixture location,
+    /// never install it over the original authority database or application root.
+    #[cfg(feature = "testing")]
+    pub fn with_metadata_image_path(mut self, path: PathBuf) -> Result<Self> {
+        let original = SqliteStore::metadata_database_path(&self.config.data_root);
+        if !path.is_absolute()
+            || path == original
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            || !path.is_file()
+            || !path
+                .parent()
+                .ok_or_else(|| {
+                    crate::host::HostError::CommandRejected("image parent is missing".into())
+                })?
+                .canonicalize()?
+                .starts_with(self.config.data_root.canonicalize()?)
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "metadata image must be a distinct owned existing fixture file".into(),
+            ));
+        }
+        self.testing_database_path = Some(path);
+        Ok(self)
     }
 
     /// Move a caller-bound control socket into the initialization and agent server task.
@@ -870,6 +1008,8 @@ where
             })
             .transpose()?;
         let database_path = SqliteStore::metadata_database_path(&self.config.data_root);
+        #[cfg(feature = "testing")]
+        let database_path = self.testing_database_path.unwrap_or(database_path);
         let control_listener = if !database_path.is_file() {
             serve_initialization(
                 &self.config,
@@ -895,6 +1035,10 @@ where
             paths.as_ref(),
             binding,
         )?);
+        #[cfg(feature = "testing")]
+        if let Some(witness) = self.joined_predecessor {
+            store.bind_joined_predecessor(witness)?;
+        }
         let identity = store.identity().await?;
         let runtime = Arc::new(PodRuntime::new_replacement(
             identity.local_identity.clone(),

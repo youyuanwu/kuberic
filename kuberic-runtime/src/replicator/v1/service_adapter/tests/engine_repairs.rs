@@ -71,6 +71,64 @@ impl Pair {
 }
 
 #[tokio::test]
+async fn live_source_carrier_join_survives_observer_loss_and_retains_real_task_failure() {
+    let pair = Pair::new().await;
+    pair.establish().await;
+    let release = Arc::new(Semaphore::new(0));
+    pair.source.test_peer_task(&pair.binding, {
+        let release = release.clone();
+        async move {
+            release.acquire().await.unwrap().forget();
+            Err(RuntimeError::ControlPlane(
+                "actual joined peer task failed".into(),
+            ))
+        }
+    });
+    let owner = pair.source.clone();
+    let binding = pair.binding.clone();
+    let observer = tokio::spawn(async move { owner.join_predecessor(&binding).await });
+    until(|| pair.source.pending_sends(&pair.binding).is_none()).await;
+    assert!(!observer.is_finished());
+    observer.abort();
+    assert!(observer.await.unwrap_err().is_cancelled());
+    let owner = pair.source.clone();
+    let binding = pair.binding.clone();
+    let retry = tokio::spawn(async move { owner.join_predecessor(&binding).await });
+    tokio::task::yield_now().await;
+    assert!(
+        !retry.is_finished(),
+        "retry must retain the exact unjoined task"
+    );
+    release.add_permits(1);
+    let failure = tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+    assert!(failure.contains("actual joined peer task failed"));
+    assert_eq!(
+        pair.source
+            .join_predecessor(&pair.binding)
+            .await
+            .unwrap_err()
+            .to_string(),
+        failure
+    );
+    assert!(pair.source.sessions.active(&pair.binding).is_err());
+    assert!(
+        pair.source
+            .sessions
+            .effect(&pair.binding, || panic!("failed join revived authority"))
+            .is_err()
+    );
+    pair.source.abort();
+    pair.target.abort();
+    assert!(pair.source.drain().await.is_err());
+    pair.target.drain().await.unwrap();
+}
+
+#[tokio::test]
 async fn m3_role_drainage_refuses_numbered_eos_data_stale_binding_and_epoch_only_credit() {
     use super::super::super::super::operation_queue::QueueOperation;
     use super::super::super::super::received_operation::{
@@ -241,6 +299,7 @@ async fn m2_recovery_session_rejects_stale_identity_epoch_and_successor_before_e
         recovery: true,
         continuation: None,
         reformation: false,
+        live_target: None,
     };
     pair.publish(source, target);
     pair.target

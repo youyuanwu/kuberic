@@ -5,6 +5,8 @@ mod controller;
 mod m2;
 #[path = "public_v1_p6_tests.rs"]
 pub(crate) mod p6;
+#[path = "public_repair_integration_tests.rs"]
+mod repair_integration;
 use crate::durable::{PgDurableIdentity, StorageMode};
 use crate::testing::{
     ProcessProbe, allocate_port, find_pg_bin, native_configuration, native_identity, wrapped_pg_bin,
@@ -290,7 +292,7 @@ impl Replica {
         drop(listener);
         let identity = native_identity(id, incarnation);
         let resource = ResourceUid::new("postgres-public-oracle");
-        let established = root.join("a/state-v2.json").exists();
+        let established = root.join("a/state-v3.json").exists();
         let durable = Arc::new(
             PgDurableStore::open(
                 root.join("a"),
@@ -395,7 +397,7 @@ impl Replica {
     }
 
     fn persisted(&self) -> Vec<Vec<u8>> {
-        ["a/state-v2.json", "d/pg_hba.conf", "d/postgresql.auto.conf"]
+        ["a/state-v3.json", "d/pg_hba.conf", "d/postgresql.auto.conf"]
             .map(|path| std::fs::read(self.root.join(path)).unwrap_or_default())
             .into()
     }
@@ -441,6 +443,568 @@ fn peer_replica(binding: &PeerBinding) -> ReplicaInformation {
     .unwrap()
 }
 
+#[test_log::test(tokio::test)]
+async fn m3_pg_native_quiescent_demotion_fences_sql_and_reports_unavailable() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = crate::testing::TestDataDir::new("native-quiescent");
+    let replica = Replica::new(directory.path().join("old-primary"), 301).await;
+    replica.singleton(1).await;
+    let (writer, connection) = replica.driver.instance.connect_application().await.unwrap();
+    writer
+        .batch_execute(
+            "CREATE TABLE retained_quiescence(value text);
+         INSERT INTO retained_quiescence VALUES ('acknowledged-before-quiescence')",
+        )
+        .await
+        .unwrap();
+    replica.driver.public_snapshot_and_persist().await.unwrap();
+    let before = replica.driver.durable.revalidate().await.unwrap();
+    let data = replica.driver.instance.data_dir();
+    let inode = std::fs::metadata(data).unwrap().ino();
+    let version = std::fs::read(data.join("PG_VERSION")).unwrap();
+    let process = ProcessProbe::postgres(data);
+    replica
+        .driver
+        .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    process.assert_reaped();
+    assert!(writer.simple_query("SELECT 1").await.is_err());
+    drop(writer);
+    connection.await.unwrap();
+    replica
+        .driver
+        .public_application_role(ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    let quiescent = replica.driver.durable.revalidate().await.unwrap();
+    let receipt = quiescent.quiescence.as_ref().unwrap();
+    assert!(quiescent.postgres_stopped && quiescent.external_access_closed);
+    assert_eq!(quiescent.role, PgDurableRole::Primary);
+    assert_eq!(receipt.process_session_id, replica.session);
+    assert!(receipt.required_certified_lsn >= before.policy_certified_lsn);
+    assert_eq!(
+        receipt.lineage.system_identifier,
+        before.system_identifier.unwrap()
+    );
+    assert_eq!(std::fs::metadata(data).unwrap().ino(), inode);
+    assert_eq!(std::fs::read(data.join("PG_VERSION")).unwrap(), version);
+    assert_eq!(replica.driver.current_progress().await.unwrap(), -1);
+    assert_eq!(replica.driver.catch_up_capability().await.unwrap(), -1);
+    assert!(!replica.driver.instance.is_running().await);
+    assert!(replica.driver.instance.connect_application().await.is_err());
+    assert!(replica.driver.public_start().await.is_err());
+    assert_eq!(
+        replica.driver.durable.revalidate().await.unwrap(),
+        quiescent
+    );
+    replica.driver.public_close().await.unwrap();
+}
+
+async fn cold_native_pair(root: &std::path::Path) -> (Replica, Replica, session::PgSessionId) {
+    cold_native_pair_with_bin(root, find_pg_bin()).await
+}
+
+async fn cold_native_pair_with_bin(
+    root: &std::path::Path,
+    target_bin: std::path::PathBuf,
+) -> (Replica, Replica, session::PgSessionId) {
+    use kuberic_runtime::protocol::public_operations::{
+        ORDINARY_ACTION_FORMAT, ReplicaConfigurationScope, ReplicaPublication,
+        ReplicaPublicationStage, ReplicaScope,
+    };
+    use kuberic_runtime::protocol::types::{
+        HistoryContext, HistoryId, PodUid, PublicProtocolGeneration, PvcUid,
+        ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId,
+        StorageGeneration,
+    };
+
+    let source = Replica::new(root.join("source"), 351).await;
+    let target = Replica::new_incarnation(
+        root.join("target"),
+        352,
+        "public-352",
+        "session-352",
+        target_bin,
+    )
+    .await;
+    target
+        .driver
+        .public_owner()
+        .exercise_owned_inbound
+        .store(true, std::sync::atomic::Ordering::Release);
+    source.singleton(1).await;
+    let (writer, connection) = source.driver.instance.connect_application().await.unwrap();
+    writer
+        .batch_execute(
+            "CREATE TABLE cold_native_history(value text);
+             INSERT INTO cold_native_history VALUES ('acknowledged-before-copy')",
+        )
+        .await
+        .unwrap();
+    drop(writer);
+    connection.await.unwrap();
+    target.role(1, ReplicaRole::IdleSecondary).await;
+    let configuration = native_configuration(std::slice::from_ref(&source.identity), 0, 1);
+    let publication = |replica: &Replica, role| ReplicaPublication {
+        format: ORDINARY_ACTION_FORMAT,
+        scope: ReplicaScope {
+            history: HistoryContext {
+                resource_uid: ResourceUid::new("postgres-public-oracle"),
+                protocol_generation: PublicProtocolGeneration::new(1),
+                history_id: HistoryId::new("m3-cold-native-history"),
+                data_loss_number: 0,
+            },
+            storage: ReplicaStorageIncarnationContext {
+                replica: replica.identity.clone(),
+                storage: ReplicaStorageIdentity::Persistent {
+                    pod_uid: PodUid::new(format!("pod-{}", replica.identity.replica_id)),
+                    pvc_uid: PvcUid::new(format!("pvc-{}", replica.identity.replica_id)),
+                },
+                storage_generation: StorageGeneration::new("cold-native-storage"),
+            },
+            process_session_id: replica.session.clone(),
+            creation_id: ReplicatorCreationId::new(format!(
+                "cold-native-creation-{}",
+                replica.identity.replica_id
+            )),
+            epoch: configuration.epoch,
+            configuration: ReplicaConfigurationScope {
+                current: configuration.clone(),
+                previous: None,
+                replicas: Vec::new(),
+            },
+        },
+        replication_address: replica.address.clone(),
+        generation: 1,
+        stage: ReplicaPublicationStage::AchievedScope,
+        role,
+    };
+    let source_publication = publication(&source, ReplicaRole::Primary);
+    let target_publication = publication(&target, ReplicaRole::IdleSecondary);
+    for driver in [&source.driver, &target.driver] {
+        *driver.public_owner().session_publications.lock().unwrap() =
+            Some((source_publication.clone(), target_publication.clone()));
+    }
+    let id = source
+        .driver
+        .pg_propose_session(source_publication, target_publication)
+        .await
+        .unwrap();
+    source.driver.pg_establish_session(&id).await.unwrap();
+    let mut binding = BindingFactory::new().build(&source, &target, "cold-native-copy");
+    binding.session = Some(Box::new(id.clone()));
+    source.driver.public_build_native(binding).await.unwrap();
+    assert!(source.driver.pg_native_established(&id).unwrap());
+    assert!(target.driver.pg_native_established(&id).unwrap());
+    target.change_role(1, ReplicaRole::ActiveSecondary).await;
+    assert!(target.driver.instance.is_running().await);
+    (source, target, id)
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn m3_pg_native_stopped_standby_role_replays_retained_wal_without_old_session() {
+    retained_standby_role_replays_without_old_session(false).await;
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn m3_pg_native_running_disconnected_standby_role_joins_before_reinitialization() {
+    retained_standby_role_replays_without_old_session(true).await;
+}
+
+async fn retained_standby_role_replays_without_old_session(running_disconnected: bool) {
+    use std::os::unix::fs::MetadataExt;
+    let directory =
+        std::mem::ManuallyDrop::new(crate::testing::TestDataDir::new("cold-native-standby"));
+    eprintln!("retained cold standby root {}", directory.path().display());
+    let (source, target, id) = cold_native_pair(directory.path()).await;
+    let credential = source.driver.public_owner().state.lock().await.grants[0]
+        .credential
+        .clone();
+    let mut old_native = native_socket(&credential, &credential.name).await.unwrap();
+    let (admin, admin_connection) = target.driver.instance.connect().await.unwrap();
+    admin
+        .simple_query("SELECT pg_wal_replay_pause()")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let paused: bool = admin
+                .query_one("SELECT pg_get_wal_replay_pause_state() = 'paused'", &[])
+                .await
+                .unwrap()
+                .get(0);
+            if paused {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("retained standby did not pause actual replay");
+    let (writer, writer_connection) = source.driver.instance.connect_application().await.unwrap();
+    writer
+        .execute(
+            "INSERT INTO cold_native_history VALUES ('acknowledged-in-local-wal')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let boundary = source.driver.current_progress().await.unwrap();
+    let retained = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let observation = target.driver.public_snapshot_and_persist().await.unwrap();
+            if observation.evidence.as_ref().is_some_and(|evidence| {
+                evidence
+                    .received_lsn
+                    .is_some_and(|received| received >= boundary)
+            }) {
+                assert!(observation.evidence.unwrap().replay_lsn.unwrap() < boundary);
+                break target.driver.durable.revalidate().await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("acknowledged WAL was not actually retained on the paused standby");
+    let data = target.driver.instance.data_dir();
+    let inode = std::fs::metadata(data).unwrap().ino();
+    let version = std::fs::read(data.join("PG_VERSION")).unwrap();
+    let process = ProcessProbe::postgres(data);
+    source.driver.pg_retire_session(&id).await.unwrap();
+    process.assert_reaped();
+    closed(&mut old_native).await;
+    assert!(admin.simple_query("SELECT 1").await.is_err());
+    drop(admin);
+    admin_connection.await.unwrap();
+    assert_eq!(target.driver.current_progress().await.unwrap(), -1);
+    assert_eq!(target.driver.catch_up_capability().await.unwrap(), -1);
+    assert!(!target.driver.instance.is_running().await);
+    assert_eq!(
+        target.driver.public_owner().fence.context().unwrap().role,
+        ReplicaRole::ActiveSecondary
+    );
+
+    let disconnected = if running_disconnected {
+        target
+            .driver
+            .instance
+            .config()
+            .disconnect_receiver(data)
+            .await
+            .unwrap();
+        target.driver.public_start().await.unwrap();
+        assert!(target.driver.instance.is_running().await);
+        assert!(!target.driver.pg_native_handover_allowed(Epoch::new(0, 1)));
+        Some(ProcessProbe::postgres(data))
+    } else {
+        None
+    };
+    target.change_role(1, ReplicaRole::ActiveSecondary).await;
+    if let Some(disconnected) = disconnected {
+        disconnected.assert_reaped();
+    }
+    assert!(target.driver.instance.is_running().await);
+    let running = ProcessProbe::postgres(data);
+    let evidence = target
+        .driver
+        .observer
+        .snapshot()
+        .await
+        .unwrap()
+        .evidence
+        .unwrap();
+    assert!(evidence.in_recovery && evidence.wal_receiver_stopped);
+    assert_eq!(
+        Some(&evidence.system_identifier),
+        retained.system_identifier.as_ref()
+    );
+    assert_eq!(Some(evidence.timeline_id), retained.timeline_id);
+    assert!(evidence.replay_lsn.unwrap() >= retained.flush_lsn);
+    assert!(target.driver.current_progress().await.unwrap() >= boundary);
+    assert!(target.driver.catch_up_capability().await.unwrap() >= 0);
+    let initialized = target.driver.durable.revalidate().await.unwrap();
+    assert_eq!(
+        initialized.timeline_history_digest,
+        retained.timeline_history_digest
+    );
+    assert_eq!(initialized.identity, retained.identity);
+    assert!(initialized.external_access_closed && !initialized.postgres_stopped);
+    assert!(initialized.policy_certified_lsn >= retained.policy_certified_lsn);
+    assert_eq!(
+        initialized.native_session_generation,
+        retained.native_session_generation
+    );
+    assert_eq!(std::fs::metadata(data).unwrap().ino(), inode);
+    assert_eq!(std::fs::read(data.join("PG_VERSION")).unwrap(), version);
+    let postmaster: u32 = std::fs::read_to_string(data.join("postmaster.pid"))
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let environment = std::fs::read(format!("/proc/{postmaster}/environ")).unwrap();
+    assert!(
+        !environment
+            .split(|byte| *byte == 0)
+            .any(|variable| variable.starts_with(b"PGPASSWORD="))
+    );
+    assert!(
+        !environment
+            .windows(credential.secret.len())
+            .any(|bytes| bytes == credential.secret.as_bytes())
+    );
+    {
+        let state = target.driver.public_owner().state.lock().await;
+        assert!(state.receiver.is_none() && state.receiver_boundary.is_none());
+        assert!(state.built.is_none() && state.built_idle.is_empty());
+        assert!(state.grants.is_empty() && state.configuration.is_none() && state.access.is_none());
+    }
+    assert_eq!(
+        target.driver.pg_session_ownership(&id),
+        (session::SessionStage::Retired, false, true)
+    );
+    assert!(!target.driver.pg_native_handover_allowed(Epoch::new(0, 1)));
+    assert!(target.driver.pg_native_established(&id).is_err());
+    assert!(
+        target
+            .driver
+            .pg_session_request(SessionRequest {
+                session: id.clone(),
+                action: session::SessionAction::Complete,
+            })
+            .await
+            .is_err()
+    );
+    assert!(source.driver.pg_establish_session(&id).await.is_err());
+    assert!(native_socket(&credential, &credential.name).await.is_err());
+    let (source_admin, source_admin_connection) = source.driver.instance.connect().await.unwrap();
+    let slot = crate::native::replication_slot_name(&target.identity);
+    assert_eq!(
+        source_admin
+            .query_one(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    drop(source_admin);
+    source_admin_connection.await.unwrap();
+    target
+        .driver
+        .public_application_role(ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap();
+    assert!(target.driver.instance.connect_application().await.is_err());
+    let connection_string = target.driver.instance.connection_string().replace(
+        "dbname=postgres",
+        &format!("dbname={}", crate::access::APPLICATION_DATABASE),
+    );
+    let (reader, reader_connection) =
+        tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+    let reader_connection = tokio::spawn(reader_connection);
+    let settings = reader
+        .query_one(
+            "SELECT pg_is_in_recovery(), current_setting('transaction_read_only'),
+                current_setting('primary_conninfo'), current_setting('primary_slot_name'),
+                current_setting('restore_command'), (SELECT count(*) FROM pg_stat_wal_receiver)",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(settings.get::<_, bool>(0));
+    assert_eq!(settings.get::<_, &str>(1), "on");
+    for column in 2..=4 {
+        assert_eq!(settings.get::<_, &str>(column), "");
+    }
+    assert_eq!(settings.get::<_, i64>(5), 0);
+    let values = reader
+        .query("SELECT value FROM cold_native_history ORDER BY value", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        ["acknowledged-before-copy", "acknowledged-in-local-wal"]
+    );
+    assert!(
+        reader
+            .execute("INSERT INTO cold_native_history VALUES ('forbidden')", &[])
+            .await
+            .is_err()
+    );
+    drop(reader);
+    reader_connection.await.unwrap().unwrap();
+
+    source.change_role(1, ReplicaRole::ActiveSecondary).await;
+    source.change_role(1, ReplicaRole::ActiveSecondary).await;
+    assert!(
+        source
+            .driver
+            .durable
+            .revalidate()
+            .await
+            .unwrap()
+            .quiescence
+            .is_some()
+    );
+    assert!(!source.driver.instance.is_running().await);
+    assert_eq!(source.driver.current_progress().await.unwrap(), -1);
+    assert!(source.driver.public_start().await.is_err());
+    assert!(writer.simple_query("SELECT 1").await.is_err());
+    drop(writer);
+    writer_connection.await.unwrap();
+    target.driver.public_close().await.unwrap();
+    running.assert_reaped();
+    source.driver.public_close().await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn m3_pg_native_cold_standby_history_failure_remains_sticky() {
+    let directory = crate::testing::TestDataDir::new("cold-native-history");
+    let (source, target, id) = cold_native_pair(directory.path()).await;
+    source.driver.pg_retire_session(&id).await.unwrap();
+    let history = target
+        .driver
+        .durable
+        .revalidate()
+        .await
+        .unwrap()
+        .timeline_history_digest;
+    target
+        .driver
+        .durable
+        .update(|state| {
+            state.timeline_history_digest = Some("crossed-retained-history".into());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = target
+        .driver
+        .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!target.driver.instance.is_running().await);
+    target
+        .driver
+        .durable
+        .update(|state| {
+            state.timeline_history_digest = history;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let persisted = target.persisted();
+    let generation = target.driver.instance.generation_id();
+    let repeated = target
+        .driver
+        .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(repeated.ends_with(&error));
+    assert_eq!(
+        target
+            .driver
+            .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+            .await
+            .unwrap_err()
+            .to_string(),
+        repeated
+    );
+    assert!(target.driver.current_progress().await.is_err());
+    assert!(target.driver.catch_up_capability().await.is_err());
+    assert!(target.driver.public_start().await.is_err());
+    assert_eq!(target.driver.instance.generation_id(), generation);
+    assert_eq!(target.persisted(), persisted);
+    assert!(!target.driver.instance.is_running().await);
+    target.driver.public_close().await.unwrap();
+    source.driver.public_close().await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn m3_pg_native_cold_standby_start_failure_remains_sticky() {
+    let directory = crate::testing::TestDataDir::new("cold-native-start-failure");
+    let fail = directory.path().join("fail-start");
+    let pg_bin = wrapped_pg_bin(
+        directory.path(),
+        "postgres",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = '-D' ] && [ -f '{}' ]; then exit 73; fi\nexec '{}' \"$@\"\n",
+            fail.display(),
+            find_pg_bin().join("postgres").display()
+        ),
+    );
+    let (source, target, id) = cold_native_pair_with_bin(directory.path(), pg_bin).await;
+    source.driver.pg_retire_session(&id).await.unwrap();
+    std::fs::write(&fail, b"fail only this test-owned native startup").unwrap();
+    let error = target
+        .driver
+        .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap_err()
+        .to_string();
+    std::fs::remove_file(fail).unwrap();
+    let generation = target.driver.instance.generation_id();
+    let persisted = target.persisted();
+    let repeated = target
+        .driver
+        .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(repeated.ends_with(&error));
+    assert!(target.driver.current_progress().await.is_err());
+    assert!(target.driver.catch_up_capability().await.is_err());
+    assert!(!target.driver.instance.is_running().await);
+    assert_eq!(target.driver.instance.generation_id(), generation);
+    assert_eq!(target.persisted(), persisted);
+    target.driver.public_close().await.unwrap();
+    source.driver.public_close().await.unwrap();
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn m3_pg_native_cold_standby_lost_join_never_restarts() {
+    let directory = crate::testing::TestDataDir::new("cold-native-lost-join");
+    let (source, target, id) = cold_native_pair(directory.path()).await;
+    let process = ProcessProbe::postgres(target.driver.instance.data_dir());
+    target.driver.instance.lose_monitor().await;
+    assert!(source.driver.pg_retire_session(&id).await.is_err());
+    process.assert_gone().await;
+    let error = target
+        .driver
+        .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap_err()
+        .to_string();
+    let generation = target.driver.instance.generation_id();
+    let persisted = target.persisted();
+    let repeated = target
+        .driver
+        .public_change_role(Epoch::new(0, 1), ReplicaRole::ActiveSecondary)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(repeated.ends_with(&error));
+    assert!(!target.driver.instance.is_running().await);
+    assert_eq!(target.driver.instance.generation_id(), generation);
+    assert_eq!(target.persisted(), persisted);
+    assert!(target.driver.current_progress().await.is_err());
+    assert!(target.driver.catch_up_capability().await.is_err());
+    assert!(target.driver.public_close().await.is_err());
+    assert!(source.driver.public_close().await.is_err());
+}
+
 async fn frame(stream: &mut tokio::net::TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     let kind = stream.read_u8().await?;
     let length = stream.read_u32().await?;
@@ -465,6 +1029,17 @@ async fn native_socket(
     );
     stream.write_u32((startup.len() + 4) as u32).await?;
     stream.write_all(&startup).await?;
+    if frame(&mut stream).await? != (b'R', 3u32.to_be_bytes().to_vec()) {
+        return Err(std::io::Error::other(
+            "native gateway refused authentication",
+        ));
+    }
+    stream.write_u8(b'p').await?;
+    stream
+        .write_u32((credential.secret.len() + 5) as u32)
+        .await?;
+    stream.write_all(credential.secret.as_bytes()).await?;
+    stream.write_all(&[0]).await?;
     if frame(&mut stream).await? != (b'R', 0u32.to_be_bytes().to_vec()) {
         return Err(std::io::Error::other("native gateway refused startup"));
     }
@@ -1823,6 +2398,9 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
             source.driver.current_progress().await.unwrap(),
             source.driver.durable.snapshot().await.flush_lsn
         );
+        assert_eq!(source.driver.catch_up_capability().await.unwrap(), -1);
+        assert!(!source.driver.instance.is_running().await);
+        assert!(source.driver.instance.connect_application().await.is_err());
         source
             .driver
             .durable

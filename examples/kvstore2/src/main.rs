@@ -455,11 +455,13 @@ mod tests {
                     },
                     desired: ReplicaGoalKind::Prepare {
                         role: ReplicaRole::Primary,
+                        rebuild: None,
                     },
                 };
                 for desired in [
                     ReplicaGoalKind::Prepare {
                         role: ReplicaRole::Primary,
+                        rebuild: None,
                     },
                     ReplicaGoalKind::Reconfigure {
                         role: ReplicaRole::Primary,

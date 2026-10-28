@@ -34,6 +34,45 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
                 actions.retain(|instruction| *instruction != ApplicationRole);
                 actions.push(ApplicationRole);
             }
+            if matches!(&goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::RecoverContainedCreation { recovery }
+                    if recovery.role == ReplicaRole::Primary
+                        && recovery.addition.as_ref().is_none_or(|addition|
+                            addition.phase != crate::protocol::public_operations::MembershipAdditionPhase::Joint))
+            {
+                actions.retain(|instruction| *instruction != ApplicationRole);
+                actions.push(ApplicationRole);
+            }
+            if super::super::ordinary_goal::addition::selection(goal).is_some_and(|addition| {
+                addition.phase
+                    == crate::protocol::public_operations::MembershipAdditionPhase::Current
+            }) {
+                actions.retain(|instruction| *instruction != ReplicatorRole);
+            }
+            if matches!(
+                goal.desired,
+                crate::protocol::public_operations::ReplicaGoalKind::Discover
+            ) {
+                actions.push(NativeInspect);
+            } else if goal.role().is_some() {
+                if goal.role() == Some(ReplicaRole::Primary)
+                    && let Some(application) =
+                        actions.iter().position(|action| *action == ApplicationRole)
+                {
+                    if let Some(epoch) = actions.iter().position(|action| *action == ProgramEpoch)
+                        && epoch > application
+                    {
+                        actions.remove(epoch);
+                        actions.insert(application, ProgramEpoch);
+                    }
+                    let application = actions
+                        .iter()
+                        .position(|action| *action == ApplicationRole)
+                        .unwrap();
+                    actions.insert(application + 1, NativeDataLossDecision);
+                }
+                actions.push(NativeComplete);
+            }
             actions
         }
         Some(P::Open { .. }) => vec![ApplicationOpen, ReplicatorOpen],
@@ -75,6 +114,51 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
     }
 }
 
+pub(crate) fn legacy_ordinary_instructions(
+    goal: &crate::protocol::public_operations::ReplicaGoal,
+) -> Vec<PublicInstruction> {
+    use crate::protocol::public_operations::ReplicaGoalKind as G;
+    use PublicInstruction::*;
+    let mut actions = operation_instructions(&goal.intent());
+    actions.retain(|instruction| {
+        !matches!(
+            instruction,
+            NativeInspect | NativeDataLossDecision | NativeComplete
+        )
+    });
+    let delayed_application = retained_primary_recovery(goal)
+        || matches!(&goal.desired, G::RecoverContainedCreation { recovery }
+            if recovery.role == ReplicaRole::Primary && recovery.addition.as_ref().is_none_or(|addition|
+                addition.phase != crate::protocol::public_operations::MembershipAdditionPhase::Joint));
+    if goal.role() == Some(ReplicaRole::Primary)
+        && !delayed_application
+        && let (Some(epoch), Some(application)) = (
+            actions
+                .iter()
+                .position(|instruction| *instruction == ProgramEpoch),
+            actions
+                .iter()
+                .position(|instruction| *instruction == ApplicationRole),
+        )
+        && epoch < application
+    {
+        actions.swap(epoch, application);
+    }
+    if matches!(
+        goal.desired,
+        G::Prepare {
+            role: ReplicaRole::IdleSecondary,
+            ..
+        }
+    ) && let Some(application) = actions
+        .iter()
+        .position(|instruction| *instruction == ApplicationRole)
+    {
+        actions.insert(application + 1, ProgramEpoch);
+    }
+    actions
+}
+
 fn retained_primary_recovery(goal: &crate::protocol::public_operations::ReplicaGoal) -> bool {
     use crate::protocol::public_operations::ReplicaGoalKind as G;
     matches!(
@@ -104,13 +188,14 @@ pub(crate) fn ordinary_handoff(
     use crate::protocol::public_operations::ReplicaGoalKind as G;
     let previous = goal.scope.configuration.previous.as_ref()?;
     let local = &goal.scope.storage.replica;
-    if !matches!(
-        goal.desired,
-        G::Reconfigure {
-            role: ReplicaRole::ActiveSecondary,
-            catch_up: Some(PublicCatchUpMode::All),
-        }
-    ) || previous.primary_id != local.replica_id
+    let G::Reconfigure {
+        role: ReplicaRole::ActiveSecondary,
+        catch_up: Some(mode),
+    } = goal.desired
+    else {
+        return None;
+    };
+    if previous.primary_id != local.replica_id
         || goal.scope.configuration.current.primary_id == local.replica_id
         || goal.scope.epoch <= previous.epoch
         || goal.scope.epoch.data_loss_number != previous.epoch.data_loss_number
@@ -161,8 +246,8 @@ pub(crate) fn ordinary_handoff(
         refreshed,
         epoch: goal.scope.epoch,
         handoff: ReplicaRole::ActiveSecondary,
-        catch_up_specific_quorum: false,
-        mode: PublicCatchUpMode::All,
+        catch_up_specific_quorum: mode == PublicCatchUpMode::WriteQuorum,
+        mode,
         controller_composed: true,
     })
 }
@@ -178,7 +263,7 @@ pub(crate) fn goal_programs(
             replica: goal.scope.storage.replica.clone(),
             existing: true,
         }),
-        G::Prepare { role } => {
+        G::Prepare { role, .. } => {
             programs.push(P::Open {
                 replica: goal.scope.storage.replica.clone(),
                 existing: true,
@@ -187,9 +272,11 @@ pub(crate) fn goal_programs(
                 epoch: goal.scope.epoch,
                 role: *role,
             });
-            programs.push(P::Epoch {
-                epoch: goal.scope.epoch,
-            });
+            if *role != ReplicaRole::IdleSecondary {
+                programs.push(P::Epoch {
+                    epoch: goal.scope.epoch,
+                });
+            }
             if *role != ReplicaRole::IdleSecondary {
                 programs.push(P::Configuration(goal.scope.configuration.ordinary()));
             }
@@ -207,6 +294,45 @@ pub(crate) fn goal_programs(
                 epoch: goal.scope.epoch,
             });
             programs.push(P::Configuration(goal.scope.configuration.ordinary()));
+        }
+        G::RecoverContainedCreation { recovery } => {
+            use crate::protocol::public_operations::MembershipAdditionPhase as Phase;
+            if let Some(addition) = &recovery.addition
+                && matches!(addition.phase, Phase::Joint | Phase::Current)
+            {
+                programs.push(P::Epoch {
+                    epoch: goal.scope.epoch,
+                });
+                programs.push(P::CatchUp {
+                    configuration: goal.scope.configuration.ordinary(),
+                    mode: PublicCatchUpMode::All,
+                });
+                if addition.phase == Phase::Current {
+                    programs.push(P::Role {
+                        epoch: goal.scope.epoch,
+                        role: ReplicaRole::Primary,
+                    });
+                }
+                return programs;
+            }
+            programs.push(P::Open {
+                replica: goal.scope.storage.replica.clone(),
+                existing: true,
+            });
+            programs.push(P::Role {
+                epoch: goal.scope.epoch,
+                role: recovery.role,
+            });
+            programs.push(P::Epoch {
+                epoch: goal.scope.epoch,
+            });
+            programs.push(match recovery.catch_up {
+                Some(mode) => P::CatchUp {
+                    configuration: goal.scope.configuration.ordinary(),
+                    mode,
+                },
+                None => P::Configuration(goal.scope.configuration.ordinary()),
+            });
         }
         G::RefreshPrimary { catch_up } => {
             programs.push(P::Epoch {
@@ -276,9 +402,44 @@ pub(crate) fn selected_program(
     instruction: PublicInstruction,
 ) -> Option<PublicOperationProgram> {
     let program = intent.program.as_ref()?;
+    if matches!(
+        instruction,
+        PublicInstruction::NativeInspect
+            | PublicInstruction::NativeDataLossDecision
+            | PublicInstruction::NativeComplete
+    ) {
+        return Some(program.clone());
+    }
     let PublicOperationProgram::AgentGoal(goal) = program else {
         return Some(program.clone());
     };
+    if instruction == PublicInstruction::CurrentConfiguration
+        && matches!(
+            goal.desired,
+            crate::protocol::public_operations::ReplicaGoalKind::Reconfigure {
+                role: ReplicaRole::Primary,
+                catch_up: Some(PublicCatchUpMode::WriteQuorum)
+            }
+        )
+        && goal.scope.configuration.previous.is_none()
+    {
+        return Some(PublicOperationProgram::Configuration(
+            goal.scope.configuration.ordinary(),
+        ));
+    }
+    if instruction == PublicInstruction::ProgramEpoch
+        && matches!(
+            goal.desired,
+            crate::protocol::public_operations::ReplicaGoalKind::Prepare {
+                role: ReplicaRole::IdleSecondary,
+                ..
+            }
+        )
+    {
+        return Some(PublicOperationProgram::Epoch {
+            epoch: goal.scope.epoch,
+        });
+    }
     goal_programs(goal).into_iter().find(|program| {
         let mut local = intent.clone();
         local.program = Some(program.clone());
@@ -348,10 +509,12 @@ pub(super) fn replica_set(
             .replicas
             .iter()
             .filter(|replica| {
-                configuration
-                    .members
-                    .iter()
-                    .any(|member| member.identity == replica.identity)
+                replica.is_up
+                    && replica.is_ready
+                    && configuration
+                        .members
+                        .iter()
+                        .any(|member| member.identity == replica.identity)
             })
             .cloned()
             .map(|replica| {
@@ -390,6 +553,22 @@ pub(super) async fn install(
         .chain(input.previous.iter())
         .flat_map(|configuration| &configuration.members)
         .any(|member| &member.identity == local)
+        && !state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| {
+                preview
+                    .current_operation
+                    .as_ref()
+                    .and_then(|id| preview.operations.get(id))
+            })
+            .and_then(|record| record.intent.goal())
+            .is_some_and(|goal| {
+                super::super::ordinary_goal::addition::selection(goal).is_some_and(|addition| {
+                    addition.phase
+                        == crate::protocol::public_operations::MembershipAdditionPhase::Receiver
+                }) && goal.scope.configuration.ordinary() == *input
+            })
     {
         return Err(RuntimeError::AuthorityNotAdmitted);
     }
@@ -497,7 +676,7 @@ pub(super) async fn execute(
     use PublicInstruction::*;
     use PublicInstructionOutcome as O;
     use PublicOperationProgram as P;
-    let record = store
+    let mut record = store
         .public_operation_records()
         .await?
         .into_iter()
@@ -522,6 +701,17 @@ pub(super) async fn execute(
         }
     });
     let recovered_terminal = intent.class.is_terminal() && start > 1;
+    if intent
+        .goal()
+        .is_some_and(super::super::original_member::restart_close)
+    {
+        let input = super::super::native_history::select(store.as_ref(), &record, &callbacks)
+            .await?
+            .ok_or_else(|| {
+                HostError::CommandRejected("native rebuild requires an actual native owner".into())
+            })?;
+        record.ordinary.as_mut().unwrap().native_input = Some(input);
+    }
     // Recorded terminal effects still need process-local Abort containment;
     // neither a child diagnostic nor an old Abort receipt is a live proof.
     if recovered_terminal
@@ -544,6 +734,52 @@ pub(super) async fn execute(
         callbacks.abort_once();
     }
     for (index, instruction) in actions.into_iter().enumerate().skip(start) {
+        let native_input = if intent.goal().is_some()
+            && record.ordinary.as_ref().is_some_and(|ordinary| {
+                ordinary
+                    .actions
+                    .iter()
+                    .any(|instruction| matches!(instruction, NativeInspect | NativeComplete))
+            })
+            && matches!(
+                instruction,
+                ReplicatorRole
+                    | ProgramEpoch
+                    | NativeInspect
+                    | NativeDataLossDecision
+                    | NativeComplete
+            ) {
+            super::super::native_history::select(store.as_ref(), &record, &callbacks).await?
+        } else {
+            None
+        };
+        if let Some(input) = &native_input {
+            record.ordinary.as_mut().unwrap().native_input = Some(input.clone());
+        }
+        if intent
+            .goal()
+            .is_some_and(|goal| super::super::ordinary_goal::reconstruction::claim(goal).is_some())
+        {
+            let actual = callbacks
+                .open_context
+                .as_ref()
+                .ok_or_else(|| {
+                    HostError::CommandRejected(
+                        "reconstruction lacks its actual host context".into(),
+                    )
+                })?
+                .partition
+                .creation_reconstruction()
+                .await?
+                .ok_or_else(|| {
+                    HostError::CommandRejected("reconstruction lost its checked owner".into())
+                })?;
+            if actual.scope() != &intent.goal().unwrap().scope {
+                return Err(HostError::IdentityMismatch(
+                    "reconstruction owner crossed scope".into(),
+                ));
+            }
+        }
         if intent.goal().is_some_and(|goal| {
             matches!(
                 goal.desired,
@@ -573,6 +809,20 @@ pub(super) async fn execute(
                 "ordinary creation was withdrawn".into(),
             ));
         }
+        if let Some(goal) = intent.goal() {
+            let current = store.load_state().await?;
+            super::super::ordinary_goal::validate_live_normal_current(&current, goal, |facts| {
+                callbacks
+                    .native
+                    .as_ref()
+                    .is_some_and(|owner| owner.matches(facts))
+                    && !*callbacks.aborted.lock().unwrap()
+            })?;
+            super::super::native_history::validate_normal_current_source(
+                &current, goal, &callbacks,
+            )
+            .await?;
+        }
         let mut selected_program =
             selected_program(&intent, instruction).expect("validated local program");
         if instruction == ApplicationOpen
@@ -586,7 +836,13 @@ pub(super) async fn execute(
         let program = &selected_program;
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
-            cut.pause(PublicCutPosition::BeforeInstruction, index).await;
+            cut.pause_instruction(
+                PublicCutPosition::BeforeInstruction,
+                index,
+                &intent,
+                instruction,
+            )
+            .await;
         }
         store
             .public_instruction(&intent, index, instruction, None)
@@ -596,8 +852,13 @@ pub(super) async fn execute(
         }
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
-            cut.pause(PublicCutPosition::InstructionSelected, index)
-                .await;
+            cut.pause_instruction(
+                PublicCutPosition::InstructionSelected,
+                index,
+                &intent,
+                instruction,
+            )
+            .await;
         }
         let mut rebuild_failure = None;
         let mut ineligible_return = None;
@@ -606,9 +867,23 @@ pub(super) async fn execute(
                 let P::Open { replica, existing } = program else {
                     unreachable!()
                 };
-                let context = callbacks.open_context.clone().ok_or_else(|| {
+                let mut context = callbacks.open_context.clone().ok_or_else(|| {
                     HostError::CommandRejected("open context is not bound".into())
                 })?;
+                if record.intent.goal().is_some() {
+                    let owner = record
+                        .ordinary
+                        .as_ref()
+                        .and_then(|ordinary| ordinary.creation_owner.as_ref())
+                        .ok_or_else(|| {
+                            HostError::Corrupt(
+                                "ordinary Open has no checked pre-effect owner".into(),
+                            )
+                        })?;
+                    if owner.builtin_factory.is_some() {
+                        context.partition = context.partition.with_builtin_history();
+                    }
+                }
                 if &context.identity != replica
                     || (context.mode == crate::application::OpenMode::Existing) != *existing
                 {
@@ -638,12 +913,10 @@ pub(super) async fn execute(
             }
             ReplicatorOpen => match callbacks.replicator.open().await {
                 Ok(endpoint) if !endpoint.trim().is_empty() => {
-                    if crate::protocol::public_operations::ORDINARY_ACTION_FORMAT == 19
-                        && callbacks.open_context.as_ref().is_some_and(|context| {
-                            context.partition.builtin_native_registration().as_ref()
-                                == Some(&callbacks.replicator_creation_id)
-                        })
-                    {
+                    if callbacks.open_context.as_ref().is_some_and(|context| {
+                        context.partition.builtin_native_registration().as_ref()
+                            == Some(&callbacks.replicator_creation_id)
+                    }) {
                         O::BuiltinNativeEndpoint {
                             endpoint,
                             process_id: std::process::id(),
@@ -731,34 +1004,75 @@ pub(super) async fn execute(
                             return Err(HostError::IdentityMismatch("retained native receipt crossed creation".into()));
                         }
                         O::RetainedNativeInitialized(Box::new(goal.scope.clone()))
+                    } else if let Some(goal) = intent.goal().filter(|goal| {
+                        super::super::ordinary_goal::reconstruction::claim(goal).is_some()
+                    }) {
+                        let initialized = callbacks.open_context.as_ref()
+                            .and_then(|context| context.partition.reconstructed_native_initialization())
+                            .ok_or_else(|| HostError::CommandRejected(
+                                "builtin adapter did not initialize the reconstructed native owner".into(),
+                            ))?;
+                        if initialized.scope() != &goal.scope {
+                            return Err(HostError::IdentityMismatch(
+                                "reconstructed native receipt crossed creation".into(),
+                            ));
+                        }
+                        O::ReconstructedNativeInitialized(Box::new(goal.scope.clone()))
                     } else {
                         O::Done
                     }
                 } else {
-                    O::ApplicationRole(
-                        super::local_callback(
-                            callbacks.application.change_role(role).await,
-                            store.as_ref(),
-                            &intent,
-                            index,
-                            instruction,
-                            epoch,
-                            Some((
-                                &callbacks.retry_proof,
-                                PublicCallbackFamily::ApplicationRole,
-                            )),
-                        )
-                        .await?
-                        .service_address,
+                    let result = callbacks.application.change_role(role).await;
+                    #[cfg(feature = "testing")]
+                    let result = if let Some(cut) = &callbacks.cut {
+                        let result = cut.addition_current_result(&intent, index, result);
+                        if result.is_err() {
+                            cut.pause_instruction(
+                                PublicCutPosition::CallbackFailure,
+                                index,
+                                &intent,
+                                instruction,
+                            )
+                            .await;
+                        }
+                        result
+                    } else {
+                        result
+                    };
+                    let result = super::local_callback(
+                        result,
+                        store.as_ref(),
+                        &intent,
+                        index,
+                        instruction,
+                        epoch,
+                        Some((
+                            &callbacks.retry_proof,
+                            PublicCallbackFamily::ApplicationRole,
+                        )),
                     )
+                    .await?;
+                    if let Some(native) = &callbacks.native {
+                        native.application_role(role);
+                    }
+                    O::ApplicationRole(result.service_address)
                 }
             }
             ProgramEpoch => {
                 let (P::Epoch { epoch } | P::Swap { epoch, .. }) = program else {
                     unreachable!()
                 };
+                let already_applied = native_input.is_some()
+                    && callbacks
+                        .native
+                        .as_ref()
+                        .is_some_and(|native| native.applied(*epoch));
                 super::local_callback(
-                    callbacks.replicator.update_epoch(*epoch).await,
+                    if already_applied {
+                        Ok(())
+                    } else {
+                        callbacks.replicator.update_epoch(*epoch).await
+                    },
                     store.as_ref(),
                     &intent,
                     index,
@@ -769,7 +1083,10 @@ pub(super) async fn execute(
                 .await?;
                 O::Done
             }
-            Configuration | StartingConfiguration | RefreshedConfiguration => {
+            Configuration
+            | StartingConfiguration
+            | RefreshedConfiguration
+            | CurrentConfiguration => {
                 let configuration = configuration(program, instruction);
                 if intent.goal().is_some() {
                     validate_admission_boundary(store.as_ref(), &record, &callbacks).await?;
@@ -847,6 +1164,32 @@ pub(super) async fn execute(
                     callbacks.replicator.current_progress().await?
                 })
             }
+            NativeInspect => {
+                if let Some(input) = &native_input {
+                    let status = super::super::native_history::inspect(input, &callbacks).await;
+                    ineligible_return = super::super::native_history::status_failure(&status);
+                    O::NativeStatus(Box::new(status))
+                } else {
+                    O::NativeUnavailable
+                }
+            }
+            NativeDataLossDecision => {
+                super::super::native_history::decision(intent.goal().unwrap(), &callbacks)?
+            }
+            NativeComplete => {
+                if let Some(input) = &native_input {
+                    O::NativeLifecycle(Box::new(
+                        super::super::native_history::complete(
+                            input,
+                            intent.goal().unwrap(),
+                            &callbacks,
+                        )
+                        .await?,
+                    ))
+                } else {
+                    O::NativeUnavailable
+                }
+            }
             Build => {
                 let P::Build(build) = program else {
                     unreachable!()
@@ -860,7 +1203,36 @@ pub(super) async fn execute(
                 if let Some(goal) = intent.goal() {
                     validate_remote(store.as_ref(), goal, &callbacks).await?;
                 }
-                match callbacks.primary.build_replica(replica).await {
+                let result = callbacks.primary.build_replica(replica).await;
+                #[cfg(feature = "testing")]
+                if result.is_ok()
+                    && let Some(cut) = &callbacks.cut
+                {
+                    cut.pause_instruction(
+                        PublicCutPosition::BuildReturned,
+                        index,
+                        &intent,
+                        instruction,
+                    )
+                    .await;
+                }
+                #[cfg(feature = "testing")]
+                let result = if let Some(cut) = &callbacks.cut {
+                    let result = cut.build_result(&intent, index, result);
+                    if result.is_err() {
+                        cut.pause_instruction(
+                            PublicCutPosition::CallbackFailure,
+                            index,
+                            &intent,
+                            instruction,
+                        )
+                        .await;
+                    }
+                    result
+                } else {
+                    result
+                };
+                match result {
                     Ok(()) => {
                         if let Some(goal) = intent.goal()
                             && let Err(error) =
@@ -965,7 +1337,22 @@ pub(super) async fn execute(
                         None => format!("terminal cleanup failed: {error}"),
                     }));
                 }
-                O::Done
+                if close_failure.is_none()
+                    && record
+                        .ordinary
+                        .as_ref()
+                        .and_then(|ordinary| ordinary.native_input.as_ref())
+                        .is_some_and(|input| input.native_rebuild.is_some())
+                {
+                    O::RecoveryExitRequired(Box::new(
+                        super::super::original_member::restart_notice(
+                            &store.load_state().await?,
+                            &record,
+                        )?,
+                    ))
+                } else {
+                    O::Done
+                }
             }
             Revoke => {
                 (callbacks.revoke_access)(intent.class.is_terminal())?;
@@ -978,7 +1365,37 @@ pub(super) async fn execute(
         }
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
-            cut.pause(PublicCutPosition::CallbackSuccess, index).await;
+            cut.pause_instruction(
+                PublicCutPosition::CallbackSuccess,
+                index,
+                &intent,
+                instruction,
+            )
+            .await;
+        }
+        if intent
+            .goal()
+            .is_some_and(|goal| super::super::ordinary_goal::reconstruction::claim(goal).is_some())
+        {
+            let actual = callbacks
+                .open_context
+                .as_ref()
+                .ok_or_else(|| {
+                    HostError::CommandRejected("reconstruction lost its actual context".into())
+                })?
+                .partition
+                .creation_reconstruction()
+                .await?
+                .ok_or_else(|| {
+                    HostError::CommandRejected(
+                        "reconstruction lost checked custody after callback".into(),
+                    )
+                })?;
+            if actual.scope() != &intent.goal().unwrap().scope {
+                return Err(HostError::IdentityMismatch(
+                    "reconstruction callback completed for another scope".into(),
+                ));
+            }
         }
         store
             .public_instruction(&intent, index, instruction, Some(outcome))
@@ -988,8 +1405,13 @@ pub(super) async fn execute(
         }
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
-            cut.pause(PublicCutPosition::InstructionApplied, index)
-                .await;
+            cut.pause_instruction(
+                PublicCutPosition::InstructionApplied,
+                index,
+                &intent,
+                instruction,
+            )
+            .await;
         }
         if let Some(message) = rebuild_failure {
             return Err(HostError::CommandRejected(message.into()));
@@ -1027,11 +1449,89 @@ async fn validate_admission_boundary(
 ) -> Result<()> {
     use crate::protocol::public_operations::*;
     let goal = record.intent.goal().expect("ordinary goal");
+    let current = store.load_state().await?;
+    super::super::native_history::validate_normal_current_source(&current, goal, callbacks).await?;
     let admissions = &record
         .ordinary
         .as_ref()
         .expect("frozen actions")
         .ready_admissions;
+    if let Some(addition) =
+        super::super::ordinary_goal::addition::selection(goal).filter(|addition| {
+            matches!(
+                addition.phase,
+                MembershipAdditionPhase::Joint | MembershipAdditionPhase::Current
+            )
+        })
+    {
+        let state = store.load_state().await?;
+        super::super::ordinary_goal::addition::validate(&state, goal)?;
+        super::super::ordinary_goal::validate_frozen_admissions(&state, record)?;
+        let build =
+            super::super::ordinary_goal::addition::build_record(&state, goal).ok_or_else(|| {
+                HostError::CommandRejected("addition lost its copied native root".into())
+            })?;
+        let remote = build.intent.goal().unwrap().remote().unwrap().clone();
+        loop {
+            if *callbacks.aborted.lock().unwrap() {
+                return Err(HostError::CommandRejected(
+                    "addition creation withdrawn".into(),
+                ));
+            }
+            let target = crate::control::resolve_replica_publication(
+                &remote.target_control_address,
+                callbacks.peer_credentials.as_ref().ok_or_else(|| {
+                    HostError::CommandRejected(
+                        "addition lacks authenticated peer credentials".into(),
+                    )
+                })?,
+                &ReplicaDiscoveryQuery {
+                    format: ORDINARY_ACTION_FORMAT,
+                    history: goal.scope.history.clone(),
+                    replica: addition.receiver.identity.clone(),
+                    process_session_id: Some(addition.receiver.process_session_id.clone()),
+                },
+            )
+            .await?;
+            if let Some(target) = target {
+                if target.scope.storage != addition.receiver.storage_incarnation
+                    || target.scope.creation_id != addition.receiver.replicator_creation_id
+                {
+                    return Err(HostError::CommandRejected(
+                        "addition peer offer crossed native lifetime".into(),
+                    ));
+                }
+                if target.stage == ReplicaPublicationStage::AchievedScope
+                    && target.role == ReplicaRole::ActiveSecondary
+                    && target.scope.configuration.current == goal.scope.configuration.current
+                    && target.scope.configuration.previous == goal.scope.configuration.previous
+                    && target.scope.configuration.replicas.iter().any(|peer| {
+                        peer.identity == addition.source.identity
+                            && peer.storage_incarnation == addition.source.storage_incarnation
+                            && peer.process_session_id == addition.source.process_session_id
+                    })
+                {
+                    let current = store.load_state().await?;
+                    super::super::ordinary_goal::addition::validate(&current, goal)?;
+                    return Ok(());
+                }
+                let prior = if addition.phase == MembershipAdditionPhase::Joint {
+                    addition.configuration(MembershipAdditionPhase::Receiver)
+                } else {
+                    addition.configuration(MembershipAdditionPhase::Joint)
+                }
+                .map_err(|error| HostError::CommandRejected(error.into()))?;
+                if target.scope.configuration.current != prior.current
+                    && target.scope.configuration.current != goal.scope.configuration.current
+                {
+                    return Err(HostError::CommandRejected(
+                        "addition peer offers another selected root".into(),
+                    ));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
     for remote in admissions {
         let validate_source = |mut state: crate::host::state::AgentState| -> Result<()> {
             if *callbacks.aborted.lock().unwrap() {
@@ -1088,7 +1588,23 @@ async fn validate_admission_boundary(
             &query,
         )
         .await?;
-        if target.as_ref() != Some(&remote.target) {
+        let copied_original = if remote.original_member.is_some() {
+            let snapshot = crate::control::resolve_native_snapshot(
+                &remote.target_control_address,
+                callbacks.peer_credentials.as_ref().unwrap(),
+                &remote.target.scope.history,
+                &remote.target.scope.storage.replica,
+            )
+            .await?;
+            super::super::original_member::target_admitted(
+                remote,
+                &snapshot,
+                super::super::original_member::accepted_build(&store.load_state().await?, remote),
+            )
+        } else {
+            false
+        };
+        if target.as_ref() != Some(&remote.target) && !copied_original {
             return Err(HostError::CommandRejected(
                 "admission target publication changed".into(),
             ));

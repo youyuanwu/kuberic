@@ -4,6 +4,9 @@ use crate::replicator::{
     TestingTcpRouteKind as Cut,
 };
 
+#[path = "private_continuation_tests.rs"]
+mod private_continuation;
+
 struct Gate {
     armed: AtomicBool,
     entered: Semaphore,
@@ -182,6 +185,7 @@ impl Recovery {
             recovery: true,
             continuation: None,
             reformation: false,
+            live_target: None,
         };
         binding.validate().unwrap();
         Self {

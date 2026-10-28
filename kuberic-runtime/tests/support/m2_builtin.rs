@@ -70,7 +70,7 @@ impl StatefulServiceReplica for EngineService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
         let interfaces = context
             .partition
-            .with_factory(Arc::new(DefaultReplicatorFactory::new()))
+            .with_builtin_replicator()
             .create_replicator(
                 Some(self.clone()),
                 Some(ReplicatorSettings {
@@ -380,7 +380,10 @@ impl Pair {
                     epoch: Epoch::new(0, 1),
                     configuration: configuration.clone(),
                 },
-                desired: ReplicaGoalKind::Prepare { role },
+                desired: ReplicaGoalKind::Prepare {
+                    role,
+                    rebuild: None,
+                },
             };
             submit(node, &goal).await.unwrap();
             assert_eq!(settled(node, &goal).await, ReplicaGoalStatus::Achieved);
@@ -415,6 +418,7 @@ impl Pair {
         goal.revision = 2;
         goal.desired = ReplicaGoalKind::Build {
             remote: Box::new(RemoteReplicaSelection {
+                original_member: None,
                 source: snapshot(&self.source).await.publication.unwrap(),
                 target: snapshot(&self.target).await.publication.unwrap(),
                 target_control_address: self.target.control_address.clone(),
@@ -729,6 +733,7 @@ async fn rejected_application_copy<A: Sample>(
         scope: publication.scope.clone(),
         desired: ReplicaGoalKind::Build {
             remote: Box::new(RemoteReplicaSelection {
+                original_member: None,
                 source: publication,
                 target: target_snapshot.publication.unwrap(),
                 target_control_address: target.control_address.clone(),
@@ -2328,6 +2333,7 @@ async fn multi_secondary_case(progressive: bool) {
     second_build.revision += 1;
     second_build.desired = ReplicaGoalKind::Build {
         remote: Box::new(RemoteReplicaSelection {
+            original_member: None,
             source: snapshot(&pair.source).await.publication.unwrap(),
             target: snapshot(&extra).await.publication.unwrap(),
             target_control_address: extra.control_address.clone(),

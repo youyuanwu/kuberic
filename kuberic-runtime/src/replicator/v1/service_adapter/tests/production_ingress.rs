@@ -216,6 +216,7 @@ async fn m3_admitted_session_is_exact_not_fresh_build_authority_and_retirement_i
     assert!(binding.admitted_reconfiguration());
     assert!(
         RemoteReplicaSelection {
+            original_member: None,
             source: binding.source.clone(),
             target: binding.target.clone(),
             target_control_address: "http://localhost:1".into(),

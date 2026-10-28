@@ -893,23 +893,28 @@ fn should_observe_replica(set: &KubericSet, now_unix_seconds: i64, replica_id: R
         return false;
     };
     let resource_uid = set.uid();
-    // A completed terminal is still observable, never a serving/election grant.
-    // Otherwise the cutoff hides both its replay and a same-Pod new process.
+    // Selected terminal/fresh inspection work remains observable, not a grant.
+    // Its first result may arrive after the ordinary outage cutoff expires.
     status.replica_goals.iter().any(|retained| {
         retained.validate().is_ok()
-            && retained.outcome.is_some()
-            && matches!(
-                retained.goal.desired,
-                kuberic_runtime::protocol::public_operations::ReplicaGoalKind::Abort
-                    | kuberic_runtime::protocol::public_operations::ReplicaGoalKind::Close
-            )
             && Some(retained.goal.scope.history.resource_uid.as_str()) == resource_uid.as_deref()
             && retained.goal.scope.storage == endpoint.storage_incarnation
-            && retained.goal.scope.process_session_id == endpoint.process_session_id
-            && retained.goal.scope.creation_id == endpoint.replicator_creation_id
             && retained.goal.scope.epoch == topology.epoch
             && retained.goal.scope.configuration.current.configuration_id
                 == topology.configuration_id
+            && match retained.goal.desired {
+                kuberic_runtime::protocol::public_operations::ReplicaGoalKind::Abort
+                | kuberic_runtime::protocol::public_operations::ReplicaGoalKind::Close => {
+                    retained.goal.scope.process_session_id == endpoint.process_session_id
+                        && retained.goal.scope.creation_id == endpoint.replicator_creation_id
+                }
+                kuberic_runtime::protocol::public_operations::ReplicaGoalKind::Discover => {
+                    retained.goal.scope.process_session_id != endpoint.process_session_id
+                        && retained.goal.scope.creation_id != endpoint.replicator_creation_id
+                        && retained.goal.scope.configuration.previous.is_none()
+                }
+                _ => false,
+            }
     })
 }
 
@@ -6726,7 +6731,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_exact_terminal_remains_observable_without_granting_unavailable_primary() {
+    fn selected_exact_terminal_remains_observable_without_granting_unavailable_primary() {
         use kuberic_runtime::protocol::public_operations::{
             ORDINARY_ACTION_FORMAT, PublicV1Identity, ReplicaConfigurationScope, ReplicaGoal,
             ReplicaGoalKind, ReplicaGoalObservation, ReplicaGoalStatus, ReplicaScope,
@@ -6789,17 +6794,31 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            !should_observe_replica(&set, 110, ReplicaId::new(1)),
-            "pending terminal work cannot override the outage cutoff"
+            should_observe_replica(&set, 110, ReplicaId::new(1)),
+            "outage cutoff must not hide an exact selected terminal's first result"
         );
         retained.outcome = Some(ReplicaGoalObservation {
             goal: goal.clone(),
             status: ReplicaGoalStatus::Achieved,
             selected_call: None,
             receipts: 2,
+            host_settled: true,
+            completed_handoff: None,
         });
         set.status.as_mut().unwrap().replica_goals = vec![retained.clone()];
         assert!(should_observe_replica(&set, 110, ReplicaId::new(1)));
+        for result in [
+            ReplicaGoalStatus::Failed("actual application Close failure".into()),
+            ReplicaGoalStatus::Uncertain("actual native join lost".into()),
+        ] {
+            let mut failed = retained.clone();
+            let outcome = failed.outcome.as_mut().unwrap();
+            outcome.status = result;
+            outcome.host_settled = false;
+            set.status.as_mut().unwrap().replica_goals = vec![failed];
+            assert!(should_observe_replica(&set, 110, ReplicaId::new(1)));
+        }
+        set.status.as_mut().unwrap().replica_goals = vec![retained.clone()];
         let status = set.status.as_ref().unwrap();
         assert_eq!(
             status
@@ -6826,6 +6845,44 @@ mod tests {
             stale.digest = stale.goal.intent().input_digest;
             stale.outcome.as_mut().unwrap().goal = stale.goal.clone();
             set.status.as_mut().unwrap().replica_goals = vec![stale];
+            assert!(!should_observe_replica(&set, 110, ReplicaId::new(1)));
+        }
+        let mut inspection = goal;
+        inspection.operation_id = OperationId::new("fresh-inspection");
+        inspection.desired = ReplicaGoalKind::Discover;
+        inspection.scope.process_session_id = ProcessSessionId::new("fresh-process");
+        inspection.scope.creation_id = ReplicatorCreationId::new("fresh-creation");
+        set.status.as_mut().unwrap().replica_goals =
+            vec![crate::crd::RetainedReplicaGoal::new(inspection.clone()).unwrap()];
+        assert!(should_observe_replica(&set, 110, ReplicaId::new(1)));
+        assert_eq!(
+            set.status
+                .as_ref()
+                .unwrap()
+                .public_v1_topology
+                .as_ref()
+                .unwrap()
+                .unavailable_primary_id,
+            Some(ReplicaId::new(1))
+        );
+        for changed in 0..4 {
+            let mut crossed = inspection.clone();
+            match changed {
+                0 => crossed.scope.process_session_id = endpoint.process_session_id.clone(),
+                1 => crossed.scope.creation_id = endpoint.replicator_creation_id.clone(),
+                2 => {
+                    crossed.scope.storage.storage_generation =
+                        StorageGeneration::new("crossed-inspection-storage")
+                }
+                _ => {
+                    crossed.desired = ReplicaGoalKind::Reconfigure {
+                        role: ReplicaRole::Primary,
+                        catch_up: None,
+                    }
+                }
+            }
+            set.status.as_mut().unwrap().replica_goals =
+                vec![crate::crd::RetainedReplicaGoal::new(crossed).unwrap()];
             assert!(!should_observe_replica(&set, 110, ReplicaId::new(1)));
         }
     }

@@ -39,6 +39,18 @@ use super::replica_manager::{CatchupMode, CompletionError, CompletionReceiver};
 use super::role::{DataLossEnd, Role, RoleConfig, RoleError, RoleReplicator, RoleStatus};
 use super::secondary::{SecondaryError, SecondaryHandle};
 
+mod build_provenance;
+mod warm_source_transfer;
+
+#[cfg(test)]
+pub(crate) async fn check_build_binding_context(
+    context: &crate::replicator::ReplicatorFactoryContext,
+    json: &[u8],
+) -> crate::Result<()> {
+    let binding = serde_json::from_slice(json)
+        .map_err(|error| crate::RuntimeError::InvalidReplication(error.to_string()))?;
+    build_provenance::check(context, &binding).await.map(|_| ())
+}
 pub(super) mod engine_session;
 mod facade;
 mod production;
@@ -55,6 +67,7 @@ pub(crate) enum LifecycleObservation {
     Ready(crate::protocol::types::ReplicaRole),
     Closed,
     Faulted,
+    EpochApplied(Epoch),
     TransportQuorum {
         epoch: Epoch,
         revision: u64,
@@ -113,6 +126,7 @@ pub(super) struct ServiceReplicator {
     registry: MessageRegistry,
     control: Option<Control>,
     retained_epoch: Option<Epoch>,
+    reconstructed_primary_epoch: Option<Epoch>,
     observe: Option<Arc<dyn Fn(LifecycleObservation) + Send + Sync>>,
 }
 
@@ -120,6 +134,7 @@ pub(super) struct ServiceReplicator {
 enum Control {
     ChangeRole,
     RestoreRetained(Epoch),
+    ReconstructPrimary(Epoch),
     UpdateEpoch,
     Progress,
     DataLoss,
@@ -151,6 +166,7 @@ impl ServiceReplicator {
             write_access: Arc::new(Mutex::new(write_access)),
             write_admission: None,
             retained_receiver: Arc::new(Mutex::new(None)),
+            demotion_receiver: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             before_assignment: None,
         };
@@ -162,6 +178,7 @@ impl ServiceReplicator {
             registry,
             control: None,
             retained_epoch: None,
+            reconstructed_primary_epoch: None,
             observe: None,
         })
     }
@@ -203,6 +220,7 @@ impl ServiceReplicator {
             Target::Unavailable(self.owner.status())
         };
         *self.target.lock().unwrap() = target;
+        *self.service.demotion_receiver.lock().unwrap() = self.owner.demotion_secondary();
     }
 
     fn select(
@@ -344,10 +362,15 @@ impl ServiceReplicator {
                         secondary: self.owner.secondary()?,
                         bound: AtomicBool::new(false),
                         draining: AtomicBool::new(false),
+                        consuming: AtomicBool::new(false),
                     }));
+            }
+            Control::ReconstructPrimary(epoch) => {
+                self.reconstructed_primary_epoch = Some(epoch);
             }
             Control::ChangeRole => {
                 self.retained_epoch = None;
+                self.reconstructed_primary_epoch = None;
                 self.service.retained_receiver.lock().unwrap().take();
             }
             _ => {}
@@ -440,6 +463,7 @@ pub(super) struct ServiceHandle {
     write_access: Arc<Mutex<Arc<dyn Fn() -> WriteAccess + Send + Sync>>>,
     write_admission: Option<Arc<Mutex<()>>>,
     retained_receiver: Arc<Mutex<Option<Arc<RetainedReceiver>>>>,
+    demotion_receiver: Arc<Mutex<Option<SecondaryHandle>>>,
     #[cfg(test)]
     before_assignment: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -448,9 +472,27 @@ struct RetainedReceiver {
     secondary: SecondaryHandle,
     bound: AtomicBool,
     draining: AtomicBool,
+    consuming: AtomicBool,
 }
 
 impl ServiceHandle {
+    fn demotion_receiver(&self, epoch: Epoch) -> Result<SecondaryHandle, AdapterError> {
+        let root = self
+            .demotion_receiver
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(AdapterError::InvalidState(RoleStatus::Opened))?;
+        let Target::Secondary(current) = self.target()? else {
+            return Err(AdapterError::InvalidState(RoleStatus::Opened));
+        };
+        if !root.same_instance(&current) {
+            return Err(AdapterError::OwnerDropped);
+        }
+        root.check_demotion_root(epoch)?;
+        Ok(root)
+    }
+
     pub(super) fn idle_replica_ids(&self) -> Result<Vec<i64>, AdapterError> {
         match self.target()? {
             Target::Primary(primary) => Ok(primary.idle_replica_ids()?),
@@ -605,6 +647,11 @@ impl Stream for ServiceStream {
         if this.terminated {
             return Poll::Ready(None);
         }
+        if matches!(this.kind, StreamKind::Replication)
+            && let Some(receiver) = &this.retained_receiver
+        {
+            receiver.consuming.store(true, Ordering::Release);
+        }
         loop {
             match Pin::new(&mut this.stream).poll_next(cx) {
                 Poll::Ready(Some(Ok(StreamEvent::Operation(operation)))) => {
@@ -624,10 +671,25 @@ impl Stream for ServiceStream {
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error.into()))),
                 Poll::Ready(None) => {
                     this.terminated = true;
+                    if matches!(this.kind, StreamKind::Replication)
+                        && let Some(receiver) = &this.retained_receiver
+                    {
+                        receiver.consuming.store(false, Ordering::Release);
+                    }
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
             }
+        }
+    }
+}
+
+impl Drop for ServiceStream {
+    fn drop(&mut self) {
+        if matches!(self.kind, StreamKind::Replication)
+            && let Some(receiver) = &self.retained_receiver
+        {
+            receiver.consuming.store(false, Ordering::Release);
         }
     }
 }

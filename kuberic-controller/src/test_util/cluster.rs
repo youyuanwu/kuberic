@@ -93,6 +93,8 @@ struct Hosted<F: ApplicationFactory> {
     process: Option<ProcessMember>,
     network: Network,
     uid: String,
+    reconstruction_join_attempted: bool,
+    reconstruction_join_failure: Option<String>,
 }
 
 impl<F: ApplicationFactory> Hosted<F> {
@@ -103,6 +105,9 @@ impl<F: ApplicationFactory> Hosted<F> {
     async fn stop_with_routes(mut self, forget_routes: bool) -> Result<()> {
         self.startup_shutdown.send_replace(true);
         let mut errors = Vec::new();
+        if let Some(error) = &self.reconstruction_join_failure {
+            errors.push(anyhow!(error.clone()));
+        }
         let process_hosted = self.process.is_some();
         if let Some(process) = self.process.take()
             && let Err(error) = process.stop().await
@@ -118,7 +123,9 @@ impl<F: ApplicationFactory> Hosted<F> {
         }
         if let Some(mut running) = self.running.take() {
             running.shutdown();
-            if let Err(error) = running.wait().await {
+            if !self.reconstruction_join_attempted
+                && let Err(error) = running.wait().await
+            {
                 errors.push(error.into());
             }
         }
@@ -236,6 +243,12 @@ struct SupervisorState<F: ApplicationFactory> {
     held_deletions: Arc<std::sync::Mutex<BTreeSet<String>>>,
     drains: Vec<JoinHandle<Result<()>>>,
     reaped_members: Vec<serde_json::Value>,
+    metadata_images: BTreeMap<String, MetadataImageOwner>,
+}
+
+struct MetadataImageOwner {
+    path: PathBuf,
+    predecessor: Option<kuberic_runtime::testing::JoinedReplicaExclusion>,
 }
 
 impl<F: ApplicationFactory> Default for SupervisorState<F> {
@@ -246,6 +259,7 @@ impl<F: ApplicationFactory> Default for SupervisorState<F> {
             held_deletions: Arc::default(),
             drains: Vec::new(),
             reaped_members: Vec::new(),
+            metadata_images: BTreeMap::new(),
         }
     }
 }
@@ -335,10 +349,12 @@ impl<F: ApplicationFactory> Harness<F> {
             || configuration.members.len() != expected
             || status.replica_goals.iter().any(|entry| {
                 entry.validate().is_err()
-                    || entry
-                        .outcome
-                        .as_ref()
-                        .is_none_or(|outcome| outcome.status != ReplicaGoalStatus::Achieved)
+                    || entry.outcome.as_ref().is_none_or(|outcome| {
+                        outcome.status != ReplicaGoalStatus::Achieved
+                            && !crate::ordinary_reconciliation::obsolete_goal_reconstructed(
+                                status, snapshots, entry,
+                            )
+                    })
             })
         {
             return false;
@@ -378,10 +394,12 @@ impl<F: ApplicationFactory> Harness<F> {
                                         entry.goal.desired,
                                         ReplicaGoalKind::Reconfigure { .. }
                                             | ReplicaGoalKind::RefreshPrimary { .. }
+                                            | ReplicaGoalKind::RecoverContainedCreation { .. }
                                     )
                                     && snapshot.goals.iter().any(|observation| {
                                         observation.goal == entry.goal
                                             && observation.status == ReplicaGoalStatus::Achieved
+                                            && observation.host_settled
                                     })
                             })
                     })
@@ -393,6 +411,7 @@ impl<F: ApplicationFactory> Harness<F> {
         })
     }
 
+    #[cfg(test)]
     pub(super) async fn new(
         factory: F,
         namespace: String,
@@ -402,9 +421,48 @@ impl<F: ApplicationFactory> Harness<F> {
         teardown_timeout: Duration,
         initial_replicas: u32,
     ) -> Result<Self> {
+        Self::from_builder(ClusterBuilder {
+            factory,
+            namespace,
+            name,
+            image,
+            timeout,
+            teardown_timeout,
+            initial_replicas,
+            storage_parent: None,
+        })
+        .await
+    }
+
+    async fn from_builder(builder: ClusterBuilder<F>) -> Result<Self> {
+        let ClusterBuilder {
+            factory,
+            namespace,
+            name,
+            image,
+            timeout,
+            teardown_timeout,
+            initial_replicas,
+            storage_parent: selected_storage,
+        } = builder;
         let api = TestApi::new(&namespace);
         let reconciler = Self::reconciler(&api, &namespace)?;
-        let storage_parent = storage_parent()?;
+        let storage_parent = if let Some(root) = selected_storage {
+            if !root.is_absolute()
+                || !std::fs::symlink_metadata(&root)?.is_dir()
+                || root.canonicalize()? != root
+                || root.parent().is_none()
+            {
+                return Err(TestError::new(
+                    ErrorKind::InvalidConfiguration,
+                    "storage parent must be an existing canonical caller-owned directory",
+                )
+                .into());
+            }
+            root
+        } else {
+            storage_parent()?
+        };
         std::fs::create_dir_all(&storage_parent)?;
         let root = tempfile::Builder::new()
             .prefix("scenario-")
@@ -961,6 +1019,28 @@ impl<F: ApplicationFactory> Harness<F> {
             Ok(())
         } else {
             let path = self.root.take().unwrap().keep();
+            let mut resources = snapshot(&self.api);
+            resources.iter_mut().for_each(redact);
+            let full_resources = path.join("failure-resources.json");
+            let retained_resources = (|| -> Result<()> {
+                use std::io::Write;
+                let bytes = serde_json::to_vec_pretty(&resources)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&full_resources)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if let Err(error) = retained_resources {
+                errors.push(error.context("retain full redacted failure resources"));
+            } else {
+                eprintln!(
+                    "full redacted failure resources: {}",
+                    full_resources.display()
+                );
+            }
             let kind = if errors.len() > scenario_errors {
                 super::ErrorKind::Cleanup
             } else {
@@ -1247,6 +1327,12 @@ async fn supervise<F: ApplicationFactory>(
                         .collect(),
                 );
             }
+            if let Some(image) = state.metadata_images.get_mut(&uid) {
+                host = host.with_metadata_image_path(image.path.clone())?;
+                if let Some(predecessor) = image.predecessor.take() {
+                    host = host.with_joined_predecessor(predecessor);
+                }
+            }
             Some(host)
         } else {
             None
@@ -1299,6 +1385,8 @@ async fn supervise<F: ApplicationFactory>(
                 process,
                 network: network.clone(),
                 uid: uid.clone(),
+                reconstruction_join_attempted: false,
+                reconstruction_join_failure: None,
             },
         );
     }
@@ -1589,8 +1677,16 @@ pub struct ClusterBuilder<F> {
     timeout: Duration,
     teardown_timeout: Duration,
     initial_replicas: u32,
+    storage_parent: Option<PathBuf>,
 }
 impl<F: ApplicationFactory> ClusterBuilder<F> {
+    /// Place this scenario beneath an existing caller-owned canonical directory.
+    /// Application bindings remain confined to their assigned owned directories.
+    pub fn storage_parent(mut self, root: PathBuf) -> Self {
+        self.storage_parent = Some(root);
+        self
+    }
+
     pub fn initial_replicas(mut self, replicas: u32) -> Self {
         self.initial_replicas = replicas;
         self
@@ -1616,6 +1712,7 @@ impl<F: ApplicationFactory> ClusterBuilder<F> {
         self
     }
     pub async fn start(self) -> super::Result<TestCluster<F>> {
+        crate::test_util::native_trace();
         for value in [&self.namespace, &self.name] {
             crate::validate_installation_namespace(value).map_err(|error| {
                 TestError::with_source(
@@ -1638,21 +1735,13 @@ impl<F: ApplicationFactory> ClusterBuilder<F> {
                 "image and positive, representable scenario/teardown timeouts are required",
             ));
         }
-        let core = Harness::new(
-            self.factory,
-            self.namespace,
-            self.name,
-            self.image,
-            self.timeout,
-            self.teardown_timeout,
-            self.initial_replicas,
-        )
-        .await?;
+        let core = Harness::from_builder(self).await?;
         Ok(TestCluster {
             core,
             nonce: uuid::Uuid::new_v4(),
             paused: None,
             stopped_processes: BTreeMap::new(),
+            instruction_holds: BTreeMap::new(),
         })
     }
 }
@@ -1663,6 +1752,7 @@ pub struct TestCluster<F: ApplicationFactory> {
     nonce: uuid::Uuid,
     paused: Option<uuid::Uuid>,
     stopped_processes: BTreeMap<String, ReplicaRef>,
+    instruction_holds: BTreeMap<String, std::sync::Weak<()>>,
 }
 
 impl<F: ApplicationFactory> TestCluster<F> {
@@ -1676,6 +1766,7 @@ impl<F: ApplicationFactory> TestCluster<F> {
             timeout: TIMEOUT,
             teardown_timeout: Duration::from_secs(45),
             initial_replicas: 3,
+            storage_parent: None,
         }
     }
     fn reference(&self, report: &PublicV1AgentReport) -> ReplicaRef {
@@ -1887,6 +1978,18 @@ impl<F: ApplicationFactory> TestCluster<F> {
     /// Read-only native routing counters; these never supply admission evidence.
     pub async fn native_route_counts(&self) -> BTreeMap<String, u64> {
         self.core.network.native_route_counts().await
+    }
+
+    pub async fn hold_native_ingress(
+        &self,
+        reference: &ReplicaRef,
+    ) -> super::Result<super::NativeIngressHold> {
+        self.validate(reference).await?;
+        self.core
+            .network
+            .hold_native_ingress(reference.instance_id())
+            .await
+            .map_err(TestError::from)
     }
 
     /// Exercise the ordinary read-only sampled snapshot RPC for an exact member.
@@ -2142,6 +2245,238 @@ impl<F: ApplicationFactory> TestCluster<F> {
             .await
             .map_err(anyhow::Error::from)?;
         Ok(goal)
+    }
+
+    /// Select a tombstone against an actually published, still-idle target.
+    /// This does not dispatch Build, mutate its selection or certify its drain.
+    pub async fn retain_remove_before_build(
+        &mut self,
+        source: &ReplicaRef,
+        target: &ReplicaRef,
+    ) -> super::Result<ReplicaGoal> {
+        use kuberic_runtime::protocol::public_operations::RemoteReplicaSelection;
+        self.driving()?;
+        self.validate(source).await?;
+        self.validate(target).await?;
+        self.core.cancel_controller_call();
+        let observation = self.observe().await?;
+        let source_snapshot = observation.snapshot(source).context("source missing")?;
+        let target_snapshot = observation.snapshot(target).context("target missing")?;
+        let source_publication = source_snapshot
+            .publication
+            .clone()
+            .context("source unpublished")?;
+        let target_publication = target_snapshot
+            .publication
+            .clone()
+            .context("target unpublished")?;
+        if !(source_publication.stage == ReplicaPublicationStage::AchievedScope
+            && source_publication.role == ReplicaRole::Primary
+            && target_publication.stage == ReplicaPublicationStage::AchievedScope
+            && target_publication.role == ReplicaRole::IdleSecondary
+            && source_snapshot.remote_operations.is_empty()
+            && !source_publication
+                .scope
+                .configuration
+                .current
+                .members
+                .iter()
+                .any(|member| member.identity == *target.identity()))
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "remove-before-Build requires a fresh, unselected idle receiver",
+            ));
+        }
+        let mut set = self.core.set().await?;
+        let status = set.status.as_mut().context("ordinary status missing")?;
+        let remote = RemoteReplicaSelection {
+            original_member: None,
+            source: source_publication.clone(),
+            target: target_publication,
+            target_control_address: self
+                .core
+                .api
+                .snapshot(Kind::Pod)
+                .into_iter()
+                .find(|pod| pod["metadata"]["uid"].as_str() == Some(target.instance_id()))
+                .and_then(|pod| {
+                    pod["metadata"]["annotations"][CONTROL_ADDRESS_ANNOTATION]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .context("target control endpoint missing")?,
+            generation: 1,
+        };
+        let goal = ReplicaGoal {
+            format: kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+            identity: source_snapshot.identity.clone(),
+            operation_id: kuberic_runtime::protocol::types::OperationId::new(format!(
+                "remove-before-build-{}",
+                uuid::Uuid::new_v4()
+            )),
+            revision: status
+                .replica_goals
+                .iter()
+                .map(|entry| entry.goal.revision)
+                .max()
+                .unwrap_or(0)
+                + 1,
+            scope: source_publication.scope,
+            desired: ReplicaGoalKind::Remove {
+                remote: Box::new(remote),
+            },
+        };
+        status
+            .replica_goals
+            .push(crate::crd::RetainedReplicaGoal::new(goal.clone()).map_err(anyhow::Error::msg)?);
+        Api::<KubericSet>::namespaced(self.core.api.client(), &self.core.namespace)
+            .replace_status(&self.core.name, &PostParams::default(), &set)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(goal)
+    }
+
+    /// Replay through the actual authenticated agent endpoint. This is not a
+    /// controller acceptance and cannot bypass production freshness checks.
+    pub async fn submit_ordinary_goal(
+        &mut self,
+        replica: &ReplicaRef,
+        goal: &ReplicaGoal,
+    ) -> super::Result<ReplicaAgentSnapshot> {
+        self.request_ordinary_goal(replica, goal, false).await
+    }
+
+    /// Exercise the actual ACK RPC, including negative outcomes and errors
+    /// returned after its SQLite transaction. Does not publish controller success.
+    pub async fn acknowledge_ordinary_goal(
+        &mut self,
+        replica: &ReplicaRef,
+        goal: &ReplicaGoal,
+    ) -> super::Result<ReplicaAgentSnapshot> {
+        self.driving()?;
+        self.core.cancel_controller_call();
+        self.request_ordinary_goal(replica, goal, true).await
+    }
+
+    /// Detached actual journal and access gate, not fixture-created receipts.
+    pub async fn addition_ack_observation(
+        &self,
+        replica: &ReplicaRef,
+    ) -> super::Result<(serde_json::Value, bool)> {
+        self.validate(replica).await?;
+        let handle = self
+            .core
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .get(replica.instance_id())
+            .and_then(|host| host.running.as_ref())
+            .context("addition ACK actor absent")?
+            .handle();
+        handle
+            .public_v1_addition_ack_observation()
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(TestError::from)
+    }
+
+    /// Settle only this selected actor while another actor's controller
+    /// acceptance is deliberately not driven. Persist the actual joined host
+    /// reply, never a fixture-created completion or native readiness value.
+    pub async fn acknowledge_retained_goal(
+        &mut self,
+        replica: &ReplicaRef,
+        goal: &ReplicaGoal,
+    ) -> super::Result<ReplicaAgentSnapshot> {
+        self.driving()?;
+        self.core.cancel_controller_call();
+        let snapshot = self.request_ordinary_goal(replica, goal, true).await?;
+        let actual = snapshot
+            .goals
+            .iter()
+            .find(|entry| {
+                entry.goal == *goal
+                    && entry.status == ReplicaGoalStatus::Achieved
+                    && entry.host_settled
+                    && entry.selected_call.is_none()
+            })
+            .context("acknowledgement lacks actual successful joined completion")?;
+        let mut set = self.core.set().await?;
+        let selected = set
+            .status
+            .as_mut()
+            .context("ordinary status missing")?
+            .replica_goals
+            .iter_mut()
+            .find(|entry| entry.goal == *goal)
+            .context("acknowledged goal was not selected")?;
+        selected.outcome = Some(actual.clone());
+        Api::<KubericSet>::namespaced(self.core.api.client(), &self.core.namespace)
+            .replace_status(&self.core.name, &PostParams::default(), &set)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(snapshot)
+    }
+
+    async fn request_ordinary_goal(
+        &mut self,
+        replica: &ReplicaRef,
+        goal: &ReplicaGoal,
+        acknowledge: bool,
+    ) -> super::Result<ReplicaAgentSnapshot> {
+        self.validate(replica).await?;
+        let pod = self
+            .core
+            .api
+            .snapshot(Kind::Pod)
+            .into_iter()
+            .find(|pod| pod["metadata"]["uid"].as_str() == Some(replica.instance_id()))
+            .context("goal endpoint missing")?;
+        let endpoint = pod["metadata"]["annotations"][CONTROL_ADDRESS_ANNOTATION]
+            .as_str()
+            .context("goal endpoint unpublished")?;
+        let request = kuberic_runtime::control::proto::ReplicaGoalRequest {
+            protocol_version: kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+            canonical_json: if acknowledge {
+                serde_json::to_vec(
+                    &kuberic_runtime::protocol::public_operations::ReplicaGoalAcknowledgement {
+                        goal: goal.clone(),
+                        logically_retired: false,
+                    },
+                )
+            } else {
+                serde_json::to_vec(goal)
+            }
+            .map_err(anyhow::Error::from)?,
+        };
+        let agent = GrpcAgentApi::new(pod::RPC_DEADLINE);
+        let response = if acknowledge {
+            agent
+                .acknowledge_goal(endpoint, "local-test-token", request)
+                .await
+        } else {
+            agent
+                .submit_goal(endpoint, "local-test-token", request)
+                .await
+        }
+        .map_err(crate::cluster_api::map_agent_effect_error)
+        .map_err(anyhow::Error::from)?;
+        let snapshot: ReplicaAgentSnapshot =
+            serde_json::from_slice(&response.canonical_json).map_err(anyhow::Error::from)?;
+        if response.protocol_version
+            != kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT
+            || snapshot.storage != *replica.storage_incarnation()
+            || snapshot.process_session_id != *replica.process_session_id()
+            || snapshot.creation_id != *replica.replicator_creation_id()
+        {
+            return Err(TestError::new(
+                ErrorKind::Fatal,
+                "submitted goal observation crossed its exact actor",
+            ));
+        }
+        Ok(snapshot)
     }
     pub async fn drive<T, E>(
         &mut self,
@@ -2531,6 +2866,492 @@ impl<F: ApplicationFactory> TestCluster<F> {
             ),
         })
     }
+
+    /// Arm before dispatch while the canonical controller Intent is held.
+    /// The index comes from the actual runtime freeze, not a universal recipe.
+    pub async fn arm_instruction(
+        &mut self,
+        participant: &ReplicaRef,
+        goal: &kuberic_runtime::protocol::public_operations::ReplicaGoal,
+        instruction: &str,
+        position: super::InstructionPosition,
+    ) -> super::Result<super::InstructionCut> {
+        self.arm_instruction_result(participant, goal, instruction, position, None, false)
+            .await
+    }
+
+    pub async fn arm_addition_current_failure(
+        &mut self,
+        participant: &ReplicaRef,
+        goal: &ReplicaGoal,
+    ) -> super::Result<super::InstructionCut> {
+        if !matches!(&goal.desired, ReplicaGoalKind::RecoverContainedCreation { recovery }
+            if recovery.addition.as_ref().is_some_and(|addition| addition.phase
+                == kuberic_runtime::protocol::public_operations::MembershipAdditionPhase::Current))
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "application failure injection requires the exact addition Current goal",
+            ));
+        }
+        self.arm_instruction_result(
+            participant,
+            goal,
+            "ApplicationRole",
+            super::InstructionPosition::FailureBeforeReceipt,
+            None,
+            true,
+        )
+        .await
+    }
+
+    pub async fn arm_build_failure(
+        &mut self,
+        participant: &ReplicaRef,
+        goal: &ReplicaGoal,
+        failure: kuberic_runtime::testing::PublicBuildFailure,
+        position: super::InstructionPosition,
+    ) -> super::Result<super::InstructionCut> {
+        if !matches!(goal.desired, ReplicaGoalKind::Build { .. })
+            || !matches!(
+                position,
+                super::InstructionPosition::FailureBeforeReceipt
+                    | super::InstructionPosition::FailureRecorded
+            )
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "Build result injection requires its exact failure observation boundary",
+            ));
+        }
+        self.arm_instruction_result(participant, goal, "Build", position, Some(failure), false)
+            .await
+    }
+
+    async fn arm_instruction_result(
+        &mut self,
+        participant: &ReplicaRef,
+        goal: &ReplicaGoal,
+        instruction: &str,
+        position: super::InstructionPosition,
+        failure: Option<kuberic_runtime::testing::PublicBuildFailure>,
+        addition_current_failure: bool,
+    ) -> super::Result<super::InstructionCut> {
+        self.validate(participant).await?;
+        if goal.scope.storage != *participant.storage_incarnation()
+            || goal.scope.process_session_id != *participant.process_session_id()
+            || goal.scope.creation_id != *participant.replicator_creation_id()
+            || self
+                .instruction_holds
+                .get(participant.instance_id())
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "instruction cut actor/goal is crossed or already held",
+            ));
+        }
+        let handle = {
+            let state = self.core.supervisor.lock().await;
+            let host = state.hosts.get(participant.instance_id()).ok_or_else(|| {
+                TestError::new(ErrorKind::InvalidReference, "instruction actor is absent")
+            })?;
+            if host.process.is_some() {
+                return Err(TestError::new(
+                    ErrorKind::UnsupportedCapability,
+                    "actor-local cut forwarding is not installed in process members",
+                ));
+            }
+            host.running
+                .as_ref()
+                .ok_or_else(|| {
+                    TestError::new(ErrorKind::InvalidReference, "instruction actor is not live")
+                })?
+                .handle()
+        };
+        let recipe = handle
+            .public_v1_instruction_recipe(goal)
+            .await
+            .map_err(anyhow::Error::new)?;
+        let index = recipe
+            .iter()
+            .position(|name| name == instruction)
+            .ok_or_else(|| {
+                TestError::new(
+                    ErrorKind::InvalidConfiguration,
+                    "instruction is absent from the actual frozen recipe",
+                )
+            })?;
+        if recipe
+            .iter()
+            .filter(|name| name.as_str() == instruction)
+            .count()
+            != 1
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "instruction name is ambiguous in the actual frozen recipe",
+            ));
+        }
+        let cut = Arc::new(if addition_current_failure {
+            kuberic_runtime::testing::PublicOperationCut::for_addition_current_failure(goal, index)
+        } else if let Some(failure) = failure {
+            kuberic_runtime::testing::PublicOperationCut::for_build_failure(
+                goal,
+                failure,
+                position.runtime(),
+                index,
+            )
+        } else {
+            kuberic_runtime::testing::PublicOperationCut::for_instruction(
+                goal,
+                instruction,
+                position.runtime(),
+                index,
+            )
+        });
+        let owner = Arc::new(());
+        self.instruction_holds
+            .insert(participant.instance_id().to_owned(), Arc::downgrade(&owner));
+        handle.set_public_operation_cut(Some(cut.clone()));
+        Ok(super::InstructionCut {
+            cluster: self.nonce,
+            participant: participant.clone(),
+            goal: goal.clone(),
+            instruction: instruction.to_owned(),
+            position,
+            index,
+            recipe,
+            build_failure: failure,
+            cut,
+            handle,
+            _owner: owner,
+            evidence: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Drive to the local hook, then authenticate its actual pending journal
+    /// projection. Releasing a cut never certifies callback/cleanup completion.
+    pub async fn enter_instruction(
+        &mut self,
+        cut: &super::InstructionCut,
+    ) -> super::Result<super::InstructionEvidence> {
+        self.driving()?;
+        if cut.cluster != self.nonce {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "instruction cut belongs to another cluster",
+            ));
+        }
+        loop {
+            self.check().await?;
+            tokio::select! {
+                _ = cut.cut.entered.notified() => break,
+                result = self.core.step() => result.map_err(TestError::from)?,
+            }
+        }
+        self.core.cancel_controller_call();
+        self.validate(&cut.participant).await?;
+        let recipe = cut
+            .handle
+            .public_v1_instruction_recipe(&cut.goal)
+            .await
+            .map_err(anyhow::Error::new)?;
+        let snapshots = self
+            .core
+            .ordinary_snapshots()
+            .await
+            .map_err(TestError::from)?;
+        let observation = snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.storage == cut.goal.scope.storage
+                    && snapshot.process_session_id == cut.goal.scope.process_session_id
+                    && snapshot.creation_id == cut.goal.scope.creation_id
+            })
+            .and_then(|snapshot| snapshot.goals.iter().find(|entry| entry.goal == cut.goal))
+            .ok_or_else(|| {
+                TestError::new(
+                    ErrorKind::InvalidReference,
+                    "held instruction has no exact journal observation",
+                )
+            })?;
+        let failed = cut.position == super::InstructionPosition::FailureRecorded;
+        let receipt = cut.position == super::InstructionPosition::Receipt
+            || (failed
+                && cut.build_failure
+                    == Some(kuberic_runtime::testing::PublicBuildFailure::TypedRemote));
+        if recipe != cut.recipe
+            || if failed {
+                !matches!(observation.status, ReplicaGoalStatus::Failed(_))
+            } else {
+                observation.status != ReplicaGoalStatus::Pending
+            }
+            || observation.receipts != cut.index + usize::from(receipt)
+            || if receipt {
+                observation.selected_call.is_some()
+            } else {
+                observation.selected_call.as_deref() != Some(cut.instruction.as_str())
+            }
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "actual instruction/receipt boundary differs from the armed canonical cut",
+            ));
+        }
+        let evidence = super::InstructionEvidence {
+            goal: cut.goal.clone(),
+            instruction: cut.instruction.clone(),
+            position: cut.position,
+            index: cut.index,
+            recipe,
+            selected_call: observation.selected_call.clone(),
+            receipts: observation.receipts,
+        };
+        *cut.evidence.lock().unwrap() = Some(evidence.clone());
+        Ok(evidence)
+    }
+    /// Capture only the consistently committed agent metadata at a verified
+    /// held boundary; no application bytes or ownership proof are cloned.
+    pub async fn capture_instruction_image(
+        &mut self,
+        cut: &super::InstructionCut,
+    ) -> super::Result<super::InstructionImage> {
+        if cut.cluster != self.nonce {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "foreign instruction image",
+            ));
+        }
+        self.validate(&cut.participant).await?;
+        let evidence = cut.evidence.lock().unwrap().clone().ok_or_else(|| {
+            TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "instruction entry was not authenticated",
+            )
+        })?;
+        let bytes = cut
+            .handle
+            .public_v1_metadata_image(
+                &evidence.goal,
+                evidence.selected_call.as_deref(),
+                evidence.receipts,
+            )
+            .map_err(anyhow::Error::new)?;
+        Ok(super::InstructionImage {
+            cluster: self.nonce,
+            participant: cut.participant.clone(),
+            bytes,
+            evidence,
+        })
+    }
+
+    /// Image-plus-actual-join fixture, not an abrupt OS crash. The original
+    /// authority file and sole real application root are never overwritten.
+    pub async fn reopen_instruction_image(
+        &mut self,
+        image: super::InstructionImage,
+    ) -> super::Result<ReplicaRef> {
+        self.reopen_metadata_image(image.cluster, image.participant, image.bytes)
+            .await
+    }
+
+    /// Only a committed no-callback tombstone can use this capture. In
+    /// particular, an in-flight Build or Remove effect cannot use this seam.
+    pub async fn capture_tombstone_image(
+        &mut self,
+        participant: &ReplicaRef,
+        goal: &ReplicaGoal,
+    ) -> super::Result<super::TombstoneImage> {
+        self.validate(participant).await?;
+        let handle = self
+            .core
+            .supervisor
+            .lock()
+            .await
+            .hosts
+            .get(participant.instance_id())
+            .and_then(|host| host.running.as_ref())
+            .context("tombstone host absent")?
+            .handle();
+        let recipe = handle
+            .public_v1_instruction_recipe(goal)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let observation = self.observe().await?;
+        let snapshot = observation
+            .snapshot(participant)
+            .context("tombstone actor absent")?;
+        if !matches!(goal.desired, ReplicaGoalKind::Remove { .. })
+            || !recipe.is_empty()
+            || !snapshot.goals.iter().any(|entry| entry.goal == *goal
+                && entry.status == ReplicaGoalStatus::Achieved && entry.receipts == 0
+                && entry.selected_call.is_none())
+            || !snapshot.remote_operations.iter().any(|entry| {
+                matches!(&goal.desired, ReplicaGoalKind::Remove { remote }
+                    if entry.selection == **remote
+                        && entry.state == kuberic_runtime::protocol::public_operations::RemoteReplicaState::Dropped)
+            })
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidConfiguration,
+                "tombstone image requires actual completed no-callback removal",
+            ));
+        }
+        let bytes = handle
+            .public_v1_metadata_image(goal, None, 0)
+            .map_err(anyhow::Error::from)?;
+        Ok(super::TombstoneImage {
+            cluster: self.nonce,
+            participant: participant.clone(),
+            bytes,
+        })
+    }
+
+    pub async fn reopen_tombstone_image(
+        &mut self,
+        image: super::TombstoneImage,
+    ) -> super::Result<ReplicaRef> {
+        self.reopen_metadata_image(image.cluster, image.participant, image.bytes)
+            .await
+    }
+
+    async fn reopen_metadata_image(
+        &mut self,
+        cluster: uuid::Uuid,
+        participant: ReplicaRef,
+        bytes: Vec<u8>,
+    ) -> super::Result<ReplicaRef> {
+        self.driving()?;
+        let predecessor = &participant;
+        if cluster != self.nonce
+            || self
+                .instruction_holds
+                .get(predecessor.instance_id())
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "release the exact held instruction before joining its actor",
+            ));
+        }
+        self.core.finish_controller_call().await?;
+        self.validate(predecessor).await?;
+        if self
+            .core
+            .network
+            .is_isolated(predecessor.instance_id())
+            .await
+        {
+            return Err(TestError::new(
+                ErrorKind::InvalidReference,
+                "heal before joining the image actor",
+            ));
+        }
+        let mut host = {
+            let mut state = self.core.supervisor.lock().await;
+            let host = state
+                .hosts
+                .remove(predecessor.instance_id())
+                .ok_or_else(|| {
+                    TestError::new(ErrorKind::InvalidReference, "image actor is absent")
+                })?;
+            if host.process.is_some() || host.running.is_none() {
+                state
+                    .hosts
+                    .insert(predecessor.instance_id().to_owned(), host);
+                return Err(TestError::new(
+                    ErrorKind::UnsupportedCapability,
+                    "metadata-image fixture requires the actual in-process running host",
+                ));
+            }
+            state.stopped.insert(predecessor.instance_id().to_owned());
+            host
+        };
+        let data_root = host.data_root.clone();
+        host.startup_shutdown.send_replace(true);
+        host.reconstruction_join_attempted = true;
+        let joined = {
+            let running = host.running.as_mut().unwrap();
+            running.shutdown();
+            running.join_for_reconstruction().await
+        };
+        let witness = match joined {
+            Ok(witness) => witness,
+            Err(error) => {
+                host.reconstruction_join_failure = Some(error.to_string());
+                self.core
+                    .supervisor
+                    .lock()
+                    .await
+                    .hosts
+                    .insert(predecessor.instance_id().to_owned(), host);
+                return Err(anyhow::Error::new(error).into());
+            }
+        };
+        if let Err(error) = host.factory.shutdown_and_drain(host.service.clone()).await {
+            host.reconstruction_join_failure = Some(error.to_string());
+            self.core
+                .supervisor
+                .lock()
+                .await
+                .hosts
+                .insert(predecessor.instance_id().to_owned(), host);
+            return Err(error);
+        }
+        if let Err(error) = self.core.network.forget(predecessor.instance_id()).await {
+            host.reconstruction_join_failure = Some(format!("{error:#}"));
+            self.core
+                .supervisor
+                .lock()
+                .await
+                .hosts
+                .insert(predecessor.instance_id().to_owned(), host);
+            return Err(error.into());
+        }
+        // Drop the exact old route registration only after the actual joins.
+        drop(host);
+        let parent = data_root
+            .join(".kuberic")
+            .join("images")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&parent)?;
+        let path = parent.join("agent.sqlite3");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        std::fs::File::open(&parent)?.sync_all()?;
+        {
+            let mut state = self.core.supervisor.lock().await;
+            state.metadata_images.insert(
+                predecessor.instance_id().to_owned(),
+                MetadataImageOwner {
+                    path,
+                    predecessor: Some(witness),
+                },
+            );
+            state.stopped.remove(predecessor.instance_id());
+        }
+        loop {
+            self.check().await?;
+            let observed = self.observe().await?;
+            if let Some((fresh, _)) = observed.snapshots().find(|(fresh, _)| {
+                fresh.identity() == predecessor.identity()
+                    && fresh.storage_incarnation() == predecessor.storage_incarnation()
+                    && fresh.process_session_id() != predecessor.process_session_id()
+                    && fresh.replicator_creation_id() != predecessor.replicator_creation_id()
+            }) {
+                return Ok(fresh.clone());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub fn completion_status_conflict(&mut self) -> super::Result<super::CompletionConflict> {
         self.driving()?;
         Ok(super::CompletionConflict {

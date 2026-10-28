@@ -313,11 +313,14 @@ async fn actual_v1_controller_terminal(fault: u8) -> Result<()> {
                 && completion.status != ReplicaGoalStatus::Pending {
                 ensure!(snapshot.publication.is_none() && snapshot.withdrawn);
                 ensure!(snapshot.read_status != AccessStatus::Granted && snapshot.write_status != AccessStatus::Granted);
+                if fault == 0 && completion.status == ReplicaGoalStatus::Achieved && !completion.host_settled {
+                    continue;
+                }
                 break (completion.clone(), snapshot.provider_writer_held);
             }
         };
         if fault == 0 {
-            ensure!(completion.status == ReplicaGoalStatus::Achieved && !writer);
+            ensure!(completion.status == ReplicaGoalStatus::Achieved && completion.host_settled && !writer);
         } else {
             ensure!(writer);
             ensure!(matches!(&completion.status, ReplicaGoalStatus::Failed(detail)
@@ -370,7 +373,7 @@ async fn actual_v1_controller_undeclared_role_failure_is_not_retried() -> Result
             harness.cluster.step().await?;
             let observed = harness.cluster.observe().await?;
             let snapshot = observed.snapshot(&target).context("Role target missing")?;
-            if snapshot.goals.iter().any(|entry| matches!(entry.goal.desired, ReplicaGoalKind::Prepare { role: ReplicaRole::IdleSecondary })
+            if snapshot.goals.iter().any(|entry| matches!(entry.goal.desired, ReplicaGoalKind::Prepare { role: ReplicaRole::IdleSecondary, .. })
                 && matches!(&entry.status, ReplicaGoalStatus::Failed(detail) if detail.contains("injected undeclared KV application Role failure"))) {
                 break snapshot.clone();
             }
@@ -900,7 +903,8 @@ async fn ordinary_primary_role_barriers_retain_exact_goal_across_recreation() ->
             ensure!(matches!(
                 frozen.goal().context("role goal missing")?.goal.desired,
                 ReplicaGoalKind::Prepare {
-                    role: ReplicaRole::Primary
+                    role: ReplicaRole::Primary,
+                    ..
                 } | ReplicaGoalKind::Reconfigure {
                     role: ReplicaRole::Primary,
                     ..
@@ -1190,7 +1194,8 @@ async fn ordinary_primary_process_reopen_preserves_quorum_data_and_fences_old_se
                 matches!(
                     entry.goal.desired,
                     ReplicaGoalKind::Prepare {
-                        role: kuberic_runtime::protocol::types::ReplicaRole::Primary
+                        role: kuberic_runtime::protocol::types::ReplicaRole::Primary,
+                        ..
                     }
                 ) && entry.goal.scope.configuration.current.members.len() == 1
             })
@@ -1315,6 +1320,104 @@ async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopped_primary_failover_preserves_acknowledged_data() -> Result<()> {
     stopped_primary_failover(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_controller_inspection_round_selects_from_actual_warm_results() -> Result<()> {
+    use kuberic_runtime::protocol::public_operations::*;
+    let mut harness = Harness::new().await?;
+    let result = async {
+        harness.write("inspection-prefix", "retained").await?;
+        let primary = harness.ready().await?;
+        let before = harness
+            .set()
+            .await?
+            .status
+            .unwrap()
+            .public_v1_topology
+            .unwrap()
+            .configuration()
+            .map_err(anyhow::Error::msg)?;
+        harness.stop(primary, false).await?;
+        let mut printed = false;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                harness.step().await?;
+                let observation = harness.cluster.observe().await?;
+                let status = observation.set().status.as_ref().unwrap();
+                let rounds = status
+                    .replica_goals
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry.goal.desired, ReplicaGoalKind::Discover)
+                            && entry.goal.scope.configuration.previous.as_ref() == Some(&before)
+                    })
+                    .collect::<Vec<_>>();
+                if !printed
+                    && rounds.iter().all(|entry| entry.outcome.is_some())
+                    && !rounds.is_empty()
+                {
+                    eprintln!("actual controller retained inspection rounds: {rounds:?}");
+                    for (_, snapshot) in observation.snapshots() {
+                        eprintln!(
+                            "actual respondent {}: native={:?}",
+                            snapshot.storage.replica.replica_id, snapshot.native_status
+                        );
+                        for round in &rounds {
+                            if let Some(native) = &snapshot.native_status
+                                && round.goal.scope.storage == snapshot.storage
+                            {
+                                eprintln!("actual round comparisons: operation={}, revision={}, scope={}, state={:?}, epoch={:?}, settled={:?}",
+                                    native.input.operation_id == round.goal.operation_id,
+                                    native.input.revision == round.goal.revision,
+                                    native.input.scope == round.goal.scope, native.input.state,
+                                    native.epoch, round.outcome.as_ref().map(|outcome| outcome.host_settled));
+                            }
+                        }
+                    }
+                    printed = true;
+                }
+                if let Some(selected) = status.replica_goals.iter().find(|entry| {
+                    entry.goal.scope.configuration.previous.as_ref() == Some(&before)
+                        && matches!(
+                            entry.goal.desired,
+                            ReplicaGoalKind::Reconfigure {
+                                role: kuberic_runtime::protocol::types::ReplicaRole::Primary,
+                                ..
+                            }
+                        )
+                }) {
+                    ensure!(selected.goal.scope.epoch > before.epoch);
+                    ensure!(
+                        selected.goal.scope.configuration.current.write_quorum
+                            == before.write_quorum
+                    );
+                    ensure!(selected.goal.scope.storage.replica.replica_id.value() != primary);
+                    ensure!(rounds.iter().all(|entry| entry.native_status().is_ok_and(|native|
+                        native.is_some_and(|native| native.input.operation_id == entry.goal.operation_id
+                            && native.input.scope == entry.goal.scope
+                            && native.input.deactivation.is_some()))));
+                    for (_, snapshot) in observation.snapshots() {
+                        let native = snapshot.native_status.as_ref().context("missing actual round")?;
+                        let binding = snapshot.publication.as_ref().context("missing actual binding")?;
+                        ensure!(native.input.scope.epoch == selected.goal.scope.epoch);
+                        ensure!(binding.scope.epoch == before.epoch);
+                        ensure!(binding.scope.configuration.current == before);
+                        ensure!(binding.scope != native.input.scope);
+                    }
+                    ensure!(!status.replica_goals.iter().any(|entry| matches!(
+                        entry.goal.desired,
+                        ReplicaGoalKind::RestoreRetainedMember { .. }
+                    )));
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await??;
+        Ok(())
+    }
+    .await;
+    harness.finish(result).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2605,6 +2708,7 @@ async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> 
                         accepted.goal.desired,
                         ReplicaGoalKind::Prepare {
                             role: ReplicaRole::Primary,
+                            ..
                         } | ReplicaGoalKind::Reconfigure {
                             role: ReplicaRole::Primary,
                             ..

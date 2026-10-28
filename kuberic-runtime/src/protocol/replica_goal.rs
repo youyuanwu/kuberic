@@ -1,6 +1,6 @@
 use super::*;
 
-pub const ORDINARY_ACTION_FORMAT: u32 = 19;
+pub const ORDINARY_ACTION_FORMAT: u32 = 23;
 pub const MAX_REMOTE_SELECTIONS: usize = 256;
 pub const MAX_REMOTE_GENERATIONS: usize = 64;
 
@@ -15,6 +15,161 @@ pub struct RetainedMemberQualification {
     pub configuration: ConfigurationDescriptor,
 }
 
+/// Exact journal dependencies, not certificates of death, drainage or readiness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContainedCreationRecovery {
+    pub predecessor_process_session_id: ProcessSessionId,
+    pub predecessor_creation_id: ReplicatorCreationId,
+    pub predecessor_operations: Vec<OperationId>,
+    pub receiver_settlements: Vec<ContainedReceiverSettlement>,
+    pub role: ReplicaRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catch_up: Option<PublicCatchUpMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addition: Option<Box<MembershipAdditionRecovery>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum MembershipAdditionPhase {
+    Bootstrap,
+    Receiver,
+    Joint,
+    Current,
+}
+
+/// A closed addition template. Historical goals are immutable root references,
+/// not caller-selected instructions or claims of native completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MembershipAdditionRecovery {
+    pub phase: MembershipAdditionPhase,
+    pub admitted: Box<ReplicaGoal>,
+    pub interrupted: Box<ReplicaGoal>,
+    pub source: ProcessSessionEndpoint,
+    pub receiver: ProcessSessionEndpoint,
+    pub bootstrap_epoch: Epoch,
+}
+
+impl MembershipAdditionRecovery {
+    pub fn configuration(
+        &self,
+        phase: MembershipAdditionPhase,
+    ) -> Result<ReplicaConfigurationScope, &'static str> {
+        let project = |original: &ConfigurationDescriptor, offset: i64| {
+            Ok::<_, &'static str>(ConfigurationDescriptor::new(
+                Epoch::new(
+                    self.bootstrap_epoch.data_loss_number,
+                    self.bootstrap_epoch
+                        .configuration_number
+                        .checked_add(offset)
+                        .ok_or("addition recovery epoch exhausted")?,
+                ),
+                original.primary_id,
+                original.members.clone(),
+                original.write_quorum,
+            ))
+        };
+        let bootstrap = project(&self.admitted.scope.configuration.current, 0)?;
+        let joint = project(&self.interrupted.scope.configuration.current, 2)?;
+        let current = match phase {
+            MembershipAdditionPhase::Bootstrap | MembershipAdditionPhase::Receiver => {
+                bootstrap.clone()
+            }
+            MembershipAdditionPhase::Joint => joint,
+            MembershipAdditionPhase::Current => {
+                project(&self.interrupted.scope.configuration.current, 3)?
+            }
+        };
+        Ok(ReplicaConfigurationScope {
+            current,
+            previous: (phase == MembershipAdditionPhase::Joint).then_some(bootstrap),
+            replicas: Vec::new(),
+        })
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        self.source.validate()?;
+        self.receiver.validate()?;
+        let a = &self.admitted.scope.configuration;
+        let c = &self.interrupted.scope.configuration;
+        if self.admitted.format != ORDINARY_ACTION_FORMAT
+            || self.interrupted.format != ORDINARY_ACTION_FORMAT
+            || !matches!(
+                self.admitted.desired,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    catch_up: Some(_)
+                } | ReplicaGoalKind::Prepare {
+                    role: ReplicaRole::Primary,
+                    ..
+                }
+            )
+            || !matches!(
+                self.interrupted.desired,
+                ReplicaGoalKind::Reconfigure {
+                    role: ReplicaRole::Primary,
+                    ..
+                }
+            )
+            || self.admitted.scope.history != self.interrupted.scope.history
+            || self.admitted.scope.storage != self.interrupted.scope.storage
+            || self.admitted.scope.process_session_id != self.interrupted.scope.process_session_id
+            || self.admitted.scope.creation_id != self.interrupted.scope.creation_id
+            || self.admitted.revision >= self.interrupted.revision
+            || self.admitted.identity != self.interrupted.identity
+            || a.previous.is_some()
+            || !a.replicas.is_empty()
+            || a.current.members.len() != 1
+            || a.current.write_quorum != 1
+            || a.current.members[0].identity != self.source.identity
+            || a.current.members[0].role != ReplicaRole::Primary
+            || c.previous.as_ref() != Some(&a.current)
+            || c.current.primary_id != a.current.primary_id
+            || c.current.members.len() != 2
+            || !c.current.members.contains(&a.current.members[0])
+            || !c.current.members.iter().any(|member| {
+                member.identity == self.receiver.identity
+                    && member.role == ReplicaRole::ActiveSecondary
+            })
+            || self.source.storage_incarnation != self.admitted.scope.storage
+            || self.source.role != ReplicaRole::Primary
+            || self.receiver.role != ReplicaRole::IdleSecondary
+            || self.source.process_session_id == self.interrupted.scope.process_session_id
+            || self.source.replicator_creation_id == self.interrupted.scope.creation_id
+            || self.bootstrap_epoch.data_loss_number != self.admitted.scope.history.data_loss_number
+            || self.bootstrap_epoch <= self.interrupted.scope.epoch
+            || self
+                .configuration(MembershipAdditionPhase::Current)
+                .is_err()
+        {
+            return Err("unsupported or crossed membership-addition recovery roots");
+        }
+        self.admitted.validate()?;
+        self.interrupted.validate()?;
+        Ok(())
+    }
+}
+
+/// Names an independently joined receiver goal. The receiver is queried again
+/// by the host; carrying this claim never proves its execution or acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContainedReceiverSettlement {
+    pub source_operation_id: OperationId,
+    pub terminal_goal: Box<ReplicaGoal>,
+}
+
+/// Journal inventory only, including fault-only IDs that are not ordinary
+/// goals. It supplies no exclusion, qualification or recovery permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreationRecoveryDependencies {
+    pub process_session_id: ProcessSessionId,
+    pub creation_id: ReplicatorCreationId,
+    pub operations: Vec<OperationId>,
+}
+
 /// An instruction to the executable to exclude this exact physical owner.
 /// It is neither successful Cleanup nor proof that the process has exited.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -27,6 +182,20 @@ pub struct RetainedRecoveryExitNotice {
     pub history: HistoryContext,
     pub storage: ReplicaStorageIncarnationContext,
     pub qualification: RetainedMemberQualification,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_rebuild: Option<Box<NativeOutOfRangeRebuild>>,
+}
+
+/// Actual GetLSN range decision retained before the selected ordinary Close.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeOutOfRangeRebuild {
+    pub source: ReplicaPublication,
+    pub source_inspection: Box<ReplicaGoal>,
+    pub target_inspection: Box<ReplicaGoal>,
+    pub source_last: i64,
+    pub source_first: i64,
+    pub target_last: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -199,10 +368,15 @@ pub struct RemoteReplicaSelection {
     pub target: ReplicaPublication,
     pub target_control_address: String,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_member: Option<Box<ReplicaGoal>>,
 }
 
 impl RemoteReplicaSelection {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.original_member.is_some() {
+            return self.validate_original_member();
+        }
         self.source.validate()?;
         self.target.validate()?;
         let source_configuration = &self.source.scope.configuration;
@@ -260,6 +434,86 @@ impl RemoteReplicaSelection {
         }
         Ok(())
     }
+
+    fn validate_original_member(&self) -> Result<(), &'static str> {
+        let prepare = self.original_member.as_ref().unwrap();
+        prepare.validate()?;
+        let ReplicaGoalKind::Prepare {
+            role: ReplicaRole::IdleSecondary,
+            rebuild: Some(rebuild),
+        } = &prepare.desired
+        else {
+            return Err("original-member Build requires its exact typed Idle preparation");
+        };
+        self.source.validate()?;
+        self.target.validate()?;
+        if self.generation == 0
+            || self.target_control_address.is_empty()
+            || self.source != rebuild.source
+            || self.target.scope != prepare.scope
+            || self.target.stage != ReplicaPublicationStage::AchievedScope
+            || self.target.role != ReplicaRole::IdleSecondary
+        {
+            return Err("original-member Build differs from prepared source/target");
+        }
+        Ok(())
+    }
+}
+
+/// Selected retained inspection and source, not a copy or exclusion certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OriginalMemberRebuild {
+    pub inspection: Box<ReplicaGoal>,
+    pub source: ReplicaPublication,
+}
+
+impl OriginalMemberRebuild {
+    fn validate(&self, scope: &ReplicaScope) -> Result<(), &'static str> {
+        self.inspection.validate()?;
+        self.source.validate()?;
+        let input = &self.inspection.scope;
+        if !matches!(self.inspection.desired, ReplicaGoalKind::Discover)
+            || input.storage != scope.storage
+            || input.process_session_id != scope.process_session_id
+            || input.creation_id != scope.creation_id
+            || input.history != scope.history
+            || input.epoch != scope.epoch
+            || input.configuration.current != scope.configuration.current
+            || input.configuration.previous != scope.configuration.previous
+            || self.source.stage != ReplicaPublicationStage::AchievedScope
+            || self.source.role != ReplicaRole::Primary
+            || self.source.scope.history != scope.history
+            || self.source.scope.epoch != scope.epoch
+            || self.source.scope.configuration.current != scope.configuration.current
+            || self.source.scope.configuration.previous != scope.configuration.previous
+            || self.source.scope.storage.replica == scope.storage.replica
+            || scope.configuration.current.primary_id
+                != self.source.scope.storage.replica.replica_id
+            || !scope.configuration.current.members.iter().any(|member| {
+                member.identity == scope.storage.replica
+                    && member.role == ReplicaRole::ActiveSecondary
+            })
+            || !scope
+                .configuration
+                .previous
+                .as_ref()
+                .unwrap_or(&scope.configuration.current)
+                .members
+                .iter()
+                .any(|member| member.identity == scope.storage.replica)
+            || self
+                .source
+                .scope
+                .configuration
+                .replicas
+                .iter()
+                .any(|peer| peer.identity == scope.storage.replica && (peer.is_ready || peer.is_up))
+        {
+            return Err("crossed original-member rebuild round or active target");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -270,8 +524,13 @@ pub enum ReplicaGoalKind {
     RestoreRetainedMember {
         qualification: Box<RetainedMemberQualification>,
     },
+    RecoverContainedCreation {
+        recovery: Box<ContainedCreationRecovery>,
+    },
     Prepare {
         role: ReplicaRole,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rebuild: Option<Box<OriginalMemberRebuild>>,
     },
     Reconfigure {
         role: ReplicaRole,
@@ -301,6 +560,8 @@ struct ReplicaGoalKindSchema {
     catch_up: Option<PublicCatchUpMode>,
     remote: Option<Box<RemoteReplicaSelection>>,
     qualification: Option<Box<RetainedMemberQualification>>,
+    recovery: Option<Box<ContainedCreationRecovery>>,
+    rebuild: Option<Box<OriginalMemberRebuild>>,
 }
 
 #[derive(JsonSchema)]
@@ -309,6 +570,7 @@ struct ReplicaGoalKindSchema {
 enum ReplicaGoalKindTag {
     Discover,
     RestoreRetainedMember,
+    RecoverContainedCreation,
     Prepare,
     Reconfigure,
     RefreshPrimary,
@@ -321,7 +583,7 @@ enum ReplicaGoalKindTag {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaGoal {
-    #[schemars(range(min = 19, max = 19))]
+    #[schemars(range(min = 23, max = 23))]
     pub format: u32,
     pub identity: PublicV1Identity,
     pub operation_id: OperationId,
@@ -342,8 +604,7 @@ impl ReplicaGoal {
         self.scope.validate()?;
         match &self.desired {
             ReplicaGoalKind::RestoreRetainedMember { qualification } => {
-                // Dormant until the parent advances the complete matched format.
-                if self.format != 19
+                if self.format != ORDINARY_ACTION_FORMAT
                     || qualification.predecessor_process_session_id.is_empty()
                     || qualification.predecessor_creation_id.is_empty()
                     || qualification.admitted_operation_id.is_empty()
@@ -366,6 +627,90 @@ impl ReplicaGoal {
                 let mut validation = self.clone();
                 validation.desired = ReplicaGoalKind::Prepare {
                     role: ReplicaRole::ActiveSecondary,
+                    rebuild: None,
+                };
+                validation.validate()?;
+            }
+            ReplicaGoalKind::RecoverContainedCreation { recovery } => {
+                if let Some(addition) = &recovery.addition {
+                    addition.validate()?;
+                    let receiver = addition.phase == MembershipAdditionPhase::Receiver;
+                    let participant = if receiver {
+                        &addition.receiver
+                    } else {
+                        &addition.source
+                    };
+                    let projection = addition.configuration(addition.phase)?;
+                    if self.scope.history != addition.admitted.scope.history
+                        || self.scope.storage != participant.storage_incarnation
+                        || self.scope.process_session_id != participant.process_session_id
+                        || self.scope.creation_id != participant.replicator_creation_id
+                        || self.scope.configuration.current != projection.current
+                        || self.scope.configuration.previous != projection.previous
+                        || recovery.role != participant.role
+                        || recovery.catch_up != (!receiver).then_some(PublicCatchUpMode::All)
+                    {
+                        return Err("addition recovery differs from its closed phase projection");
+                    }
+                }
+                let operations = recovery
+                    .predecessor_operations
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                if recovery.predecessor_process_session_id.is_empty()
+                    || recovery.predecessor_creation_id.is_empty()
+                    || recovery.predecessor_process_session_id == self.scope.process_session_id
+                    || recovery.predecessor_creation_id == self.scope.creation_id
+                    || operations.is_empty()
+                    || operations.len() != recovery.predecessor_operations.len()
+                    || operations
+                        .iter()
+                        .any(|id| id.is_empty() || **id == self.operation_id)
+                    || !matches!(
+                        recovery.role,
+                        ReplicaRole::Primary | ReplicaRole::ActiveSecondary
+                    ) && !recovery.addition.as_ref().is_some_and(|addition| {
+                        addition.phase == MembershipAdditionPhase::Receiver
+                            && recovery.role == ReplicaRole::IdleSecondary
+                    })
+                    || (recovery.role == ReplicaRole::Primary && recovery.catch_up.is_none())
+                    || (recovery.role == ReplicaRole::ActiveSecondary
+                        && recovery.catch_up.is_some())
+                    || self.scope.configuration.replicas.iter().any(|peer| {
+                        peer.current_progress != INVALID_LSN
+                            || peer.catch_up_capability != INVALID_LSN
+                            || peer.must_catchup
+                            || recovery.addition.as_ref().is_none_or(|addition| {
+                                matches!(
+                                    addition.phase,
+                                    MembershipAdditionPhase::Bootstrap
+                                        | MembershipAdditionPhase::Receiver
+                                )
+                            }) && (peer.is_up || peer.is_ready)
+                    })
+                {
+                    return Err(
+                        "contained reconstruction requires exact dependencies without native authority",
+                    );
+                }
+                let mut receivers = std::collections::BTreeSet::new();
+                for receiver in &recovery.receiver_settlements {
+                    if !operations.contains(&receiver.source_operation_id)
+                        || !receivers.insert(&receiver.source_operation_id)
+                        || !matches!(
+                            receiver.terminal_goal.desired,
+                            ReplicaGoalKind::Close | ReplicaGoalKind::Abort
+                        )
+                        || receiver.terminal_goal.identity != self.identity
+                    {
+                        return Err("contained reconstruction has crossed receiver dependencies");
+                    }
+                    receiver.terminal_goal.validate()?;
+                }
+                let mut validation = self.clone();
+                validation.desired = ReplicaGoalKind::Prepare {
+                    role: recovery.role,
+                    rebuild: None,
                 };
                 validation.validate()?;
             }
@@ -390,6 +735,18 @@ impl ReplicaGoal {
                 validation.validate()?;
             }
             ReplicaGoalKind::Prepare { role, .. } | ReplicaGoalKind::Reconfigure { role, .. } => {
+                let rebuild = match &self.desired {
+                    ReplicaGoalKind::Prepare { rebuild, .. } => rebuild.as_deref(),
+                    _ => None,
+                };
+                if let Some(rebuild) = rebuild {
+                    if *role != ReplicaRole::IdleSecondary
+                        || rebuild.inspection.revision >= self.revision
+                    {
+                        return Err("rebuild purpose is only an ordered Idle preparation");
+                    }
+                    rebuild.validate(&self.scope)?;
+                }
                 if *role != ReplicaRole::IdleSecondary {
                     self.scope.configuration.ordinary().validate()?;
                     let local = &self.scope.storage.replica;
@@ -432,6 +789,7 @@ impl ReplicaGoal {
                         .scope
                         .configuration
                         .fresh_idle_replacement(&self.scope.storage, &self.scope.process_session_id)
+                    && rebuild.is_none()
                 {
                     return Err("idle preparation cannot overlap selected voting membership");
                 }
@@ -512,6 +870,7 @@ impl ReplicaGoal {
     pub(crate) fn role(&self) -> Option<ReplicaRole> {
         match self.desired {
             ReplicaGoalKind::RestoreRetainedMember { .. } => Some(ReplicaRole::ActiveSecondary),
+            ReplicaGoalKind::RecoverContainedCreation { ref recovery } => Some(recovery.role),
             ReplicaGoalKind::RefreshPrimary { .. } => Some(ReplicaRole::Primary),
             ReplicaGoalKind::Prepare { role, .. } | ReplicaGoalKind::Reconfigure { role, .. } => {
                 Some(role)
@@ -573,6 +932,33 @@ pub struct ReplicaGoalObservation {
     pub status: ReplicaGoalStatus,
     pub selected_call: Option<String>,
     pub receipts: usize,
+    #[serde(default)]
+    pub host_settled: bool,
+    /// Ordered completed transfer effects, not current native availability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_handoff: Option<Vec<SourceHandoffReceipt>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceHandoffReceipt {
+    Revoke,
+    Epoch,
+    RefreshedConfiguration,
+    All,
+    ReplicatorDemotion,
+    ApplicationDemotion,
+}
+
+impl SourceHandoffReceipt {
+    pub const ORDERED: [Self; 6] = [
+        Self::Revoke,
+        Self::Epoch,
+        Self::RefreshedConfiguration,
+        Self::All,
+        Self::ReplicatorDemotion,
+        Self::ApplicationDemotion,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -594,6 +980,11 @@ pub struct ReplicaAgentSnapshot {
     pub remote_operations: Vec<RemoteReplicaObservation>,
     pub progress: ProgressQueryResult,
     pub capability: ProgressQueryResult,
+    /// Absent on pre-component journals and independent implementations.
+    #[serde(default)]
+    pub native_status: Option<NativeStatusObservation>,
+    #[serde(default)]
+    pub native_lifecycle: Option<NativeLifecycleFacts>,
     /// Includes fault-only operations which are not projected as ordinary goals.
     #[serde(default)]
     pub accepted_revision_high_watermark: u64,
@@ -602,6 +993,8 @@ pub struct ReplicaAgentSnapshot {
     /// Agent-checked historical eligibility, never a new native-role receipt.
     #[serde(default)]
     pub retained_member_qualification: Option<RetainedMemberQualification>,
+    #[serde(default)]
+    pub reconstruction_dependencies: Vec<CreationRecoveryDependencies>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

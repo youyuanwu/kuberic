@@ -9,6 +9,25 @@ use tokio_util::sync::CancellationToken;
 use super::application_error;
 use kuberic_runtime::Result;
 
+#[cfg(all(test, feature = "testing"))]
+#[path = "public_transport/component_tests.rs"]
+mod component_tests;
+#[path = "public_transport/rewind_connection.rs"]
+mod rewind_connection;
+#[path = "public_transport/rewind_protocol.rs"]
+mod rewind_protocol;
+
+pub(crate) fn check_rewind_candidate_layout(root: PathBuf) -> io::Result<()> {
+    rewind_connection::check_candidate_layout(root)
+}
+
+pub(crate) async fn rewind_candidate_lease_valid(
+    valid: &GatewayValidity,
+    cancellation: &CancellationToken,
+) -> bool {
+    rewind_connection::lease_valid(valid, cancellation).await
+}
+
 pub(super) fn random_bytes() -> Result<[u8; 32]> {
     let mut random = [0; 32];
     let mut filled = 0;
@@ -23,19 +42,50 @@ pub(super) fn random_bytes() -> Result<[u8; 32]> {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeCredential {
+    pub version: u32,
+    pub mode: NativeConnectionMode,
     pub host: String,
     pub port: u16,
     pub user: String,
     pub name: String,
+    pub secret: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum NativeConnectionMode {
+    Physical,
+    RewindRead,
 }
 
 impl NativeCredential {
     pub fn conninfo(&self) -> Result<String> {
-        if self.host.parse::<std::net::IpAddr>().is_err()
+        self.helper_conninfo()
+    }
+
+    pub(crate) fn helper_conninfo(&self) -> Result<String> {
+        self.validated_conninfo(NativeConnectionMode::Physical)
+    }
+
+    pub(crate) fn rewind_conninfo(&self) -> Result<String> {
+        self.validated_conninfo(NativeConnectionMode::RewindRead)
+    }
+
+    fn validated_conninfo(&self, mode: NativeConnectionMode) -> Result<String> {
+        if self.version != 2
+            || self.mode != mode
+            || (mode == NativeConnectionMode::RewindRead && self.user != "kuberic_rewind")
+            || self.host.parse::<std::net::IpAddr>().is_err()
             || self.port == 0
             || self.user.is_empty()
             || self.name.is_empty()
             || self.name.len() > 63
+            || self.secret.len() != 64
+            || !self.secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !self
+                .user
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
             || !self
                 .name
                 .bytes()
@@ -43,10 +93,15 @@ impl NativeCredential {
         {
             return Err(application_error("invalid public native connection"));
         }
-        Ok(format!(
+        let conninfo = format!(
             "host={} port={} user={} application_name={} sslmode=disable connect_timeout=5",
             self.host, self.port, self.user, self.name
-        ))
+        );
+        Ok(if mode == NativeConnectionMode::RewindRead {
+            format!("{conninfo} dbname=postgres")
+        } else {
+            conninfo
+        })
     }
 }
 
@@ -66,7 +121,7 @@ impl Drop for GatewayRun {
     }
 }
 
-pub(super) type GatewayValidity = Arc<
+pub(crate) type GatewayValidity = Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync,
 >;
 
@@ -92,11 +147,67 @@ impl NativeGateway {
         valid: GatewayValidity,
         cancellation: CancellationToken,
     ) -> Result<(Self, NativeCredential)> {
+        Self::start_mode(host, socket, name, slot, build, None, valid, cancellation).await
+    }
+
+    // Data plane only: the selected native session owner must first confirm the
+    // actual two-ended source/candidate scope, and own its continuing validity.
+    pub(super) async fn start_rewind(
+        host: &str,
+        owned_pgdata: PathBuf,
+        socket: PathBuf,
+        name: String,
+        valid: GatewayValidity,
+        cancellation: CancellationToken,
+    ) -> Result<(Self, NativeCredential)> {
+        let source = rewind_connection::RewindSource::new(owned_pgdata, &socket)
+            .map_err(application_error)?;
+        Self::start_mode(
+            host,
+            socket,
+            name,
+            String::new(),
+            false,
+            Some(Arc::new(source)),
+            valid,
+            cancellation,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared physical/rewind gateway owner"
+    )]
+    async fn start_mode(
+        host: &str,
+        socket: PathBuf,
+        name: String,
+        slot: String,
+        build: bool,
+        rewind: Option<Arc<rewind_connection::RewindSource>>,
+        valid: GatewayValidity,
+        cancellation: CancellationToken,
+    ) -> Result<(Self, NativeCredential)> {
         let credential = NativeCredential {
+            version: 2,
+            mode: if rewind.is_some() {
+                NativeConnectionMode::RewindRead
+            } else {
+                NativeConnectionMode::Physical
+            },
             host: host.into(),
             port: 0,
-            user: whoami::username().unwrap_or_else(|_| "postgres".into()),
+            user: if rewind.is_some() {
+                "kuberic_rewind".into()
+            } else {
+                whoami::username().unwrap_or_else(|_| "postgres".into())
+            },
             name,
+            secret: random_bytes()?
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         };
         let listener = TcpListener::bind((host, 0))
             .await
@@ -105,6 +216,9 @@ impl NativeGateway {
             port: listener.local_addr().map_err(application_error)?.port(),
             ..credential
         };
+        if rewind.is_some() {
+            credential.rewind_conninfo()?;
+        }
         let stopped = cancellation.clone();
         let expected = credential.clone();
         let copy_allowed = Arc::new(std::sync::atomic::AtomicBool::new(build));
@@ -133,20 +247,49 @@ impl NativeGateway {
                     },
                     accepted = listener.accept() => {
                         let Ok((client, _)) = accepted else { break; };
-                        if connections.len() >= 4 || !valid().await {
+                        if let Err(error) = client.set_nodelay(true) {
+                            failures.push(error.to_string());
+                            break;
+                        }
+                        if connections.len() >= 4 {
+                            continue;
+                        }
+                        let authorized = if rewind.is_some() {
+                            rewind_connection::lease_valid(&valid, &stopped).await
+                        } else {
+                            valid().await
+                        };
+                        if !authorized {
                             continue;
                         }
                         let expected = expected.clone();
                         let socket = socket.clone();
                         let slot = slot.clone();
                         let command_mode = command_mode.clone();
+                        let rewind = rewind.clone();
+                        let valid = valid.clone();
+                        let cancellation = stopped.clone();
                         connections.spawn(async move {
-                            if let Err(error) = connection(client, socket, expected, slot, command_mode).await {
+                            let result = if let Some(source) = rewind {
+                                rewind_connection::connection(
+                                    client, socket, expected, source, valid, cancellation,
+                                ).await
+                            } else {
+                                connection(client, socket, expected, slot, command_mode).await
+                            };
+                            if let Err(error) = result {
                                 tracing::debug!(%error, "native gateway connection ended");
                             }
                         });
                     },
-                    _ = tick.tick() => if !valid().await { break; },
+                    _ = tick.tick() => {
+                        let authorized = if rewind.is_some() {
+                            rewind_connection::lease_valid(&valid, &stopped).await
+                        } else {
+                            valid().await
+                        };
+                        if !authorized { break; }
+                    },
                 }
             }
             // Dropping a listener alone does not fence already-open WAL senders.
@@ -279,6 +422,25 @@ async fn connection(
         {
             return Err(io::Error::other("native lifecycle binding differs"));
         }
+        frame(&mut client, b'R', &3u32.to_be_bytes()).await?;
+        if client.read_u8().await? != b'p' {
+            return Err(io::Error::other("native session authentication required"));
+        }
+        let password = packet(&mut client, 128).await?;
+        let password = password
+            .strip_suffix(&[0])
+            .ok_or_else(|| io::Error::other("invalid native session authentication"))?;
+        if password.len() != expected.secret.len()
+            || password
+                .iter()
+                .zip(expected.secret.bytes())
+                .fold(0u8, |different, (actual, expected)| {
+                    different | (*actual ^ expected)
+                })
+                != 0
+        {
+            return Err(io::Error::other("native session authentication rejected"));
+        }
         // Backend access is Unix-only. The peer never receives backend login
         // credentials or a socket capable of changing its ACK application name.
         let mut backend = UnixStream::connect(socket).await?;
@@ -351,6 +513,115 @@ fn allowed_query(body: &[u8], slot: &str, build: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn m3_pg_native_gateway_authenticates_before_opening_its_backend() {
+        let directory = crate::testing::TestDataDir::new("native-gateway-authentication");
+        let valid: GatewayValidity = Arc::new(|| Box::pin(async { true }));
+        let (gateway, credential) = NativeGateway::start(
+            "127.0.0.1",
+            directory.path().join("backend-must-not-be-opened"),
+            "fresh_session".into(),
+            "fresh_slot".into(),
+            false,
+            valid,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut client = TcpStream::connect((&*credential.host, credential.port))
+            .await
+            .unwrap();
+        let mut startup = 196608u32.to_be_bytes().to_vec();
+        startup.extend_from_slice(
+            format!(
+                "user\0{}\0application_name\0{}\0replication\0true\0\0",
+                credential.user, credential.name,
+            )
+            .as_bytes(),
+        );
+        client.write_u32((startup.len() + 4) as u32).await.unwrap();
+        client.write_all(&startup).await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), b'R');
+        assert_eq!(packet(&mut client, 128).await.unwrap(), 3u32.to_be_bytes());
+        let mut incorrect = credential.secret.as_bytes().to_vec();
+        incorrect[0] = if incorrect[0] == b'a' { b'b' } else { b'a' };
+        incorrect.push(0);
+        frame(&mut client, b'p', &incorrect).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), client.read_u8())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            gateway
+                .liveness()
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        let mut cross_mode = TcpStream::connect((&*credential.host, credential.port))
+            .await
+            .unwrap();
+        let mut startup = 196608u32.to_be_bytes().to_vec();
+        startup.extend_from_slice(
+            format!(
+                "user\0{}\0database\0postgres\0application_name\0{}\0\0",
+                credential.user, credential.name,
+            )
+            .as_bytes(),
+        );
+        cross_mode
+            .write_u32((startup.len() + 4) as u32)
+            .await
+            .unwrap();
+        cross_mode.write_all(&startup).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), cross_mode.read_u8())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        gateway.drain().await.unwrap();
+        assert!(!directory.path().join("backend-must-not-be-opened").exists());
+    }
+
+    #[test]
+    fn m3_pg_native_credential_requires_explicit_wire_mode_and_secret() {
+        let credential = NativeCredential {
+            version: 2,
+            mode: NativeConnectionMode::Physical,
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "postgres".into(),
+            name: "fresh_native_session".into(),
+            secret: "ab".repeat(32),
+        };
+        assert!(
+            !credential
+                .helper_conninfo()
+                .unwrap()
+                .contains(&credential.secret)
+        );
+        assert!(!credential.conninfo().unwrap().contains(&credential.secret));
+        for field in ["version", "mode", "secret"] {
+            let mut encoded = serde_json::to_value(&credential).unwrap();
+            encoded.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<NativeCredential>(encoded).is_err());
+        }
+        let mut legacy = credential.clone();
+        legacy.version = 1;
+        assert!(legacy.conninfo().is_err());
+        let mut empty = credential.clone();
+        empty.secret.clear();
+        assert!(empty.conninfo().is_err());
+        let mut crossed = serde_json::to_value(&credential).unwrap();
+        crossed["mode"] = serde_json::json!("rewindRead");
+        let crossed = serde_json::from_value::<NativeCredential>(crossed).unwrap();
+        assert!(crossed.helper_conninfo().is_err());
+        assert!(crossed.rewind_conninfo().is_err());
+    }
 
     #[test]
     fn peer_gateway_accepts_only_the_authorized_physical_slot() {

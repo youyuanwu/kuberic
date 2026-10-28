@@ -991,8 +991,14 @@ impl<A: Sample> Node<A> {
         } else {
             self.configuration(epoch)
         };
-        self.goal(ReplicaGoalKind::Prepare { role }, configuration)
-            .await;
+        self.goal(
+            ReplicaGoalKind::Prepare {
+                role,
+                rebuild: None,
+            },
+            configuration,
+        )
+        .await;
     }
 
     async fn single(&mut self, epoch: Epoch) -> ConfigurationDescriptor {
@@ -1033,6 +1039,7 @@ impl<A: Sample> Node<A> {
         self.goal(
             ReplicaGoalKind::Build {
                 remote: Box::new(RemoteReplicaSelection {
+                    original_member: None,
                     source,
                     target: target_publication,
                     target_control_address: target.control_address.clone(),
@@ -1377,6 +1384,7 @@ async fn native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_buil
         invalid_build.revision += 1;
         invalid_build.desired = ReplicaGoalKind::Build {
             remote: Box::new(RemoteReplicaSelection {
+                original_member: None,
                 source: publication.clone(),
                 target: publication,
                 target_control_address: node.control_address.clone(),
@@ -1486,6 +1494,7 @@ async fn native_query_rejoin_matrix_distinguishes_source_capability_from_target_
             assert_eq!(m2_builtin::snapshot(&source).await, source_scope);
             assert_eq!(m2_builtin::snapshot(&target).await, target_scope);
             let remote = RemoteReplicaSelection {
+                original_member: None,
                 source: source_scope.publication.clone().unwrap(),
                 target: target_scope.publication.clone().unwrap(),
                 target_control_address: target.control_address.clone(),
@@ -1790,12 +1799,7 @@ async fn m3_retained_primary_process_reforms_actual_surviving_kv_receiver() {
             );
             assert!(Arc::ptr_eq(&target.service, &target_service));
             let target_peer = target.peer(ReplicaRole::ActiveSecondary).await;
-            let cut = Arc::new(PublicOperationCut {
-                position,
-                index: 3,
-                entered: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-            });
+            let cut = Arc::new(PublicOperationCut::new(position, 3));
             let handle = source.running.handle();
             handle.set_public_operation_cut(Some(cut.clone()));
             let mut client = proto::agent_control_client::AgentControlClient::connect(

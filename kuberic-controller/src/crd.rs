@@ -37,7 +37,7 @@ pub const SCALE_UP_ALLOCATION_ANNOTATION: &str =
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetSpec {
-    #[schemars(range(min = 19, max = 19))]
+    #[schemars(range(min = 23, max = 23))]
     pub hosting_format: u32,
     #[schemars(range(min = 1))]
     pub replicas: u32,
@@ -84,6 +84,9 @@ pub struct RetainedReplicaGoal {
     pub digest: kuberic_runtime::protocol::public_operations::CanonicalOperationInputDigest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<kuberic_runtime::protocol::public_operations::ReplicaGoalObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 2))]
+    pub native_status: Option<String>,
 }
 
 impl RetainedReplicaGoal {
@@ -95,13 +98,32 @@ impl RetainedReplicaGoal {
             digest: goal.intent().input_digest,
             goal,
             outcome: None,
+            native_status: None,
         })
     }
 
     pub fn validate(&self) -> Result<(), String> {
         use kuberic_runtime::protocol::public_operations::ReplicaGoalStatus;
         self.goal.validate().map_err(str::to_owned)?;
+        let native_status = self.native_status()?;
         if self.digest != self.goal.intent().input_digest
+            || native_status.as_ref().is_some_and(|status| {
+                !matches!(
+                    self.goal.desired,
+                    kuberic_runtime::protocol::public_operations::ReplicaGoalKind::Discover
+                ) || status.input.operation_id != self.goal.operation_id
+                    || status.input.revision != self.goal.revision
+                    || status.input.scope != self.goal.scope
+                    || status.input.deactivation.as_ref().is_some_and(|history| {
+                        history.catch_up_lsn < 0
+                            || history.primary_fence > self.goal.scope.epoch
+                            || history.primary_fence.data_loss_number
+                                != self.goal.scope.history.data_loss_number
+                    })
+                    || self.outcome.as_ref().is_none_or(|outcome| {
+                        outcome.status != ReplicaGoalStatus::Achieved || !outcome.host_settled
+                    })
+            })
             || self.outcome.as_ref().is_some_and(|outcome| {
                 outcome.goal != self.goal || matches!(outcome.status, ReplicaGoalStatus::Pending)
             })
@@ -110,6 +132,22 @@ impl RetainedReplicaGoal {
         }
         Ok(())
     }
+
+    pub fn native_status(
+        &self,
+    ) -> Result<Option<kuberic_runtime::protocol::public_operations::NativeStatusObservation>, String>
+    {
+        self.native_status
+            .as_ref()
+            .map(|json| {
+                let status = serde_json::from_str(json).map_err(|error| error.to_string())?;
+                if serde_json::to_string(&status).map_err(|error| error.to_string())? != *json {
+                    return Err("retained native status is not its canonical result".into());
+                }
+                Ok(status)
+            })
+            .transpose()
+    }
 }
 
 impl KubericSet {
@@ -117,7 +155,7 @@ impl KubericSet {
         use kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT;
         if self.spec.hosting_format != ORDINARY_ACTION_FORMAT {
             return Err(
-                "incompatible KubericSet hosting format; fresh format 18 is required".into(),
+                "incompatible KubericSet hosting format; fresh format 23 is required".into(),
             );
         }
         let Some(status) = self.status.as_ref() else {

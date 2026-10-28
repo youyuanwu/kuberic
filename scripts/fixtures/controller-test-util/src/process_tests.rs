@@ -9,10 +9,23 @@ use kuberic_runtime::application::OpenMode;
 use super::{CounterFactory, CounterService};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_counter_failed_owner_restores_without_copy_and_remains_consuming_secondary()
--> Result<()> {
+async fn real_counter_failed_owner_rebuilds_with_copy_and_remains_consuming_secondary() -> Result<()>
+{
     use super::retained_witness::{WitnessFactory, helper_path, qualify_retained_secondary};
     qualify_retained_secondary(WitnessFactory::new(
+        CounterFactory,
+        helper_path(
+            "KUBERIC_RETAINED_COUNTER_MEMBER_BIN",
+            "kuberic-retained-counter-member",
+        ),
+    ))
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_counter_unequal_prefix_opened_winner_rebuilds_warm_original_quorum() -> Result<()> {
+    use super::retained_witness::{WitnessFactory, helper_path, qualify_unequal_retained_prefix};
+    qualify_unequal_retained_prefix(WitnessFactory::new(
         CounterFactory,
         helper_path(
             "KUBERIC_RETAINED_COUNTER_MEMBER_BIN",

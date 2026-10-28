@@ -124,30 +124,43 @@ fn publication_admitted(
     };
     let original = current.current == captured.current && current.replicas == captured.replicas;
     let local = &now.scope.storage.replica;
-    let peers_match = current.replicas.len()
-        == current
-            .current
-            .members
+    let members = current
+        .previous
+        .iter()
+        .chain(std::iter::once(&current.current))
+        .flat_map(|configuration| &configuration.members)
+        .filter(|member| &member.identity != local)
+        .map(|member| (&member.identity, member.role))
+        .collect::<BTreeMap<_, _>>();
+    let peers_match = current.replicas.len() == members.len()
+        && current
+            .replicas
             .iter()
-            .filter(|member| &member.identity != local)
-            .count()
-        && current.replicas.iter().all(|peer| {
-            &peer.identity != local
-                && current
-                    .current
-                    .members
-                    .iter()
-                    .any(|member| member.identity == peer.identity && member.role == peer.role)
-        });
+            .all(|peer| &peer.identity != local && members.get(&peer.identity) == Some(&peer.role));
     let promoted = extends(&current.current, &captured.current)
         && current.current.members.iter().any(|member| {
             member.identity == binding.secondary().identity
                 && member.role == ReplicaRole::ActiveSecondary
         });
+    let retained = now.scope.epoch == origin.scope.epoch
+        && current.current.primary_id == captured.current.primary_id
+        && current.current.members.iter().any(|member| {
+            member.identity == binding.secondary().identity
+                && member.role == ReplicaRole::ActiveSecondary
+        })
+        && current.current.members.iter().any(|member| {
+            member.identity == binding.primary().identity && member.role == ReplicaRole::Primary
+        })
+        && peers_match;
     stage
-        && (original || (promoted && peers_match))
+        && (original || (promoted && peers_match) || retained)
         && (current.previous == captured.previous
             || current.previous.is_none()
+            || (retained || promoted)
+                && current.previous.as_ref().is_some_and(|previous| {
+                    previous.primary_id == current.current.primary_id
+                        && previous.epoch == current.current.epoch
+                })
             || (promoted
                 && current.previous.as_ref().is_some_and(|previous| {
                     extends(previous, &captured.current) && extends(&current.current, previous)
@@ -389,12 +402,22 @@ struct Peer {
     incarnation: i64,
     reformation_boundary: Option<crate::application::Lsn>,
     initial_ack: Arc<AtomicI64>,
+    native_installed: AtomicBool,
     fresh_ack: AtomicI64,
     ack_generation: u64,
     ack_owner: Option<uuid::Uuid>,
     current: Arc<AtomicBool>,
     tasks: TaskTracker,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Effect {
+    Control(Control),
+    Peer(bool),
+}
+
+type EffectResult = std::result::Result<i64, String>;
+type EffectObserver = watch::Receiver<Option<EffectResult>>;
 
 pub(super) struct Transport {
     context: ReplicatorFactoryContext,
@@ -403,6 +426,7 @@ pub(super) struct Transport {
     history: HistoryContext,
     registry: MessageRegistry,
     peers: Mutex<BTreeMap<i64, Arc<Peer>>>,
+    retiring_peers: Mutex<BTreeMap<String, Arc<Peer>>>,
     stop: watch::Sender<bool>,
     tasks: TaskTracker,
     failure: Arc<Mutex<Option<String>>>,
@@ -416,6 +440,7 @@ pub(super) struct Transport {
     configuration: Mutex<Option<(ConfigurationDescriptor, Option<ConfigurationDescriptor>)>>,
     acknowledgements: Mutex<Option<tokio::sync::mpsc::Sender<Ack>>>,
     ack_settlements: Mutex<BTreeMap<String, Arc<AckSettlement>>>,
+    effects: Mutex<BTreeMap<(String, Effect), (Binding, EffectObserver)>>,
     #[cfg(feature = "testing")]
     native_credits: AtomicI64,
     #[cfg(feature = "testing")]
@@ -425,6 +450,113 @@ pub(super) struct Transport {
 }
 
 impl Transport {
+    pub(super) fn production_owner(&self) -> Result<Arc<super::production::Production>> {
+        self.production
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(RuntimeError::Closed)
+    }
+
+    pub(super) async fn register_configuration(
+        &self,
+        current: &crate::replicator::ReplicaSetConfiguration,
+        previous: Option<&crate::replicator::ReplicaSetConfiguration>,
+    ) -> Result<()> {
+        let source = self.publication().await?;
+        if !self.context.ordinary_hosting()
+            || current.configuration != source.scope.configuration.current
+            || current
+                .replicas
+                .iter()
+                .chain(previous.into_iter().flat_map(|set| &set.replicas))
+                .all(|peer| peer.identity == self.local.identity)
+        {
+            return Ok(());
+        }
+        let invocation =
+            super::warm_source_transfer::invocation(&self.context, &source, current, previous)
+                .await
+                .map_err(|error| {
+                    RuntimeError::ControlPlane(format!("configuration invocation: {error}"))
+                })?;
+        self.current_normal_primary(source.scope.epoch)
+            .map_err(|error| {
+                RuntimeError::ControlPlane(format!("configuration native Primary: {error}"))
+            })?;
+        self.sessions
+            .register_configuration(invocation)
+            .map_err(|error| {
+                RuntimeError::ControlPlane(format!("configuration registration: {error}"))
+            })
+    }
+
+    fn current_normal_primary(&self, epoch: Epoch) -> Result<super::super::primary::PrimaryHandle> {
+        self.check_health()?;
+        if self.selected_lifecycle() != Some((epoch, ReplicaRole::Primary)) {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let facade = self
+            .facade
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or(RuntimeError::Closed)?;
+        if !self
+            .production
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|owner| owner.native_primary_at(epoch))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let super::Target::Primary(primary) = facade.service().target().map_err(application)?
+        else {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        };
+        Ok(primary)
+    }
+
+    pub(super) async fn associate_configuration(&self, binding: &Binding) -> Result<()> {
+        if !self.context.ordinary_hosting() {
+            return Ok(());
+        }
+        self.sessions.associate_configuration(binding)?;
+        let primary = self.current_normal_primary(binding.epoch())?;
+        let last = primary.current_progress().map_err(application)?;
+        let first = primary.catchup_capability().map_err(application)?;
+        let source = self.publication().await?;
+        let current = super::warm_source_transfer::ConfigurationInvocation::invocation_for_binding(
+            &self.context,
+            binding,
+        )
+        .await?;
+        self.sessions.check_configuration(binding, &current)?;
+        let receiver = binding
+            .source
+            .scope
+            .configuration
+            .replicas
+            .iter()
+            .find(|peer| {
+                peer.identity == binding.secondary().identity && peer.is_up && peer.is_ready
+            })
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if source != binding.source
+            || receiver.current_progress < 0
+            || receiver.current_progress > last
+            || (receiver.current_progress < last
+                && (first <= 0 || first > receiver.current_progress.saturating_add(1)))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(())
+    }
+
     pub(super) fn native_incarnation(&self, binding: &Binding) -> Result<i64> {
         self.peers
             .lock()
@@ -432,7 +564,41 @@ impl Transport {
             .values()
             .find(|peer| peer.binding == *binding)
             .map(|peer| peer.incarnation)
+            .or_else(|| {
+                self.retiring_peers
+                    .lock()
+                    .unwrap()
+                    .get(&binding.nonce)
+                    .filter(|peer| peer.binding == *binding)
+                    .map(|peer| peer.incarnation)
+            })
             .ok_or(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    #[cfg(test)]
+    pub(super) fn predecessor_carrier_withdrawn(&self, binding: &Binding) -> bool {
+        self.retiring_peers
+            .lock()
+            .unwrap()
+            .get(&binding.nonce)
+            .is_some_and(|peer| {
+                peer.binding == *binding
+                    && !peer.current.load(Ordering::Acquire)
+                    && peer.tasks.is_closed()
+            })
+    }
+
+    pub(super) fn live_target_native_installed(&self, binding: &Binding) -> Result<()> {
+        let peers = self.peers.lock().unwrap();
+        let peer = peers
+            .values()
+            .find(|peer| peer.binding == *binding)
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if binding.live_target.is_none() || peer.initial_ack.load(Ordering::Acquire) < 0 {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        peer.native_installed.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(super) async fn start(
@@ -483,6 +649,7 @@ impl Transport {
             history,
             registry,
             peers: Mutex::new(BTreeMap::new()),
+            retiring_peers: Mutex::new(BTreeMap::new()),
             stop: watch::channel(false).0,
             tasks: TaskTracker::new(),
             failure: Arc::new(Mutex::new(None)),
@@ -496,6 +663,7 @@ impl Transport {
             configuration: Mutex::new(None),
             acknowledgements: Mutex::new(None),
             ack_settlements: Mutex::new(BTreeMap::new()),
+            effects: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testing")]
             native_credits: AtomicI64::new(0),
             #[cfg(feature = "testing")]
@@ -530,6 +698,12 @@ impl Transport {
                         "sessions": owner.sessions.inspect(),
                         "tasks": owner.cardinality(),
                         "failure": *owner.failure.lock().unwrap(),
+                        "effects": owner.effects.lock().unwrap().iter().map(|((nonce, effect), (_, result))| {
+                            serde_json::json!({"nonce": nonce, "effect": format!("{effect:?}"), "result": result.borrow().clone()})
+                        }).collect::<Vec<_>>(),
+                        "retiringPeers": owner.retiring_peers.lock().unwrap().values().map(|peer| {
+                            serde_json::json!({"nonce": peer.binding.nonce, "tasks": peer.tasks.len(), "closed": peer.tasks.is_closed()})
+                        }).collect::<Vec<_>>(),
                         "ackCapacity": owner.acknowledgements.lock().unwrap().as_ref()
                             .map(|sender| sender.capacity()),
                         "controlsAvailable": owner.controls.available_permits(),
@@ -562,6 +736,7 @@ impl Transport {
         future: impl std::future::Future<Output = Result<()>> + Send + 'static,
     ) {
         let failure = self.failure.clone();
+        let sessions = self.sessions.clone();
         let context = self.context.clone();
         self.tasks.spawn(async move {
             let result = AssertUnwindSafe(future).catch_unwind().await;
@@ -571,6 +746,7 @@ impl Transport {
                 Err(_) => "native transport task panicked".into(),
             };
             tracing::error!(%error, "native transport owner failed");
+            sessions.retire_all();
             failure.lock().unwrap().get_or_insert(error);
             if let Err(report) = context
                 .report_fault(crate::protocol::types::FaultType::Transient)
@@ -581,6 +757,53 @@ impl Transport {
         });
     }
 
+    fn spawn_peer(
+        self: &Arc<Self>,
+        binding: &Binding,
+        tasks: &TaskTracker,
+        future: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    ) {
+        let token = tasks.token();
+        let failure = self.failure.clone();
+        let owner = Arc::downgrade(self);
+        let binding = binding.clone();
+        self.spawn(async move {
+            let _joined = token;
+            let result = match AssertUnwindSafe(future).catch_unwind().await {
+                Ok(result) => result,
+                Err(_) => Err(application("native peer task panicked")),
+            };
+            if let Err(error) = &result {
+                // Publish before releasing the exact peer's join token.
+                if let Some(owner) = owner.upgrade() {
+                    owner.quarantine(&binding);
+                }
+                failure
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| error.to_string());
+            }
+            result
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_peer_task(
+        self: &Arc<Self>,
+        binding: &Binding,
+        future: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    ) {
+        let peer = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|peer| peer.binding == *binding)
+            .cloned()
+            .unwrap();
+        self.spawn_peer(binding, &peer.tasks, future);
+    }
+
     pub(super) fn check_health(&self) -> Result<()> {
         match self.failure.lock().unwrap().as_ref() {
             Some(error) => Err(application(format!(
@@ -589,6 +812,124 @@ impl Transport {
             None if *self.stop.borrow() => Err(RuntimeError::Closed),
             None => Ok(()),
         }
+    }
+    pub(super) async fn fail_effect(&self, binding: &Binding, error: &RuntimeError) {
+        if self.sessions.partial_effect(binding) {
+            self.failure
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| error.to_string());
+            let _ = self.sessions.retire(binding);
+            if let Err(cleanup) = self.join_predecessor(binding).await {
+                tracing::warn!(%cleanup, "native failed effect cleanup retained");
+            }
+        } else {
+            let _ = self.sessions.retire(binding);
+        }
+    }
+    async fn owned_effect(
+        self: &Arc<Self>,
+        binding: &Binding,
+        effect: Effect,
+        future: impl std::future::Future<Output = Result<i64>> + Send + 'static,
+    ) -> Result<i64> {
+        let mut observer = {
+            let mut effects = self.effects.lock().unwrap();
+            let key = (binding.nonce.clone(), effect);
+            if let Some((exact, observer)) = effects.get(&key) {
+                if exact != binding {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                observer.clone()
+            } else {
+                if effects.len() >= 4096 {
+                    return Err(RuntimeError::QueueFull);
+                }
+                let (result, observer) = watch::channel(None);
+                effects.insert(key, (binding.clone(), observer.clone()));
+                let owner = self.clone();
+                let binding = binding.clone();
+                self.spawn(async move {
+                        let outcome = match AssertUnwindSafe(future).catch_unwind().await {
+                            Ok(result) => result.map_err(|error| error.to_string()),
+                            Err(_) => Err("native private effect owner panicked".into()),
+                        };
+                        #[cfg(test)]
+                        if let Err(error) = &outcome
+                            && std::env::var_os("KUBERIC_M3_NATIVE_SCOPE_DIAGNOSTICS").is_some()
+                        {
+                            eprintln!("native owned effect {effect:?} failed: {error}");
+                        }
+                        if let Err(error) = &outcome
+                            && owner.sessions.partial_effect(&binding)
+                        {
+                            owner.failure.lock().unwrap().get_or_insert(error.clone());
+                            // Keep the failed slot and every partial Peer. A retry is
+                            // an observer, never another native replacement attempt.
+                            let _ = owner.sessions.retire(&binding);
+                            let cleanup = owner.join_predecessor(&binding).await;
+                            if let Err(cleanup) = cleanup {
+                                tracing::warn!(%cleanup, "failed private effect retained cleanup failure");
+                            }
+                        }
+                        result.send_replace(Some(outcome));
+                        Ok(())
+                    });
+                observer
+            }
+        };
+        loop {
+            if let Some(result) = observer.borrow().clone() {
+                return result.map_err(application);
+            }
+            observer
+                .changed()
+                .await
+                .map_err(|_| application("native private effect owner lost"))?;
+        }
+    }
+
+    fn current_peer(&self, binding: &Binding, outgoing: bool) -> Result<Arc<Peer>> {
+        self.check_health()?;
+        self.sessions.active(binding)?;
+        let peer = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .find(|peer| peer.binding == *binding)
+            .cloned()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if !peer.current.load(Ordering::Acquire)
+            || peer.tasks.is_closed()
+            || peer.tasks.len() < if outgoing { 2 } else { 1 }
+            || outgoing && !peer.connecting.load(Ordering::Acquire)
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        peer.fence.check()?;
+        if self.local == binding.secondary() {
+            let facade = self.facade.lock().unwrap().as_ref().and_then(Weak::upgrade);
+            #[cfg(test)]
+            if facade.is_none() && !self.context.ordinary_hosting() {
+                return Ok(peer);
+            }
+            let facade = facade.ok_or(RuntimeError::Closed)?;
+            let super::Target::Secondary(secondary) =
+                facade.service().target().map_err(application)?
+            else {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            };
+            if secondary.transport_identity().map_err(application)?
+                != (
+                    peer.ack_owner.ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                    peer.ack_generation,
+                )
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+        }
+        Ok(peer)
     }
 
     pub(super) fn local(&self) -> &Endpoint {
@@ -698,7 +1039,11 @@ impl Transport {
             {
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
-            Ok(peers.remove(&replica))
+            let mut retiring = self.retiring_peers.lock().unwrap();
+            if let Some(peer) = peers.remove(&replica) {
+                retiring.insert(binding.nonce.clone(), peer);
+            }
+            Ok(retiring.get(&binding.nonce).cloned())
         })?;
         if let Some(peer) = peer {
             peer.current.store(false, Ordering::Release);
@@ -764,7 +1109,88 @@ impl Transport {
         current: ConfigurationDescriptor,
         previous: Option<ConfigurationDescriptor>,
     ) {
+        let prior = self.configuration.lock().unwrap().clone();
+        for binding in self.sessions.all() {
+            if binding.epoch() == current.epoch
+                && binding.primary().identity == self.local.identity
+                && prior.as_ref().is_some_and(|(current, previous)| {
+                    current
+                        .members
+                        .iter()
+                        .chain(previous.iter().flat_map(|p| &p.members))
+                        .any(|member| member.identity == binding.secondary().identity)
+                })
+                && !current
+                    .members
+                    .iter()
+                    .chain(previous.iter().flat_map(|p| &p.members))
+                    .any(|member| {
+                        member.identity == binding.secondary().identity
+                            && member.role == ReplicaRole::ActiveSecondary
+                    })
+            {
+                let _ = self.sessions.retire(&binding);
+            }
+        }
         *self.configuration.lock().unwrap() = Some((current, previous));
+    }
+
+    pub(super) fn live_target_relation(
+        &self,
+        old: &Binding,
+        source: &ReplicaPublication,
+        target: &ReplicaPublication,
+    ) -> Result<super::engine_session::LiveTarget> {
+        let configuration = self.configuration.lock().unwrap();
+        let (accepted, previous) = configuration
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if previous.is_some()
+            || source.scope.configuration.previous.as_ref() != Some(accepted)
+            || old.primary() != self.local
+            || old.primary() != Endpoint::publication(source)
+            || old.history() != &source.scope.history
+            || old.secondary().storage != target.scope.storage
+            || old.secondary().process_session_id == target.scope.process_session_id
+            || old.secondary().creation_id == target.scope.creation_id
+            || !self.sessions.predecessor_completed(old)
+            || source.scope.configuration.replicas.len() + 1 != accepted.members.len()
+            || !source.scope.configuration.replicas.iter().all(|peer| {
+                accepted
+                    .members
+                    .iter()
+                    .any(|member| member.identity == peer.identity && member.role == peer.role)
+                    && self
+                        .sessions
+                        .binding_for(peer.identity.replica_id.value())
+                        .is_some_and(|known| {
+                            known.primary() == self.local
+                                && known.history() == old.history()
+                                && self.sessions.predecessor_completed(&known)
+                                && if peer.identity == target.scope.storage.replica {
+                                    known == *old
+                                        && peer.storage_incarnation == target.scope.storage
+                                        && super::engine_session::endpoint_matches_peer(
+                                            &Endpoint::publication(target),
+                                            peer,
+                                        )
+                                } else {
+                                    super::engine_session::endpoint_matches_peer(
+                                        &known.secondary(),
+                                        peer,
+                                    )
+                                }
+                        })
+            })
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        Ok(super::engine_session::LiveTarget {
+            predecessor: old.nonce.clone(),
+            previous: accepted.clone(),
+            source: old.primary(),
+            target: old.secondary(),
+        })
     }
 
     pub(super) fn abort(&self) {
@@ -1014,8 +1440,8 @@ impl Transport {
             return Ok(());
         }
         let confirmation = async {
-            let confirmed = self.authorize_publications(binding, false).await?;
-            if self.local == binding.secondary() && !confirmed {
+            self.authorize_publications(binding, false).await?;
+            if self.local == binding.secondary() {
                 self.control(binding, Control::Confirm).await?;
             }
             self.authorize(binding).await
@@ -1177,20 +1603,83 @@ impl Transport {
         Ok(())
     }
 
+    pub(super) async fn select_build(&self, binding: &mut Binding) -> Result<()> {
+        if self.context.ordinary_hosting() || binding.original_member_idle() {
+            let checked = super::build_provenance::select(&self.context, binding).await?;
+            if self.local != binding.primary()
+                || self.selected_lifecycle() != Some((binding.epoch(), ReplicaRole::Primary))
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            self.sessions.associate_build(binding, &checked)?;
+        }
+        Ok(())
+    }
+
+    async fn validate_build_operation(&self, binding: &Binding, primary: bool) -> Result<()> {
+        if !self.context.ordinary_hosting() && !binding.original_member_idle() {
+            return Ok(());
+        }
+        let checked = super::build_provenance::check(&self.context, binding).await?;
+        if primary {
+            if self.selected_lifecycle() != Some((binding.epoch(), ReplicaRole::Primary)) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            self.sessions.check_build(binding, &checked)?;
+        } else {
+            if self.selected_lifecycle() != Some((binding.epoch(), ReplicaRole::IdleSecondary)) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            let facade = self
+                .facade
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or(RuntimeError::Closed)?;
+            if !matches!(
+                facade.service().target().map_err(application)?,
+                super::Target::Secondary(_)
+            ) {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            self.sessions.associate_build(binding, &checked)?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn authorize(&self, binding: &Binding) -> Result<()> {
-        self.authorize_publications(binding, false)
-            .await
-            .map(|_| ())
+        self.authorize_publications(binding, false).await
+    }
+
+    async fn confirm_source_scope(&self, binding: &Binding) -> Result<()> {
+        // Construction reuses the actual source proposal, not a claim that its
+        // Peer already exists. Data/receipt confirmation still requires Confirm.
+        let owned = self
+            .effects
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((nonce, effect), (exact, _))| {
+                nonce == &binding.nonce
+                    && exact == binding
+                    && matches!(
+                        effect,
+                        Effect::Control(Control::Reserve | Control::Reform | Control::Continue)
+                    )
+            });
+        match self.control(binding, Control::Confirm).await {
+            Ok(()) => Ok(()),
+            Err(error) if owned => self
+                .control(binding, Control::Activate)
+                .await
+                .map_err(|_| error),
+            Err(error) => Err(error),
+        }
     }
 
     pub(super) async fn authorize_completion(&self, binding: &Binding) -> Result<()> {
-        if self.local == binding.primary()
-            && binding.reformation
-            && !self.fresh_reformation_ready(binding)?
-        {
-            return Err(RuntimeError::ProgressNotReady);
-        }
-        self.authorize_publications(binding, true).await.map(|_| ())
+        self.authorize_publications(binding, true).await
     }
 
     fn fresh_reformation_ready(&self, binding: &Binding) -> Result<bool> {
@@ -1207,7 +1696,7 @@ impl Transport {
         };
         if !peer.current.load(Ordering::Acquire)
             || peer.fence.check().is_err()
-            || peer.fresh_ack.load(Ordering::Acquire) < boundary
+            || (!binding.reformation && peer.fresh_ack.load(Ordering::Acquire) < boundary)
         {
             return Ok(false);
         }
@@ -1231,10 +1720,23 @@ impl Transport {
             .continuation_session(&peer.route, &identity, binding.epoch())
             .map_err(application)?;
         let progress = native.progress(0);
+        let required = if binding.reformation {
+            binding
+                .source
+                .scope
+                .configuration
+                .replicas
+                .iter()
+                .find(|description| description.identity == binding.secondary().identity)
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?
+                .current_progress
+        } else {
+            boundary
+        };
         Ok(
             !native.is_processing()
-                && progress.received >= boundary
-                && progress.applied >= boundary,
+                && progress.received >= required
+                && progress.applied >= required,
         )
     }
 
@@ -1302,10 +1804,6 @@ impl Transport {
         binding.is_some_and(|binding| self.fresh_reformation_ready(&binding).unwrap_or(false))
     }
 
-    pub(super) async fn wait_for_fresh_reformation_ack(&self, binding: &Binding) -> Result<()> {
-        self.wait_for_reformation_ack(binding, true).await
-    }
-
     pub(super) async fn wait_for_reformation_checkpoint(&self, binding: &Binding) -> Result<()> {
         self.wait_for_reformation_ack(binding, false).await
     }
@@ -1347,8 +1845,14 @@ impl Transport {
 
     // Reports only whether this invocation already obtained source confirmation.
     // Callers still revalidate publications after the await; this is not a grant.
-    async fn authorize_publications(&self, binding: &Binding, completion: bool) -> Result<bool> {
-        self.sessions.active(binding)?;
+    async fn authorize_publications(&self, binding: &Binding, completion: bool) -> Result<()> {
+        self.check_health()?;
+        self.sessions.active(binding).inspect_err(|_error| {
+            #[cfg(test)]
+            if std::env::var_os("KUBERIC_M3_NATIVE_SCOPE_DIAGNOSTICS").is_some() {
+                eprintln!("native authorization session-stage refusal: completion={completion}, error={_error}");
+            }
+        })?;
         let local = self.publication().await?;
         let primary = self.local == binding.primary();
         let remote = if primary {
@@ -1376,13 +1880,91 @@ impl Transport {
         } else {
             (&publication, &local)
         };
+        if binding.target.role == ReplicaRole::IdleSecondary
+            && target.role == ReplicaRole::ActiveSecondary
+            && (!self.sessions.completed(binding)
+                || !primary
+                    && self.selected_lifecycle()
+                        != Some((binding.epoch(), ReplicaRole::ActiveSecondary)))
+        {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let changed_lease = source.scope.configuration.current
+            != binding.source.scope.configuration.current
+            || target.scope.configuration.current != binding.target.scope.configuration.current
+            || source.scope.configuration.previous != binding.source.scope.configuration.previous
+            || target.scope.configuration.previous != binding.target.scope.configuration.previous;
+        if changed_lease {
+            if !self.sessions.completed(binding)
+                || target.role == ReplicaRole::ActiveSecondary
+                    && self.local == binding.secondary()
+                    && self.selected_lifecycle()
+                        != Some((binding.epoch(), ReplicaRole::ActiveSecondary))
+            {
+                return Err(RuntimeError::AuthorityNotAdmitted);
+            }
+            if primary {
+                let installed = self
+                    .configuration
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                if installed.0 != source.scope.configuration.current
+                    && source.stage != ReplicaPublicationStage::DiscoveryPending
+                {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                let facade = self
+                    .facade
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or(RuntimeError::Closed)?;
+                let super::Target::Primary(native) =
+                    facade.service().target().map_err(application)?
+                else {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                };
+                let peer = self.current_peer(binding, true)?;
+                let current = native.current_transport_sessions().map_err(application)?;
+                let current_root = current.as_ref().is_some_and(|current| {
+                    current.epoch == binding.epoch()
+                        && current.members.iter().any(|(id, identity, active)| {
+                            *id == binding.secondary().identity.replica_id.value()
+                                && *active
+                                && identity.remote_incarnation == peer.incarnation
+                                && identity.primary_endpoint == peer.route.sender_address
+                                && identity.remote_endpoint == peer.route.remote_address
+                        })
+                });
+                let copied_idle = source.stage == ReplicaPublicationStage::DiscoveryPending
+                    && binding.target.role == ReplicaRole::IdleSecondary
+                    && native
+                        .completed_copy_transport(
+                            &peer.route,
+                            &super::super::session::SessionIdentity {
+                                primary_endpoint: peer.route.sender_address.clone(),
+                                remote_endpoint: peer.route.remote_address.clone(),
+                                remote_incarnation: peer.incarnation,
+                            },
+                            binding.epoch(),
+                        )
+                        .is_ok();
+                if !current_root && !copied_idle {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+            } else {
+                self.confirm_source_scope(binding).await?;
+            }
+        }
         if completion
             && (source.scope.configuration.current != target.scope.configuration.current
                 || source.scope.configuration.previous != target.scope.configuration.previous)
         {
             return Err(RuntimeError::AuthorityNotAdmitted);
         }
-        let mut source_confirmed = false;
         for (is_source, now, origin) in [
             (true, source, &binding.source),
             (false, target, &binding.target),
@@ -1416,10 +1998,7 @@ impl Transport {
                         .completed_replacement_for(binding)
                         .is_some_and(|selected| replacement_scope_from(now, &selected, origin))
                 } else {
-                    if !source_confirmed {
-                        self.control(binding, Control::Confirm).await?;
-                        source_confirmed = true;
-                    }
+                    self.confirm_source_scope(binding).await?;
                     true
                 }
             } else {
@@ -1432,9 +2011,40 @@ impl Transport {
                     != binding.primary().identity.replica_id
                 || (!ordinary_scope && !cohort_scope)
             {
+                #[cfg(test)]
+                if std::env::var_os("KUBERIC_M3_NATIVE_SCOPE_DIAGNOSTICS").is_some() {
+                    eprintln!(
+                        "native publication refusal: source={is_source}, completion={completion}, ordinary={ordinary_scope}, cohort={cohort_scope}, physical={}, history={}, epoch={:?}/{:?}, stage={:?}, role={:?}, current={:?}/{:?}, previous={:?}/{:?}, peers={}",
+                        Endpoint::publication(now) == Endpoint::publication(origin),
+                        now.scope.history == origin.scope.history,
+                        now.scope.epoch,
+                        origin.scope.epoch,
+                        now.stage,
+                        now.role,
+                        now.scope.configuration.current.configuration_id,
+                        origin.scope.configuration.current.configuration_id,
+                        now.scope
+                            .configuration
+                            .previous
+                            .as_ref()
+                            .map(|previous| &previous.configuration_id),
+                        origin
+                            .scope
+                            .configuration
+                            .previous
+                            .as_ref()
+                            .map(|previous| &previous.configuration_id),
+                        now.scope.configuration.replicas.len()
+                    );
+                }
                 return Err(RuntimeError::AuthorityNotAdmitted);
             }
             for peer in &now.scope.configuration.replicas {
+                if (!peer.is_up || !peer.is_ready) && !peer.must_catchup {
+                    // These descriptors retain logical quorum obligations,
+                    // not a claim that an active native root exists.
+                    continue;
+                }
                 if primary
                     && origin.scope.configuration.replicas.contains(peer)
                     && self
@@ -1553,10 +2163,7 @@ impl Transport {
                     // Requiring unrelated receivers to be reachable here
                     // would turn a single-peer outage into lost healthy quorum.
                     // A confirmation checks both complete publications.
-                    if !source_confirmed {
-                        self.control(binding, Control::Confirm).await?;
-                        source_confirmed = true;
-                    }
+                    self.confirm_source_scope(binding).await?;
                     true
                 };
                 if !matches {
@@ -1612,7 +2219,12 @@ impl Transport {
                         // native voting still uses the installed configuration.
                         let installing = publication.stage
                             == ReplicaPublicationStage::DiscoveryPending
-                            && scope.previous.as_ref() == Some(current);
+                            && scope.current.epoch == current.epoch
+                            && scope.current.primary_id == current.primary_id
+                            && scope.current.members.iter().any(|member| {
+                                member.identity == binding.secondary().identity
+                                    && member.role == ReplicaRole::ActiveSecondary
+                            });
                         (selected || prior || installing)
                             && (current.members.iter().any(|member| {
                                 member.identity == binding.secondary().identity
@@ -1625,16 +2237,19 @@ impl Transport {
             }
         }
         self.sessions.active(binding)?;
-        Ok(source_confirmed)
+        Ok(())
     }
 
     pub(super) async fn confirm_effect(&self, binding: &Binding) -> Result<()> {
         let result = async {
-            let confirmed = self.authorize_publications(binding, false).await?;
-            if self.local == binding.secondary() && !confirmed {
+            self.current_peer(binding, self.local == binding.primary())?;
+            self.authorize_publications(binding, false).await?;
+            if self.local == binding.secondary() {
                 self.control(binding, Control::Confirm).await?;
             }
-            self.authorize(binding).await
+            self.authorize(binding).await?;
+            self.current_peer(binding, self.local == binding.primary())
+                .map(|_| ())
         }
         .await;
         if let Err(error) = &result {
@@ -1829,6 +2444,18 @@ impl Transport {
                         _ = tokio::time::sleep(Duration::from_millis(10)) => {}
                     }
                 }
+                Err(RuntimeError::PeerUnavailable(_))
+                    if !matches!(
+                        command,
+                        Control::Confirm | Control::CheckContinuation | Control::CheckReformation
+                    ) =>
+                {
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait_for(|stopped| *stopped) => return Err(RuntimeError::Closed),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                }
                 result => return result,
             }
         }
@@ -1888,6 +2515,7 @@ impl Transport {
                         command,
                         Control::Recover
                             | Control::Recovered
+                            | Control::Reform
                             | Control::CheckReformation
                             | Control::CheckContinuation
                     ) {
@@ -1963,6 +2591,60 @@ impl Transport {
     }
 
     async fn receive_control(self: &Arc<Self>, control: &ControlEnvelope) -> Result<()> {
+        if matches!(
+            control.command,
+            Control::Confirm | Control::CheckContinuation | Control::CheckReformation
+        ) {
+            return self.receive_control_inner(control).await;
+        }
+        let retained = self.effects.lock().unwrap().contains_key(&(
+            control.binding.nonce.clone(),
+            Effect::Control(control.command),
+        ));
+        if !retained && control.command == Control::Complete {
+            // A rejected context check selected no effect and owns no failure
+            // of the existing root. Actual completion remains memoized below.
+            self.authorize_completion(&control.binding).await?;
+        }
+        let owner = self.clone();
+        let selected = control.clone();
+        self.owned_effect(
+            &control.binding,
+            Effect::Control(control.command),
+            async move { owner.receive_control_inner(&selected).await.map(|()| 0) },
+        )
+        .await?;
+        if matches!(
+            control.command,
+            Control::Reserve | Control::Reform | Control::Continue
+        ) {
+            self.current_peer(&control.binding, false)?;
+            self.authorize(&control.binding).await?;
+            self.current_peer(&control.binding, false)?;
+        } else if control.command == Control::Activate {
+            if !control.binding.recovery && !control.binding.retained_receiver() {
+                self.validate_build_operation(&control.binding, true)
+                    .await?;
+            }
+            self.authorize(&control.binding).await?;
+        } else if matches!(control.command, Control::Complete | Control::Recovered) {
+            self.current_peer(&control.binding, self.local == control.binding.primary())?;
+            self.authorize_completion(&control.binding).await?;
+            self.current_peer(&control.binding, self.local == control.binding.primary())?;
+        } else if control.command == Control::Recover && retained {
+            let owner = self
+                .production
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or(RuntimeError::Closed)?;
+            owner.recover_source(&control.binding, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn receive_control_inner(self: &Arc<Self>, control: &ControlEnvelope) -> Result<()> {
         let binding = &control.binding;
         #[cfg(feature = "testing")]
         if control.command == Control::Confirm {
@@ -1980,36 +2662,82 @@ impl Transport {
             Control::CheckReformation | Control::Reform if !primary && binding.reformation => {
                 let _continuation = self.continuations.lock().await;
                 self.validate_publications(binding).await?;
-                if self.sessions.active(binding).is_ok() {
-                    return self.confirm_effect(binding).await;
-                }
                 if self.selected_lifecycle()
                     != Some((binding.epoch(), ReplicaRole::ActiveSecondary))
                 {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
-                if self.sessions.vacant_receiver() {
-                    let owner = self
-                        .production
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                    owner.retained_receiver_for_reformation(binding)?;
+                let facade = self
+                    .facade
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or(RuntimeError::Closed)?;
+                if self.sessions.inbound().is_none() {
+                    let secondary = facade
+                        .service()
+                        .demotion_receiver(binding.epoch())
+                        .map_err(application)?;
+                    self.sessions.first_demotion_receiver(binding)?;
+                    let checked =
+                        super::warm_source_transfer::check(&self.context, binding, None).await?;
                     if control.command == Control::CheckReformation {
                         return Ok(());
                     }
                     self.control(binding, Control::Activate).await?;
+                    self.settle_role_sessions().await?;
                     self.validate_publications(binding).await?;
-                    owner.retained_receiver_for_reformation(binding)?;
-                    self.sessions
-                        .restore_receiver(binding, || owner.bind_retained_receiver(binding))?;
+                    let current =
+                        super::warm_source_transfer::check(&self.context, binding, None).await?;
+                    let root = facade
+                        .service()
+                        .demotion_receiver(binding.epoch())
+                        .map_err(application)?;
+                    if current != checked
+                        || !root.same_instance(&secondary)
+                        || self.selected_lifecycle()
+                            != Some((binding.epoch(), ReplicaRole::ActiveSecondary))
+                    {
+                        return Err(RuntimeError::AuthorityNotAdmitted);
+                    }
+                    self.sessions.associate_demotion_receiver(binding, || {
+                        root.check_demotion_root(binding.epoch())
+                            .map_err(application)
+                    })?;
+                    #[cfg(feature = "testing")]
+                    self.test_cut(
+                        crate::replicator::TestingTcpRouteKind::ReceiverReplaced,
+                        binding,
+                    )
+                    .await?;
                     self.sessions.activate_target(binding)?;
+                    #[cfg(feature = "testing")]
+                    self.test_cut(
+                        crate::replicator::TestingTcpRouteKind::TargetActivated,
+                        binding,
+                    )
+                    .await?;
                     self.peer(binding.clone(), false).await?;
                     return Ok(());
                 }
-                let old = self.sessions.reformation_predecessor(binding)?;
+                let normal = self
+                    .sessions
+                    .inbound()
+                    .filter(|old| old.epoch() == binding.epoch())
+                    .map(|old| async move {
+                        let checked =
+                            super::warm_source_transfer::check(&self.context, binding, Some(&old))
+                                .await?;
+                        let predecessor = self.sessions.normal_predecessor(binding, &checked)?;
+                        Ok::<_, RuntimeError>((checked, predecessor))
+                    });
+                let (checked, old) = if let Some(normal) = normal {
+                    let (checked, old) = normal.await?;
+                    (Some(checked), old)
+                } else {
+                    (None, self.sessions.reformation_predecessor(binding)?)
+                };
                 let facade = self
                     .facade
                     .lock()
@@ -2038,8 +2766,12 @@ impl Transport {
                         peer.identity == self.local.identity
                             && peer.is_up
                             && peer.is_ready
-                            && peer.current_progress == progress
-                            && peer.catch_up_capability == capability
+                            && if checked.is_some() {
+                                peer.current_progress >= 0 && progress >= peer.current_progress
+                            } else {
+                                peer.current_progress == progress
+                                    && peer.catch_up_capability == capability
+                            }
                     })
                 {
                     return Err(RuntimeError::AuthorityNotAdmitted);
@@ -2050,6 +2782,15 @@ impl Transport {
                 // Authenticate the exact source's selected proposal before joining
                 // or rotating anything. A readiness probe never grants a session.
                 self.control(binding, Control::Activate).await?;
+                if let Some(checked) = &checked {
+                    let current =
+                        super::warm_source_transfer::check(&self.context, binding, Some(&old))
+                            .await?;
+                    if &current != checked {
+                        return Err(RuntimeError::AuthorityNotAdmitted);
+                    }
+                    self.sessions.retire_normal_predecessor(binding, checked)?;
+                }
                 self.join_predecessor(&old).await?;
                 self.validate_publications(binding).await?;
                 if self.selected_lifecycle()
@@ -2057,21 +2798,44 @@ impl Transport {
                 {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
-                self.sessions.reform_receiver(binding, || {
-                    secondary
-                        .reform_transport(&predecessor, &successor, binding.epoch(), true)
-                        .map_err(application)
-                })?;
+                if let Some(checked) = &checked {
+                    let current =
+                        super::warm_source_transfer::check(&self.context, binding, Some(&old))
+                            .await?;
+                    if &current != checked {
+                        return Err(RuntimeError::AuthorityNotAdmitted);
+                    }
+                    self.sessions.reform_normal_receiver(binding, checked, || {
+                        secondary
+                            .reform_transport(&predecessor, &successor, binding.epoch(), true)
+                            .map_err(application)
+                    })?;
+                } else {
+                    self.sessions.reform_receiver(binding, || {
+                        secondary
+                            .reform_transport(&predecessor, &successor, binding.epoch(), true)
+                            .map_err(application)
+                    })?;
+                }
+                #[cfg(feature = "testing")]
+                self.test_cut(
+                    crate::replicator::TestingTcpRouteKind::ReceiverReplaced,
+                    binding,
+                )
+                .await?;
                 self.sessions.activate_target(binding)?;
+                #[cfg(feature = "testing")]
+                self.test_cut(
+                    crate::replicator::TestingTcpRouteKind::TargetActivated,
+                    binding,
+                )
+                .await?;
                 self.peer(binding.clone(), false).await?;
                 Ok(())
             }
             Control::Continue | Control::CheckContinuation if !primary => {
                 let _continuation = self.continuations.lock().await;
                 self.validate_publications(binding).await?;
-                if self.sessions.active(binding).is_ok() {
-                    return self.confirm_effect(binding).await;
-                }
                 if self.selected_lifecycle()
                     != Some((binding.epoch(), ReplicaRole::ActiveSecondary))
                 {
@@ -2112,7 +2876,19 @@ impl Transport {
                         .continue_transport(&native_route, binding.epoch())
                         .map_err(application)
                 })?;
+                #[cfg(feature = "testing")]
+                self.test_cut(
+                    crate::replicator::TestingTcpRouteKind::ReceiverReplaced,
+                    binding,
+                )
+                .await?;
                 self.sessions.activate_target(binding)?;
+                #[cfg(feature = "testing")]
+                self.test_cut(
+                    crate::replicator::TestingTcpRouteKind::TargetActivated,
+                    binding,
+                )
+                .await?;
                 self.peer(binding.clone(), false).await?;
                 Ok(())
             }
@@ -2138,6 +2914,7 @@ impl Transport {
             }
             Control::Reserve if !primary => {
                 self.validate_publications(binding).await?;
+                self.validate_build_operation(binding, false).await?;
                 if self
                     .production
                     .lock()
@@ -2149,25 +2926,39 @@ impl Transport {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
                 self.sessions.reserve(binding)?;
-                if self.sessions.active(binding).is_ok() {
-                    return self.confirm_effect(binding).await;
-                }
                 // Reservation exists before the authenticated source can become Active.
                 self.control(binding, Control::Activate).await?;
                 self.validate_publications(binding).await?;
+                self.validate_build_operation(binding, false).await?;
                 self.sessions.activate_target(binding)?;
+                #[cfg(feature = "testing")]
+                self.test_cut(
+                    crate::replicator::TestingTcpRouteKind::TargetActivated,
+                    binding,
+                )
+                .await?;
                 self.peer(binding.clone(), false).await?;
                 Ok(())
             }
             Control::Activate if primary => {
                 self.validate_publications(binding).await?;
+                if binding.reformation {
+                    self.associate_configuration(binding).await?;
+                }
+                if !binding.recovery && !binding.retained_receiver() {
+                    self.validate_build_operation(binding, true).await?;
+                }
                 if self.sessions.active(binding).is_ok() {
                     Ok(())
                 } else {
                     self.sessions.activate_source(binding)
                 }
             }
-            Control::Confirm if primary => self.authorize(binding).await,
+            Control::Confirm if primary => {
+                self.current_peer(binding, true)?;
+                self.authorize(binding).await?;
+                self.current_peer(binding, true).map(|_| ())
+            }
             Control::Complete if !primary => {
                 self.authorize_completion(binding).await?;
                 self.confirm_effect(binding).await?;
@@ -2236,6 +3027,25 @@ impl Transport {
             peer.current.store(false, Ordering::Release);
             peer.carrier.shutdown();
         }
+        let owns_peer = self
+            .peers
+            .lock()
+            .unwrap()
+            .values()
+            .any(|peer| peer.binding == *binding)
+            || self
+                .retiring_peers
+                .lock()
+                .unwrap()
+                .contains_key(&binding.nonce)
+            || self
+                .ack_settlements
+                .lock()
+                .unwrap()
+                .contains_key(&binding.nonce);
+        if owns_peer {
+            self.join_predecessor(binding).await?;
+        }
         match self.control(binding, Control::Retire).await {
             Ok(()) => self.sessions.settled(binding),
             Err(error) => {
@@ -2267,10 +3077,30 @@ impl Transport {
     }
 
     async fn peer(self: &Arc<Self>, binding: Binding, outgoing: bool) -> Result<Arc<Peer>> {
+        let owner = self.clone();
+        let selected = binding.clone();
+        self.owned_effect(&binding, Effect::Peer(outgoing), async move {
+            owner
+                .create_peer(selected, outgoing)
+                .await
+                .map(|peer| peer.incarnation)
+        })
+        .await?;
+        self.authorize(&binding).await?;
+        self.current_peer(&binding, outgoing)
+    }
+
+    async fn create_peer(self: &Arc<Self>, binding: Binding, outgoing: bool) -> Result<Arc<Peer>> {
         if *self.stop.borrow() {
             return Err(RuntimeError::Closed);
         }
         self.authorize(&binding).await?;
+        #[cfg(feature = "testing")]
+        self.test_cut(
+            crate::replicator::TestingTcpRouteKind::PeerCreating,
+            &binding,
+        )
+        .await?;
         let route = route(&binding, &self.local)?;
         let fence = self.fence(&binding);
         let id = route.destination.replica;
@@ -2302,6 +3132,11 @@ impl Transport {
                 if let Some(previous) = previous {
                     previous.current.store(false, Ordering::Release);
                     previous.carrier.shutdown();
+                    previous.tasks.close();
+                    self.retiring_peers
+                        .lock()
+                        .unwrap()
+                        .insert(previous.binding.nonce.clone(), previous);
                 }
                 let (carrier, ingress) =
                     Carrier::new(route.clone(), limits()).map_err(application)?;
@@ -2341,20 +3176,27 @@ impl Transport {
                     },
                     fresh_ack: AtomicI64::new(-1),
                     initial_ack: Arc::new(AtomicI64::new(-1)),
+                    native_installed: AtomicBool::new(binding.live_target.is_none()),
                     ack_generation,
                     ack_owner,
                     current: current.clone(),
                     tasks: TaskTracker::new(),
                 });
-                self.spawn(peer.tasks.track_future(self.clone().run_ingress(
-                    binding.clone(),
-                    current,
-                    ingress,
-                )));
+                self.spawn_peer(
+                    &binding,
+                    &peer.tasks,
+                    self.clone().run_ingress(binding.clone(), current, ingress),
+                );
                 peers.insert(id, peer.clone());
                 Ok(peer)
             }
         })??;
+        #[cfg(feature = "testing")]
+        self.test_cut(
+            crate::replicator::TestingTcpRouteKind::PeerInstalled,
+            &binding,
+        )
+        .await?;
         if outgoing {
             self.sessions.effect(&binding, || -> Result<()> {
                 if !peer.connecting.swap(true, Ordering::AcqRel) {
@@ -2363,9 +3205,9 @@ impl Transport {
                     let (initial, _) = peer.carrier.bind().map_err(application)?;
                     let owner = self.clone();
                     let connection = peer.clone();
-                    self.spawn(peer.tasks.track_future(async move {
+                    self.spawn_peer(&binding, &peer.tasks, async move {
                         owner.run_connection(connection, initial).await
-                    }));
+                    });
                 }
                 Ok(())
             })??;
@@ -2425,6 +3267,22 @@ impl Transport {
                         #[cfg(feature = "testing")]
                         self.observe_ingress(&envelope, "continuationCopyRejected".into());
                         continue;
+                    }
+                    if binding.live_target.is_some()
+                        && self.local == binding.primary()
+                        && let Some(wire::envelope::Body::ReplicationAck(ack)) = &envelope.body
+                    {
+                        let installed = self
+                            .peers
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .find(|peer| peer.binding == binding)
+                            .is_some_and(|peer| peer.native_installed.load(Ordering::Acquire));
+                        if !installed {
+                            self.record_reformation_checkpoint(&binding, ack)?;
+                            continue;
+                        }
                     }
                     let dispatched = match self.sessions.effect(&binding, || {
                         #[cfg(all(test, feature = "testing"))]
@@ -2553,6 +3411,7 @@ impl Transport {
             registry,
             credentials: Arc::from("test-token"),
             peers: Mutex::new(BTreeMap::new()),
+            retiring_peers: Mutex::new(BTreeMap::new()),
             stop: watch::channel(false).0,
             tasks: TaskTracker::new(),
             failure: Arc::new(Mutex::new(None)),
@@ -2566,6 +3425,7 @@ impl Transport {
             configuration: Mutex::new(None),
             acknowledgements: Mutex::new(None),
             ack_settlements: Mutex::new(BTreeMap::new()),
+            effects: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testing")]
             native_credits: AtomicI64::new(0),
             #[cfg(feature = "testing")]
@@ -3005,33 +3865,50 @@ impl wire::carrier_server::Carrier for Listener {
                 let outcome = AssertUnwindSafe(owner.receive_control(&control))
                     .catch_unwind()
                     .await
-                    .map_err(|_| (false, "engine control owner panicked".to_owned()))
+                    .map_err(|_| Status::permission_denied("engine control owner panicked"))
                     .and_then(|result| {
-                        result.map_err(|error| {
-                            (matches!(error, RuntimeError::QueueFull), error.to_string())
+                        result.map_err(|error| match error {
+                            RuntimeError::QueueFull => {
+                                Status::resource_exhausted(error.to_string())
+                            }
+                            RuntimeError::Closed => Status::unavailable(error.to_string()),
+                            error => Status::permission_denied(error.to_string()),
                         })
                     });
                 #[cfg(feature = "testing")]
-                if outcome.is_ok() && control.command == Control::Retire {
-                    owner
+                if outcome.is_ok()
+                    && control.command == Control::Retire
+                    && owner
                         .test_cut(
                             crate::replicator::TestingTcpRouteKind::RetireResponse,
                             &control.binding,
                         )
-                        .await?;
+                        .await
+                        .is_err()
+                {
+                    return Ok(());
+                }
+                #[cfg(feature = "testing")]
+                if outcome.is_ok()
+                    && control.command == Control::Reserve
+                    && owner
+                        .test_cut(
+                            crate::replicator::TestingTcpRouteKind::ReserveResponse,
+                            &control.binding,
+                        )
+                        .await
+                        .is_err()
+                {
+                    // Only this RPC observer loses its response. The actual
+                    // memoized operation and Peer are already retained.
+                    return Ok(());
                 }
                 result.send_replace(Some(outcome));
                 Ok(())
             });
             loop {
                 if let Some(result) = completed.borrow().clone() {
-                    result.map_err(|(retry, error)| {
-                        if retry {
-                            Status::resource_exhausted(error)
-                        } else {
-                            Status::permission_denied(error)
-                        }
-                    })?;
+                    result?;
                     break;
                 }
                 completed

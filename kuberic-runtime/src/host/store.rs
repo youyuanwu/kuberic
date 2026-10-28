@@ -32,12 +32,39 @@ pub(crate) struct RenewPublicDataLossAttempt {
 
 #[async_trait]
 pub(crate) trait AgentStore: Send + Sync {
+    async fn select_native_input(
+        &self,
+        _intent: &PublicOperationIntent,
+        _input: &crate::host::state::NativeActionInput,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "native lifecycle input selection unavailable".into(),
+        ))
+    }
+
+    async fn validate_creation_reconstruction(
+        &self,
+        _goal: &crate::protocol::public_operations::ReplicaGoal,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "checked creation reconstruction is unavailable".into(),
+        ))
+    }
+
     async fn acknowledge_ordinary_goal(
         &self,
         _acknowledgement: &crate::protocol::public_operations::ReplicaGoalAcknowledgement,
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
             "ordinary goal acknowledgement unavailable".into(),
+        ))
+    }
+    async fn finish_original_member_rebuild(
+        &self,
+        _goal: &crate::protocol::public_operations::ReplicaGoal,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "original-member final settlement unavailable".into(),
         ))
     }
     async fn identity(&self) -> Result<StorageIdentity>;

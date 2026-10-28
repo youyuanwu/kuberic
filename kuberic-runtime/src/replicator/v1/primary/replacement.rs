@@ -11,6 +11,90 @@ pub(super) fn same_route(left: &Route, right: &Route) -> bool {
 }
 
 impl PrimaryHandle {
+    pub(in crate::replicator::v1) fn freeze_live_target(
+        &self,
+        route: &Route,
+        identity: &super::super::session::SessionIdentity,
+        epoch: Epoch,
+    ) -> Result<ReplicationSession, PrimaryError> {
+        let session = self.continuation_session(route, identity, epoch)?;
+        session.close();
+        Ok(session)
+    }
+
+    pub(in crate::replicator::v1) fn install_live_target(
+        &self,
+        predecessor: &Route,
+        identity: &super::super::session::SessionIdentity,
+        successor: Route,
+        incarnation: i64,
+        epoch: Epoch,
+        checkpoint: Lsn,
+    ) -> Result<(), PrimaryError> {
+        let root = self.root()?;
+        let (effects, _activity) = {
+            let mut state = root.state.lock().unwrap();
+            Root::check_open(&state)?;
+            root.check_route(predecessor)?;
+            root.check_route(&successor)?;
+            let id = predecessor.destination.replica;
+            let old = state
+                .bindings
+                .get(&id)
+                .ok_or(PrimaryError::UnknownSession(id))?
+                .clone();
+            let mut manager = root.manager.lock().unwrap();
+            if old.idle
+                || !same_route(&old.route, predecessor)
+                || old.session.identity() != *identity
+                || old.session.transport_active()
+                || old.session.is_processing()
+                || state.replacement_predecessor.is_some()
+                || id != successor.destination.replica
+                || successor.source != predecessor.source
+                || successor.destination == predecessor.destination
+                || incarnation <= identity.remote_incarnation
+                || checkpoint < 0
+                || checkpoint > manager.last_sequence_number()?
+                || !manager
+                    .current_root(id)
+                    .is_some_and(|session| session.same_instance(&old.session))
+            {
+                return Err(PrimaryError::InvalidBinding(id));
+            }
+            let (next_identity, native_epoch) = manager.build_identity(&successor, incarnation)?;
+            if native_epoch != epoch {
+                return Err(PrimaryError::InvalidBinding(id));
+            }
+            let session = ReplicationSession::new(
+                next_identity,
+                epoch,
+                checkpoint,
+                root.sender,
+                root.send.clone(),
+                root.clock.now(),
+            );
+            session.open();
+            let effects = manager.admit_live_target(id, &old.session, session.clone())?;
+            state.replacement_predecessor = Some(old);
+            state.live_target_reformation = true;
+            state.bindings.insert(
+                id,
+                Binding {
+                    route: successor,
+                    session,
+                    owner: SessionOwner::Established(Arc::new(CopySender::new(false))),
+                    idle: false,
+                },
+            );
+            drop(manager);
+            (effects, root.activity(&mut state))
+        };
+        effects.dispatch(root.clock.now())?;
+        root.wake.notify_one();
+        Ok(())
+    }
+
     pub(in crate::replicator::v1) fn verify_replacement_metadata(
         &self,
         route: &Route,
@@ -347,6 +431,7 @@ impl PrimaryHandle {
             .is_some_and(|old| !manager.contains_root(&old.session))
         {
             state.replacement_predecessor = None;
+            state.live_target_reformation = false;
         }
         Ok(effects)
     }

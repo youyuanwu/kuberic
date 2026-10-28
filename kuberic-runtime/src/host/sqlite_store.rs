@@ -71,8 +71,22 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
             {
                 return Err(crate::host::HostError::Corrupt("native retained receipt is outside its exact restoration".into()));
             }
+            if let PublicInstructionOutcome::ReconstructedNativeInitialized(scope) = outcome
+                && operation.intent.goal().is_none_or(|goal| {
+                    super::ordinary_goal::reconstruction::claim(goal).is_none()
+                        || scope.as_ref() != &goal.scope
+                })
+            {
+                return Err(crate::host::HostError::Corrupt(
+                    "native reconstruction receipt is outside its exact goal".into(),
+                ));
+            }
         }
         if let Some(goal) = operation.intent.goal() {
+            super::native_history::validate_record(state, operation)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            super::ordinary_goal::validate_creation_owner(state, operation)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
             let ordinary = operation.ordinary.as_ref().ok_or_else(|| {
                 crate::host::HostError::Corrupt("semantic goal lacks frozen local actions".into())
             })?;
@@ -82,6 +96,7 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                 if !matches!(
                     goal.desired,
                     crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
+                        | crate::protocol::public_operations::ReplicaGoalKind::Discover
                 ) || !super::ordinary_goal::opened_creation(state, goal)
                 {
                     return Err(crate::host::HostError::Corrupt(
@@ -100,6 +115,27 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                 goal.desired,
                 crate::protocol::public_operations::ReplicaGoalKind::Remove { .. }
             ) && ordinary.actions.is_empty();
+            let mut legacy =
+                crate::host::public_lifecycle::program::legacy_ordinary_instructions(goal);
+            if ordinary.already_open {
+                legacy.retain(|instruction| {
+                    !matches!(
+                        instruction,
+                        crate::host::state::PublicInstruction::ApplicationOpen
+                            | crate::host::state::PublicInstruction::ReplicatorOpen
+                    )
+                });
+            }
+            let retained_pre_component = ordinary.native_input.is_none()
+                && ordinary.actions == legacy
+                && !operation.lifecycle.outcomes.iter().any(|outcome| {
+                    matches!(
+                        outcome,
+                        PublicInstructionOutcome::NativeStatus(_)
+                            | PublicInstructionOutcome::NativeLifecycle(_)
+                            | PublicInstructionOutcome::NativeUnavailable
+                    )
+                });
             if ordinary.action_format != crate::protocol::public_operations::ORDINARY_ACTION_FORMAT
                 || ordinary.open_existing.is_some()
                     != matches!(
@@ -107,8 +143,9 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                         crate::protocol::public_operations::ReplicaGoalKind::Discover
                             | crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
                             | crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }
+                            | crate::protocol::public_operations::ReplicaGoalKind::RecoverContainedCreation { .. }
                     )
-                || (!tombstone && ordinary.actions != expected)
+                || (!tombstone && !retained_pre_component && ordinary.actions != expected)
                 || operation.lifecycle.outcomes.len() > ordinary.actions.len()
                 || operation.lifecycle.in_flight.is_some_and(|instruction| {
                     ordinary.actions.get(operation.lifecycle.outcomes.len()) != Some(&instruction)
@@ -133,6 +170,16 @@ fn validate_public_v1_state(state: &AgentState) -> Result<()> {
                     "retained custody attached to another recipe".into(),
                 ));
             }
+            if super::ordinary_goal::reconstruction::claim(goal).is_some() {
+                super::ordinary_goal::reconstruction::validate_receipt(state, operation)
+                    .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
+            } else if ordinary.reconstruction.is_some() {
+                return Err(crate::host::HostError::Corrupt(
+                    "reconstruction custody attached to another recipe".into(),
+                ));
+            }
+            super::ordinary_goal::addition::validate(state, goal)
+                .map_err(|error| crate::host::HostError::Corrupt(error.to_string()))?;
         } else if operation.ordinary.is_some() {
             return Err(crate::host::HostError::Corrupt(
                 "ordinary actions lack their canonical goal".into(),
@@ -260,6 +307,8 @@ pub(crate) struct SqliteStore {
     connection: Mutex<Connection>,
     process_storage: Mutex<Option<Vec<File>>>,
     process_owner: Mutex<Option<crate::protocol::types::ProcessSessionId>>,
+    #[cfg(feature = "testing")]
+    joined_predecessor: Mutex<Option<crate::testing::JoinedReplicaExclusion>>,
 }
 
 impl Drop for SqliteStore {
@@ -273,6 +322,83 @@ impl Drop for SqliteStore {
 }
 
 impl SqliteStore {
+    #[cfg(feature = "testing")]
+    pub(crate) fn bind_joined_predecessor(
+        &self,
+        witness: crate::testing::JoinedReplicaExclusion,
+    ) -> Result<()> {
+        if self
+            .process_storage
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+            || witness.lifetime != super::ordinary_goal::retained::process_lifetime_id()
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "joined predecessor requires actual exclusive reacquisition in its lifetime".into(),
+            ));
+        }
+        let connection = self.connection.lock().map_err(|_| {
+            crate::host::HostError::CommandRejected("metadata custody lock was poisoned".into())
+        })?;
+        let state = load_state_from_connection(&connection)?;
+        if witness.application_paths.is_empty()
+            || state
+                .application_storage
+                .as_ref()
+                .map(|binding| &binding.paths)
+                != Some(&witness.application_paths)
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "joined predecessor application paths differ from retained custody".into(),
+            ));
+        }
+        let mut current = self.joined_predecessor.lock().unwrap();
+        if current.is_some() {
+            return Err(crate::host::HostError::CommandRejected(
+                "joined predecessor custody is already bound".into(),
+            ));
+        }
+        *current = Some(witness);
+        Ok(())
+    }
+
+    fn reconstruction_exclusion(
+        &self,
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+        predecessor: &super::ordinary_goal::reconstruction::Predecessor,
+    ) -> Result<super::state::CreationExclusion> {
+        if !self.owns_process(&goal.scope.process_session_id) {
+            return Err(crate::host::HostError::CommandRejected(
+                "reconstruction requires held metadata and application lifetime locks".into(),
+            ));
+        }
+        if predecessor.process_lifetime != super::ordinary_goal::retained::process_lifetime_id() {
+            return Ok(super::state::CreationExclusion::ExclusiveProcessReacquisition);
+        }
+        #[cfg(feature = "testing")]
+        if let Some(recovery) = super::ordinary_goal::reconstruction::claim(goal)
+            && self
+                .joined_predecessor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|witness| {
+                    witness.history == goal.scope.history
+                        && witness.storage == goal.scope.storage
+                        && witness.process == recovery.predecessor_process_session_id
+                        && witness.creation == recovery.predecessor_creation_id
+                        && witness.lifetime == predecessor.process_lifetime
+                })
+        {
+            return Ok(super::state::CreationExclusion::JoinedHost);
+        }
+        Err(crate::host::HostError::CommandRejected(
+            "same-process reconstruction requires an independently joined actual host owner".into(),
+        ))
+    }
+
     pub(crate) fn bind_process_owner(
         &self,
         process: &crate::protocol::types::ProcessSessionId,
@@ -420,6 +546,8 @@ impl SqliteStore {
                 connection: Mutex::new(connection),
                 process_storage: Mutex::new(None),
                 process_owner: Mutex::new(None),
+                #[cfg(feature = "testing")]
+                joined_predecessor: Mutex::new(None),
             })
         })();
         if result.is_err() {
@@ -458,6 +586,8 @@ impl SqliteStore {
             connection: Mutex::new(connection),
             process_storage: Mutex::new(None),
             process_owner: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            joined_predecessor: Mutex::new(None),
         })
     }
 
@@ -487,6 +617,8 @@ impl SqliteStore {
             connection: Mutex::new(connection),
             process_storage: Mutex::new(None),
             process_owner: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            joined_predecessor: Mutex::new(None),
         })
     }
 
@@ -545,12 +677,54 @@ impl SqliteStore {
             connection: Mutex::new(connection),
             process_storage: Mutex::new(Some(process_storage)),
             process_owner: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            joined_predecessor: Mutex::new(None),
         })
     }
 
     #[cfg(any(all(test, kuberic_workspace_tests), feature = "testing"))]
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn metadata_image(
+        &self,
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+        selected_call: Option<&str>,
+        receipts: usize,
+    ) -> Result<Vec<u8>> {
+        let connection = self.connection.lock().map_err(|_| {
+            crate::host::HostError::Corrupt("image capture connection mutex was poisoned".into())
+        })?;
+        let mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !connection.is_autocommit() || !mode.eq_ignore_ascii_case("delete") {
+            return Err(crate::host::HostError::CommandRejected(
+                "metadata image requires a committed rollback-journal boundary".into(),
+            ));
+        }
+        let state = load_state_from_connection(&connection)?;
+        let record = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| preview.operations.get(&goal.operation_id))
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected("image goal is absent".into())
+            })?;
+        if record.intent != goal.intent()
+            || record.lifecycle.outcomes.len() != receipts
+            || record
+                .lifecycle
+                .in_flight
+                .map(|instruction| format!("{instruction:?}"))
+                .as_deref()
+                != selected_call
+        {
+            return Err(crate::host::HostError::CommandRejected(
+                "image boundary changed since authenticated instruction entry".into(),
+            ));
+        }
+        Ok(std::fs::read(&self.path)?)
     }
 
     fn with_transaction<T>(&self, action: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
@@ -570,6 +744,64 @@ fn build_was_promoted(preview: &PublicV1OperationState, build: &PublicBuildInput
 
 #[async_trait]
 impl AgentStore for SqliteStore {
+    async fn validate_creation_reconstruction(
+        &self,
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+    ) -> Result<()> {
+        let state = self.load_state().await?;
+        let record = state
+            .public_v1_operation_state
+            .as_ref()
+            .and_then(|preview| preview.operations.get(&goal.operation_id))
+            .filter(|record| record.intent == goal.intent())
+            .ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "reconstruction does not own its exact selected journal entry".into(),
+                )
+            })?;
+        super::ordinary_goal::reconstruction::validate_receipt(&state, record)?;
+        let predecessor = super::ordinary_goal::reconstruction::validate(&state, goal)?;
+        self.reconstruction_exclusion(goal, &predecessor)?;
+        Ok(())
+    }
+
+    async fn finish_original_member_rebuild(
+        &self,
+        goal: &crate::protocol::public_operations::ReplicaGoal,
+    ) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            if !super::original_member::successful_final(&state, goal) {
+                return Err(crate::host::HostError::CommandRejected(
+                    "original-member final prefix is not successful, accepted and host-settled"
+                        .into(),
+                ));
+            }
+            let dependencies = super::original_member::custody(&state, goal)
+                .map(|custody| custody.dependencies)
+                .unwrap_or_default();
+            let preview = state.public_v1_operation_state.as_mut().unwrap();
+            for id in dependencies {
+                let old = preview.operations.get_mut(&id).ok_or_else(|| {
+                    crate::host::HostError::CommandRejected(
+                        "original-member dependency disappeared".into(),
+                    )
+                })?;
+                if old
+                    .superseded_by
+                    .as_ref()
+                    .is_some_and(|owner| owner != &goal.operation_id)
+                {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "original-member dependency already resolved by another operation".into(),
+                    ));
+                }
+                old.superseded_by = Some(goal.operation_id.clone());
+            }
+            write_agent_state(transaction, &state)
+        })
+    }
+
     async fn acknowledge_ordinary_goal(
         &self,
         acknowledgement: &crate::protocol::public_operations::ReplicaGoalAcknowledgement,
@@ -580,6 +812,7 @@ impl AgentStore for SqliteStore {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
             super::ordinary_goal::validate_acknowledgement(&state, acknowledgement)?;
+            super::ordinary_goal::addition::validate(&state, goal)?;
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("ordinary goal store unavailable".into())
             })?;
@@ -594,6 +827,35 @@ impl AgentStore for SqliteStore {
             })?;
             ordinary.accepted = true;
             ordinary.host_settled = record.stage == PublicOperationStage::Completed;
+            if super::ordinary_goal::addition::successful_final(record, false) {
+                for id in &super::ordinary_goal::addition::recovery(goal)
+                    .unwrap()
+                    .predecessor_operations
+                {
+                    let old = preview.operations.get_mut(id).ok_or_else(|| {
+                        crate::host::HostError::CommandRejected(
+                            "addition origin disappeared".into(),
+                        )
+                    })?;
+                    if old
+                        .superseded_by
+                        .as_ref()
+                        .is_some_and(|owner| owner != &goal.operation_id)
+                    {
+                        return Err(crate::host::HostError::CommandRejected(
+                            "addition origin already superseded".into(),
+                        ));
+                    }
+                    old.superseded_by = Some(goal.operation_id.clone());
+                }
+            }
+            let ordinary = preview
+                .operations
+                .get(&goal.operation_id)
+                .unwrap()
+                .ordinary
+                .as_ref()
+                .unwrap();
             if let Some(remote) = goal.remote() {
                 let key = super::ordinary_goal::remote_key(remote);
                 let watermark = (goal.scope.epoch, remote.generation);
@@ -610,6 +872,13 @@ impl AgentStore for SqliteStore {
                         .filter_map(|record| record.ordinary.as_ref())
                         .flat_map(|ordinary| ordinary.ready_admissions.iter().cloned())
                         .collect::<Vec<_>>();
+                    let reconstruction_dependencies = preview
+                        .operations
+                        .values()
+                        .filter_map(|record| record.intent.goal())
+                        .filter_map(super::ordinary_goal::reconstruction::claim)
+                        .flat_map(|recovery| recovery.predecessor_operations.iter().cloned())
+                        .collect::<std::collections::BTreeSet<_>>();
                     preview.operations.retain(|_, record| {
                         let below = record
                             .intent
@@ -622,6 +891,7 @@ impl AgentStore for SqliteStore {
                             })
                             .unwrap_or(false);
                         !(below
+                            && !reconstruction_dependencies.contains(&record.intent.operation_id)
                             && !record
                                 .intent
                                 .goal()
@@ -837,8 +1107,76 @@ impl AgentStore for SqliteStore {
             let local_identity = state.identity.local_identity.clone();
             super::public_action_state::validate(&state, intent)?;
             let mut ordinary = intent.goal().map(|goal| super::ordinary_goal::freeze(&state, goal)).transpose()?;
+            if let Some(goal) = intent.goal()
+                && let Some(ordinary) = ordinary.as_mut()
+                && ordinary.creation_owner.is_none()
+            {
+                if state.public_v1_operation_state.as_ref()
+                    .is_some_and(|preview| preview.operations.contains_key(&intent.operation_id))
+                {
+                    return Err(crate::host::HostError::Corrupt(
+                        "existing ordinary21 record has no physical owner stamp".into(),
+                    ));
+                }
+                ordinary.creation_owner =
+                    Some(super::ordinary_goal::capture_creation_owner(&state, goal));
+            }
             let restoring = intent.goal().is_some_and(|goal| matches!(goal.desired,
                 crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }));
+            let reconstructing = intent.goal().is_some_and(|goal|
+                super::ordinary_goal::reconstruction::claim(goal).is_some());
+            let inspection = intent.goal().and_then(|goal|
+                super::ordinary_goal::reconstruction::inspection_custody(&state, goal)
+                    .or_else(|| super::original_member::custody(&state, goal)));
+            if let Some(custody) = &inspection {
+                let goal = intent.goal().unwrap();
+                if !superseded.is_empty() || !self.owns_process(&intent.process_session_id) {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "inspection requires exact reacquired storage without supersession".into(),
+                    ));
+                }
+                for (process, creation, predecessor) in &custody.predecessors {
+                    if predecessor.process_lifetime == super::ordinary_goal::retained::process_lifetime_id() {
+                        #[cfg(feature = "testing")]
+                        if self.joined_predecessor.lock().unwrap().as_ref().is_some_and(|witness| {
+                            witness.history == goal.scope.history && witness.storage == goal.scope.storage
+                                && witness.process == *process && witness.creation == *creation
+                                && witness.lifetime == predecessor.process_lifetime
+                        }) { continue; }
+                        return Err(crate::host::HostError::CommandRejected(
+                            format!("inspection predecessor {process}/{creation} has not been physically excluded"),
+                        ));
+                    }
+                }
+            }
+            if reconstructing && !superseded.is_empty() {
+                return Err(crate::host::HostError::CommandRejected(
+                    "reconstruction dependencies cannot be superseded before actual new success".into(),
+                ));
+            }
+            let reconstruction_dependencies = intent.goal()
+                .and_then(super::ordinary_goal::reconstruction::claim)
+                .map(|recovery| recovery.predecessor_operations.iter().cloned()
+                    .collect::<std::collections::BTreeSet<_>>())
+                .unwrap_or_default();
+            if reconstructing {
+                let goal = intent.goal().unwrap();
+                let predecessor = super::ordinary_goal::reconstruction::validate(&state, goal)?;
+                let exclusion = self.reconstruction_exclusion(goal, &predecessor)?;
+                if let Some(existing) = state.public_v1_operation_state.as_ref()
+                    .and_then(|preview| preview.operations.get(&intent.operation_id))
+                {
+                    super::ordinary_goal::reconstruction::validate_receipt(&state, existing)?;
+                } else {
+                    ordinary.as_mut().unwrap().reconstruction = Some(super::state::CreationReconstructionReceipt {
+                        predecessor_process_id: predecessor.process_id,
+                        predecessor_process_lifetime: predecessor.process_lifetime,
+                        owner_process_id: std::process::id(),
+                        owner_process_lifetime: super::ordinary_goal::retained::process_lifetime_id().to_owned(),
+                        exclusion,
+                    });
+                }
+            }
             if restoring {
                 let goal = intent.goal().unwrap();
                 let (old_pid, old_lifetime) = super::ordinary_goal::retained::validate_restore(&state, goal)?;
@@ -880,6 +1218,16 @@ impl AgentStore for SqliteStore {
                     .map(|record| record.intent.operation_id.clone())
                     .collect::<Vec<_>>()
             } else { Vec::new() };
+            let reconstructed_lineage = state.public_v1_operation_state.as_ref()
+                .into_iter().flat_map(|preview| preview.operations.values())
+                .filter(|record| record.stage != PublicOperationStage::Completed
+                    && (intent.goal().is_some_and(|goal|
+                        super::ordinary_goal::addition::permits_attempt(&state, goal, record))
+                        || super::ordinary_goal::reconstruction::dependency_replaced_in_process(
+                        &state, record, &intent.process_session_id,
+                    )))
+                .map(|record| record.intent.operation_id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected(
                     "public-operation preview is not enabled for this store".into(),
@@ -917,7 +1265,7 @@ impl AgentStore for SqliteStore {
 
             if intent.goal().is_some()
                 && preview.terminal
-                && !restoring && !retained_lineage
+                && !restoring && !reconstructing && !retained_lineage
                 && !super::ordinary_goal::terminal_for_process(preview, &intent.process_session_id)
             {
                 preview.terminal = false;
@@ -930,6 +1278,13 @@ impl AgentStore for SqliteStore {
                     .any(|record| {
                         record.stage != PublicOperationStage::Completed
                             && record.intent.process_session_id != intent.process_session_id
+                            && !reconstructed_lineage.contains(&record.intent.operation_id)
+                            && !super::ordinary_goal::reconstruction::dependency_replaced(
+                                preview, record, &intent.process_session_id,
+                            )
+                            && !super::ordinary_goal::retained::fault_dependency_replaced(
+                                preview, record, &intent.process_session_id,
+                            )
                     })
             {
                 let renewal_authorized = preview.session_renewal.as_ref().is_some_and(|renewal| {
@@ -1006,17 +1361,19 @@ impl AgentStore for SqliteStore {
                             || staged_authority)
                 });
                 let fresh_ordinary_open = intent.goal().is_some_and(|goal| {
-                    matches!(goal.desired, crate::protocol::public_operations::ReplicaGoalKind::Discover
+                    (matches!(goal.desired, crate::protocol::public_operations::ReplicaGoalKind::Discover
                         | crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. })
+                        || super::ordinary_goal::addition::selection(goal).is_some_and(|addition|
+                            addition.phase == crate::protocol::public_operations::MembershipAdditionPhase::Receiver))
                         && preview.history.as_ref() == Some(&goal.scope.history)
                         && preview.storage_incarnation.as_ref() == Some(&goal.scope.storage)
                 });
-                if !renewal_authorized && !fresh_ordinary_open && !restoring {
+                if !renewal_authorized && !fresh_ordinary_open && !restoring && !reconstructing {
                     return Err(crate::host::HostError::IdentityMismatch(
                         "fresh session cannot resume predecessor public operations".into(),
                     ));
                 }
-                if !fresh_ordinary_open && !restoring {
+                if !fresh_ordinary_open && !restoring && !reconstructing {
                 preview.operations.clear();
                 preview.current_operation = None;
                 preview.current_topology_operation = None;
@@ -1418,7 +1775,11 @@ impl AgentStore for SqliteStore {
                         "public-operation blocker {blocker} is unknown"
                     )));
                 };
-                if record.stage != PublicOperationStage::Completed && !physically_superseded.contains(blocker) {
+                if record.stage != PublicOperationStage::Completed
+                    && !physically_superseded.contains(blocker)
+                    && !reconstruction_dependencies.contains(blocker)
+                    && !inspection.as_ref().is_some_and(|custody| custody.dependencies.contains(blocker))
+                {
                     exact_blockers.insert(blocker.clone());
                 }
             }
@@ -1765,6 +2126,19 @@ impl AgentStore for SqliteStore {
             if matches!(next, PublicOperationStage::CallbackApplied | PublicOperationStage::Completed)
                 && let Some(record) = state.public_v1_operation_state.as_ref()
                     .and_then(|preview| preview.operations.get(operation_id))
+                && record.intent.goal().is_some_and(|goal|
+                    super::ordinary_goal::reconstruction::claim(goal).is_some())
+                && (disposition == Some(PublicOperationDisposition::Succeeded)
+                    || (disposition.is_none() && record.disposition == Some(PublicOperationDisposition::Succeeded)))
+            {
+                super::ordinary_goal::reconstruction::validate_receipt(&state, record)?;
+                let goal = record.intent.goal().unwrap();
+                let predecessor = super::ordinary_goal::reconstruction::validate(&state, goal)?;
+                self.reconstruction_exclusion(goal, &predecessor)?;
+            }
+            if matches!(next, PublicOperationStage::CallbackApplied | PublicOperationStage::Completed)
+                && let Some(record) = state.public_v1_operation_state.as_ref()
+                    .and_then(|preview| preview.operations.get(operation_id))
                 && record.intent.goal().is_some_and(|goal| matches!(goal.desired,
                     crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }))
                 && (disposition == Some(PublicOperationDisposition::Succeeded)
@@ -1882,6 +2256,26 @@ impl AgentStore for SqliteStore {
                 record.lifecycle.in_flight = None;
             }
             let result = record.clone();
+            if next == PublicOperationStage::Completed
+                && result.disposition == Some(PublicOperationDisposition::Succeeded)
+                && let Some(recovery) = result.intent.goal()
+                    .and_then(super::ordinary_goal::reconstruction::claim)
+                    .filter(|recovery| recovery.addition.is_none())
+            {
+                for id in &recovery.predecessor_operations {
+                    let old = preview.operations.get_mut(id).ok_or_else(|| {
+                        crate::host::HostError::CommandRejected(
+                            "reconstruction dependency disappeared before success".into(),
+                        )
+                    })?;
+                    if old.superseded_by.as_ref().is_some_and(|previous| previous != operation_id) {
+                        return Err(crate::host::HostError::DurableEffectConflict(
+                            "reconstruction dependency already has another successor".into(),
+                        ));
+                    }
+                    old.superseded_by = Some(operation_id.clone());
+                }
+            }
             if let Some(build_record) = preview.build_records.get_mut(operation_id)
                 && matches!(
                     result.intent.program,
@@ -2158,6 +2552,64 @@ impl AgentStore for SqliteStore {
         Ok(preview.operations.into_values().collect())
     }
 
+    async fn select_native_input(
+        &self,
+        intent: &PublicOperationIntent,
+        input: &crate::host::state::NativeActionInput,
+    ) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let goal = intent.goal().ok_or_else(|| {
+                crate::host::HostError::CommandRejected(
+                    "native input requires an ordinary operation".into(),
+                )
+            })?;
+            let record = state
+                .public_v1_operation_state
+                .as_ref()
+                .and_then(|preview| preview.operations.get(&intent.operation_id))
+                .ok_or_else(|| {
+                    crate::host::HostError::CommandRejected("unknown native operation".into())
+                })?;
+            let owner = super::ordinary_goal::validate_creation_owner(&state, record)?;
+            if owner.process_id != std::process::id()
+                || owner.process_lifetime != super::ordinary_goal::retained::process_lifetime_id()
+                || record.intent != *intent
+                || record.stage != PublicOperationStage::Running
+                || record.superseded_by.is_some()
+                || input.lifecycle.scope != goal.scope
+                || input.lifecycle.operation_id != goal.operation_id
+                || input.lifecycle.revision != goal.revision
+            {
+                return Err(crate::host::HostError::StaleEffectCompletion(
+                    "native input crossed its selected round/physical creation".into(),
+                ));
+            }
+            let ordinary = state
+                .public_v1_operation_state
+                .as_mut()
+                .unwrap()
+                .operations
+                .get_mut(&intent.operation_id)
+                .unwrap()
+                .ordinary
+                .as_mut()
+                .ok_or_else(|| {
+                    crate::host::HostError::Corrupt("missing ordinary native journal".into())
+                })?;
+            if let Some(selected) = &ordinary.native_input {
+                if selected != input {
+                    return Err(crate::host::HostError::DurableEffectConflict(
+                        "native operation input is immutable".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            ordinary.native_input = Some(input.clone());
+            write_agent_state(transaction, &state)
+        })
+    }
+
     async fn public_instruction(
         &self,
         intent: &PublicOperationIntent,
@@ -2184,6 +2636,48 @@ impl AgentStore for SqliteStore {
                     .then(|| intent.process_session_id.clone());
             }
             let mut state = load_state_from_connection(transaction)?;
+            if intent.goal().is_some() {
+                let record = state.public_v1_operation_state.as_ref()
+                    .and_then(|preview| preview.operations.get(&intent.operation_id))
+                    .ok_or_else(|| crate::host::HostError::CommandRejected(
+                        "ordinary physical owner disappeared".into(),
+                    ))?;
+                let owner = super::ordinary_goal::validate_creation_owner(&state, record)?;
+                if owner.process_id != std::process::id()
+                    || owner.process_lifetime != super::ordinary_goal::retained::process_lifetime_id()
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "ordinary instruction belongs to another physical process lifetime".into(),
+                    ));
+                }
+            }
+            if let Some(goal) = intent.goal()
+                .filter(|goal| super::ordinary_goal::reconstruction::claim(goal).is_some())
+            {
+                let record = state.public_v1_operation_state.as_ref()
+                    .and_then(|preview| preview.operations.get(&intent.operation_id))
+                    .ok_or_else(|| crate::host::HostError::CommandRejected(
+                        "reconstruction owner disappeared".into(),
+                    ))?;
+                super::ordinary_goal::reconstruction::validate_receipt(&state, record)?;
+                let predecessor = super::ordinary_goal::reconstruction::validate(&state, goal)?;
+                self.reconstruction_exclusion(goal, &predecessor)?;
+                let initialized = record.lifecycle.outcomes.iter().any(|outcome| matches!(outcome,
+                    PublicInstructionOutcome::ReconstructedNativeInitialized(scope) if scope.as_ref() == &goal.scope));
+                if instruction == PublicInstruction::ApplicationRole && !initialized {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "application reconstruction precedes actual persisted native initialization".into(),
+                    ));
+                }
+                if instruction == PublicInstruction::ReplicatorRole
+                    && outcome.as_ref().is_some_and(|outcome| !matches!(outcome,
+                        PublicInstructionOutcome::ReconstructedNativeInitialized(scope) if scope.as_ref() == &goal.scope))
+                {
+                    return Err(crate::host::HostError::CommandRejected(
+                        "reconstruction role lacks actual native initialization".into(),
+                    ));
+                }
+            }
             if let Some(goal) = intent.goal().filter(|goal| matches!(goal.desired,
                 crate::protocol::public_operations::ReplicaGoalKind::RestoreRetainedMember { .. }))
             {
@@ -2214,6 +2708,16 @@ impl AgentStore for SqliteStore {
                 })
             {
                 return Err(crate::host::HostError::CommandRejected("native retained receipt is outside its selected restoration".into()));
+            }
+            if let Some(PublicInstructionOutcome::ReconstructedNativeInitialized(scope)) = &outcome
+                && intent.goal().is_none_or(|goal| {
+                    super::ordinary_goal::reconstruction::claim(goal).is_none()
+                        || scope.as_ref() != &goal.scope
+                })
+            {
+                return Err(crate::host::HostError::CommandRejected(
+                    "native reconstruction receipt is outside its selected goal".into(),
+                ));
             }
             let preview = state.public_v1_operation_state.as_mut().ok_or_else(|| {
                 crate::host::HostError::CommandRejected("replacement store required".into())
@@ -2320,8 +2824,36 @@ impl AgentStore for SqliteStore {
                         | (PublicInstruction::Progress, PublicInstructionOutcome::Progress(_)) => {
                             true
                         }
+                        (PublicInstruction::NativeInspect, PublicInstructionOutcome::NativeStatus(status)) => {
+                            record.ordinary.as_ref().and_then(|ordinary| ordinary.native_input.as_ref())
+                                .is_some_and(|input| input.lifecycle == status.input)
+                        }
+                        (PublicInstruction::NativeComplete, PublicInstructionOutcome::NativeLifecycle(facts)) => {
+                            intent.goal().is_some_and(|goal| {
+                                facts.scope == goal.scope && facts.operation_id == goal.operation_id
+                                    && facts.revision == goal.revision
+                            }) && record.ordinary.as_ref().and_then(|ordinary| ordinary.native_input.as_ref()).is_some()
+                        }
+                        (PublicInstruction::Cleanup, PublicInstructionOutcome::RecoveryExitRequired(notice)) => {
+                            intent.goal().is_some_and(|goal| {
+                                super::original_member::restart_close(goal)
+                                    && notice.fault_operation_id == goal.operation_id
+                                    && notice.fault_revision == goal.revision
+                                    && notice.history == goal.scope.history
+                                    && notice.storage == goal.scope.storage
+                                    && notice.qualification.predecessor_process_session_id
+                                        == goal.scope.process_session_id
+                                    && notice.qualification.predecessor_creation_id == goal.scope.creation_id
+                            }) && record.ordinary.as_ref().and_then(|ordinary| ordinary.native_input.as_ref())
+                                .is_some_and(|input| input.native_rebuild.is_some()
+                                    && input.native_rebuild == notice.native_rebuild)
+                        }
+                        (PublicInstruction::NativeInspect | PublicInstruction::NativeDataLossDecision
+                            | PublicInstruction::NativeComplete, PublicInstructionOutcome::NativeUnavailable) => true,
                         (PublicInstruction::ReplicatorRole,
                             PublicInstructionOutcome::RetainedNativeInitialized(_)) => true,
+                        (PublicInstruction::ReplicatorRole,
+                            PublicInstructionOutcome::ReconstructedNativeInitialized(_)) => true,
                         (
                             PublicInstruction::ReplicatorClose,
                             PublicInstructionOutcome::CloseFailure {
@@ -2370,7 +2902,9 @@ impl AgentStore for SqliteStore {
                             | PublicInstruction::ApplicationRole
                             | PublicInstruction::DataLoss
                             | PublicInstruction::ReplicatorOpen
-                            | PublicInstruction::Progress,
+                            | PublicInstruction::Progress
+                            | PublicInstruction::NativeInspect
+                            | PublicInstruction::NativeComplete,
                             _,
                         ) => false,
                         (_, PublicInstructionOutcome::Done) => true,
@@ -2380,6 +2914,13 @@ impl AgentStore for SqliteStore {
                         return Err(crate::host::HostError::DurableEffectConflict(
                             "public instruction outcome does not match callback".into(),
                         ));
+                    }
+                    if matches!(&outcome, PublicInstructionOutcome::RecoveryExitRequired(notice)
+                        if notice.native_rebuild.is_some())
+                    {
+                        // Local Close/joins completed; independent OS exit
+                        // and reaping are still required before storage reuse.
+                        record.containment = PublicOperationContainment::Pending;
                     }
                     if let PublicInstructionOutcome::DataLoss(result) = &outcome {
                         preview
@@ -3018,31 +3559,38 @@ mod tests {
     }
 
     #[test]
-    fn m3_retained_final19_rejects18_readonly_cause_without_mutation() {
+    fn m3_retained_final23_rejects_predecessors_readonly_cause_without_mutation() {
         use crate::protocol::public_operations::StatePersistence;
         assert_eq!(
-            PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 19,
+            PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 23,
             "requires coordinated matched format"
         );
-        let root = crate::host::tests::tempdir().unwrap();
-        let path = SqliteStore::metadata_database_path(root.path());
-        let binding = PublicV1LifecycleBinding {
-            identity: PublicV1Identity::new(1),
-            resource_uid: identity().resource_uid,
-            spec_generation: 1,
-            state_persistence: StatePersistence::Persisted,
-        };
-        let store =
-            SqliteStore::create_replacement_authorized(&path, AgentState::new(identity()), binding)
+        for predecessor in [22, 21, 20, 19, 18, 17, 16] {
+            let root = crate::host::tests::tempdir().unwrap();
+            let path = SqliteStore::metadata_database_path(root.path());
+            let binding = PublicV1LifecycleBinding {
+                identity: PublicV1Identity::new(1),
+                resource_uid: identity().resource_uid,
+                spec_generation: 1,
+                state_persistence: StatePersistence::Persisted,
+            };
+            let store = SqliteStore::create_replacement_authorized(
+                &path,
+                AgentState::new(identity()),
+                binding,
+            )
+            .unwrap();
+            drop(store);
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "user_version", predecessor)
                 .unwrap();
-        drop(store);
-        let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 18).unwrap();
-        drop(connection);
-        let before = std::fs::read(&path).unwrap();
-        assert!(SqliteStore::read_retained_recovery_state(&path).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(!path.with_extension("owner").exists());
+            drop(connection);
+            let before = std::fs::read(&path).unwrap();
+            assert!(SqliteStore::read_retained_recovery_state(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!path.with_extension("owner").exists());
+        }
     }
 
     #[tokio::test]
@@ -3096,10 +3644,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn m3_predecessor_formats_16_17_and_18_reject_before_retained_data_or_metadata_mutation()
-    {
+    async fn m3_predecessor_formats_16_17_18_and_19_reject_before_retained_data_or_metadata_mutation()
+     {
         use crate::protocol::public_operations::*;
-        for predecessor in [16, 17, 18] {
+        for predecessor in [16, 17, 18, 19] {
             let directory = crate::host::tests::tempdir().unwrap();
             let path = SqliteStore::metadata_database_path(directory.path());
             let application = directory.path().join("acknowledged-application-data");
