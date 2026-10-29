@@ -90,101 +90,6 @@ struct Node {
 }
 
 impl Node {
-    async fn ordinary_unavailable(&self) -> TestResult<bool> {
-        let mut client =
-            proto::agent_control_client::AgentControlClient::connect(self.control_address.clone())
-                .await?;
-        let query = || {
-            authorized(proto::ReplicaSnapshotRequest {
-                protocol_version: ORDINARY_ACTION_FORMAT,
-                resource_uid: self.history.resource_uid.to_string(),
-                target: Some(self.identity.clone().into()),
-                expected_process_session_id: self.session.to_string(),
-            })
-        };
-        let response = client.get_snapshot(query()).await?.into_inner();
-        let ReplicaAgentQueryResult::Initialized(snapshot) =
-            serde_json::from_slice(&response.canonical_json)?
-        else {
-            return Err("initialized snapshot required".into());
-        };
-        let current = ConfigurationDescriptor::new(
-            Epoch::new(0, 1),
-            ReplicaId::new(1),
-            vec![ConfigurationMember {
-                identity: identity_for(&self.history.resource_uid, 1),
-                role: ReplicaRole::Primary,
-            }],
-            1,
-        );
-        let goal = ReplicaGoal {
-            format: ORDINARY_ACTION_FORMAT,
-            identity: snapshot.identity,
-            operation_id: OperationId::new(format!(
-                "ordinary-support-{}",
-                self.identity.replica_id
-            )),
-            revision: 1,
-            scope: ReplicaScope {
-                history: self.history.clone(),
-                storage: self.storage.clone(),
-                process_session_id: self.session.clone(),
-                creation_id: snapshot.creation_id,
-                epoch: current.epoch,
-                configuration: ReplicaConfigurationScope {
-                    current,
-                    previous: None,
-                    replicas: Vec::new(),
-                },
-            },
-            desired: ReplicaGoalKind::Discover,
-        };
-        client
-            .submit_goal(authorized(proto::ReplicaGoalRequest {
-                protocol_version: ORDINARY_ACTION_FORMAT,
-                canonical_json: serde_json::to_vec(&goal)?,
-            }))
-            .await?;
-        tokio::time::timeout(RPC_BOUND, async {
-            loop {
-                let response = client.get_snapshot(query()).await?.into_inner();
-                let ReplicaAgentQueryResult::Initialized(snapshot) =
-                    serde_json::from_slice(&response.canonical_json)?
-                else {
-                    return Err("initialized snapshot required".into());
-                };
-                if let Some(observation) = snapshot
-                    .goals
-                    .iter()
-                    .find(|observation| observation.goal == goal)
-                    && let ReplicaGoalStatus::Failed(message) = &observation.status
-                {
-                    if !message
-                        .contains("built-in ordinary hosting integration is unavailable until M2")
-                    {
-                        return Err(format!("unexpected ordinary failure: {message}").into());
-                    }
-                    assert!(
-                        snapshot.publication.is_none()
-                            && !snapshot.provider_writer_held
-                            && snapshot.remote_operations.is_empty()
-                    );
-                    assert_ne!(snapshot.read_status, AccessStatus::Granted);
-                    assert_ne!(snapshot.write_status, AccessStatus::Granted);
-                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(true);
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?
-    }
-
-    async fn stop_unavailable(mut self) -> TestResult {
-        self.running.shutdown();
-        tokio::time::timeout(RPC_BOUND, self.running.wait()).await??;
-        tokio::time::timeout(RPC_BOUND, self.service.shutdown_and_drain()).await??;
-        Ok(())
-    }
     async fn start(
         root: &Path,
         id: i64,
@@ -537,15 +442,6 @@ async fn public_build_consumes_target_context_and_installs_nonempty_snapshot() {
         }
     };
     let mut copied_snapshot = None;
-    if source.ordinary_unavailable().await.unwrap() && target.ordinary_unavailable().await.unwrap()
-    {
-        eprintln!(
-            "M1 explicitly reports ordinary built-in support unavailable; retained native copy-context properties below are not qualified"
-        );
-        source.stop_unavailable().await.unwrap();
-        target.stop_unavailable().await.unwrap();
-        return;
-    }
     let outcome =
         std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(90), async {
             let epoch = Epoch::new(0, 1);

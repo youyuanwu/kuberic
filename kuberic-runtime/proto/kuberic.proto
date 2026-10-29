@@ -687,35 +687,9 @@ message ExecuteCommandResponse {
 service AgentControl {
   rpc GetStatus(GetAgentStatusRequest) returns (AgentStatusReport);
   rpc Execute(ExecuteCommandRequest) returns (ExecuteCommandResponse);
-  rpc SubmitGoal(ReplicaGoalRequest) returns (ReplicaSnapshotResponse);
-  rpc GetSnapshot(ReplicaSnapshotRequest) returns (ReplicaSnapshotResponse);
-  rpc AcknowledgeGoal(ReplicaGoalRequest) returns (ReplicaSnapshotResponse);
 }
 
 service ReplicaPeer {
   rpc GetStatus(GetAgentStatusRequest) returns (AgentStatusReport);
   rpc Execute(ExecuteCommandRequest) returns (ExecuteCommandResponse);
-  rpc Discover(ReplicaDiscoveryRequest) returns (ReplicaSnapshotResponse);
-}
-
-message ReplicaGoalRequest {
-  uint32 protocol_version = 1;
-  bytes canonical_json = 2;
-}
-
-message ReplicaSnapshotRequest {
-  uint32 protocol_version = 1;
-  string resource_uid = 2;
-  ReplicaIdentity target = 3;
-  string expected_process_session_id = 4;
-}
-
-message ReplicaDiscoveryRequest {
-  uint32 protocol_version = 1;
-  bytes canonical_json = 2;
-}
-
-message ReplicaSnapshotResponse {
-  uint32 protocol_version = 1;
-  bytes canonical_json = 2;
 }

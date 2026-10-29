@@ -17,7 +17,6 @@ fn epoch(intent: &PublicOperationIntent) -> Option<Epoch> {
         .as_ref()
         .map(|input| input.epoch)
         .or_else(|| match intent.program.as_ref()? {
-            P::AgentGoal(goal) => Some(goal.scope.epoch),
             P::Role { epoch, .. } | P::Epoch { epoch } | P::Swap { epoch, .. } => Some(*epoch),
             P::Configuration(c)
             | P::CatchUp {
@@ -33,7 +32,7 @@ fn epoch(intent: &PublicOperationIntent) -> Option<Epoch> {
 }
 
 fn achieved_role(record: &PublicOperationRecord, application: bool) -> Option<ReplicaRole> {
-    let instructions = public_lifecycle::record_instructions(record);
+    let instructions = public_lifecycle::program::operation_instructions(&record.intent);
     instructions
         .iter()
         .zip(&record.lifecycle.outcomes)
@@ -52,7 +51,6 @@ fn achieved_role(record: &PublicOperationRecord, application: bool) -> Option<Re
                 return Some(ReplicaRole::Primary);
             }
             match record.intent.program.as_ref()? {
-                P::AgentGoal(goal) => goal.role(),
                 P::Role { role, .. } => Some(*role),
                 P::Swap { handoff, .. } => Some(*handoff),
                 _ => None,
@@ -80,8 +78,7 @@ pub(crate) fn configuration_at(
     let mut configuration = if let Some(input) = &intent.lifecycle {
         input.configuration()
     } else {
-        let program = public_lifecycle::program::selected_program(intent, instruction)?;
-        public_lifecycle::program::configuration(&program, instruction).clone()
+        public_lifecycle::program::configuration(intent.program.as_ref()?, instruction).clone()
     };
     if instruction == I::CurrentConfiguration
         || (instruction == I::CatchUp
@@ -137,9 +134,6 @@ pub(crate) fn current_scope(
 /// Runs under the durable store transaction on both fresh admission and retry.
 /// Exact completed replay remains immutable and is not new authority.
 pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Result<()> {
-    if let Some(goal) = intent.goal() {
-        super::ordinary_goal::validate_admission(state, goal)?;
-    }
     if !intent.identity.is_public_v1() || intent.class.is_terminal() {
         return Ok(());
     }
@@ -197,40 +191,12 @@ pub(crate) fn validate(state: &AgentState, intent: &PublicOperationIntent) -> Re
                         // not an achieved primary engine configuration stage.
                         && current.current.primary_id == state.identity.local_identity.replica_id
                         && incoming.current.primary_id == state.identity.local_identity.replica_id
-                        && !ordinary_ready_expansion(state, intent, current, &incoming)
                 })
         })
     {
         return Err(HostError::CommandRejected(
             "joint reconfiguration cannot regress completed current-only installation".into(),
         ));
-    }
-
-    fn ordinary_ready_expansion(
-        state: &crate::host::state::AgentState,
-        intent: &crate::protocol::public_operations::PublicOperationIntent,
-        installed: &crate::protocol::public_operations::PublicConfiguration,
-        incoming: &crate::protocol::public_operations::PublicConfiguration,
-    ) -> bool {
-        use crate::protocol::public_operations::ReplicaGoalKind;
-        let Some(goal) = intent.goal() else {
-            return false;
-        };
-        matches!(
-            goal.desired,
-            ReplicaGoalKind::Reconfigure {
-                role: crate::protocol::types::ReplicaRole::Primary,
-                ..
-            }
-        ) && incoming.previous.as_ref() == Some(&installed.current)
-            && incoming.current.members.len() > installed.current.members.len()
-            && installed
-                .current
-                .members
-                .iter()
-                .all(|member| incoming.current.members.contains(member))
-            && super::ordinary_goal::admission_ready(state, goal)
-                .is_ok_and(|ready| !ready.is_empty())
     }
     if let Some(P::Swap {
         starting,

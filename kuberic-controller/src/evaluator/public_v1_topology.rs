@@ -2129,9 +2129,6 @@ fn retained_authority_revision(
 
 fn call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind, String> {
     match intent.program.as_ref() {
-        Some(PublicOperationProgram::AgentGoal(_)) => {
-            Err("semantic goals require M1 topology orchestration".into())
-        }
         Some(PublicOperationProgram::Open { .. }) => Ok(PublicV1CallKind::Open),
         Some(PublicOperationProgram::Role { .. }) => Ok(PublicV1CallKind::Role),
         Some(PublicOperationProgram::Epoch { .. }) => Ok(PublicV1CallKind::Epoch),

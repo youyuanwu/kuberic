@@ -1,19 +1,14 @@
-# SF Hosting: Ordinary M1 and Remaining Engine Integration
+# SF Hosting: Current Baseline and Proposed Extension Boundary
 
-**CURRENT:** [ordinary hosting M1](ordinary-hosting-m1.md) implements generic
-controller goals, local stages, host actions/remote state, discovery and retained
-ordinary joining through the real production path. **M2 engine-session integration
-and M3 comprehensive qualification remain NOT IMPLEMENTED.** Built-in/KV/SQLite/
-PostgreSQL ordinary production Open explicitly rejects until M2; this checkpoint
-is not deployable with those engines. The [project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap)
-is the single remaining implementation queue.
+**CURRENT:** the bounded common-host port below is delivered. **PROPOSED:**
+the [replacement extension boundary](#proposed--ordinary-engine-boundary) is
+design only, **NOT IMPLEMENTED**. This documentation change implements no
+runtime behavior. [Current semantics](classic-v1-runtime.md) remains the
+behavioral authority; the [project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+is the single future implementation queue. Do not apply the proposed contract
+to an existing factory.
 
 ## CURRENT — delivered bounded hosting
-
-**Historical pre-M1 baseline:** the section title is retained as a link target.
-The following pinned grant/companion dispatch and old formats are not current
-production behavior. Native/component algorithms and their bounded evidence
-remain relevant; use [M1](ordinary-hosting-m1.md) for the replacement host contract.
 
 This is the bounded common-host responsibility port on top of merged #198
 (`2f97d86605ce69f3812c7d5ba1dd9c6d606ca8d7`), with initial code phases through
@@ -238,8 +233,8 @@ algorithm is not a requirement that independent engines use that algorithm.
 | RA revalidates Build replies before remote readiness/FM credit; host access is separate from Build and engine progress | [RA reply:4027–4091][sf-ra-reply], [access:33–194][sf-access] |
 | Provided engine owns StartCopy/context/session checks and copy+replication completion, not target controller-attempt grant installation | [source:22–222][sf-primary], [target:827–1080][sf-secondary] |
 | Host drain waits action lists; concrete engines own their native callback/queue waits; persisted RA reopen refreshes instance context | [FUP drain:1483–1650][sf-drain], [primary Close:85–141][sf-close], [secondary Abort:452–510][sf-abort], [reopen:3795–3847][sf-reopen] |
-| Pre-M1 Kuberic hosted controller Build installed target authority and failed without native runtime control | [pinned dispatch:3310–3356][current-dispatch], [host:891–927][current-install] |
-| Pre-M1 carrier and real PG enforced additional exact attempt/host authority around native effects; PG is an independent allocation | [carrier:149–259][current-binding], [PG factory:314–362][current-pg-factory], [PG Build:2368–2701][current-pg-build] |
+| Current Kuberic hosted controller Build installs target authority and fails without native runtime control | [dispatch:3310–3356][current-dispatch], [host:891–927][current-install] |
+| Current carrier and real PG enforce additional exact attempt/host authority around native effects; PG is an independent allocation | [carrier:149–259][current-binding], [PG factory:314–362][current-pg-factory], [PG Build:2368–2701][current-pg-build] |
 
 The mandatory companion is a real **extension-boundary divergence**, not
 automatically justified by “Kubernetes/Rust adaptation.” Native FUP's source
@@ -251,13 +246,10 @@ See [source provenance and notices](sf-v1-port-provenance.md) and the retained
 
 ## PROPOSED — ordinary engine boundary
 
-This section retains the complete target design. Its generic host/controller
-portion is implemented by [M1](ordinary-hosting-m1.md); built-in/PG authenticated
-engine sessions and exhaustive recovery qualification remain proposed M2/M3.
-Mechanism removal below describes the final target: legacy companion/grant
-symbols still serve not-yet-moved engine/component consumers, not an M1 production
-fallback. Public `Replicator`, `PrimaryReplicator` and `StateProvider` method sets
-are unchanged. Do not infer M2 acceptance from generic M1 tests.
+Everything below is a **design decision, NOT IMPLEMENTED**, unless explicitly
+identified as source evidence above. Public `Replicator`, `PrimaryReplicator`
+and `StateProvider` method sets stay unchanged. Breaking other APIs/formats is
+allowed only in future separately authorized implementation.
 
 ### Decision and alternatives
 
@@ -416,8 +408,8 @@ There is no inferred selective cancellation capability or new protected method/
 token. Engine-private cooperative cancellation may shorten cleanup but is not
 a host integration interface.
 
-**Required M1 ordinary lifecycle obligation, not a universal native IDL
-guarantee; real built-in/PG adaptation remains M2:** successful ordinary Close settles the engine endpoint, receivers,
+**Explicit proposed Rust lifecycle obligation, not a universal native IDL
+guarantee:** successful ordinary Close settles the engine endpoint, receivers,
 provider interactions and descendants. Abort synchronously stops admission and
 initiates native fencing/cancellation. Engine retains a terminal join owner;
 ordinary Close remains awaitable after Abort and observes the same outcome.
@@ -497,9 +489,8 @@ restart still recovers existing durable state. Its acceptance gates must prove
 effect linearization, source retirement/target quarantine, Close-after-Abort settlement,
 same-format crash recovery and no stale Ready reuse. These are unresolved
 **implementation risks**, not permission to leave target owners unspecified or
-claims that M2/M3 code exists. Current [M1 selectors](testing.md#ordinary-hosting-m1)
-qualify the generic host/controller contract; [historical selectors](testing.md#hosting-redesign-baselines-and-future-acceptance)
-remain baselines, not proof of replacement engine sessions.
+claims that new code exists. Current selectors in [testing](testing.md#hosting-redesign-baselines-and-future-acceptance)
+are baselines, not proof of the proposal.
 
 Downstream MySQL remains unqualified: implement ordinary coherent creation,
 authenticated native session establishment/retirement, lineage/progress/restart,
@@ -511,18 +502,18 @@ SF-11/mode/PG/P7/security and native differential/production limits remain owned
 by the roadmap; this redesign does not close them.
 
 [native]: https://github.com/microsoft/service-fabric/tree/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra
-[coordinator]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/coordinator.rs#L1
-[production]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L223
-[companion]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/custom.rs#L1
-[operations]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/operation.rs#L1504
-[program]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/public_lifecycle_program.rs#L10
-[admission]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/public_action_state.rs#L136
-[access]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/selected_access.rs#L580
-[remote]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/state.rs#L315
-[report]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/protocol/public_operations.rs#L2476
-[renewal]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-controller/src/cluster_api.rs#L2374
-[v1-tests]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-level-tests/src/in_process/journeys.rs#L1
-[pg-tests]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/public_controller_tests.rs#L186
+[coordinator]: ../../../kuberic-runtime/src/replicator/coordinator.rs#L1
+[production]: ../../../kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L223
+[companion]: ../../../kuberic-runtime/src/replicator/custom.rs#L1
+[operations]: ../../../kuberic-runtime/src/host/operation.rs#L1504
+[program]: ../../../kuberic-runtime/src/host/public_lifecycle_program.rs#L10
+[admission]: ../../../kuberic-runtime/src/host/public_action_state.rs#L136
+[access]: ../../../kuberic-runtime/src/host/selected_access.rs#L580
+[remote]: ../../../kuberic-runtime/src/host/state.rs#L315
+[report]: ../../../kuberic-runtime/src/protocol/public_operations.rs#L2476
+[renewal]: ../../../kuberic-controller/src/cluster_api.rs#L2374
+[v1-tests]: ../../../kuberic-level-tests/src/in_process/journeys.rs#L1
+[pg-tests]: ../../../examples/postgres/src/public_controller_tests.rs#L186
 [sf-open]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComProxyStatefulService.OpenAsyncOperation.cpp#L11-L39
 [sf-qi]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComProxyReplicator.h#L17-L37
 [sf-contract]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/idl/public/FabricRuntime.idl#L606-L763
@@ -544,8 +535,8 @@ by the roadmap; this redesign does not close them.
 [sf-close]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/PrimaryReplicator.CloseAsyncOperation.cpp#L85-L141
 [sf-abort]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Replication/SecondaryReplicator.cpp#L452-L510
 [sf-reopen]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnit.cpp#L3795-L3847
-[current-dispatch]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-controller/src/cluster_api.rs#L3310-L3356
-[current-install]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/hosting.rs#L891-L927
-[current-binding]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/host/native_transport.rs#L149-L259
-[current-pg-factory]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/service.rs#L314-L362
-[current-pg-build]: https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/public_v1.rs#L2368-L2701
+[current-dispatch]: ../../../kuberic-controller/src/cluster_api.rs#L3310-L3356
+[current-install]: ../../../kuberic-runtime/src/host/hosting.rs#L891-L927
+[current-binding]: ../../../kuberic-runtime/src/host/native_transport.rs#L149-L259
+[current-pg-factory]: ../../../examples/postgres/src/service.rs#L314-L362
+[current-pg-build]: ../../../examples/postgres/src/public_v1.rs#L2368-L2701

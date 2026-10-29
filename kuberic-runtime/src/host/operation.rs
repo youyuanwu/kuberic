@@ -33,7 +33,6 @@ pub(crate) struct PartitionOperation {
     record: watch::Sender<PublicOperationRecord>,
     failure: watch::Sender<Option<String>>,
     task: Mutex<Option<JoinHandle<Result<()>>>>,
-    ordinary_join: Mutex<()>,
     lifecycle: Mutex<()>,
     containment: Mutex<CallbackContainment>,
     coordination_active: std::sync::atomic::AtomicBool,
@@ -46,10 +45,6 @@ pub(crate) struct PartitionOperation {
     wait_for_descendants: std::sync::atomic::AtomicBool,
     #[cfg(feature = "testing")]
     cut: Mutex<Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>>,
-    #[cfg(all(test, feature = "testing"))]
-    ordinary_join_entered: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
-    #[cfg(all(test, feature = "testing"))]
-    ordinary_return_cut: std::sync::Mutex<Option<Arc<RegistryTestCut>>>,
 }
 
 impl PartitionOperation {
@@ -67,7 +62,6 @@ impl PartitionOperation {
             record,
             failure,
             task: Mutex::new(None),
-            ordinary_join: Mutex::new(()),
             lifecycle: Mutex::new(()),
             containment: Mutex::new(CallbackContainment::RootTask),
             coordination_active: std::sync::atomic::AtomicBool::new(false),
@@ -80,10 +74,6 @@ impl PartitionOperation {
             wait_for_descendants: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             cut: Mutex::new(None),
-            #[cfg(all(test, feature = "testing"))]
-            ordinary_join_entered: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            ordinary_return_cut: Default::default(),
         }
     }
 
@@ -185,7 +175,7 @@ impl PartitionOperation {
             !matches!(
                 self.intent().program,
                 Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
-            ) && !(self.intent().goal().is_some() && self.intent().class.is_terminal()),
+            ),
             |witness| *witness.borrow(),
         )
     }
@@ -292,13 +282,6 @@ impl PartitionOperation {
                 .await;
             if let Err(error) = &recorded {
                 operation.record_failure(error);
-            }
-            #[cfg(all(test, feature = "testing"))]
-            {
-                let cut = operation.ordinary_return_cut.lock().unwrap().clone();
-                if let Some(cut) = cut {
-                    cut.pause().await;
-                }
             }
             recorded
         });
@@ -437,22 +420,6 @@ impl PartitionOperation {
     }
 
     pub(crate) async fn cancel_root(&self) -> Result<PublicOperationRecord> {
-        if self.intent().goal().is_some() {
-            self.invalidate_access();
-            // Cancellation withdraws authority, not ownership of an accepted
-            // ordinary future. Abort/Close is the creation owner's barrier.
-            self.join_ordinary_root().await?;
-            let _lifecycle = self.lifecycle.lock().await;
-            let current = self.snapshot();
-            if matches!(
-                current.stage,
-                PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-            ) {
-                return Ok(current);
-            }
-
-            return self.persist_cancellation(current, None).await;
-        }
         let task = {
             let _lifecycle = self.lifecycle.lock().await;
             let current = self.snapshot();
@@ -521,49 +488,6 @@ impl PartitionOperation {
         }
 
         self.persist_cancellation(current, task_failure).await
-    }
-
-    async fn join_ordinary_root(&self) -> Result<()> {
-        let _join = self.ordinary_join.lock().await;
-        let mut retained = self.task.lock().await;
-        if let Some(task) = retained.as_mut() {
-            #[cfg(all(test, feature = "testing"))]
-            if let Some(entered) = self.ordinary_join_entered.lock().unwrap().as_ref() {
-                entered.notify_one();
-            }
-            // Cancellation drops only the observer/guards. The operation keeps
-            // its handle until the actual join and sticky outcome are recorded.
-            let outcome = task.await;
-            retained.take();
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    self.record_failure(&error);
-                    return Err(error);
-                }
-                Err(error) => {
-                    let error = HostError::CommandRejected(format!(
-                        "ordinary callback owner join failed: {error}"
-                    ));
-                    self.record_failure(&error);
-                    return Err(error);
-                }
-            }
-        }
-        if let Some(error) = self.failure.borrow().clone() {
-            return Err(HostError::CommandRejected(error));
-        }
-        Ok(())
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn notify_ordinary_join(&self, entered: Arc<tokio::sync::Notify>) {
-        *self.ordinary_join_entered.lock().unwrap() = Some(entered);
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_ordinary_return_cut(&self, cut: Arc<RegistryTestCut>) {
-        *self.ordinary_return_cut.lock().unwrap() = Some(cut);
     }
 
     async fn persist_cancellation(
@@ -643,7 +567,7 @@ impl PartitionOperation {
                 if !canonical_failure {
                     return None;
                 }
-                super::public_lifecycle::record_instructions(&record)
+                super::public_lifecycle::program::operation_instructions(&record.intent)
                     .get(record.lifecycle.outcomes.len().checked_sub(1)?)
                     .copied()
             })
@@ -1335,29 +1259,6 @@ pub(crate) struct PartitionOperationRegistry {
                 + Sync,
         >,
     >,
-    #[cfg(all(test, feature = "testing"))]
-    admission_cut: std::sync::Mutex<Option<(OperationId, Arc<RegistryTestCut>)>>,
-    #[cfg(all(test, feature = "testing"))]
-    shutdown_cut: std::sync::Mutex<Option<Arc<RegistryTestCut>>>,
-    #[cfg(all(test, feature = "testing"))]
-    completion_cut: std::sync::Mutex<Option<(OperationId, Arc<RegistryTestCut>)>>,
-    #[cfg(all(test, feature = "testing"))]
-    drain_cut: std::sync::Mutex<Option<Arc<RegistryTestCut>>>,
-}
-
-#[cfg(all(test, feature = "testing"))]
-#[derive(Default)]
-pub(crate) struct RegistryTestCut {
-    pub(crate) entered: tokio::sync::Notify,
-    pub(crate) release: tokio::sync::Notify,
-}
-
-#[cfg(all(test, feature = "testing"))]
-impl RegistryTestCut {
-    async fn pause(&self) {
-        self.entered.notify_one();
-        self.release.notified().await;
-    }
 }
 
 impl PartitionOperationRegistry {
@@ -1393,14 +1294,6 @@ impl PartitionOperationRegistry {
             terminal_tasks: std::sync::Mutex::new(Vec::new()),
             abort_guard: Arc::new(std::sync::Mutex::new(false)),
             terminal_recovery: std::sync::OnceLock::new(),
-            #[cfg(all(test, feature = "testing"))]
-            admission_cut: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            shutdown_cut: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            completion_cut: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            drain_cut: Default::default(),
         }))
     }
 
@@ -1610,64 +1503,6 @@ impl PartitionOperationRegistry {
             .push(tokio::spawn(future));
     }
 
-    pub(crate) fn try_own_control_task(
-        &self,
-        future: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<()> {
-        let mut controls = self.control_tasks.lock().expect("control task lock");
-        if self
-            .shutting_down
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(HostError::CommandRejected(
-                "public-operation registry is shutting down".into(),
-            ));
-        }
-        controls.push(tokio::spawn(future));
-        Ok(())
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_admission_cut(&self, id: OperationId, cut: Arc<RegistryTestCut>) {
-        *self.admission_cut.lock().unwrap() = Some((id, cut));
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_shutdown_cut(&self, cut: Arc<RegistryTestCut>) {
-        *self.shutdown_cut.lock().unwrap() = Some(cut);
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_completion_cut(&self, id: OperationId, cut: Arc<RegistryTestCut>) {
-        *self.completion_cut.lock().unwrap() = Some((id, cut));
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) async fn pause_completion_registration(&self, id: &OperationId) {
-        let cut = self
-            .completion_cut
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|(expected, _)| expected == id)
-            .map(|(_, cut)| cut.clone());
-        if let Some(cut) = cut {
-            cut.pause().await;
-        }
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_drain_cut(&self, cut: Arc<RegistryTestCut>) {
-        *self.drain_cut.lock().unwrap() = Some(cut);
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) async fn owners_drained(&self) -> bool {
-        let controls = self.control_tasks.lock().unwrap().is_empty();
-        let terminals = self.terminal_tasks.lock().unwrap().is_empty();
-        controls && terminals && self.coordination.lock().await.is_empty()
-    }
-
     pub(crate) fn dispatch_lock(&self, id: &OperationId) -> Arc<Mutex<()>> {
         self.dispatch
             .lock()
@@ -1682,36 +1517,6 @@ impl PartitionOperationRegistry {
             .lock()
             .expect("terminal task lock")
             .push(tokio::spawn(future));
-    }
-
-    pub(crate) async fn join_ordinary_roots(&self) -> Result<()> {
-        let operations = self
-            .state
-            .lock()
-            .await
-            .operations
-            .values()
-            .filter(|operation| {
-                operation.intent().goal().is_some() && !operation.intent().class.is_terminal()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for operation in operations {
-            operation.join_ordinary_root().await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn join_ordinary_goal(&self, id: &OperationId) -> Result<()> {
-        let operation = self
-            .state
-            .lock()
-            .await
-            .operations
-            .get(id)
-            .cloned()
-            .ok_or_else(|| HostError::CommandRejected("ordinary goal owner unavailable".into()))?;
-        operation.join_ordinary_root().await
     }
 
     pub(crate) async fn admit(
@@ -1751,19 +1556,6 @@ impl PartitionOperationRegistry {
         }
 
         self.reap_coordination().await;
-        #[cfg(all(test, feature = "testing"))]
-        {
-            let cut = self
-                .admission_cut
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(id, _)| *id == intent.operation_id)
-                .map(|(_, cut)| cut.clone());
-            if let Some(cut) = cut {
-                cut.pause().await;
-            }
-        }
         let admission = self.admission.lock().await;
         if self
             .shutting_down
@@ -1774,9 +1566,6 @@ impl PartitionOperationRegistry {
             ));
         }
         self.load_durable_records().await?;
-        if let Some(goal) = intent.goal() {
-            crate::host::ordinary_goal::validate_admission(&self.store.load_state().await?, goal)?;
-        }
         if self.terminal_admission_is_fenced() && !intent.class.is_terminal() {
             return Err(HostError::CommandRejected(
                 "preview is synchronously fenced".into(),
@@ -1903,16 +1692,6 @@ impl PartitionOperationRegistry {
         };
         for operation in existing {
             let record = operation.snapshot();
-            if intent.goal().is_some_and(|goal| {
-                matches!(
-                    goal.desired,
-                    crate::protocol::public_operations::ReplicaGoalKind::Discover
-                        | crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
-                ) && record.intent.goal().is_some()
-                    && record.intent.process_session_id != intent.process_session_id
-            }) {
-                continue;
-            }
             if record.superseded_by.is_some()
                 || matches!(
                     record.disposition,
@@ -1931,13 +1710,7 @@ impl PartitionOperationRegistry {
             {
                 continue;
             }
-            let relation = if record.intent.goal().is_some() && intent.goal().is_some() {
-                ordinary_relation(
-                    &record.intent,
-                    &intent,
-                    record.stage == PublicOperationStage::Completed,
-                )
-            } else if renewal
+            let relation = if renewal
                 .as_ref()
                 .is_some_and(|renewal| is_contained_predecessor_fault(renewal, &record, &intent))
             {
@@ -2155,13 +1928,10 @@ impl PartitionOperationRegistry {
             {
                 recovered.push(record);
             }
-            if (matches!(
+            if matches!(
                 operation.intent().program,
                 Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
-            ) || (operation.intent().goal().is_some()
-                && operation.intent().class.is_terminal()
-                && operation.intent().process_session_id == self.process_session_id))
-                && operation.snapshot().stage == PublicOperationStage::ContainmentPending
+            ) && operation.snapshot().stage == PublicOperationStage::ContainmentPending
                 && let Some(callbacks) = self.terminal_recovery.get()
             {
                 crate::host::public_lifecycle::recover_terminal(self, &operation, callbacks()?)
@@ -2178,6 +1948,11 @@ impl PartitionOperationRegistry {
     pub(crate) async fn shutdown(&self) -> Result<()> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        let controls = std::mem::take(&mut *self.control_tasks.lock().expect("control task lock"));
+        for task in controls {
+            task.abort();
+            let _ = task.await;
+        }
         let admission = self.admission.lock().await;
         let mut first_error = None;
         let operations = self
@@ -2188,37 +1963,6 @@ impl PartitionOperationRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let ordinary = operations
-            .iter()
-            .any(|operation| operation.intent().goal().is_some());
-        // The flag and admit's post-lock check close the gate. Retained
-        // dispatchers may still need this mutex to observe that rejection.
-        drop(admission);
-        #[cfg(all(test, feature = "testing"))]
-        {
-            let cut = self.shutdown_cut.lock().unwrap().clone();
-            if let Some(cut) = cut {
-                cut.pause().await;
-            }
-        }
-        let drain_result = if ordinary && let Some(callbacks) = self.terminal_recovery.get() {
-            let mut callbacks = callbacks()?;
-            callbacks.aborted = self.abort_guard();
-            (callbacks.revoke_access)()?;
-            callbacks.abort_once();
-            let drain = callbacks.terminal_drain.clone();
-            let (completed, result) = oneshot::channel();
-            self.own_terminal_task(async move {
-                let outcome = drain().await;
-                if let Err(error) = &outcome {
-                    tracing::warn!(%error, "ordinary shutdown remains uncontained");
-                }
-                let _ = completed.send(outcome);
-            });
-            Some(result)
-        } else {
-            None
-        };
         for operation in operations {
             if !matches!(
                 operation.snapshot().stage,
@@ -2228,83 +1972,42 @@ impl PartitionOperationRegistry {
                 first_error.get_or_insert(error);
             }
         }
-        if let Err(error) = self.drain_owned_tasks(ordinary).await {
-            first_error.get_or_insert(error);
+        let terminals =
+            std::mem::take(&mut *self.terminal_tasks.lock().expect("terminal task lock"));
+        for task in terminals {
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!("terminal cleanup join failed: {error}"))
+                });
+            }
         }
+        let coordination = std::mem::take(&mut *self.coordination.lock().await);
+        for task in coordination {
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!(
+                        "public-operation coordination join failed: {error}"
+                    ))
+                });
+            }
+        }
+        drop(admission);
         if let Err(error) = self.recover_unowned().await {
             first_error.get_or_insert(error);
         }
-        if let Err(error) = self.drain_owned_tasks(ordinary).await {
-            first_error.get_or_insert(error);
-        }
-        if let Some(result) = drain_result {
-            match result.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(HostError::from(error));
-                }
-                Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        HostError::CommandRejected(format!(
-                            "ordinary shutdown drain owner lost: {error}"
-                        ))
-                    });
-                }
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    async fn drain_owned_tasks(&self, ordinary: bool) -> Result<()> {
-        let mut first_error = None;
-        // Joined owners can register completion/terminal/coordination children.
-        // External dispatch registration is closed; drain all three to quiescence.
+        // Recovery can discover a terminal record whose cleanup owner did not
+        // exist at the first join boundary. Join those owners too; shutdown is
+        // not complete merely because durable discovery has finished.
         loop {
-            let controls =
-                std::mem::take(&mut *self.control_tasks.lock().expect("control task lock"));
             let terminals =
                 std::mem::take(&mut *self.terminal_tasks.lock().expect("terminal task lock"));
-            let coordination = std::mem::take(&mut *self.coordination.lock().await);
-            #[cfg(all(test, feature = "testing"))]
-            {
-                let cut = self.drain_cut.lock().unwrap().take();
-                if let Some(cut) = cut {
-                    cut.pause().await;
-                }
-            }
-            if controls.is_empty() && terminals.is_empty() && coordination.is_empty() {
+            if terminals.is_empty() {
                 break;
-            }
-            for task in controls {
-                if !ordinary {
-                    task.abort();
-                }
-                if let Err(error) = task.await
-                    && !error.is_cancelled()
-                {
-                    first_error.get_or_insert_with(|| {
-                        HostError::CommandRejected(format!(
-                            "retained control owner join failed: {error}"
-                        ))
-                    });
-                }
             }
             for task in terminals {
                 if let Err(error) = task.await {
                     first_error.get_or_insert_with(|| {
                         HostError::CommandRejected(format!("terminal cleanup join failed: {error}"))
-                    });
-                }
-            }
-            for task in coordination {
-                if let Err(error) = task.await {
-                    first_error.get_or_insert_with(|| {
-                        HostError::CommandRejected(format!(
-                            "public-operation coordination join failed: {error}"
-                        ))
                     });
                 }
             }
@@ -2341,15 +2044,6 @@ impl PartitionOperationRegistry {
             self.fence_session_renewal();
         }
         let mut state = self.state.lock().await;
-        let durable_ids = records
-            .iter()
-            .map(|record| record.intent.operation_id.clone())
-            .collect::<BTreeSet<_>>();
-        state.operations.retain(|id, operation| {
-            operation.intent().goal().is_none()
-                || durable_ids.contains(id)
-                || operation.snapshot().stage != PublicOperationStage::Completed
-        });
         for record in records {
             state
                 .operations
@@ -2567,45 +2261,6 @@ fn retained_relation(
             Reject("operation revision does not match retained authority")
         }
         _ => Coexist,
-    }
-}
-
-fn ordinary_relation(
-    existing: &PublicOperationIntent,
-    incoming: &PublicOperationIntent,
-    completed: bool,
-) -> AdmissionRelation {
-    use AdmissionRelation::*;
-    if existing.class.is_terminal() {
-        return Reject("ordinary creation already has an immutable terminal owner");
-    }
-    if incoming.class.is_terminal() {
-        return if completed { Coexist } else { Supersede };
-    }
-    if incoming.revision <= existing.revision {
-        return Reject("ordinary goal revision is not newer");
-    }
-    if completed {
-        return Coexist;
-    }
-    match (&existing.class, &incoming.class) {
-        (
-            PublicOperationClass::Build { target: left },
-            PublicOperationClass::Build { target: right },
-        )
-        | (
-            PublicOperationClass::Remove { target: left },
-            PublicOperationClass::Remove { target: right },
-        )
-        | (
-            PublicOperationClass::Build { target: left },
-            PublicOperationClass::Remove { target: right },
-        )
-        | (
-            PublicOperationClass::Remove { target: left },
-            PublicOperationClass::Build { target: right },
-        ) if left != right => Coexist,
-        _ => Reject("unresolved ordinary action requires completion or whole-creation withdrawal"),
     }
 }
 

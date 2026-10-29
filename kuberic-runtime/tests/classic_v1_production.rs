@@ -1,7 +1,7 @@
 #![cfg(feature = "testing")]
 
-//! Production checkpoint checks and retained M2 engine journeys.
-//! The old callback-program/companion route is unavailable, not a native fallback.
+//! Public factory/host/service journeys over real authenticated loopback sockets.
+//! Metadata setup supplies controller authority, never an injected native peer.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -37,141 +37,6 @@ use kvstore2::state::CopyGate;
 use sqlite_replicated::service::SqliteService;
 
 const CREDENTIAL: &str = "classic-v1-test-credential";
-
-async fn m1_legacy_production_unavailable() -> bool {
-    let root = tempfile::tempdir().unwrap();
-    let mut node = Node::<KvService>::start(root.path(), 1, 1).await;
-    let mut client =
-        proto::agent_control_client::AgentControlClient::connect(node.control_address.clone())
-            .await
-            .unwrap();
-    let resource = node.history.resource_uid.clone();
-    let identity = node.identity.clone();
-    let session = node.session.clone();
-    let query = || {
-        authorized(proto::ReplicaSnapshotRequest {
-            protocol_version: ORDINARY_ACTION_FORMAT,
-            resource_uid: resource.to_string(),
-            target: Some(identity.clone().into()),
-            expected_process_session_id: session.to_string(),
-        })
-    };
-    let response = client.get_snapshot(query()).await.unwrap().into_inner();
-    let ReplicaAgentQueryResult::Initialized(before) =
-        serde_json::from_slice(&response.canonical_json).unwrap()
-    else {
-        panic!("initialized snapshot required")
-    };
-    let program = PublicOperationProgram::Open {
-        replica: node.identity.clone(),
-        existing: false,
-    };
-    let denied = node
-        .submit_result(PublicV1OperationCommand {
-            target: node.identity.clone(),
-            intent: PublicOperationIntent {
-                identity: node.preview.clone(),
-                operation_id: OperationId::new("rejected-legacy-open"),
-                revision: 2,
-                process_session_id: node.session.clone(),
-                class: PublicOperationClass::Authority,
-                input_digest: program.digest(),
-                replay_disposition: program.replay_disposition(),
-                lifecycle: None,
-                program: Some(program),
-            },
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        denied
-            .message()
-            .contains("controller callback programs are unavailable")
-    );
-    let response = client.get_snapshot(query()).await.unwrap().into_inner();
-    let ReplicaAgentQueryResult::Initialized(after) =
-        serde_json::from_slice(&response.canonical_json).unwrap()
-    else {
-        panic!("initialized snapshot required")
-    };
-    assert_eq!(
-        before, after,
-        "rejected legacy production route mutated host state"
-    );
-    let current = ConfigurationDescriptor::new(
-        Epoch::new(0, 1),
-        node.identity.replica_id,
-        vec![ConfigurationMember {
-            identity: node.identity.clone(),
-            role: ReplicaRole::Primary,
-        }],
-        1,
-    );
-    let goal = ReplicaGoal {
-        format: ORDINARY_ACTION_FORMAT,
-        identity: node.preview.clone(),
-        operation_id: OperationId::new("ordinary-support"),
-        revision: 3,
-        scope: ReplicaScope {
-            history: node.history.clone(),
-            storage: node.storage.clone(),
-            process_session_id: node.session.clone(),
-            creation_id: before.creation_id.clone(),
-            epoch: current.epoch,
-            configuration: ReplicaConfigurationScope {
-                current,
-                previous: None,
-                replicas: Vec::new(),
-            },
-        },
-        desired: ReplicaGoalKind::Discover,
-    };
-    client
-        .submit_goal(authorized(proto::ReplicaGoalRequest {
-            protocol_version: ORDINARY_ACTION_FORMAT,
-            canonical_json: serde_json::to_vec(&goal).unwrap(),
-        }))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let response = client.get_snapshot(query()).await.unwrap().into_inner();
-            let ReplicaAgentQueryResult::Initialized(snapshot) =
-                serde_json::from_slice(&response.canonical_json).unwrap()
-            else {
-                panic!("initialized snapshot required")
-            };
-            if let Some(observation) = snapshot
-                .goals
-                .iter()
-                .find(|observation| observation.goal == goal)
-                && let ReplicaGoalStatus::Failed(message) = &observation.status
-            {
-                assert!(
-                    message
-                        .contains("built-in ordinary hosting integration is unavailable until M2"),
-                    "{message}"
-                );
-                assert!(
-                    snapshot.publication.is_none()
-                        && !snapshot.provider_writer_held
-                        && snapshot.remote_operations.is_empty()
-                );
-                assert_ne!(snapshot.read_status, AccessStatus::Granted);
-                assert_ne!(snapshot.write_status, AccessStatus::Granted);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(node.stop().await.is_none());
-    eprintln!(
-        "M1 explicitly rejects legacy production programs and built-in ordinary integration; retained M2 engine assertions below are not qualified"
-    );
-    true
-}
 
 #[path = "support/custom_control.rs"]
 mod custom_control;
@@ -589,9 +454,6 @@ impl Sample for QueryService {
 
 #[tokio::test]
 async fn public_factory_port_zero_effective_settings_are_immutable_and_round_trip() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     tokio::time::timeout(Duration::from_secs(30), async {
         let root = tempfile::tempdir().unwrap();
         let epoch = Epoch::new(0, 1);
@@ -1144,9 +1006,6 @@ fn query_accepted(report: &PublicV1AgentReport) -> PublicV1AcceptedStatus {
 
 #[tokio::test]
 async fn native_query_outcome_matrix_survives_rpc_persistence_and_controller_eligibility() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     use kuberic_controller::evaluator::public_v1_topology::{
         PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
     };
@@ -1287,9 +1146,6 @@ async fn native_query_outcome_matrix_survives_rpc_persistence_and_controller_eli
 
 #[tokio::test]
 async fn native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_build() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     use kuberic_controller::evaluator::public_v1_topology::{
         PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
     };
@@ -1370,9 +1226,6 @@ async fn native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_buil
 
 #[tokio::test]
 async fn native_query_rejoin_matrix_distinguishes_source_capability_from_target_current() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     use kuberic_controller::evaluator::public_v1_topology::{
         PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
     };
@@ -1463,9 +1316,6 @@ async fn native_query_rejoin_matrix_distinguishes_source_capability_from_target_
 
 #[tokio::test]
 async fn public_factory_primary_process_renewal_retains_exact_role_address_authority() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     tokio::time::timeout(Duration::from_secs(90), async {
             for (fail_replay, demote) in [(false, false), (false, true), (true, false)] {
             let root = tempfile::tempdir().unwrap();
@@ -1729,9 +1579,6 @@ async fn public_factory_primary_process_renewal_retains_exact_role_address_autho
 
 #[tokio::test]
 async fn public_factory_real_kv_copy_quorum_commit_restart_and_promotion() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = tempfile::tempdir().unwrap();
         let source_root = root.path().join("source");
@@ -1902,9 +1749,6 @@ async fn sql_values(
 
 #[tokio::test]
 async fn selected_sqlite_real_wal_isolation_publication_failure_and_restart() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     use sqlite_replicated::server::SqliteServer;
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = tempfile::tempdir().unwrap();
@@ -2035,9 +1879,6 @@ async fn selected_sqlite_real_wal_isolation_publication_failure_and_restart() {
 
 #[tokio::test]
 async fn externally_compiled_helper_free_provider_uses_public_factory_host_and_transport() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     use bytes::Bytes;
     use futures::FutureExt;
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -2120,9 +1961,6 @@ async fn externally_compiled_helper_free_provider_uses_public_factory_host_and_t
 
 #[tokio::test]
 async fn controller_bootstraps_real_native_receivers_before_voting_admission() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     use kuberic_controller::evaluator::public_v1_topology::{
         PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
     };
@@ -2280,9 +2118,6 @@ async fn controller_bootstraps_real_native_receivers_before_voting_admission() {
 
 #[tokio::test]
 async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = tempfile::tempdir().unwrap();
         let mut source = Node::<KvService>::start(&root.path().join("source"), 1, 0).await;
@@ -2401,9 +2236,6 @@ async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() 
 
 #[tokio::test]
 async fn helper_free_recovery_scopes_changed_unchanged_and_failed_observations() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     use bytes::Bytes;
     tokio::time::timeout(Duration::from_secs(120), async {
         for outcome in ["unchanged", "changed", "failed"] {

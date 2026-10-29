@@ -1,40 +1,32 @@
 # PostgreSQL: Native Replication on Kuberic Public V1
 
-**M1 checkpoint:** the [generic ordinary host/controller](../kuberic/ordinary-hosting-m1.md)
-is implemented, but **M2 PostgreSQL session/lifecycle integration is NOT
-IMPLEMENTED**. PgService rejects ordinary production Open before PostgreSQL/
-listener/application initialization. Existing hosted-controller journey names
-assert exact M2 unavailability; their later SQL/backup/terminal clauses do not
-execute. Real native component smoke cases still run, not replacement-session
-acceptance. The engine architecture and explicitly historical positive
-controller evidence below do not establish current production integration.
+**CURRENT implementation.** The
+[ordinary-engine host target](../kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+and [M2 PostgreSQL integration](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **PROPOSED / NOT IMPLEMENTED**. This design/docs delivery changes no
+PostgreSQL runtime, on-disk format or qualification result.
 
 The `postgres-replicated` package supplies an independent native engine for the
-level-triggered Public V1 runtime and its pre-M1 custom-controller route.
+level-triggered Public V1 runtime and its supported custom-controller route.
 Bounded local qualification includes actual controller-driven formation and
 native database evidence. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
-The [pre-M1 engine-neutral host](../kuberic/engine-neutral-hosting.md#current--delivered-bounded-hosting) used one retained
+The [current engine-neutral host](../kuberic/engine-neutral-hosting.md#current--delivered-bounded-hosting) uses one retained
 authority/lifetime coordinator for this independent allocation and built-in V1.
 Host-installed configuration, exact host remote Build state and optional native
 idle observations are separate facts. PostgreSQL's `built_idle` query still
 means completed native copy, unlike V1 membership that can appear during copy;
 neither grants voting or SQL access. Production callback repeatability remains
-conservative in that baseline. Pinned pre-M1 controller-dispatched hosted terminal cases retained child
+conservative. Actual controller-dispatched hosted terminal cases retain child
 Close failure after successful cleanup and reject lost native joins, alongside
-the real backup/replay/SQL-fencing formation witnesses. At M1 the current
-generic host contract is [ordinary hosting](../kuberic/ordinary-hosting-m1.md);
-current PG hosted test wrappers prove only explicit integration unavailability.
+the real backup/replay/SQL-fencing formation witnesses.
 
 Use the current protocol/schema declared by the
 [runtime guide](../kuberic/classic-v1-runtime.md#production-policies-and-security).
 Prior unsupported agent/provider formats reject unchanged; there is no import,
 mixed-version or rolling mode implied by custom-controller integration.
-Current host/control/CRD input is matched format 15, not the historical
-protocol-13/schema-14 deployment. No PG metadata removal or PGDATA conversion/
-reset is authorized by that host-format change.
 
 The current implementation uses a separate checksummed PostgreSQL metadata
 store. It remains retained in the hosting redesign. Removal is separately
@@ -61,16 +53,15 @@ driver hierarchy.
 The agent delivers exact incarnation, session, endpoint, role and frozen progress
 descriptions through `ReplicaInformation` / `ReplicaSetConfiguration` and the
 existing configuration/build/catch-up callbacks. Authority stores and mutation
-capabilities remain private. The retained pre-M1 factory attaches its own
+capabilities remain private. The production factory attaches its own
 `CustomReplicatorControl` to the same creation; it does not borrow a built-in
 bundle. The separate
 [companion contract](../kuberic/replicator-boundary.md#custom-controller-integration)
 adds exact inbound copy authority, coherent idle observations and owned drainage
 without adding methods to the protected native traits. Although attachment is
-optional for a bundle, pre-M1 controller Build required it. This was a real
+optional for a bundle, current controller Build requires it. This is a real
 extra boundary beyond SF's ordinary custom-replicator integration, not justified
-merely by describing it as local. Current M1 production never uses this route;
-PG Open rejects until M2 native session/ordinary lifecycle integration.
+merely by describing it as local.
 
 PostgreSQL uses the same common lifecycle owner as the built-in engine but does
 not register the built-in replication/copy data plane. Delayed native callback
@@ -147,12 +138,7 @@ managed lifetime; there is no independent orphan self-fencing mechanism.
 
 ## Native Build and Catch-Up
 
-**Pre-M1 retained engine/component protocol and historical controller route.**
-The current M1 controller never dispatches target grant installation, and PG
-ordinary production Open rejects pending M2. The native safety mechanisms in
-this subsection are retained consumers, not current production acceptance.
-
-The pre-M1 controller installed exact inbound authority before source dispatch.
+The controller installs exact inbound authority before source dispatch.
 PostgreSQL's hosted native Build envelope carries that full authority: both
 replica/storage/process endpoints, history, epoch, configuration and operation/
 Build attempt. The creation-bound source context resolves only its accepted
@@ -332,10 +318,6 @@ TTL-based forgetting. Exhausted budgets fail closed.
 
 ## Local Usage and Configuration
 
-The command shape below is retained reference, **not a working M1 deployment
-recipe**: ordinary production Open currently returns the explicit M2 integration
-error before PostgreSQL effects. Do not bypass that gate or erase PGDATA.
-
 Run as an unprivileged Linux account with compatible local PostgreSQL server and
 client binaries (`initdb`, `postgres`, `pg_ctl`, `pg_basebackup`, `pg_rewind`,
 `pg_controldata`, `pg_isready`). PostgreSQL 16 is the validated host major;
@@ -381,10 +363,8 @@ just nextest-postgres-smoke
 ```
 
 The smoke inventory validates the live catalog before PostgreSQL starts.
-The recipe builds the owned command binary, then runs real selected native
-cases and exact hosted-controller **M2 unavailable** checks serially in one
-package-only pass. The hosted cases do not execute their later positive
-backup/SQL/terminal clauses. Selectors and
+The recipe builds the owned command binary, then runs its selected native and
+actual-controller cases serially in one package-only pass. Selectors and
 evidence limits are in the [testing guide](../kuberic/testing.md#custom-native-controller-reproduction-and-limits);
 do not copy test totals or historical removed selectors.
 Public V1 fixtures use
@@ -393,17 +373,14 @@ Public V1 fixtures use
 full target is reserved for the dedicated
 resource-owning validation path or explicit requests.
 
-The pinned pre-M1 controller fixture constructed inert production PgService
-instances and owned their native coordination listeners. Its historical body
-checked pre-Role sentinel/Open
+The actual controller fixture constructs inert production PgService instances
+and owns their native coordination listeners. It checks pre-Role sentinel/Open
 provenance, committed seed data, real source/target Build, built-idle state,
 exact joint/current-only admission, live native replay, source/target
 invalidation, synchronous SQL/replay and completed native fencing. Owned short
 socket-path aliases identify the same declared backing storage, not a different
 storage incarnation. Administrative standby queries prove replay only, never
-ordinary secondary-read authorization. The current wrapper instead verifies
-no PG startup/initdb/role effect before explicit support rejection; it is not
-evidence that those historical positives ran now.
+ordinary secondary-read authorization.
 
 Hosted native retries share one retained exact attempt, while waiting/cache
 observers remain outside mutation cleanup. Captured cancellation and coherent

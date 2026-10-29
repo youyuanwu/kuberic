@@ -636,14 +636,8 @@ impl ReplicatorInterfaces {
         Ok(self)
     }
 
-    async fn failed_creation(
-        &self,
-        error: RuntimeError,
-        registration: &dyn ReplicatorRegistration,
-    ) -> RuntimeError {
-        if self.creation.armed.swap(false, Ordering::AcqRel) {
-            self.replicator.abort();
-        }
+    async fn failed_creation(&self, error: RuntimeError) -> RuntimeError {
+        self.replicator.abort();
         let native = self
             .creation
             .native_runtime_control
@@ -655,19 +649,6 @@ impl ReplicatorInterfaces {
         {
             return RuntimeError::Application(format!(
                 "{error}; native creation cleanup failed: {cleanup}"
-            ));
-        }
-        if self
-            .creation
-            .native_runtime_control
-            .lock()
-            .unwrap()
-            .is_none()
-            && let Err(cleanup) = self.replicator.close().await
-        {
-            registration.record_creation_cleanup_failure(cleanup.to_string());
-            return RuntimeError::Application(format!(
-                "{error}; ordinary creation Close failed: {cleanup}"
             ));
         }
         error
@@ -790,52 +771,9 @@ pub struct ReplicatorFactoryContext {
     public_v1_binding: PublicV1LifecycleBinding,
     public_v1_replication_address: std::net::SocketAddr,
     native_factory_started: Arc<AtomicBool>,
-    ordinary_contract: bool,
 }
 
 impl ReplicatorFactoryContext {
-    pub(crate) fn with_ordinary_contract(mut self, ordinary: bool) -> Self {
-        self.ordinary_contract = ordinary;
-        self
-    }
-
-    pub fn ordinary_hosting(&self) -> bool {
-        self.ordinary_contract
-    }
-
-    pub fn creation_id(&self) -> Result<crate::protocol::types::ReplicatorCreationId> {
-        Ok(self
-            .reservation
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?
-            .identity(RuntimeHostToken::new())
-            .to_public_id())
-    }
-
-    pub async fn local_publication(
-        &self,
-    ) -> Result<Option<crate::protocol::public_operations::ReplicaPublication>> {
-        self.access
-            .local_publication(self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?)
-            .await
-    }
-
-    pub async fn discover_peer(
-        &self,
-        query: &crate::protocol::public_operations::ReplicaDiscoveryQuery,
-    ) -> Result<Option<crate::protocol::public_operations::ReplicaPublication>> {
-        use crate::protocol::public_operations::ORDINARY_ACTION_FORMAT;
-        if query.format != ORDINARY_ACTION_FORMAT
-            || query.history.resource_uid != self.public_v1_binding.resource_uid
-        {
-            return Err(RuntimeError::AuthorityMismatch(
-                "incompatible discovery scope".into(),
-            ));
-        }
-        let credentials = self.access.native_credentials().await?;
-        let address = self.access.peer_control_endpoint(&query.replica)?;
-        crate::control::resolve_replica_publication(&address, &credentials, query).await
-    }
-
     #[doc(hidden)]
     pub(crate) fn new(
         _token: RuntimeHostToken,
@@ -853,7 +791,6 @@ impl ReplicatorFactoryContext {
             public_v1_binding,
             public_v1_replication_address,
             native_factory_started: Arc::new(AtomicBool::new(false)),
-            ordinary_contract: false,
         }
     }
 
@@ -1017,15 +954,6 @@ impl ReplicatorFactoryContext {
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
-    async fn local_publication(
-        &self,
-        _reservation: ReplicatorCreationReservation,
-    ) -> Result<Option<crate::protocol::public_operations::ReplicaPublication>> {
-        Err(RuntimeError::AuthorityNotAdmitted)
-    }
-    fn peer_control_endpoint(&self, _identity: &ReplicaIdentity) -> Result<String> {
-        Err(RuntimeError::AuthorityNotAdmitted)
-    }
     async fn revoke_exact_inbound_build_authority(
         &self,
         _authority: &PublicInboundBuildAuthority,
@@ -1150,8 +1078,6 @@ pub(crate) trait ReplicatorRegistration: Send + Sync {
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
 
-    fn record_creation_cleanup_failure(&self, error: String);
-
     async fn register_interfaces(
         &self,
         attachment: &ReplicatorAttachment,
@@ -1169,9 +1095,6 @@ pub struct StatefulServicePartition {
 }
 
 impl StatefulServicePartition {
-    pub fn ordinary_hosting(&self) -> bool {
-        self.context.ordinary_hosting()
-    }
     #[doc(hidden)]
     pub(crate) fn new(
         _token: RuntimeHostToken,
@@ -1267,9 +1190,7 @@ impl StatefulServicePartition {
             Ok(attachment) => attachment,
             Err(error) => {
                 self.registration.cancel_replicator_creation(reservation);
-                return Err(interfaces
-                    .failed_creation(error, self.registration.as_ref())
-                    .await);
+                return Err(interfaces.failed_creation(error).await);
             }
         };
         if let Err(error) = interfaces
@@ -1277,9 +1198,7 @@ impl StatefulServicePartition {
             .bind_settings(self.context.identity.clone(), settings)
         {
             self.registration.cancel_replicator_creation(reservation);
-            return Err(interfaces
-                .failed_creation(error, self.registration.as_ref())
-                .await);
+            return Err(interfaces.failed_creation(error).await);
         }
         if let Err(error) = self
             .registration
@@ -1287,9 +1206,7 @@ impl StatefulServicePartition {
             .await
         {
             self.registration.cancel_replicator_creation(reservation);
-            return Err(interfaces
-                .failed_creation(error, self.registration.as_ref())
-                .await);
+            return Err(interfaces.failed_creation(error).await);
         }
         attachment.disarm();
         #[cfg(feature = "testing")]
@@ -1327,11 +1244,6 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         validate_public_v1_factories(PUBLIC_V1_FACTORIES)?;
-        if context.ordinary_hosting() {
-            return Err(RuntimeError::ControlPlane(
-                "built-in ordinary hosting integration is unavailable until M2".into(),
-            ));
-        }
         v1::create_production(context, state_provider, settings).await
     }
 }

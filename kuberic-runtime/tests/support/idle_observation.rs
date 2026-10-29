@@ -5,9 +5,6 @@ use kuberic_runtime::testing::{PublicCutPosition, PublicOperationCut};
 /// journeys. This fixture deliberately holds the host's native/receipt seam.
 #[tokio::test]
 async fn builtin_native_success_before_receipt_never_labels_new_idle_state_as_old_configuration() {
-    if m1_legacy_production_unavailable().await {
-        return;
-    }
     tokio::time::timeout(Duration::from_secs(60), async {
         let root = tempfile::tempdir().unwrap();
         let epoch = Epoch::new(0, 1);

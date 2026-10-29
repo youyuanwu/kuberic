@@ -37,8 +37,6 @@ async fn finish(
         .unwrap();
 }
 
-// Legacy programs exercise selected-engine components through the testing
-// handle; production transport accepts ordinary goals instead.
 fn execute(
     node: &Node,
     intent: PublicOperationIntent,
@@ -47,7 +45,7 @@ fn execute(
     tokio::spawn(async move { handle.execute_public_v1(intent).await })
 }
 
-async fn legacy_rpc(
+async fn rpc(
     node: &Node,
     intent: PublicOperationIntent,
 ) -> tokio::task::JoinHandle<kuberic_runtime::host::Result<()>> {
@@ -83,42 +81,6 @@ async fn legacy_rpc(
 
 async fn stage(node: &Node, read: AccessStatus, write: AccessStatus) {
     stage_with_completion(node, read, write, true).await;
-}
-
-#[tokio::test]
-async fn legacy_controller_program_rpc_rejects_without_component_mutation() {
-    let root = root();
-    let pair = Pair::start(root.path(), 1).await;
-    let before = pair.source.report().await;
-    let values = pair.source.service.provider.values();
-    let calls = pair.source.service.observed.lock().unwrap().len();
-    let intent = pair
-        .source
-        .intent(PublicOperationProgram::Configuration(
-            configuration(&pair).await,
-        ))
-        .await;
-    let error = legacy_rpc(&pair.source, intent)
-        .await
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(
-        error.to_string().contains(
-            "controller callback programs are unavailable; submit a semantic replica goal"
-        ),
-        "{error}"
-    );
-    assert_eq!(pair.source.service.observed.lock().unwrap().len(), calls);
-    assert_eq!(pair.source.service.provider.values(), values);
-    let after = pair.source.report().await;
-    assert_eq!(after.completed_operations, before.completed_operations);
-    assert_eq!(after.configuration, before.configuration);
-    assert_eq!(
-        (after.read_status, after.write_status),
-        (before.read_status, before.write_status)
-    );
-    pair.stop().await;
 }
 
 async fn stage_with_completion(
@@ -230,7 +192,7 @@ async fn selected_delayed_old_reservation_cannot_replace_current_promotion_owner
         .await;
     assert!(current_intent.revision > old.revision);
     let current_id = current_intent.operation_id.clone();
-    let mut current_task = execute(target, current_intent);
+    let mut current_task = rpc(target, current_intent).await;
     entered(&current_cut, &mut current_task).await;
     stage(target, Granted, ReconfigurationPending).await;
 
@@ -628,7 +590,7 @@ async fn selected_planner_unknown_progress_and_restoration_drive_real_c_and_p() 
             .source
             .intent(PublicOperationProgram::Configuration(unavailable.clone()))
             .await;
-        let mut task = execute(&pair.source, intent);
+        let mut task = rpc(&pair.source, intent).await;
         entered(&cut, &mut task).await;
         stage(&pair.source, Granted, NoWriteQuorum).await;
         finish(&pair.source, &cut, task).await;
@@ -651,7 +613,7 @@ async fn selected_planner_unknown_progress_and_restoration_drive_real_c_and_p() 
             .source
             .intent(PublicOperationProgram::Configuration(restored.clone()))
             .await;
-        let mut task = execute(&pair.source, intent);
+        let mut task = rpc(&pair.source, intent).await;
         entered(&cut, &mut task).await;
         // Restored descriptor readiness authorizes assignment, not transport completion.
         stage_with_completion(&pair.source, Granted, Granted, false).await;
@@ -680,7 +642,7 @@ async fn selected_planner_unknown_progress_and_restoration_drive_real_c_and_p() 
             .source
             .intent(PublicOperationProgram::Configuration(previous_only.clone()))
             .await;
-        let mut task = execute(&pair.source, intent);
+        let mut task = rpc(&pair.source, intent).await;
         entered(&cut, &mut task).await;
         // C is a ready local singleton; only the produced unavailable previous voter denies P.
         stage(&pair.source, Granted, NoWriteQuorum).await;
@@ -747,7 +709,7 @@ async fn selected_changed_primary_context_cannot_borrow_same_primary_grants() {
         };
         let cut = hold(&pair.source, Cut::InstructionApplied, 0);
         let old = pair.source.intent(program).await;
-        let mut task = execute(&pair.source, old.clone());
+        let mut task = rpc(&pair.source, old.clone()).await;
         entered(&cut, &mut task).await;
         stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
         pair.source.handle().set_public_operation_cut(None);
@@ -861,7 +823,7 @@ async fn selected_changed_primary_context_after_revoke_cannot_borrow_demotion_re
         .source
         .intent(PublicOperationProgram::Configuration(changed))
         .await;
-    let mut task = execute(&pair.source, intent);
+    let mut task = rpc(&pair.source, intent).await;
     entered(&cut, &mut task).await;
     stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
     old_cut.release.notify_one();
@@ -1060,7 +1022,7 @@ async fn selected_nonactivating_configuration_preserves_demotion_reconciliation(
                     .source
                     .intent(PublicOperationProgram::Configuration(refresh))
                     .await;
-                execute(&pair.source, refresh).await.unwrap().unwrap();
+                rpc(&pair.source, refresh).await.await.unwrap().unwrap();
                 release_old_demotion(&pair.source, old).await;
                 stage(&pair.source, NotPrimary, NotPrimary).await;
 
@@ -1071,7 +1033,7 @@ async fn selected_nonactivating_configuration_preserves_demotion_reconciliation(
                     Cut::BeforeInstruction,
                     if recipe { 2 } else { 1 },
                 );
-                let mut task = execute(&pair.source, intent);
+                let mut task = rpc(&pair.source, intent).await;
                 entered(&role_cut, &mut task).await;
                 stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
                 finish(&pair.source, &role_cut, task).await;
@@ -1090,7 +1052,7 @@ async fn selected_nonactivating_configuration_preserves_demotion_reconciliation(
                         })
                         .await;
                     let wait_cut = hold(&pair.source, Cut::BeforeInstruction, 1);
-                    let mut task = execute(&pair.source, catch_up);
+                    let mut task = rpc(&pair.source, catch_up).await;
                     entered(&wait_cut, &mut task).await;
                     stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
                     finish(&pair.source, &wait_cut, task).await;
@@ -1176,7 +1138,7 @@ async fn superseded_nonprimary_reservation(recipe: bool, swap: bool) {
             let intermediate = pair.source.intent(program).await;
             let intermediate_cut =
                 hold(&pair.source, position.unwrap_or(Cut::BeforeInstruction), 0);
-            let mut intermediate_task = execute(&pair.source, intermediate.clone());
+            let mut intermediate_task = rpc(&pair.source, intermediate.clone()).await;
             entered(&intermediate_cut, &mut intermediate_task).await;
             let mut held = Some((intermediate_cut, intermediate_task));
             if position.is_none() {
@@ -1209,7 +1171,7 @@ async fn superseded_nonprimary_reservation(recipe: bool, swap: bool) {
                 Cut::BeforeInstruction,
                 if recipe { 2 } else { 1 },
             );
-            let mut task = execute(&pair.source, successor.clone());
+            let mut task = rpc(&pair.source, successor.clone()).await;
             entered(&role_cut, &mut task).await;
             stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
             release_old_demotion(&pair.source, old).await;
@@ -1223,7 +1185,8 @@ async fn superseded_nonprimary_reservation(recipe: bool, swap: bool) {
                         .is_err()
                 );
                 assert!(
-                    execute(&pair.source, intermediate.clone())
+                    rpc(&pair.source, intermediate.clone())
+                        .await
                         .await
                         .unwrap()
                         .is_err()
@@ -1252,20 +1215,20 @@ async fn superseded_nonprimary_reservation(recipe: bool, swap: bool) {
                     })
                     .await;
                 let wait_cut = hold(&pair.source, Cut::BeforeInstruction, 1);
-                let mut task = execute(&pair.source, catch_up);
+                let mut task = rpc(&pair.source, catch_up).await;
                 entered(&wait_cut, &mut task).await;
                 stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
                 finish(&pair.source, &wait_cut, task).await;
             }
             stage(&pair.source, Granted, Granted).await;
-            let replay = execute(&pair.source, intermediate).await.unwrap();
+            let replay = rpc(&pair.source, intermediate).await.await.unwrap();
             if position.is_none() {
                 replay.unwrap();
             } else {
                 assert!(replay.is_err());
             }
             if recipe {
-                execute(&pair.source, successor).await.unwrap().unwrap();
+                rpc(&pair.source, successor).await.await.unwrap().unwrap();
             }
             stage(&pair.source, Granted, Granted).await;
             pair.stop().await;
@@ -1283,7 +1246,7 @@ async fn selected_secondary_epoch_recipe_cannot_activate_pending_primary_reconci
     let current = prepare_repromotion(&pair, Some(previous)).await;
     let first = repromotion_intent(&pair.source, &current, true).await;
     let first_cut = hold(&pair.source, Cut::BeforeInstruction, 5);
-    let mut first_task = execute(&pair.source, first.clone());
+    let mut first_task = rpc(&pair.source, first.clone()).await;
     entered(&first_cut, &mut first_task).await;
     stage(&pair.source, Granted, ReconfigurationPending).await;
 
@@ -1306,13 +1269,17 @@ async fn selected_secondary_epoch_recipe_cannot_activate_pending_primary_reconci
     input.validate().unwrap();
     intermediate.input_digest = input.digest();
     pair.source.handle().set_public_operation_cut(None);
-    execute(&pair.source, intermediate).await.unwrap().unwrap();
+    rpc(&pair.source, intermediate)
+        .await
+        .await
+        .unwrap()
+        .unwrap();
     stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
 
     let next = prepare_repromotion_at(&pair, current.previous, Epoch::new(0, 5)).await;
     let successor = repromotion_intent(&pair.source, &next, true).await;
     let role_cut = hold(&pair.source, Cut::BeforeInstruction, 2);
-    let mut task = execute(&pair.source, successor);
+    let mut task = rpc(&pair.source, successor).await;
     entered(&role_cut, &mut task).await;
     stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
     release_old_demotion(&pair.source, old).await;
@@ -1324,7 +1291,7 @@ async fn selected_secondary_epoch_recipe_cannot_activate_pending_primary_reconci
             .unwrap()
             .is_err()
     );
-    assert!(execute(&pair.source, first).await.unwrap().is_err());
+    assert!(rpc(&pair.source, first).await.await.unwrap().is_err());
     stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
     finish(&pair.source, &role_cut, task).await;
     stage(&pair.source, Granted, Granted).await;
@@ -1336,7 +1303,8 @@ async fn selected_secondary_epoch_recipe_cannot_activate_pending_primary_reconci
             role: ReplicaRole::Primary,
         })
         .await;
-    let error = execute(&pair.source, redundant_primary)
+    let error = rpc(&pair.source, redundant_primary)
+        .await
         .await
         .unwrap()
         .unwrap_err();
@@ -1383,7 +1351,7 @@ async fn superseded_repromotion(recipe: bool) {
                 let current = prepare_repromotion(&pair, recipe.then_some(previous)).await;
                 let first = repromotion_intent(&pair.source, &current, recipe).await;
                 let first_cut = hold(&pair.source, position, index);
-                let mut first_task = execute(&pair.source, first.clone());
+                let mut first_task = rpc(&pair.source, first.clone()).await;
                 entered(&first_cut, &mut first_task).await;
                 let read = if index == 5 {
                     Granted
@@ -1405,7 +1373,7 @@ async fn superseded_repromotion(recipe: bool) {
                     Cut::BeforeInstruction,
                     if recipe { 2 } else { 1 },
                 );
-                let mut successor_task = execute(&pair.source, successor.clone());
+                let mut successor_task = rpc(&pair.source, successor.clone()).await;
                 entered(&successor_cut, &mut successor_task).await;
                 stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
                 first_cut.release.notify_one();
@@ -1416,7 +1384,13 @@ async fn superseded_repromotion(recipe: bool) {
                         .unwrap()
                         .is_err()
                 );
-                assert!(execute(&pair.source, first.clone()).await.unwrap().is_err());
+                assert!(
+                    rpc(&pair.source, first.clone())
+                        .await
+                        .await
+                        .unwrap()
+                        .is_err()
+                );
                 stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
                 finish(&pair.source, &successor_cut, successor_task).await;
 
@@ -1441,15 +1415,15 @@ async fn superseded_repromotion(recipe: bool) {
                         })
                         .await;
                     let catch_up_cut = hold(&pair.source, Cut::BeforeInstruction, 1);
-                    let mut catch_up_task = execute(&pair.source, catch_up);
+                    let mut catch_up_task = rpc(&pair.source, catch_up).await;
                     entered(&catch_up_cut, &mut catch_up_task).await;
                     stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
                     finish(&pair.source, &catch_up_cut, catch_up_task).await;
                 }
                 stage(&pair.source, Granted, Granted).await;
-                assert!(execute(&pair.source, first).await.unwrap().is_err());
+                assert!(rpc(&pair.source, first).await.await.unwrap().is_err());
                 if recipe {
-                    execute(&pair.source, successor).await.unwrap().unwrap();
+                    rpc(&pair.source, successor).await.await.unwrap().unwrap();
                 }
                 stage(&pair.source, Granted, Granted).await;
                 pair.stop().await;
@@ -1487,7 +1461,7 @@ async fn selected_same_live_host_split_repromotion_retires_only_old_demotion() {
                         role: ReplicaRole::Primary,
                     })
                     .await;
-                let mut task = execute(&pair.source, role);
+                let mut task = rpc(&pair.source, role).await;
                 entered(&role_cut, &mut task).await;
                 stage(&pair.source, ReconfigurationPending, ReconfigurationPending).await;
                 release_old_demotion(&pair.source, old).await;
@@ -1511,7 +1485,7 @@ async fn selected_same_live_host_split_repromotion_retires_only_old_demotion() {
                     })
                     .await;
                 let replay = catch_up.clone();
-                let mut task = execute(&pair.source, catch_up);
+                let mut task = rpc(&pair.source, catch_up).await;
                 entered(&cut, &mut task).await;
                 stage(
                     &pair.source,
@@ -1578,7 +1552,7 @@ async fn selected_same_live_host_recipe_repromotion_retires_only_old_demotion() 
                 intent.lifecycle = Some(input);
                 let replay = intent.clone();
                 let cut = hold(&pair.source, Cut::BeforeInstruction, index);
-                let mut task = execute(&pair.source, intent);
+                let mut task = rpc(&pair.source, intent).await;
                 entered(&cut, &mut task).await;
                 let read = if index == 5 {
                     Granted
@@ -1632,7 +1606,7 @@ async fn selected_resumed_promotion_cannot_clear_fault_terminal_or_late_generati
                     mode: PublicCatchUpMode::All,
                 })
                 .await;
-            let mut task = execute(&pair.source, intent.clone());
+            let mut task = rpc(&pair.source, intent.clone()).await;
             entered(&cut, &mut task).await;
             stage(&pair.source, Granted, ReconfigurationPending).await;
             pair.source.handle().set_public_operation_cut(None);
@@ -1807,7 +1781,7 @@ async fn selected_promotion_waits_for_replicator_role_before_any_grant() {
             role: ReplicaRole::Primary,
         })
         .await;
-    let mut task = execute(&pair.target, intent);
+    let mut task = rpc(&pair.target, intent).await;
     entered(&cut, &mut task).await;
     stage(&pair.target, ReconfigurationPending, ReconfigurationPending).await;
     finish(&pair.target, &cut, task).await;
@@ -1816,7 +1790,7 @@ async fn selected_promotion_waits_for_replicator_role_before_any_grant() {
 }
 
 #[tokio::test]
-async fn selected_split_promotion_component_catchup_activation_survives_observer_drop() {
+async fn selected_split_promotion_rpc_catchup_activation_survives_observer_drop() {
     use AccessStatus::*;
     let root = root();
     let mut pair = Pair::start(root.path(), 1).await;
@@ -1830,7 +1804,7 @@ async fn selected_split_promotion_component_catchup_activation_survives_observer
             role: ReplicaRole::Primary,
         })
         .await;
-    let mut task = execute(target, intent);
+    let mut task = rpc(target, intent).await;
     entered(&cut, &mut task).await;
     stage(target, ReconfigurationPending, ReconfigurationPending).await;
     finish(target, &cut, task).await;
@@ -1863,7 +1837,7 @@ async fn selected_split_promotion_component_catchup_activation_survives_observer
             mode: PublicCatchUpMode::All,
         })
         .await;
-    let mut task = execute(target, intent);
+    let mut task = rpc(target, intent).await;
     entered(&cut, &mut task).await;
     stage(target, Granted, ReconfigurationPending).await;
     let id = target
@@ -2029,7 +2003,7 @@ async fn selected_split_joint_promotion_keeps_reads_until_matching_final_activat
             mode: PublicCatchUpMode::All,
         })
         .await;
-    let mut task = execute(&pair.target, intent);
+    let mut task = rpc(&pair.target, intent).await;
     entered(&cut, &mut task).await;
     stage(&pair.target, ReconfigurationPending, ReconfigurationPending).await;
     finish(&pair.target, &cut, task).await;

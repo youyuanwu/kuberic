@@ -50,53 +50,6 @@ impl Kind {
 
 type Key = (String, Kind, String);
 
-fn prune_structural(value: &mut Value, schema: &Value) {
-    if schema["x-kubernetes-preserve-unknown-fields"] == true {
-        return;
-    }
-    match value {
-        Value::Object(fields) if schema["type"] == "object" => {
-            let properties = schema.get("properties").and_then(Value::as_object);
-            fields.retain(|name, child| {
-                if let Some(property) = properties.and_then(|properties| properties.get(name)) {
-                    prune_structural(child, property);
-                    true
-                } else {
-                    match schema.get("additionalProperties") {
-                        Some(Value::Bool(true)) => true,
-                        Some(property @ Value::Object(_)) => {
-                            prune_structural(child, property);
-                            true
-                        }
-                        _ => false,
-                    }
-                }
-            });
-        }
-        Value::Array(items) => {
-            if let Some(item_schema) = schema.get("items") {
-                for item in items {
-                    prune_structural(item, item_schema);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn prune_kuberic_status(value: &mut Value) {
-    static CRD: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
-        serde_json::from_str(include_str!("../../deploy/crd.json"))
-            .expect("checked-in structural CRD")
-    });
-    if let Some(status) = value.get_mut("status") {
-        prune_structural(
-            status,
-            &CRD["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"],
-        );
-    }
-}
-
 #[derive(Default)]
 struct Store {
     objects: BTreeMap<Key, Value>,
@@ -695,9 +648,6 @@ fn execute(
                 }
                 let mut next = old.clone();
                 copy_field(&incoming, &mut next, "status");
-                if route.kind == Kind::KubericSet {
-                    prune_kuberic_status(&mut next);
-                }
                 next["metadata"]["resourceVersion"] = json!(store.rv());
                 let newly_pending = !next["status"]["publicV1Operation"].is_null()
                     && next["status"]["publicV1Operation"] != old["status"]["publicV1Operation"];
@@ -970,7 +920,7 @@ mod tests {
         let sets: Api<KubericSet> = Api::default_namespaced(server.client());
         let object = serde_json::from_value(json!({
             "apiVersion": "operator.kuberic.io/v1alpha1", "kind": "KubericSet",
-            "metadata": {"name": "demo"}, "spec": {"hostingFormat": 15, "replicas": 3, "image": "kvstore2"}
+            "metadata": {"name": "demo"}, "spec": {"replicas": 3, "image": "kvstore2"}
         }))
         .unwrap();
         serde_json::to_value(sets.create(&PostParams::default(), &object).await.unwrap()).unwrap()

@@ -39,14 +39,6 @@ pub(crate) enum PublicInboundBuildAdmission {
 
 #[async_trait]
 pub(crate) trait AgentStore: Send + Sync {
-    async fn acknowledge_ordinary_goal(
-        &self,
-        _acknowledgement: &crate::protocol::public_operations::ReplicaGoalAcknowledgement,
-    ) -> Result<()> {
-        Err(crate::host::HostError::CommandRejected(
-            "ordinary goal acknowledgement unavailable".into(),
-        ))
-    }
     async fn identity(&self) -> Result<StorageIdentity>;
 
     async fn load_state(&self) -> Result<AgentState>;

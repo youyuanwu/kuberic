@@ -35,21 +35,26 @@ The public Service Fabric-shaped interfaces are:
 The protected `Replicator`, `PrimaryReplicator` and `StateProvider` method sets
 are unchanged. Assignment and stream APIs intentionally change.
 
-The [ordinary hosting M1 contract](../docs/features/kuberic/ordinary-hosting-m1.md)
-requires only the coherent ordinary bundle, not a companion or diagnostics.
-Read-only generic peer discovery is available through factory context; early
-publication permits recovery before achieved role scope. The host retains calls
-and actual ordinary Close-after-Abort settlement independently of RPC observers.
-Legacy `CustomReplicatorControl`/grant APIs remain for engine/component consumers
-awaiting M2; production does not dispatch that route.
+An independent native engine can additionally attach
+`replicator::CustomReplicatorControl` with
+`ReplicatorInterfaces::with_custom_control(&context, owner)` during factory
+creation. This attachable **local control-plane companion**, not an SF interface,
+supports exact inbound Build authority, configuration-bound idle observations
+and owned drainage. Factory-context Build lookup/validation is read-only and
+creation-bound; it does not expose an agent store or authority setter.
+See the [custom-engine contract](../docs/features/kuberic/replicator-boundary.md#custom-controller-integration)
+and its evidence limits.
+Attachment is optional for a bundle, but **current controller-driven Build
+requires it**; ordinary custom traits alone do not integrate that path
+([host check:891–927](src/host/hosting.rs#L891-L927)).
+The [proposed ordinary-engine redesign](../docs/features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+removes this extra boundary; it is **NOT IMPLEMENTED**.
 
 ## Built-In Replicator
 
 `DefaultReplicatorFactory::new()` is the sole built-in factory. It constructs the
 source-guided Service Fabric classic V1 owners, with no engine persistence
-argument, selector, shadow writer, or fallback. **Ordinary production integration
-explicitly rejects before engine/listener effects until M2**. The following
-composition remains for native/component development, not a deployable M1 default.
+argument, selector, shadow writer, or fallback.
 
 Applications call:
 
@@ -65,8 +70,7 @@ at most one provider writer.
 
 ## Durable Ownership
 
-- agent schema 15: identity, history, canonical goals/frozen actions/receipts,
-  source remote outcomes/watermarks, uncertainty and terminal
+- agent schema 14: identity, history, lifecycle/operation authority, terminal
   completion;
 - provider: application bytes, progress, retained operations, copy state;
 - Replicator memory: queues, peers, ACKs, copy/replication tasks.
@@ -74,7 +78,7 @@ at most one provider writer.
 Old schemas and supported prior provider formats reject without mutation.
 There is no migration or compatibility reader.
 
-The pre-M1 engine baseline reconstructed native process-local queues from authority
+Process restart reconstructs native process-local queues from schema-14 authority
 and provider state. A cold secondary requires real copy even when it retains
 application data. The host reserves a real opaque creation identity before
 Open; attachment consumes that same identity. The controller can capture the
@@ -82,19 +86,16 @@ exact process/creation session under closed access before survivor epoch barrier
 owned existing-state Open, replacement role replay and exact fresh configuration.
 Participant journals advance through validated adjacent stages;
 obsolete journals can be superseded only after the accepted topology epoch has
-advanced. At M1, matching-format restart instead keeps interrupted ordinary work
-uncertain, invalidates old process publication and opens fresh DiscoveryPending;
-automatic retained-history reformation and comprehensive recovery remain M3.
+advanced.
 
 ## Public V1 Protocol
 
-Matched host/control/CRD format 15 is required. Serialized public values use
+Protocol version 13 is the only built-in identity. Serialized public values use
 the `identity` field. Prior identities and old report/command branches are rejected.
 
 The bounded tonic carrier authenticates with the host's agent bearer credential.
-Generic ordinary discovery binds current identity/storage/process/creation/
-endpoint/scope without an operation or target grant. Existing native carrier
-bindings remain component/M2 context, not a replacement-session completion claim.
+Exact identity, session, epoch, history, storage, configuration, operation, and
+build bindings are checked independently at connection and message admission.
 This is not TLS, native SF wire interoperability, or a replacement for network
 isolation and namespace RBAC.
 

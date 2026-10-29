@@ -2254,25 +2254,9 @@ async fn native_transient_fault_restarts_same_storage_under_exact_session_renewa
                 _ => {}
             }
         }
-        let calls = replacement.service.observed.lock().unwrap().len();
-        let dispatched = execute_public_v1_session_renewal(&controller, &scope, plan).await;
-        if dispatched.as_ref().is_err_and(|message| {
-            message.contains(
-            "legacy engine-grant and renewal dispatch is unavailable in ordinary hosting format 15")
-        }) {
-            assert_eq!(replacement.service.observed.lock().unwrap().len(), calls);
-            assert_eq!(replacement.service.opens.load(Ordering::SeqCst), 0);
-            assert_eq!(replacement.service.provider.values(), acknowledged);
-            let denied = wire_report(&replacement).await;
-            assert_ne!(denied.read_status, AccessStatus::Granted);
-            assert_ne!(denied.write_status, AccessStatus::Granted);
-            eprintln!(
-                "M1 explicitly rejects the old production renewal route; retained M2 renewal assertions below are not qualified"
-            );
-            replacement.stop().await;
-            return;
-        }
-        dispatched.unwrap();
+        execute_public_v1_session_renewal(&controller, &scope, plan)
+            .await
+            .unwrap();
         if replaying_role {
             let opened = replacement.report().await;
             assert_eq!(replacement.service.opens.load(Ordering::SeqCst), 1);
@@ -5225,26 +5209,9 @@ async fn native_controller_unreachable_survivor_fences_until_exact_return_or_exp
                     assert_eq!(*captured, survivor);
                     break current;
                 }
-                plan => {
-                    let calls = replacement.service.observed.lock().unwrap().len();
-                    let dispatched =
-                        execute_public_v1_session_renewal(&controller, &scope, plan).await;
-                    if dispatched.as_ref().is_err_and(|message| message.contains(
-                        "legacy engine-grant and renewal dispatch is unavailable in ordinary hosting format 15"))
-                    {
-                        assert_eq!(replacement.service.observed.lock().unwrap().len(), calls);
-                        let denied = wire_report(&replacement).await;
-                        assert_ne!(denied.read_status, AccessStatus::Granted);
-                        assert_ne!(denied.write_status, AccessStatus::Granted);
-                        blackhole.abort();
-                        let _ = blackhole.await;
-                        replacement.stop().await;
-                        pair.target.stop().await;
-                        eprintln!("M1 explicitly rejects old survivor-renewal dispatch before effects; retained M2 return/retirement assertions below are not qualified");
-                        return;
-                    }
-                    dispatched.unwrap();
-                }
+                plan => execute_public_v1_session_renewal(&controller, &scope, plan)
+                    .await
+                    .unwrap(),
             }
         };
         for _ in 0..3 {

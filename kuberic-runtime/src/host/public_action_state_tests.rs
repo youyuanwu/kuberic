@@ -285,7 +285,6 @@ async fn admitted_recovery_preserves_exact_paired_roles_and_epoch_not_predecesso
         })
         .collect();
     let record = PublicOperationRecord {
-        ordinary: None,
         intent: intent.clone(),
         attempt: 1,
         attempt_results: Default::default(),

@@ -11,24 +11,6 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
     use PublicInstruction::*;
     use PublicOperationProgram as P;
     match &intent.program {
-        Some(P::AgentGoal(goal)) if goal.class().is_terminal() => {
-            if matches!(
-                goal.desired,
-                crate::protocol::public_operations::ReplicaGoalKind::Abort
-            ) {
-                vec![Revoke, Abort, Cleanup]
-            } else {
-                vec![Revoke, Cleanup]
-            }
-        }
-        Some(P::AgentGoal(goal)) => goal_programs(goal)
-            .iter()
-            .flat_map(|program| {
-                let mut selected = intent.clone();
-                selected.program = Some(program.clone());
-                operation_instructions(&selected)
-            })
-            .collect(),
         Some(P::Open { .. }) => vec![ApplicationOpen, ReplicatorOpen],
         Some(P::Role { .. }) => vec![ReplicatorRole, ApplicationRole],
         Some(P::Epoch { .. }) => vec![ProgramEpoch],
@@ -68,95 +50,6 @@ pub(crate) fn operation_instructions(intent: &PublicOperationIntent) -> Vec<Publ
     }
 }
 
-pub(crate) fn goal_programs(
-    goal: &crate::protocol::public_operations::ReplicaGoal,
-) -> Vec<PublicOperationProgram> {
-    use crate::protocol::public_operations::ReplicaGoalKind as G;
-    use PublicOperationProgram as P;
-    let mut programs = Vec::new();
-    match &goal.desired {
-        G::Discover => programs.push(P::Open {
-            replica: goal.scope.storage.replica.clone(),
-            existing: true,
-        }),
-        G::Prepare { role } => {
-            programs.push(P::Open {
-                replica: goal.scope.storage.replica.clone(),
-                existing: true,
-            });
-            programs.push(P::Role {
-                epoch: goal.scope.epoch,
-                role: *role,
-            });
-            programs.push(P::Epoch {
-                epoch: goal.scope.epoch,
-            });
-            if *role != ReplicaRole::IdleSecondary {
-                programs.push(P::Configuration(goal.scope.configuration.ordinary()));
-            }
-        }
-        G::Reconfigure { role, catch_up } => {
-            programs.push(P::Role {
-                epoch: goal.scope.epoch,
-                role: *role,
-            });
-            programs.push(P::Epoch {
-                epoch: goal.scope.epoch,
-            });
-            if *role != ReplicaRole::IdleSecondary {
-                programs.push(match catch_up {
-                    Some(mode) => P::CatchUp {
-                        configuration: goal.scope.configuration.ordinary(),
-                        mode: *mode,
-                    },
-                    None => P::Configuration(goal.scope.configuration.ordinary()),
-                });
-            }
-        }
-        G::Build { remote } | G::Remove { remote } => {
-            let input = crate::protocol::public_operations::PublicBuildInput {
-                attempt: goal.operation_id.clone(),
-                epoch: goal.scope.epoch,
-                current_configuration_id: Some(
-                    goal.scope.configuration.current.configuration_id.clone(),
-                ),
-                replica: remote.target.scope.storage.replica.clone(),
-                target_storage: remote.target.scope.storage.clone(),
-                process_session_id: remote.target.scope.process_session_id.clone(),
-                source_address: remote.source.replication_address.clone(),
-                replication_address: remote.target.replication_address.clone(),
-                history: Some(goal.scope.history.clone()),
-            };
-            programs.push(if matches!(goal.desired, G::Build { .. }) {
-                P::Build(input)
-            } else {
-                P::Remove(input)
-            });
-        }
-        G::Close => programs.push(P::Close),
-        // Abort always retains both ordinary child Close calls.
-        G::Abort => {
-            programs.push(P::Abort);
-        }
-    }
-    programs
-}
-
-pub(crate) fn selected_program(
-    intent: &PublicOperationIntent,
-    instruction: PublicInstruction,
-) -> Option<PublicOperationProgram> {
-    let program = intent.program.as_ref()?;
-    let PublicOperationProgram::AgentGoal(goal) = program else {
-        return Some(program.clone());
-    };
-    goal_programs(goal).into_iter().find(|program| {
-        let mut local = intent.clone();
-        local.program = Some(program.clone());
-        operation_instructions(&local).contains(&instruction)
-    })
-}
-
 pub(crate) fn repeatable(instruction: PublicInstruction) -> bool {
     !matches!(
         instruction,
@@ -168,11 +61,6 @@ pub(crate) fn repeatable(instruction: PublicInstruction) -> bool {
 }
 
 pub(crate) fn replayable(record: &PublicOperationRecord) -> bool {
-    if record.intent.goal().is_some() {
-        // Ordinary selected calls belong to one process. A persisted selection
-        // without its receipt can never recreate that future.
-        return record.lifecycle.in_flight.is_none();
-    }
     if record.intent.lifecycle.is_none() && record.intent.program.is_none() {
         return false;
     }
@@ -368,22 +256,13 @@ pub(super) async fn execute(
     use PublicInstruction::*;
     use PublicInstructionOutcome as O;
     use PublicOperationProgram as P;
+    let program = intent.program.as_ref().expect("validated program");
     let record = store
         .public_operation_records()
         .await?
         .into_iter()
         .find(|record| record.intent == intent)
         .ok_or_else(|| HostError::Corrupt("missing public program".into()))?;
-    let actions = if let Some(ordinary) = &record.ordinary {
-        if ordinary.action_format != crate::protocol::public_operations::ORDINARY_ACTION_FORMAT {
-            return Err(HostError::Corrupt(
-                "incompatible frozen ordinary action format".into(),
-            ));
-        }
-        ordinary.actions.clone()
-    } else {
-        operation_instructions(&intent)
-    };
     let start = record.lifecycle.outcomes.len();
     let mut close_failure = record.lifecycle.outcomes.iter().find_map(|outcome| {
         if let O::CloseFailure { child, error } = outcome {
@@ -392,7 +271,7 @@ pub(super) async fn execute(
             None
         }
     });
-    let recovered_terminal = intent.class.is_terminal() && start > 1;
+    let recovered_terminal = matches!(program, P::Close | P::Abort) && start > 1;
     // Recorded terminal effects still need process-local Abort containment;
     // neither a child diagnostic nor an old Abort receipt is a live proof.
     if recovered_terminal
@@ -414,26 +293,11 @@ pub(super) async fn execute(
         }
         callbacks.abort_once();
     }
-    for (index, instruction) in actions.into_iter().enumerate().skip(start) {
-        if intent.goal().is_some()
-            && !intent.class.is_terminal()
-            && *callbacks.aborted.lock().unwrap()
-        {
-            return Err(HostError::CommandRejected(
-                "ordinary creation was withdrawn".into(),
-            ));
-        }
-        let mut selected_program =
-            selected_program(&intent, instruction).expect("validated local program");
-        if instruction == ApplicationOpen
-            && let P::Open { existing, .. } = &mut selected_program
-            && let Some(ordinary) = &record.ordinary
-        {
-            *existing = ordinary.open_existing.ok_or_else(|| {
-                HostError::Corrupt("ordinary Open lacks its frozen local storage mode".into())
-            })?;
-        }
-        let program = &selected_program;
+    for (index, instruction) in operation_instructions(&intent)
+        .into_iter()
+        .enumerate()
+        .skip(start)
+    {
         #[cfg(feature = "testing")]
         if let Some(cut) = &callbacks.cut {
             cut.pause(PublicCutPosition::BeforeInstruction, index).await;
@@ -450,7 +314,6 @@ pub(super) async fn execute(
                 .await;
         }
         let mut rebuild_failure = None;
-        let mut ineligible_return = None;
         let outcome = match instruction {
             ApplicationOpen => {
                 let P::Open { replica, existing } = program else {
@@ -587,9 +450,6 @@ pub(super) async fn execute(
             }
             Configuration | StartingConfiguration | RefreshedConfiguration => {
                 let configuration = configuration(program, instruction);
-                if intent.goal().is_some() {
-                    validate_admission_boundary(store.as_ref(), &record, &callbacks).await?;
-                }
                 super::local_callback(
                     install(
                         store.as_ref(),
@@ -607,11 +467,6 @@ pub(super) async fn execute(
                     None,
                 )
                 .await?;
-                if intent.goal().is_some() {
-                    // A successful engine return after invalidation is uncertain,
-                    // not an admission receipt or idle-ownership retirement.
-                    validate_admission_boundary(store.as_ref(), &record, &callbacks).await?;
-                }
                 O::Done
             }
             FirstCatchUp | SecondCatchUp => {
@@ -668,29 +523,14 @@ pub(super) async fn execute(
                     unreachable!()
                 };
                 let mut replica = ReplicaInformation::idle_build(
-                    if intent.goal().is_some() {
-                        crate::protocol::types::OperationId::default()
-                    } else {
-                        build.attempt.clone()
-                    },
+                    build.attempt.clone(),
                     build.replica.clone(),
                     build.replication_address.clone(),
                 );
                 replica.process_session_id = build.process_session_id.clone();
                 replica.storage_incarnation = Some(build.target_storage.clone());
-                if let Some(goal) = intent.goal() {
-                    validate_remote(store.as_ref(), goal, &callbacks).await?;
-                }
                 match callbacks.primary.build_replica(replica).await {
-                    Ok(()) => {
-                        if let Some(goal) = intent.goal()
-                            && let Err(error) =
-                                validate_remote(store.as_ref(), goal, &callbacks).await
-                        {
-                            ineligible_return = Some(error.to_string());
-                        }
-                        O::Done
-                    }
+                    Ok(()) => O::Done,
                     Err(crate::RuntimeError::ReplicaRebuildRequired(failure))
                         if matches!(
                             failure.as_ref(),
@@ -745,7 +585,7 @@ pub(super) async fn execute(
                 O::Done
             }
             ReplicatorClose | ApplicationClose => {
-                if (recovered_terminal || close_failure.is_some()) && intent.goal().is_none() {
+                if recovered_terminal || close_failure.is_some() {
                     O::Done
                 } else {
                     let (child, result) = if instruction == ReplicatorClose {
@@ -815,11 +655,6 @@ pub(super) async fn execute(
         if let Some(message) = rebuild_failure {
             return Err(HostError::CommandRejected(message.into()));
         }
-        if let Some(message) = ineligible_return {
-            return Err(HostError::CommandRejected(format!(
-                "ordinary callback returned successfully but its scope is no longer eligible: {message}"
-            )));
-        }
     }
     // A durable Cleanup receipt belongs to the previous owner, not this
     // process. Even an otherwise fully recorded program must join its owner.
@@ -837,129 +672,6 @@ pub(super) async fn execute(
     }
     if let Some(failure) = close_failure {
         return Err(HostError::CommandRejected(failure));
-    }
-    Ok(())
-}
-
-async fn validate_admission_boundary(
-    store: &dyn AgentStore,
-    record: &PublicOperationRecord,
-    callbacks: &PublicLifecycleCallbacks,
-) -> Result<()> {
-    use crate::protocol::public_operations::*;
-    let goal = record.intent.goal().expect("ordinary goal");
-    let admissions = &record
-        .ordinary
-        .as_ref()
-        .expect("frozen actions")
-        .ready_admissions;
-    for remote in admissions {
-        let validate_source = |mut state: crate::host::state::AgentState| -> Result<()> {
-            if *callbacks.aborted.lock().unwrap() {
-                return Err(HostError::CommandRejected(
-                    "admission source withdrawn".into(),
-                ));
-            }
-            let preview = state
-                .public_v1_operation_state
-                .as_mut()
-                .ok_or_else(|| HostError::Corrupt("missing ordinary state".into()))?;
-            let current = preview
-                .operations
-                .remove(&goal.operation_id)
-                .ok_or_else(|| HostError::Corrupt("missing admission owner".into()))?;
-            if current.intent != record.intent
-                || current.superseded_by.is_some()
-                || current.ordinary != record.ordinary
-                || super::super::ordinary_goal::publication(
-                    &state,
-                    &goal.scope.process_session_id,
-                    &goal.scope.creation_id,
-                    false,
-                )
-                .as_ref()
-                    != Some(&remote.source)
-                || !super::super::ordinary_goal::remote_observations(&state, Some(&remote.source))
-                    .iter()
-                    .any(|observation| {
-                        observation.selection == *remote
-                            && observation.state == RemoteReplicaState::Ready
-                            && observation.accepted
-                    })
-            {
-                return Err(HostError::CommandRejected(
-                    "admission source or accepted Ready changed".into(),
-                ));
-            }
-            Ok(())
-        };
-        validate_source(store.load_state().await?)?;
-        let query = ReplicaDiscoveryQuery {
-            format: ORDINARY_ACTION_FORMAT,
-            history: remote.target.scope.history.clone(),
-            replica: remote.target.scope.storage.replica.clone(),
-            process_session_id: Some(remote.target.scope.process_session_id.clone()),
-        };
-        let target = crate::control::resolve_replica_publication(
-            &remote.target_control_address,
-            callbacks
-                .peer_credentials
-                .as_ref()
-                .ok_or_else(|| HostError::CommandRejected("missing peer credentials".into()))?,
-            &query,
-        )
-        .await?;
-        if target.as_ref() != Some(&remote.target) {
-            return Err(HostError::CommandRejected(
-                "admission target publication changed".into(),
-            ));
-        }
-        validate_source(store.load_state().await?)?;
-    }
-    Ok(())
-}
-
-async fn validate_remote(
-    store: &dyn AgentStore,
-    goal: &crate::protocol::public_operations::ReplicaGoal,
-    callbacks: &PublicLifecycleCallbacks,
-) -> Result<()> {
-    use crate::protocol::public_operations::*;
-    let remote = goal.remote().expect("remote goal");
-    let state = store.load_state().await?;
-    if *callbacks.aborted.lock().unwrap()
-        || super::super::ordinary_goal::publication(
-            &state,
-            &goal.scope.process_session_id,
-            &goal.scope.creation_id,
-            false,
-        )
-        .as_ref()
-            != Some(&remote.source)
-    {
-        return Err(HostError::CommandRejected(
-            "remote source publication was withdrawn".into(),
-        ));
-    }
-    let credentials = callbacks.peer_credentials.as_ref().ok_or_else(|| {
-        HostError::CommandRejected("authenticated discovery credentials unavailable".into())
-    })?;
-    let query = ReplicaDiscoveryQuery {
-        format: ORDINARY_ACTION_FORMAT,
-        history: remote.target.scope.history.clone(),
-        replica: remote.target.scope.storage.replica.clone(),
-        process_session_id: Some(remote.target.scope.process_session_id.clone()),
-    };
-    let target = crate::control::resolve_replica_publication(
-        &remote.target_control_address,
-        credentials,
-        &query,
-    )
-    .await?;
-    if target.as_ref() != Some(&remote.target) {
-        return Err(HostError::CommandRejected(
-            "remote target publication changed".into(),
-        ));
     }
     Ok(())
 }

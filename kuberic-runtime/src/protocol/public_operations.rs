@@ -10,11 +10,7 @@ use crate::protocol::types::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 15;
-
-#[path = "replica_goal.rs"]
-mod replica_goal;
-pub use replica_goal::*;
+pub const PUBLIC_V1_PROTOCOL_VERSION: u32 = 13;
 pub(crate) const PUBLIC_V1_PROTOCOL_REGISTRATIONS: &[&str] = &["PUBLIC_V1_PROTOCOL_VERSION"];
 pub const INVALID_LSN: i64 = -1;
 
@@ -411,13 +407,6 @@ impl PublicOperationIntent {
         }
         if let Some(program) = &self.program {
             program.validate(&self.class, &self.operation_id)?;
-            if let PublicOperationProgram::AgentGoal(goal) = program
-                && (goal.identity != self.identity
-                    || goal.revision != self.revision
-                    || goal.scope.process_session_id != self.process_session_id)
-            {
-                return Err("canonical semantic goal differs from its operation binding");
-            }
             if self.input_digest != program.digest() {
                 return Err("program digest does not match frozen input");
             }
@@ -756,7 +745,6 @@ impl PublicBuildInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum PublicOperationProgram {
-    AgentGoal(Box<ReplicaGoal>),
     Open {
         replica: ReplicaIdentity,
         existing: bool,
@@ -805,7 +793,6 @@ impl PublicOperationProgram {
 
     pub const fn replay_disposition(&self) -> PublicOperationReplayDisposition {
         match self {
-            Self::AgentGoal(goal) => goal.replay_disposition(),
             Self::Progress { .. } => PublicOperationReplayDisposition::RepeatableRead,
             Self::CatchUp { .. } => PublicOperationReplayDisposition::ReevaluateCatchUp,
             Self::Build(_) => PublicOperationReplayDisposition::RetainBuildSuccessRetireAmbiguity,
@@ -836,7 +823,6 @@ impl PublicOperationProgram {
                     .is_none_or(|previous| matches(previous.epoch))
         };
         let valid = match self {
-            Self::AgentGoal(goal) => &goal.scope.history == expected_history,
             Self::Role { epoch, .. } | Self::Epoch { epoch } => matches(*epoch),
             Self::Configuration(configuration) | Self::CatchUp { configuration, .. } => {
                 configuration_matches(configuration)
@@ -869,13 +855,6 @@ impl PublicOperationProgram {
 
     fn validate(&self, class: &PublicOperationClass, id: &OperationId) -> Result<(), &'static str> {
         let expected = match self {
-            Self::AgentGoal(goal) => {
-                goal.validate()?;
-                if &goal.operation_id != id {
-                    return Err("goal operation identity changed");
-                }
-                goal.class()
-            }
             Self::RetireIdleReplica { replica_id } => {
                 if replica_id.value() <= 0 {
                     return Err("idle replica identity must be positive");
@@ -970,10 +949,6 @@ impl PublicOperationProgram {
 
     fn encode(&self, encoder: &mut CanonicalEncoder) {
         match self {
-            Self::AgentGoal(goal) => {
-                encoder.u8(15);
-                encoder.bytes(&serde_json::to_vec(goal).expect("serializable replica goal"));
-            }
             Self::Open { replica, existing } => {
                 encoder.u8(1);
                 encoder.replica_identity(replica);

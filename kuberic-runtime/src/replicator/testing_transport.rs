@@ -475,10 +475,6 @@ mod tests {
 
         #[async_trait]
         impl ReplicatorRegistration for Fixture {
-            fn record_creation_cleanup_failure(&self, error: String) {
-                panic!("unexpected ordinary cleanup failure in native fixture: {error}");
-            }
-
             fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
                 let mut creation = self.creation.lock().unwrap();
                 if creation.reserved.is_some() || creation.pending.is_some() {

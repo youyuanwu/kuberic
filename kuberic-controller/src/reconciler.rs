@@ -537,9 +537,7 @@ impl Reconciler {
                 Some(RawAgentObservation::Invalid { message }) => {
                     return Err(ControllerError::InvalidAgentEvidence(message.clone()));
                 }
-                Some(
-                    RawAgentObservation::Uninitialized(_) | RawAgentObservation::ReplicaSnapshot(_),
-                ) => {
+                Some(RawAgentObservation::Uninitialized(_)) => {
                     return Err(ControllerError::ObservationStale);
                 }
                 Some(RawAgentObservation::Unavailable { .. } | RawAgentObservation::Absent)
@@ -651,13 +649,6 @@ impl Reconciler {
         };
         let _guard = lock.lock().await;
         let raw = self.api.observe(namespace, name).await?;
-        if raw.set.spec.hosting_format
-            != kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT
-        {
-            return Err(ControllerError::InvalidAgentEvidence(
-                "incompatible hosting format".into(),
-            ));
-        }
         if !raw.failures.is_empty() {
             return Err(ControllerError::TransientObservation(
                 raw.failures
@@ -666,9 +657,6 @@ impl Reconciler {
                     .collect::<Vec<_>>()
                     .join("; "),
             ));
-        }
-        if let Some(action) = self.api.reconcile_replica_goals(&raw).await? {
-            return Ok(action);
         }
         let resource_uid = raw
             .set
@@ -1547,7 +1535,7 @@ pub(crate) fn next_initialization_command(
     Ok(None)
 }
 
-pub(crate) fn observed_or_derived_identity(
+fn observed_or_derived_identity(
     raw: &crate::observation::RawObservation,
     resource_uid: &ResourceUid,
     replica_id: ReplicaId,
@@ -1556,11 +1544,6 @@ pub(crate) fn observed_or_derived_identity(
         .agents
         .values()
         .find_map(|observation| match observation {
-            RawAgentObservation::ReplicaSnapshot(snapshot)
-                if snapshot.storage.replica.replica_id == replica_id =>
-            {
-                Some(snapshot.storage.replica.clone())
-            }
             RawAgentObservation::PublicV1Report(report)
                 if report.replica.replica_id == replica_id =>
             {

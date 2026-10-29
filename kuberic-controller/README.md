@@ -24,23 +24,27 @@ factory/lifecycle ownership, typed faults, package checks and evidence limits.
 
 Each reconcile:
 
-1. validates required format-15 spec/retained state and observes namespaced resources;
-2. obtains callback-free exact agent snapshots;
+1. observes the complete namespaced resource set and agent reports;
+2. validates accepted Public V1 status;
 3. converges missing support/replica resources;
-4. retains semantic replica goals and accepts exact achieved outcomes;
+4. applies history, session-renewal, operation, or evidence work;
 5. requeues for observation.
 
 Fresh bootstrap creates credentials, peer/write Services, PVCs, Pods, and exact
 per-Pod endpoints before consuming reports. A preseeded report cannot skip
 resource convergence.
 
-Independent per-replica Discover/Open preparation permits all endpoints to
-publish before held peer-dependent recovery finishes. Target PrepareIdle precedes
-ordinary source Build; exact two-ended Ready acknowledgement precedes separate
-joint/current voting admission and catch-up. Local agents choose ordered
-callbacks, not the controller. Interrupted matching-format work stays uncertain;
-automatic retained-history election, contraction and primary replacement are
-explicitly unavailable or waiting, not inferred from stale outcomes.
+After bootstrap, the controller persists exact topology sessions separately
+from logical membership. A same-storage process restart performs only a
+contained Open while its replicator identity is temporary, then originates
+session renewal before role, epoch, or configuration authority. Replacement
+planning selects the durably bound incarnation even while predecessor and
+replacement reports overlap.
+
+Main observation probes an unavailable primary until
+`failoverDelaySeconds` expires. After the deadline it omits only that declared
+primary, configures surviving secondaries before the promoted primary, catches
+up all survivors, and publishes the new topology before routing writes.
 
 ## Configuration
 
@@ -58,30 +62,35 @@ CRD status is structurally typed and contains:
 
 - Public V1 authority;
 - topology;
-- typed canonical per-replica goals, digests and exact outcomes.
+- session renewal;
+- replacement;
+- transition;
+- operation.
 
 Status-only reads avoid agent RPCs. Operation dispatch/report paths observe
 only the exact target; ordinary reconciliation retains the broader observation
 needed for topology and failover decisions.
 
-Host/control/CRD format 15 is required, including `spec.hostingFormat: 15`.
-Old/missing/mixed formats and retained command/renewal/replacement state reject
-before mutation; there is no converter or data reset. Fresh-only deployment
-policy does not remove matching-format restart/SQLite rollback recovery.
+Protocol version 13 is the only production command/report path. Old and
+partial controller state rejects before planning or mutation.
+See the [current format authority](../docs/features/kuberic/classic-v1-runtime.md#production-policies-and-security).
 
-The [M1 controller/agent/host split](../docs/features/kuberic/ordinary-hosting-m1.md)
-is implemented without target engine grant dispatch or mandatory companion/
-diagnostics. Built-in/KV/SQLite/PostgreSQL production integration is explicitly
-unavailable pending M2; comprehensive recovery qualification remains M3.
+The [proposed controller/agent/host responsibility split](../docs/features/kuberic/engine-neutral-hosting.md#controller-to-host-messages-and-action-selection)
+and [future runtime roadmap](../docs/features/kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **NOT IMPLEMENTED**. Current dispatch still installs exact target Build
+authority before source Build; the redesign replaces, rather than renames,
+that extension boundary.
 
 ## Deployment
 
 Assets are under `deploy/`. They are development/CI assets, not published
 release targets.
 
-The retained default-engine cluster recipes are not supported M1 deployment
-instructions. M1 acceptance uses an independent ordinary factory and real agent
-transport against an in-process Kubernetes storage model, not live KinD.
+```bash
+just level-triggered-images
+just level-triggered-install
+just level-triggered-kind-test bootstrap replacement failover
+```
 
 There is no migration, compatibility mode, Kubernetes cutover Lease, image
 publication, or production-activation procedure.

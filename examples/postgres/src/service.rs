@@ -144,11 +144,6 @@ pub(crate) fn is_empty(path: &Path) -> std::io::Result<bool> {
 #[async_trait]
 impl StatefulServiceReplica for PgService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
-        if context.partition.ordinary_hosting() {
-            return Err(application_error(
-                "PostgreSQL ordinary hosted integration is unavailable until M2",
-            ));
-        }
         if context
             .partition
             .get_partition_information()

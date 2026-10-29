@@ -201,8 +201,7 @@ impl ApplicationFactory for EmptyFactory {
             } else {
                 kuberic_runtime::host::ApplicationStorageState::Established
             },
-        )
-        .with_storage_paths([context.application_root().to_owned()]))
+        ))
     }
     async fn shutdown_and_drain(&self, service: Arc<EmptyApplication>) -> super::Result<()> {
         service.drain().await
@@ -261,9 +260,6 @@ async fn readiness_rejects_detached_stale_sessions_configuration_and_writers() -
     )
     .await?;
     let result: Result<()> = async {
-        if harness.ordinary_integration_unavailable().await? {
-            return Ok(());
-        }
         let mut barrier = harness.api.arm_operation_barrier("sample")?;
         let pending = loop {
             tokio::select! {pending=barrier.entered()=>break pending?,step=harness.step()=>step?,}
@@ -553,9 +549,6 @@ async fn public_singleton_scale_uses_real_build_and_preserves_default_controls()
         .start()
         .await?;
     let result: super::Result<()> = async {
-        if cluster.ordinary_integration_unavailable().await? {
-            return Ok(());
-        }
         let singleton = cluster.settle_members(1).await?;
         assert_eq!(singleton.members().count(), 1);
         let before = cluster.observe().await?;
@@ -599,14 +592,6 @@ async fn exact_cross_cluster_stopped_and_observation_references_are_checked() ->
     let mut first = TestCluster::builder(EmptyFactory).start().await?;
     let mut second = TestCluster::builder(EmptyFactory).start().await?;
     let result: Result<()> = async {
-        let (a, b) = tokio::try_join!(
-            first.ordinary_integration_unavailable(),
-            second.ordinary_integration_unavailable()
-        )?;
-        if a || b {
-            ensure!(a && b, "identical factories disagreed on M1 engine support");
-            return Ok(());
-        }
         let (a, b) = tokio::try_join!(first.settle(), second.settle())?;
         assert_eq!(
             first.service(b.primary()).await.err().unwrap().kind(),
@@ -674,9 +659,7 @@ impl ApplicationFactory for FailingDrainFactory {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn finalization_preserves_scenario_and_every_application_drain_error() -> Result<()> {
     let mut cluster = TestCluster::builder(FailingDrainFactory).start().await?;
-    if !cluster.ordinary_integration_unavailable().await? {
-        cluster.settle().await?;
-    }
+    cluster.settle().await?;
     let error = cluster
         .finish(Err(anyhow::anyhow!("scenario-source")))
         .await
@@ -801,21 +784,11 @@ async fn timed_out_drain_keeps_application_and_route_owners_until_they_join() ->
     .teardown_timeout(std::time::Duration::from_millis(500))
     .start()
     .await?;
-    let uids = if cluster.ordinary_integration_unavailable().await? {
-        cluster
-            .observe()
-            .await?
-            .replicas()
-            .map(|reference| reference.instance_id().to_owned())
-            .collect::<Vec<_>>()
-    } else {
-        cluster
-            .settle()
-            .await?
-            .members()
-            .map(|reference| reference.instance_id().to_owned())
-            .collect::<Vec<_>>()
-    };
+    let topology = cluster.settle().await?;
+    let uids = topology
+        .members()
+        .map(|reference| reference.instance_id().to_owned())
+        .collect::<Vec<_>>();
     let error = cluster
         .finish(Ok::<_, anyhow::Error>(()))
         .await
@@ -1013,9 +986,7 @@ impl ApplicationFactory for PanickingDrainFactory {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_application_drain_panic_remains_a_cleanup_source() -> Result<()> {
     let mut cluster = TestCluster::builder(PanickingDrainFactory).start().await?;
-    if !cluster.ordinary_integration_unavailable().await? {
-        cluster.settle().await?;
-    }
+    cluster.settle().await?;
     let error = cluster
         .finish(Ok::<_, anyhow::Error>(()))
         .await
@@ -1053,21 +1024,11 @@ async fn early_drop_requests_owned_async_drain_without_claiming_completion() -> 
     let mut cluster = TestCluster::builder(CountingDrainFactory(completed.clone()))
         .start()
         .await?;
-    let uids = if cluster.ordinary_integration_unavailable().await? {
-        cluster
-            .observe()
-            .await?
-            .replicas()
-            .map(|reference| reference.instance_id().to_owned())
-            .collect::<Vec<_>>()
-    } else {
-        cluster
-            .settle()
-            .await?
-            .members()
-            .map(|reference| reference.instance_id().to_owned())
-            .collect::<Vec<_>>()
-    };
+    let topology = cluster.settle().await?;
+    let uids = topology
+        .members()
+        .map(|reference| reference.instance_id().to_owned())
+        .collect::<Vec<_>>();
     drop(cluster);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while completed.load(std::sync::atomic::Ordering::Acquire) != 3 {

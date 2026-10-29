@@ -18,9 +18,6 @@ async fn actual_v1_nonempty_copy_separates_remote_ready_idle_and_voting() -> Res
     use std::time::Duration;
 
     let mut harness = Harness::with_members(1).await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let mut held = None;
     let result = async {
         let source_id = harness.ready_members(1).await?;
@@ -305,9 +302,6 @@ async fn actual_v1_controller_terminal_lost_native_join_never_certifies_containm
 async fn actual_v1_controller_terminal(fault: u8) -> Result<()> {
     use kuberic_runtime::protocol::types::AccessStatus;
     let mut harness = Harness::with_members(1).await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         let primary_id = harness.ready_members(1).await?;
         let primary = harness.reference(primary_id).await?;
@@ -370,9 +364,6 @@ async fn actual_v1_controller_terminal(fault: u8) -> Result<()> {
 async fn actual_v1_controller_undeclared_role_failure_is_not_retried() -> Result<()> {
     use kuberic_runtime::protocol::types::{AccessStatus, ReplicaRole};
     let mut harness = Harness::with_members(1).await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.ready_members(1).await?;
         harness.cluster.scale_to(2).await?;
@@ -499,9 +490,6 @@ async fn delete_secondary(harness: &mut Harness) -> Result<Vec<(Kind, String, St
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supporting_resources_are_repaired_without_losing_quorum() -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("repair-before", "acknowledged").await?;
         harness
@@ -619,9 +607,6 @@ async fn supporting_resources_are_repaired_without_losing_quorum() -> Result<()>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacement_then_restart_publishes_exact_retained_storage_session() -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("combined-before", "acknowledged").await?;
         harness
@@ -777,9 +762,6 @@ async fn assert_exact_completion(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_quorum_write_recovers_status_conflict() -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         let mut conflict = harness.cluster.completion_status_conflict()?;
         let (lsn, persisted) =
@@ -819,9 +801,6 @@ async fn bootstrap_quorum_write_recovers_status_conflict() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contained_restart_renews_session_and_dynamic_endpoints() -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("restart", "before").await?;
         harness.assert_values("restart", "before").await?;
@@ -874,9 +853,6 @@ async fn contained_restart_renews_session_and_dynamic_endpoints() -> Result<()> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secondary_replacement_waits_for_exact_resource_absence() -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("replacement", "before").await?;
         harness.assert_values("replacement", "before").await?;
@@ -977,12 +953,6 @@ async fn recovery_before_lifecycle(lifecycle: RecoveryLifecycle) -> Result<()> {
         .start()
         .await?;
     let mut writes = tokio::task::JoinSet::new();
-    if cluster.ordinary_integration_unavailable().await? {
-        return cluster
-            .finish(Ok::<_, anyhow::Error>(()))
-            .await
-            .map_err(Into::into);
-    }
     let mut phase = "initial topology";
     let result: Result<()> = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         let topology = cluster.settle().await?;
@@ -1171,9 +1141,6 @@ async fn unaccepted_switchover_does_not_block_unavailable_primary_failover() -> 
 
 async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("failover", "before").await?;
         harness.assert_values("failover", "before").await?;
@@ -1243,9 +1210,6 @@ async fn stopped_primary_failover(request_transfer: bool) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn controller_recreation_resumes_committed_operation() -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         let pause = harness
             .cluster
@@ -1313,9 +1277,6 @@ async fn renewed_primary_rejoins_with_service_owned_committed_prefix() -> Result
 
 async fn live_primary_isolation(attempt_isolated_writes: bool) -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let mut writes = tokio::task::JoinSet::new();
     let result = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         harness.write("live-before", "acknowledged").await?;
@@ -1429,9 +1390,6 @@ async fn live_primary_isolation(attempt_isolated_writes: bool) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quorum_loss_rejects_acknowledgements_and_recovers_ambiguous_suffix() -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("quorum-before", "acknowledged").await?;
         harness
@@ -1511,9 +1469,6 @@ async fn sf01_primary_local_commit_isolation_and_abort_never_late_grants_success
     use std::time::Duration;
 
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = tokio::time::timeout(Duration::from_secs(90), async {
         eprintln!("SF-01: bootstrap and acknowledged prefix");
         harness.write("sf01-before", "committed").await?;
@@ -1637,9 +1592,6 @@ async fn switchover_retarget_after_peer_preparation_serializes_frozen_requests()
 
 async fn changed_switchover(retarget: bool) -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result =
         async {
             harness.write("frozen-before", "acknowledged").await?;
@@ -1783,9 +1735,6 @@ async fn changed_switchover(retarget: bool) -> Result<()> {
 
 async fn switchover(cut: Option<bool>) -> Result<()> {
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("switch-before", "acknowledged").await?;
         harness
@@ -1944,9 +1893,6 @@ async fn fresh_build_source_isolation_cuts_the_real_dial() -> Result<()> {
 async fn build_transport_cut(source: bool) -> Result<()> {
     use kuberic_runtime::engine::DurableState;
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         harness.write("build-cut-before", "acknowledged").await?;
         delete_secondary(&mut harness).await?;
@@ -2022,9 +1968,6 @@ async fn build_transport_cut(source: bool) -> Result<()> {
 async fn teardown_with_isolation_and_entered_barriers_drains_owned_tasks() -> Result<()> {
     for completion in [false, true] {
         let mut harness = Harness::new().await?;
-        if harness.cluster.ordinary_integration_unavailable().await? {
-            return harness.finish(Ok(())).await;
-        }
         let mut uids = Vec::new();
         let mut addresses = Vec::new();
         let result = async {
@@ -2113,9 +2056,6 @@ async fn failover_recreation_after_durable_promotion_consumes_completion_once() 
 async fn recreate_during_change(failover: bool, completion: bool) -> Result<()> {
     use kuberic_runtime::engine::DurableState;
     let mut harness = Harness::new().await?;
-    if harness.cluster.ordinary_integration_unavailable().await? {
-        return harness.finish(Ok(())).await;
-    }
     let result = async {
         let baseline_lsn = harness.write("recreation-before", "acknowledged").await?;
         harness
