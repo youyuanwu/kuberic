@@ -16,37 +16,22 @@ if [[ $# -gt 1 ]]; then
 fi
 
 target_dir="${CARGO_TARGET_DIR:-target}"
-mkdir -p "$target_dir"
-scratch="$target_dir/runtime-api-check-$$-$RANDOM"
-mkdir "$scratch"
-doc_target="$scratch/rustdoc"
 if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
-    doc_root="$doc_target/$CARGO_BUILD_TARGET/doc/kuberic_runtime"
+    doc_root="$target_dir/$CARGO_BUILD_TARGET/doc/kuberic_runtime"
 else
-    doc_root="$doc_target/doc/kuberic_runtime"
+    doc_root="$target_dir/doc/kuberic_runtime"
 fi
 allowlist="scripts/runtime_public_api.allowlist"
-fixture="$scratch/fixture"
+fixture="scripts/fixtures/runtime-api-leak"
+scratch="target/runtime-api-check-$$"
+mkdir -p target
+mkdir "$scratch"
 inventory="$scratch/inventory"
 fixture_output="$scratch/fixture-output"
-cleanup() {
-    rm -rf -- "$scratch"
-}
-trap cleanup EXIT
-python3 -c '
-from pathlib import Path
-import shutil
-import sys
-source = Path("scripts/fixtures/runtime-api-leak")
-destination = Path(sys.argv[1])
-destination.mkdir()
-shutil.copytree(source / "src", destination / "src")
-manifest = (source / "Cargo.toml").read_text()
-manifest = manifest.replace("../../../kuberic-runtime", (Path.cwd() / "kuberic-runtime").as_posix())
-(destination / "Cargo.toml").write_text(manifest)
-' "$fixture"
+trap 'rm -f -- "$fixture/Cargo.lock"; rm -rf -- "$scratch" "$fixture/target"' EXIT
 
-cargo doc --offline --locked -p kuberic-runtime --no-deps --quiet --target-dir "$doc_target"
+rm -rf -- "$doc_root"
+cargo doc -p kuberic-runtime --no-deps --quiet
 
 find "$doc_root" -type f -name '*.html' -printf 'page:%P\n' |
     sort -u > "$inventory"
@@ -56,8 +41,7 @@ if ! diff -u "$allowlist" "$inventory"; then
     exit 1
 fi
 
-if cargo check --offline --manifest-path "$fixture/Cargo.toml" --quiet \
-    --target-dir "$scratch/private" >"$fixture_output" 2>&1; then
+if cargo check --manifest-path "$fixture/Cargo.toml" --quiet >"$fixture_output" 2>&1; then
     echo "The external application fixture unexpectedly reached agent-owned runtime APIs." >&2
     exit 1
 fi
@@ -67,7 +51,7 @@ for expected in \
     'struct `ReplicatorCreationReservation` is private' \
     'trait `ReplicatorRegistration` is private' \
     'trait `PartitionAccessView` is private' \
-    'struct `ReplicatorCreation` is private' \
+    'trait `NativeRuntimeControl` is private' \
     'module `capabilities` is private' \
     'module `hosting` is private' \
     'module `native_transport` is private' \

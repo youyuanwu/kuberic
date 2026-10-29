@@ -7,10 +7,11 @@ use crate::protocol::public_operations::{
     CanonicalOperationInputDigest, CanonicalOperationInputDigestV1,
     CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity, DataLossAttempt,
     DataLossReplay, ProcessAttemptContext, ProviderProgressReset, ProviderReplicaIdentity,
-    PublicCatchUpMode, PublicDataLossRecoveryStage, PublicDataLossRecoveryStatus,
-    PublicOperationReplayDisposition, PublicProgress, PublicProgressRole, PublicV1AgentReport,
-    PublicV1CallKind, PublicV1ExtensionSlot, PublicV1Extensions, PublicV1Identity,
-    PublicV1OperationCompletion, PublicV1OperationResult, ReplicaRebuildReason, ServiceLocation,
+    PublicBuildAttemptReference, PublicCatchUpMode, PublicDataLossRecoveryStage,
+    PublicDataLossRecoveryStatus, PublicOperationReplayDisposition, PublicProgress,
+    PublicProgressRole, PublicV1AgentReport, PublicV1CallKind, PublicV1ExtensionSlot,
+    PublicV1Extensions, PublicV1Identity, PublicV1OperationCompletion, PublicV1OperationResult,
+    ReplicaRebuildReason, ServiceLocation,
 };
 use crate::protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
@@ -1003,6 +1004,61 @@ fn captured_operation_to_proto(
     }
 }
 
+fn build_attempt_from_proto(
+    value: proto::PublicV1BuildAttemptReference,
+) -> Result<PublicBuildAttemptReference, WireError> {
+    let authorization = PublicBuildAttemptReference {
+        resource_uid: ResourceUid::new(value.resource_uid),
+        epoch: value
+            .epoch
+            .ok_or(WireError::MissingField(
+                "public_v1.rebuild.authorization.epoch",
+            ))?
+            .into(),
+        build_id: OperationId::new(value.build_id),
+        source: value
+            .source
+            .ok_or(WireError::MissingField(
+                "public_v1.rebuild.authorization.source",
+            ))?
+            .try_into()?,
+        source_storage: public_v1_storage_from_proto(value.source_storage.ok_or(
+            WireError::MissingField("public_v1.rebuild.authorization.source_storage"),
+        )?)?,
+        source_session: ProcessSessionId::new(value.source_session),
+        target: value
+            .target
+            .ok_or(WireError::MissingField(
+                "public_v1.rebuild.authorization.target",
+            ))?
+            .try_into()?,
+        target_storage: public_v1_storage_from_proto(value.target_storage.ok_or(
+            WireError::MissingField("public_v1.rebuild.authorization.target_storage"),
+        )?)?,
+        target_session: ProcessSessionId::new(value.target_session),
+    };
+    authorization
+        .validate()
+        .map_err(|message| WireError::InvalidAuthority(message.into()))?;
+    Ok(authorization)
+}
+
+fn build_attempt_to_proto(
+    value: &PublicBuildAttemptReference,
+) -> proto::PublicV1BuildAttemptReference {
+    proto::PublicV1BuildAttemptReference {
+        resource_uid: value.resource_uid.as_str().to_string(),
+        epoch: Some(value.epoch.into()),
+        build_id: value.build_id.as_str().to_string(),
+        source: Some(value.source.clone().into()),
+        source_storage: Some(public_v1_storage_to_proto(&value.source_storage)),
+        source_session: value.source_session.as_str().to_string(),
+        target: Some(value.target.clone().into()),
+        target_storage: Some(public_v1_storage_to_proto(&value.target_storage)),
+        target_session: value.target_session.as_str().to_string(),
+    }
+}
+
 fn rebuild_from_proto(
     value: proto::PublicV1ReplicaRebuildRequired,
 ) -> Result<CanonicalReplicaRebuildRequired, WireError> {
@@ -1019,7 +1075,7 @@ fn rebuild_from_proto(
     )?;
     let rebuild = match kind {
         proto::PublicV1RebuildKind::LocalProvider => {
-            if value.goal_json.is_some() {
+            if value.build.is_some() {
                 return Err(WireError::InvalidAuthority(
                     "local rebuild failure contains remote authorization".into(),
                 ));
@@ -1054,14 +1110,11 @@ fn rebuild_from_proto(
             CanonicalReplicaRebuildRequired::RemoteBuildTarget {
                 reason,
                 operation,
-                goal: Box::new(
-                    serde_json::from_str(
-                        &value
-                            .goal_json
-                            .ok_or(WireError::MissingField("public_v1.rebuild.goal_json"))?,
-                    )
-                    .map_err(|error| WireError::InvalidAuthority(error.to_string()))?,
-                ),
+                build: Box::new(build_attempt_from_proto(
+                    value
+                        .build
+                        .ok_or(WireError::MissingField("public_v1.rebuild.build"))?,
+                )?),
             }
         }
         proto::PublicV1RebuildKind::Unknown => {
@@ -1094,12 +1147,12 @@ fn rebuild_to_proto(
             provider_replica: Some(provider.replica.clone().into()),
             local_replica: Some(local_replica.clone().into()),
             local_storage: local_storage.as_str().to_string(),
-            goal_json: None,
+            build: None,
         },
         CanonicalReplicaRebuildRequired::RemoteBuildTarget {
             reason,
             operation,
-            goal,
+            build,
         } => proto::PublicV1ReplicaRebuildRequired {
             kind: proto::PublicV1RebuildKind::RemoteBuildTarget as i32,
             reason: rebuild_reason_to_proto(*reason) as i32,
@@ -1107,7 +1160,7 @@ fn rebuild_to_proto(
             provider_replica: None,
             local_replica: None,
             local_storage: String::new(),
-            goal_json: Some(serde_json::to_string(goal).expect("serializable ordinary Build goal")),
+            build: Some(build_attempt_to_proto(build)),
         },
     }
 }

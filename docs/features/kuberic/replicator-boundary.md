@@ -4,12 +4,10 @@
 ordinary factory bundle with read-only generic peer discovery, no mandatory
 companion/diagnostics, retained ordinary Close after Abort and exact host
 goals/receipts. Protected replication/provider method sets are unchanged.
-Built-in/KV/SQLite and independent PostgreSQL use engine-owned sessions through
-this route. Shared companion/grant APIs and descriptor Build IDs are removed.
-Current host/control/CRD inputs require format 16; comprehensive M3 controller
-recovery policy is not supplied by that integration.
-Bounded M2 implementation acceptance passed; documentation implementation
-review and actual final independent Sol/Astra gates remain pending.
+Built-in/KV/SQLite/PostgreSQL production integration explicitly rejects pending
+M2. The legacy companion/grant APIs described below remain for engine/component
+consumers awaiting M2, not a production fallback. They must not be removed from
+those consumers by simply deleting their fences.
 
 Kuberic hosts built-in and application-owned Replicators through the same
 Service Fabric-shaped public interfaces.
@@ -26,6 +24,7 @@ core differences, unverified qualification and deferred capability work.
 - `Replicator` / `PrimaryReplicator`;
 - optional `StateReplicator`;
 - optional `StateProvider`;
+- optional local `CustomReplicatorControl` companion for independent native engines;
 - application-owned persistence; `DurableState` is not a factory prerequisite.
 
 The protected method sets are unchanged. Applications receive no agent store,
@@ -129,18 +128,10 @@ They do not receive a compatibility adapter for the removed built-in engine.
 
 ### Custom controller integration
 
-New engines use the coherent ordinary bundle, read-only authenticated discovery,
-engine-owned receiver/session fencing, and actual ordinary Close-after-Abort
-joining. Host goals and negative outcomes retain exact source/target selections;
-they are not native transfer credentials. PostgreSQL keeps its independent
-durable native BuildAuthority, WAL/slots and metadata responsibilities.
-
-#### Historical companion contract (removed)
-
-The remainder of this subsection records the pinned pre-M1 contract. Its named
-types and methods are removed, not current integration instructions or a
-compatibility route. The immutable source anchors preserve the provenance of
-the safety properties now owned by ordinary host and concrete engine lifetimes.
+**Historical engine/component contract, not the M1 production route.** Use
+[ordinary M1](ordinary-hosting-m1.md) for new generic integration. The target
+M2 consumer replacement must qualify native sessions/effects/joins before
+deleting these remaining APIs and fixtures; PG metadata removal stays separate.
 
 An independent factory attaches its own `CustomReplicatorControl` through
 `ReplicatorInterfaces::with_custom_control(&context, owner)` while holding its
@@ -150,12 +141,11 @@ bundle cannot discard pending cleanup ownership. `NativeRuntimeControl`, its
 TCP/queue diagnostics and host/store setters remain private. Wrapping a built-in
 bundle is not an independent native-engine implementation.
 
-The companion was a **pre-M1 Kuberic extension-boundary divergence**, not a new
+The companion is a **current Kuberic extension-boundary divergence**, not a new
 method on SF's Replicator, PrimaryReplicator or StateProvider. Calling it a local
 adaptation does not establish that its mandatory controller integration is
-necessary. M1/M2 removed it with replacement host/engine safety owners.
-The following table records the old callbacks, not available public methods;
-their stale-effect and lifetime properties remain required at the new owners:
+necessary. The proposed target removes it with replacement host/engine safety
+owners; the responsibilities below remain required **today**:
 
 | Contract | Required meaning |
 |---|---|
@@ -214,14 +204,13 @@ PrimaryReplicator callback, native peer completion, or serving access.
 
 PostgreSQL supplied a pinned pre-M1 independent
 [native controller witness](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/public_controller_tests.rs).
-Historical M1 wrappers checked only M2 unavailability. Current ordinary fixtures
-execute native copy, application data and joining; their bounded evidence does
-not qualify comprehensive M3 recovery.
+Current hosted wrappers check only M2 unavailability.
+The external runtime contract fixture is contract/negative evidence only.
 Unpublished downstream MySQL fixtures and the externally reported
 seven-completion trace are not reproduced by either fixture; downstream engines
 must requalify their own native transfer, lineage, replay, admission and fencing.
 
-Both pinned pre-M1 consumers used the [same coordinator](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/coordinator.rs#L1).
+Both retained engine/component consumers use the [same coordinator](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/kuberic-runtime/src/replicator/coordinator.rs#L1).
 Adapters provide actual ingress/drain effects and optional diagnostics, not
 engine-selected authority policy. Pre-M1 production returned-failure retry
 proof was Never; unsafe or undeclared callback failures required containment.

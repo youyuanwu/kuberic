@@ -1,20 +1,12 @@
 # SQLite: Replicated SQLite on Kuberic Public V1
 
-**Bounded M2 application integration qualified:** [ordinary hosting](../kuberic/ordinary-hosting-m1.md)
-uses matched format 16 at this development checkpoint. SQLite production Open
-now uses the ordinary built-in engine. Copy installation/finalization precedes
-its apply ACK, and ordinary application Close joins the committer, SQL worker,
-fault reporter and copy/replication consumers. Expected intentional cancellation
-is observed only after the actual worker join; real join/publication failures
-remain errors. Bounded application tests are separate from enabled historical
-restart/replacement/handoff bodies and do not certify M3.
-The full application selector remains red at changed-primary same-live-creation
-handoff (`incompatible scope requires whole-creation withdrawal`) after actual
-copy/data/matching-format reopen; its later suffix is not credited.
-Documentation implementation review and actual final independent gates remain
-pending; see [executed evidence](../kuberic/testing.md#m2-accepted-evidence-and-remaining-boundaries).
+**M1 checkpoint:** [ordinary hosting](../kuberic/ordinary-hosting-m1.md) uses
+matched format 15. SQLite production Open explicitly rejects before initialization/
+committer effects until M2 built-in session integration. The component storage/
+publication behavior below remains; old production journey names now check
+unavailability rather than executing their later copy/restart clauses.
 
-## Selected classic V1 application path
+## Selected classic V1 companion
 
 The application now selects `src/v1.rs` for retained SQL/WAL publication and uses
 the no-store default factory. The [classic V1 runtime](../kuberic/classic-v1-runtime.md)

@@ -338,7 +338,6 @@ impl PrimaryEstablishmentHandle {
 }
 
 pub(super) struct PrimaryEstablishment {
-    pub(super) fence: Option<super::service_adapter::engine_session::Fence>,
     root: Arc<PrimaryRoot>,
     context: Option<OperationDataStream>,
     acquisition: Option<Acquire>,
@@ -370,7 +369,6 @@ impl PrimaryEstablishment {
             };
         let copy = CopySender::new(true);
         Ok(Self {
-            fence: None,
             root: Arc::new(PrimaryRoot {
                 state: Mutex::new(PrimaryState {
                     start: None,
@@ -473,13 +471,6 @@ impl PrimaryEstablishment {
             }
         };
         if self.acquisition.is_none() {
-            if self
-                .fence
-                .as_ref()
-                .is_some_and(|fence| fence.check().is_err())
-            {
-                return Err(EstablishError::Cancelled);
-            }
             let provider = self.provider.clone();
             let context = self.context.take().expect("single provider acquisition");
             self.acquisition = Some(Box::pin(async move {
@@ -489,24 +480,12 @@ impl PrimaryEstablishment {
         let result = self.acquisition.as_mut().unwrap().await;
         self.acquisition = None;
         let result = match result {
-            Err(crate::RuntimeError::OperationCancelled)
-                if self
-                    .fence
-                    .as_ref()
-                    .is_some_and(|fence| fence.check().is_err()) =>
-            {
-                Err(EstablishError::Cancelled)
-            }
             Err(error) => Err(EstablishError::Provider {
                 description: "GetCopyState",
                 error: Arc::new(error),
             }),
             Ok(provider) => {
-                let closed = self.root.state.lock().unwrap().closed
-                    || self
-                        .fence
-                        .as_ref()
-                        .is_some_and(|fence| fence.check().is_err());
+                let closed = self.root.state.lock().unwrap().closed;
                 if closed {
                     Err(EstablishError::Cancelled)
                 } else {
@@ -515,10 +494,6 @@ impl PrimaryEstablishment {
                         let _root = &root;
                         send(action)
                     });
-                    let provider = match &self.fence {
-                        Some(fence) => fence.stream(provider),
-                        None => provider,
-                    };
                     self.copy
                         .begin(
                             self.root.config,
@@ -784,11 +759,6 @@ impl SecondaryEstablishment {
         let result = self.acquisition.as_mut().unwrap().await;
         self.acquisition = None;
         let result = match result {
-            Err(crate::RuntimeError::OperationCancelled)
-                if !self.root.state.lock().unwrap().active =>
-            {
-                Err(EstablishError::Cancelled)
-            }
             Err(error) => {
                 let error = EstablishError::Provider {
                     description: "GetCopyContext",

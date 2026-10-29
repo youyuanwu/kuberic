@@ -1,8 +1,6 @@
 use super::*;
 #[path = "public_controller_tests.rs"]
 mod controller;
-#[path = "m2_pg_tests.rs"]
-mod m2;
 #[path = "public_v1_p6_tests.rs"]
 pub(crate) mod p6;
 use crate::durable::{PgDurableIdentity, StorageMode};
@@ -57,10 +55,10 @@ fn public_v1_process_fence_rejects_same_epoch_session_and_address_substitution()
         })
         .unwrap();
     let binding = TransportBinding::Build(BuildBinding {
-        session: None,
+        authority: None,
         resource_uid: ResourceUid::new("authority-test"),
         epoch,
-        fixture_session: OperationId::new("build"),
+        build_id: OperationId::new("build"),
         source: test_endpoint(
             source,
             "source-session",
@@ -125,7 +123,6 @@ fn public_v1_secondary_admits_joint_then_current_only_authority() {
         })
         .unwrap();
     let joint = PeerBinding {
-        session: None,
         epoch,
         previous_configuration_id: Some(ConfigurationId::new("cfg-8")),
         current_configuration_id: ConfigurationId::new("cfg-9"),
@@ -173,10 +170,10 @@ impl BindingFactory {
     fn build(&self, source: &Replica, target: &Replica, id: &str) -> BuildBinding {
         let context = source.driver.public_owner().fence.context().unwrap();
         BuildBinding {
-            session: None,
+            authority: None,
             resource_uid: ResourceUid::new("postgres-public-oracle"),
             epoch: context.epoch,
-            fixture_session: OperationId::new(id),
+            build_id: OperationId::new(id),
             source: NativeEndpoint {
                 replica: source.identity.clone(),
                 process_session_id: source.session.clone(),
@@ -200,7 +197,6 @@ impl BindingFactory {
         previous: Option<&ConfigurationDescriptor>,
     ) -> PeerBinding {
         PeerBinding {
-            session: None,
             epoch: current.epoch,
             current_configuration_id: current.configuration_id.clone(),
             previous_configuration_id: previous
@@ -226,6 +222,7 @@ struct Replica {
     identity: ReplicaIdentity,
     address: String,
     session: ProcessSessionId,
+    server: tokio::task::JoinHandle<()>,
     root: std::path::PathBuf,
 }
 
@@ -250,7 +247,7 @@ impl OracleDataDir {
                 }
             });
         let path = base.join(format!("kpv1-{}-{sequence}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
+        let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir(&path).unwrap();
         Self { path }
     }
@@ -287,10 +284,8 @@ impl Replica {
     ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
         let identity = native_identity(id, incarnation);
         let resource = ResourceUid::new("postgres-public-oracle");
-        let established = root.join("a/state-v2.json").exists();
         let durable = Arc::new(
             PgDurableStore::open(
                 root.join("a"),
@@ -298,11 +293,7 @@ impl Replica {
                     resource_uid: resource,
                     replica: identity.clone(),
                 },
-                if established {
-                    StorageMode::Established
-                } else {
-                    StorageMode::Fresh
-                },
+                StorageMode::Fresh,
             )
             .await
             .unwrap(),
@@ -322,10 +313,9 @@ impl Replica {
                 CancellationToken::new(),
                 crate::data_service::PgCoordination {
                     local_endpoint: address.clone(),
-                    bearer_token: "pg-native-fixture-coordination".into(),
-                    listen_address: None,
+                    bearer_token: String::new(),
                 },
-                !established,
+                true,
             )
             .await,
         );
@@ -340,18 +330,24 @@ impl Replica {
                 ))
                 .is_ok()
         );
-        driver
-            .public_owner()
-            .driver
-            .set(Arc::downgrade(&driver))
-            .unwrap();
         driver.start_public_owner();
         Replicator::open(driver.as_ref()).await.unwrap();
+        let service = TestService(driver.clone());
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(
+                    crate::proto::pg_data_service_server::PgDataServiceServer::new(service),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
         Self {
             driver,
             identity,
             address,
             session,
+            server,
             root,
         }
     }
@@ -377,7 +373,6 @@ impl Replica {
 
     async fn singleton(&self, epoch: i64) {
         self.change_role(epoch, ReplicaRole::Primary).await;
-        self.epoch(epoch).await;
         self.driver
             .public_application_role(ReplicaRole::Primary)
             .await
@@ -404,6 +399,7 @@ impl Replica {
 impl Drop for Replica {
     fn drop(&mut self) {
         self.driver.abort();
+        self.server.abort();
     }
 }
 
@@ -417,13 +413,56 @@ async fn production_factory_returns_no_parallel_state_replicator() {
     assert!(interfaces.primary_replicator().is_some());
     let control: Arc<dyn Replicator> = replica.driver.clone();
     assert!(Arc::ptr_eq(&interfaces.replicator(), &control));
-    Replicator::close(replica.driver.as_ref()).await.unwrap();
+}
+
+struct TestService(Arc<PgReplicator>);
+
+#[tonic::async_trait]
+impl crate::proto::pg_data_service_server::PgDataService for TestService {
+    async fn public_v1(
+        &self,
+        request: tonic::Request<crate::proto::RecoveryRequest>,
+    ) -> std::result::Result<tonic::Response<crate::proto::RecoveryResponse>, tonic::Status> {
+        let request =
+            decode(&request.into_inner().envelope_json).map_err(tonic::Status::invalid_argument)?;
+        let response = self
+            .0
+            .public_request(request)
+            .await
+            .map_err(|e| tonic::Status::failed_precondition(e.to_string()))?;
+        Ok(tonic::Response::new(crate::proto::RecoveryResponse {
+            envelope_json: encode(&response).unwrap(),
+        }))
+    }
+    async fn build(
+        &self,
+        _: tonic::Request<crate::proto::NativeBuildRequest>,
+    ) -> std::result::Result<tonic::Response<crate::proto::NativeBuildResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("legacy"))
+    }
+    async fn inspect_source(
+        &self,
+        _: tonic::Request<crate::proto::NativeBuildRequest>,
+    ) -> std::result::Result<tonic::Response<crate::proto::NativeSourceResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("legacy"))
+    }
+    async fn recover(
+        &self,
+        _: tonic::Request<crate::proto::RecoveryRequest>,
+    ) -> std::result::Result<tonic::Response<crate::proto::RecoveryResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("legacy"))
+    }
 }
 
 fn build_replica(binding: &BuildBinding) -> ReplicaInformation {
     let target = &binding.target;
-    let mut replica =
-        ReplicaInformation::idle_build(target.replica.clone(), target.replication_address.clone());
+    let mut replica = ReplicaInformation::idle_build(
+        binding.build_id.clone(),
+        target.replica.clone(),
+        target.replication_address.clone(),
+    );
     replica.process_session_id = target.process_session_id.clone();
     replica
 }
@@ -590,7 +629,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         let build = BindingFactory::new().build(&source, &idle, "selected-idle");
         source
             .driver
-            .public_build_native(build.clone())
+            .build_replica(build_replica(&build))
             .await
             .unwrap();
         let credential = source
@@ -628,7 +667,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         let binding = BindingFactory::new().build(&source, &cancelled_idle, "cancel-remove");
         source
             .driver
-            .public_build_native(binding.clone())
+            .build_replica(build_replica(&binding))
             .await
             .unwrap();
         let gate = {
@@ -704,7 +743,11 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
                 },
             );
             let slot = crate::native::replication_slot_name(&identity);
-            let mut replica = ReplicaInformation::idle_build(identity, "http://127.0.0.1:1".into());
+            let mut replica = ReplicaInformation::idle_build(
+                OperationId::new(slot.clone()),
+                identity,
+                "http://127.0.0.1:1".into(),
+            );
             replica.process_session_id = ProcessSessionId::new("unpublished-session");
             let driver = source.driver.clone();
             let task = tokio::spawn(async move { driver.build_replica(replica).await });
@@ -747,7 +790,11 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         for incarnation in 0..=budget {
             let identity = native_identity(104, &format!("failed-{incarnation}"));
             let slot = crate::native::replication_slot_name(&identity);
-            let mut replica = ReplicaInformation::idle_build(identity, "http://127.0.0.1:1".into());
+            let mut replica = ReplicaInformation::idle_build(
+                OperationId::new(format!("failed-{incarnation}")),
+                identity,
+                "http://127.0.0.1:1".into(),
+            );
             replica.process_session_id =
                 ProcessSessionId::new(format!("failed-session-{incarnation}"));
             assert!(source.driver.build_replica(replica).await.is_err());
@@ -867,7 +914,7 @@ pub(crate) async fn public_v1_postgres_selected_resources() {
         let binding = BindingFactory::new().build(&source, &replacement, "replacement-build");
         source
             .driver
-            .public_build_native(binding.clone())
+            .build_replica(build_replica(&binding))
             .await
             .unwrap();
         assert!(replacement.driver.current_progress().await.unwrap() > 0);
@@ -944,7 +991,7 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         let binding = BindingFactory::new().build(&source, &target, "abort-grant");
         source
             .driver
-            .public_build_native(binding.clone())
+            .build_replica(build_replica(&binding))
             .await
             .unwrap();
         let credential = source.driver.public_owner().state.lock().await.grants[0]
@@ -970,8 +1017,113 @@ pub(crate) async fn public_v1_postgres_retained_abort() {
         target.driver.public_close().await.unwrap();
         // Deliberately no Close or Drop on the source before all observations.
         std::hint::black_box(&source.driver);
-        source.driver.public_close().await.unwrap();
-        controller::source_service_abort_reclaims_native_work().await;
+        let hosted = production_service(directory.path().join("abort-host"), 113).await;
+        // Negative host fixture: a genuinely accepted source Build owns its
+        // grant while its unresponsive target cannot complete. It is not a
+        // controller/native transfer positive witness.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let stop_peer = CancellationToken::new();
+        let stopped = stop_peer.clone();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            stopped.cancelled().await;
+            drop(socket);
+        });
+        let handle = hosted.running.handle();
+        let report = handle.public_v1_report().await.unwrap();
+        let target_identity = native_identity(114, "abort-unused");
+        let program = PublicOperationProgram::Build(
+            kuberic_runtime::protocol::public_operations::PublicBuildInput {
+                attempt: OperationId::new("service-abort"),
+                source_address: report.replication_address.clone().unwrap(),
+                epoch: Epoch::new(0, 1),
+                current_configuration_id: Some(
+                    report
+                        .configuration
+                        .as_ref()
+                        .unwrap()
+                        .voting
+                        .current
+                        .configuration_id
+                        .clone(),
+                ),
+                replica: target_identity.clone(),
+                target_storage:
+                    kuberic_runtime::protocol::types::ReplicaStorageIncarnationContext {
+                        replica: target_identity.clone(),
+                        storage:
+                            kuberic_runtime::protocol::types::ReplicaStorageIdentity::Volatile {
+                                identity: "negative-unresponsive-target".into(),
+                            },
+                        storage_generation:
+                            kuberic_runtime::protocol::types::StorageGeneration::new(
+                                "negative-target",
+                            ),
+                    },
+                process_session_id: ProcessSessionId::new("unused"),
+                replication_address: address,
+                history: Some(report.history),
+            },
+        );
+        let mut intent = host_intent(
+            &hosted.preview,
+            handle.process_session_id(),
+            report
+                .completed_operations
+                .iter()
+                .map(|completion| completion.revision)
+                .max()
+                .unwrap(),
+            "service-abort",
+            program,
+        );
+        intent.class = PublicOperationClass::Build {
+            target: target_identity.replica_id,
+        };
+        let mut build = tokio::spawn(async move { handle.execute_public_v1(intent).await });
+        let credential = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if build.is_finished() {
+                    panic!(
+                        "negative hosted source Build ended before creating its grant: {:?}",
+                        (&mut build).await
+                    );
+                }
+                if let Some(grant) = hosted
+                    .driver
+                    .public_owner()
+                    .state
+                    .lock()
+                    .await
+                    .grants
+                    .last()
+                {
+                    break grant.credential.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let preauth = tokio::net::TcpStream::connect((&*credential.host, credential.port))
+            .await
+            .unwrap();
+        let process = ProcessProbe::postgres(hosted.driver.instance.data_dir());
+        kuberic_runtime::StatefulServiceReplica::abort(hosted.service.as_ref());
+        assert_abort_reclaimed(&hosted.driver, process, &credential, vec![preauth]).await;
+        stop_peer.cancel();
+        peer.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), build)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        // Objects remain retained until after service Abort's independent observations.
+        std::hint::black_box(&hosted.service);
+        hosted.shutdown().await;
         let failing = Replica::new(directory.path().join("join-failure"), 115).await;
         failing.singleton(1).await;
         let mut credentials = Vec::new();
@@ -1058,8 +1210,8 @@ async fn run_basebackup_cancellation_and_retry() {
     target.role(1, ReplicaRole::IdleSecondary).await;
     let binding = BindingFactory::new().build(&source, &target, "cancel-real-basebackup");
     let driver = source.driver.clone();
-    let request = binding.clone();
-    let build = tokio::spawn(async move { driver.public_build_native(request).await });
+    let replica = build_replica(&binding);
+    let build = tokio::spawn(async move { driver.build_replica(replica).await });
     let pid = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(pid) = std::fs::read_to_string(&marker)
@@ -1079,7 +1231,7 @@ async fn run_basebackup_cancellation_and_retry() {
     std::fs::remove_file(&gate).unwrap();
     source
         .driver
-        .public_build_native(binding.clone())
+        .build_replica(build_replica(&binding))
         .await
         .unwrap();
     assert!(target.driver.current_progress().await.unwrap() > 0);
@@ -1106,8 +1258,8 @@ async fn run_stale_completion_scenario() {
     let old = bindings.build(&source, &target, "stale-completion");
     let gate = target.driver.pause_public_build_completion();
     let driver = source.driver.clone();
-    let request = old.clone();
-    let build = tokio::spawn(async move { driver.public_build_native(request).await });
+    let replica = build_replica(&old);
+    let build = tokio::spawn(async move { driver.build_replica(replica).await });
     tokio::time::timeout(Duration::from_secs(90), gate.entered.notified())
         .await
         .expect("build did not reach delayed completion");
@@ -1130,7 +1282,7 @@ async fn run_stale_completion_scenario() {
             .await
             .outbound_builds
             .iter()
-            .all(|progress| progress.request.authority.build_id != old.fixture_session)
+            .all(|progress| progress.request.authority.build_id != old.build_id)
     );
     source.change_role(2, ReplicaRole::Primary).await;
     source.epoch(2).await;
@@ -1146,7 +1298,7 @@ async fn run_stale_completion_scenario() {
     let retry = bindings.build(&source, &successor_target, "successor-completion");
     source
         .driver
-        .public_build_native(retry.clone())
+        .build_replica(build_replica(&retry))
         .await
         .unwrap();
     assert!(successor_target.driver.current_progress().await.unwrap() > 0);
@@ -1179,6 +1331,7 @@ struct ProductionService {
     driver: Arc<PgReplicator>,
     store_path: std::path::PathBuf,
     preview: kuberic_runtime::protocol::public_operations::PublicV1Identity,
+    service: Arc<crate::service::PgService>,
 }
 
 impl ProductionService {
@@ -1262,10 +1415,7 @@ async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionServ
         )
         .unwrap(),
     );
-    let service = Arc::new(
-        crate::service::PgService::deferred(service_config.clone())
-            .with_coordination_token("pg-production-native-fixture-coordination".into()),
-    );
+    let service = Arc::new(crate::service::PgService::deferred(service_config.clone()));
     let running = kuberic_runtime::host::ReplicaHost::new(
         kuberic_runtime::host::ReplicaProcessConfig {
             resource_uid: resource_uid.clone(),
@@ -1365,6 +1515,7 @@ async fn production_service(root: std::path::PathBuf, id: i64) -> ProductionServ
         driver,
         store_path,
         preview,
+        service,
     }
 }
 
@@ -1473,7 +1624,7 @@ async fn build_and_admit(primary: &Replica, secondary: &Replica, epoch: i64, ope
     let build = bindings.build(primary, secondary, operation);
     primary
         .driver
-        .public_build_native(build.clone())
+        .build_replica(build_replica(&build))
         .await
         .unwrap();
     secondary.role(epoch, ReplicaRole::ActiveSecondary).await;
@@ -1861,7 +2012,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
     assert!(source.driver.build_replica(invalid).await.is_err());
     source
         .driver
-        .public_build_native(build.clone())
+        .build_replica(build_replica(&build))
         .await
         .unwrap();
     let mut substituted_source_session = build.clone();
@@ -1956,7 +2107,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
             .binding
             .clone();
         let mut conflict = completed_binding.clone();
-        conflict.fixture_session = OperationId::new("conflicting-build");
+        conflict.build_id = OperationId::new("conflicting-build");
         target
             .driver
             .public_owner()
@@ -1970,7 +2121,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
         let before = target.persisted();
         let error = source
             .driver
-            .public_build_native(build.clone())
+            .build_replica(build_replica(&build))
             .await
             .unwrap_err();
         match error {
@@ -2015,7 +2166,7 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
             .unwrap();
         let error = source
             .driver
-            .public_build_native(build.clone())
+            .build_replica(build_replica(&build))
             .await
             .unwrap_err();
         match error {
@@ -2076,7 +2227,6 @@ async fn run_oracle_scenario(scenario: OracleScenario) {
         drop(BuildGrantGuard {
             active: cancelled_active,
             armed: true,
-            session: None,
         });
         closed(&mut cancelled_socket).await;
         assert!(source.driver.instance.is_running().await);

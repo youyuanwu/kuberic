@@ -12,7 +12,8 @@ use kuberic_runtime::protocol::command::{
 };
 #[cfg(feature = "runtime-test-bridge")]
 use kuberic_runtime::protocol::public_operations::{
-    PublicConfiguration, PublicOperationClass, PublicV1SessionRenewalStatus,
+    PublicBuildAttemptReference, PublicConfiguration, PublicInboundBuildAuthority,
+    PublicOperationClass, PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::public_operations::{
     PublicOperationIntent, PublicOperationProgram, PublicV1AcceptedStatus, PublicV1AgentReport,
@@ -276,6 +277,7 @@ impl HostedPublicV1Harness {
                 .map_err(|error| error.to_string())?;
             descriptors.push(
                 kuberic_runtime::protocol::public_operations::PublicReplicaDescriptor {
+                    build_id: OperationId::default(),
                     identity: member.identity.clone(),
                     replication_address: remote.replication_address.clone(),
                     process_session_id: report.process_session_id,
@@ -727,6 +729,33 @@ impl PublicV1OperationApi for HostedPublicV1Harness {
             if self.replica(&operation.target)?.replication_address != build.source_address {
                 return Err("hosted build changed source address".into());
             }
+            target_replica
+                .handle
+                .install_public_v1_inbound_build_authority(&PublicInboundBuildAuthority {
+                    operation_id: expected.intent.operation_id.clone(),
+                    operation_revision: expected.intent.revision,
+                    attempt: PublicBuildAttemptReference {
+                        resource_uid: expected.intent.history.resource_uid.clone(),
+                        epoch: build.epoch,
+                        build_id: build.attempt.clone(),
+                        source: operation.target.clone(),
+                        source_storage: expected.intent.source.storage_incarnation.clone(),
+                        source_session: operation.intent.process_session_id.clone(),
+                        target: build.replica.clone(),
+                        target_storage: build.target_storage.clone(),
+                        target_session: build.process_session_id.clone(),
+                    },
+                    history: expected.intent.history.clone(),
+                    source_address: build.source_address.clone(),
+                    current_configuration_id: expected
+                        .intent
+                        .current_configuration_id
+                        .clone()
+                        .expect("checked current configuration"),
+                    target_address: build.replication_address.clone(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
         }
         if let Some(PublicOperationProgram::Remove(build)) = operation.intent.program.as_ref() {
             self.execute_authority_program(
@@ -940,6 +969,20 @@ impl PublicV1HistoryApi for HostedPublicV1Harness {
                 replica
                     .handle
                     .execute_public_v1(intent.as_ref().clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                replica
+                    .handle
+                    .install_public_v1_inbound_build_authority(authority)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                replica
+                    .handle
+                    .revoke_public_v1_inbound_build_authority(authority)
                     .await
                     .map_err(|error| error.to_string())?;
             }

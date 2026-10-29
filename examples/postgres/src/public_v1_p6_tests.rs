@@ -15,7 +15,7 @@ pub(crate) async fn public_v1_postgres_secondary_readiness() {
         let binding = BindingFactory::new().build(&source, &target, "readiness-build");
         source
             .driver
-            .public_build_native(binding.clone())
+            .build_replica(build_replica(&binding))
             .await
             .unwrap();
         target.role(1, ReplicaRole::ActiveSecondary).await;
@@ -267,7 +267,7 @@ pub(crate) async fn public_v1_postgres_marked_catchup() {
             let binding = BindingFactory::new().build(&source, target, "marked-build");
             source
                 .driver
-                .public_build_native(binding.clone())
+                .build_replica(build_replica(&binding))
                 .await
                 .unwrap();
             target.role(1, ReplicaRole::ActiveSecondary).await;

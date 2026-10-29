@@ -521,13 +521,7 @@ async fn remote_build_projection_separates_admission_running_success_and_retirem
             .remote_build_states(&ProcessSessionId::new("other-session"))
             .is_empty()
     );
-    assert!(
-        !serde_json::to_value(&preview)
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .contains_key("currentInboundBuildAuthority")
-    );
+    assert!(preview.current_inbound_build_authority.is_none());
     fixture.registry.shutdown().await.unwrap();
 }
 
@@ -600,9 +594,10 @@ async fn declared_configuration_and_epoch_failures_resume_only_exact_frozen_inpu
 }
 
 #[tokio::test]
-async fn engine_role_declaration_cannot_certify_application_failure() {
-    {
+async fn engine_role_declaration_cannot_certify_application_failure_or_native_observer() {
+    for native_observer in [false, true] {
         let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = native_observer;
         declare(&mut fixture, [Family::ReplicatorRole]);
         fixture
             .probe
@@ -677,8 +672,9 @@ async fn declared_replicator_role_and_catchup_resume_with_frozen_successful_pref
 }
 
 #[tokio::test]
-async fn failed_replicator_callback_is_not_a_repeatability_contract() {
-    let fixture = Fixture::new().await;
+async fn native_observer_is_not_a_returned_replicator_failure_repeatability_contract() {
+    let mut fixture = Fixture::new().await;
+    fixture.callbacks.native_observer_callbacks = true;
     fixture.probe.fail_role.store(true, Ordering::Release);
     let program = PublicOperationProgram::Role {
         epoch: Epoch::new(0, 2),
@@ -686,7 +682,7 @@ async fn failed_replicator_callback_is_not_a_repeatability_contract() {
     };
     let operation = fixture.launch(program.clone(), 1).await;
     let failed = completed(&operation).await;
-    assert_eq!(failed.stage, PublicOperationStage::ContainmentPending);
+    assert_eq!(failed.stage, PublicOperationStage::Completed);
     assert!(matches!(
         failed.disposition,
         Some(PublicOperationDisposition::Failed(_))
@@ -735,6 +731,7 @@ async fn retrying_catchup_cannot_borrow_configuration_repeatability_for_nested_r
 #[tokio::test]
 async fn declared_canonical_rebuild_takes_precedence_over_retry_pending() {
     let mut fixture = Fixture::new().await;
+    fixture.callbacks.native_observer_callbacks = true;
     declare(&mut fixture, [Family::ReplicatorRole]);
     *fixture.probe.role_rebuild.lock().unwrap() = Some(
         fixture
@@ -751,7 +748,7 @@ async fn declared_canonical_rebuild_takes_precedence_over_retry_pending() {
     };
     let operation = fixture.launch(program.clone(), 1).await;
     let failed = completed(&operation).await;
-    assert_eq!(failed.stage, PublicOperationStage::ContainmentPending);
+    assert_eq!(failed.stage, PublicOperationStage::Completed);
     assert!(failed.retry_failure.is_none());
     assert!(matches!(
         failed.lifecycle.outcomes.as_slice(),
@@ -898,6 +895,7 @@ async fn callback_success_receipt_failure_and_unknown_host_failure_never_enable_
 async fn retry_receipt_persistence_failure_is_ambiguous_not_permission_to_restart() {
     let mut fixture = Fixture::new().await;
     declare(&mut fixture, [Family::ApplicationRole]);
+    fixture.callbacks.native_observer_callbacks = true;
     fixture
         .probe
         .fail_application_role
@@ -1289,7 +1287,7 @@ async fn schema13_current_cancelled_and_partial_records_reject_without_changing_
                     &binding
                 ),
                 Err(HostError::SchemaMismatch {
-                    expected: 16,
+                    expected: 15,
                     observed: 13
                 })
             ),

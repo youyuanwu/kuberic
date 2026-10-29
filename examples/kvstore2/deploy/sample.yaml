@@ -4,15 +4,16 @@ metadata:
   name: kvstore2
   namespace: kuberic-system
 spec:
-  hostingFormat: 16
+  hostingFormat: 15
   replicas: 3
-  # Ordinary hosting uses authenticated engine-owned copy/replication sessions.
+  # M1 development asset, not a deployable default-engine stack:
+  # KVStore2 ordinary production Open rejects explicitly until M2 integration.
   # Use fresh matching host/control/CRD metadata; never reset existing data.
   # PVC object deletion: no retention/import path; not a physical-erasure guarantee.
   # The test-only live copy gate is intentionally absent from this user manifest.
   image: localhost/kvstore2:level-triggered-v1
   failoverDelaySeconds: 10
-  # Planned primary replacement remains outside the delivered M2 boundary.
+  # Planned primary replacement remains unavailable at the M1 checkpoint.
   # switchover:
   #   requestId: move-to-replica-2-001
   #   targetReplicaId: 2

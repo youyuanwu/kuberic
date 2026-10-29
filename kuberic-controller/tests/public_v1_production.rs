@@ -26,7 +26,7 @@ fn empty_observation(replicas: u32) -> RawObservation {
     let mut set = KubericSet::new(
         "sample",
         KubericSetSpec {
-            hosting_format: kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+            hosting_format: 15,
             replicas,
             image: "example".into(),
             failover_delay_seconds: 30,

@@ -16,6 +16,18 @@ use crate::protocol::public_operations::{
 };
 use crate::protocol::types::{OperationId, ProcessSessionId, ReplicaIdentity};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackContainment {
+    /// Joining the root future proves all operation-owned work terminated.
+    RootTask,
+    /// The public future observes work retained and fenced by the native owner.
+    /// Joining this observer does not claim that native callbacks have drained.
+    NativeObserver,
+    /// Successful callback completion is the public contract boundary; failure or
+    /// cancellation still requires object/process containment.
+    ObjectOwnedOnInterruption,
+}
+
 pub(crate) struct PartitionOperation {
     store: Arc<dyn AgentStore>,
     record: watch::Sender<PublicOperationRecord>,
@@ -23,6 +35,7 @@ pub(crate) struct PartitionOperation {
     task: Mutex<Option<JoinHandle<Result<()>>>>,
     ordinary_join: Mutex<()>,
     lifecycle: Mutex<()>,
+    containment: Mutex<CallbackContainment>,
     coordination_active: std::sync::atomic::AtomicBool,
     access_invalidated: std::sync::atomic::AtomicBool,
     access_invalidation: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -56,6 +69,7 @@ impl PartitionOperation {
             task: Mutex::new(None),
             ordinary_join: Mutex::new(()),
             lifecycle: Mutex::new(()),
+            containment: Mutex::new(CallbackContainment::RootTask),
             coordination_active: std::sync::atomic::AtomicBool::new(false),
             access_invalidated: std::sync::atomic::AtomicBool::new(false),
             access_invalidation: std::sync::Mutex::new(None),
@@ -217,16 +231,21 @@ impl PartitionOperation {
         }
     }
 
-    pub(crate) async fn spawn_root<F, E>(self: &Arc<Self>, future: F) -> Result<()>
+    pub(crate) async fn spawn_root<F, E>(
+        self: &Arc<Self>,
+        containment: CallbackContainment,
+        future: F,
+    ) -> Result<()>
     where
         F: Future<Output = std::result::Result<(), E>> + Send + 'static,
         E: std::fmt::Display + Send + 'static,
     {
-        self.spawn_root_with_retry(None, future).await
+        self.spawn_root_with_retry(containment, None, future).await
     }
 
     pub(crate) async fn spawn_root_with_retry<F, E>(
         self: &Arc<Self>,
+        containment: CallbackContainment,
         returned_failure: Option<
             Arc<std::sync::Mutex<Option<crate::host::state::PublicCallbackFailure>>>,
         >,
@@ -258,6 +277,8 @@ impl PartitionOperation {
                 current.intent.operation_id
             )));
         }
+        *self.containment.lock().await = containment;
+
         let (start, started) = oneshot::channel();
         let operation = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -266,7 +287,9 @@ impl PartitionOperation {
             }
             let result = future.await.map_err(|error| error.to_string());
             let failure = returned_failure.and_then(|failure| failure.lock().unwrap().take());
-            let recorded = operation.record_root_result(result, failure).await;
+            let recorded = operation
+                .record_root_result(result, containment, failure)
+                .await;
             if let Err(error) = &recorded {
                 operation.record_failure(error);
             }
@@ -311,6 +334,7 @@ impl PartitionOperation {
     async fn record_root_result(
         &self,
         result: std::result::Result<(), String>,
+        containment: CallbackContainment,
         returned_failure: Option<crate::host::state::PublicCallbackFailure>,
     ) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
@@ -358,9 +382,10 @@ impl PartitionOperation {
             return Ok(());
         }
 
-        if (!current.intent.class.is_terminal()
+        let containment = self.selected_containment(containment).await;
+        if (containment == CallbackContainment::ObjectOwnedOnInterruption
             && matches!(disposition, PublicOperationDisposition::Failed(_)))
-            || (current.intent.class.is_terminal() && !self.descendants_contained().await)
+            || (containment == CallbackContainment::RootTask && !self.descendants_contained().await)
         {
             let pending = self
                 .advance(
@@ -546,35 +571,21 @@ impl PartitionOperation {
         current: PublicOperationRecord,
         task_failure: Option<String>,
     ) -> Result<PublicOperationRecord> {
-        let no_unsettled_callback = task_failure.is_none()
-            && self
-                .store
-                .public_operation_records()
-                .await?
-                .iter()
-                .any(|record| {
-                    record.intent == current.intent
-                        && matches!(
-                            record.lifecycle.in_flight,
-                            None | Some(crate::host::state::PublicInstruction::Revoke)
-                        )
-                        && !record.lifecycle.outcomes.iter().any(|outcome| {
-                            matches!(
-                                outcome,
-                                crate::host::state::PublicInstructionOutcome::RebuildRequired(_)
-                                    | crate::host::state::PublicInstructionOutcome::DataLoss(
-                                        crate::host::state::DataLossOutcome::Error(_)
-                                    )
-                            )
-                        })
-                });
-        let next = if current.stage == PublicOperationStage::RetryPending
-            || no_unsettled_callback
-            || (current.intent.class.is_terminal() && self.descendants_contained().await)
-        {
-            PublicOperationStage::Completed
-        } else {
-            PublicOperationStage::ContainmentPending
+        let containment = self
+            .selected_containment(*self.containment.lock().await)
+            .await;
+        let next = match containment {
+            _ if current.stage == PublicOperationStage::RetryPending => {
+                PublicOperationStage::Completed
+            }
+            CallbackContainment::NativeObserver => PublicOperationStage::Completed,
+            CallbackContainment::RootTask if self.descendants_contained().await => {
+                PublicOperationStage::Completed
+            }
+            CallbackContainment::RootTask => PublicOperationStage::ContainmentPending,
+            CallbackContainment::ObjectOwnedOnInterruption => {
+                PublicOperationStage::ContainmentPending
+            }
         };
         let disposition = task_failure.map_or(PublicOperationDisposition::Cancelled, |error| {
             PublicOperationDisposition::Ambiguous(error)
@@ -589,6 +600,83 @@ impl PartitionOperation {
         self.record.send_replace(updated.clone());
         self.bump_revision();
         Ok(updated)
+    }
+
+    async fn selected_containment(&self, declared: CallbackContainment) -> CallbackContainment {
+        if declared != CallbackContainment::NativeObserver {
+            return declared;
+        }
+        // An engine's declaration cannot certify the independent application.
+        // Read the durable selection, not the coarse Running watch snapshot.
+        let record = self
+            .store
+            .public_operation_records()
+            .await
+            .ok()
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.intent == self.intent())
+            });
+        let canonical_failure = record.as_ref().is_some_and(|record| {
+            matches!(
+                record.lifecycle.outcomes.last(),
+                Some(crate::host::state::PublicInstructionOutcome::RebuildRequired(_))
+            )
+        });
+        // A joined root between successful callbacks has no interrupted child.
+        // In particular, a successful application receipt does not require
+        // shutting down the application merely to supersede the next stage.
+        // A callback-success/receipt-loss still has in_flight set and cannot
+        // take this path. A receipted canonical failure is not success either:
+        // recover its callback provenance below, including application owners.
+        // Missing store evidence remains conservative.
+        if !canonical_failure
+            && record
+                .as_ref()
+                .is_some_and(|record| record.lifecycle.in_flight.is_none())
+        {
+            return declared;
+        }
+        let selected = record.and_then(|record| {
+            record.lifecycle.in_flight.or_else(|| {
+                if !canonical_failure {
+                    return None;
+                }
+                super::public_lifecycle::record_instructions(&record)
+                    .get(record.lifecycle.outcomes.len().checked_sub(1)?)
+                    .copied()
+            })
+        });
+        use crate::host::state::PublicInstruction::*;
+        match selected {
+            Some(
+                ReplicatorOpen
+                | ReplicatorRole
+                | ReplicatorPrimary
+                | ProgramEpoch
+                | Epoch
+                | Configuration
+                | StartingConfiguration
+                | RefreshedConfiguration
+                | CurrentConfiguration
+                | CatchUpConfiguration
+                | FirstCatchUp
+                | SecondCatchUp
+                | CatchUp
+                | DataLoss
+                | Progress
+                | Build
+                | Remove
+                // Synchronous host-owned revocation has no external child to
+                // outlive the joined root, even at its selected test barrier.
+                | Revoke,
+            ) => declared,
+            // Access refreshes the application role/address. An active
+            // application selection and unknown provenance cannot borrow an
+            // engine declaration.
+            _ => CallbackContainment::ObjectOwnedOnInterruption,
+        }
     }
 
     pub(crate) async fn complete_containment(&self) -> Result<PublicOperationRecord> {
@@ -1103,6 +1191,37 @@ fn renewal_endpoint_matches_intent(
         })
 }
 
+fn renewal_inbound_build_matches(
+    renewal: &PublicV1SessionRenewalStatus,
+    process: &ProcessSessionId,
+    creation: &crate::protocol::types::ReplicatorCreationId,
+    authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+) -> bool {
+    use crate::protocol::types::ReplicaRole;
+
+    let required = &renewal.required;
+    renewal.validate().is_ok()
+        && renewal.stage == PublicSessionRenewalStage::ConfigurationPending
+        && required.predecessor_contained
+        && required.predecessor.role == ReplicaRole::ActiveSecondary
+        && required.history == authority.history
+        && required.renewal_epoch == authority.attempt.epoch
+        && required.replacement.as_ref().is_some_and(|replacement| {
+            replacement.identity == authority.attempt.target
+                && replacement.storage_incarnation == authority.attempt.target_storage
+                && replacement.process_session_id == authority.attempt.target_session
+                && &replacement.process_session_id == process
+                && &replacement.replicator_creation_id == creation
+        })
+        && required.surviving_sessions.iter().any(|survivor| {
+            survivor.role == ReplicaRole::Primary
+                && survivor.identity.replica_id == required.fresh_configuration.primary_id
+                && survivor.identity == authority.attempt.source
+                && survivor.storage_incarnation == authority.attempt.source_storage
+                && survivor.process_session_id == authority.attempt.source_session
+        })
+}
+
 fn is_retained_replacement_open(
     renewal: &PublicV1SessionRenewalStatus,
     local: &ReplicaIdentity,
@@ -1300,7 +1419,6 @@ impl PartitionOperationRegistry {
     pub(crate) fn revision_receiver(&self) -> watch::Receiver<u64> {
         self.revision.subscribe()
     }
-    #[cfg(test)]
     pub(crate) async fn operation_for_validation(
         &self,
         id: &OperationId,
@@ -1356,6 +1474,38 @@ impl PartitionOperationRegistry {
         self.renewal_fence
             .load(std::sync::atomic::Ordering::Acquire)
             || self.terminal_admission_is_fenced()
+    }
+
+    pub(crate) fn build_authority_is_fenced(
+        &self,
+        state: &super::state::AgentState,
+        creation: &crate::protocol::types::ReplicatorCreationId,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> bool {
+        // Renewal keeps application/operation admission closed until configuration
+        // installation, but the exact replacement must receive its copy first.
+        let renewal_blocks = self
+            .renewal_fence
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !state
+                .public_v1_operation_state
+                .as_ref()
+                .is_some_and(|preview| {
+                    !preview.terminal
+                        && state.identity.local_identity == authority.attempt.target
+                        && preview.history.as_ref() == Some(&authority.history)
+                        && preview.storage_incarnation.as_ref()
+                            == Some(&authority.attempt.target_storage)
+                        && preview.session_renewal.as_ref().is_some_and(|renewal| {
+                            renewal_inbound_build_matches(
+                                renewal,
+                                &self.process_session_id,
+                                creation,
+                                authority,
+                            )
+                        })
+                });
+        renewal_blocks || self.terminal_admission_is_fenced()
     }
 
     async fn prepare_fenced_session_renewal_configuration(
@@ -1914,7 +2064,9 @@ impl PartitionOperationRegistry {
             async move {
                 if operation.wait_until_ready().await? {
                     operation
-                        .spawn_root(async { Ok::<(), HostError>(()) })
+                        .spawn_root(CallbackContainment::RootTask, async {
+                            Ok::<(), HostError>(())
+                        })
                         .await?;
                 }
                 Ok::<(), HostError>(())
@@ -2180,13 +2332,10 @@ impl PartitionOperationRegistry {
         }) {
             self.fence();
         }
-        if durable.public_v1_operation_state.is_some_and(|preview| {
-            preview.terminal
-                && crate::host::ordinary_goal::terminal_for_process(
-                    &preview,
-                    &self.process_session_id,
-                )
-        }) {
+        if durable
+            .public_v1_operation_state
+            .is_some_and(|preview| preview.terminal)
+        {
             // A contained predecessor fault can remain in a replacement's
             // journal. Only this process's terminal records close it forever.
             self.fence_session_renewal();
@@ -2427,13 +2576,6 @@ fn ordinary_relation(
     completed: bool,
 ) -> AdmissionRelation {
     use AdmissionRelation::*;
-    if existing.process_session_id != incoming.process_session_id {
-        return if completed {
-            Coexist
-        } else {
-            Reject("predecessor ordinary creation remains unresolved")
-        };
-    }
     if existing.class.is_terminal() {
         return Reject("ordinary creation already has an immutable terminal owner");
     }
@@ -2697,7 +2839,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_renewal_cannot_clear_current_terminal_admission() {
+    async fn renewal_inbound_copy_requires_exact_replayed_replacement_and_surviving_primary() {
+        use crate::protocol::public_operations::{
+            PublicBuildAttemptReference, PublicInboundBuildAuthority,
+        };
+
         let resource = ResourceUid::new("resource-renewal-inbound");
         let generation = PublicProtocolGeneration::new(1);
         let initialization = derive_history_initialization_id(&resource, generation);
@@ -2779,31 +2925,144 @@ mod tests {
                 ReplicaRole::ActiveSecondary,
             )
             .unwrap();
-        pending.validate().unwrap();
+        let authority = PublicInboundBuildAuthority {
+            operation_id: OperationId::new("renewal-inbound-copy"),
+            operation_revision: 10,
+            attempt: PublicBuildAttemptReference {
+                resource_uid: resource,
+                epoch,
+                build_id: OperationId::new("renewal-inbound-copy"),
+                source: source.identity.clone(),
+                source_storage: source.storage_incarnation.clone(),
+                source_session: source.process_session_id.clone(),
+                target: replacement.identity.clone(),
+                target_storage: replacement.storage_incarnation.clone(),
+                target_session: replacement.process_session_id.clone(),
+            },
+            history,
+            current_configuration_id: ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )
+            .configuration_id,
+            source_address: "http://127.0.0.1:7001".into(),
+            target_address: "http://127.0.0.1:7002".into(),
+        };
+        authority.validate().unwrap();
+        let matches = |renewal: &PublicV1SessionRenewalStatus,
+                       authority: &PublicInboundBuildAuthority| {
+            renewal_inbound_build_matches(
+                renewal,
+                &replacement.process_session_id,
+                &replacement.replicator_creation_id,
+                authority,
+            )
+        };
+        assert!(matches(&pending, &authority));
         let root = crate::host::tests::tempdir().unwrap();
         let (store, registry) =
             fence_registry(root.path(), replacement.process_session_id.clone()).await;
-        let before = store.load_state().await.unwrap();
+        let mut snapshot = store.load_state().await.unwrap();
+        snapshot.identity.local_identity = replacement.identity.clone();
+        let preview = snapshot.public_v1_operation_state.as_mut().unwrap();
+        preview.history = Some(authority.history.clone());
+        preview.storage_incarnation = Some(replacement.storage_incarnation.clone());
+        preview.session_renewal = Some(pending.clone());
         registry.fence_session_renewal();
         assert!(registry.is_fenced());
+        assert!(!registry.build_authority_is_fenced(
+            &snapshot,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        let source_registry = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            source.process_session_id.clone(),
+        )
+        .unwrap();
+        source_registry.fence_session_renewal();
+        assert!(source_registry.build_authority_is_fenced(
+            &snapshot,
+            &source.replicator_creation_id,
+            &authority,
+        ));
         registry.fence();
-        assert!(registry.terminal_admission_is_fenced());
-        registry
-            .release_session_renewal_fence(&program_intent(
-                PublicOperationProgram::Configuration(
-                    crate::protocol::public_operations::PublicConfiguration {
-                        current: pending.required.fresh_configuration.clone(),
-                        previous: None,
-                        replicas: Vec::new(),
-                    },
-                ),
-                1,
-            ))
-            .await
-            .unwrap();
-        assert!(registry.is_fenced());
-        assert!(registry.terminal_admission_is_fenced());
-        assert_eq!(store.load_state().await.unwrap(), before);
+        assert!(
+            registry.build_authority_is_fenced(
+                &snapshot,
+                &replacement.replicator_creation_id,
+                &authority,
+            ),
+            "a stale nonterminal renewal snapshot cannot weaken current terminal admission"
+        );
+        assert!(!matches(&required, &authority));
+        assert!(!matches(&role_pending, &authority));
+        assert!(!matches(
+            &pending
+                .install_fresh_configuration(&pending.required.fresh_configuration)
+                .unwrap(),
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &predecessor.process_session_id,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &replacement.process_session_id,
+            &predecessor.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &source.process_session_id,
+            &source.replicator_creation_id,
+            &authority,
+        ));
+        let changes: [fn(&mut PublicInboundBuildAuthority); 7] = [
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_session = ProcessSessionId::new("historical-target");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_session = ProcessSessionId::new("historical-source");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_storage.storage_generation =
+                    StorageGeneration::new("other-target-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_storage.storage_generation =
+                    StorageGeneration::new("other-source-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 1);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 3);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.history.data_loss_number += 1;
+            },
+        ];
+        for change in changes {
+            let mut changed = authority.clone();
+            change(&mut changed);
+            assert!(!matches(&pending, &changed), "{changed:?}");
+        }
+        let mut changed = pending.clone();
+        changed.required.predecessor_contained = false;
+        assert!(!matches(&changed, &authority));
+        let mut changed = pending;
+        changed.replayed_role = None;
+        assert!(!matches(&changed, &authority));
     }
 
     #[test]

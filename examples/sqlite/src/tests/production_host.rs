@@ -1,7 +1,10 @@
 use super::*;
 use kuberic_runtime::application::OpenMode;
 use kuberic_runtime::control::{convert, proto};
-use kuberic_runtime::protocol::public_operations::*;
+use kuberic_runtime::protocol::command::PublicV1OperationCommand;
+use kuberic_runtime::protocol::public_operations::{
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+};
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRole, derive_agent_generation, derive_initialization_id,
@@ -231,72 +234,38 @@ async fn production_host_new_existing_and_invalid_storage() -> Result<(), Box<dy
                 },
                 "production storage binding selects the authorized mode"
             );
-            let query = || {
-                authorized(proto::ReplicaSnapshotRequest {
-                    protocol_version: ORDINARY_ACTION_FORMAT,
+            let program = PublicOperationProgram::Open {
+                replica: identity.clone(),
+                existing: round != 0,
+            };
+            let command = PublicV1OperationCommand {
+                target: identity.clone(),
+                intent: PublicOperationIntent {
+                    identity: report.identity,
+                    operation_id: OperationId::new(format!("open-{round}")),
+                    revision: 10 + round * 10,
+                    process_session_id: report.process_session_id.clone(),
+                    class: PublicOperationClass::Authority,
+                    input_digest: program.digest(),
+                    replay_disposition: program.replay_disposition(),
+                    lifecycle: None,
+                    program: Some(program),
+                },
+            };
+            let request = |command: &PublicV1OperationCommand| {
+                authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
                     resource_uid: resource.to_string(),
                     target: Some(identity.clone().into()),
                     expected_process_session_id: report.process_session_id.to_string(),
+                    command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                        convert::public_v1_operation_command_to_proto(command).unwrap(),
+                    )),
                 })
             };
-            let response = client.get_snapshot(query()).await?.into_inner();
-            let ReplicaAgentQueryResult::Initialized(snapshot) =
-                serde_json::from_slice(&response.canonical_json)?
-            else {
-                panic!("initialized ordinary snapshot required")
-            };
-            let configuration = ConfigurationDescriptor::new(
-                Epoch::new(0, 1),
-                id,
-                vec![ConfigurationMember {
-                    identity: identity.clone(),
-                    role: ReplicaRole::Primary,
-                }],
-                1,
-            );
-            let goal = ReplicaGoal {
-                format: ORDINARY_ACTION_FORMAT,
-                identity: report.identity,
-                operation_id: OperationId::new(format!("open-{round}")),
-                revision: 10 + round * 10,
-                scope: ReplicaScope {
-                    history: report.history,
-                    storage: report.storage_incarnation,
-                    process_session_id: report.process_session_id.clone(),
-                    creation_id: snapshot.creation_id,
-                    epoch: configuration.epoch,
-                    configuration: ReplicaConfigurationScope {
-                        current: configuration,
-                        previous: None,
-                        replicas: Vec::new(),
-                    },
-                },
-                desired: ReplicaGoalKind::Prepare {
-                    role: ReplicaRole::Primary,
-                },
-            };
-            client
-                .submit_goal(authorized(proto::ReplicaGoalRequest {
-                    protocol_version: ORDINARY_ACTION_FORMAT,
-                    canonical_json: serde_json::to_vec(&goal)?,
-                }))
-                .await?;
-            let opened = loop {
-                let response = client.get_snapshot(query()).await?.into_inner();
-                let ReplicaAgentQueryResult::Initialized(snapshot) =
-                    serde_json::from_slice(&response.canonical_json)?
-                else {
-                    panic!("snapshot required")
-                };
-                if let Some(observation) = snapshot.goals.iter().find(|entry| entry.goal == goal)
-                    && observation.status != ReplicaGoalStatus::Pending
-                {
-                    break observation.status.clone();
-                }
-                tokio::task::yield_now().await;
-            };
+            let opened = client.execute(request(&command)).await;
             if round < 2 {
-                assert_eq!(opened, ReplicaGoalStatus::Achieved);
+                opened?;
                 let report = convert::normalize_public_v1_agent_status_report(
                     client
                         .get_status(authorized(status_request))
@@ -306,9 +275,8 @@ async fn production_host_new_existing_and_invalid_storage() -> Result<(), Box<dy
                 assert_eq!(report.open_mode, OpenMode::Existing);
                 assert!(manifest.is_file());
             } else {
-                let ReplicaGoalStatus::Failed(detail) = opened else {
-                    panic!("invalid storage must fail: {opened:?}")
-                };
+                let error = opened.expect_err("invalid established storage must reject");
+                let detail = error.message();
                 assert!(
                     detail.contains("application error:"),
                     "actual application Open must reject: {detail}"

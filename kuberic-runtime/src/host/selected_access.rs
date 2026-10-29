@@ -450,6 +450,25 @@ impl AccessOwner {
         }
     }
 
+    pub(crate) fn resumes_primary(&self) -> bool {
+        let (Some(host), Some(operation)) = (self.host.upgrade(), self.operation.upgrade()) else {
+            return false;
+        };
+        let _admission = host.write_admission.lock().unwrap();
+        let access = host.selected_access.lock().unwrap();
+        access.generation == self.generation
+            && access.valid
+            && operation.access_live()
+            && access.promotion
+            && access
+                .primary_reconciliation
+                .as_ref()
+                .is_some_and(|evidence| {
+                    evidence.generation == self.generation
+                        && Some(&evidence.context) == access.context.as_ref()
+                })
+    }
+
     pub(crate) fn selected(&self, instruction: I) {
         self.update(|access, _| match instruction {
             I::ReplicatorRole | I::ReplicatorPrimary => {

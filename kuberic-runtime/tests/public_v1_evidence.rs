@@ -178,7 +178,7 @@ fn public_v1_source_uses_no_native_evidence() {
 
 #[tokio::test]
 async fn public_v1_evidence_report_is_structurally_public_only() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 16);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 15);
     let root = test_root("report");
     let path = SqliteStore::metadata_database_path(&root);
     let resource_uid = ResourceUid::new("evidence-resource");
@@ -516,7 +516,7 @@ fn split_report_wire_cases(
 #[test]
 fn public_v1_replacement_schema_rejects_prior_preview_stores() {
     let preview = PublicV1Identity::new(42);
-    for version in [8, 9, 10, 15] {
+    for version in [8, 9, 10] {
         let root = test_root(&format!("reject-{version}"));
         let path = SqliteStore::metadata_database_path(&root);
         let resource_uid = ResourceUid::new("evidence-resource");

@@ -162,8 +162,6 @@ struct Core {
     #[cfg(feature = "testing")]
     before_success: crate::testing::PauseGate,
     #[cfg(feature = "testing")]
-    worker_exit: crate::testing::PauseGate,
-    #[cfg(feature = "testing")]
     fail: std::sync::atomic::AtomicU8,
 }
 
@@ -456,8 +454,6 @@ impl Committer {
             #[cfg(feature = "testing")]
             before_success: Default::default(),
             #[cfg(feature = "testing")]
-            worker_exit: Default::default(),
-            #[cfg(feature = "testing")]
             fail: Default::default(),
         });
         crate::commit_barrier::register(&vfs, Arc::new(Barrier(Arc::downgrade(&core))))
@@ -477,10 +473,7 @@ impl Committer {
                 let sql_core = core.clone();
                 let sql_vfs = vfs.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let result = sql_core.execute(request.statements, &sql_vfs);
-                    #[cfg(feature = "testing")]
-                    sql_core.runtime.block_on(sql_core.worker_exit.pause());
-                    result
+                    sql_core.execute(request.statements, &sql_vfs)
                 })
                 .await;
                 let result = match result {
@@ -809,10 +802,6 @@ impl Committer {
     #[cfg(feature = "testing")]
     pub fn before_success(&self) -> &crate::testing::PauseGate {
         &self.core.before_success
-    }
-    #[cfg(feature = "testing")]
-    pub fn worker_exit(&self) -> &crate::testing::PauseGate {
-        &self.core.worker_exit
     }
     #[cfg(feature = "testing")]
     pub fn fail_once(&self, cut: FailureCut) {

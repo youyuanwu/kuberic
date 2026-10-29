@@ -145,7 +145,6 @@ async fn checking_data_loss_gates_previously_issued_primary_handles_and_ingress(
             },
             rig.provider.clone(),
             BuildCallbacks {
-                fence: None,
                 replication: Arc::new(|_| true),
                 copy: Arc::new(|_| true),
                 context_ack: Arc::new(|_, _| true),

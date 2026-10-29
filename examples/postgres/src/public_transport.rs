@@ -52,18 +52,9 @@ impl NativeCredential {
 
 pub(super) struct NativeGateway {
     cancellation: CancellationToken,
-    task: Option<JoinHandle<Result<()>>>,
-    copy_allowed: Arc<std::sync::atomic::AtomicBool>,
-    running: Arc<std::sync::atomic::AtomicBool>,
+    task: Option<JoinHandle<()>>,
     #[cfg(all(test, feature = "testing"))]
     exit_gate: Arc<std::sync::Mutex<Option<Arc<GatewayExitGate>>>>,
-}
-
-struct GatewayRun(Arc<std::sync::atomic::AtomicBool>);
-impl Drop for GatewayRun {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
-    }
 }
 
 pub(super) type GatewayValidity = Arc<
@@ -107,30 +98,19 @@ impl NativeGateway {
         };
         let stopped = cancellation.clone();
         let expected = credential.clone();
-        let copy_allowed = Arc::new(std::sync::atomic::AtomicBool::new(build));
-        let command_mode = copy_allowed.clone();
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let run = running.clone();
         #[cfg(all(test, feature = "testing"))]
         let exit_gate = Arc::new(std::sync::Mutex::new(None::<Arc<GatewayExitGate>>));
         #[cfg(all(test, feature = "testing"))]
         let exiting = exit_gate.clone();
         let task = tokio::spawn(async move {
-            let _run = GatewayRun(run.clone());
             let mut connections = JoinSet::new();
-            let mut failures = Vec::new();
             let mut tick = tokio::time::interval(Duration::from_millis(20));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     biased;
                     _ = stopped.cancelled() => break,
-                    joined = connections.join_next(), if !connections.is_empty() => {
-                        if let Some(Err(error)) = joined {
-                            failures.push(error.to_string());
-                            break;
-                        }
-                    },
+                    _ = tick.tick() => if !valid().await { break; },
+                    _ = connections.join_next(), if !connections.is_empty() => {},
                     accepted = listener.accept() => {
                         let Ok((client, _)) = accepted else { break; };
                         if connections.len() >= 4 || !valid().await {
@@ -139,27 +119,18 @@ impl NativeGateway {
                         let expected = expected.clone();
                         let socket = socket.clone();
                         let slot = slot.clone();
-                        let command_mode = command_mode.clone();
                         connections.spawn(async move {
-                            if let Err(error) = connection(client, socket, expected, slot, command_mode).await {
+                            if let Err(error) = connection(client, socket, expected, slot, build).await {
                                 tracing::debug!(%error, "native gateway connection ended");
                             }
                         });
-                    },
-                    _ = tick.tick() => if !valid().await { break; },
+                    }
                 }
             }
             // Dropping a listener alone does not fence already-open WAL senders.
-            run.store(false, std::sync::atomic::Ordering::Release);
             drop(listener);
             connections.abort_all();
-            while let Some(result) = connections.join_next().await {
-                if let Err(error) = result
-                    && !error.is_cancelled()
-                {
-                    failures.push(error.to_string());
-                }
-            }
+            while connections.join_next().await.is_some() {}
             #[cfg(all(test, feature = "testing"))]
             {
                 let gate = exiting.lock().unwrap().take();
@@ -168,32 +139,16 @@ impl NativeGateway {
                     gate.release.notified().await;
                 }
             }
-            if failures.is_empty() {
-                Ok(())
-            } else {
-                Err(application_error(failures.join("; ")))
-            }
         });
         Ok((
             Self {
                 cancellation,
                 task: Some(task),
-                copy_allowed,
-                running,
                 #[cfg(all(test, feature = "testing"))]
                 exit_gate,
             },
             credential,
         ))
-    }
-
-    pub(super) fn finish_copy(&self) {
-        self.copy_allowed
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
-    pub(super) fn liveness(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        self.running.clone()
     }
 
     #[cfg(all(test, feature = "testing"))]
@@ -219,7 +174,7 @@ impl NativeGateway {
     pub async fn drain(mut self) -> Result<()> {
         self.cancellation.cancel();
         if let Some(task) = self.task.take() {
-            task.await.map_err(application_error)??;
+            task.await.map_err(application_error)?;
         }
         Ok(())
     }
@@ -247,7 +202,7 @@ async fn connection(
     socket: PathBuf,
     expected: NativeCredential,
     slot: String,
-    copy_allowed: Arc<std::sync::atomic::AtomicBool>,
+    build: bool,
 ) -> io::Result<()> {
     let mut backend = tokio::time::timeout(Duration::from_secs(5), async {
         let mut startup = packet(&mut client, 8192).await?;
@@ -303,11 +258,7 @@ async fn connection(
             let kind = client_read.read_u8().await?;
             let body = packet(&mut client_read, 65536).await?;
             match kind {
-                b'Q' if allowed_query(
-                    &body,
-                    &slot,
-                    copy_allowed.load(std::sync::atomic::Ordering::Acquire),
-                ) => {}
+                b'Q' if allowed_query(&body, &slot, build) => {}
                 b'd' if matches!(body.first(), Some(b'r' | b'h')) && body.len() <= 64 => {}
                 b'c' | b'X' if body.is_empty() => {}
                 _ => return Err(io::Error::other("unsupported native replication command")),

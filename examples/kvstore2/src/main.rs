@@ -261,261 +261,218 @@ async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     use kvstore2::state::CopyGate;
 
-    mod production_host {
-        use super::CopyGate;
-        #[tokio::test]
-        async fn production_host_opens_fresh_application_storage() -> anyhow::Result<()> {
-            use kuberic_runtime::application::OpenMode;
-            use kuberic_runtime::control::{convert, proto};
-            use kuberic_runtime::protocol::public_operations::*;
-            use kuberic_runtime::protocol::types::{
-                ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, ReplicaIdentity,
-                ReplicaInstanceId, ReplicaRole, derive_agent_generation, derive_initialization_id,
-            };
+    #[tokio::test]
+    async fn production_host_opens_fresh_application_storage() -> anyhow::Result<()> {
+        use kuberic_runtime::application::OpenMode;
+        use kuberic_runtime::control::{convert, proto};
+        use kuberic_runtime::protocol::command::PublicV1OperationCommand;
+        use kuberic_runtime::protocol::public_operations::{
+            PublicOperationClass, PublicOperationIntent, PublicOperationProgram,
+        };
+        use kuberic_runtime::protocol::types::{
+            ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, ReplicaIdentity,
+            ReplicaInstanceId, ReplicaRole, derive_agent_generation, derive_initialization_id,
+        };
 
-            fn authorized<T>(message: T) -> tonic::Request<T> {
-                let mut request = tonic::Request::new(message);
-                request
-                    .metadata_mut()
-                    .insert("authorization", "Bearer startup-token".parse().unwrap());
-                request
+        fn authorized<T>(message: T) -> tonic::Request<T> {
+            let mut request = tonic::Request::new(message);
+            request
+                .metadata_mut()
+                .insert("authorization", "Bearer startup-token".parse().unwrap());
+            request
+        }
+
+        let root = tempfile::tempdir()?;
+        let config = super::Config {
+            resource_uid: "binary-startup-resource".into(),
+            replica_id: 1,
+            pod_uid: "binary-startup-pod".into(),
+            pvc_uid: "binary-startup-pvc".into(),
+            pod_ip: "127.0.0.1".into(),
+            set_name: "binary-startup".into(),
+            namespace: "default".into(),
+            bearer_token: "startup-token".into(),
+            data_root: root.path().to_path_buf(),
+            control_address: "127.0.0.1:0".parse()?,
+            replication_address: "127.0.0.1:0".parse()?,
+            application_address: "127.0.0.1:0".parse()?,
+            live_test_copy_gate_address: None,
+        };
+        let application_path = root.path().join("application");
+        assert!(super::KvPersistence::is_fresh_empty(&application_path)?);
+        let application = super::Arc::new(super::KvService::new(
+            super::Arc::new(super::KvPersistence::open(&application_path)?),
+            "http://127.0.0.1:0".into(),
+            CopyGate::disabled(),
+        ));
+        let host = super::replica_host(
+            &config,
+            application.clone(),
+            super::ApplicationStorageState::FreshEmpty,
+        );
+        let listener = tokio::net::TcpListener::bind(config.control_address).await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let (ready, mut ready_receiver) = tokio::sync::watch::channel(false);
+        let startup = tokio::spawn(async move {
+            if let Some(mut running) = host.start_with_shutdown(listener, receiver.clone()).await? {
+                ready.send_replace(true);
+                super::wait_shutdown(receiver).await;
+                running.shutdown();
+                running.wait().await?;
             }
-
-            let root = tempfile::tempdir()?;
-            let config = super::Config {
-                resource_uid: "binary-startup-resource".into(),
-                replica_id: 1,
-                pod_uid: "binary-startup-pod".into(),
-                pvc_uid: "binary-startup-pvc".into(),
-                pod_ip: "127.0.0.1".into(),
-                set_name: "binary-startup".into(),
-                namespace: "default".into(),
-                bearer_token: "startup-token".into(),
-                data_root: root.path().to_path_buf(),
-                control_address: "127.0.0.1:0".parse()?,
-                replication_address: "127.0.0.1:0".parse()?,
-                application_address: "127.0.0.1:0".parse()?,
-                live_test_copy_gate_address: None,
+            Ok::<_, kuberic_runtime::host::HostError>(())
+        });
+        let result = tokio::time::timeout(super::Duration::from_secs(20), async {
+            let mut client =
+                proto::agent_control_client::AgentControlClient::connect(address.clone()).await?;
+            let status_request = proto::GetAgentStatusRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: config.resource_uid.clone(),
+                replica_id: config.replica_id,
+                expected_instance_id: config.pod_uid.clone(),
             };
-            let application_path = root.path().join("application");
-            assert!(super::KvPersistence::is_fresh_empty(&application_path)?);
-            let application = super::Arc::new(super::KvService::new(
-                super::Arc::new(super::KvPersistence::open(&application_path)?),
-                "http://127.0.0.1:0".into(),
-                CopyGate::disabled(),
-            ));
-            let host = super::replica_host(
-                &config,
-                application.clone(),
-                super::ApplicationStorageState::FreshEmpty,
+            let status = client
+                .get_status(authorized(status_request.clone()))
+                .await?
+                .into_inner();
+            anyhow::ensure!(status.storage_state == proto::AgentStorageState::Uninitialized as i32);
+            let resource = super::ResourceUid::new(&config.resource_uid);
+            let replica_id = super::ReplicaId::new(config.replica_id);
+            let initialization = derive_initialization_id(
+                &resource,
+                replica_id,
+                &super::PodUid::new(&config.pod_uid),
+                &super::PvcUid::new(&config.pvc_uid),
             );
-            let listener = tokio::net::TcpListener::bind(config.control_address).await?;
-            let address = format!("http://{}", listener.local_addr()?);
-            let (shutdown, receiver) = tokio::sync::watch::channel(false);
-            let (ready, mut ready_receiver) = tokio::sync::watch::channel(false);
-            let startup = tokio::spawn(async move {
-                if let Some(mut running) =
-                    host.start_with_shutdown(listener, receiver.clone()).await?
-                {
-                    ready.send_replace(true);
-                    super::wait_shutdown(receiver).await;
-                    running.shutdown();
-                    running.wait().await?;
-                }
-                Ok::<_, kuberic_runtime::host::HostError>(())
-            });
-            let result = tokio::time::timeout(super::Duration::from_secs(20), async {
-                let mut client =
-                    proto::agent_control_client::AgentControlClient::connect(address.clone())
-                        .await?;
-                let status_request = proto::GetAgentStatusRequest {
+            let identity = ReplicaIdentity {
+                replica_id,
+                instance_id: ReplicaInstanceId::new(&config.pod_uid),
+                agent_generation: derive_agent_generation(&initialization),
+            };
+            let configuration = ConfigurationDescriptor::new(
+                Epoch::new(0, 1),
+                replica_id,
+                vec![ConfigurationMember {
+                    identity: identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            );
+            client
+                .execute(authorized(proto::ExecuteCommandRequest {
                     protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                    resource_uid: config.resource_uid.clone(),
-                    replica_id: config.replica_id,
-                    expected_instance_id: config.pod_uid.clone(),
-                };
-                let status = client
+                    resource_uid: resource.to_string(),
+                    target: Some(identity.clone().into()),
+                    expected_process_session_id: status.process_session_id,
+                    command: Some(
+                        proto::execute_command_request::Command::InitializeAgentStore(
+                            proto::InitializeAgentStoreCommand {
+                                initialization_id: initialization.to_string(),
+                                resource_uid: resource.to_string(),
+                                local_replica_id: replica_id.value(),
+                                expected_instance_id: config.pod_uid.clone(),
+                                expected_pod_uid: config.pod_uid.clone(),
+                                expected_pvc_uid: config.pvc_uid.clone(),
+                                assigned_agent_generation: identity.agent_generation.to_string(),
+                                effective_policy: Some(proto::EffectivePolicy {
+                                    replica_set_size: 1,
+                                    write_quorum: 1,
+                                    read_quorum: 1,
+                                    failover_delay_seconds: 1,
+                                }),
+                                bootstrap_configuration: Some(configuration.into()),
+                                provisioning: None,
+                            },
+                        ),
+                    ),
+                }))
+                .await?;
+            drop(client);
+            ready_receiver.wait_for(|ready| *ready).await?;
+            let mut client =
+                proto::agent_control_client::AgentControlClient::connect(address).await?;
+            let report = convert::normalize_public_v1_agent_status_report(
+                client
                     .get_status(authorized(status_request.clone()))
                     .await?
-                    .into_inner();
-                anyhow::ensure!(
-                    status.storage_state == proto::AgentStorageState::Uninitialized as i32
-                );
-                let resource = super::ResourceUid::new(&config.resource_uid);
-                let replica_id = super::ReplicaId::new(config.replica_id);
-                let initialization = derive_initialization_id(
-                    &resource,
-                    replica_id,
-                    &super::PodUid::new(&config.pod_uid),
-                    &super::PvcUid::new(&config.pvc_uid),
-                );
-                let identity = ReplicaIdentity {
-                    replica_id,
-                    instance_id: ReplicaInstanceId::new(&config.pod_uid),
-                    agent_generation: derive_agent_generation(&initialization),
-                };
-                let configuration = ConfigurationDescriptor::new(
-                    Epoch::new(0, 1),
-                    replica_id,
-                    vec![ConfigurationMember {
-                        identity: identity.clone(),
-                        role: ReplicaRole::Primary,
-                    }],
-                    1,
-                );
-                client
-                    .execute(authorized(proto::ExecuteCommandRequest {
-                        protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
-                        resource_uid: resource.to_string(),
-                        target: Some(identity.clone().into()),
-                        expected_process_session_id: status.process_session_id,
-                        command: Some(
-                            proto::execute_command_request::Command::InitializeAgentStore(
-                                proto::InitializeAgentStoreCommand {
-                                    initialization_id: initialization.to_string(),
-                                    resource_uid: resource.to_string(),
-                                    local_replica_id: replica_id.value(),
-                                    expected_instance_id: config.pod_uid.clone(),
-                                    expected_pod_uid: config.pod_uid.clone(),
-                                    expected_pvc_uid: config.pvc_uid.clone(),
-                                    assigned_agent_generation: identity
-                                        .agent_generation
-                                        .to_string(),
-                                    effective_policy: Some(proto::EffectivePolicy {
-                                        replica_set_size: 1,
-                                        write_quorum: 1,
-                                        read_quorum: 1,
-                                        failover_delay_seconds: 1,
-                                    }),
-                                    bootstrap_configuration: Some(configuration.clone().into()),
-                                    provisioning: None,
-                                },
-                            ),
-                        ),
-                    }))
-                    .await?;
-                drop(client);
-                ready_receiver.wait_for(|ready| *ready).await?;
-                let mut client =
-                    proto::agent_control_client::AgentControlClient::connect(address).await?;
-                let report = convert::normalize_public_v1_agent_status_report(
-                    client
-                        .get_status(authorized(status_request.clone()))
-                        .await?
-                        .into_inner(),
-                )?;
-                anyhow::ensure!(
-                    report.open_mode == OpenMode::New,
-                    "fresh production storage must authorize New, not Existing"
-                );
-                let query = || {
-                    authorized(proto::ReplicaSnapshotRequest {
-                        protocol_version: ORDINARY_ACTION_FORMAT,
-                        resource_uid: resource.to_string(),
-                        target: Some(identity.clone().into()),
-                        expected_process_session_id: report.process_session_id.to_string(),
-                    })
-                };
-                let response = client.get_snapshot(query()).await?.into_inner();
-                let ReplicaAgentQueryResult::Initialized(snapshot) =
-                    serde_json::from_slice(&response.canonical_json)?
-                else {
-                    anyhow::bail!("ordinary snapshot required")
-                };
-                let mut goal = ReplicaGoal {
-                    format: ORDINARY_ACTION_FORMAT,
+                    .into_inner(),
+            )?;
+            anyhow::ensure!(
+                report.open_mode == OpenMode::New,
+                "fresh production storage must authorize New, not Existing"
+            );
+            let program = PublicOperationProgram::Open {
+                replica: identity.clone(),
+                existing: false,
+            };
+            let mut command = PublicV1OperationCommand {
+                target: identity,
+                intent: PublicOperationIntent {
                     identity: report.identity,
                     operation_id: OperationId::new("binary-first-open"),
                     revision: 1,
-                    scope: ReplicaScope {
-                        history: report.history,
-                        storage: report.storage_incarnation,
-                        process_session_id: report.process_session_id.clone(),
-                        creation_id: snapshot.creation_id,
-                        epoch: configuration.epoch,
-                        configuration: ReplicaConfigurationScope {
-                            current: configuration,
-                            previous: None,
-                            replicas: Vec::new(),
-                        },
-                    },
-                    desired: ReplicaGoalKind::Prepare {
-                        role: ReplicaRole::Primary,
-                    },
-                };
-                for desired in [
-                    ReplicaGoalKind::Prepare {
-                        role: ReplicaRole::Primary,
-                    },
-                    ReplicaGoalKind::Reconfigure {
-                        role: ReplicaRole::Primary,
-                        catch_up: Some(PublicCatchUpMode::WriteQuorum),
-                    },
-                    ReplicaGoalKind::Close,
-                ] {
-                    goal.desired = desired;
-                    goal.revision += 1;
-                    goal.operation_id = OperationId::new(format!("binary-goal-{}", goal.revision));
-                    client
-                        .submit_goal(authorized(proto::ReplicaGoalRequest {
-                            protocol_version: ORDINARY_ACTION_FORMAT,
-                            canonical_json: serde_json::to_vec(&goal)?,
-                        }))
-                        .await?;
-                    loop {
-                        let response = client.get_snapshot(query()).await?.into_inner();
-                        let ReplicaAgentQueryResult::Initialized(snapshot) =
-                            serde_json::from_slice(&response.canonical_json)?
-                        else {
-                            anyhow::bail!("ordinary snapshot required")
-                        };
-                        if let Some(observation) =
-                            snapshot.goals.iter().find(|entry| entry.goal == goal)
-                            && observation.status != ReplicaGoalStatus::Pending
-                        {
-                            anyhow::ensure!(
-                                observation.status == ReplicaGoalStatus::Achieved,
-                                "{observation:?}"
-                            );
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                    if matches!(goal.desired, ReplicaGoalKind::Reconfigure { .. }) {
-                        application
-                            .replicate_put("ordinary".into(), "acknowledged".into())
-                            .await?;
-                        anyhow::ensure!(
-                            application.get("ordinary").await?.as_deref() == Some("acknowledged")
-                        );
-                    }
-                }
-                let opened = convert::normalize_public_v1_agent_status_report(
-                    client
-                        .get_status(authorized(status_request))
-                        .await?
-                        .into_inner(),
-                )?;
-                anyhow::ensure!(opened.open_mode == OpenMode::Existing);
-                anyhow::ensure!(application_path.join("state.json").is_file());
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
-            shutdown.send_replace(true);
-            let host_result = startup.await?;
-            let application_result = application.shutdown_and_drain().await;
-            result??;
-            host_result?;
-            application_result?;
-            Ok(())
-        }
+                    process_session_id: report.process_session_id.clone(),
+                    class: PublicOperationClass::Authority,
+                    input_digest: program.digest(),
+                    replay_disposition: program.replay_disposition(),
+                    lifecycle: None,
+                    program: Some(program),
+                },
+            };
+            client
+                .execute(authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: resource.to_string(),
+                    target: Some(command.target.clone().into()),
+                    expected_process_session_id: report.process_session_id.to_string(),
+                    command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                        convert::public_v1_operation_command_to_proto(&command)?,
+                    )),
+                }))
+                .await?;
+            let opened = convert::normalize_public_v1_agent_status_report(
+                client
+                    .get_status(authorized(status_request))
+                    .await?
+                    .into_inner(),
+            )?;
+            anyhow::ensure!(opened.open_mode == OpenMode::Existing);
+            anyhow::ensure!(application_path.join("state.json").is_file());
+            let close = PublicOperationProgram::Close;
+            command.intent.operation_id = OperationId::new("binary-close");
+            command.intent.revision += 1;
+            command.intent.class = PublicOperationClass::Close;
+            command.intent.input_digest = close.digest();
+            command.intent.replay_disposition = close.replay_disposition();
+            command.intent.program = Some(close);
+            client
+                .execute(authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: resource.to_string(),
+                    target: Some(command.target.clone().into()),
+                    expected_process_session_id: report.process_session_id.to_string(),
+                    command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                        convert::public_v1_operation_command_to_proto(&command)?,
+                    )),
+                }))
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        shutdown.send_replace(true);
+        let host_result = startup.await?;
+        let application_result = application.shutdown_and_drain().await;
+        result??;
+        host_result?;
+        application_result?;
+        Ok(())
     }
 
     #[test]

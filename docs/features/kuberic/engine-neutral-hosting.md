@@ -1,15 +1,11 @@
-# SF Hosting: Ordinary M1 and Engine-Owned M2 Integration
+# SF Hosting: Ordinary M1 and Remaining Engine Integration
 
 **CURRENT:** [ordinary hosting M1](ordinary-hosting-m1.md) implements generic
 controller goals, local stages, host actions/remote state, discovery and retained
-ordinary joining through the real production path. **Bounded M2 implementation
-is qualified; M3 exhaustive qualification is deferred.** Built-in V1,
-KV/SQLite/external-provider and independent PG use authenticated engine sessions
-and retained actual ordinary joins. Shared companion/grant/carrier authority
-plumbing is removed, not retained as a fallback.
-Documentation implementation review and actual independent final Sol/Astra
-gates remain pending; this is not complete M2 workflow or production certification.
-The [project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap)
+ordinary joining through the real production path. **M2 engine-session integration
+and M3 comprehensive qualification remain NOT IMPLEMENTED.** Built-in/KV/SQLite/
+PostgreSQL ordinary production Open explicitly rejects until M2; this checkpoint
+is not deployable with those engines. The [project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap)
 is the single remaining implementation queue.
 
 ## CURRENT — delivered bounded hosting
@@ -18,9 +14,6 @@ is the single remaining implementation queue.
 The following pinned grant/companion dispatch and old formats are not current
 production behavior. Native/component algorithms and their bounded evidence
 remain relevant; use [M1](ordinary-hosting-m1.md) for the replacement host contract.
-All sections through “Source-confirmed extension-boundary difference” below
-describe that pinned baseline, not available companion methods or current
-format instructions. The implemented ordinary M1/M2 boundary follows afterward.
 
 This is the bounded common-host responsibility port on top of merged #198
 (`2f97d86605ce69f3812c7d5ba1dd9c6d606ca8d7`), with initial code phases through
@@ -104,7 +97,7 @@ Ranges are inspected source evidence, not executed native tests.
 | `FailoverUnitProxy.cpp:1483–1664`; user API invoker `:50–64` | Cancellation can race Begin; drain waits owned work | Retained Rust roots/control tasks and compensation joins outlive RPC observers. Cancellation invalidates access and aborts **and joins** roots; engine descendants require their declared ownership/drain boundary. |
 | `ReconfigurationAgentProxy.cpp:1386–1456`; Close child operation `:78–111` | Native outer Close may Abort and send success after child failure | Deliberately different local result: abort/join still runs, but child failure remains a failed public completion even after positive containment. Failed/lost drain never becomes positive containment. |
 
-This historical implementation map covers relevant RAP/FUP/common-proxy semantics, not full RA
+This current implementation map covers relevant RAP/FUP/common-proxy semantics, not full RA
 reconfiguration stages, FM placement, Hosting2 process management, native
 compatibility tables, settings or automatic recovery policy.
 
@@ -256,17 +249,15 @@ real fences. The redesign replaces their safety owners, not just their names.
 See [source provenance and notices](sf-v1-port-provenance.md) and the retained
 [MIT attribution](../../../THIRD-PARTY-NOTICES).
 
-<a id="proposed--ordinary-engine-boundary"></a>
+## PROPOSED — ordinary engine boundary
 
-## CURRENT — ordinary engine boundary
-
-The original design anchor above is retained for incoming links. Generic
-host/controller [M1](ordinary-hosting-m1.md), built-in V1 and independent PG
-integration are implemented. Engine retirement/effect fencing and actual joins
-are qualified by [actual M2 evidence](testing.md#m2-accepted-evidence-and-remaining-boundaries),
-not inferred from generic M1 tests. Exhaustive M3 remains unimplemented.
-The complete files containing `Replicator`, `PrimaryReplicator` and
-`StateProvider` are unchanged from the M2 base, stronger than method-name equality.
+This section retains the complete target design. Its generic host/controller
+portion is implemented by [M1](ordinary-hosting-m1.md); built-in/PG authenticated
+engine sessions and exhaustive recovery qualification remain proposed M2/M3.
+Mechanism removal below describes the final target: legacy companion/grant
+symbols still serve not-yet-moved engine/component consumers, not an M1 production
+fallback. Public `Replicator`, `PrimaryReplicator` and `StateProvider` method sets
+are unchanged. Do not infer M2 acceptance from generic M1 tests.
 
 ### Decision and alternatives
 
@@ -311,8 +302,8 @@ and at most one provider writer. Mismatched/abandoned creation is fenced and
 settled. Engine Open owns and returns its real endpoint **before** peer-dependent
 role recovery; pending recovery must not block the connectivity it needs.
 
-`with_custom_control` and public outbound Build-authority accessors are removed.
-Read-only partition/lifecycle/creation context and generic peer discovery remain.
+Remove `with_custom_control` and public outbound Build-authority accessors.
+Keep read-only partition/lifecycle/creation context and generic peer discovery.
 The local agent publishes the fresh endpoint immediately after successful Open
 as **DiscoveryPending**, before any peer-dependent role/epoch/configuration
 callback must complete. Authenticated discovery and engine-owned recovery/status
@@ -387,24 +378,10 @@ Built-in copy preserves receiver-before-context establishment, target-origin
 context including empty items/EOF, source state at start-minus-one, and final
 copy **plus** replication boundary ACKs. PG retains its own backup/slot/WAL/
 receive+replay/checkpoint protocol; it need not imitate built-in queues.
-The actual built-in
-[session gate](../../../kuberic-runtime/src/replicator/v1/service_adapter/engine_session.rs)
-and [ordinary callbacks](../../../kuberic-runtime/src/replicator/v1/service_adapter/production.rs#L720-L920)
-are separate from PG's
-[independent native session owner](../../../examples/postgres/src/public_session.rs).
-PG's exact joint `(P,C)` → current-only `(None,C)` continuation preserves only an
-existing session for unchanged C/Primary/identity/history/epoch while either
-latest publication is pending. It creates neither fresh transfer nor SQL
-authority; retirement/incompatibility invalidates it. See
-[native continuity and physical joins](../postgres/design.md#native-build-and-catch-up).
 
 ### Controller-to-host messages and action selection
 
-These are logical responsibilities, **not API signatures**. Delivered semantic
-goals and publications are defined in
-[`replica_goal.rs`](../../../kuberic-runtime/src/protocol/replica_goal.rs);
-factory discovery is read-only
-[`ReplicatorFactoryContext`](../../../kuberic-runtime/src/replicator/mod.rs#L635-L685).
+These are logical proposed messages, **not delivered API signatures**:
 
 | Request / direction | Preconditions, action, completion and stale rule |
 |---|---|
@@ -430,7 +407,7 @@ first. Successful copy is not serving access or storage-deletion permission.
 
 ### Cancellation, Close, Abort and real joins
 
-`callback_ownership` policy selection is removed. Host retains **every** accepted
+Remove `callback_ownership` policy selection. Host retains **every** accepted
 ordinary future and immutable result independently of RPC observers until
 End-like completion; response loss never drops accepted callback work.
 Cancellation invalidates generation/access first and is advisory. Portable
@@ -439,8 +416,8 @@ There is no inferred selective cancellation capability or new protected method/
 token. Engine-private cooperative cancellation may shorten cleanup but is not
 a host integration interface.
 
-**Implemented ordinary lifecycle obligation, not a universal native IDL
-guarantee:** successful ordinary Close settles the engine endpoint, receivers,
+**Required M1 ordinary lifecycle obligation, not a universal native IDL
+guarantee; real built-in/PG adaptation remains M2:** successful ordinary Close settles the engine endpoint, receivers,
 provider interactions and descendants. Abort synchronously stops admission and
 initiates native fencing/cancellation. Engine retains a terminal join owner;
 ordinary Close remains awaitable after Abort and observes the same outcome.
@@ -464,7 +441,7 @@ selection/outcome, successful prefix, ambiguity and retirement properties.
 Replace instruction-journal layout; it is not immutable protocol. Keep source
 remote results/tombstones until accepted incarnation/epoch rejection watermark
 permits compaction; bound storage, never TTL-forget unresolved ambiguity.
-Target grant journals/reauthorization receipts are removed. Host reports do not
+Remove target grant journal/reauthorization receipts. Host reports do not
 replace engine data/history.
 
 Restart unpublishes process-bound endpoints/sessions and stays closed. Open
@@ -505,27 +482,24 @@ fallback is not removed by this redesign.
 | NativeBinding controller-attempt fields | **Removed** | Generic authenticated identity and engine-owned session/epoch/history checks |
 | Access/PC/CC/catch-up owner | **Retained/refactored privately** | Host responsibility distinct from native commitment |
 | Metadata/CRD/control payload formats | **Replaced/versioned** | Local durable safety; no native wire compatibility claim |
-| PG durable metadata, slots, lineage/process ownership | **Retained** | Companion removal is not field-by-field metadata-removal proof |
+| PG durable metadata, slots, lineage/process ownership | **Retained initially** | Companion removal is not field-by-field metadata-removal proof |
 
 ### Migration and unresolved proof risks
 
 The [single project roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
-records delivered M1, bounded qualified M2 integration, and deferred M3
-recovery/failure qualification. Superseded paths are removed
+orders M1 host/controller replacement, M2 built-in and real independent PG
+integration, and M3 recovery/failure qualification. Superseded paths are removed
 alongside their replacements, not retained for a later compatibility cutover.
 The target supports fresh deployments only: no old-state import, upgrade or
 downgrade path, no mixed-version mode and no automatic data/PGDATA reset.
 Incompatible metadata and commands reject before mutation; matching-format
-restart still recovers existing durable state. Current inputs/assets all use
-matched format 16. Actual M2 acceptance covers effect linearization, source
-retirement/target quarantine, Close-after-Abort settlement, stale Ready fencing
-and bounded same-format recovery; it does not close the exhaustive M3 matrix.
-The bounded retained-member case requires an unchanged available Primary and
-exact history/epoch/configuration/storage: fresh session, joined predecessor,
-nonregressing provider transfer, then exact ordinary callback readmission.
-Singleton restart and subsequent real KV growth are also qualified, not general
-election or handoff. See [actual selectors and limits](testing.md#m2-accepted-evidence-and-remaining-boundaries);
-the pinned historical selectors remain baselines.
+restart still recovers existing durable state. Its acceptance gates must prove
+effect linearization, source retirement/target quarantine, Close-after-Abort settlement,
+same-format crash recovery and no stale Ready reuse. These are unresolved
+**implementation risks**, not permission to leave target owners unspecified or
+claims that M2/M3 code exists. Current [M1 selectors](testing.md#ordinary-hosting-m1)
+qualify the generic host/controller contract; [historical selectors](testing.md#hosting-redesign-baselines-and-future-acceptance)
+remain baselines, not proof of replacement engine sessions.
 
 Downstream MySQL remains unqualified: implement ordinary coherent creation,
 authenticated native session establishment/retirement, lineage/progress/restart,

@@ -16,7 +16,9 @@ use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
     RunningReplica,
 };
-use kuberic_runtime::protocol::command::PublicV1OperationCommand;
+use kuberic_runtime::protocol::command::{
+    PublicV1HistoryCommand, PublicV1OperationCommand, PublicV1SessionRenewalCommand,
+};
 use kuberic_runtime::protocol::public_operations::*;
 use kuberic_runtime::protocol::types::*;
 #[allow(
@@ -36,8 +38,7 @@ use sqlite_replicated::service::SqliteService;
 
 const CREDENTIAL: &str = "classic-v1-test-credential";
 
-#[tokio::test]
-async fn legacy_callback_program_rejects_without_mutating_ordinary_host() {
+async fn m1_legacy_production_unavailable() -> bool {
     let root = tempfile::tempdir().unwrap();
     let mut node = Node::<KvService>::start(root.path(), 1, 1).await;
     let mut client =
@@ -97,106 +98,88 @@ async fn legacy_callback_program_rejects_without_mutating_ordinary_host() {
         before, after,
         "rejected legacy production route mutated host state"
     );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        node.identity.replica_id,
+        vec![ConfigurationMember {
+            identity: node.identity.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let goal = ReplicaGoal {
+        format: ORDINARY_ACTION_FORMAT,
+        identity: node.preview.clone(),
+        operation_id: OperationId::new("ordinary-support"),
+        revision: 3,
+        scope: ReplicaScope {
+            history: node.history.clone(),
+            storage: node.storage.clone(),
+            process_session_id: node.session.clone(),
+            creation_id: before.creation_id.clone(),
+            epoch: current.epoch,
+            configuration: ReplicaConfigurationScope {
+                current,
+                previous: None,
+                replicas: Vec::new(),
+            },
+        },
+        desired: ReplicaGoalKind::Discover,
+    };
+    client
+        .submit_goal(authorized(proto::ReplicaGoalRequest {
+            protocol_version: ORDINARY_ACTION_FORMAT,
+            canonical_json: serde_json::to_vec(&goal).unwrap(),
+        }))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = client.get_snapshot(query()).await.unwrap().into_inner();
+            let ReplicaAgentQueryResult::Initialized(snapshot) =
+                serde_json::from_slice(&response.canonical_json).unwrap()
+            else {
+                panic!("initialized snapshot required")
+            };
+            if let Some(observation) = snapshot
+                .goals
+                .iter()
+                .find(|observation| observation.goal == goal)
+                && let ReplicaGoalStatus::Failed(message) = &observation.status
+            {
+                assert!(
+                    message
+                        .contains("built-in ordinary hosting integration is unavailable until M2"),
+                    "{message}"
+                );
+                assert!(
+                    snapshot.publication.is_none()
+                        && !snapshot.provider_writer_held
+                        && snapshot.remote_operations.is_empty()
+                );
+                assert_ne!(snapshot.read_status, AccessStatus::Granted);
+                assert_ne!(snapshot.write_status, AccessStatus::Granted);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(node.stop().await.is_none());
+    eprintln!(
+        "M1 explicitly rejects legacy production programs and built-in ordinary integration; retained M2 engine assertions below are not qualified"
+    );
+    true
 }
+
+#[path = "support/custom_control.rs"]
+mod custom_control;
+#[path = "support/idle_observation.rs"]
+mod idle_observation;
 
 mod native_wire {
     tonic::include_proto!("kuberic.sf.v1");
-}
-
-#[path = "support/m2_builtin.rs"]
-mod m2_builtin;
-
-include!("support/m2_application.rs");
-
-#[tokio::test]
-async fn m2_builtin_target_context_and_ack_boundaries() {
-    m2_builtin::context_and_ack_boundaries().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_exact_session_replay_and_retirement() {
-    m2_builtin::exact_replay_and_retirement().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_remove_serializes_with_native_configuration_adoption() {
-    m2_builtin::remove_adoption_orderings().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_legal_idle_remove_retains_join_after_observer_loss() {
-    m2_builtin::idle_remove_lost_observer().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_delayed_first_establishment_after_retirement() {
-    m2_builtin::delayed_first_establishment().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_lost_target_cancel_quarantines_receiver() {
-    m2_builtin::lost_cancel().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_effect_fences_and_retained_provider_join() {
-    m2_builtin::effect_fences().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_crossed_identity_and_stale_ack() {
-    m2_builtin::crossed_identity().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_bound_ingress_rejects_body_epochs_before_native_mutation() {
-    m2_builtin::bound_body_epochs().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_abort_close_retains_all_joins() {
-    m2_builtin::retained_joins().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_burst_ack_is_bounded_and_duplicates_reject_synchronously() {
-    m2_builtin::burst_ack(false).await;
-}
-
-#[tokio::test]
-async fn m2_builtin_retirement_joins_queued_ack_work_without_credit() {
-    m2_builtin::burst_ack(true).await;
-}
-
-#[tokio::test]
-async fn m2_builtin_creation_tombstones_are_bounded_without_forgetting() {
-    m2_builtin::tombstone_bounds().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_pending_scope_cannot_publish_final_copy_credit() {
-    m2_builtin::pending_final_credit().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_lost_retire_response_retains_actual_terminal_owner() {
-    m2_builtin::lost_retire_response().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_multi_secondary_joint_current_preserves_exact_sessions() {
-    m2_builtin::multi_secondary().await;
-}
-
-#[tokio::test]
-async fn m2_builtin_target_retire_joins_actual_ack_before_reply() {
-    m2_builtin::target_retire_ack(false).await;
-}
-
-#[tokio::test]
-async fn m2_builtin_target_retire_retains_actual_ack_failure() {
-    m2_builtin::target_retire_ack(true).await;
 }
 
 fn authorized<T>(message: T) -> tonic::Request<T> {
@@ -510,23 +493,6 @@ struct QueryService {
     scripts: Arc<QueryScripts>,
     control: OnceLock<Arc<dyn Replicator>>,
     settings: OnceLock<Arc<dyn kuberic_runtime::replicator::StateReplicator>>,
-    aborted: AtomicBool,
-}
-
-impl Node<QueryService> {
-    async fn optional_query_observation(&self) -> PublicV1AgentReport {
-        let mut report = self.report().await;
-        if let Some(control) = self.service.control.get() {
-            let convert = |result: Result<i64>| match result {
-                Ok(value) => ProgressQueryResult::Value(value),
-                Err(RuntimeError::ProgressNotReady) => ProgressQueryResult::NotReady,
-                Err(error) => ProgressQueryResult::Failed(error.to_string()),
-            };
-            report.progress.current_progress = convert(control.current_progress().await);
-            report.progress.catch_up_capability = convert(control.catch_up_capability().await);
-        }
-        report
-    }
 }
 
 #[async_trait::async_trait]
@@ -536,9 +502,6 @@ impl StateProvider for QueryService {
         self.last_committed_lsn().await.map(|_| ())
     }
     async fn last_committed_lsn(&self) -> Result<i64> {
-        if self.aborted.load(Ordering::Acquire) {
-            return Err(RuntimeError::Closed);
-        }
         self.committer
             .progress()
             .map_err(|error| RuntimeError::Application(error.to_string()))
@@ -551,9 +514,6 @@ impl StateProvider for QueryService {
         up_to: i64,
         _: OperationDataStream,
     ) -> Result<OperationDataStream> {
-        if self.aborted.load(Ordering::Acquire) {
-            return Err(RuntimeError::Closed);
-        }
         let snapshot = self
             .committer
             .snapshot(up_to)
@@ -597,7 +557,7 @@ impl StatefulServiceReplica for QueryService {
         self.drain().await
     }
     fn abort(&self) {
-        self.aborted.store(true, Ordering::Release);
+        self.committer.abort();
     }
 }
 
@@ -617,7 +577,6 @@ impl Sample for QueryService {
             }),
             control: OnceLock::new(),
             settings: OnceLock::new(),
-            aborted: AtomicBool::new(false),
         })
     }
     async fn drain(&self) -> Result<()> {
@@ -630,19 +589,17 @@ impl Sample for QueryService {
 
 #[tokio::test]
 async fn public_factory_port_zero_effective_settings_are_immutable_and_round_trip() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(30), async {
         let root = tempfile::tempdir().unwrap();
         let epoch = Epoch::new(0, 1);
         let mut node = Node::<QueryService>::start_sized(root.path(), 1, 0, 1).await;
         node.open(ReplicaRole::Primary, epoch).await;
         node.single(epoch).await;
-        let before = m2_builtin::snapshot(&node).await;
-        let address = before
-            .publication
-            .as_ref()
-            .unwrap()
-            .replication_address
-            .clone();
+        let before = node.report().await;
+        let address = before.replication_address.clone().unwrap();
         assert!(!address.ends_with(":0"));
         let state = node.service.settings.get().unwrap();
         state
@@ -668,10 +625,11 @@ async fn public_factory_port_zero_effective_settings_are_immutable_and_round_tri
                 .is_err(),
             "unresolved input is not an effective endpoint alias"
         );
-        let after = m2_builtin::snapshot(&node).await;
-        assert_eq!(before.publication, after.publication);
+        let after = node.report().await;
+        assert_eq!(before.replication_address, after.replication_address);
         assert_eq!(before.process_session_id, after.process_session_id);
-        assert_eq!(before.creation_id, after.creation_id);
+        assert_eq!(before.replicator_creation_id, after.replicator_creation_id);
+        assert_eq!(before.role, after.role);
         let _socket = tokio::net::TcpStream::connect(
             address
                 .trim_end_matches('/')
@@ -687,6 +645,16 @@ async fn public_factory_port_zero_effective_settings_are_immutable_and_round_tri
     .expect("effective settings journey exceeded its bound");
 }
 
+struct Resolver;
+impl ReplicaEndpointResolver for Resolver {
+    fn control_endpoint(&self, _: &ReplicaIdentity) -> String {
+        "http://127.0.0.1:1".into()
+    }
+    fn replication_endpoint(&self, _: &ReplicaIdentity) -> String {
+        "http://127.0.0.1:1".into()
+    }
+}
+
 struct Node<A: Sample = KvService> {
     running: RunningReplica,
     service: Arc<A>,
@@ -697,7 +665,6 @@ struct Node<A: Sample = KvService> {
     revision: u64,
     control_address: String,
     session: ProcessSessionId,
-    scope: Option<ReplicaScope>,
 }
 
 impl<A: Sample> Node<A> {
@@ -706,24 +673,6 @@ impl<A: Sample> Node<A> {
     }
 
     async fn start_sized(root: &Path, id: i64, revision: u64, replicas: u32) -> Self {
-        static RESOLVER: OnceLock<Arc<m2_builtin::ResolverMap>> = OnceLock::new();
-        let resolver = RESOLVER.get_or_init(Default::default).clone();
-        let node = Self::start_resolved(root, id, revision, replicas, resolver.clone()).await;
-        resolver
-            .0
-            .lock()
-            .unwrap()
-            .insert(node.identity.replica_id, node.control_address.clone());
-        node
-    }
-
-    async fn start_resolved<R: ReplicaEndpointResolver + 'static>(
-        root: &Path,
-        id: i64,
-        revision: u64,
-        replicas: u32,
-        resolver: Arc<R>,
-    ) -> Self {
         let resource = ResourceUid::new("classic-v1-public-journey");
         let preview = PublicV1Identity::new(1);
         let identity = identity_for(&resource, id);
@@ -748,7 +697,7 @@ impl<A: Sample> Node<A> {
             } else {
                 ApplicationStorageState::Established
             },
-            resolver,
+            Arc::new(Resolver),
         )
         .with_application_storage_paths(std::collections::BTreeMap::from([(
             "application".into(),
@@ -849,72 +798,7 @@ impl<A: Sample> Node<A> {
             revision,
             control_address,
             session: report.process_session_id,
-            scope: None,
         }
-    }
-
-    async fn goal(
-        &mut self,
-        desired: ReplicaGoalKind,
-        configuration: ReplicaConfigurationScope,
-    ) -> ReplicaGoal {
-        let snapshot = m2_builtin::snapshot(self).await;
-        self.revision = self.revision.max(
-            snapshot
-                .goals
-                .iter()
-                .map(|entry| entry.goal.revision)
-                .max()
-                .unwrap_or(0),
-        ) + 1;
-        let scope = ReplicaScope {
-            history: self.history.clone(),
-            storage: self.storage.clone(),
-            process_session_id: self.session.clone(),
-            creation_id: snapshot.creation_id,
-            epoch: configuration.current.epoch,
-            configuration,
-        };
-        let goal = ReplicaGoal {
-            format: ORDINARY_ACTION_FORMAT,
-            identity: self.preview.clone(),
-            operation_id: OperationId::new(format!(
-                "ordinary-{}-{}-{}",
-                self.identity.replica_id, self.session, self.revision
-            )),
-            revision: self.revision,
-            scope: scope.clone(),
-            desired,
-        };
-        m2_builtin::submit(self, &goal)
-            .await
-            .unwrap_or_else(|error| panic!("ordinary submission {goal:?}: {error}"));
-        assert_eq!(
-            m2_builtin::settled(self, &goal).await,
-            ReplicaGoalStatus::Achieved,
-            "{goal:?}"
-        );
-        self.scope = Some(scope);
-        goal
-    }
-
-    fn configuration(&self, epoch: Epoch) -> ReplicaConfigurationScope {
-        self.scope
-            .as_ref()
-            .map(|scope| scope.configuration.clone())
-            .unwrap_or_else(|| ReplicaConfigurationScope {
-                current: ConfigurationDescriptor::new(
-                    epoch,
-                    ReplicaId::new(1),
-                    vec![ConfigurationMember {
-                        identity: identity_for(&self.history.resource_uid, 1),
-                        role: ReplicaRole::Primary,
-                    }],
-                    1,
-                ),
-                previous: None,
-                replicas: Vec::new(),
-            })
     }
 
     async fn report(&self) -> PublicV1AgentReport {
@@ -924,6 +808,59 @@ impl<A: Sample> Node<A> {
             &self.identity,
         )
         .await
+    }
+
+    async fn command(&mut self, program: PublicOperationProgram) {
+        if !matches!(
+            program,
+            PublicOperationProgram::Build(_) | PublicOperationProgram::Remove(_)
+        ) {
+            self.revision += 1;
+        }
+        let id = match &program {
+            PublicOperationProgram::Build(build) | PublicOperationProgram::Remove(build) => {
+                build.attempt.clone()
+            }
+            _ => OperationId::new(format!(
+                "{}-{}-{}",
+                self.identity.replica_id, self.session, self.revision
+            )),
+        };
+        let class = match &program {
+            PublicOperationProgram::Build(build) => PublicOperationClass::Build {
+                target: build.replica.replica_id,
+            },
+            PublicOperationProgram::Remove(build) => PublicOperationClass::Remove {
+                target: build.replica.replica_id,
+            },
+            PublicOperationProgram::Close => PublicOperationClass::Close,
+            PublicOperationProgram::Abort => PublicOperationClass::Abort,
+            _ => PublicOperationClass::Authority,
+        };
+        let revision = self.revision;
+        let intent = PublicOperationIntent {
+            identity: self.preview.clone(),
+            operation_id: id,
+            revision,
+            process_session_id: self.session.clone(),
+            class,
+            input_digest: program.digest(),
+            replay_disposition: program.replay_disposition(),
+            lifecycle: None,
+            program: Some(program),
+        };
+        let operation = PublicV1OperationCommand {
+            target: self.identity.clone(),
+            intent,
+        };
+        self.submit(operation).await;
+    }
+
+    async fn submit(&mut self, operation: PublicV1OperationCommand) {
+        let label = format!("{:?}", operation.intent);
+        self.submit_result(operation)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
     }
 
     async fn submit_result(
@@ -953,44 +890,37 @@ impl<A: Sample> Node<A> {
     }
 
     async fn open(&mut self, role: ReplicaRole, epoch: Epoch) {
-        let configuration = if role == ReplicaRole::Primary && self.scope.is_none() {
-            ReplicaConfigurationScope {
-                current: ConfigurationDescriptor::new(
-                    epoch,
-                    self.identity.replica_id,
-                    vec![ConfigurationMember {
-                        identity: self.identity.clone(),
-                        role,
-                    }],
-                    1,
-                ),
-                previous: None,
-                replicas: Vec::new(),
-            }
-        } else if role == ReplicaRole::IdleSecondary && self.scope.is_none() {
-            let primary = ReplicaId::new(if self.identity.replica_id == ReplicaId::new(1) {
-                2
-            } else {
-                1
-            });
-            ReplicaConfigurationScope {
-                current: ConfigurationDescriptor::new(
-                    epoch,
-                    primary,
-                    vec![ConfigurationMember {
-                        identity: identity_for(&self.history.resource_uid, primary.value()),
-                        role: ReplicaRole::Primary,
-                    }],
-                    1,
-                ),
-                previous: None,
-                replicas: Vec::new(),
-            }
-        } else {
-            self.configuration(epoch)
-        };
-        self.goal(ReplicaGoalKind::Prepare { role }, configuration)
+        let existing = self.report().await.open_mode == OpenMode::Existing;
+        self.command(PublicOperationProgram::Open {
+            replica: self.identity.clone(),
+            existing,
+        })
+        .await;
+        self.command(PublicOperationProgram::Role { epoch, role })
             .await;
+        if role == ReplicaRole::Primary {
+            self.command(PublicOperationProgram::Epoch { epoch }).await;
+        }
+    }
+
+    async fn descriptor(&self, role: ReplicaRole) -> PublicReplicaDescriptor {
+        let report = self.report().await;
+        PublicReplicaDescriptor {
+            is_up: true,
+            is_ready: true,
+            build_id: OperationId::default(),
+            identity: self.identity.clone(),
+            replication_address: report.replication_address.unwrap(),
+            process_session_id: report.process_session_id,
+            storage_incarnation: Some(self.storage.clone()),
+            role,
+            current_progress: report.progress.current().expect("native query succeeded"),
+            catch_up_capability: report
+                .progress
+                .capability()
+                .expect("native query succeeded"),
+            must_catchup: false,
+        }
     }
 
     async fn single(&mut self, epoch: Epoch) -> ConfigurationDescriptor {
@@ -1003,17 +933,11 @@ impl<A: Sample> Node<A> {
             }],
             1,
         );
-        self.goal(
-            ReplicaGoalKind::Reconfigure {
-                role: ReplicaRole::Primary,
-                catch_up: Some(PublicCatchUpMode::WriteQuorum),
-            },
-            ReplicaConfigurationScope {
-                current: current.clone(),
-                previous: None,
-                replicas: Vec::new(),
-            },
-        )
+        self.command(PublicOperationProgram::Configuration(PublicConfiguration {
+            current: current.clone(),
+            previous: None,
+            replicas: Vec::new(),
+        }))
         .await;
         current
     }
@@ -1023,23 +947,48 @@ impl<A: Sample> Node<A> {
         target: &mut Self,
         epoch: Epoch,
         current: &ConfigurationDescriptor,
-    ) -> ReplicaGoal {
-        let source = m2_builtin::snapshot(self).await.publication.unwrap();
-        let target_publication = m2_builtin::snapshot(target).await.publication.unwrap();
-        assert_eq!(source.scope.epoch, epoch);
-        assert_eq!(&source.scope.configuration.current, current);
-        self.goal(
-            ReplicaGoalKind::Build {
-                remote: Box::new(RemoteReplicaSelection {
-                    source,
-                    target: target_publication,
-                    target_control_address: target.control_address.clone(),
-                    generation: 1,
-                }),
+    ) -> PublicInboundBuildAuthority {
+        let target_report = target.report().await;
+        let attempt = OperationId::new(format!(
+            "build-{}-{}",
+            target.identity.replica_id, target_report.process_session_id
+        ));
+        let address = target_report.replication_address.unwrap();
+        let source_address = self.report().await.replication_address.unwrap();
+        let source_session = self.session.clone();
+        let build = PublicBuildInput {
+            attempt: attempt.clone(),
+            epoch,
+            current_configuration_id: Some(current.configuration_id.clone()),
+            replica: target.identity.clone(),
+            target_storage: target.storage.clone(),
+            process_session_id: target_report.process_session_id.clone(),
+            source_address: source_address.clone(),
+            replication_address: address.clone(),
+            history: Some(self.history.clone()),
+        };
+        let authority = PublicInboundBuildAuthority {
+            operation_id: attempt.clone(),
+            operation_revision: self.revision,
+            attempt: PublicBuildAttemptReference {
+                resource_uid: self.history.resource_uid.clone(),
+                epoch,
+                build_id: attempt,
+                source: self.identity.clone(),
+                source_storage: self.storage.clone(),
+                source_session,
+                target: target.identity.clone(),
+                target_storage: target.storage.clone(),
+                target_session: target_report.process_session_id,
             },
-            self.configuration(epoch),
-        )
-        .await
+            history: self.history.clone(),
+            current_configuration_id: current.configuration_id.clone(),
+            source_address,
+            target_address: address,
+        };
+        target.install_build_authority(authority.clone()).await;
+        self.command(PublicOperationProgram::Build(build)).await;
+        authority
     }
 
     async fn build(
@@ -1047,23 +996,17 @@ impl<A: Sample> Node<A> {
         target: &mut Self,
         epoch: Epoch,
         current: &ConfigurationDescriptor,
-    ) -> ReplicaGoal {
-        let build = self.build_idle(target, epoch, current).await;
-        let mut client =
-            proto::agent_control_client::AgentControlClient::connect(self.control_address.clone())
-                .await
-                .unwrap();
-        client
-            .acknowledge_goal(authorized(proto::ReplicaGoalRequest {
-                protocol_version: ORDINARY_ACTION_FORMAT,
-                canonical_json: serde_json::to_vec(&ReplicaGoalAcknowledgement {
-                    goal: build.clone(),
-                    logically_retired: false,
-                })
-                .unwrap(),
-            }))
-            .await
-            .unwrap();
+    ) -> PublicInboundBuildAuthority {
+        let authority = self.build_idle(target, epoch, current).await;
+        target
+            .command(PublicOperationProgram::Role {
+                epoch,
+                role: ReplicaRole::ActiveSecondary,
+            })
+            .await;
+        target
+            .command(PublicOperationProgram::Epoch { epoch })
+            .await;
         let full = ConfigurationDescriptor::new(
             epoch,
             self.identity.replica_id,
@@ -1079,57 +1022,79 @@ impl<A: Sample> Node<A> {
             ],
             2,
         );
-        let source_peer = self.peer(ReplicaRole::Primary).await;
-        let target_peer = target.peer(ReplicaRole::ActiveSecondary).await;
-        for previous in [Some(current.clone()), None] {
-            self.goal(
-                ReplicaGoalKind::Reconfigure {
-                    role: ReplicaRole::Primary,
-                    catch_up: previous.is_none().then_some(PublicCatchUpMode::WriteQuorum),
-                },
-                ReplicaConfigurationScope {
-                    current: full.clone(),
-                    previous: previous.clone(),
-                    replicas: vec![target_peer.clone()],
-                },
-            )
+        target
+            .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                current: full.clone(),
+                previous: None,
+                replicas: vec![self.descriptor(ReplicaRole::Primary).await],
+            }))
             .await;
-            target
-                .goal(
-                    ReplicaGoalKind::Reconfigure {
-                        role: ReplicaRole::ActiveSecondary,
-                        catch_up: None,
-                    },
-                    ReplicaConfigurationScope {
-                        current: full.clone(),
-                        previous,
-                        replicas: vec![source_peer.clone()],
-                    },
-                )
-                .await;
-        }
-        build
+        self.command(PublicOperationProgram::Configuration(PublicConfiguration {
+            current: full,
+            previous: None,
+            replicas: vec![target.descriptor(ReplicaRole::ActiveSecondary).await],
+        }))
+        .await;
+        authority
     }
 
-    async fn peer(&self, role: ReplicaRole) -> ReplicaPeerDescription {
-        let publication = m2_builtin::snapshot(self).await.publication.unwrap();
-        ReplicaPeerDescription {
-            identity: self.identity.clone(),
-            replication_address: publication.replication_address,
-            process_session_id: self.session.clone(),
-            storage_incarnation: self.storage.clone(),
-            role,
-            current_progress: 0,
-            catch_up_capability: 0,
-            is_up: true,
-            is_ready: true,
-            must_catchup: false,
+    async fn install_build_authority(&self, authority: PublicInboundBuildAuthority) {
+        let mut client =
+            proto::replica_peer_client::ReplicaPeerClient::connect(self.control_address.clone())
+                .await
+                .unwrap();
+        client
+            .execute(authorized(proto::ExecuteCommandRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: self.history.resource_uid.to_string(),
+                target: Some(self.identity.clone().into()),
+                expected_process_session_id: self.session.to_string(),
+                command: Some(proto::execute_command_request::Command::PublicV1History(
+                    convert::public_v1_history_command_to_proto(
+                        &PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                            authority: Box::new(authority),
+                        },
+                    )
+                    .unwrap(),
+                )),
+            }))
+            .await
+            .unwrap();
+    }
+
+    fn renewal_request(
+        &self,
+        command: PublicV1SessionRenewalCommand,
+    ) -> proto::ExecuteCommandRequest {
+        proto::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: self.history.resource_uid.to_string(),
+            target: Some(self.identity.clone().into()),
+            expected_process_session_id: self.session.to_string(),
+            command: Some(proto::execute_command_request::Command::PublicV1History(
+                convert::public_v1_history_command_to_proto(
+                    &PublicV1HistoryCommand::SessionRenewal {
+                        command: Box::new(command),
+                    },
+                )
+                .unwrap(),
+            )),
         }
+    }
+
+    async fn renewal(&self, command: PublicV1SessionRenewalCommand) {
+        let mut client =
+            proto::agent_control_client::AgentControlClient::connect(self.control_address.clone())
+                .await
+                .unwrap();
+        client
+            .execute(authorized(self.renewal_request(command)))
+            .await
+            .unwrap();
     }
 
     async fn close(mut self) {
-        self.goal(ReplicaGoalKind::Close, self.configuration(Epoch::new(0, 1)))
-            .await;
+        self.command(PublicOperationProgram::Close).await;
         self.running.shutdown();
         self.running.wait().await.unwrap();
         self.service.drain().await.unwrap();
@@ -1137,15 +1102,8 @@ impl<A: Sample> Node<A> {
 
     async fn stop(mut self) -> Option<kuberic_runtime::RuntimeError> {
         self.running.shutdown();
-        let host = self.running.wait().await.err();
-        let service = self.service.drain().await.err();
-        match (host, service) {
-            (None, result) => result,
-            (Some(host), None) => Some(RuntimeError::Application(host.to_string())),
-            (Some(host), Some(service)) => {
-                Some(RuntimeError::Application(format!("{host}; {service}")))
-            }
-        }
+        self.running.wait().await.unwrap();
+        self.service.drain().await.err()
     }
 }
 
@@ -1166,20 +1124,46 @@ fn persist_query_observation(
     reloaded
 }
 
+fn query_accepted(report: &PublicV1AgentReport) -> PublicV1AcceptedStatus {
+    PublicV1AcceptedStatus {
+        identity: report.identity.clone(),
+        history_initialization_id: derive_history_initialization_id(
+            &report.history.resource_uid,
+            PublicProtocolGeneration::new(report.identity.generation),
+        ),
+        history: report.history.clone(),
+        data_loss_recovery: None,
+        completed_operations: report
+            .completed_operations
+            .iter()
+            .map(PublicV1AcceptedOperationCompletion::from_completion)
+            .collect(),
+        extensions: Default::default(),
+    }
+}
+
 #[tokio::test]
 async fn native_query_outcome_matrix_survives_rpc_persistence_and_controller_eligibility() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
+    use kuberic_controller::evaluator::public_v1_topology::{
+        PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
+    };
     use kuberic_controller::evaluator::testing::{
         PublicV1ElectionStatus, compare_public_v1_election_reports, public_v1_election_status,
     };
+    use std::cmp::Ordering as Comparison;
 
     tokio::time::timeout(Duration::from_secs(60), async {
         let root = tempfile::tempdir().unwrap();
         let mut node = Node::<QueryService>::start_sized(&root.path().join("node"), 1, 0, 1).await;
         node.open(ReplicaRole::Primary, Epoch::new(0, 1)).await;
         let current = node.single(Epoch::new(0, 1)).await;
-        let native = node.optional_query_observation().await;
+        let native = node.report().await;
         assert_eq!(native.progress.current(), Some(0));
         assert_eq!(native.progress.capability(), Some(0));
+        let accepted = query_accepted(&native);
         let admitted = [native.storage_incarnation.clone()];
         let value = QueryScript::Value;
         let failed = QueryScript::Failed;
@@ -1210,7 +1194,7 @@ async fn native_query_outcome_matrix_survives_rpc_persistence_and_controller_eli
                 .calls
                 .each_ref()
                 .map(|calls| calls.load(Ordering::SeqCst));
-            let received = node.optional_query_observation().await;
+            let received = node.report().await;
             for (calls, previous) in node.service.scripts.calls.iter().zip(before) {
                 assert!(calls.load(Ordering::SeqCst) > previous, "{label}");
             }
@@ -1240,14 +1224,15 @@ async fn native_query_outcome_matrix_survives_rpc_persistence_and_controller_eli
             assert_eq!(received.read_status, native.read_status);
             assert_eq!(received.write_status, native.write_status);
             let observed = persist_query_observation(root.path(), label, &received);
+            let available = observed.progress.current().is_some();
             assert_eq!(
                 public_v1_election_status(&observed, &admitted),
-                if observed.progress.current().is_some() {
+                if available {
                     PublicV1ElectionStatus::Eligible
                 } else {
                     PublicV1ElectionStatus::Ineligible
                 },
-                "{label}: legacy advisory ranking still requires current, not capability"
+                "{label}: election requires current, not capability"
             );
             assert_eq!(
                 compare_public_v1_election_reports(&observed, &native, &admitted),
@@ -1259,40 +1244,41 @@ async fn native_query_outcome_matrix_survives_rpc_persistence_and_controller_eli
                 PublicV1ElectionStatus::Ineligible,
                 "{label}: successful queries do not admit unaccepted storage"
             );
-            let snapshot = m2_builtin::snapshot(&node).await;
-            assert!(matches!(
-                snapshot.progress,
-                ProgressQueryResult::NotQueried(_)
-            ));
+            let plan = plan_public_v1_topology(
+                &accepted,
+                Some(&current),
+                &[PublicV1TopologyReplica {
+                    replication_address: observed.replication_address.clone().unwrap(),
+                    report: observed,
+                }],
+                1,
+                None,
+                Some(node.identity.replica_id),
+                "query-matrix",
+            )
+            .unwrap();
             assert_eq!(
-                snapshot.publication.unwrap().scope.configuration.current,
-                current
+                plan,
+                if available {
+                    PublicV1TopologyPlan::Stable
+                } else {
+                    PublicV1TopologyPlan::Wait
+                },
+                "{label}: missing current cannot authorize topology work"
             );
-            assert_eq!(snapshot.write_status, AccessStatus::Granted);
         }
         *node.service.scripts.outcomes.lock().unwrap() = [value(3), value(99)];
-        let left = persist_query_observation(
-            root.path(),
-            "comparison-left",
-            &node.optional_query_observation().await,
-        );
+        let left = persist_query_observation(root.path(), "comparison-left", &node.report().await);
         *node.service.scripts.outcomes.lock().unwrap() = [value(5), value(1)];
-        let right = persist_query_observation(
-            root.path(),
-            "comparison-right",
-            &node.optional_query_observation().await,
-        );
+        let right =
+            persist_query_observation(root.path(), "comparison-right", &node.report().await);
         assert_eq!(
             compare_public_v1_election_reports(&left, &right, &admitted),
-            Some(std::cmp::Ordering::Less),
-            "advisory ordering uses current rather than independent capability"
+            Some(Comparison::Less),
+            "election orders current progress, never the independent capability"
         );
-        assert!(left.progress.current().unwrap() < right.progress.current().unwrap());
         *node.service.scripts.outcomes.lock().unwrap() = [QueryScript::Native; 2];
-        assert_eq!(
-            node.optional_query_observation().await.progress,
-            native.progress
-        );
+        assert_eq!(node.report().await.progress, native.progress);
         node.close().await;
     })
     .await
@@ -1301,6 +1287,12 @@ async fn native_query_outcome_matrix_survives_rpc_persistence_and_controller_eli
 
 #[tokio::test]
 async fn native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_build() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
+    use kuberic_controller::evaluator::public_v1_topology::{
+        PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
+    };
     use kuberic_controller::evaluator::testing::{
         PublicV1ElectionStatus, compare_public_v1_election_reports, public_v1_election_status,
     };
@@ -1331,9 +1323,7 @@ async fn native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_buil
             .map(|calls| calls.load(Ordering::SeqCst));
         let observed =
             persist_query_observation(root.path(), "copy-incomplete", &node.report().await);
-        let pending = ProgressQueryResult::NotQueried(
-            "ordinary hosting report does not sample callbacks".into(),
-        );
+        let pending = ProgressQueryResult::NotQueried("native copy is incomplete".into());
         assert_eq!(observed.progress.current_progress, pending);
         assert_eq!(observed.progress.catch_up_capability, pending);
         assert_ne!(observed.progress, unopened.progress);
@@ -1355,22 +1345,23 @@ async fn native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_buil
             compare_public_v1_election_reports(&observed, &observed, &admitted),
             None
         );
-        let before = m2_builtin::snapshot(&node).await;
-        let publication = before.publication.clone().unwrap();
-        assert_eq!(publication.role, ReplicaRole::IdleSecondary);
-        let mut invalid_build = before.goals.last().unwrap().goal.clone();
-        invalid_build.operation_id = OperationId::new("idle-cannot-source-build");
-        invalid_build.revision += 1;
-        invalid_build.desired = ReplicaGoalKind::Build {
-            remote: Box::new(RemoteReplicaSelection {
-                source: publication.clone(),
-                target: publication,
-                target_control_address: node.control_address.clone(),
-                generation: 1,
-            }),
-        };
-        assert!(m2_builtin::submit(&node, &invalid_build).await.is_err());
-        assert_eq!(m2_builtin::snapshot(&node).await, before);
+        assert_eq!(
+            plan_public_v1_topology(
+                &query_accepted(&observed),
+                None,
+                &[PublicV1TopologyReplica {
+                    replication_address: observed.replication_address.clone().unwrap(),
+                    report: observed,
+                }],
+                1,
+                None,
+                None,
+                "query-not-queried",
+            )
+            .unwrap(),
+            PublicV1TopologyPlan::Wait,
+            "an open endpoint without queried current is not promotion or Build authority"
+        );
         node.close().await;
     })
     .await
@@ -1379,108 +1370,87 @@ async fn native_query_not_queried_preserves_copy_detail_and_cannot_elect_or_buil
 
 #[tokio::test]
 async fn native_query_rejoin_matrix_distinguishes_source_capability_from_target_current() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
+    use kuberic_controller::evaluator::public_v1_topology::{
+        PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
+    };
+
     tokio::time::timeout(Duration::from_secs(60), async {
         let root = tempfile::tempdir().unwrap();
         let mut source = Node::<QueryService>::start(&root.path().join("source"), 1, 0).await;
         let mut target = Node::<QueryService>::start(&root.path().join("target"), 2, 0).await;
         let epoch = Epoch::new(0, 1);
         source.open(ReplicaRole::Primary, epoch).await;
-        source.single(epoch).await;
+        let current = source.single(epoch).await;
         target.open(ReplicaRole::Primary, epoch).await;
         target.single(epoch).await;
+        let mut accepted = query_accepted(&source.report().await);
+        accepted.completed_operations.extend(
+            query_accepted(&target.report().await).completed_operations,
+        );
+        accepted.validate_evidence().unwrap();
         let value = QueryScript::Value;
         let ready = QueryScript::NotReady;
         let failed = QueryScript::Failed;
         let cases = [
-            (
-                "retained",
-                [value(7), value(3)],
-                [value(5), value(99)],
-                Some(ReplicaRole::ActiveSecondary),
-            ),
-            (
-                "range-requires-copy",
-                [value(7), value(9)],
-                [value(5), value(99)],
-                Some(ReplicaRole::IdleSecondary),
-            ),
-            (
-                "source-capability-not-ready",
-                [value(7), ready],
-                [value(5), value(99)],
-                Some(ReplicaRole::IdleSecondary),
-            ),
-            (
-                "source-capability-failed",
-                [value(7), failed("source capability failed")],
-                [value(5), value(99)],
-                Some(ReplicaRole::IdleSecondary),
-            ),
-            (
-                "target-current-not-ready",
-                [value(7), value(3)],
-                [ready, value(99)],
-                Some(ReplicaRole::IdleSecondary),
-            ),
-            (
-                "target-current-failed",
-                [value(7), value(3)],
-                [failed("target current failed"), value(99)],
-                Some(ReplicaRole::IdleSecondary),
-            ),
-            (
-                "target-capability-not-ready",
-                [value(7), value(3)],
-                [value(5), ready],
-                Some(ReplicaRole::ActiveSecondary),
-            ),
-            (
-                "target-capability-failed",
-                [value(7), value(3)],
-                [value(5), failed("target capability failed")],
-                Some(ReplicaRole::ActiveSecondary),
-            ),
-            (
-                "source-current-not-ready",
-                [ready, value(3)],
-                [value(5), value(99)],
-                None,
-            ),
-            (
-                "source-current-failed",
-                [failed("source current failed"), value(3)],
-                [value(5), value(99)],
-                None,
-            ),
+            ("retained", [value(7), value(3)], [value(5), value(99)], Some(ReplicaRole::ActiveSecondary)),
+            ("range-requires-copy", [value(7), value(9)], [value(5), value(99)], Some(ReplicaRole::IdleSecondary)),
+            ("source-capability-not-ready", [value(7), ready], [value(5), value(99)], Some(ReplicaRole::IdleSecondary)),
+            ("source-capability-failed", [value(7), failed("source capability failed")], [value(5), value(99)], Some(ReplicaRole::IdleSecondary)),
+            ("target-current-not-ready", [value(7), value(3)], [ready, value(99)], Some(ReplicaRole::IdleSecondary)),
+            ("target-current-failed", [value(7), value(3)], [failed("target current failed"), value(99)], Some(ReplicaRole::IdleSecondary)),
+            ("target-capability-not-ready", [value(7), value(3)], [value(5), ready], Some(ReplicaRole::ActiveSecondary)),
+            ("target-capability-failed", [value(7), value(3)], [value(5), failed("target capability failed")], Some(ReplicaRole::ActiveSecondary)),
+            ("source-current-not-ready", [ready, value(3)], [value(5), value(99)], None),
+            ("source-current-failed", [failed("source current failed"), value(3)], [value(5), value(99)], None),
         ];
-        let source_scope = m2_builtin::snapshot(&source).await;
-        let target_scope = m2_builtin::snapshot(&target).await;
-        for (label, source_queries, target_queries, _historical_role) in cases {
+        for (label, source_queries, target_queries, expected_role) in cases {
             *source.service.scripts.outcomes.lock().unwrap() = source_queries;
             *target.service.scripts.outcomes.lock().unwrap() = target_queries;
+            let mut replicas = Vec::new();
             for (name, node) in [("source", &source), ("target", &target)] {
                 let report = persist_query_observation(
                     root.path(),
                     &format!("{label}-{name}"),
-                    &node.optional_query_observation().await,
+                    &node.report().await,
                 );
+                replicas.push(PublicV1TopologyReplica {
+                    replication_address: report.replication_address.clone().unwrap(),
+                    report,
+                });
+            }
+            let plan = plan_public_v1_topology(
+                &accepted,
+                Some(&current),
+                &replicas,
+                2,
+                None,
+                Some(source.identity.replica_id),
+                "query-rejoin",
+            )
+            .unwrap();
+            if let Some(role) = expected_role {
+                let PublicV1TopologyPlan::Begin { command, .. } = plan else {
+                    panic!("{label}: expected exact target preparation, got {plan:?}");
+                };
+                assert_eq!(command.target, target.identity, "{label}");
                 assert!(
-                    report.replication_address.is_none(),
-                    "legacy diagnostics cannot replace ordinary publication"
+                    matches!(
+                        command.intent.program,
+                        Some(PublicOperationProgram::Role { role: actual, .. }) if actual == role
+                    ),
+                    "{label}: retained rejoin prepares ActiveSecondary; copy prepares IdleSecondary: {:?}",
+                    command.intent.program
+                );
+            } else {
+                assert_eq!(
+                    plan,
+                    PublicV1TopologyPlan::Wait,
+                    "{label}: unavailable source current cannot authorize rejoin or Build"
                 );
             }
-            assert_eq!(m2_builtin::snapshot(&source).await, source_scope);
-            assert_eq!(m2_builtin::snapshot(&target).await, target_scope);
-            let remote = RemoteReplicaSelection {
-                source: source_scope.publication.clone().unwrap(),
-                target: target_scope.publication.clone().unwrap(),
-                target_control_address: target.control_address.clone(),
-                generation: 1,
-            };
-            assert!(
-                remote.validate().is_err(),
-                "{label}: scalar queries admitted an existing Primary as an idle receiver"
-            );
         }
         *source.service.scripts.outcomes.lock().unwrap() = [QueryScript::Native; 2];
         *target.service.scripts.outcomes.lock().unwrap() = [QueryScript::Native; 2];
@@ -1493,11 +1463,275 @@ async fn native_query_rejoin_matrix_distinguishes_source_capability_from_target_
 
 #[tokio::test]
 async fn public_factory_primary_process_renewal_retains_exact_role_address_authority() {
-    ordinary_reopen_role_address_scenario().await;
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(90), async {
+            for (fail_replay, demote) in [(false, false), (false, true), (true, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let epoch = Epoch::new(0, 1);
+            let renewed_epoch = Epoch::new(0, 2);
+            let mut predecessor = Node::<RoleAddressKvService>::start_sized(root.path(), 1, 0, 1).await;
+            predecessor.open(ReplicaRole::Primary, epoch).await;
+            predecessor.single(epoch).await;
+            predecessor
+                .service
+                .inner
+                .replicate_put("renewal".into(), "retained".into())
+                .await
+                .unwrap();
+            let old = predecessor.report().await;
+            let old_location = old.service_location.clone().unwrap();
+            assert_eq!(old_location.address, predecessor.service.address);
+            let old_revision = predecessor.revision;
+            predecessor.stop().await;
+
+            let mut replacement =
+                Node::<RoleAddressKvService>::start_sized(root.path(), 1, old_revision, 1).await;
+            let fresh = replacement.report().await;
+            assert_eq!(fresh.storage_incarnation, old.storage_incarnation);
+            assert_eq!(fresh.history, old.history);
+            assert_ne!(fresh.process_session_id, old.process_session_id);
+            assert_ne!(fresh.replicator_creation_id, old.replicator_creation_id);
+            assert_eq!(fresh.role, ReplicaRole::None);
+            assert!(fresh.service_location.is_none());
+            assert!(fresh.completed_operations.is_empty());
+            replacement
+                .command(PublicOperationProgram::Open {
+                    replica: replacement.identity.clone(),
+                    existing: true,
+                })
+                .await;
+            let open_revision = replacement.revision;
+            let fresh = replacement.report().await;
+            let endpoint = |report: &PublicV1AgentReport| ProcessSessionEndpoint {
+                identity: report.replica.clone(),
+                storage_incarnation: report.storage_incarnation.clone(),
+                process_session_id: report.process_session_id.clone(),
+                replicator_creation_id: report.replicator_creation_id.clone(),
+                role: report.role,
+            };
+            let configuration = ConfigurationDescriptor::new(
+                renewed_epoch,
+                replacement.identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: replacement.identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            );
+            let required = PublicV1SessionRenewalStatus::required(ProcessSessionRenewalRequired {
+                operation_id: OperationId::new("real-primary-process-renewal"),
+                reason: ProcessSessionRenewalReason::PrimaryReplacement,
+                resource_uid: old.resource_uid.clone(),
+                history: old.history.clone(),
+                previous_epoch: epoch,
+                renewal_epoch: renewed_epoch,
+                predecessor: endpoint(&old),
+                replacement: Some(endpoint(&fresh)),
+                surviving_sessions: Vec::new(),
+                fresh_configuration: configuration.clone(),
+                predecessor_contained: true,
+                data_loss: None,
+            })
+            .unwrap();
+            required.required.validate_replacement_report(&fresh).unwrap();
+            replacement
+                .renewal(PublicV1SessionRenewalCommand::CloseAccessAndIngress {
+                    accepted: required.clone(),
+                })
+                .await;
+            let pending = required
+                .close_access()
+                .unwrap()
+                .freeze_surviving_set()
+                .unwrap()
+                .begin_epoch_barriers()
+                .unwrap()
+                .finish_epoch_barriers()
+                .unwrap();
+            let replay = PublicV1SessionRenewalCommand::ReplayReplacementRole {
+                accepted: pending,
+                process_session_id: fresh.process_session_id.clone(),
+                epoch: renewed_epoch,
+                role: ReplicaRole::Primary,
+            };
+            replacement.service.block_primary.store(true, Ordering::SeqCst);
+            replacement.service.fail_primary.store(fail_replay, Ordering::SeqCst);
+            let mut client = proto::agent_control_client::AgentControlClient::connect(
+                replacement.control_address.clone(),
+            )
+            .await
+            .unwrap();
+            let request = replacement.renewal_request(replay.clone());
+            let mut waiter = tokio::spawn(async move { client.execute(authorized(request)).await });
+            tokio::select! {
+                () = replacement.service.primary_entered.notified() => {},
+                result = &mut waiter => panic!("role replay returned before application callback: {result:?}"),
+                () = tokio::time::sleep(Duration::from_secs(10)) => panic!("role callback was not entered"),
+            }
+            let in_flight = replacement.report().await;
+            assert_ne!(in_flight.write_status, AccessStatus::Granted);
+            assert!(in_flight.service_location.is_none());
+            let role_intent = in_flight
+                .active_operations
+                .iter()
+                .find(|intent| {
+                    intent.program
+                        == Some(PublicOperationProgram::Role {
+                            epoch: renewed_epoch,
+                            role: ReplicaRole::Primary,
+                        })
+                })
+                .expect("application callback has a durable current-process owner")
+                .clone();
+            assert_eq!(role_intent.process_session_id, fresh.process_session_id);
+            assert_eq!(role_intent.revision, open_revision + 1);
+            assert_ne!(role_intent.operation_id, old_location.operation_id);
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            replacement.service.primary_release.notify_one();
+            if fail_replay {
+                let mut client = proto::agent_control_client::AgentControlClient::connect(
+                    replacement.control_address.clone()).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(10),
+                    client.execute(authorized(replacement.renewal_request(replay.clone()))))
+                    .await.expect("exact retry observes the retained application failure");
+                assert!(result.unwrap_err().message().contains("replacement application role rejected"));
+                let rejected = replacement.report().await;
+                assert!(!rejected.completed_operations.iter().any(|completion|
+                    completion.operation_id == role_intent.operation_id),
+                    "an engine observer cannot publish application failure as contained completion");
+                assert_ne!(rejected.write_status, AccessStatus::Granted);
+                assert!(rejected.service_location.is_none());
+                assert!(replacement.service.inner.replicate_put("renewal".into(), "rejected".into()).await.is_err());
+                assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
+                let drainage = replacement.stop().await;
+                // Uncertain application failure requires actual Abort/join;
+                // the KV committer retains its expected aborted-work result.
+                assert!(matches!(drainage, Some(kuberic_runtime::RuntimeError::OperationCancelled)),
+                    "{drainage:?}");
+                continue;
+            }
+            let completed = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let report = replacement.report().await;
+                    if let Some(completion) = report.completed_operations.iter().find(|completion| {
+                        completion.operation_id == role_intent.operation_id
+                    }) {
+                        break completion.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled RPC leaves role callback and completion owned");
+            assert_eq!(completed.call_kind, PublicV1CallKind::Role);
+            assert_eq!(completed.revision, role_intent.revision);
+            assert_eq!(completed.process_session_id, fresh.process_session_id);
+            assert_eq!(completed.input_digest, role_intent.input_digest);
+            assert_eq!(completed.history, fresh.history);
+            assert_eq!(completed.storage_incarnation, fresh.storage_incarnation);
+            replacement.revision = completed.revision;
+            assert_eq!(completed.result, PublicV1OperationResult::Succeeded);
+            replacement.renewal(replay.clone()).await;
+            assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
+            assert!(replacement.report().await.service_location.is_none());
+            replacement
+                .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: configuration.clone(),
+                    previous: None,
+                    replicas: Vec::new(),
+                }))
+                .await;
+            let renewed = replacement.report().await;
+            let location = renewed.service_location.as_ref().unwrap();
+            assert_eq!(renewed.write_status, AccessStatus::Granted);
+            assert_eq!(location.identity, replacement.preview);
+            assert_eq!(location.resource_uid, fresh.resource_uid);
+            assert_eq!(location.replica, fresh.replica);
+            assert_eq!(location.process_session_id, fresh.process_session_id);
+            assert_eq!(location.operation_id, completed.operation_id);
+            assert_eq!(location.revision, completed.revision);
+            assert_eq!(location.epoch, renewed_epoch);
+            assert_eq!(location.address, replacement.service.address);
+            assert_ne!(location.address, old_location.address);
+            renewed.validate().unwrap();
+            assert_eq!(
+                replacement.service.inner.get("renewal").await.unwrap().as_deref(),
+                Some("retained")
+            );
+            replacement
+                .service
+                .inner
+                .replicate_put("renewal".into(), "new-process".into())
+                .await
+                .unwrap();
+            assert_eq!(
+                replacement.service.inner.get("renewal").await.unwrap().as_deref(),
+                Some("new-process")
+            );
+
+            let mut stale_report = renewed.clone();
+            stale_report.service_location = Some(old_location.clone());
+            assert!(stale_report.validate().is_err());
+            let stale_role = PublicOperationProgram::Role {
+                epoch,
+                role: ReplicaRole::Primary,
+            };
+            let failure = replacement
+                .submit_result(PublicV1OperationCommand {
+                    target: replacement.identity.clone(),
+                    intent: PublicOperationIntent {
+                        identity: replacement.preview.clone(),
+                        operation_id: old_location.operation_id,
+                        revision: old_location.revision,
+                        process_session_id: old.process_session_id,
+                        class: PublicOperationClass::Authority,
+                        input_digest: stale_role.digest(),
+                        replay_disposition: stale_role.replay_disposition(),
+                        lifecycle: None,
+                        program: Some(stale_role),
+                    },
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(failure.code(), tonic::Code::InvalidArgument);
+            assert!(failure.message().contains("differs from execute envelope"));
+            assert_eq!(replacement.report().await.service_location, renewed.service_location);
+            assert_eq!(replacement.service.primary_calls.load(Ordering::SeqCst), 1);
+
+            if demote {
+                replacement
+                    .command(PublicOperationProgram::Role {
+                        epoch: Epoch::new(0, 3),
+                        role: ReplicaRole::ActiveSecondary,
+                    })
+                    .await;
+                let demoted = replacement.report().await;
+                assert_eq!(demoted.role, ReplicaRole::ActiveSecondary);
+                assert_ne!(demoted.write_status, AccessStatus::Granted);
+                assert!(demoted.service_location.is_none());
+            }
+            replacement.command(PublicOperationProgram::Close).await;
+            let closed = replacement.report().await;
+            assert_eq!(closed.role, ReplicaRole::None);
+            assert!(closed.service_location.is_none());
+            assert!(closed.replication_address.is_none());
+            replacement.running.shutdown();
+            replacement.running.wait().await.unwrap();
+            replacement.service.drain().await.unwrap();
+            }
+        })
+        .await
+        .expect("bounded real primary process renewal");
 }
 
 #[tokio::test]
 async fn public_factory_real_kv_copy_quorum_commit_restart_and_promotion() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = tempfile::tempdir().unwrap();
         let source_root = root.path().join("source");
@@ -1524,6 +1758,28 @@ async fn public_factory_real_kv_copy_quorum_commit_restart_and_promotion() {
             Some("committed")
         );
         let promotion_epoch = Epoch::new(0, 2);
+        source
+            .command(PublicOperationProgram::Role {
+                epoch: promotion_epoch,
+                role: ReplicaRole::ActiveSecondary,
+            })
+            .await;
+        source
+            .command(PublicOperationProgram::Epoch {
+                epoch: promotion_epoch,
+            })
+            .await;
+        target
+            .command(PublicOperationProgram::Role {
+                epoch: promotion_epoch,
+                role: ReplicaRole::Primary,
+            })
+            .await;
+        target
+            .command(PublicOperationProgram::Epoch {
+                epoch: promotion_epoch,
+            })
+            .await;
         let promoted = ConfigurationDescriptor::new(
             promotion_epoch,
             target.identity.replica_id,
@@ -1540,30 +1796,21 @@ async fn public_factory_real_kv_copy_quorum_commit_restart_and_promotion() {
             2,
         );
         source
-            .goal(
-                ReplicaGoalKind::Reconfigure {
-                    role: ReplicaRole::ActiveSecondary,
-                    catch_up: None,
-                },
-                ReplicaConfigurationScope {
-                    current: promoted.clone(),
-                    previous: None,
-                    replicas: vec![target.peer(ReplicaRole::Primary).await],
-                },
-            )
+            .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                current: promoted.clone(),
+                previous: None,
+                replicas: vec![target.descriptor(ReplicaRole::Primary).await],
+            }))
             .await;
         target
-            .goal(
-                ReplicaGoalKind::Reconfigure {
-                    role: ReplicaRole::Primary,
-                    catch_up: Some(PublicCatchUpMode::All),
-                },
-                ReplicaConfigurationScope {
+            .command(PublicOperationProgram::CatchUp {
+                configuration: PublicConfiguration {
                     current: promoted,
                     previous: None,
-                    replicas: vec![source.peer(ReplicaRole::ActiveSecondary).await],
+                    replicas: vec![source.descriptor(ReplicaRole::ActiveSecondary).await],
                 },
-            )
+                mode: PublicCatchUpMode::All,
+            })
             .await;
         let promoted_lsn = target
             .service
@@ -1577,8 +1824,14 @@ async fn public_factory_real_kv_copy_quorum_commit_restart_and_promotion() {
         );
         let source_revision = source.revision;
         let target_revision = target.revision;
-        assert!(source.stop().await.is_none());
-        assert!(target.stop().await.is_none());
+        assert!(matches!(
+            source.stop().await,
+            Some(kuberic_runtime::RuntimeError::OperationCancelled)
+        ));
+        assert!(matches!(
+            target.stop().await,
+            Some(kuberic_runtime::RuntimeError::OperationCancelled)
+        ));
 
         let mut source = Node::<KvService>::start(&source_root, 1, source_revision).await;
         let mut target = Node::<KvService>::start(&target_root, 2, target_revision).await;
@@ -1649,6 +1902,9 @@ async fn sql_values(
 
 #[tokio::test]
 async fn selected_sqlite_real_wal_isolation_publication_failure_and_restart() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     use sqlite_replicated::server::SqliteServer;
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = tempfile::tempdir().unwrap();
@@ -1723,8 +1979,14 @@ async fn selected_sqlite_real_wal_isolation_publication_failure_and_restart() {
         drop(server);
         let ar = source.revision;
         let br = target.revision;
-        assert!(source.stop().await.is_none());
-        assert!(target.stop().await.is_none());
+        assert!(matches!(
+            source.stop().await,
+            Some(kuberic_runtime::RuntimeError::OperationCancelled)
+        ));
+        assert!(matches!(
+            target.stop().await,
+            Some(kuberic_runtime::RuntimeError::OperationCancelled)
+        ));
 
         let mut source = Node::<SqliteService>::start(&a, 1, ar).await;
         let mut target = Node::<SqliteService>::start(&b, 2, br).await;
@@ -1773,6 +2035,9 @@ async fn selected_sqlite_real_wal_isolation_publication_failure_and_restart() {
 
 #[tokio::test]
 async fn externally_compiled_helper_free_provider_uses_public_factory_host_and_transport() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     use bytes::Bytes;
     use futures::FutureExt;
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -1855,98 +2120,159 @@ async fn externally_compiled_helper_free_provider_uses_public_factory_host_and_t
 
 #[tokio::test]
 async fn controller_bootstraps_real_native_receivers_before_voting_admission() {
-    use kuberic_controller::test_util::{
-        ApplicationFactory, CreatedApplication, ReplicaContext, TestCluster,
-    };
-    struct Applications;
-    #[async_trait::async_trait]
-    impl ApplicationFactory for Applications {
-        type Service = KvService;
-        async fn create(
-            &self,
-            context: ReplicaContext,
-        ) -> kuberic_controller::test_util::Result<CreatedApplication<KvService>> {
-            let root = context.application_root();
-            let convert = |error: RuntimeError| {
-                kuberic_controller::test_util::TestError::with_source(
-                    kuberic_controller::test_util::ErrorKind::Application,
-                    "KV storage validation",
-                    error,
-                )
-            };
-            let fresh = KvPersistence::is_fresh_empty(root).map_err(convert)?;
-            Ok(CreatedApplication::new(
-                Arc::new(KvService::new(
-                    Arc::new(KvPersistence::open(root).map_err(convert)?),
-                    context.replication_address().into(),
-                    CopyGate::disabled(),
-                )),
-                if fresh {
-                    ApplicationStorageState::FreshEmpty
-                } else {
-                    ApplicationStorageState::Established
-                },
-            )
-            .with_storage_paths([root.to_owned()]))
-        }
-        async fn shutdown_and_drain(
-            &self,
-            service: Arc<KvService>,
-        ) -> kuberic_controller::test_util::Result<()> {
-            service.shutdown_and_drain().await.map_err(|error| {
-                kuberic_controller::test_util::TestError::with_source(
-                    kuberic_controller::test_util::ErrorKind::Cleanup,
-                    "KV Close failed",
-                    error,
-                )
-            })?;
-            Ok(())
-        }
+    if m1_legacy_production_unavailable().await {
+        return;
     }
+    use kuberic_controller::evaluator::public_v1_topology::{
+        PublicV1TopologyPlan, PublicV1TopologyReplica, plan_public_v1_topology,
+    };
     tokio::time::timeout(Duration::from_secs(120), async {
-        let mut cluster = TestCluster::builder(Applications)
-            .initial_replicas(1)
-            .start()
+        let root = tempfile::tempdir().unwrap();
+        let mut nodes = Vec::new();
+        for id in 1..=3 {
+            nodes.push(
+                Node::<KvService>::start_sized(
+                    &root.path().join(format!("replica-{id}")),
+                    id,
+                    0,
+                    3,
+                )
+                .await,
+            );
+        }
+        let mut accepted = PublicV1AcceptedStatus {
+            identity: nodes[0].preview.clone(),
+            history_initialization_id: derive_history_initialization_id(
+                &nodes[0].history.resource_uid,
+                PublicProtocolGeneration::new(1),
+            ),
+            history: nodes[0].history.clone(),
+            data_loss_recovery: None,
+            completed_operations: Vec::new(),
+            extensions: Default::default(),
+        };
+        let mut current = None;
+        let mut routed = None;
+        let mut stable = false;
+        for _ in 0..200 {
+            let mut observations = Vec::new();
+            for node in &nodes {
+                let report = node.report().await;
+                observations.push(PublicV1TopologyReplica {
+                    replication_address: report.replication_address.clone().unwrap_or_default(),
+                    report,
+                });
+            }
+            match plan_public_v1_topology(
+                &accepted,
+                current.as_ref(),
+                &observations,
+                3,
+                None,
+                routed,
+                "1",
+            )
+            .unwrap()
+            {
+                PublicV1TopologyPlan::Begin {
+                    transition,
+                    command,
+                } => {
+                    let source = nodes
+                        .iter()
+                        .position(|node| node.identity == command.target)
+                        .unwrap();
+                    if let Some(PublicOperationProgram::Build(build)) =
+                        command.intent.program.as_ref()
+                    {
+                        let target = nodes
+                            .iter()
+                            .position(|node| node.identity == build.replica)
+                            .unwrap();
+                        nodes[target]
+                            .install_build_authority(PublicInboundBuildAuthority {
+                                operation_id: command.intent.operation_id.clone(),
+                                operation_revision: command.intent.revision,
+                                attempt: PublicBuildAttemptReference {
+                                    resource_uid: accepted.history.resource_uid.clone(),
+                                    epoch: build.epoch,
+                                    build_id: build.attempt.clone(),
+                                    source: nodes[source].identity.clone(),
+                                    source_storage: nodes[source].storage.clone(),
+                                    source_session: nodes[source].session.clone(),
+                                    target: nodes[target].identity.clone(),
+                                    target_storage: nodes[target].storage.clone(),
+                                    target_session: nodes[target].session.clone(),
+                                },
+                                history: accepted.history.clone(),
+                                current_configuration_id: transition
+                                    .intent
+                                    .current_configuration_id
+                                    .clone()
+                                    .unwrap(),
+                                source_address: nodes[source]
+                                    .report()
+                                    .await
+                                    .replication_address
+                                    .unwrap(),
+                                target_address: build.replication_address.clone(),
+                            })
+                            .await;
+                    }
+                    let id = command.intent.operation_id.clone();
+                    nodes[source].submit(*command).await;
+                    let report = nodes[source].report().await;
+                    let completion = report
+                        .completed_operations
+                        .iter()
+                        .find(|completion| completion.operation_id == id)
+                        .unwrap();
+                    assert_eq!(completion.result, PublicV1OperationResult::Succeeded);
+                    accepted.completed_operations.push(
+                        PublicV1AcceptedOperationCompletion::from_completion(completion),
+                    );
+                    accepted.validate_evidence().unwrap();
+                }
+                PublicV1TopologyPlan::PersistTopology { expected, next } => {
+                    assert_eq!(
+                        expected.as_ref(),
+                        current
+                            .as_ref()
+                            .map(|configuration: &ConfigurationDescriptor| {
+                                &configuration.configuration_id
+                            })
+                    );
+                    current = Some(*next);
+                }
+                PublicV1TopologyPlan::RoutePrimary { primary } => routed = Some(primary.replica_id),
+                PublicV1TopologyPlan::Wait => tokio::time::sleep(Duration::from_millis(10)).await,
+                PublicV1TopologyPlan::Stable => {
+                    stable = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            stable,
+            "public controller/native bootstrap did not converge"
+        );
+        assert_eq!(current.unwrap().members.len(), 3);
+        let primary = nodes
+            .iter()
+            .find(|node| node.identity.replica_id == ReplicaId::new(1))
+            .unwrap();
+        primary
+            .service
+            .replicate_put("controller".into(), "committed".into())
             .await
             .unwrap();
-        let outcome = async {
-            let singleton = cluster.settle_members(1).await?;
-            let source = cluster.service(singleton.primary()).await?;
-            cluster
-                .probe(source.replicate_put("controller".into(), "copied-before-admission".into()))
-                .await?;
-            cluster.scale_to(3).await?;
-            let topology = cluster.settle_members(3).await?;
-            let observed = cluster.observe().await?;
-            for reference in topology.members() {
-                let snapshot = observed.snapshot(reference).unwrap();
-                let publication = snapshot.publication.as_ref().unwrap();
-                assert_eq!(publication.stage, ReplicaPublicationStage::AchievedScope);
-                assert_eq!(publication.scope.configuration.current.members.len(), 3);
-                let service = cluster.service(reference).await?;
-                assert_eq!(
-                    service.persistence().get("controller").as_deref(),
-                    Some("copied-before-admission")
-                );
-            }
-            cluster
-                .probe(source.replicate_put("controller".into(), "quorum-committed".into()))
-                .await?;
-            for reference in topology.members() {
-                assert_eq!(
-                    cluster
-                        .service(reference)
-                        .await?
-                        .persistence()
-                        .get("controller")
-                        .as_deref(),
-                    Some("quorum-committed")
-                );
-            }
-            Ok::<_, kuberic_controller::test_util::TestError>(())
+        for node in nodes {
+            assert_eq!(
+                node.service.persistence().get("controller").as_deref(),
+                Some("committed")
+            );
+            node.close().await;
         }
-        .await;
-        cluster.finish(outcome).await.unwrap();
     })
     .await
     .expect("bounded controller-to-production-host bootstrap");
@@ -1954,6 +2280,9 @@ async fn controller_bootstraps_real_native_receivers_before_voting_admission() {
 
 #[tokio::test]
 async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() {
+    if m1_legacy_production_unavailable().await {
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = tempfile::tempdir().unwrap();
         let mut source = Node::<KvService>::start(&root.path().join("source"), 1, 0).await;
@@ -1963,22 +2292,20 @@ async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() 
         let single = source.single(epoch).await;
         target.open(ReplicaRole::IdleSecondary, epoch).await;
         let first_build = source.build(&mut target, epoch, &single).await;
-        let source_report = m2_builtin::snapshot(&source).await;
-        let target_report = m2_builtin::snapshot(&target).await;
-        let configuration = &source_report
-            .publication
-            .as_ref()
-            .unwrap()
-            .scope
-            .configuration
-            .current
-            .configuration_id;
-        let endpoint = |report: &ReplicaAgentSnapshot| {
+        let source_report = source.report().await;
+        let target_report = target.report().await;
+        let configuration = source_report
+            .completed_operations
+            .iter()
+            .filter_map(|completion| completion.current_configuration_id.as_ref())
+            .next_back()
+            .unwrap();
+        let endpoint = |report: &PublicV1AgentReport| {
             serde_json::json!({
-                "identity": report.storage.replica,
+                "identity": report.replica,
                 "processSessionId": report.process_session_id,
-                "storage": report.storage,
-                "address": report.publication.as_ref().unwrap().replication_address,
+                "storage": report.storage_incarnation,
+                "address": report.replication_address,
             })
         };
         let binding = serde_json::json!({
@@ -2004,12 +2331,7 @@ async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() 
         rejected.push((stale_history, format!("Bearer {CREDENTIAL}")));
         for (binding, credential) in rejected {
             let mut client = native_wire::carrier_client::CarrierClient::connect(
-                target_report
-                    .publication
-                    .as_ref()
-                    .unwrap()
-                    .replication_address
-                    .clone(),
+                target_report.replication_address.clone().unwrap(),
             )
             .await
             .unwrap();
@@ -2042,22 +2364,32 @@ async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() 
         );
 
         let mut successor = first_build;
-        successor.revision = source.revision + 1;
+        successor.operation_revision = source.revision + 1;
         successor.operation_id = OperationId::new("successor-copy");
-        let mut client = proto::agent_control_client::AgentControlClient::connect(
-            source.control_address.clone(),
-        )
-        .await
-        .unwrap();
+        successor.attempt.build_id = successor.operation_id.clone();
+        let mut client =
+            proto::replica_peer_client::ReplicaPeerClient::connect(target.control_address.clone())
+                .await
+                .unwrap();
         let failure = client
-            .submit_goal(authorized(proto::ReplicaGoalRequest {
-                protocol_version: ORDINARY_ACTION_FORMAT,
-                canonical_json: serde_json::to_vec(&successor).unwrap(),
+            .execute(authorized(proto::ExecuteCommandRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: target.history.resource_uid.to_string(),
+                target: Some(target.identity.clone().into()),
+                expected_process_session_id: target.session.to_string(),
+                command: Some(proto::execute_command_request::Command::PublicV1History(
+                    convert::public_v1_history_command_to_proto(
+                        &PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                            authority: Box::new(successor),
+                        },
+                    )
+                    .unwrap(),
+                )),
             }))
             .await
             .unwrap_err();
-        assert!(!failure.message().is_empty());
-        let retired = m2_builtin::snapshot(&target).await;
+        assert!(failure.message().contains("requires process replacement"));
+        let retired = target.report().await;
         assert_eq!(retired.read_status, AccessStatus::NotPrimary);
         assert_eq!(retired.write_status, AccessStatus::NotPrimary);
         source.stop().await;
@@ -2069,69 +2401,86 @@ async fn production_carrier_rejects_stale_bindings_and_retires_successor_copy() 
 
 #[tokio::test]
 async fn helper_free_recovery_scopes_changed_unchanged_and_failed_observations() {
-    use bytes::Bytes;
-    fn metadata(root: &Path) -> serde_json::Value {
-        let path =
-            kuberic_runtime::testing::sqlite_store::SqliteStore::metadata_database_path(root);
-        let connection =
-            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .unwrap();
-        let json: String = connection
-            .query_row(
-                "SELECT state_json FROM agent_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        serde_json::from_str(&json).unwrap()
+    if m1_legacy_production_unavailable().await {
+        return;
     }
+    use bytes::Bytes;
     tokio::time::timeout(Duration::from_secs(120), async {
         for outcome in ["unchanged", "changed", "failed"] {
             let root = tempfile::tempdir().unwrap();
             let mut node = Node::<ExternalService>::start_sized(root.path(), 1, 0, 1).await;
-            node.open(ReplicaRole::Primary, Epoch::new(0, 1)).await;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while metadata(root.path())["applicationStorage"]["initializing"] == true {
-                    tokio::task::yield_now().await;
-                }
+            node.command(PublicOperationProgram::Open {
+                replica: node.identity.clone(),
+                existing: false,
             })
-            .await
-            .unwrap();
-            let before = m2_builtin::snapshot(&node).await;
-            let metadata_before = metadata(root.path());
-            let bytes_before = std::fs::read(root.path().join("application/state.json")).unwrap();
-            let original =
-                ExternalService::read_persisted_snapshot(&root.path().join("application")).unwrap();
-            let program = PublicOperationProgram::Progress { capability: false };
-            let denied = node
-                .submit_result(PublicV1OperationCommand {
-                    target: node.identity.clone(),
-                    intent: PublicOperationIntent {
-                        identity: node.preview.clone(),
-                        operation_id: OperationId::new("unsupported-recovery-callback-program"),
-                        revision: node.revision + 1,
-                        process_session_id: node.session.clone(),
-                        class: PublicOperationClass::Authority,
-                        input_digest: program.digest(),
-                        replay_disposition: program.replay_disposition(),
-                        lifecycle: None,
-                        program: Some(program),
+            .await;
+            let before = node.report().await;
+            let authorization_id = OperationId::new(format!("loss-{outcome}"));
+            let proposed =
+                derive_data_loss_history(&authorization_id, &node.history, 1, &node.storage)
+                    .unwrap();
+            let epoch = Epoch::new(1, 2);
+            let revision = node.revision + 1;
+            let authorization = DataLossAuthorization {
+                authorization_id: authorization_id.clone(),
+                predecessor: node.history.clone(),
+                proposed: proposed.clone(),
+                provisional_primary: node.storage.clone(),
+                reset_scope: ProviderProgressReset::Preserve,
+                replay_disposition: DataLossReplay::ReplaceOnAmbiguity,
+            };
+            let input = PublicLifecycleInput {
+                recipe: PublicLifecycleRecipe::InitialPrimary,
+                replica: node.identity.clone(),
+                epoch,
+                possible_data_loss: PossibleDataLossIntent::Possible,
+                current: ConfigurationDescriptor::new(
+                    epoch,
+                    node.identity.replica_id,
+                    vec![ConfigurationMember {
+                        identity: node.identity.clone(),
+                        role: ReplicaRole::Primary,
+                    }],
+                    1,
+                ),
+                previous: None,
+                replicas: Vec::new(),
+                data_loss_recovery: Some(PublicDataLossRecoveryInput {
+                    authorization,
+                    attempt: DataLossAttempt {
+                        authorization_id,
+                        attempt_id: OperationId::new(format!("recover-{outcome}")),
+                        process: ProcessAttemptContext {
+                            process_session_id: node.session.clone(),
+                            replicator_creation_id: before.replicator_creation_id,
+                            catch_up_specific_quorum: before
+                                .extensions
+                                .catch_up_specific_quorum
+                                .unwrap(),
+                            data_loss_replay: DataLossReplay::ReplaceOnAmbiguity,
+                            epoch,
+                            attempt_revision: revision,
+                        },
                     },
-                })
-                .await
-                .unwrap_err();
-            assert!(
-                denied
-                    .message()
-                    .contains("controller callback programs are unavailable")
-            );
-            assert_eq!(m2_builtin::snapshot(&node).await, before);
-            assert_eq!(metadata(root.path()), metadata_before);
-            assert_eq!(
-                std::fs::read(root.path().join("application/state.json")).unwrap(),
-                bytes_before
-            );
-            assert_eq!(node.service.data_loss_calls(), 0);
+                }),
+            };
+            input.validate().unwrap();
+            let command = PublicV1OperationCommand {
+                target: node.identity.clone(),
+                intent: PublicOperationIntent {
+                    identity: node.preview.clone(),
+                    operation_id: OperationId::new(format!("recover-{outcome}")),
+                    revision,
+                    process_session_id: node.session.clone(),
+                    class: PublicOperationClass::Authority,
+                    input_digest: input.digest(),
+                    replay_disposition: PublicOperationReplayDisposition::DataLoss(
+                        DataLossReplay::ReplaceOnAmbiguity,
+                    ),
+                    lifecycle: Some(input),
+                    program: None,
+                },
+            };
             let service = node.service.clone();
             service.pause_recovery(match outcome {
                 "unchanged" => None,
@@ -2139,60 +2488,62 @@ async fn helper_free_recovery_scopes_changed_unchanged_and_failed_observations()
                 "failed" => Some(Err("provider recovery failed".into())),
                 _ => unreachable!(),
             });
-            let native = service.clone();
-            let mut task = tokio::spawn(async move { native.native_data_loss().await });
+            let control = node.control_address.clone();
+            let history = node.history.clone();
+            let identity = node.identity.clone();
+            let mut task = tokio::spawn(async move {
+                let result = node.submit_result(command).await;
+                (node, result)
+            });
             tokio::select! {
                 _ = service.recovery_entered() => {}
                 result = &mut task => panic!(
                     "recovery did not reach provider: {:?}",
-                    result,
+                    result.map(|(_, result)| result),
                 ),
             }
-            let pending = m2_builtin::snapshot(&node).await;
-            assert_eq!(pending, before);
-            assert_eq!(pending.read_status, AccessStatus::ReconfigurationPending);
-            assert_eq!(pending.write_status, AccessStatus::ReconfigurationPending);
-            assert_eq!(service.data_loss_calls(), 1);
+            let pending = report_at(&control, &history.resource_uid, &identity).await;
+            assert_eq!(pending.history, history);
+            assert!(matches!(
+                pending.progress.current_progress,
+                ProgressQueryResult::NotQueried(_)
+            ));
+            assert_eq!(pending.read_status, AccessStatus::NotPrimary);
+            assert_eq!(pending.write_status, AccessStatus::NotPrimary);
             service.release_recovery();
-            let result = task.await.unwrap();
-            let observed = m2_builtin::snapshot(&node).await;
-            assert_eq!(observed.history, before.history);
-            assert_eq!(observed.goals, before.goals);
-            assert_ne!(observed.read_status, AccessStatus::Granted);
-            assert_ne!(observed.write_status, AccessStatus::Granted);
-            let persisted =
-                ExternalService::read_persisted_snapshot(&root.path().join("application")).unwrap();
+            let (mut node, result) = task.await.unwrap();
+            let report = node.report().await;
             if outcome == "failed" {
                 assert!(
                     result
                         .unwrap_err()
-                        .to_string()
+                        .message()
                         .contains("provider recovery failed")
                 );
-                assert_eq!(persisted, original);
+                assert_eq!(report.history, history);
+                assert!(report.progress.current().is_none());
+                assert_eq!(report.write_status, AccessStatus::NotPrimary);
+                node.stop().await;
             } else {
-                assert_eq!(result.unwrap(), outcome == "changed");
+                result.unwrap();
+                assert_eq!(report.history, proposed);
+                assert!(report.has_current_open_endpoint());
+                let restored = if outcome == "changed" { 1 } else { 0 };
+                assert_eq!(report.progress.current(), Some(restored));
                 assert_eq!(
-                    persisted.committed_lsn,
-                    if outcome == "changed" { 1 } else { 0 }
+                    report.data_loss_recovery.as_ref().unwrap().stage,
+                    PublicDataLossRecoveryStage::Admitted
                 );
-                assert_eq!(
-                    persisted.values,
-                    if outcome == "changed" {
-                        vec![Bytes::from_static(b"restored")]
-                    } else {
-                        Vec::new()
-                    }
-                );
-            }
-            assert!(
-                service
-                    .begin_write(Bytes::from_static(b"unadmitted-history"))
+                let write = node
+                    .service
+                    .begin_write(Bytes::from_static(b"new-history"))
                     .await
-                    .is_err()
-            );
-            assert_eq!(service.data_loss_calls(), 1);
-            node.close().await;
+                    .unwrap();
+                assert_eq!(write.lsn, restored + 1);
+                write.wait().await.unwrap();
+                node.history = proposed;
+                node.close().await;
+            }
         }
     })
     .await

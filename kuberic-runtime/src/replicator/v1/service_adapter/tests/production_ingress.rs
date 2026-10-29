@@ -1,22 +1,20 @@
 use super::super::super::transport::{Carrier, CarrierLimits, ExchangeService, connect};
-use super::super::engine_session::{Binding, Endpoint};
 use super::super::production_transport::Transport;
 use super::facade::{config, facade_config, information, until};
 use super::*;
+use crate::host::native_transport::{NativeBinding, NativeEndpoint};
 use crate::protocol::public_operations::*;
 use crate::protocol::types::*;
 use crate::replicator::{
-    PartitionAccessView, PartitionInformation, PrimaryReplicator, Replicator,
-    ReplicatorFactoryContext,
+    PartitionAccessView, PartitionInformation, PrimaryReplicator, PublicInboundBuildAdmission,
+    Replicator, ReplicatorFactoryContext,
 };
 use tokio_stream::wrappers::TcpListenerStream;
 
 struct Access {
-    publication: Mutex<ReplicaPublication>,
     validated: Semaphore,
     release: Semaphore,
     pause: AtomicBool,
-    withdrawn: AtomicBool,
     faults: AtomicUsize,
     writer_releases: AtomicUsize,
 }
@@ -33,18 +31,29 @@ impl PartitionAccessView for Access {
     async fn write_status(&self) -> crate::Result<AccessStatus> {
         Ok(AccessStatus::Granted)
     }
-    async fn local_publication(
-        &self,
-        _: crate::replicator::ReplicatorCreationReservation,
-    ) -> crate::Result<Option<ReplicaPublication>> {
+    async fn validate_native_binding(&self, _: &NativeBinding) -> crate::Result<()> {
+        // Controlled authority seam: native Remove is deliberately independent
+        // of an already successful journal/authentication decision.
         self.validated.add_permits(1);
         if self.pause.swap(false, Ordering::SeqCst) {
             self.release.acquire().await.unwrap().forget();
         }
-        if self.withdrawn.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        Ok(Some(self.publication.lock().unwrap().clone()))
+        Ok(())
+    }
+    async fn classify_replacement_inbound_build_authority(
+        &self,
+        _: &PublicInboundBuildAuthority,
+    ) -> crate::Result<PublicInboundBuildAdmission> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+    async fn install_replacement_inbound_build_authority(
+        &self,
+        _: &PublicInboundBuildAuthority,
+    ) -> crate::Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+    fn release_provider_writer(&self) {
+        self.writer_releases.fetch_add(1, Ordering::SeqCst);
     }
     async fn report_load(&self, _: Vec<LoadMetric>) -> crate::Result<()> {
         Ok(())
@@ -53,18 +62,11 @@ impl PartitionAccessView for Access {
         self.faults.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    fn native_write_admission(&self) -> crate::Result<Arc<Mutex<()>>> {
-        Ok(Arc::new(Mutex::new(())))
-    }
-    fn native_write_status(&self) -> AccessStatus {
-        AccessStatus::Granted
-    }
 }
 
-fn native_endpoint(id: i64) -> Endpoint {
+fn native_endpoint(id: i64) -> NativeEndpoint {
     let info = information(id);
-    Endpoint {
-        creation_id: ReplicatorCreationId::new(format!("creation-{id}")),
+    NativeEndpoint {
         storage: ReplicaStorageIncarnationContext {
             replica: info.identity.clone(),
             storage: ReplicaStorageIdentity::Persistent {
@@ -79,34 +81,14 @@ fn native_endpoint(id: i64) -> Endpoint {
     }
 }
 
-fn publication(history: &HistoryContext, id: i64) -> ReplicaPublication {
-    let endpoint = native_endpoint(id);
-    ReplicaPublication {
-        format: ORDINARY_ACTION_FORMAT,
-        scope: ReplicaScope {
-            history: history.clone(),
-            storage: endpoint.storage,
-            process_session_id: endpoint.process_session_id,
-            creation_id: endpoint.creation_id,
-            epoch: epoch(1),
-            configuration: ReplicaConfigurationScope {
-                current: config(1, 1, &[]).configuration,
-                previous: None,
-                replicas: Vec::new(),
-            },
-        },
-        replication_address: endpoint.address,
-        generation: 1,
-        stage: ReplicaPublicationStage::AchievedScope,
-        role: if id == 1 {
-            ReplicaRole::Primary
-        } else {
-            ReplicaRole::IdleSecondary
-        },
-    }
-}
-
-fn owner(registry: MessageRegistry, pause: bool) -> (Arc<Transport>, Arc<Access>, Binding) {
+fn owner(registry: MessageRegistry, pause: bool) -> (Arc<Transport>, Arc<Access>, NativeBinding) {
+    let access = Arc::new(Access {
+        validated: Semaphore::new(0),
+        release: Semaphore::new(0),
+        pause: AtomicBool::new(pause),
+        faults: AtomicUsize::new(0),
+        writer_releases: AtomicUsize::new(0),
+    });
     let binding = PublicV1LifecycleBinding {
         identity: PublicV1Identity::new(1),
         resource_uid: ResourceUid::new("pump-test"),
@@ -115,23 +97,11 @@ fn owner(registry: MessageRegistry, pause: bool) -> (Arc<Transport>, Arc<Access>
     };
     let initialization =
         derive_history_initialization_id(&binding.resource_uid, PublicProtocolGeneration::new(1));
-    let mut history = derive_bootstrap_history(
+    let history = derive_bootstrap_history(
         &binding.resource_uid,
         PublicProtocolGeneration::new(1),
         &initialization,
     );
-    history.data_loss_number = 1;
-    let source = publication(&history, 1);
-    let target = publication(&history, 2);
-    let access = Arc::new(Access {
-        publication: Mutex::new(source.clone()),
-        validated: Semaphore::new(0),
-        release: Semaphore::new(0),
-        pause: AtomicBool::new(pause),
-        withdrawn: AtomicBool::new(false),
-        faults: AtomicUsize::new(0),
-        writer_releases: AtomicUsize::new(0),
-    });
     let context = ReplicatorFactoryContext::new(
         crate::replicator::RuntimeHostToken::new(),
         native_endpoint(1).identity,
@@ -139,20 +109,21 @@ fn owner(registry: MessageRegistry, pause: bool) -> (Arc<Transport>, Arc<Access>
         access.clone(),
         binding,
         "127.0.0.1:0".parse().unwrap(),
-    )
-    .for_creation(crate::replicator::ReplicatorCreationReservation::new(
-        crate::replicator::RuntimeHostToken::new(),
-    ));
-    let native = Binding::new(source, target.clone()).unwrap();
-    let owner = Transport::test_owner(
-        context,
-        native_endpoint(1),
-        history.clone(),
-        vec![target, publication(&history, 3)],
-        registry,
     );
-    owner.selected_role(epoch(1), ReplicaRole::Primary);
-    (owner, access, native)
+    let native = NativeBinding {
+        history,
+        epoch: epoch(1),
+        current_configuration_id: config(1, 1, &[]).configuration.configuration_id,
+        previous_configuration_id: None,
+        primary: native_endpoint(1),
+        secondary: native_endpoint(2),
+        build: None,
+    };
+    (
+        Transport::test_owner(context, native_endpoint(1), registry),
+        access,
+        native,
+    )
 }
 
 struct Pump {
@@ -165,9 +136,7 @@ struct Pump {
 }
 
 impl Pump {
-    async fn start(owner: &Arc<Transport>, binding: Binding, peer: i64) -> Self {
-        owner.sessions.propose(&binding).unwrap();
-        owner.sessions.activate_source(&binding).unwrap();
+    async fn start(owner: &Arc<Transport>, binding: NativeBinding, peer: i64) -> Self {
         let limits = CarrierLimits {
             outbound_count: 32,
             outbound_bytes: 8192,
@@ -285,8 +254,7 @@ async fn production_pump_drops_late_retired_ack_and_continues_live_peer_progress
     assert!(owner.check_health().is_ok());
     assert_eq!(access.faults.load(Ordering::SeqCst), 0);
     let mut live_binding = binding;
-    live_binding.nonce = uuid::Uuid::new_v4().to_string();
-    live_binding.target = publication(live_binding.history(), 3);
+    live_binding.secondary = native_endpoint(3);
     let live = Pump::start(&owner, live_binding, 3).await;
     let mut write = source
         .service()
@@ -399,8 +367,7 @@ async fn actual_builtin_failed_drain_never_publishes_positive_containment() {
             },
             "127.0.0.1:0".parse().unwrap(),
         );
-        let control =
-            super::super::production::test_control(context, facade.clone(), transport.clone());
+        let control = super::super::production::test_control(context, facade, transport.clone());
         transport.spawn(async move {
             assert!(!lost, "lost actual builtin transport worker");
             Err(RuntimeError::ControlPlane(
@@ -408,12 +375,13 @@ async fn actual_builtin_failed_drain_never_publishes_positive_containment() {
             ))
         });
         until(|| access.faults.load(Ordering::SeqCst) == 1).await;
-        control.abort();
-        let first = control.close().await.unwrap_err().to_string();
-        assert_eq!(control.close().await.unwrap_err().to_string(), first);
+        assert!(control.shutdown_and_drain().await.is_err());
+        assert!(!*control.containment().borrow());
+        assert!(!control.build_authority_open());
+        assert!(control.shutdown_and_drain().await.is_err());
+        assert!(!*control.containment().borrow());
         assert_eq!(access.writer_releases.load(Ordering::SeqCst), 0);
-        assert_eq!(transport.cardinality(), 0);
-        assert_eq!(facade.retained_task_count(), 0);
+        assert_eq!(control.raw_retained_task_cardinality(), (0, 0));
     }
 }
 
@@ -458,6 +426,3 @@ async fn production_pump_keeps_non_ack_unknown_session_fatal() {
     source.close().await.unwrap();
     source.join().await.unwrap();
 }
-
-#[path = "engine_repairs.rs"]
-mod engine_repairs;

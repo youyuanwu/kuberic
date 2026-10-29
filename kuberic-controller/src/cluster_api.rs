@@ -25,6 +25,10 @@ use kuberic_runtime::protocol::public_operations::{
     PublicV1AgentReport, PublicV1OperationCompletion, PublicV1OperationResult,
     PublicV1SessionRenewalStatus,
 };
+#[cfg(test)]
+use kuberic_runtime::protocol::public_operations::{
+    PublicBuildAttemptReference, PublicInboundBuildAuthority,
+};
 use kuberic_runtime::protocol::types::{
     ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, PodUid,
     ProcessSessionEndpoint, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
@@ -2386,6 +2390,7 @@ fn renewal_public_configuration(
         .filter(|replica| replica.report.replica != *local)
         .map(|replica| {
             Ok(PublicReplicaDescriptor {
+                build_id: OperationId::default(),
                 identity: replica.report.replica.clone(),
                 replication_address: replica.replication_address.clone(),
                 process_session_id: replica.report.process_session_id.clone(),
@@ -2504,6 +2509,102 @@ fn renewal_configuration_commands(
     }
 
     Ok(commands)
+}
+
+#[cfg(test)]
+fn renewal_completed_copy_revoke(
+    renewal: &PublicV1SessionRenewalStatus,
+    replicas: &[PublicV1TopologyReplica],
+) -> std::result::Result<Option<ProtocolCommand>, String> {
+    use kuberic_runtime::protocol::public_operations::PublicV1CallKind;
+    let Some(replacement) = renewal
+        .required
+        .replacement
+        .as_ref()
+        .filter(|_| renewal.required.predecessor.role == ReplicaRole::ActiveSecondary)
+    else {
+        return Ok(None);
+    };
+    let source = replicas
+        .iter()
+        .find(|replica| {
+            replica.report.replica.replica_id == renewal.required.fresh_configuration.primary_id
+        })
+        .ok_or("renewal revoke lacks exact source")?;
+    let copy_id = OperationId::new(format!(
+        "{}-native-copy-{}",
+        renewal.required.operation_id, replacement.process_session_id
+    ));
+    let Some(completion) = source
+        .report
+        .completed_operations
+        .iter()
+        .find(|completion| {
+            completion.operation_id == copy_id
+                && completion.call_kind == PublicV1CallKind::Build
+                && completion.result == PublicV1OperationResult::Succeeded
+                && completion.process_session_id == source.report.process_session_id
+                && completion.storage_incarnation == source.report.storage_incarnation
+                && completion.history == renewal.required.history
+        })
+    else {
+        return Ok(None);
+    };
+    let remote = source
+        .report
+        .remote_builds
+        .iter()
+        .find(|remote| remote.operation_id == copy_id && remote.revision == completion.revision)
+        .ok_or("completed renewal copy lacks exact retained Build input for revocation")?;
+    let build = &remote.build;
+    let target = replicas
+        .iter()
+        .find(|replica| replica.report.replica == replacement.identity)
+        .ok_or("renewal revoke lacks exact replacement")?;
+    if build.attempt != copy_id
+        || build.epoch != renewal.required.renewal_epoch
+        || build.replica != replacement.identity
+        || build.target_storage != replacement.storage_incarnation
+        || build.process_session_id != replacement.process_session_id
+        || target.report.process_session_id != replacement.process_session_id
+        || target.report.storage_incarnation != replacement.storage_incarnation
+        || build.source_address != source.replication_address
+        || build.replication_address != target.replication_address
+        || build.history.as_ref() != Some(&renewal.required.history)
+        || completion.input_digest != PublicOperationProgram::Build(build.clone()).digest()
+    {
+        return Err("completed renewal copy revocation differs from frozen authority".into());
+    }
+    let authority = PublicInboundBuildAuthority {
+        operation_id: copy_id.clone(),
+        operation_revision: remote.revision,
+        attempt: PublicBuildAttemptReference {
+            resource_uid: renewal.required.resource_uid.clone(),
+            epoch: build.epoch,
+            build_id: copy_id,
+            source: source.report.replica.clone(),
+            source_storage: source.report.storage_incarnation.clone(),
+            source_session: source.report.process_session_id.clone(),
+            target: build.replica.clone(),
+            target_storage: build.target_storage.clone(),
+            target_session: build.process_session_id.clone(),
+        },
+        history: renewal.required.history.clone(),
+        current_configuration_id: build
+            .current_configuration_id
+            .clone()
+            .ok_or("renewal revoke lacks configuration")?,
+        source_address: build.source_address.clone(),
+        target_address: build.replication_address.clone(),
+    };
+    authority.validate().map_err(str::to_owned)?;
+    // Historical success may justify only an exact compare-revoke, never
+    // reinstall authority or fabricate a fresh engine observation.
+    Ok(Some(ProtocolCommand::PublicV1History(Box::new(
+        kuberic_runtime::protocol::command::PublicV1HistoryCommand::RevokeInboundBuildAuthority {
+            authority: Box::new(authority),
+        },
+    ))))
 }
 
 #[cfg(any(test, feature = "runtime-test-bridge"))]
@@ -5742,8 +5843,7 @@ mod corrective_replacement_tests {
         let mut set = KubericSet::new(
             "sample",
             KubericSetSpec {
-                hosting_format:
-                    kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+                hosting_format: 15,
                 replicas: 1,
                 image: "example".into(),
                 failover_delay_seconds: 30,
@@ -6660,8 +6760,7 @@ mod tests {
         let mut set = KubericSet::new(
             "sample",
             crate::crd::KubericSetSpec {
-                hosting_format:
-                    kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+                hosting_format: 15,
                 replicas: 3,
                 image: "example".into(),
                 failover_delay_seconds: 10,
@@ -6940,6 +7039,14 @@ mod tests {
             }
         );
         assert_eq!(retirement.intent.revision, frozen.revision);
+        assert!(
+            renewal_completed_copy_revoke(&renewal, &replicas)
+                .unwrap()
+                .is_none()
+        );
+        // Simulate interruption after the retained Build succeeded but before
+        // the old controller could issue revoke. A recreated controller has
+        // only independently reobserved exact journal evidence, not its stack.
         replicas[0]
             .report
             .completed_operations
@@ -6949,32 +7056,32 @@ mod tests {
         replicas[0].report.remote_builds[0].state =
             kuberic_runtime::protocol::public_operations::PublicV1RemoteBuildState::Ready;
         replicas[0].report.validate().unwrap();
+        let first_revoke = renewal_completed_copy_revoke(&renewal, &replicas)
+            .unwrap()
+            .unwrap();
         let mut reobserved = replicas.clone();
         for replica in &mut reobserved {
             replica.report =
                 serde_json::from_slice(&serde_json::to_vec(&replica.report).unwrap()).unwrap();
         }
-        let completion = reobserved[0].report.completed_operations.last().unwrap();
-        assert_eq!(completion.operation_id, frozen.operation_id);
-        assert_eq!(completion.revision, frozen.revision);
-        assert_eq!(completion.process_session_id, frozen.process_session_id);
-        assert_eq!(completion.input_digest, frozen.input_digest);
         assert_eq!(
-            completion,
-            replicas[0].report.completed_operations.last().unwrap()
+            renewal_completed_copy_revoke(&renewal, &reobserved).unwrap(),
+            Some(first_revoke.clone())
         );
-        assert_eq!(
-            reobserved[0].report.remote_builds,
-            replicas[0].report.remote_builds
-        );
+        let ProtocolCommand::PublicV1History(command) = first_revoke else {
+            panic!("expected exact revoke")
+        };
+        let kuberic_runtime::protocol::command::PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } = *command
+            else { panic!("historical completion cannot reinstall a grant") };
+        assert_eq!(authority.operation_id, frozen.operation_id);
+        assert_eq!(authority.operation_revision, frozen.revision);
+        assert_eq!(authority.attempt.target_session, build.process_session_id);
+        assert_eq!(authority.attempt.target_storage, build.target_storage);
+        assert_eq!(authority.attempt.source_session, frozen.process_session_id);
+        assert_eq!(authority.source_address, build.source_address);
+        assert_eq!(authority.target_address, build.replication_address);
         reobserved[1].report.process_session_id = ProcessSessionId::new("successor-session");
-        assert_ne!(
-            reobserved[0].report.remote_builds[0]
-                .build
-                .process_session_id,
-            reobserved[1].report.process_session_id,
-            "historical source completion does not authorize a successor receiver"
-        );
+        assert!(renewal_completed_copy_revoke(&renewal, &reobserved).is_err());
     }
 
     #[test]
@@ -7021,8 +7128,7 @@ mod tests {
         let mut set = KubericSet::new(
             "sample",
             crate::crd::KubericSetSpec {
-                hosting_format:
-                    kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
+                hosting_format: 15,
                 replicas: replicas.len() as u32,
                 image: "example".into(),
                 failover_delay_seconds: 10,

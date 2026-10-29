@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::application::StatefulServiceReplica;
-use crate::host::operation::{PartitionOperation, PartitionOperationRegistry};
+use crate::host::operation::{CallbackContainment, PartitionOperation, PartitionOperationRegistry};
 use crate::host::state::{
     DataLossOutcome, PublicCallbackFailure, PublicCallbackFamily, PublicInstruction,
     PublicInstructionOutcome, PublicOperationDisposition, PublicOperationRecord,
@@ -57,6 +57,15 @@ pub(crate) fn instruction_selected(
 mod tests;
 
 type ApplicationControlMatch = Arc<dyn Fn(&Arc<dyn Replicator>) -> bool + Send + Sync>;
+pub(crate) type NativeRoleEpoch = Arc<
+    dyn Fn() -> crate::Result<
+            Option<(
+                crate::replicator::v1::LifecycleObservation,
+                Option<crate::protocol::types::Epoch>,
+            )>,
+        > + Send
+        + Sync,
+>;
 pub(crate) type TerminalDrain =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, crate::Result<()>> + Send + Sync>;
 pub(crate) type AccessFactory =
@@ -109,11 +118,15 @@ pub(crate) struct PublicLifecycleCallbacks {
     pub(crate) replicator: Arc<dyn Replicator>,
     pub(crate) primary: Arc<dyn PrimaryReplicator>,
     pub(crate) application_control_match: Option<ApplicationControlMatch>,
+    pub(crate) native_role_epoch: Option<NativeRoleEpoch>,
     pub(crate) revoke_access: Arc<dyn Fn() -> crate::Result<()> + Send + Sync>,
     pub(crate) capabilities: ReplicatorCapabilities,
     pub(crate) replicator_creation_id: ReplicatorCreationId,
     pub(crate) open_context: Option<crate::application::OpenContext>,
     pub(crate) containment: Option<tokio::sync::watch::Receiver<bool>>,
+    pub(crate) wait_for_containment: bool,
+    pub(crate) preempt_retained_owner: bool,
+    pub(crate) native_observer_callbacks: bool,
     pub(crate) retry_proof: PublicCallbackRetryProof,
     pub(crate) terminal_drain: TerminalDrain,
     pub(crate) peer_credentials: Option<Arc<str>>,
@@ -163,6 +176,8 @@ pub(crate) fn is_replacement_role_replay(
 #[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicCutPosition {
+    BuildAuthorityRead,
+    BeforeInboundBuildCommit,
     BeforeAccessReservation,
     BeforeInstruction,
     InstructionSelected,
@@ -196,6 +211,32 @@ impl PublicLifecycleCallbacks {
         epoch: crate::protocol::types::Epoch,
         instruction: PublicInstruction,
     ) -> crate::Result<()> {
+        if self
+            .access_owner
+            .as_ref()
+            .is_some_and(|owner| owner.resumes_primary())
+            && let Some(
+                native @ (
+                    crate::replicator::v1::LifecycleObservation::Ready(ReplicaRole::Primary),
+                    Some(_),
+                ),
+            ) = self
+                .native_role_epoch
+                .as_ref()
+                .map(|observe| observe())
+                .transpose()?
+                .flatten()
+        {
+            // Final demotion catch-up can finish before its role callback. Reconcile
+            // the observed native role; this promotion still requires fresh catch-up.
+            return super::service::replay_role_at_epoch(
+                self.replicator.as_ref(),
+                Some(native),
+                epoch,
+                ReplicaRole::Primary,
+            )
+            .await;
+        }
         let result = self
             .replicator
             .change_role(epoch, ReplicaRole::Primary)
@@ -339,6 +380,9 @@ pub(crate) async fn launch_bound_attempt<T>(
     callbacks.aborted = registry.abort_guard();
     if intent.goal().is_some() {
         callbacks.ordinary = true;
+        callbacks.native_role_epoch = None;
+        callbacks.native_observer_callbacks = false;
+        callbacks.preempt_retained_owner = intent.class.is_terminal();
     }
     callbacks.retry_proof = callbacks.retry_proof.for_attempt();
     if intent.class.is_terminal()
@@ -396,7 +440,9 @@ pub(crate) async fn launch_bound_attempt<T>(
             terminal::recover(registry, &operation, callbacks).await?;
             return Ok((operation, attempt, observer));
         }
-        if callbacks.ordinary && registry.has_uncontained_predecessors(&operation).await {
+        if callbacks.preempt_retained_owner
+            && registry.has_uncontained_predecessors(&operation).await
+        {
             callbacks.abort_once();
             if intent.goal().is_some() {
                 let drain = callbacks.terminal_drain.clone();
@@ -444,12 +490,25 @@ pub(crate) async fn launch_bound_attempt<T>(
                 .map(|cleanup| cleanup.witness())
                 .or_else(|| callbacks.containment.clone())
             {
-                operation.track_containment(witness, true).await?;
+                operation
+                    .track_containment(
+                        witness,
+                        intent.class.is_terminal() || callbacks.wait_for_containment,
+                    )
+                    .await?;
             }
             #[cfg(feature = "testing")]
             operation.track_cut(callbacks.cut.clone()).await;
+            let containment = if intent.class.is_terminal() {
+                CallbackContainment::RootTask
+            } else if callbacks.native_observer_callbacks {
+                CallbackContainment::NativeObserver
+            } else {
+                CallbackContainment::ObjectOwnedOnInterruption
+            };
             operation
                 .spawn_root_with_retry(
+                    containment,
                     Some(callbacks.retry_proof.returned_failure.clone()),
                     async move {
                         let _terminal_guard = terminal_guard;
@@ -871,43 +930,22 @@ pub(super) fn enrich_remote_rebuild(
             "remote rebuild failure differs from the captured build attempt".into(),
         ));
     }
-    let goal = intent.goal().ok_or_else(|| {
-        HostError::CommandRejected("remote rebuild evidence requires an ordinary Build goal".into())
-    })?;
-    let crate::protocol::public_operations::ReplicaGoalKind::Build { remote } = &goal.desired
-    else {
-        return Err(HostError::StaleEffectCompletion(
-            "rebuild evidence is not a Build goal".into(),
-        ));
+    let build = crate::protocol::public_operations::PublicBuildAttemptReference {
+        resource_uid: identity.resource_uid.clone(),
+        epoch: build.epoch,
+        build_id: intent.operation_id.clone(),
+        source: identity.local_identity.clone(),
+        source_storage: source_storage.clone(),
+        source_session: intent.process_session_id.clone(),
+        target: build.replica.clone(),
+        target_storage: build.target_storage.clone(),
+        target_session: build.process_session_id.clone(),
     };
-    if goal.scope.storage != *source_storage
-        || goal.intent() != *intent
-        || goal.scope.epoch != build.epoch
-        || goal.scope.history.resource_uid != identity.resource_uid
-        || goal.scope.storage.replica != identity.local_identity
-        || build.history.as_ref() != Some(&goal.scope.history)
-        || build.current_configuration_id.as_ref()
-            != Some(&goal.scope.configuration.current.configuration_id)
-        || build.attempt != goal.operation_id
-        || remote.target.scope.storage != build.target_storage
-        || remote.target.scope.storage.replica != build.replica
-        || remote.target.scope.process_session_id != build.process_session_id
-        || remote.target.replication_address != build.replication_address
-        || remote.source.replication_address != build.source_address
-    {
-        return Err(HostError::StaleEffectCompletion(
-            "rebuild evidence changed the selected ordinary endpoints".into(),
-        ));
-    }
-    let canonical = CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+    Ok(CanonicalReplicaRebuildRequired::RemoteBuildTarget {
         reason: failure.reason,
         operation: captured_operation(identity, intent, build.epoch),
-        goal: Box::new(goal.clone()),
-    };
-    canonical
-        .validate()
-        .map_err(|error| HostError::StaleEffectCompletion(error.into()))?;
-    Ok(canonical)
+        build: Box::new(build),
+    })
 }
 
 pub(crate) struct PublicV1ReportProjection {

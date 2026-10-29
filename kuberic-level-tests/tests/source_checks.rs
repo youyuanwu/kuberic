@@ -20,95 +20,6 @@ struct Cargo {
     vendor: PathBuf,
 }
 
-struct ConsumerScratch {
-    source: tempfile::TempDir,
-    target: tempfile::TempDir,
-}
-
-fn external_source_parent(root: &Path, scratch_parent: &Path) -> Result<PathBuf> {
-    let parent = scratch_parent.canonicalize()?;
-    ensure!(
-        !parent.starts_with(root.canonicalize()?),
-        "consumer TMPDIR must be outside the checkout to avoid inheriting Cargo configuration",
-    );
-    Ok(parent)
-}
-
-impl ConsumerScratch {
-    fn new(root: &Path, target: &Path, scratch_parent: &Path) -> Result<Self> {
-        // Validate before allocating either owner. Never change inherited TMPDIR
-        // or CARGO_TARGET_DIR; only build commands receive an owned --target-dir.
-        let source_parent = external_source_parent(root, scratch_parent)?;
-        let source = tempfile::Builder::new()
-            .prefix("kuberic-test-util-consumer-")
-            .tempdir_in(source_parent)?;
-        let target = tempfile::Builder::new()
-            .prefix("kuberic-test-util-build-")
-            .tempdir_in(target)?;
-        Ok(Self { source, target })
-    }
-}
-
-fn check_consumer_placement(root: &Path) -> Result<()> {
-    let inherited = (
-        std::env::var_os("CARGO_TARGET_DIR"),
-        std::env::var_os("TMPDIR"),
-    );
-    let scratch_parent = std::env::temp_dir();
-    let external = external_source_parent(root, &scratch_parent)?;
-    let owned = tempfile::Builder::new()
-        .prefix("kuberic-consumer-placement-")
-        .tempdir_in(&external)?;
-    let checkout = owned.path().join("checkout");
-    fs::create_dir(&checkout)?;
-    // Representative default, documented checkout-local, and external cache
-    // layouts. These probes allocate owners but never build in those targets.
-    for target in [
-        checkout.join("target"),
-        checkout.join("target/m2-validation-owned/build"),
-        owned.path().join("external-cache"),
-    ] {
-        fs::create_dir_all(&target)?;
-        let fixture = ConsumerScratch::new(&checkout, &target, &scratch_parent)?;
-        let source_path = fixture.source.path().canonicalize()?;
-        let target_path = fixture.target.path().canonicalize()?;
-        ensure!(!source_path.starts_with(root.canonicalize()?));
-        ensure!(!source_path.starts_with(&checkout));
-        ensure!(source_path.parent() == Some(external.as_path()));
-        ensure!(target_path.parent() == Some(target.canonicalize()?.as_path()));
-        ensure!(source_path != target_path);
-        let cargo = Cargo {
-            toolchain: "placement-probe-only".into(),
-            target: target_path.clone(),
-            vendor: source_path.join("vendor"),
-        };
-        let command = cargo.command(&source_path, "check");
-        ensure!(
-            command
-                .get_envs()
-                .all(|(name, _)| { name != "CARGO_TARGET_DIR" && name != "TMPDIR" })
-        );
-        let args = command.get_args().collect::<Vec<_>>();
-        ensure!(
-            args.windows(2)
-                .any(|pair| { pair[0] == "--target-dir" && pair[1] == target_path.as_os_str() })
-        );
-        drop(fixture);
-        ensure!(!source_path.exists() && !target_path.exists());
-    }
-    let before = fs::read_dir(&checkout)?.count();
-    ensure!(ConsumerScratch::new(&checkout, &checkout, &checkout).is_err());
-    ensure!(fs::read_dir(&checkout)?.count() == before);
-    ensure!(
-        inherited
-            == (
-                std::env::var_os("CARGO_TARGET_DIR"),
-                std::env::var_os("TMPDIR")
-            )
-    );
-    Ok(())
-}
-
 impl Cargo {
     fn command(&self, directory: &Path, subcommand: &str) -> Command {
         let mut command = Command::new("cargo");
@@ -116,10 +27,8 @@ impl Cargo {
             .arg(subcommand)
             .current_dir(directory)
             .env_remove("KUBERIC_WORKSPACE_TESTS")
-            .env("RUSTUP_TOOLCHAIN", &self.toolchain);
-        if matches!(subcommand, "check" | "clippy" | "package" | "test") {
-            command.arg("--target-dir").arg(&self.target);
-        }
+            .env("RUSTUP_TOOLCHAIN", &self.toolchain)
+            .env("CARGO_TARGET_DIR", &self.target);
         if std::env::var_os("CARGO_BUILD_JOBS").is_none() {
             command.env("CARGO_BUILD_JOBS", "2");
         }
@@ -275,10 +184,27 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .context("level tests must be inside the workspace")?;
-    check_consumer_placement(root)?;
-    // Fail unsupported checkout-local TMPDIR before invoking Cargo or writing.
-    let scratch_parent = external_source_parent(root, &std::env::temp_dir())?;
     let toolchain = pinned_toolchain(root)?;
+    // Separate invocations keep test/dev dependencies from enabling runtime hosting.
+    for (package, target) in [
+        ("kuberic-runtime", "--lib"),
+        ("kuberic-controller", "--bins"),
+    ] {
+        checked_output(
+            Command::new("cargo")
+                .args([
+                    "check",
+                    "--locked",
+                    "--offline",
+                    "--no-default-features",
+                    "--package",
+                    package,
+                    target,
+                ])
+                .current_dir(root)
+                .env("RUSTUP_TOOLCHAIN", &toolchain),
+        )?;
+    }
     let output = checked_output(
         Command::new("cargo")
             .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
@@ -286,31 +212,19 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
             .env("RUSTUP_TOOLCHAIN", &toolchain),
     )?;
     let metadata: Metadata = serde_json::from_slice(&output.stdout)?;
-    let scratch = ConsumerScratch::new(root, &metadata.target_directory, &scratch_parent)?;
-    let scratch_path = scratch.source.path().canonicalize()?;
+    let scratch = tempfile::Builder::new()
+        .prefix("kuberic-test-util-consumer-")
+        .tempdir()?;
+    let scratch_path = scratch.path().canonicalize()?;
     ensure!(
         !scratch_path.starts_with(root.canonicalize()?),
         "consumer must be outside the checkout to avoid inheriting Cargo configuration",
     );
     let cargo = Cargo {
         toolchain,
-        target: scratch.target.path().canonicalize()?,
+        target: metadata.target_directory.join("test-util-consumer"),
         vendor: scratch_path.join("vendor"),
     };
-    // Separate invocations keep test/dev dependencies from enabling runtime hosting.
-    for (package, target) in [
-        ("kuberic-runtime", "--lib"),
-        ("kuberic-controller", "--bins"),
-    ] {
-        checked_output(cargo.command(root, "check").args([
-            "--locked",
-            "--offline",
-            "--no-default-features",
-            "--package",
-            package,
-            target,
-        ]))?;
-    }
     checked_output(
         cargo
             .command(root, "vendor")
@@ -318,15 +232,20 @@ fn packaged_controller_test_util_boundary() -> Result<()> {
             .arg(&cargo.vendor),
     )?;
     for name in ["kuberic-runtime", "kuberic-controller"] {
-        checked_output(cargo.packaged_command(root, "package")?.args([
-            "-p",
-            name,
-            "--allow-dirty",
-            "--no-verify",
-            "--offline",
-            "--quiet",
-        ]))?;
-        unpack_package(name, &cargo.vendor, &cargo.target)?;
+        checked_output(
+            cargo
+                .packaged_command(root, "package")?
+                .args([
+                    "-p",
+                    name,
+                    "--allow-dirty",
+                    "--no-verify",
+                    "--offline",
+                    "--quiet",
+                ])
+                .env("CARGO_TARGET_DIR", &metadata.target_directory),
+        )?;
+        unpack_package(name, &cargo.vendor, &metadata.target_directory)?;
     }
 
     let fixture = root.join("scripts/fixtures/controller-test-util");

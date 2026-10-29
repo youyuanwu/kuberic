@@ -26,7 +26,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-kuberic-controller = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tonic.workspace = true
 tower = "0.5"
