@@ -264,30 +264,6 @@ pub(super) struct ReplicaManager {
 }
 
 impl ReplicaManager {
-    #[cfg(feature = "testing")]
-    pub(super) fn inspect_recoveries(&self) -> serde_json::Value {
-        serde_json::json!(
-            self.builds
-                .iter()
-                .filter_map(|(id, transfer)| {
-                    let member = self
-                        .current
-                        .as_ref()?
-                        .members
-                        .iter()
-                        .find(|member| member.replica_id == *id)?;
-                    if self.has_idle_membership(*id) {
-                        return None;
-                    }
-                    Some(serde_json::json!({
-                        "replica": id,
-                        "complete": transfer.result().is_some_and(|end| end.result.is_ok()),
-                        "voting": member.session.same_instance(&transfer.session()),
-                    }))
-                })
-                .collect::<Vec<_>>()
-        )
-    }
     pub(super) fn from_transferred(
         queue_config: QueueConfig,
         transfer: QueueTransfer,
@@ -617,30 +593,6 @@ impl ReplicaManager {
         }
         let old_sessions = self.established_sessions();
         let mut checked = old_sessions.clone();
-        let unchanged_current = self.previous.is_none()
-            && configuration.previous.is_none()
-            && self.current.as_ref().is_some_and(|old| {
-                old.write_quorum == configuration.current.write_quorum
-                    && old.members.len() == configuration.current.members.len()
-                    && old.members.iter().all(|member| {
-                        configuration.current.members.iter().any(|next| {
-                            next.replica_id == member.replica_id
-                                && next.must_catchup == member.must_catchup
-                        })
-                    })
-            });
-        for member in &configuration.current.members {
-            if unchanged_current
-                && !self.has_idle_membership(member.replica_id)
-                && old_sessions.contains_key(&member.replica_id)
-                && self.builds.get(&member.replica_id).is_some_and(|transfer| {
-                    transfer.session().same_instance(&member.session)
-                        && transfer.result().is_some_and(|end| end.result.is_ok())
-                })
-            {
-                checked.insert(member.replica_id, member.session.clone());
-            }
-        }
         self.validate_set(
             &configuration.current,
             configuration.catchup_configuration,
@@ -810,43 +762,14 @@ impl ReplicaManager {
         Ok((effects, start))
     }
 
-    #[cfg(test)]
     pub(super) fn remove_idle(&mut self, replica_id: i64) -> Result<ManagerEffects, ManagerError> {
-        self.remove_idle_with(replica_id, false, |native_idle| {
-            native_idle
-                .then_some(())
-                .ok_or(ConfigurationError::IdleNotFound(replica_id).into())
-        })
-    }
-
-    pub(super) fn remove_idle_with(
-        &mut self,
-        replica_id: i64,
-        exclude_voters: bool,
-        before_remove: impl FnOnce(bool) -> Result<(), ManagerError>,
-    ) -> Result<ManagerEffects, ManagerError> {
         self.ensure_active()?;
-        if exclude_voters
-            && self.current.iter().chain(self.previous.iter()).any(|set| {
-                set.members
-                    .iter()
-                    .any(|member| member.replica_id == replica_id)
-            })
-        {
-            return Err(ConfigurationError::IdleNotFound(replica_id).into());
-        }
         let Some(index) = self
             .idle
             .iter()
             .position(|idle| idle.replica_id == replica_id)
         else {
-            if self.contains_session(replica_id) {
-                return Err(ConfigurationError::IdleNotFound(replica_id).into());
-            }
-            // A production transfer may still be awaiting establishment before
-            // native Build. Its exact source owner must admit that cancellation.
-            before_remove(false)?;
-            return Ok(ManagerEffects::default());
+            return Err(ConfigurationError::IdleNotFound(replica_id).into());
         };
         let mut retained_idle = self.idle.clone();
         let idle = retained_idle.remove(index);
@@ -855,7 +778,6 @@ impl ReplicaManager {
             self.previous.as_ref(),
             &retained_idle,
         )?;
-        before_remove(true)?;
         self.idle = retained_idle;
         let mut effects = ManagerEffects::default();
         if let Some(build) = self.builds.remove(&replica_id) {
@@ -868,63 +790,6 @@ impl ReplicaManager {
         Ok(effects)
     }
 
-    #[cfg(all(test, feature = "testing"))]
-    pub(super) fn removal_membership(&self, id: i64) -> (bool, bool, bool) {
-        let contains = |set: &Option<ReplicaSet>| {
-            set.as_ref()
-                .is_some_and(|set| set.members.iter().any(|member| member.replica_id == id))
-        };
-        (
-            contains(&self.current),
-            contains(&self.previous),
-            self.has_idle_membership(id),
-        )
-    }
-    pub(super) fn admit_recovery(
-        &mut self,
-        member: EstablishedIdle,
-        build: BuildIdleHandle,
-        establishment: &mut PrimaryEstablishment,
-    ) -> Result<(ManagerEffects, SessionSendBatch), ManagerError> {
-        self.ensure_active()?;
-        self.check_reported_fault()?;
-        self.validate_session(member.replica_id, &member.session)?;
-        if self.previous.is_some() || self.has_idle_membership(member.replica_id) {
-            return Err(ConfigurationError::InvalidCopyTarget(member.replica_id).into());
-        }
-        let old = self
-            .current
-            .as_ref()
-            .and_then(|set| {
-                set.members
-                    .iter()
-                    .find(|m| m.replica_id == member.replica_id)
-            })
-            .ok_or(ConfigurationError::InvalidCopyTarget(member.replica_id))?;
-        if old.session.same_instance(&member.session) {
-            return Err(ConfigurationError::InvalidCopyTarget(member.replica_id).into());
-        }
-        let old_session = old.session.clone();
-        let Some((first, operations)) = self.queue.pending_for_build() else {
-            return Err(ConfigurationError::MissingCurrentReplay(member.replica_id).into());
-        };
-        let start = establishment
-            .prepare_begin(first)
-            .map_err(|e| ManagerError::BuildLifecycle(e.to_string()))?;
-        let mut effects = ManagerEffects::default();
-        effects.sessions.push(SessionEffect::Close(old_session));
-        if !operations.is_empty() {
-            effects.sessions.push(SessionEffect::Replay {
-                session: member.session.clone(),
-                operations,
-                completed_hint: self.queue.first_lsn_in_replication_queue() - 1,
-            });
-        }
-        // Transfer traffic has no vote. Keep the fenced predecessor in CC until
-        // the ordinary configuration callback selects this completed sender.
-        self.builds.insert(member.replica_id, build);
-        Ok((effects, start))
-    }
     pub(super) fn enqueue(
         &mut self,
         data: OperationData,
@@ -964,13 +829,7 @@ impl ReplicaManager {
             self.evaluate_wait(&mut effects);
         }
         let hint = self.queue.first_lsn_in_replication_queue() - 1;
-        let recovering = self
-            .builds
-            .values()
-            .map(|build| build.session())
-            .filter(|session| !sessions.values().any(|known| known.same_instance(session)))
-            .collect::<Vec<_>>();
-        for session in sessions.into_values().chain(recovering) {
+        for session in sessions.into_values() {
             effects.sessions.push(SessionEffect::Send {
                 session,
                 operation: operation.clone(),

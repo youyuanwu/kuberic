@@ -1,43 +1,34 @@
 # PostgreSQL: Native Replication on Kuberic Public V1
 
-**Hosting M2 integration:** PostgreSQL owns its authenticated ordinary endpoint,
-two-ended native transfer sessions and retained terminal lifetime through the
-[ordinary host/controller](../kuberic/ordinary-hosting-m1.md). Controller fixtures
-exercise real backup, WAL replay, native membership and separately gated SQL;
-an unavailable response is not a positive witness. This bounded integration is
-part of accepted bounded M2 implementation evidence, not completion of the
-entire M2 workflow or comprehensive M3 recovery policy. Documentation
-implementation review and actual independent final Sol/Astra gates are pending.
+**CURRENT implementation.** The
+[ordinary-engine host target](../kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+and [M2 PostgreSQL integration](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **PROPOSED / NOT IMPLEMENTED**. This design/docs delivery changes no
+PostgreSQL runtime, on-disk format or qualification result.
 
 The `postgres-replicated` package supplies an independent native engine for the
-level-triggered Public V1 runtime. The pre-M1 custom-controller route is historical.
+level-triggered Public V1 runtime and its supported custom-controller route.
 Bounded local qualification includes actual controller-driven formation and
 native database evidence. Images, deployment assets and distribution
 remain deferred; there is no PostgreSQL KinD or live-cluster coverage.
 This is experimental software, not a production deployment guide.
 
-The [pre-M1 engine-neutral host](../kuberic/engine-neutral-hosting.md#current--delivered-bounded-hosting) used one retained
+The [current engine-neutral host](../kuberic/engine-neutral-hosting.md#current--delivered-bounded-hosting) uses one retained
 authority/lifetime coordinator for this independent allocation and built-in V1.
 Host-installed configuration, exact host remote Build state and optional native
 idle observations are separate facts. PostgreSQL's `built_idle` query still
 means completed native copy, unlike V1 membership that can appear during copy;
 neither grants voting or SQL access. Production callback repeatability remains
-conservative in that baseline. Pinned pre-M1 controller-dispatched hosted terminal cases retained child
+conservative. Actual controller-dispatched hosted terminal cases retain child
 Close failure after successful cleanup and reject lost native joins, alongside
-the real backup/replay/SQL-fencing formation witnesses. The current generic contract is
-[ordinary hosting](../kuberic/ordinary-hosting-m1.md), with engine-owned transfer
-authority rather than the historical controller-installed grant.
+the real backup/replay/SQL-fencing formation witnesses.
 
 Use the current protocol/schema declared by the
 [runtime guide](../kuberic/classic-v1-runtime.md#production-policies-and-security).
 Prior unsupported agent/provider formats reject unchanged; there is no import,
 mixed-version or rolling mode implied by custom-controller integration.
-Current host/control/CRD input is matched format 16, not the historical
-protocol-13/schema-14 deployment. No PG metadata removal or PGDATA conversion/
-reset is authorized by that host-format change.
 
-The host-format change does not change the independent PG durable schema or
-its native BuildAuthority/slot identities. The current implementation uses a separate checksummed PostgreSQL metadata
+The current implementation uses a separate checksummed PostgreSQL metadata
 store. It remains retained in the hosting redesign. Removal is separately
 deferred behind the [complete metadata-disposition gate](stateless-metadata-prerequisites.md),
 not an assumption that three generic changes make it safe.
@@ -62,23 +53,15 @@ driver hierarchy.
 The agent delivers exact incarnation, session, endpoint, role and frozen progress
 descriptions through `ReplicaInformation` / `ReplicaSetConfiguration` and the
 existing configuration/build/catch-up callbacks. Authority stores and mutation
-capabilities remain private. The historical pre-M1 factory attached its own
+capabilities remain private. The production factory attaches its own
 `CustomReplicatorControl` to the same creation; it does not borrow a built-in
-bundle. The [removed companion contract](../kuberic/replicator-boundary.md#historical-companion-contract-removed)
-was a pre-M1 integration requirement, not an ordinary native interface.
-The current PG factory no longer attaches that companion or supplies a callback-ownership
-policy: ordinary `Abort` fences admission and ordinary `Close` retains cleanup.
-
-PG's ordinary replicator Open binds the actual configured data listener before
-role recovery. `PublicV1` checks the configured PG coordination credential
-before decoding or dispatching; outbound requests carry it too. Private
-nonce/generation sessions bind both complete achieved publications, including
-storage, process, creation, endpoint, history and epoch. Target reservation
-precedes source Active confirmation; retirement and confirmation share a local
-gate, retained tombstones are bounded, and unresolved remote ownership remains
-quarantined. Session-control completion is not native copy completion, Ready,
-voter admission or SQL permission. The same retained session owns native
-copy-to-peer handover and the bounded joint-to-current continuation below.
+bundle. The separate
+[companion contract](../kuberic/replicator-boundary.md#custom-controller-integration)
+adds exact inbound copy authority, coherent idle observations and owned drainage
+without adding methods to the protected native traits. Although attachment is
+optional for a bundle, current controller Build requires it. This is a real
+extra boundary beyond SF's ordinary custom-replicator integration, not justified
+merely by describing it as local.
 
 PostgreSQL uses the same common lifecycle owner as the built-in engine but does
 not register the built-in replication/copy data plane. Delayed native callback
@@ -155,28 +138,25 @@ managed lifetime; there is no independent orphan self-fencing mechanism.
 
 ## Native Build and Catch-Up
 
-Hosted Build authority is the PG-private session nonce/generation and its two
-achieved origins, not a controller operation, descriptor Build ID or installed
-host grant. The target reserves its single native receiver before source Active
-confirmation. Source confirmation and retirement linearize under the same local
-session gate; no network await holds that gate. Native inbound work remains
-owned independently of RPC observers.
+The controller installs exact inbound authority before source dispatch.
+PostgreSQL's hosted native Build envelope carries that full authority: both
+replica/storage/process endpoints, history, epoch, configuration and operation/
+Build attempt. The creation-bound source context resolves only its accepted
+running Build. Target installation alone is not source liveness; native source
+inspection independently validates the source journal and grant.
 
-The native owner revalidates around gateway creation, backup/receiver work,
-asynchronous completion cuts and publication. Native
+The selected native owner revalidates around gateway creation, destructive
+backup/receiver work, asynchronous completion cuts and publication. Native
 `pg_basebackup`, compatible system/timeline history, receive **and replay** at
 the captured source boundary, and a checkpoint establish its actual completion.
 Its exact process-local completion cache also revalidates durable/physical
-history and fresh source Active confirmation. Cache observers never acquire
-transfer mutation or process-cleanup ownership. Backup uses `--no-clean`:
-failure does not automatically remove partially written PGDATA, and existing
-history rejects before another physical installation. Ordinary paths never
-clear, reset or reinitialize retained data.
+history and live source/target authority; it is not a durable generic-agent
+database receipt or permission to reopen revoked ingress.
 
 Target preflight and cached source-inspection reads observe captured work
 cancellation without acquiring process cleanup authority. Graceful Close can
 interrupt those reads before its final durable observation and lifetime join.
-Source slot retirement revalidates the exact session before each new mutating
+Source slot retirement revalidates the hosted attempt before each new mutating
 SQL retry; this does not roll back an already-issued SQL statement.
 
 PGDATA helpers, native gateways and their retained join owners remain
@@ -188,79 +168,32 @@ Terminal and periodic paths transfer every gateway to retained drain ownership
 before awaiting any exit. Each completed drain outcome is shared immediately,
 so dropping a Close while another exit is pending loses neither the remaining
 gateways nor an already-observed failure.
-Source Remove excludes installed current and previous voters before fencing.
-Idle eligibility and synchronous session retirement share the configuration
-state owner; a configuration resolved before that fence revalidates before
-grant conversion, slots or SQL policy changes. State is released before
-awaiting local cleanup, which may itself need state or lifecycle serialization.
-A lost Remove observer does not lose the retained local or two-ended joins.
-Remove observes local cleanup, not target containment. The retained two-ended
-owner retries exact remote retirement; terminal joins observe both endpoints,
-and unresolved ownership remains quarantined, never revived to Active.
-A different uncertain receiver requires actual settlement, not an in-place
-metadata reset. A source still being Primary is not Active confirmation.
-Copied data and native durable metadata are retained. Failed callbacks
+Revocation removes copy ingress, not copied data or voter
+membership. A different uncertain receiver attempt requires containment/process
+replacement, not an in-place metadata reset. Failed/interrupted custom callbacks
 can remain `ContainmentPending` until explicit terminal cleanup; this bounded
 route does not promise arbitrary failed-Build automatic reformation.
 
-Source joint configuration installs and reads back its local exact native
-policy without awaiting target ActiveSecondary. A retained membership worker
-uses the completed copy's same reservation, nonce, gateway, slot and ACK name
-after actual target Role/Epoch callbacks. It joins the old owned receiver before
-handover, preserving lineage and data. Compatible same-role/epoch callbacks do
-not blanket-drain transport.
-The worker is registered only after receiver, session generation and lifecycle
-admission are revalidated under the same gate that seals retirement's joins.
-Retirement includes that actual child; cancellation alone is not settlement.
-
-Only the exact joint `(P,C)` to current-only `(None,C)` edge retains continuation
-for unchanged C, primary, identities, history and epoch. The bounded monotonic
-phase lives in the existing session owner. Its achieved origins allow only
-that existing session to progress while either latest publication is
-DiscoveryPending; pending never creates fresh transfer authority or serving
-permission. The worker need not observe the fleeting joint publication.
-Current-only policy is compiled/read back for C using the same session-qualified
-ACK names. Actual exact-session catch-up precedes the host receipt; SQL remains
-separately gated by achieved ordinary scope and native readiness.
-
-Missing, withdrawn, incompatible, uncertain, retired or quarantined ownership
-invalidates continuation. A delayed joint request cannot downgrade current-only
-permission. Native gateway validation waits for the owned physical SQL-access
-fence/restart to settle before checking history, rather than misclassifying its
-temporary stopped run as incompatible history. This preserves the session,
-not an old process-generation capability.
-
-Ordinary Abort synchronously closes effect admission and cancels session work.
-Authenticated retirement/cancellation-only ingress remains until two-ended settlement;
-fresh Build/Inspect/Peer admission is closed. Close joins that endpoint as well
-as actual native/Rust descendants, retaining sticky failures across observers.
-Physical SQL/admin/pre-authentication fencing precedes remote settlement waits.
-The endpoint drains terminal RPC replies before physically fencing idle or
-pre-handshake coordination sockets. A locally failed join can still cancel the
-peer, but cannot advertise local settlement or release its quarantined owner.
-
 Successful built-idle ownership and last installed native membership are
-separate from live transport/readiness. Incompatible history/epoch advancement drains transport and cannot revive
-retired sessions. Secondary host
+separate from live transport/readiness. Same-history epoch advancement can
+drain transport while retaining the exact predecessor for joint catch-up;
+completed copy authority is not reused as a current grant. Secondary host
 configuration authority precedes primary native Peer admission and supplies
 neither a primary-only callback nor serving access.
 
 An empty uninitialized native history reports the unknown sentinel, not a
-fabricated zero. This native/direct progress semantic does not require ordinary
-bootstrap to query it: ordinary snapshots report progress and capability as
-`NotQueried`. Initial singleton formation uses successful New-Open provenance
-and the actual native initial-Primary guard requiring uninitialized durable
-history and the initializing flag. Ordinary receipts, achieved-scope and
-admission checks still apply; the historical native/direct sentinel-query
-evidence below is not a current ordinary bootstrap prerequisite.
+fabricated zero. Initial singleton authority requires exact successful New-Open
+provenance and both explicit sentinel query results; this local initialization
+exception changes neither retained election nor native progress semantics.
 `WriteQuorum` with marked successors remains explicitly unsupported; ordinary
 unmarked waits and `All` retain their qualified native behavior.
 
-Selected implementation: [ordinary factory](../../../examples/postgres/src/service.rs),
-[session and membership owners](../../../examples/postgres/src/public_session.rs),
-[native transfer and terminal joins](../../../examples/postgres/src/public_v1.rs),
-[physical-only gateway](../../../examples/postgres/src/public_transport.rs) and
-[production-controller witnesses](../../../examples/postgres/src/public_controller_tests.rs).
+Selected implementation: [factory:294–311](../../../examples/postgres/src/service.rs#L294-L311),
+[companion:547–641](../../../examples/postgres/src/public_v1.rs#L547-L641),
+[retained drainage:701–800](../../../examples/postgres/src/public_v1.rs#L701-L800),
+[Close joins:1273–1323](../../../examples/postgres/src/public_v1.rs#L1273-L1323),
+[Build/replay:2365–2698](../../../examples/postgres/src/public_v1.rs#L2365-L2698)
+and [native/controller qualification:185–1412](../../../examples/postgres/src/public_controller_tests.rs#L185-L1412).
 
 Physical replication slots belong to exact incarnations, not quorum votes.
 Slots reserve WAL before build and survive internal reconnection/restart.
@@ -309,13 +242,6 @@ success from a role flag.
 
 ## Scaling, Replacement and Restart
 
-Fresh sequential growth is qualified through ordinary production goals.
-The following broader removal/replacement/restart mechanics describe retained
-native/direct or historical controller behavior, **not current general M3
-orchestration instructions**. Planned primary replacement, automatic contraction
-and retained-history election remain unavailable or waiting in the current
-ordinary controller. No PG live-cluster or comprehensive recovery claim follows.
-
 Sequential scale-up builds/adopts one exact fresh identity at a time. PC/CC
 configuration precedes current-only admission, and candidates stay fenced until
 their selected build completes. Secondary removal closes writes, freezes a
@@ -352,14 +278,13 @@ never exempts a true role/signal mismatch.
 
 Application-only and whole-agent-host restart reconstruct durable state with
 fresh sessions. Accepted standbys wait for validated current source connections.
-In the historical pre-M1 whole-agent route, a persisted custom-replicator access
-grant remained desired, not immediately effective: transient access reconciliation keeps the control service
+On whole-agent restart a persisted custom-replicator grant remains desired, not
+immediately effective: transient access reconciliation keeps the control service
 live and reports access pending while application SQL stays closed. Progress/status
 reconciliation retries that grant only under the restored authority until exact
 peer discovery, native policy readback and acknowledgement availability converge.
 New access/authority fencing supersedes the deferred grant; other startup errors
-remain fatal. This historical access-grant reconstruction is not a current
-ordinary retained-history election or general PG restart-qualification claim.
+remain fatal. The default replication engine's restart behavior is unchanged.
 Lost quorum closes writes without discarding acknowledged data; accepted
 secondary reads remain possible. Restoration requires fresh evidence and native
 policy readback, not old scalar journals.
@@ -392,10 +317,6 @@ metadata to 4 MiB. New epochs compact old IDs into a rejection watermark, never
 TTL-based forgetting. Exhausted budgets fail closed.
 
 ## Local Usage and Configuration
-
-The command shape below is bounded local integration reference, not a packaged
-production deployment recipe. Never erase PGDATA to bypass an admission or
-retained-history rejection.
 
 Run as an unprivileged Linux account with compatible local PostgreSQL server and
 client binaries (`initdb`, `postgres`, `pg_ctl`, `pg_basebackup`, `pg_rewind`,
@@ -442,49 +363,24 @@ just nextest-postgres-smoke
 ```
 
 The smoke inventory validates the live catalog before PostgreSQL starts.
-Accepted routine smoke `7f8131ed-acb2-4e32-b6d5-a842c45b5765` passed on recovery
-source `af06768a4e5dbc8ef2a57935e0b12342a2c540eb`. The subsequent terminal-owner
-controller repair changed no PG/host implementation; it did not rerun PG.
-See [exact source/result boundaries](../kuberic/testing.md#m2-accepted-evidence-and-remaining-boundaries).
-The recipe builds the owned command binary, then runs real selected native
-cases and actual ordinary production-controller native witnesses serially in one
-package-only pass. Required PG-N cases include pending joint/current continuity,
-retired-owner rejection, lost cancellation and matching-format reopen. The
-Remove/adoption cases start from completed actual native Build, exercise both
-orders, preserve an installed voter's exact owners and replay-ACK-dependent SQL,
-and join retired owners after a lost observer, including sticky native failure.
-Selectors and
+The recipe builds the owned command binary, then runs its selected native and
+actual-controller cases serially in one package-only pass. Selectors and
 evidence limits are in the [testing guide](../kuberic/testing.md#custom-native-controller-reproduction-and-limits);
 do not copy test totals or historical removed selectors.
 Public V1 fixtures use
-`KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set. Set it and `TMPDIR` to short,
-previously reserved owned paths for local validation (`TMPDIR` must be external
-when also running the packaged source gate); do not
-rely on recipe fallback storage or delete shared output. Run the full
-`just nextest-postgres` only when explicitly requested (or in its dedicated
-CI partitions), never as a routine documentation check.
+`KUBERIC_POSTGRES_PUBLIC_V1_TMPDIR` when set; the smoke recipe otherwise uses
+`/dev/shm` when at least 2 GiB is available and falls back to `/tmp`. The
+full target is reserved for the dedicated
+resource-owning validation path or explicit requests.
 
-The pinned pre-M1 controller fixture constructed inert production PgService
-instances and owned their native coordination listeners. Its historical body
-checked pre-Role sentinel/Open
+The actual controller fixture constructs inert production PgService instances
+and owns their native coordination listeners. It checks pre-Role sentinel/Open
 provenance, committed seed data, real source/target Build, built-idle state,
 exact joint/current-only admission, live native replay, source/target
 invalidation, synchronous SQL/replay and completed native fencing. Owned short
 socket-path aliases identify the same declared backing storage, not a different
 storage incarnation. Administrative standby queries prove replay only, never
-ordinary secondary-read authorization. Current controller fixtures use the production Reconciler and ordinary
-publications, without target-role/configuration shortcuts or host grants.
-The pending-continuation witness holds real WAL replay and source catch-up,
-then proves native quorum before its achieved receipt and separately holds
-the target current-role receipt before final SQL admission.
-It retains the late-worker ordering; a separate already-live-joint ordering
-captures the actual WAL receiver/sender, gateway task and physical slot before
-current-only policy. Live-publication fault cases retain the original session
-ID and change newest discovery prerequisites, rather than only substituting
-another immutable ID. They require native fencing and retained actual joins.
-Pre-effect, checkpoint and source-final-credit invalidation cases check the
-released native owner and retained ordinary Build outcome before teardown,
-including absent stale Ready/credit and no late receiver installation.
+ordinary secondary-read authorization.
 
 Hosted native retries share one retained exact attempt, while waiting/cache
 observers remain outside mutation cleanup. Captured cancellation and coherent
@@ -524,13 +420,12 @@ Shared regressions, partition validation and guard commands are in the
 
 - Hosting integration M2 removes the companion and controller-attempt grant
   coupling through M1 production routing, alongside built-in engine qualification.
-  PG owns authenticated engine Active/Retired transfer sessions, target
+  PG then owns authenticated engine Active/Retired transfer sessions, target
   quarantine and ordinary Close-after-Abort joins; backup/WAL/lineage/replay,
   SQL fences, slot/process ownership and metadata remain PG responsibilities.
   M3 qualifies same-format recovery and failures, not old-state upgrades.
   The target supports fresh deployments only and never automatically resets
-  existing PGDATA. Bounded ordinary formation, native continuation and terminal
-  qualification do not certify arbitrary replacement/election or metadata removal.
+  existing PGDATA; current formation tests do not qualify the replacement.
   See the [single roadmap](../kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented).
 - Images, distribution and deployment assets remain future work. No PostgreSQL
   Kubernetes/container dependency, manifest or live test is part of this port.

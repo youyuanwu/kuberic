@@ -6,8 +6,8 @@
 use super::super::facade::{Facade, FacadeConfig, FacadeError, PeerBinding};
 use super::*;
 use crate::protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, ConfigurationMember, ProcessSessionId, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    AgentGeneration, ConfigurationDescriptor, ConfigurationMember, OperationId, ProcessSessionId,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
 };
 use crate::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetConfiguration, ReplicaSetQuorumMode,
@@ -45,7 +45,11 @@ fn identity(id: i64) -> ReplicaIdentity {
 }
 
 pub(super) fn information(id: i64) -> ReplicaInformation {
-    let mut info = ReplicaInformation::idle_build(identity(id), format!("replica-{id}"));
+    let mut info = ReplicaInformation::idle_build(
+        OperationId::new(format!("build-{id}")),
+        identity(id),
+        format!("replica-{id}"),
+    );
     info.process_session_id = ProcessSessionId::new(format!("process-{id}"));
     info
 }

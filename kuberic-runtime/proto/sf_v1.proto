@@ -72,9 +72,6 @@ message InduceFault {
   bytes target_incarnation = 2;
   string reason = 3;
 }
-message EngineSessionControl {
-  bytes canonical_json = 1;
-}
 message Envelope {
   uint32 version = 1;
   Endpoint source = 2;
@@ -90,6 +87,5 @@ message Envelope {
     CopyContextAck copy_context_ack = 15;
     RequestAck request_ack = 16;
     InduceFault induce_fault = 17;
-    EngineSessionControl engine_session_control = 18;
   }
 }

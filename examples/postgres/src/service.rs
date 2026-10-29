@@ -35,7 +35,6 @@ pub struct PgService {
     driver: OnceLock<Arc<PgReplicator>>,
     cancellation: CancellationToken,
     coordination_token: String,
-    listener_address: Option<std::net::SocketAddr>,
     #[cfg(test)]
     fail_close: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -57,7 +56,6 @@ impl PgService {
             driver: OnceLock::new(),
             cancellation: CancellationToken::new(),
             coordination_token: String::new(),
-            listener_address: None,
             #[cfg(test)]
             fail_close: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -111,11 +109,6 @@ impl PgService {
         self
     }
 
-    pub fn with_listener_address(mut self, address: std::net::SocketAddr) -> Self {
-        self.listener_address = Some(address);
-        self
-    }
-
     pub(crate) fn driver(&self) -> std::result::Result<&Arc<PgReplicator>, tonic::Status> {
         self.driver
             .get()
@@ -123,9 +116,6 @@ impl PgService {
     }
 
     pub fn abort_and_wait(&self) -> Result<()> {
-        if let Some(driver) = self.driver.get() {
-            Replicator::abort(driver.as_ref());
-        }
         self.cancellation.cancel();
         if self
             .driver
@@ -204,7 +194,6 @@ impl StatefulServiceReplica for PgService {
                 crate::data_service::PgCoordination {
                     local_endpoint: self.config.replication_address.clone(),
                     bearer_token: self.coordination_token.clone(),
-                    listen_address: self.listener_address,
                 },
                 initializing,
             )
@@ -233,7 +222,7 @@ impl StatefulServiceReplica for PgService {
                 }
             }
         });
-        driver.retain_fault_owner(reporter);
+        driver.retain_fault_owner(reporter).await;
         let interfaces = context
             .partition
             .with_factory(Arc::new(PgReplicatorFactory(driver)))
@@ -367,6 +356,7 @@ impl ReplicatorFactory for PgReplicatorFactory {
         self.0
             .configure_public_v1(settings, context.identity()?, context.process_session_id()?)?;
         self.0.configure_public_host(context.clone())?;
-        Ok(self.interfaces())
+        self.interfaces()
+            .with_custom_control(&context, self.0.clone())
     }
 }

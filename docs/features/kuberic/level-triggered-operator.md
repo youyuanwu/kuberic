@@ -5,50 +5,10 @@
 The `operator.kuberic.io/v1alpha1` stack is the only Kuberic operator path.
 It is experimental and intended for development and CI. Images are not
 published and no production activation procedure is provided.
-**Current:** [ordinary hosting M1](ordinary-hosting-m1.md) replaces production
-callback-program/grant dispatch with canonical per-replica goals, callback-free
-snapshots and authenticated discovery. All host/control/CRD formats are 16;
-fresh resources require `spec.hostingFormat: 16`. Incompatible retained commands
-and missing/mixed formats reject before mutation. There is no migration/data reset.
-
-Each peer opens and publishes DiscoveryPending before peer-dependent recovery;
-PrepareIdle precedes ordinary source Build, exact Ready acknowledgement and
-separate admission. Old process publication is invalid after restart; interrupted
-work stays uncertain. Default V1/KV/SQLite and independent PG use ordinary
-engine-owned sessions and actual joining. Automatic contraction/primary
-replacement/history election remain unavailable or pending; comprehensive
-recovery is M3. Bounded M2 implementation acceptance passed; documentation
-implementation review and actual independent final Sol/Astra gates are pending.
-
-## Current bounded qualification
-
-Fresh discovery/formation and separate joint/current admission execute through
-the production reconciler. Matching-format singleton and unchanged-Primary
-retained-secondary recovery use fresh authenticated sessions, joined predecessor
-owners and nonregressing acknowledged-data transfer before exact callback
-readmission. A retained predecessor Close cannot veto fresh growth; an exact
-current terminal owner still does. This is not general M3 election or handoff.
-
-Full owned matching-image bootstrap, including actual secondary reconstruction,
-renewed authority and final write/read, passed on recovery source
-`af06768a4e5dbc8ef2a57935e0b12342a2c540eb`. The later terminal-owner controller
-repair `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a` has actual bounded controller/
-KV tests but no newer live image pass. Compatible CRD/sample inputs alone are
-not deployment proof; replacement/failover remain unqualified. See
-[exact evidence and red-gate limits](testing.md#m2-accepted-evidence-and-remaining-boundaries).
-
-Use matching binaries and fresh format-16 resources (`spec.hostingFormat: 16`),
-not the historical resource/command example below. No old-state import,
-converter, downgrade, mixed-version enrollment or automatic reset is supported.
-Matching-format acknowledged-data and uncertain-operation recovery remain required.
-
-## Historical pre-M1 operator baseline
-
-The remaining sections preserve the former operator choreography and recipe
-context. Their schema-14/protocol-13 renewal/replacement/failover and KV example
-are **not current deployment instructions or executed M1 capabilities**.
-Use the current contract above and the [roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap)
-for actual checkpoint support. Existing assets are not new live-cluster proof.
+This page describes **CURRENT** behavior. The
+[controller/local-agent/host redesign](engine-neutral-hosting.md#controller-to-host-messages-and-action-selection)
+and [M1–M3 runtime roadmap](sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **NOT IMPLEMENTED**; no Kubernetes resource/control behavior changes here.
 
 ## Architecture
 

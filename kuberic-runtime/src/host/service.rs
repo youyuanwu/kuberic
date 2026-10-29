@@ -33,8 +33,6 @@ use crate::protocol::types::{
 
 const AUTHORIZATION_HEADER: &str = "authorization";
 pub(crate) const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-#[path = "ordinary_goal_service.rs"]
-mod ordinary_goals;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicV1ControlServiceRegistration {
     AgentControl,
@@ -394,54 +392,6 @@ impl Clone for InitializationService {
 
 #[tonic::async_trait]
 impl proto::agent_control_server::AgentControl for InitializationService {
-    async fn submit_goal(
-        &self,
-        request: Request<proto::ReplicaGoalRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        Err(Status::failed_precondition(
-            "agent store is not initialized",
-        ))
-    }
-    async fn get_snapshot(
-        &self,
-        request: Request<proto::ReplicaSnapshotRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        let query = request.into_inner();
-        let target = query
-            .target
-            .ok_or_else(|| Status::invalid_argument("missing snapshot target"))?;
-        self.validate_status_target(&proto::GetAgentStatusRequest {
-            protocol_version: query.protocol_version,
-            resource_uid: query.resource_uid,
-            replica_id: target.replica_id,
-            expected_instance_id: target.instance_id,
-        })?;
-        if !query.expected_process_session_id.is_empty()
-            && query.expected_process_session_id != self.session.id().as_str()
-        {
-            return Err(Status::failed_precondition("snapshot process changed"));
-        }
-        let fresh = crate::control::normalize_uninitialized_agent_status_report(self.report())
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        Ok(Response::new(proto::ReplicaSnapshotResponse {
-            protocol_version: crate::protocol::public_operations::ORDINARY_ACTION_FORMAT,
-            canonical_json: serde_json::to_vec(
-                &crate::protocol::public_operations::ReplicaAgentQueryResult::Uninitialized(fresh),
-            )
-            .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-    async fn acknowledge_goal(
-        &self,
-        request: Request<proto::ReplicaGoalRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        Err(Status::failed_precondition(
-            "agent store is not initialized",
-        ))
-    }
     async fn get_status(
         &self,
         request: Request<proto::GetAgentStatusRequest>,
@@ -462,15 +412,6 @@ impl proto::agent_control_server::AgentControl for InitializationService {
 
 #[tonic::async_trait]
 impl proto::replica_peer_server::ReplicaPeer for InitializationService {
-    async fn discover(
-        &self,
-        request: Request<proto::ReplicaDiscoveryRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        Err(Status::failed_precondition(
-            "agent store is not initialized",
-        ))
-    }
     async fn get_status(
         &self,
         request: Request<proto::GetAgentStatusRequest>,
@@ -670,15 +611,6 @@ where
         &self,
         preview: crate::protocol::public_operations::PublicV1Identity,
     ) -> Result<Arc<crate::host::operation::PartitionOperationRegistry>> {
-        if self
-            .store
-            .public_operation_records()
-            .await?
-            .iter()
-            .any(|record| record.intent.goal().is_some())
-        {
-            self.runtime.enable_ordinary_contract()?;
-        }
         let registry = crate::host::operation::PartitionOperationRegistry::new(
             self.store.clone(),
             preview.clone(),
@@ -756,11 +688,9 @@ where
                 "Public V1 report requires replacement state".into(),
             )
         })?;
-        if !self.runtime.is_ordinary_contract() {
-            self.runtime
-                .refresh_replacement_projection(self.store.as_ref(), self.session.id(), false)
-                .await?;
-        }
+        self.runtime
+            .refresh_replacement_projection(self.store.as_ref(), self.session.id(), false)
+            .await?;
         let projection = self
             .runtime
             .replacement_report_projection(
@@ -787,10 +717,10 @@ where
         let (completed, result) = tokio::sync::oneshot::channel();
         // Access-fence release and projection publication belong to the accepted
         // execution, not to the lifetime of the RPC waiting for its reply.
-        registry.try_own_control_task(async move {
+        registry.own_control_task(async move {
             let outcome = service.execute_public_intent_owned(intent).await;
             let _ = completed.send(outcome);
-        })?;
+        });
         result.await.map_err(|error| {
             crate::host::HostError::CommandRejected(format!(
                 "owned public execution stopped before replying: {error}"
@@ -881,6 +811,30 @@ where
             PublicV1HistoryCommand::Recover { intent, .. } => {
                 self.execute_public_intent(*intent).await
             }
+            PublicV1HistoryCommand::InstallInboundBuildAuthority { authority } => {
+                let state = self.store.load_state().await?;
+                if authority.attempt.target != state.identity.local_identity {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "inbound build authority targets another replica".into(),
+                    ));
+                }
+                self.runtime
+                    .install_replacement_inbound_build_authority(&authority)
+                    .await
+                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+            }
+            PublicV1HistoryCommand::RevokeInboundBuildAuthority { authority } => {
+                let state = self.store.load_state().await?;
+                if authority.attempt.target != state.identity.local_identity {
+                    return Err(crate::host::HostError::IdentityMismatch(
+                        "inbound build authority targets another replica".into(),
+                    ));
+                }
+                self.runtime
+                    .revoke_replacement_inbound_build_authority(&authority)
+                    .await
+                    .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+            }
             PublicV1HistoryCommand::SessionRenewal { command } => {
                 self.execute_session_renewal(*command).await
             }
@@ -895,10 +849,10 @@ where
         })?;
         let service = self.clone();
         let (completed, result) = tokio::sync::oneshot::channel();
-        registry.try_own_control_task(async move {
+        registry.own_control_task(async move {
             let outcome = service.execute_session_renewal_owned(command).await;
             let _ = completed.send(outcome);
-        })?;
+        });
         result.await.map_err(|error| {
             crate::host::HostError::CommandRejected(format!(
                 "owned session renewal stopped before replying: {error}"
@@ -1001,7 +955,7 @@ where
                 if survivor.identity == self.store.load_state().await?.identity.local_identity {
                     replay_role_at_epoch(
                         callbacks.replicator.as_ref(),
-                        None,
+                        self.runtime.native_role_epoch()?,
                         *epoch,
                         survivor.role,
                     )
@@ -1169,11 +1123,6 @@ where
                 }
             }
             ProtocolCommand::PublicV1History(command) => {
-                if !matches!(command.as_ref(), PublicV1HistoryCommand::Initialize { .. }) {
-                    return Err(Status::failed_precondition(
-                        "legacy renewal dispatch is unavailable in ordinary hosting format 16",
-                    ));
-                }
                 self.execute_history(*command)
                     .await
                     .map_err(status_from_agent)?;
@@ -1187,9 +1136,9 @@ where
                         "Public V1 operation targets another replica",
                     ));
                 }
-                return Err(Status::failed_precondition(
-                    "controller callback programs are unavailable; submit a semantic replica goal",
-                ));
+                self.execute_public_intent(command.intent)
+                    .await
+                    .map_err(status_from_agent)?;
             }
         }
         Ok(proto::ExecuteCommandResponse {
@@ -1216,41 +1165,6 @@ impl<S> proto::agent_control_server::AgentControl for AgentService<S>
 where
     S: AgentStore + 'static,
 {
-    async fn submit_goal(
-        &self,
-        request: Request<proto::ReplicaGoalRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        self.require_ready()?;
-        Ok(Response::new(
-            self.submit_ordinary_goal(request.into_inner()).await?,
-        ))
-    }
-    async fn get_snapshot(
-        &self,
-        request: Request<proto::ReplicaSnapshotRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        self.validate_snapshot_request(request.get_ref()).await?;
-        Ok(Response::new(proto::ReplicaSnapshotResponse {
-            protocol_version: crate::protocol::public_operations::ORDINARY_ACTION_FORMAT,
-            canonical_json: serde_json::to_vec(
-                &crate::protocol::public_operations::ReplicaAgentQueryResult::Initialized(
-                    Box::new(self.ordinary_snapshot().await?),
-                ),
-            )
-            .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-    async fn acknowledge_goal(
-        &self,
-        request: Request<proto::ReplicaGoalRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        Ok(Response::new(
-            self.acknowledge_ordinary_goal(request.into_inner()).await?,
-        ))
-    }
     async fn get_status(
         &self,
         request: Request<proto::GetAgentStatusRequest>,
@@ -1278,15 +1192,6 @@ impl<S> proto::replica_peer_server::ReplicaPeer for AgentService<S>
 where
     S: AgentStore + 'static,
 {
-    async fn discover(
-        &self,
-        request: Request<proto::ReplicaDiscoveryRequest>,
-    ) -> std::result::Result<Response<proto::ReplicaSnapshotResponse>, Status> {
-        self.authorize(&request)?;
-        Ok(Response::new(
-            self.discover_ordinary_peer(request.into_inner()).await?,
-        ))
-    }
     async fn get_status(
         &self,
         request: Request<proto::GetAgentStatusRequest>,
@@ -1371,10 +1276,6 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 mod cancellation_tests;
 
 #[cfg(test)]
-#[path = "ordinary_goal_tests.rs"]
-mod ordinary_goal_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
@@ -1384,8 +1285,8 @@ mod tests {
         InitializeAgentStore, PublicV1HistoryCommand, PublicV1SessionRenewalCommand,
     };
     use crate::protocol::public_operations::{
-        ProcessSessionRenewalRequired, PublicV1Identity, PublicV1LifecycleBinding,
-        PublicV1SessionRenewalStatus, StatePersistence,
+        ProcessSessionRenewalRequired, PublicSessionRenewalStage, PublicV1Identity,
+        PublicV1LifecycleBinding, PublicV1SessionRenewalStatus, StatePersistence,
     };
     use crate::protocol::types::{
         ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch, InitializationId,
@@ -1667,7 +1568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_service_rejects_legacy_session_renewal_before_mutation() {
+    async fn agent_service_dispatches_initial_session_renewal_through_wire_boundary() {
         let root = tempfile::tempdir().unwrap();
         let resource_uid = ResourceUid::new("resource-renewal");
         let local = ReplicaIdentity {
@@ -1780,15 +1681,19 @@ mod tests {
                 crate::control::public_v1_history_command_to_proto(&command).unwrap(),
             )),
         };
-        let before = store.load_state().await.unwrap();
-        let error = service.execute_inner(request).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            error
-                .message()
-                .contains("unavailable in ordinary hosting format 16")
+        service.execute_inner(request).await.unwrap();
+        assert_eq!(
+            store
+                .load_state()
+                .await
+                .unwrap()
+                .public_v1_operation_state
+                .unwrap()
+                .session_renewal
+                .unwrap()
+                .stage,
+            PublicSessionRenewalStage::AccessClosed
         );
-        assert_eq!(store.load_state().await.unwrap(), before);
         service
             .operation_runtime
             .lock()

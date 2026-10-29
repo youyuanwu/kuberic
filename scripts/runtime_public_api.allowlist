@@ -87,6 +87,7 @@ page:control/proto/struct.PrepareSecondaryRemovalCommand.html
 page:control/proto/struct.PrepareSwitchoverCommand.html
 page:control/proto/struct.ProvisioningIntent.html
 page:control/proto/struct.PublicV1AgentStatus.html
+page:control/proto/struct.PublicV1BuildAttemptReference.html
 page:control/proto/struct.PublicV1CapturedOperationIdentity.html
 page:control/proto/struct.PublicV1DataLossAttempt.html
 page:control/proto/struct.PublicV1DataLossRecoveryStatus.html
@@ -100,12 +101,8 @@ page:control/proto/struct.PublicV1ReplicaRebuildRequired.html
 page:control/proto/struct.PublicV1ServiceLocation.html
 page:control/proto/struct.PublicV1StorageIncarnation.html
 page:control/proto/struct.ReplicaCleanupIdentity.html
-page:control/proto/struct.ReplicaDiscoveryRequest.html
-page:control/proto/struct.ReplicaGoalRequest.html
 page:control/proto/struct.ReplicaIdentity.html
 page:control/proto/struct.ReplicaRetirementReport.html
-page:control/proto/struct.ReplicaSnapshotRequest.html
-page:control/proto/struct.ReplicaSnapshotResponse.html
 page:control/proto/struct.RetireReplicaCommand.html
 page:control/proto/struct.ScaleUpCleanup.html
 page:control/proto/struct.ScaleUpConfigurationEvidence.html
@@ -320,6 +317,9 @@ page:protocol/validation/scale_up/fn.validate_scale_up_failover_transition.html
 page:protocol/validation/scale_up/fn.validate_scale_up_provisioning.html
 page:protocol/validation/scale_up/fn.validate_scale_up_provisioning_request.html
 page:protocol/validation/scale_up/fn.validate_scale_up_receipt.html
+page:replicator/custom/enum.CallbackOwnership.html
+page:replicator/custom/trait.CustomReplicatorControl.html
+page:replicator/enum.CallbackOwnership.html
 page:replicator/enum.ReplicaSetQuorumMode.html
 page:replicator/index.html
 page:replicator/stream/enum.OperationKind.html
@@ -335,6 +335,7 @@ page:replicator/struct.ReplicatorFactoryContext.html
 page:replicator/struct.ReplicatorInterfaces.html
 page:replicator/struct.ReplicatorSettings.html
 page:replicator/struct.StatefulServicePartition.html
+page:replicator/trait.CustomReplicatorControl.html
 page:replicator/trait.PrimaryReplicator.html
 page:replicator/trait.Replicator.html
 page:replicator/trait.ReplicatorFactory.html

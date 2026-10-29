@@ -39,7 +39,6 @@ use super::replica_manager::{CatchupMode, CompletionError, CompletionReceiver};
 use super::role::{DataLossEnd, Role, RoleConfig, RoleError, RoleReplicator, RoleStatus};
 use super::secondary::{SecondaryError, SecondaryHandle};
 
-pub(super) mod engine_session;
 mod facade;
 mod production;
 mod production_transport;
@@ -446,6 +445,13 @@ impl ServiceHandle {
             }
             Target::Secondary(_) => Err(AdapterError::WriteAccess(WriteAccess::NotPrimary)),
             Target::Unavailable(status) => Err(AdapterError::InvalidState(status)),
+        }
+    }
+
+    pub(super) fn progress_query_readiness(&self) -> Result<bool, AdapterError> {
+        match self.target()? {
+            Target::Secondary(secondary) => Ok(secondary.progress_query_readiness()?),
+            Target::Primary(_) | Target::Unavailable(_) => Ok(true),
         }
     }
 

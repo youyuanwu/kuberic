@@ -10,7 +10,6 @@ pub(crate) mod hosting;
 pub(crate) mod native_transport;
 mod operation;
 mod operation_recovery;
-mod ordinary_goal;
 #[allow(clippy::disallowed_types)]
 mod process;
 mod provisioning;

@@ -8,7 +8,8 @@ use crate::host::state::{
     StorageIdentity,
 };
 use crate::protocol::public_operations::{
-    DataLossRenewalDecision, PublicOperationIntent, PublicV1SessionRenewalStatus,
+    DataLossRenewalDecision, PublicInboundBuildAuthority, PublicInboundBuildReceipt,
+    PublicOperationIntent, PublicV1SessionRenewalStatus,
 };
 use crate::protocol::types::{
     FaultType, HistoryContext, HistoryInitializationId, LoadMetric, OperationId,
@@ -30,16 +31,14 @@ pub(crate) struct RenewPublicDataLossAttempt {
     pub(crate) successor: Option<PublicOperationRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicInboundBuildAdmission {
+    Current,
+    Successor,
+}
+
 #[async_trait]
 pub(crate) trait AgentStore: Send + Sync {
-    async fn acknowledge_ordinary_goal(
-        &self,
-        _acknowledgement: &crate::protocol::public_operations::ReplicaGoalAcknowledgement,
-    ) -> Result<()> {
-        Err(crate::host::HostError::CommandRejected(
-            "ordinary goal acknowledgement unavailable".into(),
-        ))
-    }
     async fn identity(&self) -> Result<StorageIdentity>;
 
     async fn load_state(&self) -> Result<AgentState>;
@@ -153,6 +152,78 @@ pub(crate) trait AgentStore: Send + Sync {
     ) -> Result<()> {
         Err(crate::host::HostError::CommandRejected(
             "Public V1 operations are not enabled for this store".into(),
+        ))
+    }
+
+    async fn classify_public_v1_inbound_build_authority(
+        &self,
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission> {
+        Err(crate::host::HostError::CommandRejected(
+            "Public V1 inbound build authority is not enabled for this store".into(),
+        ))
+    }
+
+    async fn install_public_v1_inbound_build_authority(
+        &self,
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "Public V1 inbound build authority is not enabled for this store".into(),
+        ))
+    }
+
+    async fn public_v1_inbound_build_authority(
+        &self,
+        _build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        Ok(None)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "store journal conformance seam, not native ACK")
+    )]
+    async fn public_v1_terminal_inbound_build_receipt(
+        &self,
+        _build_id: &OperationId,
+    ) -> Result<Option<PublicInboundBuildReceipt>> {
+        Ok(None)
+    }
+
+    async fn revoke_public_v1_inbound_build_authority(&self) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "Public V1 inbound build authority is not enabled for this store".into(),
+        ))
+    }
+
+    async fn revoke_exact_public_v1_inbound_build_authority(
+        &self,
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "exact inbound authority revocation is not enabled for this store".into(),
+        ))
+    }
+
+    async fn public_v1_outbound_build_authority(
+        &self,
+        _build_id: &OperationId,
+        _current_configuration_id: &crate::protocol::types::ConfigurationId,
+    ) -> Result<Option<PublicInboundBuildAuthority>> {
+        Ok(None)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "store journal conformance seam, not native ACK")
+    )]
+    async fn complete_public_v1_inbound_build(
+        &self,
+        _receipt: &PublicInboundBuildReceipt,
+    ) -> Result<()> {
+        Err(crate::host::HostError::CommandRejected(
+            "Public V1 inbound build authority is not enabled for this store".into(),
         ))
     }
 }

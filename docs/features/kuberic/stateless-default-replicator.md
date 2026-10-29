@@ -3,13 +3,12 @@
 “Stateless” here describes process-local engine queues/sessions, not absence of
 durable application or agent state. The selected implementation is classic V1,
 constructed by the sole built-in factory
-([factory](../../../kuberic-runtime/src/replicator/mod.rs#L1037-L1060)).
+([factory:1138–1156](../../../kuberic-runtime/src/replicator/mod.rs#L1138-L1156)).
 Use [current semantics](classic-v1-runtime.md) for the authoritative behavior,
 [ownership boundary](replicator-boundary.md) for integration responsibilities,
 and [pending work](sf-v1-semantic-alignment-plan.md) for remaining alignment.
 The [ordinary-engine hosting redesign](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
-has delivered generic M1 and bounded qualified M2 engine integration; exhaustive
-M3 and final workflow reviews remain outstanding. Process-local queues do not imply removable
+is **PROPOSED / NOT IMPLEMENTED**. Process-local queues do not imply removable
 agent authority or PostgreSQL metadata; those have separate recovery owners.
 
 ## Ownership
@@ -28,19 +27,12 @@ Native queues are not a recovered application write journal.
 
 ## Deployment and recovery constraints
 
-The selected format constants are matched protocol / agent / ordinary goal
-format **16**
-([protocol](../../../kuberic-runtime/src/protocol/public_operations.rs#L13),
+The selected format constants are public protocol 13 / agent schema 14
+([protocol:13](../../../kuberic-runtime/src/protocol/public_operations.rs#L13),
 [schema:19–21](../../../kuberic-runtime/src/host/state.rs#L19-L21)).
 This reference does not promise old-state migration, mixed-version enrollment
 or transparent completion of crash-interrupted requests. Application retry and
 ambiguity decisions must not treat a cancelled observer as rollback.
-The built-in authenticated session owns reserve/Active/effect/retirement gates,
-creation-lifetime tombstones, quarantined uncertainty and actual predecessor/
-terminal joins. Ordinary Close after Abort joins the transport and facade/provider
-owners; source Remove alone never proves target containment. Matching-format
-acknowledged-data recovery is retained. The bounded unchanged-Primary member
-and singleton recovery proofs are not general election or data-reset authority.
 
 Transport uses agent bearer credentials over HTTP, **not credential-free
 transport and not TLS**

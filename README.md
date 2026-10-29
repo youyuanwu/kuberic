@@ -9,18 +9,15 @@ level-triggered stack provides the Public V1 replication, copy, history,
 session, fencing, and lifecycle contracts plus an experimental namespace-bound
 controller and owned-cluster validation harness.
 
-The production control loop now uses the [ordinary hosting M1 contract](docs/features/kuberic/ordinary-hosting-m1.md):
-format-16 semantic replica goals, early peer discovery, retained ordinary calls,
-and exact Build outcomes before separate admission. Application state remains
-provider-owned. Built-in/KV/SQLite and independent PostgreSQL use engine-owned
-authenticated sessions and actual ordinary joining. This remains an experimental
-development checkpoint; comprehensive recovery/failover qualification is M3.
-Bounded M2 implementation acceptance has passed; documentation implementation
-review and independent final review gates are still pending.
+The production control loop initializes fresh agents, originates exact
+topology authority, renews restarted process sessions, builds and admits
+same-cardinality replacements, and performs delayed failover from observation.
+Committed application state remains provider-owned; agent schema 14 stores
+history and lifecycle authority.
 
-The retained default Replicator composes source-guided Service Fabric classic V1
-owners. Assignment, quorum completion and service-local commitment remain
-separate; bounded integration is not complete M3 or live deployment qualification.
+The sole default Replicator now composes the source-guided Service Fabric classic
+V1 owners. Assignment, quorum completion and service-local commitment are
+separate; KVStore2 and SQLite own durable commit and client publication.
 
 ## Repository
 
@@ -64,8 +61,7 @@ cargo check --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --doc --workspace --all-features
-cargo nextest list --workspace --all-features --profile ordinary
-cargo nextest run --workspace --all-features --profile ordinary
+just nextest-test
 ```
 
 PostgreSQL validation requires compatible host-local PostgreSQL binaries and an
@@ -96,23 +92,36 @@ application/provider tests execute from archive partitions.
 
 ## Experimental Kubernetes Validation
 
-The controller and KVStore2 Dockerfiles/owned-cluster recipes are development
-assets, not published release images. A full owned matching-image bootstrap,
-including secondary reconstruction and final write/read, passed on recovery
-source `af06768a4e5dbc8ef2a57935e0b12342a2c540eb`. That image predates the
-accepted terminal-owner controller repair at `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a`;
-it is not a live run of that newer controller. Replacement/failover remain
-unqualified. See [exact evidence limits](docs/features/kuberic/testing.md#m2-accepted-evidence-and-remaining-boundaries).
+The retained controller and KVStore2 Dockerfiles are development/CI assets.
+They are not published release images.
+
+```bash
+export KIND_CLUSTER_NAME=kuberic-level-dev
+mkdir -p target/kuberic-level-dev
+export KUBECONFIG="$PWD/target/kuberic-level-dev/kubeconfig"
+export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KUBERIC_AGENT_BEARER_TOKEN=local-level-triggered-token
+
+just create-kind-cluster
+just level-triggered-images
+just level-triggered-install
+just level-triggered-kind-test bootstrap replacement failover
+just delete-kind-cluster
+```
+
+Use nondefault owned cluster coordinates. The recipes verify the exact
+cluster/context/kubeconfig tuple before every mutation and deletion.
 
 ## Applications
 
 ### KVStore2
 
-The conformance application exercises ordinary controller/agent hosting through
-an HTTP key/value API. Bounded matching-format singleton and retained-secondary
-recovery preserve acknowledged data through fresh authenticated sessions;
-fresh growth copies that data before separate admission. This is not general
-election, replacement or handoff qualification.
+The conformance application exercises the complete level-triggered controller,
+agent and runtime path through an HTTP key/value API. Its retained isolated
+live scenarios cover fresh bootstrap with process-session renewal,
+same-cardinality replacement with preserved data, and sustained-outage
+failover with old-primary fencing; the broader behavioral matrix runs in the
+cluster-free runtime/provider tiers.
 
 ### SQLite
 
@@ -120,8 +129,6 @@ election, replacement or handoff qualification.
 committed snapshots and retained catch-up through Public V1. Fresh replacement
 storage is required; prior provider state is rejected unchanged. See the
 [SQLite design](docs/features/sqlite/design.md).
-Ordinary production Open/copy and actual application joins are qualified;
-the historical changed-primary handoff still rejects after copy/data/reopen.
 
 ### PostgreSQL
 
@@ -131,9 +138,6 @@ promotion while Kuberic owns generic authority and lifecycle choreography.
 It uses the Public V1 lifecycle and owns rejection of its prior provider
 formats. See the
 [PostgreSQL design](docs/features/postgres/design.md).
-Ordinary native formation, session retirement, joint/current continuation,
-SQL fencing and actual joins are qualified in routine PostgreSQL smoke.
-Durable metadata remains; exhaustive recovery is separate.
 
 ## Distribution Status
 
@@ -148,9 +152,8 @@ the isolated development/CI assets above.
 ## Documentation
 
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md)
-- [Ordinary hosting M1 — implemented contract and checkpoint limits](docs/features/kuberic/ordinary-hosting-m1.md)
-- [Classic V1 component semantics and pre-M1 evidence](docs/features/kuberic/classic-v1-runtime.md)
-- [SF hosting — ordinary M1 and bounded M2 integration](docs/features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
+- [Classic V1 current semantics](docs/features/kuberic/classic-v1-runtime.md)
+- [SF hosting target design — PROPOSED, not implemented](docs/features/kuberic/engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
 - [Future runtime roadmap and remaining qualification](docs/features/kuberic/sf-v1-semantic-alignment-plan.md)
 - [SF V1 current evidence/dispositions](docs/features/kuberic/sf-v1-port-ledger.md) and [source provenance/notices](docs/features/kuberic/sf-v1-port-provenance.md)
 - [V2 transactional Replicator design](docs/features/kuberic/v2-transactional-replicator-design.md)

@@ -1056,7 +1056,7 @@ fn public_v1_data_loss_renewal_requires_exact_replay_capability() {
 
 #[tokio::test]
 async fn public_v1_replacement_schema_requires_a_fresh_exact_store() {
-    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 16);
+    assert_eq!(PUBLIC_V1_REPLACEMENT_SCHEMA_VERSION, 14);
     let root = test_root("replacement_schema-fresh");
     let path = SqliteStore::metadata_database_path(&root);
     let preview = PublicV1Identity::new(42);
@@ -1584,10 +1584,119 @@ async fn public_v1_replacement_schema_failed_build_containment_survives_reopen()
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn public_v1_replacement_schema_rebuild_then_cancellation_survives_reopen() {
+    use kuberic_runtime::protocol::public_operations::{
+        CanonicalReplicaRebuildRequired, CapturedPublicOperationIdentity,
+        PublicBuildAttemptReference, ReplicaRebuildReason,
+    };
+
+    let root = test_root("replacement_schema-build-rebuild-cancelled");
+    let path = SqliteStore::metadata_database_path(&root);
+    let preview = PublicV1Identity::new(42);
+    let local = replica(1);
+    let local_storage = storage(local.clone());
+    let target_storage = storage(replica(2));
+    let store = SqliteStore::create_public_v1(
+        &path,
+        preview.clone(),
+        StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource-1"),
+            pod_uid: PodUid::new("pod-1"),
+            pvc_uid: PvcUid::new("pvc-1"),
+            initialization_id: InitializationId::new("local-initialization"),
+            local_identity: local.clone(),
+            effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+        },
+    )
+    .unwrap();
+    let generation = PublicProtocolGeneration::new(42);
+    let initialization =
+        derive_history_initialization_id(&ResourceUid::new("resource-1"), generation);
+    let history =
+        derive_bootstrap_history(&ResourceUid::new("resource-1"), generation, &initialization);
+    store
+        .initialize_public_v1_history(&initialization, &history, &local_storage)
+        .await
+        .unwrap();
+    let intent = build_intent(&preview, &history, target_storage.clone());
+    seed_build_primary_fixture(&store, &intent).await;
+    let PublicOperationProgram::Build(build) = intent.program.as_ref().unwrap() else {
+        panic!("expected build program");
+    };
+    let rebuild = CanonicalReplicaRebuildRequired::RemoteBuildTarget {
+        reason: ReplicaRebuildReason::RemoteCopyConflict,
+        operation: CapturedPublicOperationIdentity {
+            resource_uid: ResourceUid::new("resource-1"),
+            identity: preview.clone(),
+            epoch: build.epoch,
+            operation_id: intent.operation_id.clone(),
+            revision: intent.revision,
+            detecting_session: intent.process_session_id.clone(),
+        },
+        build: Box::new(PublicBuildAttemptReference {
+            resource_uid: ResourceUid::new("resource-1"),
+            epoch: build.epoch,
+            build_id: intent.operation_id.clone(),
+            source: local,
+            source_storage: local_storage,
+            source_session: intent.process_session_id.clone(),
+            target: build.replica.clone(),
+            target_storage,
+            target_session: build.process_session_id.clone(),
+        }),
+    };
+    store.begin_public_v1_operation(&intent).await.unwrap();
+    store
+        .mark_public_v1_build_rebuild_pending(&intent, rebuild.clone())
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let pending = reopened
+        .public_v1_operation_snapshot(&intent.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(pending.stage, PublicV1OperationSnapshotStage::Running);
+    assert_eq!(pending.disposition, None);
+    assert_eq!(
+        reopened.public_v1_build_records().await.unwrap()[0].result,
+        Some(PublicV1OperationResult::RebuildRequired(Box::new(
+            rebuild.clone()
+        )))
+    );
+    reopened
+        .cancel_public_v1_build_rebuild_pending(&intent)
+        .await
+        .unwrap();
+    drop(reopened);
+
+    let reopened = SqliteStore::open_public_v1(&path, &preview).unwrap();
+    let record = reopened
+        .public_v1_operation_snapshot(&intent.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        record.stage,
+        PublicV1OperationSnapshotStage::ContainmentPending
+    );
+    assert_eq!(
+        record.disposition,
+        Some(PublicV1OperationSnapshotDisposition::Cancelled)
+    );
+    assert_eq!(
+        reopened.public_v1_build_records().await.unwrap()[0].result,
+        Some(PublicV1OperationResult::RebuildRequired(Box::new(rebuild)))
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn public_v1_replacement_schema_rejects_prior_preview_stores() {
     let preview = PublicV1Identity::new(42);
-    for version in [6, 7, 8, 9, 10, 15] {
+    for version in [6, 7, 8, 9, 10] {
         let root = test_root(&format!("replacement_schema-reject-{version}"));
         let path = SqliteStore::metadata_database_path(&root);
         let store = SqliteStore::create_public_v1(

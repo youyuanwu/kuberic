@@ -16,13 +16,25 @@ use crate::protocol::public_operations::{
 };
 use crate::protocol::types::{OperationId, ProcessSessionId, ReplicaIdentity};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallbackContainment {
+    /// Joining the root future proves all operation-owned work terminated.
+    RootTask,
+    /// The public future observes work retained and fenced by the native owner.
+    /// Joining this observer does not claim that native callbacks have drained.
+    NativeObserver,
+    /// Successful callback completion is the public contract boundary; failure or
+    /// cancellation still requires object/process containment.
+    ObjectOwnedOnInterruption,
+}
+
 pub(crate) struct PartitionOperation {
     store: Arc<dyn AgentStore>,
     record: watch::Sender<PublicOperationRecord>,
     failure: watch::Sender<Option<String>>,
     task: Mutex<Option<JoinHandle<Result<()>>>>,
-    ordinary_join: Mutex<()>,
     lifecycle: Mutex<()>,
+    containment: Mutex<CallbackContainment>,
     coordination_active: std::sync::atomic::AtomicBool,
     access_invalidated: std::sync::atomic::AtomicBool,
     access_invalidation: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -33,10 +45,6 @@ pub(crate) struct PartitionOperation {
     wait_for_descendants: std::sync::atomic::AtomicBool,
     #[cfg(feature = "testing")]
     cut: Mutex<Option<Arc<crate::host::public_lifecycle::PublicOperationCut>>>,
-    #[cfg(all(test, feature = "testing"))]
-    ordinary_join_entered: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
-    #[cfg(all(test, feature = "testing"))]
-    ordinary_return_cut: std::sync::Mutex<Option<Arc<RegistryTestCut>>>,
 }
 
 impl PartitionOperation {
@@ -54,8 +62,8 @@ impl PartitionOperation {
             record,
             failure,
             task: Mutex::new(None),
-            ordinary_join: Mutex::new(()),
             lifecycle: Mutex::new(()),
+            containment: Mutex::new(CallbackContainment::RootTask),
             coordination_active: std::sync::atomic::AtomicBool::new(false),
             access_invalidated: std::sync::atomic::AtomicBool::new(false),
             access_invalidation: std::sync::Mutex::new(None),
@@ -66,10 +74,6 @@ impl PartitionOperation {
             wait_for_descendants: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             cut: Mutex::new(None),
-            #[cfg(all(test, feature = "testing"))]
-            ordinary_join_entered: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            ordinary_return_cut: Default::default(),
         }
     }
 
@@ -171,7 +175,7 @@ impl PartitionOperation {
             !matches!(
                 self.intent().program,
                 Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
-            ) && !(self.intent().goal().is_some() && self.intent().class.is_terminal()),
+            ),
             |witness| *witness.borrow(),
         )
     }
@@ -217,16 +221,21 @@ impl PartitionOperation {
         }
     }
 
-    pub(crate) async fn spawn_root<F, E>(self: &Arc<Self>, future: F) -> Result<()>
+    pub(crate) async fn spawn_root<F, E>(
+        self: &Arc<Self>,
+        containment: CallbackContainment,
+        future: F,
+    ) -> Result<()>
     where
         F: Future<Output = std::result::Result<(), E>> + Send + 'static,
         E: std::fmt::Display + Send + 'static,
     {
-        self.spawn_root_with_retry(None, future).await
+        self.spawn_root_with_retry(containment, None, future).await
     }
 
     pub(crate) async fn spawn_root_with_retry<F, E>(
         self: &Arc<Self>,
+        containment: CallbackContainment,
         returned_failure: Option<
             Arc<std::sync::Mutex<Option<crate::host::state::PublicCallbackFailure>>>,
         >,
@@ -258,6 +267,8 @@ impl PartitionOperation {
                 current.intent.operation_id
             )));
         }
+        *self.containment.lock().await = containment;
+
         let (start, started) = oneshot::channel();
         let operation = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -266,16 +277,11 @@ impl PartitionOperation {
             }
             let result = future.await.map_err(|error| error.to_string());
             let failure = returned_failure.and_then(|failure| failure.lock().unwrap().take());
-            let recorded = operation.record_root_result(result, failure).await;
+            let recorded = operation
+                .record_root_result(result, containment, failure)
+                .await;
             if let Err(error) = &recorded {
                 operation.record_failure(error);
-            }
-            #[cfg(all(test, feature = "testing"))]
-            {
-                let cut = operation.ordinary_return_cut.lock().unwrap().clone();
-                if let Some(cut) = cut {
-                    cut.pause().await;
-                }
             }
             recorded
         });
@@ -311,6 +317,7 @@ impl PartitionOperation {
     async fn record_root_result(
         &self,
         result: std::result::Result<(), String>,
+        containment: CallbackContainment,
         returned_failure: Option<crate::host::state::PublicCallbackFailure>,
     ) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
@@ -358,9 +365,10 @@ impl PartitionOperation {
             return Ok(());
         }
 
-        if (!current.intent.class.is_terminal()
+        let containment = self.selected_containment(containment).await;
+        if (containment == CallbackContainment::ObjectOwnedOnInterruption
             && matches!(disposition, PublicOperationDisposition::Failed(_)))
-            || (current.intent.class.is_terminal() && !self.descendants_contained().await)
+            || (containment == CallbackContainment::RootTask && !self.descendants_contained().await)
         {
             let pending = self
                 .advance(
@@ -412,22 +420,6 @@ impl PartitionOperation {
     }
 
     pub(crate) async fn cancel_root(&self) -> Result<PublicOperationRecord> {
-        if self.intent().goal().is_some() {
-            self.invalidate_access();
-            // Cancellation withdraws authority, not ownership of an accepted
-            // ordinary future. Abort/Close is the creation owner's barrier.
-            self.join_ordinary_root().await?;
-            let _lifecycle = self.lifecycle.lock().await;
-            let current = self.snapshot();
-            if matches!(
-                current.stage,
-                PublicOperationStage::Completed | PublicOperationStage::ContainmentPending
-            ) {
-                return Ok(current);
-            }
-
-            return self.persist_cancellation(current, None).await;
-        }
         let task = {
             let _lifecycle = self.lifecycle.lock().await;
             let current = self.snapshot();
@@ -498,83 +490,26 @@ impl PartitionOperation {
         self.persist_cancellation(current, task_failure).await
     }
 
-    async fn join_ordinary_root(&self) -> Result<()> {
-        let _join = self.ordinary_join.lock().await;
-        let mut retained = self.task.lock().await;
-        if let Some(task) = retained.as_mut() {
-            #[cfg(all(test, feature = "testing"))]
-            if let Some(entered) = self.ordinary_join_entered.lock().unwrap().as_ref() {
-                entered.notify_one();
-            }
-            // Cancellation drops only the observer/guards. The operation keeps
-            // its handle until the actual join and sticky outcome are recorded.
-            let outcome = task.await;
-            retained.take();
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    self.record_failure(&error);
-                    return Err(error);
-                }
-                Err(error) => {
-                    let error = HostError::CommandRejected(format!(
-                        "ordinary callback owner join failed: {error}"
-                    ));
-                    self.record_failure(&error);
-                    return Err(error);
-                }
-            }
-        }
-        if let Some(error) = self.failure.borrow().clone() {
-            return Err(HostError::CommandRejected(error));
-        }
-        Ok(())
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn notify_ordinary_join(&self, entered: Arc<tokio::sync::Notify>) {
-        *self.ordinary_join_entered.lock().unwrap() = Some(entered);
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_ordinary_return_cut(&self, cut: Arc<RegistryTestCut>) {
-        *self.ordinary_return_cut.lock().unwrap() = Some(cut);
-    }
-
     async fn persist_cancellation(
         &self,
         current: PublicOperationRecord,
         task_failure: Option<String>,
     ) -> Result<PublicOperationRecord> {
-        let no_unsettled_callback = task_failure.is_none()
-            && self
-                .store
-                .public_operation_records()
-                .await?
-                .iter()
-                .any(|record| {
-                    record.intent == current.intent
-                        && matches!(
-                            record.lifecycle.in_flight,
-                            None | Some(crate::host::state::PublicInstruction::Revoke)
-                        )
-                        && !record.lifecycle.outcomes.iter().any(|outcome| {
-                            matches!(
-                                outcome,
-                                crate::host::state::PublicInstructionOutcome::RebuildRequired(_)
-                                    | crate::host::state::PublicInstructionOutcome::DataLoss(
-                                        crate::host::state::DataLossOutcome::Error(_)
-                                    )
-                            )
-                        })
-                });
-        let next = if current.stage == PublicOperationStage::RetryPending
-            || no_unsettled_callback
-            || (current.intent.class.is_terminal() && self.descendants_contained().await)
-        {
-            PublicOperationStage::Completed
-        } else {
-            PublicOperationStage::ContainmentPending
+        let containment = self
+            .selected_containment(*self.containment.lock().await)
+            .await;
+        let next = match containment {
+            _ if current.stage == PublicOperationStage::RetryPending => {
+                PublicOperationStage::Completed
+            }
+            CallbackContainment::NativeObserver => PublicOperationStage::Completed,
+            CallbackContainment::RootTask if self.descendants_contained().await => {
+                PublicOperationStage::Completed
+            }
+            CallbackContainment::RootTask => PublicOperationStage::ContainmentPending,
+            CallbackContainment::ObjectOwnedOnInterruption => {
+                PublicOperationStage::ContainmentPending
+            }
         };
         let disposition = task_failure.map_or(PublicOperationDisposition::Cancelled, |error| {
             PublicOperationDisposition::Ambiguous(error)
@@ -589,6 +524,83 @@ impl PartitionOperation {
         self.record.send_replace(updated.clone());
         self.bump_revision();
         Ok(updated)
+    }
+
+    async fn selected_containment(&self, declared: CallbackContainment) -> CallbackContainment {
+        if declared != CallbackContainment::NativeObserver {
+            return declared;
+        }
+        // An engine's declaration cannot certify the independent application.
+        // Read the durable selection, not the coarse Running watch snapshot.
+        let record = self
+            .store
+            .public_operation_records()
+            .await
+            .ok()
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|record| record.intent == self.intent())
+            });
+        let canonical_failure = record.as_ref().is_some_and(|record| {
+            matches!(
+                record.lifecycle.outcomes.last(),
+                Some(crate::host::state::PublicInstructionOutcome::RebuildRequired(_))
+            )
+        });
+        // A joined root between successful callbacks has no interrupted child.
+        // In particular, a successful application receipt does not require
+        // shutting down the application merely to supersede the next stage.
+        // A callback-success/receipt-loss still has in_flight set and cannot
+        // take this path. A receipted canonical failure is not success either:
+        // recover its callback provenance below, including application owners.
+        // Missing store evidence remains conservative.
+        if !canonical_failure
+            && record
+                .as_ref()
+                .is_some_and(|record| record.lifecycle.in_flight.is_none())
+        {
+            return declared;
+        }
+        let selected = record.and_then(|record| {
+            record.lifecycle.in_flight.or_else(|| {
+                if !canonical_failure {
+                    return None;
+                }
+                super::public_lifecycle::program::operation_instructions(&record.intent)
+                    .get(record.lifecycle.outcomes.len().checked_sub(1)?)
+                    .copied()
+            })
+        });
+        use crate::host::state::PublicInstruction::*;
+        match selected {
+            Some(
+                ReplicatorOpen
+                | ReplicatorRole
+                | ReplicatorPrimary
+                | ProgramEpoch
+                | Epoch
+                | Configuration
+                | StartingConfiguration
+                | RefreshedConfiguration
+                | CurrentConfiguration
+                | CatchUpConfiguration
+                | FirstCatchUp
+                | SecondCatchUp
+                | CatchUp
+                | DataLoss
+                | Progress
+                | Build
+                | Remove
+                // Synchronous host-owned revocation has no external child to
+                // outlive the joined root, even at its selected test barrier.
+                | Revoke,
+            ) => declared,
+            // Access refreshes the application role/address. An active
+            // application selection and unknown provenance cannot borrow an
+            // engine declaration.
+            _ => CallbackContainment::ObjectOwnedOnInterruption,
+        }
     }
 
     pub(crate) async fn complete_containment(&self) -> Result<PublicOperationRecord> {
@@ -1103,6 +1115,37 @@ fn renewal_endpoint_matches_intent(
         })
 }
 
+fn renewal_inbound_build_matches(
+    renewal: &PublicV1SessionRenewalStatus,
+    process: &ProcessSessionId,
+    creation: &crate::protocol::types::ReplicatorCreationId,
+    authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+) -> bool {
+    use crate::protocol::types::ReplicaRole;
+
+    let required = &renewal.required;
+    renewal.validate().is_ok()
+        && renewal.stage == PublicSessionRenewalStage::ConfigurationPending
+        && required.predecessor_contained
+        && required.predecessor.role == ReplicaRole::ActiveSecondary
+        && required.history == authority.history
+        && required.renewal_epoch == authority.attempt.epoch
+        && required.replacement.as_ref().is_some_and(|replacement| {
+            replacement.identity == authority.attempt.target
+                && replacement.storage_incarnation == authority.attempt.target_storage
+                && replacement.process_session_id == authority.attempt.target_session
+                && &replacement.process_session_id == process
+                && &replacement.replicator_creation_id == creation
+        })
+        && required.surviving_sessions.iter().any(|survivor| {
+            survivor.role == ReplicaRole::Primary
+                && survivor.identity.replica_id == required.fresh_configuration.primary_id
+                && survivor.identity == authority.attempt.source
+                && survivor.storage_incarnation == authority.attempt.source_storage
+                && survivor.process_session_id == authority.attempt.source_session
+        })
+}
+
 fn is_retained_replacement_open(
     renewal: &PublicV1SessionRenewalStatus,
     local: &ReplicaIdentity,
@@ -1216,29 +1259,6 @@ pub(crate) struct PartitionOperationRegistry {
                 + Sync,
         >,
     >,
-    #[cfg(all(test, feature = "testing"))]
-    admission_cut: std::sync::Mutex<Option<(OperationId, Arc<RegistryTestCut>)>>,
-    #[cfg(all(test, feature = "testing"))]
-    shutdown_cut: std::sync::Mutex<Option<Arc<RegistryTestCut>>>,
-    #[cfg(all(test, feature = "testing"))]
-    completion_cut: std::sync::Mutex<Option<(OperationId, Arc<RegistryTestCut>)>>,
-    #[cfg(all(test, feature = "testing"))]
-    drain_cut: std::sync::Mutex<Option<Arc<RegistryTestCut>>>,
-}
-
-#[cfg(all(test, feature = "testing"))]
-#[derive(Default)]
-pub(crate) struct RegistryTestCut {
-    pub(crate) entered: tokio::sync::Notify,
-    pub(crate) release: tokio::sync::Notify,
-}
-
-#[cfg(all(test, feature = "testing"))]
-impl RegistryTestCut {
-    async fn pause(&self) {
-        self.entered.notify_one();
-        self.release.notified().await;
-    }
 }
 
 impl PartitionOperationRegistry {
@@ -1274,14 +1294,6 @@ impl PartitionOperationRegistry {
             terminal_tasks: std::sync::Mutex::new(Vec::new()),
             abort_guard: Arc::new(std::sync::Mutex::new(false)),
             terminal_recovery: std::sync::OnceLock::new(),
-            #[cfg(all(test, feature = "testing"))]
-            admission_cut: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            shutdown_cut: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            completion_cut: Default::default(),
-            #[cfg(all(test, feature = "testing"))]
-            drain_cut: Default::default(),
         }))
     }
 
@@ -1300,7 +1312,6 @@ impl PartitionOperationRegistry {
     pub(crate) fn revision_receiver(&self) -> watch::Receiver<u64> {
         self.revision.subscribe()
     }
-    #[cfg(test)]
     pub(crate) async fn operation_for_validation(
         &self,
         id: &OperationId,
@@ -1356,6 +1367,38 @@ impl PartitionOperationRegistry {
         self.renewal_fence
             .load(std::sync::atomic::Ordering::Acquire)
             || self.terminal_admission_is_fenced()
+    }
+
+    pub(crate) fn build_authority_is_fenced(
+        &self,
+        state: &super::state::AgentState,
+        creation: &crate::protocol::types::ReplicatorCreationId,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> bool {
+        // Renewal keeps application/operation admission closed until configuration
+        // installation, but the exact replacement must receive its copy first.
+        let renewal_blocks = self
+            .renewal_fence
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !state
+                .public_v1_operation_state
+                .as_ref()
+                .is_some_and(|preview| {
+                    !preview.terminal
+                        && state.identity.local_identity == authority.attempt.target
+                        && preview.history.as_ref() == Some(&authority.history)
+                        && preview.storage_incarnation.as_ref()
+                            == Some(&authority.attempt.target_storage)
+                        && preview.session_renewal.as_ref().is_some_and(|renewal| {
+                            renewal_inbound_build_matches(
+                                renewal,
+                                &self.process_session_id,
+                                creation,
+                                authority,
+                            )
+                        })
+                });
+        renewal_blocks || self.terminal_admission_is_fenced()
     }
 
     async fn prepare_fenced_session_renewal_configuration(
@@ -1460,64 +1503,6 @@ impl PartitionOperationRegistry {
             .push(tokio::spawn(future));
     }
 
-    pub(crate) fn try_own_control_task(
-        &self,
-        future: impl Future<Output = ()> + Send + 'static,
-    ) -> Result<()> {
-        let mut controls = self.control_tasks.lock().expect("control task lock");
-        if self
-            .shutting_down
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(HostError::CommandRejected(
-                "public-operation registry is shutting down".into(),
-            ));
-        }
-        controls.push(tokio::spawn(future));
-        Ok(())
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_admission_cut(&self, id: OperationId, cut: Arc<RegistryTestCut>) {
-        *self.admission_cut.lock().unwrap() = Some((id, cut));
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_shutdown_cut(&self, cut: Arc<RegistryTestCut>) {
-        *self.shutdown_cut.lock().unwrap() = Some(cut);
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_completion_cut(&self, id: OperationId, cut: Arc<RegistryTestCut>) {
-        *self.completion_cut.lock().unwrap() = Some((id, cut));
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) async fn pause_completion_registration(&self, id: &OperationId) {
-        let cut = self
-            .completion_cut
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|(expected, _)| expected == id)
-            .map(|(_, cut)| cut.clone());
-        if let Some(cut) = cut {
-            cut.pause().await;
-        }
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) fn set_drain_cut(&self, cut: Arc<RegistryTestCut>) {
-        *self.drain_cut.lock().unwrap() = Some(cut);
-    }
-
-    #[cfg(all(test, feature = "testing"))]
-    pub(crate) async fn owners_drained(&self) -> bool {
-        let controls = self.control_tasks.lock().unwrap().is_empty();
-        let terminals = self.terminal_tasks.lock().unwrap().is_empty();
-        controls && terminals && self.coordination.lock().await.is_empty()
-    }
-
     pub(crate) fn dispatch_lock(&self, id: &OperationId) -> Arc<Mutex<()>> {
         self.dispatch
             .lock()
@@ -1532,36 +1517,6 @@ impl PartitionOperationRegistry {
             .lock()
             .expect("terminal task lock")
             .push(tokio::spawn(future));
-    }
-
-    pub(crate) async fn join_ordinary_roots(&self) -> Result<()> {
-        let operations = self
-            .state
-            .lock()
-            .await
-            .operations
-            .values()
-            .filter(|operation| {
-                operation.intent().goal().is_some() && !operation.intent().class.is_terminal()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for operation in operations {
-            operation.join_ordinary_root().await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn join_ordinary_goal(&self, id: &OperationId) -> Result<()> {
-        let operation = self
-            .state
-            .lock()
-            .await
-            .operations
-            .get(id)
-            .cloned()
-            .ok_or_else(|| HostError::CommandRejected("ordinary goal owner unavailable".into()))?;
-        operation.join_ordinary_root().await
     }
 
     pub(crate) async fn admit(
@@ -1601,19 +1556,6 @@ impl PartitionOperationRegistry {
         }
 
         self.reap_coordination().await;
-        #[cfg(all(test, feature = "testing"))]
-        {
-            let cut = self
-                .admission_cut
-                .lock()
-                .unwrap()
-                .as_ref()
-                .filter(|(id, _)| *id == intent.operation_id)
-                .map(|(_, cut)| cut.clone());
-            if let Some(cut) = cut {
-                cut.pause().await;
-            }
-        }
         let admission = self.admission.lock().await;
         if self
             .shutting_down
@@ -1624,9 +1566,6 @@ impl PartitionOperationRegistry {
             ));
         }
         self.load_durable_records().await?;
-        if let Some(goal) = intent.goal() {
-            crate::host::ordinary_goal::validate_admission(&self.store.load_state().await?, goal)?;
-        }
         if self.terminal_admission_is_fenced() && !intent.class.is_terminal() {
             return Err(HostError::CommandRejected(
                 "preview is synchronously fenced".into(),
@@ -1753,16 +1692,6 @@ impl PartitionOperationRegistry {
         };
         for operation in existing {
             let record = operation.snapshot();
-            if intent.goal().is_some_and(|goal| {
-                matches!(
-                    goal.desired,
-                    crate::protocol::public_operations::ReplicaGoalKind::Discover
-                        | crate::protocol::public_operations::ReplicaGoalKind::Prepare { .. }
-                ) && record.intent.goal().is_some()
-                    && record.intent.process_session_id != intent.process_session_id
-            }) {
-                continue;
-            }
             if record.superseded_by.is_some()
                 || matches!(
                     record.disposition,
@@ -1781,13 +1710,7 @@ impl PartitionOperationRegistry {
             {
                 continue;
             }
-            let relation = if record.intent.goal().is_some() && intent.goal().is_some() {
-                ordinary_relation(
-                    &record.intent,
-                    &intent,
-                    record.stage == PublicOperationStage::Completed,
-                )
-            } else if renewal
+            let relation = if renewal
                 .as_ref()
                 .is_some_and(|renewal| is_contained_predecessor_fault(renewal, &record, &intent))
             {
@@ -1914,7 +1837,9 @@ impl PartitionOperationRegistry {
             async move {
                 if operation.wait_until_ready().await? {
                     operation
-                        .spawn_root(async { Ok::<(), HostError>(()) })
+                        .spawn_root(CallbackContainment::RootTask, async {
+                            Ok::<(), HostError>(())
+                        })
                         .await?;
                 }
                 Ok::<(), HostError>(())
@@ -2003,13 +1928,10 @@ impl PartitionOperationRegistry {
             {
                 recovered.push(record);
             }
-            if (matches!(
+            if matches!(
                 operation.intent().program,
                 Some(PublicOperationProgram::Close | PublicOperationProgram::Abort)
-            ) || (operation.intent().goal().is_some()
-                && operation.intent().class.is_terminal()
-                && operation.intent().process_session_id == self.process_session_id))
-                && operation.snapshot().stage == PublicOperationStage::ContainmentPending
+            ) && operation.snapshot().stage == PublicOperationStage::ContainmentPending
                 && let Some(callbacks) = self.terminal_recovery.get()
             {
                 crate::host::public_lifecycle::recover_terminal(self, &operation, callbacks()?)
@@ -2026,6 +1948,11 @@ impl PartitionOperationRegistry {
     pub(crate) async fn shutdown(&self) -> Result<()> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        let controls = std::mem::take(&mut *self.control_tasks.lock().expect("control task lock"));
+        for task in controls {
+            task.abort();
+            let _ = task.await;
+        }
         let admission = self.admission.lock().await;
         let mut first_error = None;
         let operations = self
@@ -2036,37 +1963,6 @@ impl PartitionOperationRegistry {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let ordinary = operations
-            .iter()
-            .any(|operation| operation.intent().goal().is_some());
-        // The flag and admit's post-lock check close the gate. Retained
-        // dispatchers may still need this mutex to observe that rejection.
-        drop(admission);
-        #[cfg(all(test, feature = "testing"))]
-        {
-            let cut = self.shutdown_cut.lock().unwrap().clone();
-            if let Some(cut) = cut {
-                cut.pause().await;
-            }
-        }
-        let drain_result = if ordinary && let Some(callbacks) = self.terminal_recovery.get() {
-            let mut callbacks = callbacks()?;
-            callbacks.aborted = self.abort_guard();
-            (callbacks.revoke_access)()?;
-            callbacks.abort_once();
-            let drain = callbacks.terminal_drain.clone();
-            let (completed, result) = oneshot::channel();
-            self.own_terminal_task(async move {
-                let outcome = drain().await;
-                if let Err(error) = &outcome {
-                    tracing::warn!(%error, "ordinary shutdown remains uncontained");
-                }
-                let _ = completed.send(outcome);
-            });
-            Some(result)
-        } else {
-            None
-        };
         for operation in operations {
             if !matches!(
                 operation.snapshot().stage,
@@ -2076,83 +1972,42 @@ impl PartitionOperationRegistry {
                 first_error.get_or_insert(error);
             }
         }
-        if let Err(error) = self.drain_owned_tasks(ordinary).await {
-            first_error.get_or_insert(error);
+        let terminals =
+            std::mem::take(&mut *self.terminal_tasks.lock().expect("terminal task lock"));
+        for task in terminals {
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!("terminal cleanup join failed: {error}"))
+                });
+            }
         }
+        let coordination = std::mem::take(&mut *self.coordination.lock().await);
+        for task in coordination {
+            if let Err(error) = task.await {
+                first_error.get_or_insert_with(|| {
+                    HostError::CommandRejected(format!(
+                        "public-operation coordination join failed: {error}"
+                    ))
+                });
+            }
+        }
+        drop(admission);
         if let Err(error) = self.recover_unowned().await {
             first_error.get_or_insert(error);
         }
-        if let Err(error) = self.drain_owned_tasks(ordinary).await {
-            first_error.get_or_insert(error);
-        }
-        if let Some(result) = drain_result {
-            match result.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(HostError::from(error));
-                }
-                Err(error) => {
-                    first_error.get_or_insert_with(|| {
-                        HostError::CommandRejected(format!(
-                            "ordinary shutdown drain owner lost: {error}"
-                        ))
-                    });
-                }
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    async fn drain_owned_tasks(&self, ordinary: bool) -> Result<()> {
-        let mut first_error = None;
-        // Joined owners can register completion/terminal/coordination children.
-        // External dispatch registration is closed; drain all three to quiescence.
+        // Recovery can discover a terminal record whose cleanup owner did not
+        // exist at the first join boundary. Join those owners too; shutdown is
+        // not complete merely because durable discovery has finished.
         loop {
-            let controls =
-                std::mem::take(&mut *self.control_tasks.lock().expect("control task lock"));
             let terminals =
                 std::mem::take(&mut *self.terminal_tasks.lock().expect("terminal task lock"));
-            let coordination = std::mem::take(&mut *self.coordination.lock().await);
-            #[cfg(all(test, feature = "testing"))]
-            {
-                let cut = self.drain_cut.lock().unwrap().take();
-                if let Some(cut) = cut {
-                    cut.pause().await;
-                }
-            }
-            if controls.is_empty() && terminals.is_empty() && coordination.is_empty() {
+            if terminals.is_empty() {
                 break;
-            }
-            for task in controls {
-                if !ordinary {
-                    task.abort();
-                }
-                if let Err(error) = task.await
-                    && !error.is_cancelled()
-                {
-                    first_error.get_or_insert_with(|| {
-                        HostError::CommandRejected(format!(
-                            "retained control owner join failed: {error}"
-                        ))
-                    });
-                }
             }
             for task in terminals {
                 if let Err(error) = task.await {
                     first_error.get_or_insert_with(|| {
                         HostError::CommandRejected(format!("terminal cleanup join failed: {error}"))
-                    });
-                }
-            }
-            for task in coordination {
-                if let Err(error) = task.await {
-                    first_error.get_or_insert_with(|| {
-                        HostError::CommandRejected(format!(
-                            "public-operation coordination join failed: {error}"
-                        ))
                     });
                 }
             }
@@ -2180,27 +2035,15 @@ impl PartitionOperationRegistry {
         }) {
             self.fence();
         }
-        if durable.public_v1_operation_state.is_some_and(|preview| {
-            preview.terminal
-                && crate::host::ordinary_goal::terminal_for_process(
-                    &preview,
-                    &self.process_session_id,
-                )
-        }) {
+        if durable
+            .public_v1_operation_state
+            .is_some_and(|preview| preview.terminal)
+        {
             // A contained predecessor fault can remain in a replacement's
             // journal. Only this process's terminal records close it forever.
             self.fence_session_renewal();
         }
         let mut state = self.state.lock().await;
-        let durable_ids = records
-            .iter()
-            .map(|record| record.intent.operation_id.clone())
-            .collect::<BTreeSet<_>>();
-        state.operations.retain(|id, operation| {
-            operation.intent().goal().is_none()
-                || durable_ids.contains(id)
-                || operation.snapshot().stage != PublicOperationStage::Completed
-        });
         for record in records {
             state
                 .operations
@@ -2418,52 +2261,6 @@ fn retained_relation(
             Reject("operation revision does not match retained authority")
         }
         _ => Coexist,
-    }
-}
-
-fn ordinary_relation(
-    existing: &PublicOperationIntent,
-    incoming: &PublicOperationIntent,
-    completed: bool,
-) -> AdmissionRelation {
-    use AdmissionRelation::*;
-    if existing.process_session_id != incoming.process_session_id {
-        return if completed {
-            Coexist
-        } else {
-            Reject("predecessor ordinary creation remains unresolved")
-        };
-    }
-    if existing.class.is_terminal() {
-        return Reject("ordinary creation already has an immutable terminal owner");
-    }
-    if incoming.class.is_terminal() {
-        return if completed { Coexist } else { Supersede };
-    }
-    if incoming.revision <= existing.revision {
-        return Reject("ordinary goal revision is not newer");
-    }
-    if completed {
-        return Coexist;
-    }
-    match (&existing.class, &incoming.class) {
-        (
-            PublicOperationClass::Build { target: left },
-            PublicOperationClass::Build { target: right },
-        )
-        | (
-            PublicOperationClass::Remove { target: left },
-            PublicOperationClass::Remove { target: right },
-        )
-        | (
-            PublicOperationClass::Build { target: left },
-            PublicOperationClass::Remove { target: right },
-        )
-        | (
-            PublicOperationClass::Remove { target: left },
-            PublicOperationClass::Build { target: right },
-        ) if left != right => Coexist,
-        _ => Reject("unresolved ordinary action requires completion or whole-creation withdrawal"),
     }
 }
 
@@ -2697,7 +2494,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_renewal_cannot_clear_current_terminal_admission() {
+    async fn renewal_inbound_copy_requires_exact_replayed_replacement_and_surviving_primary() {
+        use crate::protocol::public_operations::{
+            PublicBuildAttemptReference, PublicInboundBuildAuthority,
+        };
+
         let resource = ResourceUid::new("resource-renewal-inbound");
         let generation = PublicProtocolGeneration::new(1);
         let initialization = derive_history_initialization_id(&resource, generation);
@@ -2779,31 +2580,144 @@ mod tests {
                 ReplicaRole::ActiveSecondary,
             )
             .unwrap();
-        pending.validate().unwrap();
+        let authority = PublicInboundBuildAuthority {
+            operation_id: OperationId::new("renewal-inbound-copy"),
+            operation_revision: 10,
+            attempt: PublicBuildAttemptReference {
+                resource_uid: resource,
+                epoch,
+                build_id: OperationId::new("renewal-inbound-copy"),
+                source: source.identity.clone(),
+                source_storage: source.storage_incarnation.clone(),
+                source_session: source.process_session_id.clone(),
+                target: replacement.identity.clone(),
+                target_storage: replacement.storage_incarnation.clone(),
+                target_session: replacement.process_session_id.clone(),
+            },
+            history,
+            current_configuration_id: ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            )
+            .configuration_id,
+            source_address: "http://127.0.0.1:7001".into(),
+            target_address: "http://127.0.0.1:7002".into(),
+        };
+        authority.validate().unwrap();
+        let matches = |renewal: &PublicV1SessionRenewalStatus,
+                       authority: &PublicInboundBuildAuthority| {
+            renewal_inbound_build_matches(
+                renewal,
+                &replacement.process_session_id,
+                &replacement.replicator_creation_id,
+                authority,
+            )
+        };
+        assert!(matches(&pending, &authority));
         let root = crate::host::tests::tempdir().unwrap();
         let (store, registry) =
             fence_registry(root.path(), replacement.process_session_id.clone()).await;
-        let before = store.load_state().await.unwrap();
+        let mut snapshot = store.load_state().await.unwrap();
+        snapshot.identity.local_identity = replacement.identity.clone();
+        let preview = snapshot.public_v1_operation_state.as_mut().unwrap();
+        preview.history = Some(authority.history.clone());
+        preview.storage_incarnation = Some(replacement.storage_incarnation.clone());
+        preview.session_renewal = Some(pending.clone());
         registry.fence_session_renewal();
         assert!(registry.is_fenced());
+        assert!(!registry.build_authority_is_fenced(
+            &snapshot,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        let source_registry = PartitionOperationRegistry::new(
+            store,
+            PublicV1Identity::new(1),
+            source.process_session_id.clone(),
+        )
+        .unwrap();
+        source_registry.fence_session_renewal();
+        assert!(source_registry.build_authority_is_fenced(
+            &snapshot,
+            &source.replicator_creation_id,
+            &authority,
+        ));
         registry.fence();
-        assert!(registry.terminal_admission_is_fenced());
-        registry
-            .release_session_renewal_fence(&program_intent(
-                PublicOperationProgram::Configuration(
-                    crate::protocol::public_operations::PublicConfiguration {
-                        current: pending.required.fresh_configuration.clone(),
-                        previous: None,
-                        replicas: Vec::new(),
-                    },
-                ),
-                1,
-            ))
-            .await
-            .unwrap();
-        assert!(registry.is_fenced());
-        assert!(registry.terminal_admission_is_fenced());
-        assert_eq!(store.load_state().await.unwrap(), before);
+        assert!(
+            registry.build_authority_is_fenced(
+                &snapshot,
+                &replacement.replicator_creation_id,
+                &authority,
+            ),
+            "a stale nonterminal renewal snapshot cannot weaken current terminal admission"
+        );
+        assert!(!matches(&required, &authority));
+        assert!(!matches(&role_pending, &authority));
+        assert!(!matches(
+            &pending
+                .install_fresh_configuration(&pending.required.fresh_configuration)
+                .unwrap(),
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &predecessor.process_session_id,
+            &replacement.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &replacement.process_session_id,
+            &predecessor.replicator_creation_id,
+            &authority,
+        ));
+        assert!(!renewal_inbound_build_matches(
+            &pending,
+            &source.process_session_id,
+            &source.replicator_creation_id,
+            &authority,
+        ));
+        let changes: [fn(&mut PublicInboundBuildAuthority); 7] = [
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_session = ProcessSessionId::new("historical-target");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_session = ProcessSessionId::new("historical-source");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.target_storage.storage_generation =
+                    StorageGeneration::new("other-target-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.source_storage.storage_generation =
+                    StorageGeneration::new("other-source-storage");
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 1);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.attempt.epoch = Epoch::new(0, 3);
+            },
+            |authority: &mut PublicInboundBuildAuthority| {
+                authority.history.data_loss_number += 1;
+            },
+        ];
+        for change in changes {
+            let mut changed = authority.clone();
+            change(&mut changed);
+            assert!(!matches(&pending, &changed), "{changed:?}");
+        }
+        let mut changed = pending.clone();
+        changed.required.predecessor_contained = false;
+        assert!(!matches(&changed, &authority));
+        let mut changed = pending;
+        changed.replayed_role = None;
+        assert!(!matches(&changed, &authority));
     }
 
     #[test]

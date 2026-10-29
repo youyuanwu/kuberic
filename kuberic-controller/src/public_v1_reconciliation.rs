@@ -116,9 +116,6 @@ pub(crate) fn recovery_peer_changed(
             Some(RawAgentObservation::Uninitialized(_)) => {
                 return Err("ordinary recovery peer lost initialized authority".into());
             }
-            Some(RawAgentObservation::ReplicaSnapshot(_)) => {
-                return Err("legacy recovery commands cannot consume ordinary snapshots".into());
-            }
             Some(RawAgentObservation::Absent | RawAgentObservation::Unavailable { .. }) | None => {}
         }
     }

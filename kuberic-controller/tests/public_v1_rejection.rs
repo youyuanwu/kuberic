@@ -156,8 +156,6 @@ async fn partial_controller_status_rejects_before_reconciliation_effects() {
         let mut set = KubericSet::new(
             "sample",
             KubericSetSpec {
-                hosting_format:
-                    kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
                 replicas: 1,
                 image: "example".into(),
                 failover_delay_seconds: 30,
@@ -209,7 +207,6 @@ async fn incomplete_kubernetes_observation_rejects_before_effects() {
     let mut set = KubericSet::new(
         "sample",
         KubericSetSpec {
-            hosting_format: kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
             replicas: 1,
             image: "example".into(),
             failover_delay_seconds: 30,
@@ -293,8 +290,6 @@ async fn cross_field_partial_status_rejects_before_effects() {
         let mut set = KubericSet::new(
             format!("sample-{index}").as_str(),
             KubericSetSpec {
-                hosting_format:
-                    kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT,
                 replicas: 1,
                 image: "example".into(),
                 failover_delay_seconds: 30,

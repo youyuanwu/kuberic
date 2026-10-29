@@ -1350,6 +1350,7 @@ fn public_configuration(
                     )
                 })?;
             Ok(PublicReplicaDescriptor {
+                build_id: OperationId::default(),
                 identity: replica.report.replica.clone(),
                 replication_address: replica.replication_address.clone(),
                 process_session_id: replica.report.process_session_id.clone(),
@@ -1471,6 +1472,7 @@ pub(crate) fn native_public_configuration(
         } else {
             let observed = observed.ok_or("configuration lacks exact peer authority")?;
             PublicReplicaDescriptor {
+                build_id: OperationId::default(),
                 identity: observed.report.replica.clone(),
                 replication_address: observed.replication_address.clone(),
                 process_session_id: observed.report.process_session_id.clone(),
@@ -2127,9 +2129,6 @@ fn retained_authority_revision(
 
 fn call_kind(intent: &PublicOperationIntent) -> Result<PublicV1CallKind, String> {
     match intent.program.as_ref() {
-        Some(PublicOperationProgram::AgentGoal(_)) => {
-            Err("semantic goals require M1 topology orchestration".into())
-        }
         Some(PublicOperationProgram::Open { .. }) => Ok(PublicV1CallKind::Open),
         Some(PublicOperationProgram::Role { .. }) => Ok(PublicV1CallKind::Role),
         Some(PublicOperationProgram::Epoch { .. }) => Ok(PublicV1CallKind::Epoch),

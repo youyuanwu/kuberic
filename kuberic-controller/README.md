@@ -24,29 +24,27 @@ factory/lifecycle ownership, typed faults, package checks and evidence limits.
 
 Each reconcile:
 
-1. validates required format-16 spec/retained state and observes namespaced resources;
-2. obtains callback-free exact agent snapshots;
+1. observes the complete namespaced resource set and agent reports;
+2. validates accepted Public V1 status;
 3. converges missing support/replica resources;
-4. retains semantic replica goals and accepts exact achieved outcomes;
+4. applies history, session-renewal, operation, or evidence work;
 5. requeues for observation.
 
 Fresh bootstrap creates credentials, peer/write Services, PVCs, Pods, and exact
 per-Pod endpoints before consuming reports. A preseeded report cannot skip
 resource convergence.
 
-Independent per-replica Discover/Open preparation permits all endpoints to
-publish before held peer-dependent recovery finishes. Target PrepareIdle precedes
-ordinary source Build; exact two-ended Ready acknowledgement precedes separate
-joint/current voting admission and catch-up. Local agents choose ordered
-callbacks, not the controller. Interrupted matching-format work stays uncertain;
-automatic retained-history election, contraction and primary replacement are
-explicitly unavailable or waiting, not inferred from stale outcomes.
-Exact Discover is retried rather than duplicated from an old snapshot. Bounded
-unchanged-Primary retained-secondary and singleton restart preserve acknowledged
-data through fresh sessions and callback readmission. Achieved predecessor
-Close history cannot veto a fresh current owner's Build; exact current
-storage/process/creation Abort or Close still vetoes it regardless of status.
-These repairs and actual KV growth do not supply general M3 election/handoff.
+After bootstrap, the controller persists exact topology sessions separately
+from logical membership. A same-storage process restart performs only a
+contained Open while its replicator identity is temporary, then originates
+session renewal before role, epoch, or configuration authority. Replacement
+planning selects the durably bound incarnation even while predecessor and
+replacement reports overlap.
+
+Main observation probes an unavailable primary until
+`failoverDelaySeconds` expires. After the deadline it omits only that declared
+primary, configures surviving secondaries before the promoted primary, catches
+up all survivors, and publishes the new topology before routing writes.
 
 ## Configuration
 
@@ -64,39 +62,35 @@ CRD status is structurally typed and contains:
 
 - Public V1 authority;
 - topology;
-- typed canonical per-replica goals, digests and exact outcomes.
+- session renewal;
+- replacement;
+- transition;
+- operation.
 
 Status-only reads avoid agent RPCs. Operation dispatch/report paths observe
 only the exact target; ordinary reconciliation retains the broader observation
 needed for topology and failover decisions.
 
-Host/control/CRD format 16 is required, including `spec.hostingFormat: 16`.
-Old/missing/mixed formats and retained command/renewal/replacement state reject
-before mutation; there is no converter or data reset. Fresh-only deployment
-policy does not remove matching-format restart/SQLite rollback recovery.
+Protocol version 13 is the only production command/report path. Old and
+partial controller state rejects before planning or mutation.
+See the [current format authority](../docs/features/kuberic/classic-v1-runtime.md#production-policies-and-security).
 
-The [M1 controller/agent/host split](../docs/features/kuberic/ordinary-hosting-m1.md)
-is implemented without target engine grant dispatch or mandatory companion/
-diagnostics. Built-in/KV/SQLite and independent PostgreSQL use ordinary native
-engine integration; comprehensive recovery qualification remains M3.
-Bounded M2 implementation acceptance passed; documentation implementation
-review and actual independent final Sol/Astra gates have not run.
+The [proposed controller/agent/host responsibility split](../docs/features/kuberic/engine-neutral-hosting.md#controller-to-host-messages-and-action-selection)
+and [future runtime roadmap](../docs/features/kuberic/sf-v1-semantic-alignment-plan.md#hosting-redesign-roadmap--not-implemented)
+are **NOT IMPLEMENTED**. Current dispatch still installs exact target Build
+authority before source Build; the redesign replaces, rather than renames,
+that extension boundary.
 
 ## Deployment
 
 Assets are under `deploy/`. They are development/CI assets, not published
 release targets.
 
-The shipped sample and generated CRD use format 16. Live qualification requires
-an owned cluster and matching images; compatible assets alone are not live evidence.
-Historical M1 acceptance used an independent ordinary factory and real agent
-transport against an in-process Kubernetes storage model, not live KinD.
-Full M2 owned bootstrap, secondary reconstruction and final write/read passed
-on recovery image source `af06768a4e5dbc8ef2a57935e0b12342a2c540eb`.
-The later accepted terminal-owner repair at `84ff69cf5790f6b41e82c352fe03c39a40fc7d7a`
-has actual bounded controller/KV tests, not a new matching-image live run.
-See the [source-bound evidence](../docs/features/kuberic/testing.md#m2-accepted-evidence-and-remaining-boundaries);
-replacement/failover and all-source/CI green are not claimed.
+```bash
+just level-triggered-images
+just level-triggered-install
+just level-triggered-kind-test bootstrap replacement failover
+```
 
 There is no migration, compatibility mode, Kubernetes cutover Lease, image
 publication, or production-activation procedure.

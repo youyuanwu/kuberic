@@ -273,13 +273,7 @@ impl StateProvider for KvStateProvider {
     }
 
     async fn get_copy_context(&self) -> Result<OperationDataStream> {
-        let progress = self.persistence.native_progress();
-        if progress == 0 {
-            return Ok(Box::pin(stream::empty()));
-        }
-        Ok(Box::pin(stream::iter([Ok(self
-            .persistence
-            .native_snapshot(progress)?)])))
+        Ok(Box::pin(stream::empty()))
     }
 
     async fn get_copy_state(
@@ -289,12 +283,10 @@ impl StateProvider for KvStateProvider {
     ) -> Result<OperationDataStream> {
         use futures::StreamExt;
         if let Some(item) = copy_context.next().await {
-            self.persistence.validate_copy_prefix(&item?, up_to_lsn)?;
-            if copy_context.next().await.is_some() {
-                return Err(RuntimeError::Application(
-                    "multiple KV copy prefixes".into(),
-                ));
-            }
+            item?;
+            return Err(RuntimeError::Application(
+                "kvstore2 does not use a copy context".into(),
+            ));
         }
         self.copy_gate.wait_until_released().await?;
         let data = self
@@ -337,77 +329,6 @@ mod tests {
             chunks.push(chunk.unwrap());
         }
         chunks
-    }
-
-    #[tokio::test]
-    async fn m2_recovery_context_proves_full_retained_prefix_before_nonregressing_transfer() {
-        let root = tempfile::tempdir().unwrap();
-        let source_store = Arc::new(KvPersistence::open(root.path().join("source")).unwrap());
-        let target_store = Arc::new(KvPersistence::open(root.path().join("target")).unwrap());
-        for store in [&source_store, &target_store] {
-            store
-                .native_prepare(
-                    1,
-                    KvPersistence::encode_put("retained".into(), "acknowledged".into()).unwrap(),
-                    true,
-                )
-                .unwrap();
-        }
-        source_store
-            .native_prepare(
-                2,
-                KvPersistence::encode_put("later".into(), "acknowledged".into()).unwrap(),
-                true,
-            )
-            .unwrap();
-        let (source, _source_commit) = bound_provider(source_store.clone(), CopyGate::disabled());
-        let (target, target_commit) = bound_provider(target_store.clone(), CopyGate::disabled());
-        let context = target.get_copy_context().await.unwrap();
-        let chunks = collect_copy(source.get_copy_state(2, context).await.unwrap()).await;
-        target_commit.begin_copy().unwrap();
-        target_commit
-            .install_copy(Bytes::from(chunks.concat()))
-            .unwrap();
-        target_commit.finish_copy().unwrap();
-        assert_eq!(target_store.native_progress(), 2);
-        assert_eq!(
-            target_store.get("retained").as_deref(),
-            Some("acknowledged")
-        );
-        assert_eq!(target_store.get("later").as_deref(), Some("acknowledged"));
-
-        let source_before = std::fs::read(root.path().join("source/state.json")).unwrap();
-        let target_before = std::fs::read(root.path().join("target/state.json")).unwrap();
-        let mut conflicting: serde_json::Value =
-            serde_json::from_slice(&source_store.native_snapshot(1).unwrap()).unwrap();
-        conflicting["values"]["retained"] = serde_json::json!("different-history");
-        let bytes = Bytes::from(serde_json::to_vec(&conflicting).unwrap());
-        assert!(
-            source
-                .get_copy_state(2, Box::pin(stream::iter([Ok(bytes)])))
-                .await
-                .is_err()
-        );
-        assert!(
-            source
-                .get_copy_state(1, target.get_copy_context().await.unwrap())
-                .await
-                .is_err()
-        );
-        assert!(
-            source
-                .get_copy_state(2, Box::pin(stream::iter([Ok(Bytes::from_static(b"{}"))])))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            std::fs::read(root.path().join("source/state.json")).unwrap(),
-            source_before
-        );
-        assert_eq!(
-            std::fs::read(root.path().join("target/state.json")).unwrap(),
-            target_before
-        );
     }
 
     #[tokio::test]

@@ -7,12 +7,13 @@ use kuberic_runtime::protocol::command::{
     PublicV1SessionRenewalCommand,
 };
 use kuberic_runtime::protocol::public_operations::{
-    ProcessSessionRenewalRequired, PublicOperationClass, PublicOperationIntent,
-    PublicOperationProgram, PublicV1Identity, PublicV1SessionRenewalStatus,
+    ProcessSessionRenewalRequired, PublicBuildAttemptReference, PublicInboundBuildAuthority,
+    PublicOperationClass, PublicOperationIntent, PublicOperationProgram, PublicV1Identity,
+    PublicV1SessionRenewalStatus,
 };
 use kuberic_runtime::protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId, PodUid,
-    ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
+    AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember, Epoch,
+    OperationId, PodUid, ProcessSessionEndpoint, ProcessSessionId, ProcessSessionRenewalReason,
     PublicProtocolGeneration, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
     ReplicaStorageIdentity, ReplicaStorageIncarnationContext, ReplicatorCreationId, ResourceUid,
     StorageGeneration, derive_bootstrap_history, derive_history_initialization_id,
@@ -77,6 +78,7 @@ fn availability_is_required_canonical_evidence_for_every_configuration_input() {
         current: current.clone(),
         previous: None,
         replicas: vec![PublicReplicaDescriptor {
+            build_id: OperationId::default(),
             identity: remote.replica.clone(),
             replication_address: "http://127.0.0.1:50052".into(),
             process_session_id: ProcessSessionId::new("session-2"),
@@ -138,7 +140,7 @@ fn availability_is_required_canonical_evidence_for_every_configuration_input() {
             intent,
         };
         let request = proto::ExecuteCommandRequest {
-            protocol_version: PUBLIC_V1_PROTOCOL_VERSION,
+            protocol_version: 13,
             resource_uid: "resource-1".into(),
             target: Some(identity().into()),
             expected_process_session_id: "session-1".into(),
@@ -249,7 +251,7 @@ fn availability_is_required_canonical_evidence_for_every_configuration_input() {
     let required = schema.as_value()["required"].as_array().unwrap();
     assert!(required.iter().any(|field| field == "isUp"));
     assert!(required.iter().any(|field| field == "isReady"));
-    assert_eq!(PUBLIC_V1_PROTOCOL_VERSION, 16);
+    assert_eq!(PUBLIC_V1_PROTOCOL_VERSION, 13);
     assert!(
         !PublicV1Identity {
             protocol_version: 12,
@@ -456,13 +458,50 @@ fn public_v1_operation_command_round_trips_and_rejects_partial_or_crossed_input(
 }
 
 #[test]
-fn removed_inbound_authority_commands_are_not_wire_inputs() {
-    for kind in [
-        "installInboundBuildAuthority",
-        "revokeInboundBuildAuthority",
+fn public_v1_inbound_build_authority_commands_round_trip() {
+    let accepted = accepted();
+    let source_storage = storage();
+    let target_storage = target_storage();
+    let authority = PublicInboundBuildAuthority {
+        operation_id: OperationId::new("build-operation"),
+        operation_revision: 7,
+        attempt: PublicBuildAttemptReference {
+            resource_uid: ResourceUid::new("resource-1"),
+            epoch: Epoch::new(0, 2),
+            build_id: OperationId::new("build-attempt"),
+            source: source_storage.replica.clone(),
+            source_storage,
+            source_session: ProcessSessionId::new("source-session"),
+            target: target_storage.replica.clone(),
+            target_storage: target_storage.clone(),
+            target_session: ProcessSessionId::new("target-session"),
+        },
+        history: accepted.history,
+        current_configuration_id: ConfigurationId::new("configuration-2"),
+        source_address: "http://pod-1:50052".into(),
+        target_address: "http://pod-2:50052".into(),
+    };
+    for command in [
+        PublicV1HistoryCommand::InstallInboundBuildAuthority {
+            authority: Box::new(authority.clone()),
+        },
+        PublicV1HistoryCommand::RevokeInboundBuildAuthority {
+            authority: Box::new(authority.clone()),
+        },
     ] {
-        let input = serde_json::json!({"kind": kind, "authority": {}});
-        assert!(serde_json::from_value::<PublicV1HistoryCommand>(input).is_err());
+        let request = proto::ExecuteCommandRequest {
+            protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+            resource_uid: "resource-1".into(),
+            target: Some(target_storage.replica.clone().into()),
+            expected_process_session_id: "target-session".into(),
+            command: Some(proto::execute_command_request::Command::PublicV1History(
+                public_v1_history_command_to_proto(&command).unwrap(),
+            )),
+        };
+        assert_eq!(
+            normalize_execute_request(request).unwrap().command,
+            ProtocolCommand::PublicV1History(Box::new(command))
+        );
     }
 }
 

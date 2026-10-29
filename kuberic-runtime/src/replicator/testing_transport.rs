@@ -7,30 +7,13 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use futures::future::BoxFuture;
 
 use crate::protocol::types::{ProcessSessionId, ReplicatorCreationId};
-use crate::replicator::{ReplicatorCreation, ReplicatorCreationReservation};
+use crate::replicator::ReplicatorCreation;
 
 /// The actual built-in physical dial being redirected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestingTcpRouteKind {
     Replication,
     Build,
-    EngineReserve,
-    EngineActivate,
-    EngineConfirm,
-    EngineComplete,
-    EngineRetire,
-    ConfirmReceived,
-    BeforeDispatch,
-    BeforeCredit,
-    AfterContext,
-    BuildResult,
-    BeforeDelivery,
-    RetireResponse,
-    RecoveryDiscovery,
-    RecoveryReceived,
-    ConfigurationValidated,
-    ConfigurationAdmitted,
-    RemoveAdmitted,
 }
 
 type Route = Arc<
@@ -44,8 +27,6 @@ struct Registration {
     generation: Arc<()>,
     evidence: Option<(ProcessSessionId, Weak<ReplicatorCreation>)>,
     driver_loss: Option<Arc<dyn Fn() -> BoxFuture<'static, std::io::Result<()>> + Send + Sync>>,
-    native: Option<(ProcessSessionId, ReplicatorCreationReservation)>,
-    inspect: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
 }
 
 fn routes() -> &'static Mutex<BTreeMap<String, Registration>> {
@@ -70,47 +51,12 @@ pub(in crate::replicator) fn before_attachment(
         .map(|registration| {
             registration.evidence = None;
             registration.driver_loss = None;
-            registration.native = None;
-            registration.inspect = None;
             registration.generation = Arc::new(());
             AttachmentRoute {
                 instance: instance.to_owned(),
                 session: session.clone(),
                 generation: Arc::downgrade(&registration.generation),
             }
-        })
-}
-
-pub(in crate::replicator) fn retain_inspection(
-    instance: &str,
-    inspect: impl Fn() -> serde_json::Value + Send + Sync + 'static,
-) {
-    if let Some(registration) = routes().lock().unwrap().get_mut(instance) {
-        registration.inspect = Some(Arc::new(inspect));
-    }
-}
-
-pub(in crate::replicator) fn retain_native_transport(
-    instance: &str,
-    session: ProcessSessionId,
-    reservation: ReplicatorCreationReservation,
-) {
-    if let Some(registration) = routes().lock().unwrap().get_mut(instance) {
-        registration.native = Some((session, reservation));
-    }
-}
-
-pub(in crate::replicator) fn has_native_transport(
-    route: &AttachmentRoute,
-    reservation: ReplicatorCreationReservation,
-) -> bool {
-    routes()
-        .lock()
-        .unwrap()
-        .get(&route.instance)
-        .is_some_and(|registration| {
-            Weak::ptr_eq(&route.generation, &Arc::downgrade(&registration.generation))
-                && registration.native.as_ref() == Some(&(route.session.clone(), reservation))
         })
 }
 
@@ -180,8 +126,6 @@ impl TestingTcpRoute {
                 generation: Arc::new(()),
                 evidence: None,
                 driver_loss: None,
-                native: None,
-                inspect: None,
             },
         );
         Ok(Self { instance })
@@ -235,17 +179,6 @@ impl TestingTcpRoute {
                 .and_then(|registration| registration.driver_loss.clone())
                 .ok_or_else(|| std::io::Error::other("exact live V1 driver unavailable"))?;
         loss().await
-    }
-
-    /// Read-only diagnostics of the concrete test-owned transport; never admission.
-    pub fn inspect_native(&self) -> std::io::Result<serde_json::Value> {
-        let inspect = routes()
-            .lock()
-            .unwrap()
-            .get(&self.instance)
-            .and_then(|registration| registration.inspect.clone())
-            .ok_or_else(|| std::io::Error::other("native transport unavailable"))?;
-        Ok(inspect())
     }
 }
 
@@ -493,8 +426,10 @@ mod tests {
     mod attachment {
         use super::*;
         use crate::application::{OperationDataStream, StateProvider};
+        use crate::host::store::PublicInboundBuildAdmission;
         use crate::protocol::public_operations::{
-            PublicV1Identity, PublicV1LifecycleBinding, StatePersistence,
+            PublicInboundBuildAuthority, PublicV1Identity, PublicV1LifecycleBinding,
+            StatePersistence,
         };
         use crate::protocol::types::{
             AccessStatus, AgentGeneration, FaultType, LoadMetric, PartitionId,
@@ -502,10 +437,10 @@ mod tests {
             ReplicaStorageIncarnationContext, ResourceUid,
         };
         use crate::replicator::{
-            DefaultReplicatorFactory, PartitionAccessView, ReplicatorAttachment,
-            ReplicatorCreationReservation, ReplicatorFactory, ReplicatorFactoryContext,
-            ReplicatorInterfaces, ReplicatorRegistration, ReplicatorSettings,
-            StatefulServicePartition,
+            DefaultReplicatorFactory, NativeRuntimeControl, PartitionAccessView,
+            ReplicatorAttachment, ReplicatorCreationReservation, ReplicatorFactory,
+            ReplicatorFactoryContext, ReplicatorInterfaces, ReplicatorRegistration,
+            ReplicatorSettings, StatefulServicePartition,
         };
         use crate::{Result, RuntimeError};
 
@@ -520,7 +455,8 @@ mod tests {
         #[derive(Default)]
         struct Creation {
             reserved: Option<ReplicatorCreationReservation>,
-            retained: Vec<Arc<dyn crate::replicator::Replicator>>,
+            pending: Option<Arc<dyn NativeRuntimeControl>>,
+            retained: Vec<Arc<dyn NativeRuntimeControl>>,
         }
 
         impl Fixture {
@@ -528,24 +464,20 @@ mod tests {
                 let owners = {
                     let mut creation = self.creation.lock().unwrap();
                     assert!(creation.reserved.is_none());
+                    assert!(creation.pending.is_none());
                     std::mem::take(&mut creation.retained)
                 };
                 for owner in owners {
-                    owner.abort();
-                    owner.close().await.unwrap();
+                    owner.shutdown_and_drain().await.unwrap();
                 }
             }
         }
 
         #[async_trait]
         impl ReplicatorRegistration for Fixture {
-            fn record_creation_cleanup_failure(&self, error: String) {
-                panic!("unexpected ordinary cleanup failure in native fixture: {error}");
-            }
-
             fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation> {
                 let mut creation = self.creation.lock().unwrap();
-                if creation.reserved.is_some() {
+                if creation.reserved.is_some() || creation.pending.is_some() {
                     return Err(RuntimeError::AuthorityNotAdmitted);
                 }
                 let reservation = ReplicatorCreationReservation::new(RuntimeHostToken::new());
@@ -556,6 +488,9 @@ mod tests {
                 let mut creation = self.creation.lock().unwrap();
                 assert_eq!(creation.reserved, Some(reservation));
                 creation.reserved = None;
+                if let Some(owner) = creation.pending.take() {
+                    creation.retained.push(owner);
+                }
             }
             async fn register_interfaces(
                 &self,
@@ -577,9 +512,9 @@ mod tests {
                     Err(RuntimeError::Closed)
                 } else {
                     creation.reserved = None;
-                    creation
-                        .retained
-                        .push(attachment.replicator(RuntimeHostToken::new()));
+                    if let Some(owner) = creation.pending.take() {
+                        creation.retained.push(owner);
+                    }
                     Ok(())
                 }
             }
@@ -587,6 +522,19 @@ mod tests {
 
         #[async_trait]
         impl PartitionAccessView for Fixture {
+            fn retain_creation_control(
+                &self,
+                reservation: ReplicatorCreationReservation,
+                owner: Arc<dyn NativeRuntimeControl>,
+            ) -> Result<()> {
+                let mut creation = self.creation.lock().unwrap();
+                if creation.reserved != Some(reservation) || creation.pending.is_some() {
+                    return Err(RuntimeError::AuthorityNotAdmitted);
+                }
+                creation.pending = Some(owner);
+                Ok(())
+            }
+
             fn native_write_admission(&self) -> Result<Arc<Mutex<()>>> {
                 Ok(self.write_admission.clone())
             }
@@ -655,6 +603,19 @@ mod tests {
             async fn write_status(&self) -> Result<AccessStatus> {
                 unreachable!()
             }
+            async fn classify_replacement_inbound_build_authority(
+                &self,
+                _: &PublicInboundBuildAuthority,
+            ) -> Result<PublicInboundBuildAdmission> {
+                unreachable!()
+            }
+            async fn install_replacement_inbound_build_authority(
+                &self,
+                _: &PublicInboundBuildAuthority,
+            ) -> Result<()> {
+                unreachable!()
+            }
+            fn release_provider_writer(&self) {}
             async fn report_load(&self, _: Vec<LoadMetric>) -> Result<()> {
                 unreachable!()
             }

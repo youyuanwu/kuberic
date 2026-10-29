@@ -315,20 +315,21 @@ impl Fixture {
         let replication = Arc::new(Replication(probe.clone()));
         let drain_probe = probe.clone();
         let callbacks = PublicLifecycleCallbacks {
-            peer_credentials: None,
-            ordinary: false,
-            abort_creation: None,
             access_factory: None,
             access_owner: None,
             application: Arc::new(Application(probe.clone(), replication.clone())),
             replicator: replication.clone(),
             primary: replication,
             application_control_match: None,
+            native_role_epoch: None,
             revoke_access: Arc::new(|| Ok(())),
             capabilities: ReplicatorCapabilities::conservative(),
             replicator_creation_id: ReplicatorCreationId::new("creation"),
             open_context: None,
             containment: None,
+            wait_for_containment: false,
+            preempt_retained_owner: false,
+            native_observer_callbacks: false,
             retry_proof: Default::default(),
             terminal_drain: Arc::new(move || {
                 let probe = drain_probe.clone();
@@ -628,6 +629,7 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
     let descriptor = |storage| PublicReplicaDescriptor {
         is_up: true,
         is_ready: true,
+        build_id: OperationId::default(),
         identity: target.clone(),
         replication_address: build.replication_address.clone(),
         process_session_id: build.process_session_id.clone(),
@@ -672,6 +674,7 @@ async fn promoted_build_releases_its_slot_for_a_fresh_incarnation_without_losing
             PublicReplicaDescriptor {
                 is_up: true,
                 is_ready: true,
+                build_id: OperationId::default(),
                 identity: epoch_primary.clone(),
                 replication_address: "http://127.0.0.1:4".into(),
                 process_session_id: ProcessSessionId::new("epoch-primary-session"),
@@ -1452,6 +1455,7 @@ async fn native_observer_between_receipted_callbacks_does_not_require_runtime_sh
         (PublicCutPosition::InstructionApplied, 1, 2),
     ] {
         let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
         let (_contained, witness) = tokio::sync::watch::channel(false);
         fixture.callbacks.containment = Some(witness);
         let cut = Arc::new(PublicOperationCut {
@@ -1520,6 +1524,7 @@ async fn native_observer_between_receipted_callbacks_does_not_require_runtime_sh
 async fn native_observer_selected_host_revoke_does_not_require_runtime_shutdown() {
     for composed in [false, true] {
         let (mut fixture, configuration) = swap_admission_tests::installed_primary().await;
+        fixture.callbacks.native_observer_callbacks = true;
         let (_contained, witness) = tokio::sync::watch::channel(false);
         fixture.callbacks.containment = Some(witness);
         let mut refreshed = configuration.clone();
@@ -1586,8 +1591,10 @@ async fn native_observer_selected_host_revoke_does_not_require_runtime_shutdown(
 async fn canonical_application_rebuild_receipt_keeps_real_child_containment_and_blocks_successor() {
     for recipe in [false, true] {
         let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
         // Match a live creation's retained witness: supersession must observe
         // its eventual actual join, rather than a one-off bare-fixture poll.
+        fixture.callbacks.wait_for_containment = true;
         let local = fixture
             .store
             .load_state()
@@ -1744,6 +1751,7 @@ async fn canonical_application_rebuild_receipt_keeps_real_child_containment_and_
 async fn native_engine_ownership_does_not_certify_failed_or_cancelled_application_role() {
     for cancel in [false, true] {
         let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
         fixture
             .probe
             .fail_application_role
@@ -1803,6 +1811,7 @@ async fn native_engine_ownership_does_not_certify_failed_or_cancelled_applicatio
 async fn native_engine_ownership_does_not_certify_access_application_callback() {
     for cancel in [false, true] {
         let mut fixture = Fixture::new().await;
+        fixture.callbacks.native_observer_callbacks = true;
         if cancel {
             fixture
                 .probe
@@ -1912,6 +1921,7 @@ async fn sf06_terminal_custom_witness_blocks_completion_and_lost_witness_is_not_
         let mut fixture = Fixture::new().await;
         let (sender, receiver) = tokio::sync::watch::channel(false);
         fixture.callbacks.containment = Some(receiver);
+        fixture.callbacks.wait_for_containment = true;
         let operation = fixture.launch(PublicOperationProgram::Abort, 1).await;
         fixture.probe.drain_entered.notified().await;
         assert_ne!(operation.snapshot().stage, PublicOperationStage::Completed);
@@ -1961,7 +1971,7 @@ async fn sf06_replayed_terminal_cuts_reestablish_containment_and_preserve_first_
         fixture.registry.own_terminal_task(owner);
         let store = fixture.store.clone();
         operation
-            .spawn_root(async move {
+            .spawn_root(CallbackContainment::RootTask, async move {
                 // Seed the durable state at the same boundaries as an interrupted
                 // process, then run the ordinary executor against the retained log.
                 if cut == 0 {

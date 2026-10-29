@@ -1,6 +1,5 @@
-use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -8,17 +7,19 @@ use futures::FutureExt;
 use kuberic_public_v1_tests::{
     CopyContextObservations, CopyStateObservation, ExternalService, PersistedSnapshot,
 };
-use kuberic_runtime::control::proto;
+use kuberic_runtime::control::{convert, proto};
 use kuberic_runtime::host::{
     ApplicationStorageState, ReplicaEndpointResolver, ReplicaHost, ReplicaProcessConfig,
     RunningReplica,
 };
+use kuberic_runtime::protocol::command::{PublicV1HistoryCommand, PublicV1OperationCommand};
 use kuberic_runtime::protocol::public_operations::*;
 use kuberic_runtime::protocol::types::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 const CREDENTIAL: &str = "public-copy-context-credential";
-const BOUND: Duration = Duration::from_secs(20);
+const RPC_BOUND: Duration = Duration::from_secs(20);
 
 fn authorized<T>(message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
@@ -43,19 +44,37 @@ fn identity_for(resource: &ResourceUid, id: i64) -> ReplicaIdentity {
     }
 }
 
-#[derive(Default)]
-struct Resolver(Mutex<BTreeMap<ReplicaId, String>>);
+async fn report_at(
+    address: &str,
+    resource: &ResourceUid,
+    identity: &ReplicaIdentity,
+) -> TestResult<PublicV1AgentReport> {
+    tokio::time::timeout(RPC_BOUND, async {
+        let mut client =
+            proto::agent_control_client::AgentControlClient::connect(address.to_owned()).await?;
+        let response = client
+            .get_status(authorized(proto::GetAgentStatusRequest {
+                protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                resource_uid: resource.to_string(),
+                replica_id: identity.replica_id.value(),
+                expected_instance_id: identity.instance_id.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(convert::normalize_public_v1_agent_status_report(response)?)
+    })
+    .await?
+}
+
+struct Resolver;
+
 impl ReplicaEndpointResolver for Resolver {
-    fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
-        self.0
-            .lock()
-            .unwrap()
-            .get(&identity.replica_id)
-            .cloned()
-            .unwrap_or_default()
+    fn control_endpoint(&self, _: &ReplicaIdentity) -> String {
+        "http://127.0.0.1:1".into()
     }
+
     fn replication_endpoint(&self, _: &ReplicaIdentity) -> String {
-        String::new()
+        "http://127.0.0.1:1".into()
     }
 }
 
@@ -63,17 +82,18 @@ struct Node {
     running: RunningReplica,
     service: Arc<ExternalService>,
     identity: ReplicaIdentity,
-    resource: ResourceUid,
+    storage: ReplicaStorageIncarnationContext,
+    history: HistoryContext,
+    revision: u64,
     control_address: String,
     session: ProcessSessionId,
-    revision: u64,
 }
 
 impl Node {
     async fn start(
         root: &Path,
         id: i64,
-        resolver: Arc<Resolver>,
+        replicas: u32,
         advertised: Vec<Bytes>,
         expected: Vec<Bytes>,
     ) -> TestResult<Self> {
@@ -101,18 +121,16 @@ impl Node {
             },
             service.clone(),
             ApplicationStorageState::FreshEmpty,
-            resolver.clone(),
+            Arc::new(Resolver),
         )
-        .with_application_storage_paths(BTreeMap::from([("application".into(), application)]));
+        .with_application_storage_paths(std::collections::BTreeMap::from([(
+            "application".into(),
+            application,
+        )]));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let control_address = format!("http://{}", listener.local_addr()?);
-        resolver
-            .0
-            .lock()
-            .unwrap()
-            .insert(identity.replica_id, control_address.clone());
         let mut startup = tokio::spawn(host.start(listener));
-        let initialized = tokio::time::timeout(BOUND, async {
+        let initialized = tokio::time::timeout(RPC_BOUND, async {
             let mut client = loop {
                 match proto::agent_control_client::AgentControlClient::connect(
                     control_address.clone(),
@@ -132,10 +150,9 @@ impl Node {
                 }))
                 .await?
                 .into_inner();
-            assert_eq!(
-                status.storage_state,
-                proto::AgentStorageState::Uninitialized as i32
-            );
+            if status.storage_state != proto::AgentStorageState::Uninitialized as i32 {
+                return Err("fresh host unexpectedly had initialized metadata".into());
+            }
             let initialization = derive_initialization_id(
                 &resource,
                 identity.replica_id,
@@ -145,7 +162,7 @@ impl Node {
             let bootstrap = ConfigurationDescriptor::new(
                 Epoch::new(0, 1),
                 ReplicaId::new(1),
-                (1..=id)
+                (1..=i64::from(replicas))
                     .map(|member| ConfigurationMember {
                         identity: identity_for(&resource, member),
                         role: if member == 1 {
@@ -155,7 +172,7 @@ impl Node {
                         },
                     })
                     .collect(),
-                id as u32 / 2 + 1,
+                replicas / 2 + 1,
             );
             client
                 .execute(authorized(proto::ExecuteCommandRequest {
@@ -174,7 +191,9 @@ impl Node {
                                 expected_pvc_uid: format!("pvc-{id}"),
                                 assigned_agent_generation: identity.agent_generation.to_string(),
                                 effective_policy: Some(
-                                    EffectivePolicy::fixed(id as u32, 1).unwrap().into(),
+                                    EffectivePolicy::fixed(replicas, 1)
+                                        .ok_or("invalid replica policy")?
+                                        .into(),
                                 ),
                                 bootstrap_configuration: Some(bootstrap.into()),
                                 provisioning: None,
@@ -183,15 +202,19 @@ impl Node {
                     ),
                 }))
                 .await?;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         })
         .await;
-        if let Err(error) = initialized.unwrap_or_else(|error| Err(error.into())) {
+        let initialized: TestResult = match initialized {
+            Ok(result) => result,
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = initialized {
             startup.abort();
             let _ = startup.await;
             return Err(error);
         }
-        let running = match tokio::time::timeout(BOUND, &mut startup).await {
+        let mut running = match tokio::time::timeout(RPC_BOUND, &mut startup).await {
             Ok(result) => result??,
             Err(error) => {
                 startup.abort();
@@ -199,122 +222,184 @@ impl Node {
                 return Err(error.into());
             }
         };
-        let mut client =
-            proto::agent_control_client::AgentControlClient::connect(control_address.clone())
-                .await?;
-        let response = client
-            .get_snapshot(authorized(proto::ReplicaSnapshotRequest {
-                protocol_version: ORDINARY_ACTION_FORMAT,
-                resource_uid: resource.to_string(),
-                target: Some(identity.clone().into()),
-                expected_process_session_id: String::new(),
-            }))
-            .await?
-            .into_inner();
-        let ReplicaAgentQueryResult::Initialized(snapshot) =
-            serde_json::from_slice(&response.canonical_json)?
-        else {
-            return Err("initialized ordinary snapshot required".into());
+        let report = match report_at(&control_address, &resource, &identity).await {
+            Ok(report) => report,
+            Err(error) => {
+                running.shutdown();
+                let _ = tokio::time::timeout(RPC_BOUND, running.wait()).await;
+                let _ = tokio::time::timeout(RPC_BOUND, service.shutdown_and_drain()).await;
+                return Err(error);
+            }
         };
-        let session = snapshot.process_session_id;
+        assert_eq!(report.replica, identity);
         Ok(Self {
             running,
             service,
             identity,
-            resource,
-            control_address,
-            session,
+            storage: report.storage_incarnation,
+            history: report.history,
             revision: 0,
+            control_address,
+            session: report.process_session_id,
         })
     }
 
-    async fn snapshot(&self) -> TestResult<ReplicaAgentSnapshot> {
-        let mut client =
-            proto::agent_control_client::AgentControlClient::connect(self.control_address.clone())
-                .await?;
-        let response = client
-            .get_snapshot(authorized(proto::ReplicaSnapshotRequest {
-                protocol_version: ORDINARY_ACTION_FORMAT,
-                resource_uid: self.resource.to_string(),
-                target: Some(self.identity.clone().into()),
-                expected_process_session_id: self.session.to_string(),
-            }))
-            .await?
-            .into_inner();
-        let ReplicaAgentQueryResult::Initialized(snapshot) =
-            serde_json::from_slice(&response.canonical_json)?
-        else {
-            return Err("initialized ordinary snapshot required".into());
-        };
-        Ok(*snapshot)
+    async fn report(&self) -> TestResult<PublicV1AgentReport> {
+        report_at(
+            &self.control_address,
+            &self.history.resource_uid,
+            &self.identity,
+        )
+        .await
     }
 
-    async fn goal(
+    async fn command(
         &mut self,
-        configuration: ReplicaConfigurationScope,
-        desired: ReplicaGoalKind,
-    ) -> TestResult<ReplicaGoal> {
-        let snapshot = self.snapshot().await?;
-        self.revision += 1;
-        let goal = ReplicaGoal {
-            format: ORDINARY_ACTION_FORMAT,
-            identity: snapshot.identity,
-            operation_id: OperationId::new(format!(
-                "ordinary-{}-{}",
-                self.identity.replica_id, self.revision
-            )),
-            revision: self.revision,
-            scope: ReplicaScope {
-                history: snapshot.history,
-                storage: snapshot.storage,
-                process_session_id: self.session.clone(),
-                creation_id: snapshot.creation_id,
-                epoch: configuration.current.epoch,
-                configuration,
-            },
-            desired,
-        };
-        let mut client =
-            proto::agent_control_client::AgentControlClient::connect(self.control_address.clone())
-                .await?;
-        client
-            .submit_goal(authorized(proto::ReplicaGoalRequest {
-                protocol_version: ORDINARY_ACTION_FORMAT,
-                canonical_json: serde_json::to_vec(&goal)?,
-            }))
-            .await?;
-        tokio::time::timeout(BOUND, async {
-            loop {
-                if let Some(observation) = self
-                    .snapshot()
-                    .await?
-                    .goals
-                    .iter()
-                    .find(|observation| observation.goal == goal)
-                {
-                    match &observation.status {
-                        ReplicaGoalStatus::Achieved => {
-                            return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
-                        }
-                        ReplicaGoalStatus::Pending => {}
-                        status => return Err(format!("ordinary goal failed: {status:?}").into()),
-                    }
-                }
-                tokio::task::yield_now().await;
+        program: PublicOperationProgram,
+    ) -> TestResult<(PublicV1OperationCommand, PublicV1AgentReport)> {
+        let (id, class) = match &program {
+            PublicOperationProgram::Build(build) => (
+                build.attempt.clone(),
+                PublicOperationClass::Build {
+                    target: build.replica.replica_id,
+                },
+            ),
+            _ => {
+                self.revision += 1;
+                (
+                    OperationId::new(format!(
+                        "{}-{}-{}",
+                        self.identity.replica_id, self.session, self.revision
+                    )),
+                    if matches!(program, PublicOperationProgram::Close) {
+                        PublicOperationClass::Close
+                    } else {
+                        PublicOperationClass::Authority
+                    },
+                )
             }
+        };
+        let operation = PublicV1OperationCommand {
+            target: self.identity.clone(),
+            intent: PublicOperationIntent {
+                identity: PublicV1Identity::new(1),
+                operation_id: id,
+                revision: self.revision,
+                process_session_id: self.session.clone(),
+                class,
+                input_digest: program.digest(),
+                replay_disposition: program.replay_disposition(),
+                lifecycle: None,
+                program: Some(program),
+            },
+        };
+        let report = tokio::time::timeout(RPC_BOUND, async {
+            let mut client = proto::agent_control_client::AgentControlClient::connect(
+                self.control_address.clone(),
+            )
+            .await?;
+            let response = client
+                .execute(authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: self.history.resource_uid.to_string(),
+                    target: Some(self.identity.clone().into()),
+                    expected_process_session_id: self.session.to_string(),
+                    command: Some(proto::execute_command_request::Command::PublicV1Operation(
+                        convert::public_v1_operation_command_to_proto(&operation)?,
+                    )),
+                }))
+                .await?
+                .into_inner();
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                convert::normalize_public_v1_agent_status_report(
+                    response
+                        .observation
+                        .ok_or("operation response omitted observation")?,
+                )?,
+            )
         })
         .await??;
-        Ok(goal)
+        let completion = report
+            .completed_operations
+            .iter()
+            .find(|completion| {
+                completion.operation_id == operation.intent.operation_id
+                    && completion.revision == operation.intent.revision
+                    && completion.process_session_id == self.session
+                    && completion.input_digest == operation.intent.input_digest
+            })
+            .ok_or("operation response omitted exact completion")?;
+        if completion.result != PublicV1OperationResult::Succeeded {
+            return Err(format!("public operation failed: {completion:?}").into());
+        }
+        Ok((operation, report))
     }
 
-    async fn close(mut self, configuration: ReplicaConfigurationScope) -> TestResult {
-        let closed = self.goal(configuration, ReplicaGoalKind::Close).await;
+    async fn open(&mut self, role: ReplicaRole, epoch: Epoch) -> TestResult {
+        self.command(PublicOperationProgram::Open {
+            replica: self.identity.clone(),
+            existing: false,
+        })
+        .await?;
+        self.command(PublicOperationProgram::Role { epoch, role })
+            .await?;
+        if role == ReplicaRole::Primary {
+            self.command(PublicOperationProgram::Epoch { epoch })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn install_authority(&self, authority: PublicInboundBuildAuthority) -> TestResult {
+        tokio::time::timeout(RPC_BOUND, async {
+            let mut client = proto::replica_peer_client::ReplicaPeerClient::connect(
+                self.control_address.clone(),
+            )
+            .await?;
+            client
+                .execute(authorized(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_runtime::protocol::PROTOCOL_VERSION,
+                    resource_uid: self.history.resource_uid.to_string(),
+                    target: Some(self.identity.clone().into()),
+                    expected_process_session_id: self.session.to_string(),
+                    command: Some(proto::execute_command_request::Command::PublicV1History(
+                        convert::public_v1_history_command_to_proto(
+                            &PublicV1HistoryCommand::InstallInboundBuildAuthority {
+                                authority: Box::new(authority),
+                            },
+                        )?,
+                    )),
+                }))
+                .await?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn close(mut self) -> TestResult {
+        let closed = self.command(PublicOperationProgram::Close).await;
         self.running.shutdown();
-        let waited = tokio::time::timeout(BOUND, self.running.wait()).await;
-        let drained = tokio::time::timeout(BOUND, self.service.shutdown_and_drain()).await;
-        closed?;
-        waited??;
-        drained??;
+        let waited = tokio::time::timeout(RPC_BOUND, self.running.wait()).await;
+        let drained = tokio::time::timeout(RPC_BOUND, self.service.shutdown_and_drain()).await;
+        let errors: Vec<_> = [
+            closed
+                .map(|_| ())
+                .map_err(|error| format!("public Close: {error}")),
+            waited
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()))
+                .map_err(|error| format!("RunningReplica::wait: {error}")),
+            drained
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()))
+                .map_err(|error| format!("shutdown_and_drain: {error}")),
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect();
+        if !errors.is_empty() {
+            return Err(errors.join("; ").into());
+        }
         Ok(())
     }
 }
@@ -322,8 +407,9 @@ impl Node {
 #[tokio::test]
 async fn public_build_consumes_target_context_and_installs_nonempty_snapshot() {
     let root = tempfile::tempdir().unwrap();
-    let target_application = root.path().join("target/application");
-    let resolver = Arc::new(Resolver::default());
+    let source_root = root.path().join("source");
+    let target_root = root.path().join("target");
+    let target_application = target_root.join("application");
     let target_context = vec![
         Bytes::from_static(b"target/context"),
         Bytes::new(),
@@ -339,101 +425,223 @@ async fn public_build_consumes_target_context_and_installs_nonempty_snapshot() {
         Bytes::from_static(b"application/committed-second"),
     ];
     let mut source = Node::start(
-        &root.path().join("source"),
+        &source_root,
         1,
-        resolver.clone(),
+        1,
         source_context.clone(),
         target_context.clone(),
     )
     .await
     .unwrap();
-    let mut target = Node::start(
-        &root.path().join("target"),
-        2,
-        resolver,
-        target_context.clone(),
-        Vec::new(),
-    )
-    .await
-    .unwrap();
-    let current = ConfigurationDescriptor::new(
-        Epoch::new(0, 1),
-        source.identity.replica_id,
-        vec![ConfigurationMember {
-            identity: source.identity.clone(),
-            role: ReplicaRole::Primary,
-        }],
-        1,
-    );
-    let configuration = ReplicaConfigurationScope {
-        current: current.clone(),
-        previous: None,
-        replicas: Vec::new(),
+    let mut target = match Node::start(&target_root, 2, 2, target_context.clone(), Vec::new()).await
+    {
+        Ok(target) => target,
+        Err(error) => {
+            let cleanup = source.close().await;
+            panic!("target startup failed: {error}; source cleanup: {cleanup:?}");
+        }
     };
     let mut copied_snapshot = None;
-    let outcome = std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(90), async {
-        source.goal(configuration.clone(), ReplicaGoalKind::Prepare { role: ReplicaRole::Primary }).await?;
-        let before_access = source.snapshot().await?;
-        assert_ne!(before_access.write_status, AccessStatus::Granted);
-        assert!(source.service.begin_write(Bytes::from_static(b"forbidden-before-access")).await.is_err());
-        source.goal(configuration.clone(), ReplicaGoalKind::Reconfigure { role: ReplicaRole::Primary, catch_up: Some(PublicCatchUpMode::WriteQuorum) }).await?;
-        let mut committed = 0;
-        for value in &expected_values {
-            let write = source.service.begin_write(value.clone()).await?;
-            let assigned = write.lsn;
-            committed = write.wait().await?;
-            assert_eq!(committed, assigned);
-        }
-        assert!(committed > 0);
-        assert_eq!(source.service.values().await?, expected_values);
-        target.goal(configuration.clone(), ReplicaGoalKind::Prepare { role: ReplicaRole::IdleSecondary }).await?;
-        assert_eq!(ExternalService::read_persisted_snapshot(&target_application)?, PersistedSnapshot { committed_lsn: 0, values: Vec::new() });
-        assert_eq!(target.service.copy_context_observations(), CopyContextObservations::default());
-        let source_publication = source.snapshot().await?.publication.unwrap();
-        let target_publication = target.snapshot().await?.publication.unwrap();
-        assert_eq!(source_publication.stage, ReplicaPublicationStage::AchievedScope);
-        assert_eq!(target_publication.stage, ReplicaPublicationStage::AchievedScope);
-        let remote = RemoteReplicaSelection {
-            source: source_publication, target: target_publication,
-            target_control_address: target.control_address.clone(), generation: 1,
-        };
-        let build = source.goal(configuration.clone(), ReplicaGoalKind::Build { remote: Box::new(remote.clone()) }).await?;
-        let ready = source.snapshot().await?;
-        assert!(ready.goals.iter().any(|entry| entry.goal == build && entry.status == ReplicaGoalStatus::Achieved));
-        assert!(ready.remote_operations.iter().any(|entry| entry.operation_id == build.operation_id
-            && entry.selection == remote && entry.state == RemoteReplicaState::Ready && !entry.accepted));
-        assert_eq!(ready.publication.unwrap().scope.configuration.current, current);
-        assert!(!current.members.iter().any(|member| member.identity == target.identity));
-        assert_eq!(source.service.copy_context_observations(), CopyContextObservations {
-            context_acquisitions: 0,
-            copy_state_acquisitions: vec![CopyStateObservation { up_to: committed, items: target_context.clone(), reached_eof: true }],
-        });
-        assert_ne!(target_context, source_context);
-        assert_eq!(target.service.copy_context_observations(), CopyContextObservations { context_acquisitions: 1, copy_state_acquisitions: Vec::new() });
-        let snapshot = ExternalService::read_persisted_snapshot(&target_application)?;
-        assert_eq!(snapshot, PersistedSnapshot { committed_lsn: committed, values: expected_values.clone() });
-        assert_ne!(snapshot.values, target_context);
-        let idle = target.snapshot().await?;
-        assert_eq!(idle.publication.unwrap().role, ReplicaRole::IdleSecondary);
-        assert_ne!(idle.read_status, AccessStatus::Granted);
-        assert_ne!(idle.write_status, AccessStatus::Granted);
-        assert!(matches!(target.service.values().await, Err(kuberic_runtime::RuntimeError::ReadClosed(_))));
-        assert!(target.service.begin_write(Bytes::from_static(b"forbidden-idle")).await.is_err());
-        copied_snapshot = Some(snapshot);
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-    })).catch_unwind().await;
-    let (source_closed, target_closed) = tokio::join!(
-        source.close(configuration.clone()),
-        target.close(configuration)
+    let outcome =
+        std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(90), async {
+            let epoch = Epoch::new(0, 1);
+            source.open(ReplicaRole::Primary, epoch).await?;
+            let current = ConfigurationDescriptor::new(
+                epoch,
+                source.identity.replica_id,
+                vec![ConfigurationMember {
+                    identity: source.identity.clone(),
+                    role: ReplicaRole::Primary,
+                }],
+                1,
+            );
+            source
+                .command(PublicOperationProgram::Configuration(PublicConfiguration {
+                    current: current.clone(),
+                    previous: None,
+                    replicas: Vec::new(),
+                }))
+                .await?;
+            let mut committed = 0;
+            for value in &expected_values {
+                let write = source.service.begin_write(value.clone()).await?;
+                let assigned = write.lsn;
+                committed = write.wait().await?;
+                assert_eq!(committed, assigned);
+            }
+            assert!(committed > 0);
+            assert_eq!(source.service.values().await?, expected_values);
+            target.open(ReplicaRole::IdleSecondary, epoch).await?;
+            assert_eq!(
+                ExternalService::read_persisted_snapshot(&target_application)?,
+                PersistedSnapshot {
+                    committed_lsn: 0,
+                    values: Vec::new()
+                },
+            );
+            assert_eq!(
+                target.service.copy_context_observations(),
+                CopyContextObservations::default()
+            );
+            let source_report = source.report().await?;
+            let target_report = target.report().await?;
+            assert_eq!(source_report.history, target_report.history);
+            assert_eq!(source_report.progress.current(), Some(committed));
+            assert_eq!(target_report.role, ReplicaRole::IdleSecondary);
+            let source_address = source_report
+                .replication_address
+                .ok_or("source endpoint missing")?;
+            let target_address = target_report
+                .replication_address
+                .ok_or("target endpoint missing")?;
+            let attempt = OperationId::new(format!("target-context-build-{}", target.session));
+            let build = PublicBuildInput {
+                attempt: attempt.clone(),
+                epoch,
+                current_configuration_id: Some(current.configuration_id.clone()),
+                replica: target.identity.clone(),
+                target_storage: target.storage.clone(),
+                process_session_id: target.session.clone(),
+                source_address: source_address.clone(),
+                replication_address: target_address.clone(),
+                history: Some(source.history.clone()),
+            };
+            let authority = PublicInboundBuildAuthority {
+                operation_id: attempt.clone(),
+                operation_revision: source.revision,
+                attempt: PublicBuildAttemptReference {
+                    resource_uid: source.history.resource_uid.clone(),
+                    epoch,
+                    build_id: attempt.clone(),
+                    source: source.identity.clone(),
+                    source_storage: source.storage.clone(),
+                    source_session: source.session.clone(),
+                    target: target.identity.clone(),
+                    target_storage: target.storage.clone(),
+                    target_session: target.session.clone(),
+                },
+                history: source.history.clone(),
+                current_configuration_id: current.configuration_id.clone(),
+                source_address,
+                target_address,
+            };
+            target.install_authority(authority.clone()).await?;
+            let (operation, report) = source
+                .command(PublicOperationProgram::Build(build.clone()))
+                .await?;
+            let completions: Vec<_> = report
+                .completed_operations
+                .iter()
+                .filter(|completion| completion.operation_id == attempt)
+                .collect();
+            assert_eq!(
+                completions,
+                [&PublicV1OperationCompletion {
+                    operation_id: authority.operation_id.clone(),
+                    revision: authority.operation_revision,
+                    call_kind: PublicV1CallKind::Build,
+                    process_session_id: authority.attempt.source_session.clone(),
+                    input_digest: operation.intent.input_digest.clone(),
+                    replay_disposition: operation.intent.replay_disposition,
+                    history: authority.history.clone(),
+                    storage_incarnation: authority.attempt.source_storage.clone(),
+                    previous_configuration_id: None,
+                    current_configuration_id: Some(authority.current_configuration_id.clone()),
+                    catch_up_mode: None,
+                    catch_up_specific_quorum: None,
+                    result: PublicV1OperationResult::Succeeded,
+                }]
+            );
+            assert_eq!(
+                report.remote_builds,
+                [PublicV1RemoteBuildObservation {
+                    operation_id: attempt,
+                    revision: authority.operation_revision,
+                    build,
+                    state: PublicV1RemoteBuildState::Ready,
+                }]
+            );
+            println!("observed Build completions: {completions:?}");
+            println!("observed remote Builds: {:?}", report.remote_builds);
+            assert_eq!(
+                report.configuration.as_ref().unwrap().voting.current,
+                current
+            );
+            assert!(
+                current
+                    .members
+                    .iter()
+                    .all(|member| member.identity != target.identity)
+            );
+            assert_eq!(
+                source.service.copy_context_observations(),
+                CopyContextObservations {
+                    context_acquisitions: 0,
+                    copy_state_acquisitions: vec![CopyStateObservation {
+                        up_to: committed,
+                        items: target_context.clone(),
+                        reached_eof: true,
+                    }],
+                }
+            );
+            assert_ne!(target_context, source_context);
+            assert_eq!(
+                target.service.copy_context_observations(),
+                CopyContextObservations {
+                    context_acquisitions: 1,
+                    copy_state_acquisitions: Vec::new(),
+                }
+            );
+            println!(
+                "observed source context: {:?}; target context: {:?}",
+                source.service.copy_context_observations(),
+                target.service.copy_context_observations()
+            );
+            let snapshot = ExternalService::read_persisted_snapshot(&target_application)?;
+            assert_eq!(
+                snapshot,
+                PersistedSnapshot {
+                    committed_lsn: committed,
+                    values: expected_values.clone(),
+                }
+            );
+            assert_ne!(snapshot.values, target_context);
+            println!("checked target snapshot before shutdown: {snapshot:?}");
+            let idle = target.report().await?;
+            assert_eq!(idle.role, ReplicaRole::IdleSecondary);
+            assert_ne!(idle.read_status, AccessStatus::Granted);
+            assert!(matches!(
+                target.service.values().await,
+                Err(kuberic_runtime::RuntimeError::ReadClosed(_))
+            ));
+            copied_snapshot = Some(snapshot);
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        }))
+        .catch_unwind()
+        .await;
+    let source_closed = source.close().await;
+    let target_closed = target.close().await;
+    println!(
+        "source Close/wait/drain: {source_closed:?}; target Close/wait/drain: {target_closed:?}"
     );
-    assert!(source_closed.is_ok(), "{source_closed:?}");
-    assert!(target_closed.is_ok(), "{target_closed:?}");
+    assert!(
+        source_closed.is_ok(),
+        "source Close/wait/drain failed: {source_closed:?}"
+    );
+    assert!(
+        target_closed.is_ok(),
+        "target Close/wait/drain failed: {target_closed:?}"
+    );
     match outcome {
-        Ok(result) => result.expect("bounded ordinary external copy").unwrap(),
+        Ok(result) => result
+            .expect("bounded public copy-context journey")
+            .unwrap(),
         Err(panic) => std::panic::resume_unwind(panic),
     }
+    let persisted = ExternalService::read_persisted_snapshot(&target_application).unwrap();
+    println!("checked target snapshot after shutdown: {persisted:?}");
     assert_eq!(
-        ExternalService::read_persisted_snapshot(&target_application).unwrap(),
-        copied_snapshot.unwrap()
+        persisted,
+        copied_snapshot.expect("successful Build observed the checked target snapshot"),
     );
 }

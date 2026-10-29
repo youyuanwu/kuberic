@@ -181,6 +181,52 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn install_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with Public V1 replacement authority".into(),
+            )
+        })?;
+        if !preview.binding.identity.is_public_v1()
+            || authority.attempt.target != self.store.load_state().await?.identity.local_identity
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "inbound build authority differs from the replacement target".into(),
+            ));
+        }
+        self.runtime
+            .install_replacement_inbound_build_authority(authority)
+            .await
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
+    pub async fn revoke_public_v1_inbound_build_authority(
+        &self,
+        authority: &crate::protocol::public_operations::PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        let preview = self.replacement.as_ref().ok_or_else(|| {
+            crate::host::HostError::CommandRejected(
+                "replica was not constructed with Public V1 replacement authority".into(),
+            )
+        })?;
+        if !preview.binding.identity.is_public_v1()
+            || authority.attempt.target != self.store.load_state().await?.identity.local_identity
+        {
+            return Err(crate::host::HostError::IdentityMismatch(
+                "inbound build authority differs from the replacement target".into(),
+            ));
+        }
+        self.runtime
+            .revoke_replacement_inbound_build_authority(authority)
+            .await
+            .map_err(|error| crate::host::HostError::CommandRejected(error.to_string()))
+    }
+
+    #[cfg(feature = "testing")]
     pub fn set_public_operation_cut(&self, cut: Option<Arc<crate::testing::PublicOperationCut>>) {
         self.runtime.set_public_operation_cut(cut);
     }
@@ -197,10 +243,10 @@ impl ReplicaHandle {
         })?;
         let handle = self.clone();
         let (completed, result) = tokio::sync::oneshot::channel();
-        preview.registry.try_own_control_task(async move {
+        preview.registry.own_control_task(async move {
             let outcome = handle.execute_public_v1_owned(intent).await;
             let _ = completed.send(outcome);
-        })?;
+        });
         result.await.map_err(|error| {
             crate::host::HostError::CommandRejected(format!(
                 "owned public testing execution stopped before replying: {error}"
@@ -388,6 +434,18 @@ impl ReplicaHandle {
     }
 
     #[cfg(feature = "testing")]
+    pub async fn public_v1_inbound_build_authority(
+        &self,
+    ) -> Result<Option<crate::protocol::public_operations::PublicInboundBuildAuthority>> {
+        Ok(self
+            .store
+            .load_state()
+            .await?
+            .public_v1_operation_state
+            .and_then(|state| state.current_inbound_build_authority))
+    }
+
+    #[cfg(feature = "testing")]
     pub async fn public_v1_operation_is_contained(
         &self,
         operation_id: &crate::protocol::types::OperationId,
@@ -532,6 +590,13 @@ impl ReplicaHandle {
     #[cfg(feature = "testing")]
     pub fn public_v1_provider_writer_count(&self) -> usize {
         self.runtime.provider_writer_lease_count()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn public_v1_raw_retained_task_cardinality(&self) -> Result<(usize, usize)> {
+        self.runtime
+            .replacement_raw_retained_task_cardinality()
+            .map_err(Into::into)
     }
 }
 
@@ -718,12 +783,19 @@ where
         let completion = tokio::spawn(async move {
             let first = tokio::select! {
                     _ = async { stopping.wait_for(|stopped| *stopped).await.map(|_| ()) } => {
+                        // Custom descendants may be the reason a control RPC
+                        // cannot finish. Drain their owner before waiting for
+                        // the graceful control-server acknowledgement.
                         // Fence creation registration even if an in-flight Open
                         // has not returned its bundle yet. Its failed-registration
                         // path owns cleanup; it cannot publish a late creation.
                         supervisor_runtime.abort();
                         let drain = drain_runtime(&supervisor_runtime).await;
                         let control = finish_control(&mut control_task).await;
+                        let late = tokio::time::timeout(AGENT_SHUTDOWN_TIMEOUT, supervisor_runtime.drain_pending_control())
+                            .await.map_err(|_| crate::host::HostError::CommandRejected("late creation control drain timed out".into()))
+                            .and_then(|result| result.map_err(crate::host::HostError::Runtime));
+                        let drain = with_shutdown_error(drain, late, "late creation control drain");
                         return with_shutdown_error(control, drain, "replicator drain");
                     }
                     result = &mut control_task => result,
@@ -819,7 +891,6 @@ where
             self.config.replication_address,
         ));
         runtime.configure_native_transport(Arc::from(self.config.bearer_token.as_str()))?;
-        runtime.configure_discovery_resolver(self._resolver.clone())?;
         let agent = AgentService::new(
             store.clone(),
             runtime.clone(),

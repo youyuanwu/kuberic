@@ -50,53 +50,6 @@ impl Kind {
 
 type Key = (String, Kind, String);
 
-fn prune_structural(value: &mut Value, schema: &Value) {
-    if schema["x-kubernetes-preserve-unknown-fields"] == true {
-        return;
-    }
-    match value {
-        Value::Object(fields) if schema["type"] == "object" => {
-            let properties = schema.get("properties").and_then(Value::as_object);
-            fields.retain(|name, child| {
-                if let Some(property) = properties.and_then(|properties| properties.get(name)) {
-                    prune_structural(child, property);
-                    true
-                } else {
-                    match schema.get("additionalProperties") {
-                        Some(Value::Bool(true)) => true,
-                        Some(property @ Value::Object(_)) => {
-                            prune_structural(child, property);
-                            true
-                        }
-                        _ => false,
-                    }
-                }
-            });
-        }
-        Value::Array(items) => {
-            if let Some(item_schema) = schema.get("items") {
-                for item in items {
-                    prune_structural(item, item_schema);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn prune_kuberic_status(value: &mut Value) {
-    static CRD: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| {
-        serde_json::from_str(include_str!("../../deploy/crd.json"))
-            .expect("checked-in structural CRD")
-    });
-    if let Some(status) = value.get_mut("status") {
-        prune_structural(
-            status,
-            &CRD["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"],
-        );
-    }
-}
-
 #[derive(Default)]
 struct Store {
     objects: BTreeMap<Key, Value>,
@@ -127,7 +80,6 @@ struct ArmedBarrier {
     call_kind: Option<&'static str>,
     operation_fragment: Option<String>,
     matcher: Option<super::faults::Barrier>,
-    goal: Arc<Mutex<Option<kuberic_runtime::protocol::public_operations::ReplicaGoal>>>,
 }
 
 /// Both barriers publish the persisted object before waiting, without a store lock.
@@ -136,16 +88,11 @@ struct ArmedBarrier {
 pub(super) struct StatusBarrier {
     entered: oneshot::Receiver<Value>,
     release: Option<oneshot::Sender<()>>,
-    goal: Arc<Mutex<Option<kuberic_runtime::protocol::public_operations::ReplicaGoal>>>,
 }
 
 impl StatusBarrier {
     pub(super) async fn entered(&mut self) -> anyhow::Result<Value> {
         Ok((&mut self.entered).await?)
-    }
-
-    pub(super) fn goal(&self) -> Option<kuberic_runtime::protocol::public_operations::ReplicaGoal> {
-        self.goal.lock().unwrap().clone()
     }
 
     pub(super) fn release(mut self) {
@@ -312,8 +259,7 @@ impl ApiServer {
         self.arm_matching(name, false, None, None)
     }
 
-    /// Targets the next status write that records an actual ordinary outcome or
-    /// increases the legacy accepted completion count.
+    /// Targets the next status write that increases accepted completion count.
     /// Instead of accepting its status, bump only the stored RV and return 409
     /// after release. The same submitted RV will genuinely remain stale on retry.
     pub(super) fn arm_completion_conflict(&self, name: &str) -> anyhow::Result<StatusBarrier> {
@@ -342,7 +288,6 @@ impl ApiServer {
         anyhow::ensure!(slot.is_none(), "status barrier is already armed");
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
-        let goal = Arc::new(Mutex::new(None));
         *slot = Some(ArmedBarrier {
             key,
             uid,
@@ -351,12 +296,10 @@ impl ApiServer {
             call_kind,
             operation_fragment: operation_fragment.map(str::to_owned),
             matcher: None,
-            goal: goal.clone(),
         });
         Ok(StatusBarrier {
             entered,
             release: Some(release),
-            goal,
         })
     }
 
@@ -693,14 +636,8 @@ fn execute(
             if route.status {
                 let completion = completion_count(&incoming) > completion_count(&old);
                 if route.kind == Kind::KubericSet
-                    && ((completion && barrier_matches(&store.completion_conflict, &key, &old))
-                        || ordinary_barrier_matches(
-                            &store.completion_conflict,
-                            &key,
-                            &old,
-                            &incoming,
-                            true,
-                        ))
+                    && completion
+                    && barrier_matches(&store.completion_conflict, &key, &old)
                 {
                     let mut bumped = old;
                     bumped["metadata"]["resourceVersion"] = json!(store.rv());
@@ -711,21 +648,13 @@ fn execute(
                 }
                 let mut next = old.clone();
                 copy_field(&incoming, &mut next, "status");
-                if route.kind == Kind::KubericSet {
-                    prune_kuberic_status(&mut next);
-                }
                 next["metadata"]["resourceVersion"] = json!(store.rv());
                 let newly_pending = !next["status"]["publicV1Operation"].is_null()
                     && next["status"]["publicV1Operation"] != old["status"]["publicV1Operation"];
                 let barrier = if route.kind == Kind::KubericSet
-                    && ((newly_pending && barrier_matches(&store.operation_barrier, &key, &next))
-                        || ordinary_barrier_matches(
-                            &store.operation_barrier,
-                            &key,
-                            &old,
-                            &next,
-                            false,
-                        )) {
+                    && newly_pending
+                    && barrier_matches(&store.operation_barrier, &key, &next)
+                {
                     store.operation_barrier.take()
                 } else {
                     None
@@ -897,7 +826,6 @@ fn is_deleting(object: &Value) -> bool {
 fn barrier_matches(barrier: &Option<ArmedBarrier>, key: &Key, object: &Value) -> bool {
     barrier.as_ref().is_some_and(|barrier| {
         &barrier.key == key
-            && barrier.matcher.is_none()
             && object["metadata"]["uid"] == barrier.uid
             && barrier.call_kind.is_none_or(|kind| {
                 object["status"]["publicV1Transition"]["callKind"].as_str() == Some(kind)
@@ -910,6 +838,10 @@ fn barrier_matches(barrier: &Option<ArmedBarrier>, key: &Key, object: &Value) ->
                         .as_str()
                         .is_some_and(|id| id.contains(fragment))
                 })
+            && barrier
+                .matcher
+                .as_ref()
+                .is_none_or(|matcher| matcher.matches(object))
     })
 }
 
@@ -917,53 +849,6 @@ fn completion_count(object: &Value) -> u64 {
     object["status"]["publicV1Authority"]["completedOperationCount"]
         .as_u64()
         .unwrap_or(0)
-}
-
-fn ordinary_barrier_matches(
-    barrier: &Option<ArmedBarrier>,
-    key: &Key,
-    old: &Value,
-    next: &Value,
-    completion: bool,
-) -> bool {
-    let Some(barrier) = barrier.as_ref().filter(|barrier| {
-        &barrier.key == key
-            && next["metadata"]["uid"] == barrier.uid
-            && barrier.call_kind.is_none()
-            && barrier.operation_fragment.is_none()
-    }) else {
-        return false;
-    };
-    let Some(entries) = next["status"]["replicaGoals"].as_array() else {
-        return false;
-    };
-    entries.iter().any(|entry| {
-        let previous = old["status"]["replicaGoals"]
-            .as_array()
-            .and_then(|entries| entries.iter().find(|old| old["goal"] == entry["goal"]));
-        let changed = if completion {
-            !entry["outcome"].is_null() && previous.is_some_and(|old| old["outcome"].is_null())
-        } else {
-            previous.is_none() && entry["outcome"].is_null()
-        };
-        if !changed {
-            return false;
-        }
-        let Ok(entry) = serde_json::from_value::<crate::crd::RetainedReplicaGoal>(entry.clone())
-        else {
-            return false;
-        };
-        if entry.validate().is_err()
-            || barrier.matcher.as_ref().is_some_and(|matcher| {
-                !serde_json::from_value::<crate::crd::KubericSet>(next.clone())
-                    .is_ok_and(|set| matcher.matches_goal(&entry, &set))
-            })
-        {
-            return false;
-        }
-        *barrier.goal.lock().unwrap() = Some(entry.goal);
-        true
-    })
 }
 
 fn apply_patch(
@@ -1035,7 +920,7 @@ mod tests {
         let sets: Api<KubericSet> = Api::default_namespaced(server.client());
         let object = serde_json::from_value(json!({
             "apiVersion": "operator.kuberic.io/v1alpha1", "kind": "KubericSet",
-            "metadata": {"name": "demo"}, "spec": {"hostingFormat": kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT, "replicas": 3, "image": "kvstore2"}
+            "metadata": {"name": "demo"}, "spec": {"replicas": 3, "image": "kvstore2"}
         }))
         .unwrap();
         serde_json::to_value(sets.create(&PostParams::default(), &object).await.unwrap()).unwrap()

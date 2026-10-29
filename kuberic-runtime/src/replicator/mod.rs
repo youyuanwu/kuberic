@@ -70,7 +70,11 @@ pub(crate) fn validate_public_v1_factories(manifest: PublicV1FactoryManifest) ->
     }
     Ok(())
 }
+mod coordinator;
+mod custom;
 pub mod stream;
+pub use custom::CallbackOwnership;
+pub use custom::CustomReplicatorControl;
 #[cfg(feature = "testing")]
 mod testing_transport;
 #[cfg(feature = "testing")]
@@ -89,15 +93,60 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use crate::capabilities::{ReplicatorCreationIdentity, RuntimeHostToken};
 use crate::protocol::types::{
-    AccessStatus, ConfigurationDescriptor, FaultType, LoadMetric, PartitionInformation,
-    ProcessSessionId, ReplicaIdentity, ReplicaRole, ReplicaStorageIncarnationContext,
+    AccessStatus, ConfigurationDescriptor, FaultType, LoadMetric, OperationId,
+    PartitionInformation, ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole,
+    ReplicaStorageIncarnationContext,
 };
 use async_trait::async_trait;
 
 use crate::application::{INVALID_LSN, Lsn, OperationData, StateProvider};
+use crate::host::store::PublicInboundBuildAdmission;
+use crate::protocol::public_operations::PublicInboundBuildAuthority;
 use crate::protocol::public_operations::PublicV1LifecycleBinding;
 use crate::protocol::public_operations::{DataLossReplay, PublicReplicaDescriptor};
 use crate::{Result, RuntimeError};
+
+#[async_trait]
+pub(crate) trait NativeRuntimeControl: Send + Sync {
+    fn callback_ownership(&self) -> CallbackOwnership;
+    fn observes_lifecycle(&self) -> bool;
+    fn build_authority_open(&self) -> bool;
+    fn inbound_build_live(&self, authority: &PublicInboundBuildAuthority) -> bool;
+    fn containment(&self) -> tokio::sync::watch::Receiver<bool>;
+    fn selected_epoch(&self) -> Option<crate::protocol::types::Epoch>;
+    fn idle_replicas(&self) -> Result<Vec<ReplicaId>>;
+    async fn configuration_idle_replicas(
+        &self,
+        _configuration: &crate::protocol::public_operations::PublicConfiguration,
+    ) -> Result<Vec<ReplicaId>> {
+        self.idle_replicas()
+    }
+
+    fn progress_query_readiness(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    #[cfg(feature = "testing")]
+    fn testing_tcp_binding(
+        &self,
+    ) -> Option<(
+        ReplicaIdentity,
+        ProcessSessionId,
+        ReplicatorCreationReservation,
+    )>;
+
+    async fn shutdown_and_drain(&self) -> Result<()>;
+    async fn install_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
+    async fn revoke_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
+
+    fn raw_retained_task_cardinality(&self) -> (usize, usize);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaSetQuorumMode {
@@ -110,6 +159,7 @@ pub enum ReplicaSetQuorumMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaInformation {
+    pub build_id: OperationId,
     pub identity: ReplicaIdentity,
     pub replication_address: String,
     pub process_session_id: ProcessSessionId,
@@ -129,12 +179,23 @@ pub struct ReplicaInformation {
 }
 
 impl ReplicaInformation {
-    pub fn new(identity: ReplicaIdentity, replication_address: String) -> Self {
-        Self::idle_build(identity, replication_address)
+    /// Compatibility constructor for an idle build target. New code should use
+    /// `idle_build` to make the invalid-progress choice explicit.
+    pub fn new(
+        build_id: OperationId,
+        identity: ReplicaIdentity,
+        replication_address: String,
+    ) -> Self {
+        Self::idle_build(build_id, identity, replication_address)
     }
 
-    pub fn idle_build(identity: ReplicaIdentity, replication_address: String) -> Self {
+    pub fn idle_build(
+        build_id: OperationId,
+        identity: ReplicaIdentity,
+        replication_address: String,
+    ) -> Self {
         Self {
+            build_id,
             identity,
             replication_address,
             process_session_id: ProcessSessionId::default(),
@@ -155,6 +216,7 @@ impl ReplicaInformation {
         must_catchup: bool,
     ) -> Result<Self> {
         let information = Self {
+            build_id: OperationId::default(),
             identity,
             replication_address,
             process_session_id,
@@ -194,6 +256,7 @@ impl ReplicaInformation {
 impl From<PublicReplicaDescriptor> for ReplicaInformation {
     fn from(replica: PublicReplicaDescriptor) -> Self {
         Self {
+            build_id: replica.build_id,
             identity: replica.identity,
             replication_address: replica.replication_address,
             process_session_id: replica.process_session_id,
@@ -270,6 +333,8 @@ struct ReplicatorCreation {
     capabilities: ReplicatorCapabilities,
     #[cfg(feature = "testing")]
     specific_quorum_suppressed: AtomicBool,
+    callback_containment: StdMutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    native_runtime_control: StdMutex<Option<Arc<dyn NativeRuntimeControl>>>,
     settings: StdMutex<Option<BoundReplicatorSettings>>,
     effective_address: OnceLock<String>,
     armed: AtomicBool,
@@ -293,6 +358,8 @@ impl ReplicatorCreation {
             capabilities,
             #[cfg(feature = "testing")]
             specific_quorum_suppressed: AtomicBool::new(false),
+            callback_containment: StdMutex::new(None),
+            native_runtime_control: StdMutex::new(None),
             settings: StdMutex::new(None),
             effective_address: OnceLock::new(),
             armed: AtomicBool::new(true),
@@ -493,12 +560,63 @@ impl ReplicatorAttachment {
         self.has_provider_writer
     }
 
+    pub(crate) fn callback_containment(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.creation
+            .callback_containment
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn native_runtime_control(
+        &self,
+        _token: RuntimeHostToken,
+    ) -> Option<Arc<dyn NativeRuntimeControl>> {
+        self.creation
+            .native_runtime_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     fn disarm(&self) {
         self.creation.armed.store(false, Ordering::Release);
     }
 }
 
 impl ReplicatorInterfaces {
+    /// Attaches the application's controller companion to this factory creation.
+    ///
+    /// This is a local host-authority adaptation, not an addition to the native
+    /// SF Replicator interfaces. The owner must fence and join its real native
+    /// work; it must not substitute proposed membership or invented progress.
+    pub fn with_custom_control(
+        self,
+        context: &ReplicatorFactoryContext,
+        control: Arc<dyn CustomReplicatorControl>,
+    ) -> Result<Self> {
+        context.claim_native_creation()?;
+        let reservation = context
+            .reservation
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        self.creation
+            .bind_identity(reservation.identity(RuntimeHostToken::new()))?;
+        let mut slot = self.creation.native_runtime_control.lock().unwrap();
+        if slot.is_some() {
+            return Err(RuntimeError::AuthorityNotAdmitted);
+        }
+        let owner: Arc<dyn NativeRuntimeControl> =
+            Arc::new(custom::control(context.clone(), control));
+        context
+            .access
+            .retain_creation_control(reservation, owner.clone())?;
+        *slot = Some(owner);
+        drop(slot);
+        Ok(self)
+    }
     pub(crate) fn with_effective_replication_address(self, address: String) -> Self {
         self.creation
             .effective_address
@@ -518,21 +636,34 @@ impl ReplicatorInterfaces {
         Ok(self)
     }
 
-    async fn failed_creation(
-        &self,
-        error: RuntimeError,
-        registration: &dyn ReplicatorRegistration,
-    ) -> RuntimeError {
-        if self.creation.armed.swap(false, Ordering::AcqRel) {
-            self.replicator.abort();
-        }
-        if let Err(cleanup) = self.replicator.close().await {
-            registration.record_creation_cleanup_failure(cleanup.to_string());
+    async fn failed_creation(&self, error: RuntimeError) -> RuntimeError {
+        self.replicator.abort();
+        let native = self
+            .creation
+            .native_runtime_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(native) = native
+            && let Err(cleanup) = native.shutdown_and_drain().await
+        {
             return RuntimeError::Application(format!(
-                "{error}; ordinary creation Close failed: {cleanup}"
+                "{error}; native creation cleanup failed: {cleanup}"
             ));
         }
         error
+    }
+
+    pub(crate) fn with_native_runtime_control(
+        self,
+        control: Arc<dyn NativeRuntimeControl>,
+    ) -> Self {
+        *self
+            .creation
+            .native_runtime_control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control);
+        self
     }
 
     pub fn secondary(
@@ -640,52 +771,9 @@ pub struct ReplicatorFactoryContext {
     public_v1_binding: PublicV1LifecycleBinding,
     public_v1_replication_address: std::net::SocketAddr,
     native_factory_started: Arc<AtomicBool>,
-    ordinary_contract: bool,
 }
 
 impl ReplicatorFactoryContext {
-    pub(crate) fn with_ordinary_contract(mut self, ordinary: bool) -> Self {
-        self.ordinary_contract = ordinary;
-        self
-    }
-
-    pub fn ordinary_hosting(&self) -> bool {
-        self.ordinary_contract
-    }
-
-    pub fn creation_id(&self) -> Result<crate::protocol::types::ReplicatorCreationId> {
-        Ok(self
-            .reservation
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?
-            .identity(RuntimeHostToken::new())
-            .to_public_id())
-    }
-
-    pub async fn local_publication(
-        &self,
-    ) -> Result<Option<crate::protocol::public_operations::ReplicaPublication>> {
-        self.access
-            .local_publication(self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?)
-            .await
-    }
-
-    pub async fn discover_peer(
-        &self,
-        query: &crate::protocol::public_operations::ReplicaDiscoveryQuery,
-    ) -> Result<Option<crate::protocol::public_operations::ReplicaPublication>> {
-        use crate::protocol::public_operations::ORDINARY_ACTION_FORMAT;
-        if query.format != ORDINARY_ACTION_FORMAT
-            || query.history.resource_uid != self.public_v1_binding.resource_uid
-        {
-            return Err(RuntimeError::AuthorityMismatch(
-                "incompatible discovery scope".into(),
-            ));
-        }
-        let credentials = self.access.native_credentials().await?;
-        let address = self.access.peer_control_endpoint(&query.replica)?;
-        crate::control::resolve_replica_publication(&address, &credentials, query).await
-    }
-
     #[doc(hidden)]
     pub(crate) fn new(
         _token: RuntimeHostToken,
@@ -703,7 +791,6 @@ impl ReplicatorFactoryContext {
             public_v1_binding,
             public_v1_replication_address,
             native_factory_started: Arc::new(AtomicBool::new(false)),
-            ordinary_contract: false,
         }
     }
 
@@ -762,6 +849,37 @@ impl ReplicatorFactoryContext {
         self.public_v1_replication_address
     }
 
+    pub(crate) async fn classify_replacement_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission> {
+        self.access
+            .classify_replacement_inbound_build_authority(authority)
+            .await
+    }
+
+    pub(crate) async fn install_replacement_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.access
+            .install_replacement_inbound_build_authority(authority)
+            .await
+    }
+
+    pub(crate) async fn revoke_exact_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.access
+            .revoke_exact_inbound_build_authority(authority)
+            .await
+    }
+
+    pub(crate) fn release_provider_writer(&self) {
+        self.access.release_provider_writer();
+    }
+
     pub(crate) async fn native_credentials(&self) -> Result<Arc<str>> {
         self.access.native_credentials().await
     }
@@ -774,6 +892,13 @@ impl ReplicatorFactoryContext {
         crate::host::native_transport::NativeEndpoint,
     )> {
         self.access.native_local_endpoint(address).await
+    }
+
+    pub(crate) async fn validate_native_binding(
+        &self,
+        binding: &crate::host::native_transport::NativeBinding,
+    ) -> Result<()> {
+        self.access.validate_native_binding(binding).await
     }
 
     pub(crate) fn native_write_status(&self) -> AccessStatus {
@@ -790,18 +915,64 @@ impl ReplicatorFactoryContext {
                 .observe_native_lifecycle(reservation, observation);
         }
     }
+
+    pub(crate) async fn native_outbound_build_authority(
+        &self,
+        build: &OperationId,
+    ) -> Result<PublicInboundBuildAuthority> {
+        self.access.native_outbound_build_authority(build).await
+    }
+
+    /// Resolves the host's exact, currently running source Build operation.
+    /// The returned value is data, not a bearer grant. Revalidate around native
+    /// effects and asynchronous boundaries using `validate_build_authority`.
+    pub async fn outbound_build_authority(
+        &self,
+        build: &OperationId,
+    ) -> Result<PublicInboundBuildAuthority> {
+        let authority = self.native_outbound_build_authority(build).await?;
+        self.validate_build_authority(&authority).await?;
+        Ok(authority)
+    }
+
+    /// Checks the exact live source operation or installed target ingress grant
+    /// against this registered creation, process, storage and history.
+    pub async fn validate_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
+        self.access
+            .validate_creation_build_authority(
+                self.reservation.ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                authority,
+                true,
+            )
+            .await
+    }
 }
 
 #[async_trait]
 #[doc(hidden)]
 pub(crate) trait PartitionAccessView: Send + Sync {
-    async fn local_publication(
+    async fn revoke_exact_inbound_build_authority(
         &self,
-        _reservation: ReplicatorCreationReservation,
-    ) -> Result<Option<crate::protocol::public_operations::ReplicaPublication>> {
+        _authority: &PublicInboundBuildAuthority,
+    ) -> Result<()> {
         Err(RuntimeError::AuthorityNotAdmitted)
     }
-    fn peer_control_endpoint(&self, _identity: &ReplicaIdentity) -> Result<String> {
+    fn retain_creation_control(
+        &self,
+        _reservation: ReplicatorCreationReservation,
+        _owner: Arc<dyn NativeRuntimeControl>,
+    ) -> Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+    async fn validate_creation_build_authority(
+        &self,
+        _reservation: ReplicatorCreationReservation,
+        _authority: &PublicInboundBuildAuthority,
+        _require_installed: bool,
+    ) -> Result<()> {
         Err(RuntimeError::AuthorityNotAdmitted)
     }
     fn native_write_admission(&self) -> Result<Arc<std::sync::Mutex<()>>> {
@@ -846,6 +1017,32 @@ pub(crate) trait PartitionAccessView: Send + Sync {
         Err(RuntimeError::AuthorityNotAdmitted)
     }
 
+    async fn validate_native_binding(
+        &self,
+        _binding: &crate::host::native_transport::NativeBinding,
+    ) -> Result<()> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    async fn native_outbound_build_authority(
+        &self,
+        _build: &OperationId,
+    ) -> Result<PublicInboundBuildAuthority> {
+        Err(RuntimeError::AuthorityNotAdmitted)
+    }
+
+    async fn classify_replacement_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<PublicInboundBuildAdmission>;
+
+    async fn install_replacement_inbound_build_authority(
+        &self,
+        authority: &PublicInboundBuildAuthority,
+    ) -> Result<()>;
+
+    fn release_provider_writer(&self);
+
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()>;
 
     async fn report_fault(&self, fault: FaultType) -> Result<()>;
@@ -881,8 +1078,6 @@ pub(crate) trait ReplicatorRegistration: Send + Sync {
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
 
-    fn record_creation_cleanup_failure(&self, error: String);
-
     async fn register_interfaces(
         &self,
         attachment: &ReplicatorAttachment,
@@ -900,13 +1095,6 @@ pub struct StatefulServicePartition {
 }
 
 impl StatefulServicePartition {
-    pub(crate) fn record_creation_cleanup_failure(&self, error: String) {
-        self.registration.record_creation_cleanup_failure(error);
-    }
-
-    pub fn ordinary_hosting(&self) -> bool {
-        self.context.ordinary_hosting()
-    }
     #[doc(hidden)]
     pub(crate) fn new(
         _token: RuntimeHostToken,
@@ -1002,9 +1190,7 @@ impl StatefulServicePartition {
             Ok(attachment) => attachment,
             Err(error) => {
                 self.registration.cancel_replicator_creation(reservation);
-                return Err(interfaces
-                    .failed_creation(error, self.registration.as_ref())
-                    .await);
+                return Err(interfaces.failed_creation(error).await);
             }
         };
         if let Err(error) = interfaces
@@ -1012,9 +1198,7 @@ impl StatefulServicePartition {
             .bind_settings(self.context.identity.clone(), settings)
         {
             self.registration.cancel_replicator_creation(reservation);
-            return Err(interfaces
-                .failed_creation(error, self.registration.as_ref())
-                .await);
+            return Err(interfaces.failed_creation(error).await);
         }
         if let Err(error) = self
             .registration
@@ -1022,14 +1206,19 @@ impl StatefulServicePartition {
             .await
         {
             self.registration.cancel_replicator_creation(reservation);
-            return Err(interfaces
-                .failed_creation(error, self.registration.as_ref())
-                .await);
+            return Err(interfaces.failed_creation(error).await);
         }
         attachment.disarm();
         #[cfg(feature = "testing")]
-        if let Some(route) = testing_route
-            .filter(|route| testing_transport::has_native_transport(route, reservation))
+        if let Some(control) = attachment.native_runtime_control(RuntimeHostToken::new())
+            && let Some(route) = testing_route.filter(|_| {
+                control.testing_tcp_binding()
+                    == Some((
+                        self.context.identity.clone(),
+                        self.context.process_session_id.clone(),
+                        reservation,
+                    ))
+            })
         {
             testing_transport::acknowledge(route, &interfaces.creation);
         }

@@ -37,8 +37,6 @@ pub const SCALE_UP_ALLOCATION_ANNOTATION: &str =
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetSpec {
-    #[schemars(range(min = 16, max = 16))]
-    pub hosting_format: u32,
     #[schemars(range(min = 1))]
     pub replicas: u32,
     #[schemars(length(min = 1))]
@@ -61,8 +59,6 @@ pub struct PlannedSwitchoverRequestSpec {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetStatus {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub replica_goals: Vec<RetainedReplicaGoal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_authority: Option<PublicV1AuthorityStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,85 +71,6 @@ pub struct KubericSetStatus {
     pub public_v1_transition: Option<PublicV1TransitionState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_v1_operation: Option<PublicV1OperationStatus>,
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RetainedReplicaGoal {
-    pub goal: kuberic_runtime::protocol::public_operations::ReplicaGoal,
-    pub digest: kuberic_runtime::protocol::public_operations::CanonicalOperationInputDigest,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<kuberic_runtime::protocol::public_operations::ReplicaGoalObservation>,
-}
-
-impl RetainedReplicaGoal {
-    pub fn new(
-        goal: kuberic_runtime::protocol::public_operations::ReplicaGoal,
-    ) -> Result<Self, String> {
-        goal.validate().map_err(str::to_owned)?;
-        Ok(Self {
-            digest: goal.intent().input_digest,
-            goal,
-            outcome: None,
-        })
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        use kuberic_runtime::protocol::public_operations::ReplicaGoalStatus;
-        self.goal.validate().map_err(str::to_owned)?;
-        if self.digest != self.goal.intent().input_digest
-            || self.outcome.as_ref().is_some_and(|outcome| {
-                outcome.goal != self.goal || matches!(outcome.status, ReplicaGoalStatus::Pending)
-            })
-        {
-            return Err("retained goal differs from its canonical digest or exact outcome".into());
-        }
-        Ok(())
-    }
-}
-
-impl KubericSet {
-    pub fn validate_ordinary_hosting(&self) -> Result<(), String> {
-        use kuberic_runtime::protocol::public_operations::ORDINARY_ACTION_FORMAT;
-        if self.spec.hosting_format != ORDINARY_ACTION_FORMAT {
-            return Err(
-                "incompatible KubericSet hosting format; fresh format 16 is required".into(),
-            );
-        }
-        let Some(status) = self.status.as_ref() else {
-            return Ok(());
-        };
-        if status.public_v1_operation.is_some()
-            || status.public_v1_transition.is_some()
-            || status.public_v1_session_renewal.is_some()
-            || status.public_v1_replacement.is_some()
-        {
-            return Err("legacy retained command/renewal/replacement state is incompatible with ordinary hosting".into());
-        }
-        status.validate_public_v1()?;
-        let mut ids = std::collections::BTreeSet::new();
-        let mut revisions = std::collections::BTreeSet::new();
-        if status.replica_goals.len() > 1024 {
-            return Err("retained controller goal budget exhausted".into());
-        }
-        for retained in &status.replica_goals {
-            retained.validate()?;
-            if Some(retained.goal.scope.history.resource_uid.as_str())
-                != self.metadata.uid.as_deref()
-                || !ids.insert(&retained.goal.operation_id)
-                || !revisions.insert((&retained.goal.scope.storage.replica, retained.goal.revision))
-                || status.public_v1_authority.as_ref().is_none_or(|authority| {
-                    authority.history != retained.goal.scope.history
-                        || authority.identity != retained.goal.identity
-                })
-            {
-                return Err(
-                    "retained goals lack unique exact resource/history/revision authority".into(),
-                );
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -761,7 +678,6 @@ mod tests {
                 "publicV1SessionRenewal",
                 "publicV1Topology",
                 "publicV1Transition",
-                "replicaGoals",
             ])
         );
         for field in [

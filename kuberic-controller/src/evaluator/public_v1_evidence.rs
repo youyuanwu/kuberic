@@ -304,7 +304,7 @@ fn accepted_completion(
                     CanonicalReplicaRebuildRequired::RemoteBuildTarget {
                         reason: rebuild.reason,
                         operation: rebuild.operation.clone(),
-                        goal: Box::new(rebuild.goal.clone().ok_or_else(|| {
+                        build: Box::new(rebuild.build.clone().ok_or_else(|| {
                             "accepted remote rebuild lacks exact build identity".to_string()
                         })?),
                     }

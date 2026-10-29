@@ -1,13 +1,8 @@
 # SF V1: Hosting Redesign Roadmap and Remaining Qualification
 
-This is the **single active runtime roadmap**, not a delivery-phase checklist.
-**M1 generic host/controller implementation is delivered; bounded M2
-implementation is qualified; M3 exhaustive recovery/failure qualification is
-deferred, not implemented.** M2 documentation implementation review and actual
-independent final Sol/Astra gates remain pending, so the M2 workflow is not
-complete. The [ordinary contract and evidence limits](ordinary-hosting-m1.md)
-supersede old production-host claims. The design research baseline is Kuberic
-`b37009f8af7a7b2ed91f58f4889ed74e06013861`;
+This is the **single active future runtime roadmap**, not a delivery-phase
+checklist. The hosting redesign is **PROPOSED / NOT IMPLEMENTED**; its current
+research baseline is Kuberic `b37009f8af7a7b2ed91f58f4889ed74e06013861`;
 native SF is `3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d`.
 Older bounded access/host evidence retains its explicit pins below.
 Read [current semantics](classic-v1-runtime.md) first and use the
@@ -18,9 +13,7 @@ Priorities below order **future separately authorized work**. “Verified differ
 source-confirmed divergence, not a dynamically reproduced data-loss defect;
 “unverified” means missing claim-specific qualification, not demonstrated failure.
 
-<a id="hosting-redesign-roadmap--not-implemented"></a>
-
-## Hosting redesign roadmap
+## Hosting redesign roadmap — NOT IMPLEMENTED
 
 The [target owner/message/state contract](engine-neutral-hosting.md#proposed--ordinary-engine-boundary)
 removes the mandatory custom companion and controller-to-target exact-grant
@@ -29,27 +22,25 @@ host/engine separation; generic peer identity publication, durable agent stages,
 engine-session retirement and Rust Close-after-Abort settlement are explicit
 local **design choices**, not native public APIs.
 
-**M1 and bounded M2 implementation are delivered under their respective
-authorizations; M3 still requires separate authorization.** M2 qualifies real
-built-in and independent PG sessions on that production ordinary path, not the
-exhaustive recovery matrix. No native
-executable equivalence is claimed. M1–M3 replace the earlier R1–R5 cutover plan
-with a clean-break implementation for fresh deployments. Independent
+**All M milestones below are NOT IMPLEMENTED and require separate runtime
+authorization.** This workflow delivers reviewed design/docs only. No runtime
+defect is presumed, no phase is promoted into execution, and no native
+executable equivalence is claimed. M1–M3 replace the earlier R1–R5 cutover
+plan with a clean-break implementation for fresh deployments. Independent
 SF-11/mode/PG/P7/security obligations below remain open/deferred, not erased.
 
-| Milestone / dependency | Deliverable / status | Evidence or remaining gate |
+| Milestone / dependency | Future deliverable | Completion gate |
 |---|---|---|
-| **M1 — IMPLEMENTED: host/controller contract**. No predecessor. | Semantic controller goals, durable local-agent stages, retained ordinary host actions/remote state and **production** goal→PrepareIdle→Build routing. Original format-15 evidence is historical; current matched inputs are 16. DiscoveryPending→AchievedScope lives in existing components, with no parallel authority ledger. | [Executed independent ordinary-engine acceptance](ordinary-hosting-m1.md#verification-and-limits): no companion/diagnostics; mutual discovery with recovery held and copy/voting/serving closed; failed-preparation withdrawal, stale/reply-loss/two-ended Ready and Abort→Close actual joins. Protected whole files unchanged. |
-| **M2 — IMPLEMENTATION QUALIFIED, final gates pending: built-in and PostgreSQL integration**. M1. | Engine-owned authenticated sessions and ordinary joining replace grant-based copy. KV/SQLite/external-provider consumers moved; shared companion/control/grant/carrier-authority fields deleted. Built-in retains stream/context/quorum; independent PG retains backup/WAL/lineage/slots, physical SQL fencing and durable metadata. Format 16 matches all current inputs/assets. | [Actual bounded acceptance and source bindings](testing.md#m2-accepted-evidence-and-remaining-boundaries): empty context items versus EOF, copy+replication ACKs, duplicate StartCopy, stale identity/epoch/ACK refusal; retirement races, quarantine, no late successor and actual joins in both engines. PG receive/replay/checkpoint, nonmutating replay, slot retirement, SQL/pre-auth fencing and exact joint/current pending continuation pass. Bounded unchanged-Primary retained-member and singleton recovery plus real KV growth pass; not general M3 election. Documentation implementation review and actual independent final Sol/Astra reviews remain required. |
+| **M1 — NOT IMPLEMENTED: host/controller contract**. No predecessor. | Replace controller goals, local-agent stages, host action/remote-operation state and **production** goal→PrepareIdle→Build routing. Define one new matched host/control/CRD format and DiscoveryPending→AchievedScope publication. Keep RA/FUP responsibilities inside existing components, not new services or parallel authority ledgers. | Independent ordinary bundle with **no companion/diagnostics**; real production dispatch; mutual discovery while multi-replica recovery is held, with copy/serving closed; safe failed-preparation withdrawal. Stale goals/epochs/instances reject; lost responses retain calls; held callbacks and scope withdrawal obey Abort→Close joining. Protected method sets unchanged. |
+| **M2 — NOT IMPLEMENTED: built-in and PostgreSQL integration**. M1. | Replace grant-based copy with engine-owned authenticated sessions and ordinary lifecycle joining. Built-in retains stream/context/quorum semantics; independent PG retains backup/WAL/lineage/slots, physical SQL fencing and its durable metadata responsibilities. Delete superseded companion/grant/carrier paths as their consumers move, not in a later compatibility phase. | Both engines through M1 production routing, with real PG and no built-in wrapper. Built-in: nonempty target context/empty items/EOF, copy+replication ACK boundaries, duplicate StartCopy and stale process/storage/history/endpoint/epoch/ACK rejection. Both: delayed establishment after retirement, lost target cancellation while source stays Primary, pre-effect/await races, quarantine, no late successor install and actual joins. PG additionally proves receive+replay/checkpoint, live replay without mutation, slot retirement, SQL/pre-auth socket fencing and sticky join failure. |
 | **M3 — NOT IMPLEMENTED: recovery and failure qualification**. M2. | Complete and qualify goal/stage reconciliation for renewal, replacement, failover and handoff using only the replacement path. Verify same-format crash recovery, clean deployment and complete legacy-path removal. | Source/target/controller restart at selection/effect/receipt gaps; target reopen invalidates old Ready; remove-before-Build tombstone and failed-Build ambiguity; held multi-replica discovery with copy/access closed until AchievedScope. PC/CC/catch-up/promotion/demotion, actual KV/SQLite/PG access, acknowledged-prefix/history preservation, retained joins, protected API/package proof and incompatible-format rejection **before mutation**. |
 
 ### Fresh-deployment contract and removal order
 
-Current host/control/CRD inputs use matched format 16; the
-[M1 format-15 checkpoint](ordinary-hosting-m1.md#fresh-deployment-format) is historical.
-protocol 13 / schema 14 are the historical baseline, not supported deployment input.
+Current formats remain [protocol 13 / host schema 14](classic-v1-runtime.md#production-policies-and-security).
 The replacement supports **fresh deployments only**, with matching binaries
-and newly provisioned compatible metadata/application storage. Do not reinterpret earlier payloads as the current format.
+and newly provisioned compatible metadata/application storage. Allocate the
+replacement format versions during M1; do not reinterpret current payloads.
 Reject incompatible stores, commands and retained CRD intents before mutation.
 There is **no** old-state import, in-place upgrade, rolling/mixed-version mode,
 downgrade reader or reverse migration. Do not build converters or software
@@ -78,15 +69,10 @@ before voting. Source Remove never certifies remote receiver drainage.
 
 ### Validation entry points and qualification limits
 
-[M2 production/host/engine selectors](testing.md#m2-accepted-evidence-and-remaining-boundaries)
-exercise the replacement contract. [Historical baseline selectors](testing.md#hosting-redesign-baselines-and-future-acceptance)
-remain pinned to their original source. Current bodies execute real work,
-not unavailable-success wrappers. The unchanged source aggregate remains exit
-100: a budget-terminated native child is an infrastructure outcome, while
-a complete exact-selection complement supplies its missing native outcomes.
-V05/V14 retain actual later handoff/replacement/election diagnostics and
-unexecuted suffixes, not a blanket M3 waiver from their names.
-List the exact live selection before future authorized
+[Concrete current selectors](testing.md#hosting-redesign-baselines-and-future-acceptance)
+map M1–M3 to existing host, built-in, controller, public workspace and real PG
+baseline witnesses. They are source-inspected baselines, **not tests of this
+unimplemented redesign**. List the exact live selection before future authorized
 execution; add missing race/crash/fresh-deployment cases at replacement owners rather
 than inventing evidence or hard-coding test totals.
 
@@ -107,14 +93,12 @@ The [message/action/state map](engine-neutral-hosting.md) records pinned native
 evidence, common host admission/authority/lifetime owners, optional diagnostics,
 exact remote Build state and intentional Rust/Kubernetes adaptations.
 
-Pinned pre-M1 V1 and independent PostgreSQL controller dispatch qualified real copy
+Actual V1 and independent PostgreSQL controller dispatch now qualify real copy
 outside voting, truthful host/engine observations, separate admission, exact
 retry/revoke/cancel and successful/failed hosted terminal joins. Production
 failed-callback repeatability remains conservative; native observation ownership
 does not certify an application's failure or a native join. Historical success
-never created a new grant or an engine idle observation. Current ordinary
-witnesses qualify replacement owners separately; the old pinned runs are not
-relabelled as current-source executions.
+never creates a new grant or an engine idle observation.
 
 This closes the bounded structural hosting queue item, not wholesale Hosting2,
 RA/FM, P7/security/settings, arbitrary failed-Build recovery, native executable
@@ -141,7 +125,7 @@ Cleanup is not a process-local join or a generic application-task join.
 The selected runtime now publishes same-primary, split/recipe promotion and
 standalone/composed demotion stages from operation-owned live evidence
 ([policy:209–300][aligned-access], [public barriers:144–2159][aligned-access-tests]).
-The [pinned matrix and protocol-13 boundary](classic-v1-runtime.md#host-access-lifecycle-and-retirement)
+The [current matrix and protocol-13 boundary](classic-v1-runtime.md#host-access-lifecycle-and-retirement)
 replace the former blanket pending/fence availability difference. Public tests
 attempt committed service reads and raw writes, including independent missing
 C/P, pre/post-Revoke, final-wait-before-receipt, cancellation, exact replay,
@@ -189,28 +173,24 @@ do not certify provider commitment, durability or client success.
 
 ## Custom-native controller evidence and remaining obligations
 
-The **pre-M1** [local companion](replicator-boundary.md#custom-controller-integration)
-and [pinned PostgreSQL controller cases](https://github.com/youyuanwu/kuberic/blob/ce9df4ad85603b935752ed7184d9314a778b6eb5/examples/postgres/src/public_controller_tests.rs)
-provided bounded upstream evidence for exact inbound authority, truthful installed
+The [supported local companion](replicator-boundary.md#custom-controller-integration)
+and [actual PostgreSQL controller cases](../../../examples/postgres/src/public_controller_tests.rs)
+provide bounded upstream evidence for exact inbound authority, truthful installed
 voting/idle observations, real copy before admission, exact joint/current-only
 staging, native replay/invalidation, SQL/replay and completed fencing. Fresh
 sentinel initialization requires exact successful New-Open provenance; it is
 not zero progress or a retained-history election. Protected native method sets
-and representations remain unchanged. Current M2 witnesses execute actual
-ordinary copy/SQL/replay/fencing with independent evidence; the pinned results
-above remain historical, not new executions.
+and representations remain unchanged.
 
 Remaining claim-specific obligations are not presumed defects or implied runs:
 
-- **Pre-M1 retained engine/component route:** downstream MySQL needed the companion and
+- **Current route:** downstream MySQL would need the supported companion and
   must requalify its own
   source/target Build, native lineage/progress, later admission and actual access
   fencing with exact process/storage/history/attempt bindings. Its unpublished
   fixtures and externally reported seven-completion trace were not reproduced.
-  **Current generic M1 route:** no companion is required. Actual downstream
-  engine sessions/integration remain to be qualified independently; M2's bounded
-  built-in/PG results do not qualify MySQL. Native transfer/lineage/access/terminal obligations
-  remain, with no downstream evidence claim.
+  **Proposed route:** M1–M3 remove that companion requirement; native transfer/
+  lineage/access/terminal obligations remain, with no downstream evidence claim.
 - Native SF executable/differential validation, arbitrary failed custom-Build
   reformation and production deployment remain outside the bounded upstream
   witness. Failed/interrupted custom work may require explicit terminal cleanup
@@ -309,7 +289,7 @@ do not satisfy the entire original P8 qualification claim.
 [pg-wait]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/examples/postgres/src/public_v1.rs#L1476-L1504
 [fallback]: https://github.com/youyuanwu/kuberic/blob/e2a47b6c631c974aa0135e81c3a7e3a439980ded/kuberic-controller/src/evaluator/public_v1_topology.rs#L445-L470
 [rejection-owner]: ../../../kuberic-runtime/src/replicator/v1/primary/tests/rejection_order.rs#L18-L230
-[rejection-public]: https://github.com/youyuanwu/kuberic/blob/b37009f8af7a7b2ed91f58f4889ed74e06013861/kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
+[rejection-public]: ../../../kuberic-runtime/tests/public_v1_recovery/rejection_order.rs#L57-L392
 [native-host-open]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComProxyStatefulService.OpenAsyncOperation.cpp#L17-L39
 [native-host-proxy]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/ComProxyReplicator.h#L17-L35
 [native-host-build]: https://github.com/microsoft/service-fabric/blob/3988b4518236d2d0a37f4d8bdcdf0a2093c5a61d/src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReplicatorBuildIdleReplicaAsyncOperation.cpp#L256-L357

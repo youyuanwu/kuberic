@@ -241,7 +241,6 @@ fn callbacks(sent: &Arc<Mutex<Sent>>) -> BuildCallbacks {
     let copy = sent.clone();
     let context = sent.clone();
     BuildCallbacks {
-        fence: None,
         replication: Arc::new(move |intent| {
             replication.lock().unwrap().replication.push(intent);
             true

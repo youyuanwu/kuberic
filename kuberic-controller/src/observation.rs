@@ -12,7 +12,6 @@ pub enum RawAgentObservation {
     Invalid { message: String },
     Uninitialized(kuberic_runtime::protocol::observation::UninitializedAgentObservation),
     PublicV1Report(Box<kuberic_runtime::protocol::public_operations::PublicV1AgentReport>),
-    ReplicaSnapshot(Box<kuberic_runtime::protocol::public_operations::ReplicaAgentSnapshot>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

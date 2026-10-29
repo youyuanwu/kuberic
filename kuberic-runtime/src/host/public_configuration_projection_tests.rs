@@ -15,6 +15,7 @@ fn peer(identity: ReplicaIdentity, role: ReplicaRole) -> PublicReplicaDescriptor
         }),
         identity,
         role,
+        build_id: OperationId::default(),
         replication_address: "http://127.0.0.1:2".into(),
         process_session_id: ProcessSessionId::new("peer-session"),
         current_progress: 0,
