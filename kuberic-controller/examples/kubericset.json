@@ -1,0 +1,26 @@
+{
+  "apiVersion": "operator.kuberic.io/v1alpha2",
+  "kind": "KubericSet",
+  "metadata": {
+    "name": "sample",
+    "namespace": "kuberic-dev"
+  },
+  "spec": {
+    "replicas": 3,
+    "image": "kuberic-fube:local",
+    "packagePath": "/opt/fube/package",
+    "clientPort": 8080,
+    "service": {
+      "application": "fabric:/External",
+      "applicationType": "HostingLocalStatefulApp",
+      "applicationNumber": 1,
+      "package": "LocalService",
+      "serviceType": "LocalStatefulType",
+      "name": "fabric:/External/Singleton",
+      "packageVersionInstance": 1
+    },
+    "parameters": {
+      "Arguments": "--stateful-lifecycle --data-replicator --replication-listen {node_ip}:0 --service-listen {node_ip}:8080"
+    }
+  }
+}

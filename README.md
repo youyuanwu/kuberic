@@ -12,9 +12,11 @@ replica deletion. Its deterministic reconciliation core and native-channel
 adapter use the same fube codecs as the real nodes.
 
 Only one fresh volatile partition with three immutable original nodes is
-supported. There is no Kubernetes integration, persistence/recovery, failover,
-switchover, replacement, reconnect, resize or rolling upgrade. State is
-in-memory; restarting the FM does not recover the deployment. A lost original
+supported. A Kubernetes-facing bootstrap library is qualified against a mock
+API and local processes; real-cluster deployment is not supported. There is no
+replica persistence/recovery, failover, switchover, replacement, reconnect,
+resize or rolling upgrade. FM state is in-memory; restarting the FM does not
+recover the deployment. A lost original
 channel or invalid completion produces explicit control uncertainty and withdraws
 FM endpoint publication. It does **not** prove that an existing writer stopped.
 Control TCP is unauthenticated and unencrypted; use a trusted, isolated network.
@@ -25,14 +27,61 @@ Control TCP is unauthenticated and unencrypted; use a trusted, isolated network.
 git submodule update --init --recursive
 cargo build -p kuberic-fm
 cargo test --workspace
-cargo fmt -p kuberic-fm -- --check
+cargo fmt -p kuberic-fm -p kuberic-controller -- --check
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 
-Default tests exercise FM decisions with scripted native replies and real
-loopback channels. They do not launch node/application processes or prove
-replication correctness. Use `cargo test --workspace -- --list` for the live
-inventory.
+Default tests exercise FM decisions with scripted native replies, real loopback
+channels, and Kubernetes reconciliation through a mock-backed `kube::Client`.
+They do not launch node/application processes or prove replication correctness.
+Use `cargo test --workspace -- --list` for the live inventory.
+
+## Kubernetes bootstrap controller
+
+`kuberic-controller` provides a namespace-bound `Reconciler`, a pure evaluator,
+the `operator.kuberic.io/v1alpha2` `KubericSet`, and a `ProcessFm` adapter around
+the existing native FM. It is a library, not a deployed watch loop. Callers must
+reconcile repeatedly, including stable/waiting states; each call applies a
+bounded effect or returns an explicit blocked/waiting outcome. The example
+[KubericSet](kuberic-controller/examples/kubericset.json) describes the sample
+package, not an available image or installation.
+
+Bootstrap proceeds through separately observed facts:
+
+- Persist fresh allocation authority before creating owned objects.
+- Create empty per-node ConfigMaps, a disabled client Service and all original
+  Pods. Pods use `restartPolicy: Never`; their startup gate waits for `node.json`.
+- Observe all Pod IPs and bind exact Pod/ConfigMap UIDs before freezing topology.
+  Pod Running/Ready is not native replica readiness.
+- Start the original native FM listener, then publish immutable node
+  configurations. `{node_ip}` in parameter values expands to that node's frozen
+  IP; target/minimum sizes remain 3/2.
+- Publish the opaque native endpoint and select the exact original primary Pod
+  only after final native configuration completion.
+
+Owned-resource writes retain UID/resourceVersion checks and effects revalidate
+their observation. Lost API replies do not roll back persisted authority.
+Changed or missing original Pods/configurations, container restarts, unsupported
+spec changes, lost allocation status or a different live FM owner block the
+cohort. Blocking invalidates further locally owned FM intent and restores a
+nonmatching Service selector; it does not prove a remote writer stopped.
+Foreign-owned resources are not mutated.
+
+The initial volatile profile creates no PVCs. The desired client port is an
+application contract and must match its listener; opaque native endpoint
+strings are preserved, not reinterpreted as a universal Kubernetes port format.
+The Pod template requires an image containing `tini`, a POSIX shell, `sleep`,
+the fube runner and the declared application package. No such image, RBAC,
+installation, finalizer/garbage-collection workflow or Kubernetes networking
+qualification is provided yet.
+
+Tests use a narrow in-memory HTTP API behind a real `kube::Client`, including
+namespaces, ownership, UID/resourceVersion fencing, immutable ConfigMaps and
+explicit conflict/lost-response injection. A mock-Pod supervisor supplies only
+infrastructure facts and launches local fube processes from the published
+configurations. Native bootstrap/build/configuration still uses the real FM.
+Controller-facade recreation can reuse the same retained live FM owner; a new
+FM process cannot adopt status or reconnect to the old cohort.
 
 ## Process mode
 
@@ -71,13 +120,14 @@ On Linux, build the pinned fube binaries, then explicitly run the process tier:
 ```sh
 cargo build --locked --manifest-path fube/Cargo.toml \
   -p fube-node-runner -p hosting-local-app --bins --target-dir target
-cargo test -p kuberic-fm --test processes -- --ignored
+cargo test --workspace -- --include-ignored
 ```
 
-This launches the actual FM binary, node binaries and sample application
-children, checks write/readback and verifies owned teardown. It needs no Docker,
-Kubernetes or native Service Fabric. `FUBE_NODE_EXE` and `FUBE_NODE_APP` can
-override the prebuilt binary paths.
+The process tiers exercise the standalone FM binary and the mock-backed
+controller/native-FM bridge with real node binaries and sample application
+children. They check write/readback, native-controlled client routing and owned
+teardown. They need no Docker, Kubernetes or native Service Fabric.
+`FUBE_NODE_EXE` and `FUBE_NODE_APP` can override the prebuilt binary paths.
 
 The fixture follows fube's temporary bind-to-port-zero allocation for node
 control addresses. Releasing those sockets before child startup leaves a port
