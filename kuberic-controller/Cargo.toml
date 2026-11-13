@@ -1,0 +1,31 @@
+[package]
+name = "kuberic-controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mock-qualified Kubernetes bootstrap controller for fube"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+fube-node-runner.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+kuberic-fm.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+fube-local-host = { path = "../fube/crates/libs/fube-local-host" }
+fube-ra.workspace = true
+fube-transport.workspace = true
+http = "1"
+form_urlencoded = "1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

@@ -25,6 +25,18 @@ pub async fn run(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = Result<()>>,
+    observe: impl FnMut(&Status) -> Result<()>,
+) -> Result<()> {
+    run_guarded(config, listener, shutdown, std::future::pending(), observe).await
+}
+
+/// Invalidation stops new FM intent and withdraws publication. It does not
+/// certify that a remote application writer has stopped.
+pub async fn run_guarded(
+    config: Config,
+    listener: TcpListener,
+    shutdown: impl Future<Output = Result<()>>,
+    invalidated: impl Future<Output = String>,
     mut observe: impl FnMut(&Status) -> Result<()>,
 ) -> Result<()> {
     config.validate()?;
@@ -35,16 +47,22 @@ pub async fn run(
     let mut state = State::new(config.clone())?;
     let mut links = vec![None; 3];
     let mut previous = None;
-    let result = drive(
-        &config,
-        listener,
-        shutdown,
-        &mut state,
-        &mut links,
-        &mut previous,
-        &mut observe,
-    )
-    .await;
+    let result = {
+        tokio::pin!(invalidated);
+        tokio::select! {
+            biased;
+            reason = &mut invalidated => Err(anyhow::anyhow!("FM authority invalidated: {reason}")),
+            result = drive(
+                &config,
+                listener,
+                shutdown,
+                &mut state,
+                &mut links,
+                &mut previous,
+                &mut observe,
+            ) => result,
+        }
+    };
     let mut failures = Vec::new();
     if let Err(error) = result {
         state.fail(format!("{error:#}"));

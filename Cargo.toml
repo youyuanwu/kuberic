@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kuberic-fm"]
+members = ["kuberic-fm", "kuberic-controller"]
 exclude = ["archive", "fube"]
 
 [workspace.package]
@@ -12,6 +12,7 @@ repository = "https://github.com/youyuanwu/kuberic"
 
 [workspace.dependencies]
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,3 +22,7 @@ fube-node = { path = "fube/crates/libs/fube-node" }
 fube-node-runner = { path = "fube/crates/tools/fube-node-runner" }
 fube-ra = { path = "fube/crates/libs/fube-ra" }
 fube-transport = { path = "fube/crates/libs/fube-transport" }
+kuberic-fm = { path = "kuberic-fm" }
+k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"] }
+kube = { version = "4", default-features = false, features = ["client", "derive", "rustls-tls"] }
+schemars = "1"
