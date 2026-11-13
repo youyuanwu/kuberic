@@ -1,0 +1,4 @@
+[submodule "fube"]
+	path = fube
+	url = https://github.com/youyuanwu/fube.git
+	branch = main
