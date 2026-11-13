@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["kuberic-fm"]
+exclude = ["archive", "fube"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/youyuanwu/kuberic"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+fube-node = { path = "fube/crates/libs/fube-node" }
+fube-node-runner = { path = "fube/crates/tools/fube-node-runner" }
+fube-ra = { path = "fube/crates/libs/fube-ra" }
+fube-transport = { path = "fube/crates/libs/fube-transport" }
