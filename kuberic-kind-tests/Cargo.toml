@@ -8,16 +8,12 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 clap.workspace = true
-fube-local-host.workspace = true
-fube-node-runner.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
-kuberic-controller.workspace = true
 kuberic-fm.workspace = true
+kuberic-operator.workspace = true
 rustls.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

@@ -1,6 +1,6 @@
 # KinD lifecycle tests
 
-This crate runs the current fube-backed controller against real Kubernetes,
+This crate runs the current fube-backed operator and controller against real Kubernetes,
 following the archived setup's dedicated cluster, explicit kubeconfig/context
 and ownership-receipt contract. It does not deploy the archived operator.
 
@@ -51,9 +51,18 @@ always attempts owned-cluster deletion.
 
 ## What is exercised
 
-The host test process only prepares and observes the isolated cluster. A Job
-runs the namespace-bound `Reconciler` and its original in-memory `ProcessFm`
-inside Kubernetes, advertising the Job's concrete Pod IP. Workload Pods run
+The host test process prepares and observes the isolated cluster. Ordinary
+bootstrap and early-deletion journeys install the generated namespace-scoped
+operator Deployment/RBAC. Their Job only creates/deletes KubericSets, sends
+application requests and observes results; its Role cannot mutate workload
+resources or parent status. The operator owns reconciliation and native FM
+listeners. The host independently matches its final native-join/cleanup events
+to the exact cohort observed by the driver.
+
+The deterministic staggered-shutdown journey instead runs the library
+`Reconciler` and original in-memory `ProcessFm` inside its Job, so it can pause
+effects at a precise teardown boundary without production scheduling hooks.
+Workload Pods run
 the actual fube runner and `hosting-local-app` stateful/data-replicator package.
 Native FM/RA and replica links use concrete Pod IPs, not translated host ports
 or Service VIPs. Only application traffic uses the primary ClusterIP Service.
@@ -63,7 +72,7 @@ period keeps initial ConfigMap projection skew within the runner startup budget.
 The healthy journey checks native final-configuration publication, exact primary
 selection, a quorum-acknowledged write and readback through the Service, then
 controller-owned deletion. The early-deletion journey requests deletion after
-initial node configuration publication but before native bootstrap completes,
+the original cohort is frozen but before bootstrap completes,
 requires client routing to remain disabled, finishes the accepted bootstrap and
 reuses the same teardown.
 
@@ -75,12 +84,13 @@ resume and delete the remaining Pods. This proves an original node can finish
 before the others receive kubelet termination, rather than relying on signal
 timing or simultaneous shutdown.
 
-The image installs a test-only node wrapper at `/opt/fube/fube-node`, with the
+The fixture derives from the operator runtime image and installs its shared
+owned-node supervisor at `/opt/fube/fube-node`, with the
 real runner at `/opt/fube/fube-node-real`. The wrapper owns the actual node child,
 forwards kubelet SIGTERM, checks successful exit, reaping, no surviving original
 application PID, final runner cleanup and resource joins, and rejects forced
 cleanup. It writes that exact deployment/node/Pod-UID report to the container
-termination message. A test-only Pod finalizer retains the message until the
+termination message. The operator's `operator.kuberic.io/cleanup-report` Pod finalizer retains the message until the
 backend validates and caches it; only then is that finalizer released.
 Missing reports, replacement UIDs, killed containers or incomplete cleanup
 fail explicitly. Pod absence and native deletion replies never fabricate receipts.
@@ -88,11 +98,11 @@ Each wrapper forwards kubelet SIGTERM immediately to its own original runner;
 there is no cross-node shutdown barrier. The pinned fube runner keeps lost-peer
 control uncertainty separate from successful owned local shutdown. Neither
 successful local cleanup nor connection loss substitutes for native deletion.
-The driver separately requires native deletion and FM joining, checks owned
-resources disappeared, and the host checks disappearance again before success.
+The lifecycle owner separately requires native deletion and FM joining; the
+driver and host independently check that owned resources disappeared.
 
-This is a test harness, not a production controller/watch-loop installation.
-It retains original backend authority only for the lifetime of the Job. It
+This is qualification of the experimental operator, not production readiness.
+Original backend authority lasts only for the lifecycle owner's process. It
 does not add failover, persistence, reconnect, restart adoption or upgrades.
 Control traffic remains unauthenticated and unencrypted; use only the isolated,
 trusted test cluster.

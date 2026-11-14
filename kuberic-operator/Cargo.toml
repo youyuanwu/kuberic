@@ -1,20 +1,24 @@
 [package]
-name = "kuberic-controller"
+name = "kuberic-operator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Mock-qualified Kubernetes bootstrap controller for fube"
+description = "Reusable Kubernetes reconciliation, namespace operator, and owned node supervisor for Kuberic"
 publish = false
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+clap.workspace = true
+fube-local-host.workspace = true
 fube-node-runner.workspace = true
+futures-util.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 kuberic-fm.workspace = true
+rustls.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

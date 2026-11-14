@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{ensure, Context, Result};
 use fube_local_host::process::OwnedApp;
-use kuberic_controller::{ReconcileOutcome, Reconciler, StaleObservation};
+use kuberic_operator::{ReconcileOutcome, Reconciler, StaleObservation};
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},

@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         Operation::Diagnostics => Cluster::from_env()?.diagnostics()?,
         Operation::Crd => println!(
             "{}",
-            serde_json::to_string_pretty(&kuberic_controller::KubericSet::crd())?
+            serde_json::to_string_pretty(&kuberic_operator::KubericSet::crd())?
         ),
         Operation::Run {
             early_delete,

@@ -45,6 +45,7 @@ struct Session {
 pub struct ProcessFm {
     admission: BackendAdmission,
     session: Mutex<Option<Session>>,
+    listener: Mutex<Option<TcpListener>>,
 }
 
 impl Default for ProcessFm {
@@ -58,6 +59,14 @@ impl ProcessFm {
         Self {
             admission: BackendAdmission::default(),
             session: Mutex::new(None),
+            listener: Mutex::new(None),
+        }
+    }
+
+    pub fn with_listener(listener: TcpListener) -> Self {
+        Self {
+            listener: Mutex::new(Some(listener)),
+            ..Self::new()
         }
     }
 
@@ -189,9 +198,20 @@ impl FmApi for ProcessFm {
             return Ok(());
         }
         let config = cohort.fm_config()?;
-        let listener = TcpListener::bind(config.fm.address)
-            .await
-            .context("binding accepted FM listener")?;
+        let mut reserved = self.listener.lock().await;
+        let listener = match reserved.as_ref() {
+            Some(listener) => {
+                ensure!(
+                    listener.local_addr()? == config.fm.address.into(),
+                    "reserved listener differs from accepted FM address"
+                );
+                reserved.take().context("missing reserved FM listener")?
+            }
+            None => TcpListener::bind(config.fm.address)
+                .await
+                .context("binding accepted FM listener")?,
+        };
+        drop(reserved);
         let (status, observed) = watch::channel(State::new(config.clone())?.status());
         let (shutdown, stopped) = oneshot::channel();
         let (invalidation, invalidated) = oneshot::channel();

@@ -5,7 +5,7 @@ use kube::{
     api::{DeleteParams, PostParams, Preconditions},
     Api, ResourceExt,
 };
-use kuberic_controller::{resources, ControllerPhase, FmApi, KubericSet, ProcessFm, Reconciler};
+use kuberic_operator::{resources, ControllerPhase, FmApi, KubericSet, ProcessFm, Reconciler};
 use kuberic_tests::{
     controller as support,
     process::{application, controller::Supervisor, reconcile, reserve},

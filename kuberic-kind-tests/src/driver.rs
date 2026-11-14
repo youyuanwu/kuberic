@@ -6,9 +6,9 @@ use kube::{
     api::{DeleteParams, ListParams, PostParams, Preconditions},
     Api, Client, ResourceExt,
 };
-use kuberic_controller::{
-    resources, CleanupState, ControllerPhase, FmApi, FmAuthority, FrozenCohort, KubericSet,
-    ProcessFm, Reconciler, Settings, StaleObservation, TeardownStage,
+use kuberic_operator::{
+    processes::PodProcesses, resources, CleanupState, ControllerPhase, FmApi, FmAuthority,
+    FrozenCohort, KubericSet, ProcessFm, Reconciler, Settings, StaleObservation, TeardownStage,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -16,12 +16,18 @@ use tokio::{
     time::Instant,
 };
 
-use crate::{processes::PodProcesses, Scenario};
+use crate::Scenario;
 
 const BUDGET: Duration = Duration::from_secs(180);
 
 pub async fn run(scenario: Scenario) -> Result<()> {
-    let early_delete = scenario == Scenario::DeleteDuringBootstrap;
+    if scenario != Scenario::StaggeredShutdown {
+        return crate::deployed::run(scenario).await;
+    }
+    run_staggered().await
+}
+
+async fn run_staggered() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("driver TLS provider was already installed"))?;
@@ -52,7 +58,7 @@ pub async fn run(scenario: Scenario) -> Result<()> {
     let maps: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
     let services: Api<Service> = Api::namespaced(client, &namespace);
     let mut desired: KubericSet = serde_json::from_str(include_str!(
-        "../../kuberic-controller/examples/kubericset.json"
+        "../../kuberic-operator/examples/kubericset.json"
     ))?;
     desired.metadata.namespace = Some(namespace);
     desired.spec.image = image;
@@ -68,31 +74,7 @@ pub async fn run(scenario: Scenario) -> Result<()> {
             println!("{}", serde_json::json!({"event": "phase", "phase": phase}));
             last_phase = phase;
         }
-        if early_delete {
-            if let Some(cohort) = current.status.as_ref().and_then(|status| status.cohort()) {
-                let mut configured = false;
-                for node in &cohort.allocation.nodes {
-                    configured |= maps
-                        .get(&node.config_map_name)
-                        .await?
-                        .data
-                        .as_ref()
-                        .is_some_and(|data| data.contains_key("node.json"));
-                }
-                if configured {
-                    ensure!(
-                        fm.observe()
-                            .await?
-                            .context("missing native FM")?
-                            .status
-                            .phase
-                            == kuberic_fm::Phase::Bootstrap,
-                        "early deletion missed native bootstrap"
-                    );
-                    break current;
-                }
-            }
-        } else if phase == Some(ControllerPhase::Serving) {
+        if phase == Some(ControllerPhase::Serving) {
             break current;
         }
         ensure!(
@@ -106,7 +88,7 @@ pub async fn run(scenario: Scenario) -> Result<()> {
         .as_ref()
         .and_then(|status| status.cohort())
         .context("missing original cohort")?;
-    if !early_delete {
+    {
         let native = fm.observe().await?.context("missing native FM")?;
         ensure!(
             native.status.phase == kuberic_fm::Phase::Serving
@@ -164,16 +146,14 @@ pub async fn run(scenario: Scenario) -> Result<()> {
         },
     )
     .await?;
-    let deadline = Instant::now() + BUDGET * if early_delete { 2 } else { 1 };
-    let mut bootstrap_wait = false;
+    let deadline = Instant::now() + BUDGET;
     let mut staggered_shutdown = false;
     loop {
         reconcile(&controller, &name).await?;
         let Some(current) = sets.get_opt(&name).await? else {
             break;
         };
-        if scenario == Scenario::StaggeredShutdown
-            && !staggered_shutdown
+        if !staggered_shutdown
             && current
                 .status
                 .as_ref()
@@ -192,24 +172,6 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                 staggered_shutdown = true;
             }
         }
-        if early_delete {
-            let status = current.status.as_ref().context("missing deletion status")?;
-            ensure!(
-                status.phase != ControllerPhase::Serving && status.service_endpoint.is_none(),
-                "deleting bootstrap published client access"
-            );
-            bootstrap_wait |= status.bootstrap_wait.is_some();
-            if let Some(service) = services
-                .get_opt(&resources::write_service_name(&name))
-                .await?
-            {
-                ensure!(
-                    service.spec.context("Service spec")?.selector
-                        == Some(resources::disabled_selector(&current)?),
-                    "deleting bootstrap enabled client routing"
-                );
-            }
-        }
         ensure!(
             Instant::now() < deadline,
             "owned teardown timed out: {current:?}"
@@ -217,11 +179,7 @@ pub async fn run(scenario: Scenario) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     ensure!(
-        bootstrap_wait == early_delete,
-        "early deletion did not retain its bootstrap wait"
-    );
-    ensure!(
-        staggered_shutdown == (scenario == Scenario::StaggeredShutdown),
+        staggered_shutdown,
         "staggered shutdown was not independently verified"
     );
     processes.verify_complete(&cohort).await?;
@@ -241,7 +199,7 @@ pub async fn run(scenario: Scenario) -> Result<()> {
         "{}",
         serde_json::json!({
             "event": "scenario_complete",
-            "scenario": scenario.name(),
+            "scenario": Scenario::StaggeredShutdown.name(),
             "set_uid": original.uid(), "native_joined": true, "resources_absent": true
         })
     );
@@ -381,7 +339,7 @@ fn retry_observation(error: &anyhow::Error) -> bool {
     retry
 }
 
-async fn wait_for_service(endpoint: &str) -> Result<()> {
+pub(crate) async fn wait_for_service(endpoint: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(endpoint)).await {
@@ -395,7 +353,7 @@ async fn wait_for_service(endpoint: &str) -> Result<()> {
     }
 }
 
-async fn application(endpoint: &str, command: &str) -> Result<String> {
+pub(crate) async fn application(endpoint: &str, command: &str) -> Result<String> {
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = TcpStream::connect(endpoint).await?;
         stream.write_all(format!("{command}\n").as_bytes()).await?;

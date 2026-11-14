@@ -11,10 +11,12 @@ builds, native 3/2 admission, endpoint publication, exact retries and normal
 replica deletion. Its deterministic reconciliation core and native-channel
 adapter use the same fube codecs as the real nodes.
 
-Only one fresh volatile partition with three immutable original nodes is
-supported. A Kubernetes-facing bootstrap library is qualified against a mock
-API, local processes and an isolated KinD test driver. There is no production
-operator installation or restart recovery. There is no
+Each KubericSet supports one fresh volatile partition with three immutable
+original nodes. The Kubernetes-facing library and experimental
+[`kuberic-operator`](kuberic-operator/README.md) are qualified against a mock
+API, local processes and an isolated KinD cluster. The operator provides a
+namespace-scoped watch/requeue loop, image build and installation manifests;
+it is not production-ready or restart-recoverable. There is no
 replica persistence/recovery, failover, switchover, replacement, reconnect,
 resize or rolling upgrade. FM state is in-memory; restarting the FM does not
 recover the deployment. A lost original
@@ -50,13 +52,14 @@ barrier. These tests require an explicitly owned KinD cluster and run with
 
 ## Kubernetes bootstrap controller
 
-`kuberic-controller` provides a namespace-bound `Reconciler`, a pure evaluator,
+The `kuberic-operator` library provides a namespace-bound `Reconciler`, a pure evaluator,
 the `operator.kuberic.io/v1alpha2` `KubericSet`, and a `ProcessFm` adapter around
-the existing native FM. It is a library, not a deployed watch loop. Callers must
+the existing native FM. Its `kuberic-operator` binary supplies deployed watches
+and timed requeues; `kuberic-node` supplies owned-node supervision. Other callers must
 reconcile repeatedly, including stable/waiting states; each call applies a
 bounded effect or returns an explicit blocked/waiting outcome. The example
-[KubericSet](kuberic-controller/examples/kubericset.json) describes the sample
-package, not an available image or installation.
+[KubericSet](kuberic-operator/examples/kubericset.json) describes the sample
+package, not a published application image.
 
 Bootstrap proceeds through separately observed facts:
 
@@ -86,9 +89,10 @@ The initial volatile profile creates no PVCs. The desired client port is an
 application contract and must match its listener; opaque native endpoint
 strings are preserved, not reinterpreted as a universal Kubernetes port format.
 The Pod template requires an image containing `tini`, a POSIX shell, `sleep`,
-the fube runner and the declared application package. No production image,
-RBAC or installation is provided. The KinD test crate builds a
-compatible image and supplies namespace-scoped test-driver RBAC.
+the owned-node supervisor, real fube runner and declared application package.
+The operator crate provides a runtime Dockerfile and generated namespace-scoped
+RBAC/Deployment; applications supply their own package image. The KinD test
+crate builds a compatible sample image and installs the same operator resources.
 
 Tests use a narrow in-memory HTTP API behind a real `kube::Client`, including
 namespaces, ownership, UID/resourceVersion fencing, immutable ConfigMaps and
@@ -159,9 +163,11 @@ handles, including successful node exit, application reaping, resource joins
 and whether cleanup was forced. The local process tests publish those facts
 only after checking the real fube exits, final cleanup status and owned joins.
 Kubernetes annotations and object absence cannot substitute for that backend.
-The KinD adapter collects exact container termination messages produced by a
-wrapper owning the original node handle. A test-only Pod finalizer retains
-the message until validated cleanup evidence has been cached by that backend.
+The deployed operator collects exact container termination messages produced by
+its supervisor owning the original node handle. Its
+`operator.kuberic.io/cleanup-report` Pod finalizer retains the message until
+validated cleanup evidence has been cached by the original backend. KinD uses
+the same supervisor and backend.
 
 Reconciliation may resume after lost API replies or controller-facade recreation
 with the same retained backend admission. Creating fresh backends is not recovery.
@@ -180,8 +186,11 @@ Unhealthy cohorts, premature Pod loss, changed original resource UIDs, or an
 expired cleanup deadline also remain explicitly blocked. There is no
 forced-deletion or automatic adoption path. The finalizer workflow is qualified
 against the mock API, local processes and the isolated KinD backend. The latter
-qualifies kubelet termination and real API garbage collection, not a production
-remote supervisor or restart-recoverable cleanup authority.
+qualifies kubelet termination and real API garbage collection through the
+experimental deployed supervisor, not restart-recoverable cleanup authority.
+The operator refuses existing allocations after restart, withdraws routing and
+retains finalizers; it never infers that an old writer stopped. Only one
+operator instance per namespace is supported.
 
 ## Process mode
 

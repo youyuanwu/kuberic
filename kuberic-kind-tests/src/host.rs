@@ -216,7 +216,7 @@ impl Cluster {
 
     pub fn install(&self) -> Result<()> {
         self.verify()?;
-        self.apply(&serde_json::to_value(kuberic_controller::KubericSet::crd())?)?;
+        self.apply(&serde_json::to_value(kuberic_operator::KubericSet::crd())?)?;
         self.kubectl(&[
             "wait",
             "--for=condition=Established",
@@ -312,7 +312,7 @@ impl Cluster {
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         let namespace = format!("kuberic-e2e-{}", uuid::Uuid::new_v4().simple());
-        let resources = scenario_resources(&namespace, &self.name, image, scenario);
+        let resources = scenario_resources(&namespace, &self.name, image, scenario)?;
         self.apply(&resources)?;
         let result = self.wait_for_scenario(&namespace, scenario);
         if let Err(error) = result {
@@ -359,15 +359,14 @@ impl Cluster {
             .filter(|line| line.starts_with('{'))
             .map(serde_json::from_str)
             .collect::<std::result::Result<_, _>>()?;
-        ensure!(
-            events
-                .iter()
-                .any(|event| event["event"] == "scenario_complete"
+        let completed = events
+            .iter()
+            .find(|event| {
+                event["event"] == "scenario_complete"
                     && event["scenario"] == scenario.name()
-                    && event["native_joined"] == true
-                    && event["resources_absent"] == true),
-            "successful driver omitted final lifecycle verification"
-        );
+                    && event["resources_absent"] == true
+            })
+            .context("successful driver omitted final lifecycle verification")?;
         ensure!(
             scenario == Scenario::DeleteDuringBootstrap
                 || events
@@ -375,12 +374,28 @@ impl Cluster {
                     .any(|event| event["event"] == "application_write_read"),
             "successful bootstrap omitted application write/read"
         );
-        ensure!(
-            events
-                .iter()
-                .any(|event| event["event"] == "physical_cleanup"),
-            "successful driver omitted physical cleanup evidence"
-        );
+        if scenario == Scenario::StaggeredShutdown {
+            ensure!(
+                completed["native_joined"] == true
+                    && events
+                        .iter()
+                        .any(|event| event["event"] == "physical_cleanup"),
+                "scripted qualification omitted native joining or physical cleanup"
+            );
+        } else {
+            ensure!(
+                completed["mode"] == "deployed-operator",
+                "ordinary journey did not use the operator"
+            );
+            let logs = self.kubectl(&["-n", namespace, "logs", "deployment/kuberic-operator"])?;
+            eprintln!("operator:\n{logs}");
+            let operator_events: Vec<Value> = logs
+                .lines()
+                .filter(|line| line.starts_with('{'))
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?;
+            verify_operator_cleanup(completed, &operator_events)?;
+        }
         ensure!(
             scenario != Scenario::StaggeredShutdown
                 || events
@@ -414,24 +429,40 @@ impl Cluster {
     }
 }
 
-fn scenario_resources(namespace: &str, cluster: &str, image: &str, scenario: Scenario) -> Value {
+fn scenario_resources(
+    namespace: &str,
+    cluster: &str,
+    image: &str,
+    scenario: Scenario,
+) -> Result<Value> {
     let arguments = match scenario {
         Scenario::Bootstrap => vec!["run"],
         Scenario::DeleteDuringBootstrap => vec!["run", "--early-delete"],
         Scenario::StaggeredShutdown => vec!["run", "--staggered-shutdown"],
     };
-    json!({"apiVersion": "v1", "kind": "List", "items": [
+    let scripted = scenario == Scenario::StaggeredShutdown;
+    let rules = if scripted {
+        json!([
+            {"apiGroups": ["operator.kuberic.io"], "resources": ["kubericsets", "kubericsets/status", "kubericsets/finalizers"],
+             "verbs": ["get", "list", "create", "update", "patch", "delete"]},
+            {"apiGroups": [""], "resources": ["pods", "pods/finalizers", "configmaps", "services"],
+             "verbs": ["get", "list", "create", "update", "patch", "delete"]}
+        ])
+    } else {
+        json!([
+            {"apiGroups": ["operator.kuberic.io"], "resources": ["kubericsets"],
+             "verbs": ["get", "list", "create", "delete"]},
+            {"apiGroups": [""], "resources": ["pods", "configmaps", "services"],
+             "verbs": ["get", "list"]}
+        ])
+    };
+    let mut resources = json!({"apiVersion": "v1", "kind": "List", "items": [
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {
             "name": namespace, "labels": {"testing.kuberic.io/kind-owned": cluster}}},
         {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {
             "name": "driver", "namespace": namespace}},
         {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
-         "metadata": {"name": "driver", "namespace": namespace}, "rules": [
-            {"apiGroups": ["operator.kuberic.io"], "resources": ["kubericsets", "kubericsets/status", "kubericsets/finalizers"],
-             "verbs": ["get", "list", "create", "update", "patch", "delete"]},
-            {"apiGroups": [""], "resources": ["pods", "pods/finalizers", "configmaps", "services"],
-             "verbs": ["get", "list", "create", "update", "patch", "delete"]}
-         ]},
+         "metadata": {"name": "driver", "namespace": namespace}, "rules": rules},
         {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
          "metadata": {"name": "driver", "namespace": namespace},
          "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "driver"},
@@ -448,7 +479,64 @@ fn scenario_resources(namespace: &str, cluster: &str, image: &str, scenario: Sce
                     ]}]
             }
          }}}
-    ]})
+    ]});
+    if !scripted {
+        let installation = kuberic_operator::deploy::installation(namespace, image)?;
+        resources["items"]
+            .as_array_mut()
+            .context("scenario resources")?
+            .extend(
+                installation["items"]
+                    .as_array()
+                    .context("operator installation")?
+                    .iter()
+                    .cloned(),
+            );
+    }
+    Ok(resources)
+}
+
+fn verify_operator_cleanup(completed: &Value, events: &[Value]) -> Result<()> {
+    let errors: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "reconcile_error" && event["retry_observation"] != true)
+        .collect();
+    ensure!(
+        errors.is_empty(),
+        "healthy operator lifecycle reported unexpected errors: {errors:?}"
+    );
+    let cohort: kuberic_operator::FrozenCohort =
+        serde_json::from_value(completed["cohort"].clone())?;
+    let event = events
+        .iter()
+        .find(|event| {
+            event["event"] == "lifecycle_complete"
+                && event["set_uid"] == completed["set_uid"]
+                && event["cohort"] == completed["cohort"]
+                && event["native_joined"] == true
+                && event["resources_absent"] == true
+        })
+        .context("operator omitted original native joining and cleanup evidence")?;
+    let reports: BTreeMap<String, kuberic_operator::node::Report> =
+        serde_json::from_value(event["reports"].clone())?;
+    ensure!(
+        reports.len() == cohort.bindings.len(),
+        "operator omitted original cleanup reports"
+    );
+    for (node, binding) in cohort.allocation.nodes.iter().zip(&cohort.bindings) {
+        let report = reports
+            .get(&binding.pod_uid)
+            .context("missing original Pod cleanup report")?;
+        ensure!(
+            report.resource_uid == cohort.allocation.resource_uid
+                && report.deployment == cohort.allocation.deployment
+                && report.pod_uid == binding.pod_uid
+                && report.node_id == node.node_id,
+            "operator cleanup evidence belongs to another original cohort"
+        );
+        report.receipt()?;
+    }
+    Ok(())
 }
 
 pub fn prepare_image(cluster: &Cluster) -> Result<String> {
@@ -457,7 +545,8 @@ pub fn prepare_image(cluster: &Cluster) -> Result<String> {
         "Cargo.toml",
         &[
             ("kuberic-kind-tests", "kuberic-kind"),
-            ("kuberic-kind-tests", "kuberic-kind-node"),
+            ("kuberic-operator", "kuberic-operator"),
+            ("kuberic-operator", "kuberic-node"),
         ],
     )?;
     artifacts.extend(build(
@@ -472,7 +561,8 @@ pub fn prepare_image(cluster: &Cluster) -> Result<String> {
         .tempdir_in(root().join("target"))?;
     for (binary, target) in [
         ("kuberic-kind", "kuberic-kind"),
-        ("kuberic-kind-node", "fube-node"),
+        ("kuberic-operator", "kuberic-operator"),
+        ("kuberic-node", "kuberic-node"),
         ("fube-node", "fube-node-real"),
     ] {
         fs::copy(
@@ -499,10 +589,25 @@ pub fn prepare_image(cluster: &Cluster) -> Result<String> {
             context.path().join("package").join(relative),
         )?;
     }
-    let image = format!("localhost/kuberic-kind:{}", uuid::Uuid::new_v4().simple());
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let base = format!("localhost/kuberic-operator:{tag}");
     checked(
         Command::new("docker")
-            .args(["build", "--tag", &image, "--file"])
+            .args(["build", "--tag", &base, "--file"])
+            .arg(root().join("kuberic-operator/deploy/Dockerfile"))
+            .arg(context.path()),
+    )?;
+    let image = format!("localhost/kuberic-kind:{tag}");
+    checked(
+        Command::new("docker")
+            .args([
+                "build",
+                "--tag",
+                &image,
+                "--build-arg",
+                &format!("OPERATOR_IMAGE={base}"),
+                "--file",
+            ])
             .arg(root().join("kuberic-kind-tests/deploy/Dockerfile"))
             .arg(context.path()),
     )?;

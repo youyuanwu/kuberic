@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use fube_local_host::process::OwnedApp;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use kube::{api::ListParams, Api, Client, ResourceExt};
-use kuberic_controller::{resources, CleanupReceipt, CleanupState, KubericSet, TeardownStage};
+use kuberic_operator::{resources, CleanupReceipt, CleanupState, KubericSet, TeardownStage};
 use serde_json::Value;
 use support::{NAME, NAMESPACE};
 
