@@ -8,7 +8,7 @@ use kube::{
     api::{DeleteParams, PostParams, Preconditions},
     Api, ResourceExt,
 };
-use kuberic_controller::{
+use kuberic_operator::{
     evaluate,
     resources::{self, FINALIZER},
     CleanupReceipt, CleanupState, ControllerPhase, FmApi, FrozenCohort, KubericSet, Plan,
@@ -134,7 +134,7 @@ async fn joined_processes(fixture: &Fixture, cohort: &FrozenCohort) {
     }
 }
 
-async fn drive_to(controller: &kuberic_controller::Reconciler, predicate: impl Fn(&Plan) -> bool) {
+async fn drive_to(controller: &kuberic_operator::Reconciler, predicate: impl Fn(&Plan) -> bool) {
     for _ in 0..64 {
         let observation = controller.observe(NAME).await.unwrap();
         let plan = evaluate(&observation, &support::settings());
@@ -542,7 +542,7 @@ async fn a_new_process_owner_cannot_reconstruct_cleanup_from_status() {
     })
     .await;
     let replacement_owner = Arc::new(support::ProcessEvidence::new());
-    let controller = kuberic_controller::Reconciler::new(
+    let controller = kuberic_operator::Reconciler::new(
         fixture.client.clone(),
         support::settings(),
         fixture.fm.clone(),
@@ -582,7 +582,7 @@ async fn accepted_teardown_ignores_later_spec_edits_and_preserves_foreign_finali
     let mut policy = support::settings();
     policy.teardown_timeout_ms = 100;
     let clock = fixture.clock.clone();
-    let controller = kuberic_controller::Reconciler::new(
+    let controller = kuberic_operator::Reconciler::new(
         fixture.client.clone(),
         policy,
         fixture.fm.clone(),
@@ -705,7 +705,7 @@ async fn bootstrap_wait_survives_conflicts_lost_replies_and_facade_or_policy_cha
     let mut policy = support::settings();
     policy.teardown_timeout_ms = 100;
     let clock = fixture.clock.clone();
-    let recreated = kuberic_controller::Reconciler::new(
+    let recreated = kuberic_operator::Reconciler::new(
         fixture.client.clone(),
         policy,
         fixture.fm.clone(),

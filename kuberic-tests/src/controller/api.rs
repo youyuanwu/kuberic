@@ -271,6 +271,22 @@ fn execute(
         if route.kind == Kind::Set {
             object["metadata"]["generation"] = json!(1);
         }
+        if route.kind == Kind::Pod {
+            for container in object["spec"]["containers"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                for variable in container["env"].as_array_mut().into_iter().flatten() {
+                    if let Some(field) = variable
+                        .pointer_mut("/valueFrom/fieldRef")
+                        .and_then(Value::as_object_mut)
+                    {
+                        field.entry("apiVersion").or_insert_with(|| json!("v1"));
+                    }
+                }
+            }
+        }
         object
             .as_object_mut()
             .ok_or_else(|| bad("object is not a map"))?

@@ -10,7 +10,7 @@ use kube::{
     api::{DeleteParams, ObjectMeta, PostParams, Preconditions},
     Api, ResourceExt,
 };
-use kuberic_controller::{
+use kuberic_operator::{
     evaluate,
     resources::{self, POD_UID},
     ControllerPhase, FmApi, KubericSet, Plan, ProcessFm, Reconciler, StaleObservation,

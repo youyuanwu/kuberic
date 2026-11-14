@@ -17,12 +17,12 @@ use kube::{
     api::{ListParams, PostParams},
     Api, Client, ResourceExt,
 };
-use kuberic_controller::{
+use kuberic_fm::{Outbound, State};
+use kuberic_operator::{
     resources, Allocation, BackendAdmission, CleanupState, ControllerPhase, FmApi, FmAuthority,
     FmObservation, FrozenCohort, KubericSet, KubericSetSpec, NodeCleanup, ProcessApi,
     ProcessObservation, Reconciler, ServiceTemplate, Settings,
 };
-use kuberic_fm::{Outbound, State};
 use tokio::sync::Mutex;
 
 pub const NAMESPACE: &str = "test-kuberic";

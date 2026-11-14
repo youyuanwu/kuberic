@@ -178,6 +178,14 @@ impl Reconciler {
     }
 
     pub async fn reconcile(&self, name: &str) -> Result<ReconcileOutcome> {
+        self.reconcile_for(name, None).await
+    }
+
+    pub async fn reconcile_uid(&self, name: &str, uid: &str) -> Result<ReconcileOutcome> {
+        self.reconcile_for(name, Some(uid)).await
+    }
+
+    async fn reconcile_for(&self, name: &str, uid: Option<&str>) -> Result<ReconcileOutcome> {
         let Some(set) = self.sets.get_opt(name).await? else {
             return Ok(ReconcileOutcome {
                 changed: false,
@@ -185,6 +193,10 @@ impl Reconciler {
                 resource_absent: true,
             });
         };
+        ensure!(
+            uid.is_none_or(|uid| set.uid().as_deref() == Some(uid)),
+            StaleObservation::Resources
+        );
         let observation = self.observe_set(set).await?;
         let plan = crate::evaluate(&observation, &self.settings);
         self.apply(&observation, plan).await

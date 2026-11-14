@@ -92,6 +92,20 @@ pub fn pod(set: &KubericSet, allocation: &Allocation, node: usize) -> Result<Pod
                     name: "KUBERIC_RUN_PARENT".into(),
                     value: Some(parent.to_str().context("run root is not UTF-8")?.into()),
                     ..EnvVar::default()
+                }, EnvVar {
+                    name: "POD_UID".into(),
+                    value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                        field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+                            api_version: Some("v1".into()),
+                            field_path: "metadata.uid".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..EnvVar::default()
+                }, EnvVar {
+                    name: "KUBERIC_SET_UID".into(),
+                    value: Some(allocation.resource_uid.clone()),
+                    ..EnvVar::default()
                 }]),
                 volume_mounts: Some(vec![
                     VolumeMount { name: "config".into(), mount_path: "/etc/fube".into(), read_only: Some(true), ..VolumeMount::default() },

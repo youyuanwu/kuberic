@@ -11,7 +11,7 @@ create-kind-cluster:
 verify-kind-context:
     {{kind_command}} verify
 
-# Build fresh test binaries and load the node/application/driver image.
+# Build fresh operator/supervisor/test binaries and load the sample image.
 kind-images:
     {{kind_command}} images
 

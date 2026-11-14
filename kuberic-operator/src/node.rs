@@ -3,7 +3,6 @@ use std::{fs, path::Path, process::Command, time::Duration};
 use anyhow::{ensure, Context, Result};
 use fube_local_host::process::OwnedApp;
 use fube_node_runner::Config;
-use kuberic_controller::CleanupReceipt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
@@ -11,9 +10,12 @@ use tokio::{
     time::Instant,
 };
 
+use crate::CleanupReceipt;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Report {
+pub struct Report {
+    pub resource_uid: String,
     pub deployment: String,
     pub pod_uid: String,
     pub node_id: String,
@@ -46,6 +48,16 @@ pub async fn run(path: &Path) -> Result<()> {
         .canonicalize()
         .context("resolving projected node configuration")?;
     let config = Config::read(&path).map_err(anyhow::Error::msg)?;
+    let pod_uid = std::env::var("POD_UID").context("POD_UID is required")?;
+    let resource_uid = std::env::var("KUBERIC_SET_UID").context("KUBERIC_SET_UID is required")?;
+    ensure!(
+        config
+            .run_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(&pod_uid),
+        "configuration does not belong to this Pod UID"
+    );
     let mut command = Command::new("/opt/fube/fube-node-real");
     command.arg("--config").arg(&path);
     let mut owner = None;
@@ -90,13 +102,9 @@ pub async fn run(path: &Path) -> Result<()> {
         .as_u64()
         .context("missing original application PID")?;
     let report = Report {
+        resource_uid,
         deployment: config.deployment.clone(),
-        pod_uid: config
-            .run_directory
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("missing Pod UID in original run directory")?
-            .into(),
+        pod_uid,
         node_id: config.node.identity.id.clone(),
         node_reaped: child.status().reaped && cleanup["reaped"] == true,
         node_exit_success: exit.success(),

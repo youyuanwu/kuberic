@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use kube::CustomResourceExt;
-use kuberic_controller::{FmApi, KubericSet, ProcessApi, Reconciler};
+use kuberic_operator::{FmApi, KubericSet, ProcessApi, Reconciler};
 use serde_json::Value;
 
 fn properties(value: &Value, fields: &mut BTreeSet<String>) {

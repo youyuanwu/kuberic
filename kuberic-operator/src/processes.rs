@@ -4,19 +4,19 @@ use anyhow::{ensure, Context, Result};
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{api::PostParams, Api, Client, ResourceExt};
-use kuberic_controller::{
-    Allocation, BackendAdmission, CleanupState, FrozenCohort, NodeCleanup, ProcessApi,
-    ProcessObservation,
-};
 use tokio::sync::Mutex;
 
-use crate::node::Report;
+use crate::{
+    node::Report, resources, Allocation, BackendAdmission, CleanupState, FrozenCohort, NodeCleanup,
+    ProcessApi, ProcessObservation,
+};
 
-const FINALIZER: &str = "testing.kuberic.io/cleanup-report";
+pub const FINALIZER: &str = "operator.kuberic.io/cleanup-report";
 
-pub(crate) struct PodProcesses {
+pub struct PodProcesses {
     admission: BackendAdmission,
     pods: Api<Pod>,
+    cohort: Mutex<Option<FrozenCohort>>,
     reports: Mutex<BTreeMap<String, Report>>,
 }
 
@@ -25,11 +25,17 @@ impl PodProcesses {
         Self {
             admission: BackendAdmission::default(),
             pods: Api::namespaced(client, namespace),
+            cohort: Mutex::new(None),
             reports: Mutex::new(BTreeMap::new()),
         }
     }
 
-    pub async fn verify_complete(&self, cohort: &FrozenCohort) -> Result<()> {
+    pub async fn reports(&self, cohort: &FrozenCohort) -> Result<BTreeMap<String, Report>> {
+        self.admission.require(&cohort.allocation).await?;
+        ensure!(
+            self.cohort.lock().await.as_ref() == Some(cohort),
+            "cleanup report cohort changed"
+        );
         let reports = self.reports.lock().await;
         ensure!(
             reports.len() == cohort.bindings.len(),
@@ -41,9 +47,14 @@ impl PodProcesses {
                 .context("missing Pod cleanup report")?
                 .receipt()?;
         }
+        Ok(reports.clone())
+    }
+
+    pub async fn verify_complete(&self, cohort: &FrozenCohort) -> Result<()> {
+        let reports = self.reports(cohort).await?;
         println!(
             "{}",
-            serde_json::json!({"event": "physical_cleanup", "reports": *reports})
+            serde_json::json!({"event": "physical_cleanup", "reports": reports})
         );
         Ok(())
     }
@@ -60,24 +71,88 @@ impl ProcessApi for PodProcesses {
     }
 
     async fn observe(&self, cohort: &FrozenCohort) -> Result<Option<ProcessObservation>> {
-        self.admission.require(&cohort.allocation).await?;
+        if self.admission.allocation().await.as_ref() != Some(&cohort.allocation) {
+            return Ok(None);
+        }
+        let mut original = self.cohort.lock().await;
+        if let Some(original) = original.as_ref() {
+            if original != cohort {
+                return Ok(Some(ProcessObservation {
+                    cohort: original.clone(),
+                    nodes: original
+                        .bindings
+                        .iter()
+                        .map(|binding| NodeCleanup {
+                            pod_uid: binding.pod_uid.clone(),
+                            outcome: CleanupState::Failed("original cleanup cohort changed".into()),
+                        })
+                        .collect(),
+                }));
+            }
+        } else {
+            ensure!(
+                cohort.bindings.len() == 3 && cohort.allocation.nodes.len() == 3,
+                "cannot observe an incomplete original cohort"
+            );
+            *original = Some(cohort.clone());
+        }
+        drop(original);
         let mut reports = self.reports.lock().await;
         let mut nodes = Vec::new();
         for (node, binding) in cohort.allocation.nodes.iter().zip(&cohort.bindings) {
             let pod = self.pods.get_opt(&node.pod_name).await?;
             let outcome = match pod {
                 Some(mut pod) => {
-                    ensure!(
-                        pod.uid().as_deref() == Some(&binding.pod_uid),
-                        "cleanup cannot adopt a replacement Pod"
-                    );
-                    let terminated = pod
+                    let owned = pod
+                        .metadata
+                        .owner_references
+                        .as_ref()
+                        .is_some_and(|owners| {
+                            owners
+                                .iter()
+                                .filter(|owner| owner.controller == Some(true))
+                                .count()
+                                == 1
+                                && owners.iter().any(|owner| {
+                                    owner.controller == Some(true)
+                                        && owner.uid == cohort.allocation.resource_uid
+                                        && owner.name == cohort.allocation.resource_name
+                                        && owner.kind == "KubericSet"
+                                        && owner.api_version == "operator.kuberic.io/v1alpha2"
+                                })
+                        });
+                    if pod.uid().as_deref() != Some(&binding.pod_uid)
+                        || !owned
+                        || pod.labels().get(resources::SET_UID)
+                            != Some(&cohort.allocation.resource_uid)
+                        || pod.labels().get(resources::DEPLOYMENT)
+                            != Some(&cohort.allocation.deployment)
+                    {
+                        nodes.push(NodeCleanup {
+                            pod_uid: binding.pod_uid.clone(),
+                            outcome: CleanupState::Failed(
+                                "cleanup cannot adopt a replacement or foreign Pod".into(),
+                            ),
+                        });
+                        continue;
+                    }
+                    let container = pod
                         .status
                         .as_ref()
                         .and_then(|status| status.container_statuses.as_ref())
                         .and_then(|containers| {
                             containers.iter().find(|container| container.name == "node")
-                        })
+                        });
+                    if container.is_some_and(|container| container.restart_count != 0) {
+                        nodes.push(NodeCleanup {
+                            pod_uid: binding.pod_uid.clone(),
+                            outcome: CleanupState::Failed(
+                                "original node container restarted".into(),
+                            ),
+                        });
+                        continue;
+                    }
+                    let terminated = container
                         .and_then(|container| container.state.as_ref())
                         .and_then(|state| state.terminated.as_ref());
                     if let Some(terminated) = terminated {
@@ -88,7 +163,17 @@ impl ProcessApi for PodProcesses {
                             terminated.exit_code,
                             terminated.signal,
                             terminated.message.as_deref(),
-                        )?;
+                        );
+                        let report = match report {
+                            Ok(report) => report,
+                            Err(error) => {
+                                nodes.push(NodeCleanup {
+                                    pod_uid: binding.pod_uid.clone(),
+                                    outcome: CleanupState::Failed(format!("{error:#}")),
+                                });
+                                continue;
+                            }
+                        };
                         reports.insert(binding.pod_uid.clone(), report);
                     }
                     let complete = reports.get(&binding.pod_uid);
@@ -102,10 +187,15 @@ impl ProcessApi for PodProcesses {
                             .replace(&node.pod_name, &PostParams::default(), &pod)
                             .await?;
                     } else if complete.is_none() && !held {
-                        ensure!(
-                            pod.metadata.deletion_timestamp.is_none(),
-                            "Pod deletion began without a retained cleanup observer"
-                        );
+                        if pod.metadata.deletion_timestamp.is_some() {
+                            nodes.push(NodeCleanup {
+                                pod_uid: binding.pod_uid.clone(),
+                                outcome: CleanupState::Failed(
+                                    "Pod deletion began without a retained cleanup observer".into(),
+                                ),
+                            });
+                            continue;
+                        }
                         // Retain kubelet's actual termination message, not an annotation
                         // inferred from Pod disappearance or native FM completion.
                         pod.metadata
@@ -155,7 +245,8 @@ fn validate_report(
     let report: Report =
         serde_json::from_str(message.context("node exited without a cleanup report")?)?;
     ensure!(
-        report.deployment == cohort.allocation.deployment
+        report.resource_uid == cohort.allocation.resource_uid
+            && report.deployment == cohort.allocation.deployment
             && report.pod_uid == uid
             && report.node_id == node_id,
         "cleanup report changed original deployment, Pod UID or native identity"
@@ -170,10 +261,8 @@ mod tests {
 
     #[test]
     fn cleanup_requires_successful_exact_nonforced_physical_evidence() {
-        let set: kuberic_controller::KubericSet = serde_json::from_str(include_str!(
-            "../../kuberic-controller/examples/kubericset.json"
-        ))
-        .unwrap();
+        let set: crate::KubericSet =
+            serde_json::from_str(include_str!("../examples/kubericset.json")).unwrap();
         let cohort = FrozenCohort {
             allocation: Allocation {
                 resource_uid: "set-uid".into(),
@@ -182,7 +271,7 @@ mod tests {
                 generation: 1,
                 deployment: "deployment".into(),
                 partition: "partition".into(),
-                fm: kuberic_controller::FmAuthority {
+                fm: crate::FmAuthority {
                     id: "fm".into(),
                     instance: 1,
                     address: "10.0.0.1:19000".into(),
@@ -194,7 +283,7 @@ mod tests {
             bindings: vec![],
         };
         let report = serde_json::json!({
-            "deployment": "deployment", "pod_uid": "uid", "node_id": "node",
+            "resource_uid": "set-uid", "deployment": "deployment", "pod_uid": "uid", "node_id": "node",
             "node_reaped": true, "node_exit_success": true,
             "application_reaped": true, "resources_joined": true, "forced": false
         });
@@ -211,7 +300,7 @@ mod tests {
         assert!(validate(&report, 0, None).is_ok());
         assert!(validate(&report, 137, Some(9)).is_err());
         assert!(validate_report(&cohort, "uid", "node", 0, None, None).is_err());
-        for field in ["deployment", "pod_uid", "node_id"] {
+        for field in ["resource_uid", "deployment", "pod_uid", "node_id"] {
             let mut changed = report.clone();
             changed[field] = "replacement".into();
             assert!(validate(&changed, 0, None).is_err());

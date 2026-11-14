@@ -10,7 +10,7 @@ struct Arguments {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match kuberic_kind_tests::run_node(&Arguments::parse().config).await {
+    match kuberic_operator::node::run(&Arguments::parse().config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let message = format!("node cleanup observer failed: {error:#}");
