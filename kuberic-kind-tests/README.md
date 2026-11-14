@@ -52,7 +52,7 @@ always attempts owned-cluster deletion.
 ## What is exercised
 
 The host test process prepares and observes the isolated cluster. Ordinary
-bootstrap, early-deletion and primary application-crash journeys install the generated namespace-scoped
+bootstrap, early-deletion and application-crash journeys install the generated namespace-scoped
 operator Deployment/RBAC. Their Job only creates/deletes KubericSets, sends
 application requests and observes results; its Role cannot mutate workload
 resources or parent status. The operator owns reconciliation and native FM
@@ -99,9 +99,17 @@ The journey now restores the failed original Node, then crashes the new Primary
 and verifies another failover/restoration with a distinct acknowledged write.
 At each restoration boundary the host inspects every UID-validated live runner,
 requires native full membership and fresh replica IDs/instances, and checks the
-retired application's actual reaping/group/root evidence without forced cleanup.
+retired application's actual reaping/group/root evidence. Forced predecessor
+cleanup remains observable but is not a veto once all physical cleanup succeeds.
 Test-only host ConfigMap acknowledgements gate the next fault; they are not
 operator cleanup authority or a production shutdown barrier.
+
+The Secondary application-crash journey faults each original Secondary in turn,
+retains the same Primary endpoint and Service Pod UID selector, verifies
+acknowledged data and continuing writes, and requires fresh replica identities
+and native full membership before the next fault. Host inspection gates progress
+with the same test-only acknowledgement; ordinary driver workload RBAC remains
+read-only.
 
 The fixture derives from the operator runtime image and installs its shared
 owned-node supervisor at `/opt/fube/fube-node`, with the

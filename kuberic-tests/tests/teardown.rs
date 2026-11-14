@@ -72,10 +72,23 @@ async fn drive_unrouted(fixture: &Fixture) {
 
 #[tokio::test]
 async fn deleting_during_primary_reconfiguration_finishes_it_without_client_publication() {
+    deleting_during_repair(false).await;
+}
+
+#[tokio::test]
+async fn deleting_during_secondary_repair_finishes_it_without_client_publication() {
+    deleting_during_repair(true).await;
+}
+
+async fn deleting_during_repair(secondary: bool) {
     let fixture = Fixture::new().await;
     fixture.serving().await;
     let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
-    fixture.fm.lose_primary().await;
+    if secondary {
+        fixture.fm.lose_application(0).await;
+    } else {
+        fixture.fm.lose_primary().await;
+    }
     request_delete(&fixture).await;
     fixture.drive().await;
     drive_unrouted(&fixture).await;

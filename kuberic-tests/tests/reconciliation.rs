@@ -368,7 +368,7 @@ fn restored_original_node_can_fail_over_again_without_reusing_a_retired_replica(
 
 #[test]
 fn repair_requires_old_deletion_fresh_build_and_exact_final_configuration() {
-    for invalid in 0..3 {
+    for (node, invalid) in (0..3).flat_map(|invalid| [0, 1].map(|node| (node, invalid))) {
         let config = config();
         let mut state = State::new(config.clone()).unwrap();
         bootstrap(&mut state, &config);
@@ -376,8 +376,8 @@ fn repair_requires_old_deletion_fresh_build_and_exact_final_configuration() {
         let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
         state
             .observe(
-                1,
-                &replica_up_message(&app_host_loss(&config, &committed.unit, 1), Owner::Fm)
+                node,
+                &replica_up_message(&app_host_loss(&config, &committed.unit, node), Owner::Fm)
                     .unwrap(),
             )
             .unwrap();
@@ -397,7 +397,7 @@ fn repair_requires_old_deletion_fresh_build_and_exact_final_configuration() {
                     }
                     1 => {
                         let mut body = decode_add_replica_reply(&reply).unwrap().0;
-                        body.replica.id = config.nodes[1].replica_id;
+                        body.replica.id = config.nodes[node].replica_id;
                         add_replica_reply_message(&body, Owner::Fm).unwrap()
                     }
                     _ => {
@@ -417,14 +417,13 @@ fn repair_requires_old_deletion_fresh_build_and_exact_final_configuration() {
 }
 
 #[test]
-fn invalid_loss_history_secondary_loss_and_lost_survivor_never_grant_promotion() {
-    for invalid in 0..6 {
+fn invalid_loss_history_and_lost_survivor_never_grant_promotion() {
+    for (node, invalid) in (1..6).flat_map(|invalid| [0, 1].map(|node| (node, invalid))) {
         let config = config();
         let mut state = State::new(config.clone()).unwrap();
         bootstrap(&mut state, &config);
         let replies = serving(&mut state);
         let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
-        let node = if invalid == 0 { 0 } else { 1 };
         let mut report = app_host_loss(&config, &committed.unit, node);
         match invalid {
             1 => report.dropped.0[0].unit.current.configuration += 1,
@@ -456,6 +455,273 @@ fn invalid_loss_history_secondary_loss_and_lost_survivor_never_grant_promotion()
         assert!(state.status().service_endpoint.is_none());
         assert!(state.reconcile(Duration::ZERO).is_err());
     }
+}
+
+#[test]
+fn repeated_secondary_loss_reports_do_not_extend_any_repair_stage_deadline() {
+    for stage in 0..4 {
+        let config = config();
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let replies = serving(&mut state);
+        let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+        let report =
+            replica_up_message(&current_app_host_loss(&config, &committed, 0), Owner::Fm).unwrap();
+        state.observe(0, &report).unwrap();
+        for _ in 0..stage {
+            let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            state
+                .observe(command.node, &completion(&command.message))
+                .unwrap();
+        }
+        state.reconcile(Duration::ZERO).unwrap();
+        state.observe(0, &report).unwrap();
+        assert!(state
+            .reconcile(Duration::from_millis(config.operation_timeout_ms))
+            .is_err());
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+    }
+}
+
+#[test]
+fn secondary_loss_removes_exact_predecessor_and_repairs_without_changing_primary() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    let replies = serving(&mut state);
+    let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+    let endpoint = state.status().service_endpoint;
+    let report = current_app_host_loss(&config, &committed, 0);
+    let loss = replica_up_message(&report, Owner::Fm).unwrap();
+    state.observe(0, &loss).unwrap();
+    assert_eq!(state.phase(), Phase::Restoring);
+    assert_eq!(state.status().restoring_node_id.as_deref(), Some("1"));
+    assert_eq!(state.status().service_endpoint, endpoint);
+    let removal = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+    assert_eq!(removal.node, 1);
+    let request = decode_do_reconfiguration(&removal.message).unwrap().0;
+    assert_eq!(request.configuration.unit.previous, committed.unit.current);
+    assert_eq!(
+        request.configuration.unit.current.configuration,
+        committed.unit.current.configuration + 1
+    );
+    assert_eq!(
+        request.configuration.unit.current.data_loss,
+        committed.unit.current.data_loss
+    );
+    for replica in &request.configuration.replicas.0 {
+        let previous = committed
+            .replicas
+            .0
+            .iter()
+            .find(|old| old.node == replica.node)
+            .unwrap();
+        assert_eq!(replica.previous_role, previous.current_role);
+        if replica.node == config.nodes[0].identity.native().unwrap() {
+            assert_eq!(replica.current_role, 1);
+            assert!(!replica.up);
+            assert_eq!(replica.state, 3);
+        } else {
+            assert_eq!(replica.current_role, previous.current_role);
+            assert_eq!(replica.service_endpoint, previous.service_endpoint);
+        }
+    }
+    state.observe(0, &loss).unwrap();
+    assert_eq!(
+        state.reconcile(Duration::from_millis(100)).unwrap(),
+        vec![removal.clone()]
+    );
+    let reduced = completion(&removal.message);
+    state.observe(1, &reduced).unwrap();
+    let deletion = state
+        .reconcile(Duration::from_millis(100))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(deletion.node, 0);
+    assert_eq!(
+        decode_delete_replica(&deletion.message)
+            .unwrap()
+            .0
+            .replica
+            .0
+            .unit,
+        committed.unit
+    );
+    state.observe(1, &reduced).unwrap();
+    state.observe(0, &loss).unwrap();
+    assert_eq!(state.status().service_endpoint, endpoint);
+    state.observe(0, &completion(&deletion.message)).unwrap();
+    let build = state
+        .reconcile(Duration::from_millis(100))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(build.node, 1);
+    let fresh = decode_add_replica(&build.message).unwrap().0;
+    assert!(
+        fresh.replica.id
+            > config
+                .nodes
+                .iter()
+                .map(|node| node.replica_id)
+                .max()
+                .unwrap()
+    );
+    state.observe(1, &completion(&build.message)).unwrap();
+    assert_eq!(state.phase(), Phase::Restoring);
+    assert_eq!(state.status().service_endpoint, endpoint);
+    let admission = state
+        .reconcile(Duration::from_millis(100))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let reply = completion(&admission.message);
+    state.observe(1, &reply).unwrap();
+    assert_eq!(state.phase(), Phase::Serving);
+    assert_eq!(state.status().primary_node_id, "2");
+    assert_eq!(state.status().service_endpoint, endpoint);
+    let restored = decode_do_reconfiguration_reply(&reply).unwrap().0;
+    assert_eq!(restored.replicas.0.len(), 3);
+    assert_eq!(
+        restored.unit.current.configuration,
+        committed.unit.current.configuration + 2
+    );
+    state.observe(0, &loss).unwrap();
+    assert!(state
+        .reconcile(Duration::from_millis(100))
+        .unwrap()
+        .is_empty());
+    state.request_shutdown(Duration::from_millis(100)).unwrap();
+    let deletion = state
+        .reconcile(Duration::from_millis(100))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let target = decode_delete_replica(&deletion.message)
+        .unwrap()
+        .0
+        .replica
+        .0;
+    assert_eq!(target.unit, restored.unit);
+    assert_eq!(target.replica.id, fresh.replica.id);
+    assert_eq!(target.replica.instance, fresh.replica.instance);
+}
+
+#[test]
+fn secondary_removal_requires_exact_survivors_and_preserved_primary_endpoint() {
+    for invalid in 0..4 {
+        let config = config();
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let replies = serving(&mut state);
+        let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+        state
+            .observe(
+                0,
+                &replica_up_message(&current_app_host_loss(&config, &committed, 0), Owner::Fm)
+                    .unwrap(),
+            )
+            .unwrap();
+        let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        let mut reply =
+            completed_configuration(&decode_do_reconfiguration(&command.message).unwrap().0);
+        match invalid {
+            0 => reply.replicas.0[0].service_endpoint.push_str("/changed"),
+            1 => reply.replicas.0[1] = reply.replicas.0[0].clone(),
+            2 => reply.unit.current.configuration += 1,
+            3 => reply.error = -1,
+            _ => unreachable!(),
+        }
+        assert!(state
+            .observe(
+                command.node,
+                &do_reconfiguration_reply_message(&reply, Owner::Fm).unwrap()
+            )
+            .is_err());
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+    }
+}
+
+#[test]
+fn another_application_loss_during_each_secondary_repair_stage_blocks() {
+    for stage in 0..4 {
+        for other in [1, 2] {
+            let config = config();
+            let mut state = State::new(config.clone()).unwrap();
+            bootstrap(&mut state, &config);
+            let replies = serving(&mut state);
+            let mut committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+            state
+                .observe(
+                    0,
+                    &replica_up_message(&current_app_host_loss(&config, &committed, 0), Owner::Fm)
+                        .unwrap(),
+                )
+                .unwrap();
+            for _ in 0..stage {
+                let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+                let reply = completion(&command.message);
+                if command.message.properties().unwrap().action == "DoReconfiguration" {
+                    committed = decode_do_reconfiguration_reply(&reply).unwrap().0;
+                }
+                state.observe(command.node, &reply).unwrap();
+            }
+            assert!(state
+                .observe(
+                    other,
+                    &replica_up_message(
+                        &current_app_host_loss(&config, &committed, other),
+                        Owner::Fm
+                    )
+                    .unwrap()
+                )
+                .is_err());
+            assert_eq!(state.phase(), Phase::ControlUnknown);
+            assert!(state.status().service_endpoint.is_none());
+        }
+    }
+}
+
+#[test]
+fn secondary_repair_outlives_replay_history_and_can_be_followed_by_primary_failover() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    let replies = serving(&mut state);
+    let mut committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+    let original = current_app_host_loss(&config, &committed, 0);
+    for cycle in 0..35 {
+        let node = if cycle == 34 { 1 } else { cycle % 2 * 2 };
+        let report = current_app_host_loss(&config, &committed, node);
+        let message = replica_up_message(&report, Owner::Fm).unwrap();
+        state.observe(node, &message).unwrap();
+        let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        state
+            .observe(command.node, &completion(&command.message))
+            .unwrap();
+        let replies = restore(&mut state, Duration::ZERO);
+        committed = decode_do_reconfiguration_reply(&replies[2].1).unwrap().0;
+        let fresh = committed
+            .replicas
+            .0
+            .iter()
+            .find(|replica| replica.node == config.nodes[node].identity.native().unwrap())
+            .unwrap();
+        assert!(fresh.id > report.dropped.0[0].replicas.0[0].description.id);
+        state.observe(node, &message).unwrap();
+        assert!(state.reconcile(Duration::ZERO).unwrap().is_empty());
+        assert_eq!(
+            state.status().primary_node_id,
+            if cycle == 34 { "1" } else { "2" }
+        );
+    }
+    assert!(state
+        .observe(0, &replica_up_message(&original, Owner::Fm).unwrap())
+        .is_err());
+    assert_eq!(state.phase(), Phase::ControlUnknown);
 }
 
 #[test]

@@ -74,6 +74,33 @@ async fn primary_application_failover_withdraws_then_routes_only_native_complete
     fixture.api.check();
 }
 
+#[tokio::test]
+async fn secondary_application_repair_keeps_exact_primary_routing_until_final_admission() {
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let original = fixture.set().await.status.unwrap();
+    let selected = selector(&fixture).await;
+    fixture.fm.lose_application(0).await;
+    for _ in 0..4 {
+        fixture.drive().await;
+        let status = fixture.set().await.status.unwrap();
+        assert_eq!(status.phase, ControllerPhase::Restoring);
+        assert_eq!(status.cohort(), original.cohort());
+        assert_eq!(status.primary_node_id, original.primary_node_id);
+        assert_eq!(status.service_endpoint, original.service_endpoint);
+        assert_eq!(selector(&fixture).await, selected);
+        let command = fixture.fm.command().await;
+        fixture.fm.complete(&command).await;
+    }
+    fixture.drive().await;
+    assert_eq!(
+        fixture.set().await.status.unwrap().phase,
+        ControllerPhase::Serving
+    );
+    assert_eq!(selector(&fixture).await, selected);
+    fixture.api.check();
+}
+
 async fn delete<K>(api: &Api<K>, object: &K)
 where
     K: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug + serde::de::DeserializeOwned,

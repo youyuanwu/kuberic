@@ -134,6 +134,23 @@ pub fn app_host_loss(config: &Config, unit: &FailoverUnit, node: usize) -> Repli
     }
 }
 
+pub fn current_app_host_loss(
+    config: &Config,
+    completed: &ConfigurationReply,
+    node: usize,
+) -> ReplicaUp {
+    let mut report = app_host_loss(config, &completed.unit, node);
+    let replica = completed
+        .replicas
+        .0
+        .iter()
+        .find(|replica| replica.node == config.nodes[node].identity.native().unwrap())
+        .unwrap();
+    report.dropped.0[0].replicas.0[0].description.id = replica.id;
+    report.dropped.0[0].replicas.0[0].description.instance = replica.instance;
+    report
+}
+
 pub fn completion(message: &Message) -> Message {
     match message.properties().unwrap().action.as_str() {
         "AddPrimary" => add_primary_reply_message(
