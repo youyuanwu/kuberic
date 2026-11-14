@@ -6,6 +6,22 @@ pub mod driver;
 pub mod host;
 mod node;
 mod processes;
-mod shutdown;
 
 pub use node::run as run_node;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scenario {
+    Bootstrap,
+    DeleteDuringBootstrap,
+    StaggeredShutdown,
+}
+
+impl Scenario {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::DeleteDuringBootstrap => "delete-during-bootstrap",
+            Self::StaggeredShutdown => "staggered-shutdown",
+        }
+    }
+}

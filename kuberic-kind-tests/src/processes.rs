@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{ensure, Context, Result};
 use async_trait::async_trait;
@@ -18,17 +18,15 @@ pub(crate) struct PodProcesses {
     admission: BackendAdmission,
     pods: Api<Pod>,
     reports: Mutex<BTreeMap<String, Report>>,
-    shutdown: Mutex<crate::shutdown::Shutdown>,
 }
 
 impl PodProcesses {
-    pub async fn new(client: Client, namespace: &str, ip: &str) -> Result<Self> {
-        Ok(Self {
+    pub fn new(client: Client, namespace: &str) -> Self {
+        Self {
             admission: BackendAdmission::default(),
             pods: Api::namespaced(client, namespace),
             reports: Mutex::new(BTreeMap::new()),
-            shutdown: Mutex::new(crate::shutdown::Shutdown::bind(ip).await?),
-        })
+        }
     }
 
     pub async fn verify_complete(&self, cohort: &FrozenCohort) -> Result<()> {
@@ -65,7 +63,6 @@ impl ProcessApi for PodProcesses {
         self.admission.require(&cohort.allocation).await?;
         let mut reports = self.reports.lock().await;
         let mut nodes = Vec::new();
-        let mut deleting = BTreeSet::new();
         for (node, binding) in cohort.allocation.nodes.iter().zip(&cohort.bindings) {
             let pod = self.pods.get_opt(&node.pod_name).await?;
             let outcome = match pod {
@@ -74,9 +71,6 @@ impl ProcessApi for PodProcesses {
                         pod.uid().as_deref() == Some(&binding.pod_uid),
                         "cleanup cannot adopt a replacement Pod"
                     );
-                    if pod.metadata.deletion_timestamp.is_some() {
-                        deleting.insert(binding.pod_uid.clone());
-                    }
                     let terminated = pod
                         .status
                         .as_ref()
@@ -139,11 +133,6 @@ impl ProcessApi for PodProcesses {
                 outcome,
             });
         }
-        self.shutdown
-            .lock()
-            .await
-            .observe(cohort, &deleting)
-            .await?;
         Ok(Some(ProcessObservation {
             cohort: cohort.clone(),
             nodes,
