@@ -106,14 +106,30 @@ Delete and positively clean all KubericSets before intentionally replacing or
 uninstalling a healthy operator. After unsupported owner loss, intervention
 must establish actual original-node/application shutdown before removing
 retained finalizers or deploying a fresh lifetime. There is no automatic
-restart recovery, reconnect, failover, replacement, persistence or upgrade
+restart recovery, reconnect, Node/Pod-loss failover, replacement, persistence or upgrade
 workflow.
+
+## Primary application-crash failover
+
+With the original operator and Node/control sessions alive, the FM can react to
+matched native loss of a fully admitted Primary application. It drives shared
+native reconfiguration with committed history and a fresh configuration epoch,
+and waits for final quorum/configuration completion before publishing the new
+Primary. During `reconfiguring`, the operator withdraws Service routing; on
+completion it selects the new Primary's exact original Pod UID and records
+`status.primaryNodeId`. It never rewrites the frozen allocation or restarts Pods.
+
+This is unplanned application-process failover, not graceful switchover or
+Node/Pod/network-partition recovery. Further loss in the reduced cohort remains
+blocked. The failed application can remain an owned zombie until Node teardown;
+normal native deletion and validated physical cleanup are still required for
+every original Node before finalizer release.
 
 ## Qualification
 
 Mock-backed runtime tests cover independent original owners, reserved
 listeners, stale parent UIDs, restart refusal and cleanup evidence. Real
-KinD bootstrap and early-deletion journeys run against the deployed operator;
+KinD bootstrap, early-deletion and application-crash failover journeys run against the deployed operator;
 their driver has only read access to workload resources. The separate
 staggered-shutdown qualification retains explicit deterministic reconciliation
 scheduling. See the live inventory with `cargo test --workspace -- --list`.

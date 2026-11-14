@@ -98,11 +98,20 @@ impl Cluster {
     }
 
     pub async fn until(&mut self, phase: &str) -> Value {
+        self.until_status(phase, |status| status["phase"] == phase)
+            .await
+    }
+
+    pub async fn until_status(
+        &mut self,
+        description: &str,
+        ready: impl Fn(&Value) -> bool,
+    ) -> Value {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = self.status() {
                 assert!(status["error"].is_null(), "{}", self.diagnostics());
-                if status["phase"] == phase {
+                if ready(&status) {
                     return status;
                 }
             }
@@ -115,7 +124,7 @@ impl Cluster {
             }
             assert!(
                 Instant::now() < deadline,
-                "FM {phase} deadline: {}",
+                "FM {description} deadline: {}",
                 self.diagnostics()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;

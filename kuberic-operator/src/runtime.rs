@@ -237,6 +237,7 @@ impl Operator {
                 "event": "lifecycle_complete", "name": owner.name, "set_uid": owner.uid,
                 "cohort": native.cohort,
                 "deployment": native.cohort.allocation.deployment, "reports": reports,
+                "primary_node_id": native.status.primary_node_id,
                 "native_joined": true, "resources_absent": true
             })
         );

@@ -160,6 +160,7 @@ pub enum ControllerPhase {
     Provisioning,
     Configuring,
     Starting,
+    Reconfiguring,
     Serving,
     Stopping,
     Stopped,
@@ -199,6 +200,8 @@ pub struct KubericSetStatus {
     pub allocation: Option<Allocation>,
     pub bindings: Option<Vec<Binding>>,
     pub service_endpoint: Option<String>,
+    #[serde(default)]
+    pub primary_node_id: Option<String>,
     pub reason: Option<String>,
     #[serde(default)]
     pub bootstrap_wait: Option<BootstrapWait>,

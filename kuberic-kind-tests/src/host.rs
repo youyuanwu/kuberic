@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context, Result};
-use kube::CustomResourceExt;
+use kube::{CustomResourceExt, ResourceExt};
 use serde_json::{json, Value};
 
 use crate::Scenario;
@@ -333,6 +333,7 @@ impl Cluster {
 
     fn wait_for_scenario(&self, namespace: &str, scenario: Scenario) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(600);
+        let mut original_operator = None;
         loop {
             let job: Value = serde_json::from_str(
                 &self.kubectl(&["-n", namespace, "get", "job", "driver", "-o", "json"])?,
@@ -342,6 +343,41 @@ impl Cluster {
                 "in-cluster driver failed: {}",
                 job["status"]
             );
+            if scenario == Scenario::PrimaryAppFailover && original_operator.is_none() {
+                let pods: Value = serde_json::from_str(&self.kubectl(&[
+                    "-n",
+                    namespace,
+                    "get",
+                    "pods",
+                    "-l",
+                    "job-name=driver",
+                    "-o",
+                    "json",
+                ])?)?;
+                if pods["items"]
+                    .as_array()
+                    .context("driver Pods")?
+                    .iter()
+                    .any(|pod| {
+                        pod["status"]["containerStatuses"]
+                            .as_array()
+                            .is_some_and(|containers| {
+                                containers
+                                    .iter()
+                                    .any(|container| container["state"]["running"].is_object())
+                            })
+                    })
+                {
+                    let logs = self.kubectl(&["-n", namespace, "logs", "job/driver"])?;
+                    for line in logs.lines().filter(|line| line.starts_with('{')) {
+                        let event: Value = serde_json::from_str(line)?;
+                        if event["event"] == "failover_ready" {
+                            original_operator = Some(self.crash_primary_app(namespace, &event)?);
+                            break;
+                        }
+                    }
+                }
+            }
             if job["status"]["succeeded"].as_u64() == Some(1) {
                 break;
             }
@@ -367,6 +403,23 @@ impl Cluster {
                     && event["resources_absent"] == true
             })
             .context("successful driver omitted final lifecycle verification")?;
+        if scenario == Scenario::PrimaryAppFailover {
+            ensure!(
+                original_operator.as_ref() == Some(&self.operator_uid(namespace)?),
+                "failover lost or restarted the original operator"
+            );
+            ensure!(
+                events
+                    .iter()
+                    .any(|event| event["event"] == "primary_app_failover"
+                        && event["set_uid"] == completed["set_uid"]
+                        && event["cohort"] == completed["cohort"]
+                        && event["data_preserved"] == true
+                        && event["writes_continued"] == true
+                        && event["original_nodes_unchanged"] == true),
+                "successful driver omitted actual application-crash failover evidence"
+            );
+        }
         ensure!(
             scenario == Scenario::DeleteDuringBootstrap
                 || events
@@ -395,6 +448,20 @@ impl Cluster {
                 .map(serde_json::from_str)
                 .collect::<std::result::Result<_, _>>()?;
             verify_operator_cleanup(completed, &operator_events)?;
+            if scenario == Scenario::PrimaryAppFailover {
+                let promoted = events
+                    .iter()
+                    .find(|event| event["event"] == "primary_app_failover")
+                    .context("missing promoted primary")?;
+                ensure!(
+                    operator_events
+                        .iter()
+                        .any(|event| event["event"] == "lifecycle_complete"
+                            && event["set_uid"] == completed["set_uid"]
+                            && event["primary_node_id"] == promoted["primary_node_id"]),
+                    "native lifecycle completion did not retain the promoted primary"
+                );
+            }
         }
         ensure!(
             scenario != Scenario::StaggeredShutdown
@@ -427,6 +494,115 @@ impl Cluster {
         );
         Ok(())
     }
+
+    fn operator_uid(&self, namespace: &str) -> Result<String> {
+        let pods: Value = serde_json::from_str(&self.kubectl(&[
+            "-n",
+            namespace,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=kuberic-operator",
+            "-o",
+            "json",
+        ])?)?;
+        let pods = pods["items"].as_array().context("operator Pods")?;
+        ensure!(
+            pods.len() == 1,
+            "qualification requires one original operator Pod"
+        );
+        ensure!(
+            pods[0]["status"]["containerStatuses"]
+                .as_array()
+                .is_some_and(|containers| containers.len() == 1
+                    && containers[0]["restartCount"] == 0
+                    && containers[0]["state"]["running"].is_object()),
+            "original operator is not continuously running"
+        );
+        Ok(pods[0]["metadata"]["uid"]
+            .as_str()
+            .context("operator UID")?
+            .into())
+    }
+
+    fn crash_primary_app(&self, namespace: &str, event: &Value) -> Result<String> {
+        let cohort: kuberic_operator::FrozenCohort =
+            serde_json::from_value(event["cohort"].clone())?;
+        cohort.fm_config()?;
+        let set: kuberic_operator::KubericSet = serde_json::from_str(&self.kubectl(&[
+            "-n",
+            namespace,
+            "get",
+            "kubericset",
+            &cohort.allocation.resource_name,
+            "-o",
+            "json",
+        ])?)?;
+        ensure!(
+            set.uid().as_deref() == Some(&cohort.allocation.resource_uid)
+                && set.namespace().as_deref() == Some(namespace)
+                && event["set_uid"] == cohort.allocation.resource_uid
+                && set
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.cohort().as_ref() == Some(&cohort)
+                        && status.phase == kuberic_operator::ControllerPhase::Serving
+                        && status.primary_node_id.as_ref()
+                            == Some(&cohort.allocation.nodes[1].node_id)),
+            "fault request changed original Serving authority"
+        );
+        let name = &cohort.allocation.nodes[1].pod_name;
+        let pod: k8s_openapi::api::core::v1::Pod = serde_json::from_str(
+            &self.kubectl(&["-n", namespace, "get", "pod", name, "-o", "json"])?,
+        )?;
+        ensure!(
+            pod.uid().as_deref() == Some(&cohort.bindings[1].pod_uid)
+                && pod.metadata.deletion_timestamp.is_none()
+                && pod
+                    .owner_references()
+                    .iter()
+                    .any(|owner| owner.controller == Some(true)
+                        && owner.uid == cohort.allocation.resource_uid)
+                && pod.labels().get(kuberic_operator::resources::POD_UID)
+                    == Some(&cohort.bindings[1].pod_uid)
+                && pod.status.as_ref().is_some_and(|status| status
+                    .container_statuses
+                    .as_ref()
+                    .is_some_and(|containers| containers.len() == 1
+                        && containers[0].restart_count == 0
+                        && containers[0]
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.running.is_some()))),
+            "fault target is not the running original primary Pod"
+        );
+        let operator = self.operator_uid(namespace)?;
+        let logs = self.kubectl(&[
+            "-n",
+            namespace,
+            "exec",
+            name,
+            "-c",
+            "node",
+            "--",
+            "/opt/fube/kuberic-kind",
+            "crash-primary-app",
+            "--cohort",
+            &serde_json::to_string(&cohort)?,
+        ])?;
+        let report: Value = serde_json::from_str(logs.trim())?;
+        ensure!(
+            report["event"] == "primary_app_crashed"
+                && report["set_uid"] == cohort.allocation.resource_uid
+                && report["pod_uid"] == cohort.bindings[1].pod_uid
+                && report["application_pid"]
+                    .as_u64()
+                    .is_some_and(|pid| pid > 1),
+            "fault injector omitted original application-crash evidence"
+        );
+        eprintln!("{logs}");
+        Ok(operator)
+    }
 }
 
 fn scenario_resources(
@@ -439,6 +615,7 @@ fn scenario_resources(
         Scenario::Bootstrap => vec!["run"],
         Scenario::DeleteDuringBootstrap => vec!["run", "--early-delete"],
         Scenario::StaggeredShutdown => vec!["run", "--staggered-shutdown"],
+        Scenario::PrimaryAppFailover => vec!["run", "--primary-app-failover"],
     };
     let scripted = scenario == Scenario::StaggeredShutdown;
     let rules = if scripted {

@@ -28,3 +28,12 @@ fn original_node_exits_before_remaining_pods_receive_deletion() {
         .scenario(Scenario::StaggeredShutdown)
         .unwrap();
 }
+
+#[test]
+#[ignore = "requires an explicitly owned KinD cluster; run just kind-test"]
+fn primary_application_crash_preserves_data_and_updates_deployed_operator_routing() {
+    Cluster::from_env()
+        .unwrap()
+        .scenario(Scenario::PrimaryAppFailover)
+        .unwrap();
+}

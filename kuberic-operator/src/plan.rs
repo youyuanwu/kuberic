@@ -398,11 +398,7 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
             cohort.as_ref() == Some(&report.cohort),
             "FM report belongs to a different frozen cohort"
         );
-        ensure!(
-            report.status.deployment == allocation.deployment
-                && report.status.primary_node_id == allocation.nodes[1].node_id,
-            "native status changed deployment or initial primary"
-        );
+        report.primary_index()?;
         ensure!(
             report.status.phase != Phase::ControlUnknown && report.status.error.is_none(),
             "native FM control uncertainty: {}",
@@ -569,12 +565,13 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         "serving FM report has no native service endpoint"
     );
     let publish = serving && !deleting;
+    let primary = report.primary_index()?;
     let selector = if publish {
         BTreeMap::from([
             (SET_UID.into(), allocation.resource_uid.clone()),
             (DEPLOYMENT.into(), allocation.deployment.clone()),
-            (NODE_ID.into(), allocation.nodes[1].node_id.clone()),
-            (POD_UID.into(), cohort.bindings[1].pod_uid.clone()),
+            (NODE_ID.into(), allocation.nodes[primary].node_id.clone()),
+            (POD_UID.into(), cohort.bindings[primary].pod_uid.clone()),
         ])
     } else {
         resources::disabled_selector(set)?
@@ -594,12 +591,14 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
     } else {
         match report.status.phase {
             Phase::Serving => ControllerPhase::Serving,
+            Phase::Reconfiguring => ControllerPhase::Reconfiguring,
             Phase::Deleting | Phase::AwaitingNodeShutdown => ControllerPhase::Stopping,
             Phase::Stopped => ControllerPhase::Stopped,
             _ => ControllerPhase::Starting,
         }
     };
     next.service_endpoint = report.status.service_endpoint.clone().filter(|_| publish);
+    next.primary_node_id = publish.then(|| report.status.primary_node_id.clone());
     next.reason = None;
     if &next != status {
         return Ok(Plan::Status(Box::new(next)));

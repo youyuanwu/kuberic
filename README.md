@@ -8,7 +8,10 @@ Kuberic is being rebuilt on top of [fube](fube/). The initial implementation is
 
 The FM owns fresh bootstrap, initial primary placement, sequential replica
 builds, native 3/2 admission, endpoint publication, exact retries and normal
-replica deletion. Its deterministic reconciliation core and native-channel
+replica deletion. After matched native Primary application-host loss in a
+fully admitted cohort, it can reconfigure the surviving original replicas and
+publish their new Primary after final native completion. Its deterministic
+reconciliation core and native-channel
 adapter use the same fube codecs as the real nodes.
 
 Each KubericSet supports one fresh volatile partition with three immutable
@@ -16,8 +19,9 @@ original nodes. The Kubernetes-facing library and experimental
 [`kuberic-operator`](kuberic-operator/README.md) are qualified against a mock
 API, local processes and an isolated KinD cluster. The operator provides a
 namespace-scoped watch/requeue loop, image build and installation manifests;
-it is not production-ready or restart-recoverable. There is no
-replica persistence/recovery, failover, switchover, replacement, reconnect,
+it is not production-ready or restart-recoverable. The supported failover is
+an application-process crash, not Node/Pod loss or a network partition.
+There is no replica persistence/recovery, switchover, replacement, reconnect,
 resize or rolling upgrade. FM state is in-memory; restarting the FM does not
 recover the deployment. A lost original
 channel or invalid completion produces explicit control uncertainty and withdraws
@@ -39,7 +43,8 @@ reconciliation through a mock-backed `kube::Client`.
 Shared helpers live in `kuberic-tests/src` and are imported through the crate.
 On Linux, it also builds and launches the real FM, node and sample
 application binaries automatically. Its process journeys verify application
-write/readback and lifecycle cleanup, not failover or recovery.
+write/readback, application-crash failover and lifecycle cleanup, not Node-loss
+failover or restart recovery.
 Use `cargo test --workspace -- --list` for the live inventory.
 
 The separate [`kuberic-kind-tests`](kuberic-kind-tests/README.md) crate qualifies
@@ -47,7 +52,9 @@ real Kubernetes bootstrap, a quorum-acknowledged sample write/read through the
 primary Service, and finalizer-driven physical cleanup. It also deletes during
 bootstrap without publishing client access and qualifies a node completing
 cleanup before the remaining Pods receive deletion requests, without a shutdown
-barrier. These tests require an explicitly owned KinD cluster and run with
+barrier. Its deployed application-crash journey verifies preserved data, continued
+writes and changed-primary Service routing without replacing the original Pods.
+These tests require an explicitly owned KinD cluster and run with
 `just kind-test`, not ordinary workspace tests.
 
 ## Kubernetes bootstrap controller
@@ -74,6 +81,39 @@ Bootstrap proceeds through separately observed facts:
   IP; target/minimum sizes remain 3/2.
 - Publish the opaque native endpoint and select the exact original primary Pod
   only after final native configuration completion.
+
+### Primary application-crash failover
+
+Only a matched native dropped-replica report from the Serving Primary's original
+Node/channel, with the exact committed partition/epoch and replica incarnation,
+admits failover. The original operator/FM and all Node/control sessions must
+remain alive. Service-type changes, TCP failure and Kubernetes Pod readiness do
+not authorize promotion.
+
+The FM freezes a new configuration epoch and previous committed membership,
+marks the failed original replica down and requests native reconfiguration on an
+original Secondary. Shared RA owns GetLSN, PC/CC quorum evaluation and
+Deactivate/Activate; the FM does not invent LSNs, replication acknowledgements
+or data-loss authority. It withdraws endpoint publication while reconfiguring.
+The operator disables routing when it observes that phase and selects the exact
+new original Primary Pod UID only after validated final native completion.
+`status.primaryNodeId` describes the observed Serving Primary; the accepted
+allocation and node configurations remain immutable.
+
+This supports a primary application crash from fully admitted original 3/2
+membership, not further failures of the resulting reduced cohort. Secondary
+loss, interrupted reconfiguration, missing/invalid completion and original
+channel loss block rather than granting a new writer. Operator restart, whole
+Node/Pod loss, reconnection, replacement and network-partition failover remain
+unsupported. Routing withdrawal is not itself writer fencing.
+
+Teardown retains the failed replica's original epoch separately from the
+survivors' completed configuration. Every original replica still requires its
+actual normal deletion acknowledgement, and every original Node/application
+requires positive physical cleanup. A crashed application may remain an owned
+zombie until Node teardown; successful failover is not a reaping receipt.
+
+### Bootstrap authority
 
 Owned-resource writes retain UID/resourceVersion checks and effects revalidate
 their observation. A `StaleObservation` error means the planned effect was
@@ -241,6 +281,9 @@ The process tests exercise the standalone FM binary and the mock-backed
 controller/native-FM bridge with real node binaries and sample application
 children. They check write/readback, native-controlled client routing and
 controller-driven finalizer teardown with independent process-cleanup receipts.
+Primary application-crash journeys drive actual native reconfiguration, preserve
+an acknowledged value, continue writes through the new Primary, and clean up
+every original Node.
 Deletion during node startup also qualifies bootstrap completion without client
 publication, followed by the same native deletion and physical cleanup.
 They need no Docker, Kubernetes or native Service Fabric.

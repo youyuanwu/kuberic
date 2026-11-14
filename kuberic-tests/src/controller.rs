@@ -68,6 +68,7 @@ struct ScriptedSession {
     state: State,
     joined: bool,
     now: Duration,
+    configured: Option<ConfigurationReply>,
 }
 
 #[derive(Default)]
@@ -128,13 +129,29 @@ impl ScriptedFm {
 
     pub async fn complete(&self, outbound: &Outbound) {
         let reply = native_completion(&outbound.message);
-        self.session
-            .lock()
-            .await
-            .as_mut()
-            .unwrap()
+        let mut session = self.session.lock().await;
+        let session = session.as_mut().unwrap();
+        session.state.observe(outbound.node, &reply).unwrap();
+        if outbound.message.properties().unwrap().action == "DoReconfiguration" {
+            session.configured = Some(decode_do_reconfiguration_reply(&reply).unwrap().0);
+        }
+    }
+
+    pub async fn lose_primary(&self) {
+        let mut session = self.session.lock().await;
+        let session = session.as_mut().unwrap();
+        let config = session.cohort.fm_config().unwrap();
+        let primary = session.state.status().primary_node_id;
+        let node = config
+            .nodes
+            .iter()
+            .position(|node| node.identity.id == primary)
+            .unwrap();
+        let report =
+            crate::fm::app_host_loss(&config, &session.configured.as_ref().unwrap().unit, node);
+        session
             .state
-            .observe(outbound.node, &reply)
+            .observe(node, &replica_up_message(&report, Owner::Fm).unwrap())
             .unwrap();
     }
 
@@ -190,6 +207,7 @@ impl FmApi for ScriptedFm {
             state: State::new(cohort.fm_config()?)?,
             joined: false,
             now: Duration::ZERO,
+            configured: None,
         });
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -321,7 +339,14 @@ pub fn native_completion(
         configuration.unit.previous = Epoch::default();
         for replica in &mut configuration.replicas.0 {
             replica.previous_role = 1;
+            if replica.current_role == 4 && replica.service_endpoint.is_empty() {
+                replica.service_endpoint = format!("client://native-primary-{}", replica.id);
+            }
         }
+        configuration
+            .replicas
+            .0
+            .retain(|replica| replica.current_role >= 3);
         return do_reconfiguration_reply_message(
             &ConfigurationReply {
                 unit: configuration.unit,

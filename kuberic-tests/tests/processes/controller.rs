@@ -8,7 +8,10 @@ use kube::{
 use kuberic_operator::{resources, ControllerPhase, FmApi, KubericSet, ProcessFm, Reconciler};
 use kuberic_tests::{
     controller as support,
-    process::{application, controller::Supervisor, reconcile, reserve},
+    process::{
+        application, assert_application_stopped, controller::Supervisor, crash_application,
+        reconcile, reserve, wait_replicated,
+    },
 };
 use serde_json::Value;
 use support::{NAME, NAMESPACE};
@@ -16,15 +19,20 @@ use tokio::time::Instant;
 
 #[tokio::test]
 async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
-    lifecycle(false).await;
+    lifecycle(false, false).await;
 }
 
 #[tokio::test]
 async fn deleting_during_node_startup_finishes_real_bootstrap_without_publishing_clients() {
-    lifecycle(true).await;
+    lifecycle(true, false).await;
 }
 
-async fn lifecycle(delete_during_bootstrap: bool) {
+#[tokio::test]
+async fn real_primary_app_crash_updates_controller_routing_without_replacing_original_cohort() {
+    lifecycle(false, true).await;
+}
+
+async fn lifecycle(delete_during_bootstrap: bool, failover: bool) {
     let api = support::api::MockApi::default();
     let client = api.client(NAMESPACE);
     let fm = Arc::new(ProcessFm::new());
@@ -45,7 +53,7 @@ async fn lifecycle(delete_during_bootstrap: bool) {
         .unwrap();
     let controller = Reconciler::new(client.clone(), settings, fm.clone(), evidence).unwrap();
     let deadline = Instant::now() + operation_budget;
-    let started = loop {
+    let mut started = loop {
         let result = reconcile(&controller, NAME).await.unwrap();
         assert!(
             result.blocked.is_none(),
@@ -102,6 +110,54 @@ async fn lifecycle(delete_during_bootstrap: bool) {
             selector.get(resources::POD_UID),
             Some(&cohort.bindings[1].pod_uid)
         );
+        if failover {
+            wait_replicated(endpoint).await;
+            let lost = crash_application(&supervisor.configs[&cohort.bindings[1].pod_uid]);
+            let deadline = Instant::now() + operation_budget;
+            started = loop {
+                let outcome = reconcile(&controller, NAME).await.unwrap();
+                assert!(
+                    outcome.blocked.is_none(),
+                    "{outcome:?}; FM={:?}",
+                    fm.observe().await.unwrap()
+                );
+                supervisor.tick(&set.uid().unwrap()).await;
+                let current = sets.get(NAME).await.unwrap();
+                let status = current.status.as_ref().unwrap();
+                assert_eq!(status.cohort().as_ref(), Some(&cohort));
+                if status.phase == ControllerPhase::Serving
+                    && status.primary_node_id.as_ref() == Some(&cohort.allocation.nodes[0].node_id)
+                {
+                    let next = status.service_endpoint.as_ref().unwrap();
+                    assert!(application(next, "read")
+                        .await
+                        .contains("value=acknowledged"));
+                    assert!(application(next, "write-more").await.starts_with("OK"));
+                    assert!(application(next, "read").await.contains("value=continued"));
+                    let selector = services
+                        .get(&resources::write_service_name(NAME))
+                        .await
+                        .unwrap()
+                        .spec
+                        .unwrap()
+                        .selector
+                        .unwrap();
+                    assert_eq!(
+                        selector.get(resources::POD_UID),
+                        Some(&cohort.bindings[0].pod_uid)
+                    );
+                    assert_application_stopped(lost);
+                    break current;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "controller failover timed out: {status:?}; FM={:?}; nodes={}",
+                    fm.observe().await.unwrap(),
+                    supervisor.diagnostics()
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+        }
     }
 
     sets.delete(
