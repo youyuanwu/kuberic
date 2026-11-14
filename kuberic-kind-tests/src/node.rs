@@ -65,7 +65,6 @@ pub async fn run(path: &Path) -> Result<()> {
             received = term.recv(), if !stopping => {
                 received.context("SIGTERM stream closed")?;
                 deadline = Some(Instant::now() + Duration::from_secs(23));
-                crate::shutdown::await_originals(&config).await?;
                 ensure!(
                     Command::new("/bin/kill")
                         .args(["-TERM", &child.pid().to_string()])

@@ -1,14 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Service};
 use kube::{
     api::{DeleteParams, ListParams, PostParams, Preconditions},
     Api, Client, ResourceExt,
 };
 use kuberic_controller::{
-    resources, ControllerPhase, FmApi, FmAuthority, FrozenCohort, KubericSet, ProcessFm,
-    Reconciler, Settings, StaleObservation,
+    resources, CleanupState, ControllerPhase, FmApi, FmAuthority, FrozenCohort, KubericSet,
+    ProcessFm, Reconciler, Settings, StaleObservation, TeardownStage,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -16,11 +16,12 @@ use tokio::{
     time::Instant,
 };
 
-use crate::processes::PodProcesses;
+use crate::{processes::PodProcesses, Scenario};
 
 const BUDGET: Duration = Duration::from_secs(180);
 
-pub async fn run(early_delete: bool) -> Result<()> {
+pub async fn run(scenario: Scenario) -> Result<()> {
+    let early_delete = scenario == Scenario::DeleteDuringBootstrap;
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("driver TLS provider was already installed"))?;
@@ -29,7 +30,7 @@ pub async fn run(early_delete: bool) -> Result<()> {
     let image = std::env::var("KUBERIC_TEST_IMAGE").context("KUBERIC_TEST_IMAGE is required")?;
     let client = Client::try_default().await?;
     let fm = Arc::new(ProcessFm::new());
-    let processes = Arc::new(PodProcesses::new(client.clone(), &namespace, &ip).await?);
+    let processes = Arc::new(PodProcesses::new(client.clone(), &namespace));
     let controller = Reconciler::new(
         client.clone(),
         Settings {
@@ -165,11 +166,32 @@ pub async fn run(early_delete: bool) -> Result<()> {
     .await?;
     let deadline = Instant::now() + BUDGET * if early_delete { 2 } else { 1 };
     let mut bootstrap_wait = false;
+    let mut staggered_shutdown = false;
     loop {
         reconcile(&controller, &name).await?;
         let Some(current) = sets.get_opt(&name).await? else {
             break;
         };
+        if scenario == Scenario::StaggeredShutdown
+            && !staggered_shutdown
+            && current
+                .status
+                .as_ref()
+                .and_then(|status| status.teardown.as_ref())
+                .is_some_and(|teardown| teardown.stage == TeardownStage::Pods)
+        {
+            let first = pods.get(&cohort.allocation.nodes[0].pod_name).await?;
+            ensure!(
+                first.uid().as_deref() == Some(&cohort.bindings[0].pod_uid),
+                "staggered shutdown cannot adopt a replacement first Pod"
+            );
+            if first.metadata.deletion_timestamp.is_some() {
+                // Pause effects, not node signals: the first wrapper must finish
+                // before reconciliation can request deletion of any remaining Pod.
+                await_first_shutdown(&controller, &name, &cohort, deadline).await?;
+                staggered_shutdown = true;
+            }
+        }
         if early_delete {
             let status = current.status.as_ref().context("missing deletion status")?;
             ensure!(
@@ -198,6 +220,10 @@ pub async fn run(early_delete: bool) -> Result<()> {
         bootstrap_wait == early_delete,
         "early deletion did not retain its bootstrap wait"
     );
+    ensure!(
+        staggered_shutdown == (scenario == Scenario::StaggeredShutdown),
+        "staggered shutdown was not independently verified"
+    );
     processes.verify_complete(&cohort).await?;
     verify_native_cleanup(&fm, &cohort).await?;
     let selector = ListParams::default().labels(&format!(
@@ -215,11 +241,110 @@ pub async fn run(early_delete: bool) -> Result<()> {
         "{}",
         serde_json::json!({
             "event": "scenario_complete",
-            "scenario": if early_delete { "delete-during-bootstrap" } else { "bootstrap" },
+            "scenario": scenario.name(),
             "set_uid": original.uid(), "native_joined": true, "resources_absent": true
         })
     );
     Ok(())
+}
+
+async fn await_first_shutdown(
+    controller: &Reconciler,
+    name: &str,
+    cohort: &FrozenCohort,
+    deadline: Instant,
+) -> Result<()> {
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(60));
+    let first_uid = &cohort.bindings[0].pod_uid;
+    loop {
+        ensure!(
+            Instant::now() < deadline,
+            "first original Pod did not finish before remaining Pod deletions"
+        );
+        let observation = match controller.observe(name).await {
+            Ok(observation) => observation,
+            Err(error) if retry_observation(&error) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        ensure!(
+            observation.set.uid().as_deref() == Some(&cohort.allocation.resource_uid)
+                && observation.set.metadata.deletion_timestamp.is_some()
+                && observation
+                    .set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.teardown.as_ref())
+                    .is_some_and(|teardown| teardown.stage == TeardownStage::Pods
+                        && teardown.cohort == *cohort),
+            "staggered shutdown lost original teardown authority"
+        );
+        let native = observation
+            .fm
+            .as_ref()
+            .context("missing original native owner")?;
+        ensure!(
+            native.cohort == *cohort
+                && native.status.phase == kuberic_fm::Phase::AwaitingNodeShutdown
+                && native.status.deleted_nodes == cohort.bindings.len(),
+            "staggered Pod termination preceded native deletion completion"
+        );
+        let mut remaining_running = true;
+        for (pod, binding) in observation.pods.iter().zip(&cohort.bindings).skip(1) {
+            let pod = pod.as_ref().context("remaining original Pod disappeared")?;
+            ensure!(
+                pod.uid().as_deref() == Some(&binding.pod_uid)
+                    && pod.metadata.deletion_timestamp.is_none(),
+                "remaining original Pod was replaced or deletion started before first cleanup"
+            );
+            let state = pod
+                .status
+                .as_ref()
+                .and_then(|status| status.container_statuses.as_ref())
+                .and_then(|containers| containers.iter().find(|container| container.name == "node"))
+                .and_then(|container| container.state.as_ref());
+            ensure!(
+                state.is_none_or(|state| state.terminated.is_none()),
+                "remaining node terminated before its Pod deletion"
+            );
+            remaining_running &= state.is_some_and(|state| state.running.is_some());
+        }
+        let processes = observation
+            .processes
+            .as_ref()
+            .context("missing physical cleanup observation")?;
+        ensure!(
+            processes.cohort == *cohort,
+            "staggered cleanup observation changed the original cohort"
+        );
+        let first = processes
+            .nodes
+            .iter()
+            .find(|node| &node.pod_uid == first_uid)
+            .context("missing first original cleanup observation")?;
+        match &first.outcome {
+            CleanupState::Complete(receipt) => {
+                receipt.validate()?;
+                if remaining_running {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "staggered_node_shutdown",
+                            "stopped_pod_uid": first_uid,
+                            "running_pod_uids": cohort.bindings.iter().skip(1)
+                                .map(|binding| &binding.pod_uid).collect::<Vec<_>>()
+                        })
+                    );
+                    return Ok(());
+                }
+            }
+            CleanupState::Failed(reason) => bail!("first original cleanup failed: {reason}"),
+            CleanupState::Pending => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn verify_native_cleanup(fm: &ProcessFm, cohort: &FrozenCohort) -> Result<()> {
@@ -240,18 +365,20 @@ async fn verify_native_cleanup(fm: &ProcessFm, cohort: &FrozenCohort) -> Result<
 async fn reconcile(controller: &Reconciler, name: &str) -> Result<()> {
     match controller.reconcile(name).await {
         Ok(outcome) => ensure!(outcome.blocked.is_none(), "controller blocked: {outcome:?}"),
-        Err(error) if error.is::<StaleObservation>() => {
-            eprintln!("Reobserving stale controller premise: {error}");
-        }
-        Err(error)
-            if matches!(error.downcast_ref::<kube::Error>(),
-                Some(kube::Error::Api(response)) if response.code == 409 && response.reason == "Conflict") =>
-        {
-            eprintln!("Reobserving concurrent Kubernetes resource update: {error}");
-        }
+        Err(error) if retry_observation(&error) => {}
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+fn retry_observation(error: &anyhow::Error) -> bool {
+    let retry = error.is::<StaleObservation>()
+        || matches!(error.downcast_ref::<kube::Error>(),
+            Some(kube::Error::Api(response)) if response.code == 409 && response.reason == "Conflict");
+    if retry {
+        eprintln!("Reobserving concurrent controller/Kubernetes update: {error}");
+    }
+    retry
 }
 
 async fn wait_for_service(endpoint: &str) -> Result<()> {

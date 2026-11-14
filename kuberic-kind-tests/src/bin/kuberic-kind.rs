@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use kube::CustomResourceExt;
-use kuberic_kind_tests::{driver, host::Cluster};
+use kuberic_kind_tests::{driver, host::Cluster, Scenario};
 
 #[derive(Parser)]
 struct Arguments {
@@ -19,8 +19,10 @@ enum Operation {
     Diagnostics,
     Crd,
     Run {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "staggered_shutdown")]
         early_delete: bool,
+        #[arg(long)]
+        staggered_shutdown: bool,
     },
 }
 
@@ -42,7 +44,19 @@ async fn main() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&kuberic_controller::KubericSet::crd())?
         ),
-        Operation::Run { early_delete } => driver::run(early_delete).await?,
+        Operation::Run {
+            early_delete,
+            staggered_shutdown,
+        } => {
+            let scenario = if early_delete {
+                Scenario::DeleteDuringBootstrap
+            } else if staggered_shutdown {
+                Scenario::StaggeredShutdown
+            } else {
+                Scenario::Bootstrap
+            };
+            driver::run(scenario).await?;
+        }
     }
     Ok(())
 }

@@ -12,6 +12,8 @@ use anyhow::{bail, ensure, Context, Result};
 use kube::CustomResourceExt;
 use serde_json::{json, Value};
 
+use crate::Scenario;
+
 #[derive(Clone, Debug)]
 pub struct Cluster {
     name: String,
@@ -298,7 +300,7 @@ impl Cluster {
         Ok(())
     }
 
-    pub fn scenario(&self, early_delete: bool) -> Result<()> {
+    pub fn scenario(&self, scenario: Scenario) -> Result<()> {
         self.verify()?;
         static IMAGE: OnceLock<Result<String, String>> = OnceLock::new();
         let image = IMAGE
@@ -310,9 +312,9 @@ impl Cluster {
             .as_ref()
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         let namespace = format!("kuberic-e2e-{}", uuid::Uuid::new_v4().simple());
-        let resources = scenario_resources(&namespace, &self.name, image, early_delete);
+        let resources = scenario_resources(&namespace, &self.name, image, scenario);
         self.apply(&resources)?;
-        let result = self.wait_for_scenario(&namespace, early_delete);
+        let result = self.wait_for_scenario(&namespace, scenario);
         if let Err(error) = result {
             if let Err(diagnostics) = self.diagnose_namespace(&namespace) {
                 eprintln!("Additional diagnostic failure: {diagnostics:#}");
@@ -329,7 +331,7 @@ impl Cluster {
         Ok(())
     }
 
-    fn wait_for_scenario(&self, namespace: &str, early_delete: bool) -> Result<()> {
+    fn wait_for_scenario(&self, namespace: &str, scenario: Scenario) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
             let job: Value = serde_json::from_str(
@@ -361,12 +363,13 @@ impl Cluster {
             events
                 .iter()
                 .any(|event| event["event"] == "scenario_complete"
+                    && event["scenario"] == scenario.name()
                     && event["native_joined"] == true
                     && event["resources_absent"] == true),
             "successful driver omitted final lifecycle verification"
         );
         ensure!(
-            early_delete
+            scenario == Scenario::DeleteDuringBootstrap
                 || events
                     .iter()
                     .any(|event| event["event"] == "application_write_read"),
@@ -375,11 +378,15 @@ impl Cluster {
         ensure!(
             events
                 .iter()
-                .any(|event| event["event"] == "coordinated_node_shutdown")
-                && events
+                .any(|event| event["event"] == "physical_cleanup"),
+            "successful driver omitted physical cleanup evidence"
+        );
+        ensure!(
+            scenario != Scenario::StaggeredShutdown
+                || events
                     .iter()
-                    .any(|event| event["event"] == "physical_cleanup"),
-            "successful driver omitted coordinated termination or physical cleanup evidence"
+                    .any(|event| event["event"] == "staggered_node_shutdown"),
+            "successful driver omitted independent staggered termination verification"
         );
         let remaining: Value = serde_json::from_str(&self.kubectl(&[
             "-n",
@@ -407,11 +414,11 @@ impl Cluster {
     }
 }
 
-fn scenario_resources(namespace: &str, cluster: &str, image: &str, early_delete: bool) -> Value {
-    let arguments = if early_delete {
-        vec!["run", "--early-delete"]
-    } else {
-        vec!["run"]
+fn scenario_resources(namespace: &str, cluster: &str, image: &str, scenario: Scenario) -> Value {
+    let arguments = match scenario {
+        Scenario::Bootstrap => vec!["run"],
+        Scenario::DeleteDuringBootstrap => vec!["run", "--early-delete"],
+        Scenario::StaggeredShutdown => vec!["run", "--staggered-shutdown"],
     };
     json!({"apiVersion": "v1", "kind": "List", "items": [
         {"apiVersion": "v1", "kind": "Namespace", "metadata": {

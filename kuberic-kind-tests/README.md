@@ -62,10 +62,18 @@ period keeps initial ConfigMap projection skew within the runner startup budget.
 
 The healthy journey checks native final-configuration publication, exact primary
 selection, a quorum-acknowledged write and readback through the Service, then
-controller-owned deletion. The other journey requests deletion after initial
-node configuration publication but before native bootstrap completes, requires
-client routing to remain disabled, finishes the accepted bootstrap and reuses
-the same teardown.
+controller-owned deletion. The early-deletion journey requests deletion after
+initial node configuration publication but before native bootstrap completes,
+requires client routing to remain disabled, finishes the accepted bootstrap and
+reuses the same teardown.
+
+The staggered-shutdown journey also checks application write/read, then pauses
+reconciliation after the first original Pod deletion. It requires that node's
+validated physical-cleanup receipt while the other original Pods remain running
+with their exact UIDs and no deletion requests. Only then does reconciliation
+resume and delete the remaining Pods. This proves an original node can finish
+before the others receive kubelet termination, rather than relying on signal
+timing or simultaneous shutdown.
 
 The image installs a test-only node wrapper at `/opt/fube/fube-node`, with the
 real runner at `/opt/fube/fube-node-real`. The wrapper owns the actual node child,
@@ -76,11 +84,10 @@ termination message. A test-only Pod finalizer retains the message until the
 backend validates and caches it; only then is that finalizer released.
 Missing reports, replacement UIDs, killed containers or incomplete cleanup
 fail explicitly. Pod absence and native deletion replies never fabricate receipts.
-Kubelet signals arrive independently. A test-only TCP barrier on the driver
-validates the original deployment/node/Pod-UID and source IP, waits for all
-original kubelet termination requests, then releases the owned runners together.
-The current fube profile treats staggered peer exits before local shutdown as
-control loss; uncoordinated kubelet shutdown is not qualified by this fixture.
+Each wrapper forwards kubelet SIGTERM immediately to its own original runner;
+there is no cross-node shutdown barrier. The pinned fube runner keeps lost-peer
+control uncertainty separate from successful owned local shutdown. Neither
+successful local cleanup nor connection loss substitutes for native deletion.
 The driver separately requires native deletion and FM joining, checks owned
 resources disappeared, and the host checks disappearance again before success.
 

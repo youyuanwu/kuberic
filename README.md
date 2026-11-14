@@ -43,8 +43,10 @@ Use `cargo test --workspace -- --list` for the live inventory.
 The separate [`kuberic-kind-tests`](kuberic-kind-tests/README.md) crate qualifies
 real Kubernetes bootstrap, a quorum-acknowledged sample write/read through the
 primary Service, and finalizer-driven physical cleanup. It also deletes during
-bootstrap without publishing client access. These tests require an explicitly
-owned KinD cluster and run with `just kind-test`, not ordinary workspace tests.
+bootstrap without publishing client access and qualifies a node completing
+cleanup before the remaining Pods receive deletion requests, without a shutdown
+barrier. These tests require an explicitly owned KinD cluster and run with
+`just kind-test`, not ordinary workspace tests.
 
 ## Kubernetes bootstrap controller
 
