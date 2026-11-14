@@ -197,6 +197,17 @@ fn disabled(observation: &Observation) -> Result<Option<Plan>> {
     Ok(None)
 }
 
+fn validate_window(now: u64, started: u64, deadline: u64) -> Result<()> {
+    ensure!(
+        now >= started
+            && deadline
+                .checked_sub(started)
+                .is_some_and(|duration| (100..=600_000).contains(&duration)),
+        "operation clock or retained deadline changed"
+    );
+    Ok(())
+}
+
 pub(crate) fn evaluate(observation: &Observation, settings: &Settings) -> Result<Plan> {
     let set = &observation.set;
     let finalizer = set
@@ -242,10 +253,57 @@ pub(crate) fn evaluate(observation: &Observation, settings: &Settings) -> Result
                 .context("blocked teardown has no reason")?,
         ));
     }
+    if status.teardown.is_none()
+        && (status.bootstrap_wait.is_some()
+            || !observation
+                .fm
+                .as_ref()
+                .is_some_and(|report| report.status.phase == Phase::Serving))
+    {
+        ensure!(finalizer, "owned teardown finalizer disappeared");
+        let bootstrap = crate::plan::bootstrap(observation, settings)?;
+        ensure!(
+            observation.fm.as_ref().is_none_or(|report| !matches!(
+                report.status.phase,
+                Phase::Deleting | Phase::AwaitingNodeShutdown | Phase::Stopped
+            )),
+            "native shutdown began before accepted bootstrap completed"
+        );
+        let Some(wait) = &status.bootstrap_wait else {
+            return Ok(Plan::AwaitBootstrap);
+        };
+        validate_window(
+            observation.now_unix_ms,
+            wait.started_unix_ms,
+            wait.deadline_unix_ms,
+        )?;
+        ensure!(
+            observation.now_unix_ms < wait.deadline_unix_ms,
+            "bootstrap completion deadline exceeded; cleanup requires intervention"
+        );
+        if let Some(plan) = disabled(observation)? {
+            return Ok(plan);
+        }
+        if bootstrap != Plan::Wait {
+            return Ok(bootstrap);
+        }
+        if !observation
+            .fm
+            .as_ref()
+            .is_some_and(|report| report.status.phase == Phase::Serving)
+        {
+            return Ok(Plan::Wait);
+        }
+    }
     let cohort = status
         .cohort()
-        .context("deletion before native create completes requires external cohort teardown")?;
-    validate_allocation(set, &cohort.allocation, settings, status.teardown.is_none())?;
+        .context("native teardown requires the original frozen cohort")?;
+    validate_allocation(
+        set,
+        &cohort.allocation,
+        settings,
+        status.teardown.is_none() && status.bootstrap_wait.is_none(),
+    )?;
     admitted(observation, &cohort.allocation)?;
     let report = native(observation, &cohort)?;
     let nodes = process_nodes(observation, &cohort)?;
@@ -283,14 +341,11 @@ pub(crate) fn evaluate(observation: &Observation, settings: &Settings) -> Result
         teardown.cohort == cohort && component(&teardown.service_uid),
         "retained teardown changed the original frozen cohort"
     );
-    ensure!(
-        observation.now_unix_ms >= teardown.started_unix_ms
-            && teardown
-                .deadline_unix_ms
-                .checked_sub(teardown.started_unix_ms)
-                .is_some_and(|duration| (100..=600_000).contains(&duration)),
-        "teardown clock or retained deadline changed"
-    );
+    validate_window(
+        observation.now_unix_ms,
+        teardown.started_unix_ms,
+        teardown.deadline_unix_ms,
+    )?;
     ensure!(
         finalizer || teardown.stage == TeardownStage::Complete,
         "owned teardown finalizer disappeared before cleanup completion"

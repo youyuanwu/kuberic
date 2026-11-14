@@ -243,6 +243,16 @@ async fn application(endpoint: &str, command: &str) -> String {
 #[tokio::test]
 #[ignore = "requires prebuilt fube-node and hosting-local-app; see root README"]
 async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
+    lifecycle(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires prebuilt fube-node and hosting-local-app; see root README"]
+async fn deleting_during_node_startup_finishes_real_bootstrap_without_publishing_clients() {
+    lifecycle(true).await;
+}
+
+async fn lifecycle(delete_during_bootstrap: bool) {
     let root = tempfile::tempdir().unwrap();
     let package = root.path().join("package");
     fs::create_dir_all(package.join("LocalService/Code")).unwrap();
@@ -291,7 +301,7 @@ async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
         root,
     };
     let deadline = Instant::now() + Duration::from_secs(30);
-    let serving = loop {
+    let started = loop {
         let result = controller.reconcile(NAME).await.unwrap();
         assert!(
             result.blocked.is_none(),
@@ -300,6 +310,13 @@ async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
         );
         supervisor.tick(&set.uid().unwrap()).await;
         let current = sets.get(NAME).await.unwrap();
+        if delete_during_bootstrap && supervisor.nodes.len() == 1 {
+            assert_eq!(
+                fm.observe().await.unwrap().unwrap().status.phase,
+                kuberic_fm::Phase::Bootstrap
+            );
+            break current;
+        }
         if current
             .status
             .as_ref()
@@ -313,38 +330,40 @@ async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
-    let cohort = serving.status.as_ref().unwrap().cohort().unwrap();
-    let endpoint = serving
-        .status
-        .as_ref()
-        .unwrap()
-        .service_endpoint
-        .as_ref()
-        .unwrap();
-    assert!(application(endpoint, "write").await.starts_with("OK"));
-    assert!(application(endpoint, "read")
-        .await
-        .contains("value=acknowledged"));
+    let cohort = started.status.as_ref().unwrap().cohort().unwrap();
     let services: Api<Service> = Api::namespaced(client.clone(), NAMESPACE);
-    let selector = services
-        .get(&resources::write_service_name(NAME))
-        .await
-        .unwrap()
-        .spec
-        .unwrap()
-        .selector
-        .unwrap();
-    assert_eq!(
-        selector.get(resources::POD_UID),
-        Some(&cohort.bindings[1].pod_uid)
-    );
+    if !delete_during_bootstrap {
+        let endpoint = started
+            .status
+            .as_ref()
+            .unwrap()
+            .service_endpoint
+            .as_ref()
+            .unwrap();
+        assert!(application(endpoint, "write").await.starts_with("OK"));
+        assert!(application(endpoint, "read")
+            .await
+            .contains("value=acknowledged"));
+        let selector = services
+            .get(&resources::write_service_name(NAME))
+            .await
+            .unwrap()
+            .spec
+            .unwrap()
+            .selector
+            .unwrap();
+        assert_eq!(
+            selector.get(resources::POD_UID),
+            Some(&cohort.bindings[1].pod_uid)
+        );
+    }
 
     sets.delete(
         NAME,
         &DeleteParams {
             preconditions: Some(Preconditions {
-                uid: serving.uid(),
-                resource_version: serving.resource_version(),
+                uid: started.uid(),
+                resource_version: started.resource_version(),
             }),
             ..DeleteParams::default()
         },
@@ -352,11 +371,29 @@ async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
     .await
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_bootstrap_wait = false;
     loop {
         let outcome = controller.reconcile(NAME).await.unwrap();
         assert!(outcome.blocked.is_none(), "{outcome:?}");
         if outcome.resource_absent || sets.get_opt(NAME).await.unwrap().is_none() {
             break;
+        }
+        if delete_during_bootstrap {
+            let current = sets.get(NAME).await.unwrap();
+            let status = current.status.as_ref().unwrap();
+            assert_ne!(status.phase, ControllerPhase::Serving);
+            assert!(status.service_endpoint.is_none());
+            saw_bootstrap_wait |= status.bootstrap_wait.is_some();
+            if let Some(service) = services
+                .get_opt(&resources::write_service_name(NAME))
+                .await
+                .unwrap()
+            {
+                assert_eq!(
+                    service.spec.unwrap().selector,
+                    Some(resources::disabled_selector(&current).unwrap())
+                );
+            }
         }
         supervisor.tick(&set.uid().unwrap()).await;
         assert!(
@@ -365,6 +402,7 @@ async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    assert_eq!(saw_bootstrap_wait, delete_during_bootstrap);
     assert!(services
         .get_opt(&resources::write_service_name(NAME))
         .await
@@ -377,6 +415,7 @@ async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
         kuberic_fm::Phase::Stopped
     );
     assert!(fm.observe().await.unwrap().unwrap().joined);
+    assert_eq!(fm.observe().await.unwrap().unwrap().status.deleted_nodes, 3);
     for config in supervisor.configs.values() {
         let status: Value =
             serde_json::from_slice(&fs::read(config.run_directory.join("status.json")).unwrap())

@@ -38,6 +38,7 @@ pub enum Plan {
     ConfigureNode(usize),
     Route(BTreeMap<String, String>),
     Status(Box<KubericSetStatus>),
+    AwaitBootstrap,
     BeginTeardown {
         cohort: FrozenCohort,
         service_uid: String,
@@ -311,6 +312,12 @@ fn evaluate_inner(observation: &Observation, settings: &Settings) -> Result<Plan
     if set.metadata.deletion_timestamp.is_some() {
         return crate::teardown::evaluate(observation, settings);
     }
+    bootstrap(observation, settings)
+}
+
+pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Result<Plan> {
+    let set = &observation.set;
+    let deleting = set.metadata.deletion_timestamp.is_some();
     if let Some(status) = &set.status {
         if status.phase == ControllerPhase::Blocked {
             return Ok(Plan::Blocked(
@@ -321,7 +328,7 @@ fn evaluate_inner(observation: &Observation, settings: &Settings) -> Result<Plan
             ));
         }
         ensure!(
-            status.teardown.is_none(),
+            status.teardown.is_none() && (deleting || status.bootstrap_wait.is_none()),
             "retained teardown cannot return to bootstrap"
         );
     }
@@ -370,7 +377,7 @@ fn evaluate_inner(observation: &Observation, settings: &Settings) -> Result<Plan
         }
         return Ok(Plan::Allocate);
     };
-    validate_allocation(set, allocation, settings, true)?;
+    validate_allocation(set, allocation, settings, !deleting)?;
     admitted(observation, allocation)?;
     let status = set.status.as_ref().context("missing accepted status")?;
     let cohort = status.cohort();
@@ -559,7 +566,8 @@ fn evaluate_inner(observation: &Observation, settings: &Settings) -> Result<Plan
                 .is_some_and(|endpoint| !endpoint.is_empty()),
         "serving FM report has no native service endpoint"
     );
-    let selector = if serving {
+    let publish = serving && !deleting;
+    let selector = if publish {
         BTreeMap::from([
             (SET_UID.into(), allocation.resource_uid.clone()),
             (DEPLOYMENT.into(), allocation.deployment.clone()),
@@ -579,13 +587,17 @@ fn evaluate_inner(observation: &Observation, settings: &Settings) -> Result<Plan
         return Ok(Plan::Route(selector));
     }
     let mut next = status.clone();
-    next.phase = match report.status.phase {
-        Phase::Serving => ControllerPhase::Serving,
-        Phase::Deleting | Phase::AwaitingNodeShutdown => ControllerPhase::Stopping,
-        Phase::Stopped => ControllerPhase::Stopped,
-        _ => ControllerPhase::Starting,
+    next.phase = if deleting {
+        ControllerPhase::Stopping
+    } else {
+        match report.status.phase {
+            Phase::Serving => ControllerPhase::Serving,
+            Phase::Deleting | Phase::AwaitingNodeShutdown => ControllerPhase::Stopping,
+            Phase::Stopped => ControllerPhase::Stopped,
+            _ => ControllerPhase::Starting,
+        }
     };
-    next.service_endpoint = report.status.service_endpoint.clone().filter(|_| serving);
+    next.service_endpoint = report.status.service_endpoint.clone().filter(|_| publish);
     next.reason = None;
     if &next != status {
         return Ok(Plan::Status(Box::new(next)));

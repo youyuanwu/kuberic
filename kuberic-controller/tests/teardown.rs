@@ -44,6 +44,32 @@ async fn request_delete(fixture: &Fixture) {
         .unwrap();
 }
 
+async fn drive_unrouted(fixture: &Fixture) {
+    for _ in 0..64 {
+        let outcome = fixture.controller.reconcile(NAME).await.unwrap();
+        assert!(outcome.blocked.is_none(), "{outcome:?}");
+        let set = fixture.set().await;
+        let status = set.status.as_ref().unwrap();
+        assert_ne!(status.phase, ControllerPhase::Serving);
+        assert!(status.service_endpoint.is_none());
+        if let Some(service) = Api::<Service>::namespaced(fixture.client.clone(), NAMESPACE)
+            .get_opt(&resources::write_service_name(NAME))
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                service.spec.unwrap().selector,
+                Some(resources::disabled_selector(&set).unwrap())
+            );
+        }
+        if !outcome.changed {
+            fixture.api.check();
+            return;
+        }
+    }
+    panic!("deleting bootstrap did not reach a waiting state");
+}
+
 async fn begin(fixture: &Fixture) -> FrozenCohort {
     fixture.serving().await;
     let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
@@ -585,23 +611,193 @@ async fn accepted_teardown_ignores_later_spec_edits_and_preserves_foreign_finali
 }
 
 #[tokio::test]
-async fn deletion_before_native_create_completes_stays_explicitly_blocked() {
+async fn deletion_after_allocation_finishes_provisioning_before_normal_teardown() {
+    let fixture = Fixture::new().await;
+    fixture.controller.reconcile(NAME).await.unwrap();
+    fixture.controller.reconcile(NAME).await.unwrap();
+    let allocation = fixture.set().await.status.unwrap().allocation.unwrap();
+    assert!(fixture.pods().await.is_empty());
+    request_delete(&fixture).await;
+    drive_unrouted(&fixture).await;
+    assert_eq!(fixture.pods().await.len(), 3);
+    assert_eq!(fixture.fm.starts.load(Ordering::SeqCst), 0);
+    for (index, pod) in fixture.pods().await.iter().enumerate() {
+        support::publish_ip(
+            &fixture.client,
+            pod,
+            &format!("127.0.0.{}", index + 2),
+            true,
+        )
+        .await;
+    }
+    drive_unrouted(&fixture).await;
+    let status = fixture.set().await.status.unwrap();
+    assert_eq!(status.allocation.as_ref(), Some(&allocation));
+    let cohort = status.cohort().unwrap();
+    assert_eq!(status.phase, ControllerPhase::Stopping);
+    assert!(status.bootstrap_wait.is_some());
+    assert!(status.teardown.is_none());
+    fixture.fm.create().await;
+    drive_unrouted(&fixture).await;
+    assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 1);
+    pod_deletions(&fixture).await;
+    joined_processes(&fixture, &cohort).await;
+    fixture.drive().await;
+    assert_gone(&fixture, &cohort).await;
+}
+
+#[tokio::test]
+async fn deletion_during_each_native_create_step_finishes_the_original_request_without_routing() {
+    for completed in 0..4 {
+        let fixture = Fixture::new().await;
+        fixture.provision().await;
+        let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+        fixture.fm.bootstrap().await;
+        for _ in 0..completed {
+            let command = fixture.fm.command().await;
+            fixture.fm.complete(&command).await;
+        }
+        let pending = fixture.fm.command().await;
+        request_delete(&fixture).await;
+        drive_unrouted(&fixture).await;
+        assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 0);
+        assert!(fixture
+            .api
+            .deletes()
+            .iter()
+            .all(|(kind, ..)| *kind == Kind::Set));
+        let retry = fixture.fm.retry().await;
+        assert_eq!(retry, pending);
+        fixture.fm.complete(&retry).await;
+        for _ in completed + 1..4 {
+            drive_unrouted(&fixture).await;
+            assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 0);
+            let command = fixture.fm.command().await;
+            fixture.fm.complete(&command).await;
+        }
+        drive_unrouted(&fixture).await;
+        let retained = fixture.set().await.status.unwrap();
+        assert_eq!(retained.cohort().as_ref(), Some(&cohort));
+        assert_eq!(retained.phase, ControllerPhase::Stopping);
+        assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 1);
+        pod_deletions(&fixture).await;
+        joined_processes(&fixture, &cohort).await;
+        fixture.drive().await;
+        assert_gone(&fixture, &cohort).await;
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_wait_survives_conflicts_lost_replies_and_facade_or_policy_changes() {
     let fixture = Fixture::new().await;
     fixture.provision().await;
+    let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
     request_delete(&fixture).await;
-    assert!(fixture
-        .controller
-        .reconcile(NAME)
+    fixture.api.conflict_next(Kind::Set, true);
+    assert!(fixture.controller.reconcile(NAME).await.is_err());
+    assert!(fixture.set().await.status.unwrap().bootstrap_wait.is_none());
+    fixture.api.lose_next_response(Kind::Set, true);
+    assert!(fixture.controller.reconcile(NAME).await.is_err());
+    let wait = fixture.set().await.status.unwrap().bootstrap_wait.unwrap();
+    fixture
+        .clock
+        .store(wait.started_unix_ms + 100, Ordering::SeqCst);
+    let mut policy = support::settings();
+    policy.teardown_timeout_ms = 100;
+    let clock = fixture.clock.clone();
+    let recreated = kuberic_controller::Reconciler::new(
+        fixture.client.clone(),
+        policy,
+        fixture.fm.clone(),
+        fixture.processes.clone(),
+    )
+    .unwrap()
+    .with_clock(move || Ok(clock.load(Ordering::SeqCst)));
+    let sets: Api<KubericSet> = Api::namespaced(fixture.client.clone(), NAMESPACE);
+    let mut set = fixture.set().await;
+    set.spec.image = "sample:later-edit".into();
+    sets.replace(NAME, &PostParams::default(), &set)
         .await
-        .unwrap()
+        .unwrap();
+    let outcome = recreated.reconcile(NAME).await.unwrap();
+    assert!(outcome.blocked.is_none(), "{outcome:?}");
+    assert_eq!(
+        fixture.set().await.status.unwrap().bootstrap_wait.as_ref(),
+        Some(&wait)
+    );
+    fixture.fm.create().await;
+    drive_unrouted(&fixture).await;
+    assert_eq!(
+        fixture.set().await.status.unwrap().bootstrap_wait.as_ref(),
+        Some(&wait)
+    );
+    pod_deletions(&fixture).await;
+    joined_processes(&fixture, &cohort).await;
+    fixture.drive().await;
+    assert_gone(&fixture, &cohort).await;
+}
+
+#[tokio::test]
+async fn bootstrap_completion_deadline_blocks_before_or_after_native_start() {
+    for native_started in [false, true] {
+        let fixture = Fixture::new().await;
+        if native_started {
+            fixture.provision().await;
+        } else {
+            fixture.drive().await;
+        }
+        request_delete(&fixture).await;
+        drive_unrouted(&fixture).await;
+        let wait = fixture.set().await.status.unwrap().bootstrap_wait.unwrap();
+        fixture.clock.store(wait.deadline_unix_ms, Ordering::SeqCst);
+        if native_started {
+            fixture.fm.create().await;
+        }
+        let recreated = fixture.recreate();
+        let outcome = recreated.reconcile(NAME).await.unwrap();
+        assert!(outcome
+            .blocked
+            .as_deref()
+            .unwrap()
+            .contains("bootstrap completion deadline"));
+        let set = fixture.set().await;
+        let status = set.status.as_ref().unwrap();
+        assert_eq!(status.phase, ControllerPhase::Blocked);
+        assert!(status.service_endpoint.is_none());
+        assert!(status.teardown.is_none());
+        assert!(set.finalizers().iter().any(|value| value == FINALIZER));
+        assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 0);
+        assert!(fixture
+            .api
+            .deletes()
+            .iter()
+            .all(|(kind, ..)| *kind == Kind::Set));
+        assert!(recreated.reconcile(NAME).await.unwrap().blocked.is_some());
+        fixture.api.check();
+    }
+}
+
+#[tokio::test]
+async fn failed_bootstrap_keeps_the_finalizer_instead_of_attempting_normal_shutdown() {
+    let fixture = Fixture::new().await;
+    fixture.provision().await;
+    let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+    request_delete(&fixture).await;
+    drive_unrouted(&fixture).await;
+    fixture
+        .fm
+        .invalidate(&cohort, "bootstrap build failed")
+        .await
+        .unwrap();
+    let outcome = fixture.controller.reconcile(NAME).await.unwrap();
+    assert!(outcome
         .blocked
-        .is_some());
-    assert!(fixture
-        .set()
-        .await
-        .finalizers()
-        .iter()
-        .any(|value| value == FINALIZER));
+        .as_deref()
+        .unwrap()
+        .contains("bootstrap build failed"));
+    let set = fixture.set().await;
+    assert_eq!(set.status.as_ref().unwrap().phase, ControllerPhase::Blocked);
+    assert!(set.finalizers().iter().any(|value| value == FINALIZER));
     assert_eq!(fixture.fm.shutdowns.load(Ordering::SeqCst), 0);
     assert!(fixture
         .api

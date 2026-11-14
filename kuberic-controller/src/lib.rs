@@ -13,8 +13,8 @@ mod teardown;
 
 pub use admission::BackendAdmission;
 pub use crd::{
-    Allocation, Binding, ControllerPhase, FmAuthority, FrozenCohort, KubericSet, KubericSetSpec,
-    KubericSetStatus, NodeAllocation, ServiceTemplate, Teardown, TeardownStage,
+    Allocation, Binding, BootstrapWait, ControllerPhase, FmAuthority, FrozenCohort, KubericSet,
+    KubericSetSpec, KubericSetStatus, NodeAllocation, ServiceTemplate, Teardown, TeardownStage,
 };
 pub use fm::{FmApi, FmObservation, ProcessFm};
 pub use plan::{evaluate, Observation, Plan};

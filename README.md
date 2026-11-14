@@ -92,7 +92,7 @@ The CRD stores Kubernetes/native intent, not local supervisor internals:
 | Parent namespace/name/UID, accepted generation and spec | Exact Kubernetes ownership and frozen desired intent |
 | Deployment/partition, native FM identity/instance/generation/address, node/replica IDs | Original native protocol authority |
 | Pod/ConfigMap names and UIDs, Pod IPs and control ports | Exact object incarnations and native listener bindings |
-| Phase, native endpoint, reason, teardown cohort/Service UID/stage/start/deadline | Observed progress and retained operation scope |
+| Phase, native endpoint, reason, bootstrap-wait start/deadline, teardown cohort/Service UID/stage/start/deadline | Observed progress and retained operation scope |
 
 `fmOwner`, `processOwner`, runtime `Settings`, host run directories and raw
 process-reaping receipts are not CRD fields. `Settings` is a controller input;
@@ -116,8 +116,15 @@ written into Kubernetes objects.
 ### Controller-owned deletion
 
 The controller retains `operator.kuberic.io/owned-teardown` until the original
-cohort is positively cleaned up. Deleting a healthy, fully created KubericSet
-drives these separately observed stages:
+cohort is positively cleaned up. Deletion before allocation removes the finalizer
+without starting anything, provided no owned resources or native session exist.
+After allocation, deletion finishes the accepted bootstrap before normal teardown.
+The controller continues provisioning and native creation for the original
+allocation, keeps client routing disabled, and never publishes Serving status or
+a client endpoint while deletion is pending. Later spec edits cannot retarget
+this bootstrap. It does not cancel individual native build steps.
+
+Once native creation completes, deletion drives these separately observed stages:
 
 - Persist teardown intent for the exact frozen cohort and original Service UID,
   with a bounded deadline. Later spec edits cannot retarget that accepted intent.
@@ -146,14 +153,16 @@ requires live original cleanup evidence. API conflicts do not advance cleanup.
 Missing, failed, forced, partial or changed evidence retains the finalizer and
 surfaces uncertainty instead of successful teardown.
 
-`Settings::teardown_timeout_ms` supplies the bound when teardown is accepted.
-Only the resulting start/deadline persist; later runtime policy changes cannot
-rewrite that accepted deadline.
-Deletion before native create completes, unhealthy cohorts, premature Pod loss,
-changed original resource UIDs, or an expired cleanup deadline remain explicitly
-blocked and require intervention. There is no forced-deletion or automatic
-adoption path. The finalizer workflow is qualified only against the mock API and
-local processes, not a real-cluster garbage collector or remote process backend.
+`Settings::teardown_timeout_ms` separately bounds the bootstrap-completion wait
+(when needed) and subsequent teardown. Each operation persists its start/deadline
+before effects; retries, controller-facade recreation and later runtime policy
+changes cannot extend an accepted deadline. Bootstrap failure or timeout retains
+the finalizer and requires intervention rather than attempting an unsafe abort.
+Unhealthy cohorts, premature Pod loss, changed original resource UIDs, or an
+expired cleanup deadline also remain explicitly blocked. There is no
+forced-deletion or automatic adoption path. The finalizer workflow is qualified
+only against the mock API and local processes, not a real-cluster garbage
+collector or remote process backend.
 
 ## Process mode
 
@@ -199,6 +208,8 @@ The process tiers exercise the standalone FM binary and the mock-backed
 controller/native-FM bridge with real node binaries and sample application
 children. They check write/readback, native-controlled client routing and
 controller-driven finalizer teardown with independent process-cleanup receipts.
+Deletion during node startup also qualifies bootstrap completion without client
+publication, followed by the same native deletion and physical cleanup.
 They need no Docker, Kubernetes or native Service Fabric.
 `FUBE_NODE_EXE` and `FUBE_NODE_APP` can override the prebuilt binary paths.
 

@@ -14,8 +14,8 @@ use kube::{
 use crate::{
     plan::{new_allocation, owned},
     resources::{self, POD_UID},
-    ControllerPhase, FmApi, KubericSet, KubericSetStatus, Observation, Plan, ProcessApi, Settings,
-    Teardown, TeardownStage,
+    BootstrapWait, ControllerPhase, FmApi, KubericSet, KubericSetStatus, Observation, Plan,
+    ProcessApi, Settings, Teardown, TeardownStage,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -269,7 +269,11 @@ impl Reconciler {
             Plan::Freeze(bindings) => {
                 let mut next = accepted;
                 next.bindings = Some(bindings);
-                next.phase = ControllerPhase::Configuring;
+                next.phase = if set.metadata.deletion_timestamp.is_some() {
+                    ControllerPhase::Stopping
+                } else {
+                    ControllerPhase::Configuring
+                };
                 self.status(set, next).await?;
             }
             Plan::StartFm(cohort) => {
@@ -305,6 +309,20 @@ impl Reconciler {
             }
             Plan::Status(status) => {
                 self.status(set, *status).await?;
+            }
+            Plan::AwaitBootstrap => {
+                let mut next = accepted;
+                next.phase = ControllerPhase::Stopping;
+                next.service_endpoint = None;
+                next.reason = None;
+                next.bootstrap_wait = Some(BootstrapWait {
+                    started_unix_ms: current.now_unix_ms,
+                    deadline_unix_ms: current
+                        .now_unix_ms
+                        .checked_add(self.settings.teardown_timeout_ms)
+                        .context("bootstrap completion deadline overflow")?,
+                });
+                self.status(set, next).await?;
             }
             Plan::BeginTeardown {
                 cohort,

@@ -185,6 +185,13 @@ pub struct Teardown {
     pub stage: TeardownStage,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BootstrapWait {
+    pub started_unix_ms: u64,
+    pub deadline_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KubericSetStatus {
@@ -193,6 +200,8 @@ pub struct KubericSetStatus {
     pub bindings: Option<Vec<Binding>>,
     pub service_endpoint: Option<String>,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub bootstrap_wait: Option<BootstrapWait>,
     #[serde(default)]
     pub teardown: Option<Teardown>,
 }
