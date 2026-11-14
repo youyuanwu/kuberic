@@ -168,3 +168,11 @@ journeys run against the deployed operator;
 their driver has only read access to workload resources. The separate
 staggered-shutdown qualification retains explicit deterministic reconciliation
 scheduling. See the live inventory with `cargo test --workspace -- --list`.
+
+Real-process safety coverage exercises unavailable progress from a paused,
+lagging Secondary, quorum loss at the direct live-Primary endpoint, and fresh
+replica failure during held native copy/final admission. Refusal withdraws FM
+publication without claiming remote writer fencing or successful native
+deletion. Physical cleanup of these failed fixtures is verified separately.
+KinD additionally holds actual fresh-host copy and verifies non-voting Idle
+state and unchanged Primary routing before releasing normal repair.

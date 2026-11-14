@@ -51,6 +51,20 @@ write/readback, application-crash failover/restoration and lifecycle cleanup, no
 failover or restart recovery.
 Use `cargo test --workspace -- --list` for the live inventory.
 
+Real-process safety journeys also pause an owned Secondary before a
+quorum-acknowledged write, verify its lag from actual peer progress, and require
+explicit refusal when Primary loss cannot obtain native progress. This covers
+an unresponsive lagging survivor, not election among responsive divergent
+histories. Losing both Secondary applications cannot successfully complete a new client
+write, even through the live Primary's direct endpoint. Crashing a fresh
+replica while real copy or final native admission is held never restores
+Serving publication.
+
+These refusal journeys distinguish physical process/group/root cleanup from
+normal native deletion: failed-session reports can remain unacknowledged, and
+blocked native shutdown is not certified as successful lifecycle completion.
+They do not make a blocked deployment restart-recoverable.
+
 The separate [`kuberic-kind-tests`](kuberic-kind-tests/README.md) crate qualifies
 real Kubernetes bootstrap, a quorum-acknowledged sample write/read through the
 primary Service, and finalizer-driven physical cleanup. It also deletes during
@@ -61,6 +75,9 @@ writes, restored redundancy and repeated changed-primary Service routing without
 replacing the original Pods.
 Secondary application-crash qualification verifies unchanged Primary routing,
 fresh native replica identities and restored redundancy on the original Pods.
+Its copy-held variant verifies that a fresh Idle cannot restore Serving or
+voting membership before real copy/build completes, then releases the barrier
+and finishes normal repair and owned teardown.
 These tests require an explicitly owned KinD cluster and run with
 `just kind-test`, not ordinary workspace tests.
 

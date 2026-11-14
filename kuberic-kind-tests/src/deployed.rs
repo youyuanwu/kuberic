@@ -28,6 +28,18 @@ pub async fn run(scenario: Scenario) -> Result<()> {
     ))?;
     desired.metadata.namespace = Some(namespace.clone());
     desired.spec.image = image;
+    if scenario == Scenario::CopyHeldSecondaryRepair {
+        desired.spec.package_path = "/opt/fube/gated-package".into();
+        let arguments = desired
+            .spec
+            .parameters
+            .get_mut("Arguments")
+            .context("sample arguments")?;
+        *arguments = format!(
+            "--kuberic-test-control-root {} {arguments}",
+            crate::driver::COPY_CONTROL_ROOT,
+        );
+    }
     let original = sets.create(&PostParams::default(), &desired).await?;
     let name = original.name_any();
     let uid = original.uid().context("missing original KubericSet UID")?;
@@ -115,9 +127,11 @@ pub async fn run(scenario: Scenario) -> Result<()> {
         );
         if matches!(
             scenario,
-            Scenario::PrimaryAppFailover | Scenario::SecondaryAppRepair
+            Scenario::PrimaryAppFailover
+                | Scenario::SecondaryAppRepair
+                | Scenario::CopyHeldSecondaryRepair
         ) {
-            let secondary = scenario == Scenario::SecondaryAppRepair;
+            let secondary = scenario != Scenario::PrimaryAppFailover;
             let mut previous_endpoint = started
                 .status
                 .as_ref()
@@ -159,7 +173,7 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                     "{}",
                     serde_json::json!({
                         "event": "application_fault_ready", "set_uid": uid, "cohort": cohort,
-                        "cycle": cycle, "victim": victim
+                        "cycle": cycle, "victim": victim, "primary_endpoint": previous_endpoint
                     })
                 );
                 if secondary {

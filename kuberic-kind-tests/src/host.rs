@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::OnceLock,
@@ -334,12 +335,15 @@ impl Cluster {
     fn wait_for_scenario(&self, namespace: &str, scenario: Scenario) -> Result<()> {
         let application_fault = matches!(
             scenario,
-            Scenario::PrimaryAppFailover | Scenario::SecondaryAppRepair
+            Scenario::PrimaryAppFailover
+                | Scenario::SecondaryAppRepair
+                | Scenario::CopyHeldSecondaryRepair
         );
         let deadline = Instant::now() + Duration::from_secs(600);
         let mut original_operator = None;
         let mut faults = BTreeMap::<u64, Value>::new();
         let mut restored = std::collections::BTreeSet::new();
+        let mut copy_released = false;
         loop {
             let job: Value = serde_json::from_str(
                 &self.kubectl(&["-n", namespace, "get", "job", "driver", "-o", "json"])?,
@@ -395,7 +399,10 @@ impl Cluster {
                                 original_operator = Some(operator);
                                 faults.insert(
                                     cycle,
-                                    json!({"cohort": event["cohort"], "report": report}),
+                                    json!({
+                                        "cohort": event["cohort"], "report": report,
+                                        "primary_endpoint": event["primary_endpoint"],
+                                    }),
                                 );
                             }
                         } else if event["event"] == "repair_complete"
@@ -408,6 +415,21 @@ impl Cluster {
                                         == Some(&self.operator_uid(namespace)?),
                                     "repair changed the original operator"
                                 );
+                                if scenario == Scenario::CopyHeldSecondaryRepair
+                                    && cycle == 0
+                                    && !copy_released
+                                {
+                                    if !self.release_held_copy(
+                                        namespace,
+                                        &event,
+                                        faults
+                                            .get(&cycle)
+                                            .context("copy barrier has no original fault")?,
+                                    )? {
+                                        continue;
+                                    }
+                                    copy_released = true;
+                                }
                                 if self.verify_restoration(
                                     namespace,
                                     &event,
@@ -457,7 +479,7 @@ impl Cluster {
             );
             ensure!(
                 events.iter().any(|event| event["event"]
-                    == if scenario == Scenario::SecondaryAppRepair {
+                    == if scenario != Scenario::PrimaryAppFailover {
                         "secondary_app_repair"
                     } else {
                         "primary_app_failover"
@@ -468,6 +490,10 @@ impl Cluster {
                     && event["writes_continued"] == true
                     && event["original_nodes_unchanged"] == true),
                 "successful driver omitted actual application-crash repair evidence"
+            );
+            ensure!(
+                scenario != Scenario::CopyHeldSecondaryRepair || copy_released,
+                "copy barrier was not verified before native restoration"
             );
         }
         ensure!(
@@ -585,7 +611,7 @@ impl Cluster {
         event: &Value,
         scenario: Scenario,
     ) -> Result<(String, Value)> {
-        let secondary = scenario == Scenario::SecondaryAppRepair;
+        let secondary = scenario != Scenario::PrimaryAppFailover;
         let cohort: kuberic_operator::FrozenCohort =
             serde_json::from_value(event["cohort"].clone())?;
         cohort.fm_config()?;
@@ -615,6 +641,9 @@ impl Cluster {
             "fault request changed original Serving authority"
         );
         self.original_pod(namespace, &cohort, index)?;
+        if scenario == Scenario::CopyHeldSecondaryRepair && event["cycle"] == 0 {
+            self.copy_barrier(namespace, &cohort, index, true, false)?;
+        }
         let name = &cohort.allocation.nodes[index].pod_name;
         let operator = self.operator_uid(namespace)?;
         let logs = self.kubectl(&[
@@ -691,6 +720,125 @@ impl Cluster {
             "fault target is not the running original Pod"
         );
         Ok(())
+    }
+
+    fn copy_barrier(
+        &self,
+        namespace: &str,
+        cohort: &kuberic_operator::FrozenCohort,
+        index: usize,
+        hold: bool,
+        release: bool,
+    ) -> Result<Value> {
+        self.original_pod(namespace, cohort, index)?;
+        let serialized = serde_json::to_string(cohort)?;
+        let index_text = index.to_string();
+        let mut arguments = vec![
+            "-n",
+            namespace,
+            "exec",
+            &cohort.allocation.nodes[index].pod_name,
+            "-c",
+            "node",
+            "--",
+            "/opt/fube/kuberic-kind",
+            "copy-barrier",
+            "--cohort",
+            &serialized,
+            "--node-index",
+            &index_text,
+        ];
+        if hold {
+            arguments.push("--hold");
+        }
+        if release {
+            arguments.push("--release");
+        }
+        let report: Value = serde_json::from_str(&self.kubectl(&arguments)?)?;
+        ensure!(
+            report["event"] == "copy_barrier"
+                && report["set_uid"] == cohort.allocation.resource_uid
+                && report["pod_uid"] == cohort.bindings[index].pod_uid
+                && report["node_index"].as_u64() == Some(u64::try_from(index)?),
+            "copy barrier changed original ownership"
+        );
+        Ok(report)
+    }
+
+    fn release_held_copy(&self, namespace: &str, event: &Value, fault: &Value) -> Result<bool> {
+        ensure!(
+            event["cohort"] == fault["cohort"],
+            "copy hold changed original cohort"
+        );
+        let cohort: kuberic_operator::FrozenCohort =
+            serde_json::from_value(event["cohort"].clone())?;
+        let victim = usize::try_from(event["victim"].as_u64().context("copy victim")?)?;
+        let report = self.copy_barrier(namespace, &cohort, victim, false, false)?;
+        if report["held"] != true {
+            return Ok(false);
+        }
+        let set: kuberic_operator::KubericSet = serde_json::from_str(&self.kubectl(&[
+            "-n",
+            namespace,
+            "get",
+            "kubericset",
+            &cohort.allocation.resource_name,
+            "-o",
+            "json",
+        ])?)?;
+        let status = set.status.as_ref().context("copy-held controller status")?;
+        ensure!(
+            set.uid().as_deref() == Some(&cohort.allocation.resource_uid)
+                && status.cohort().as_ref() == Some(&cohort)
+                && status.phase != kuberic_operator::ControllerPhase::Blocked,
+            "copy hold changed accepted authority or blocked: {set:?}"
+        );
+        if status.phase != kuberic_operator::ControllerPhase::Restoring {
+            return Ok(false);
+        }
+        let primary = cohort.fm_config()?.primary_index()?;
+        let service: k8s_openapi::api::core::v1::Service =
+            serde_json::from_str(&self.kubectl(&[
+                "-n",
+                namespace,
+                "get",
+                "service",
+                &kuberic_operator::resources::write_service_name(&cohort.allocation.resource_name),
+                "-o",
+                "json",
+            ])?)?;
+        ensure!(
+            status.primary_node_id.as_ref() == Some(&cohort.allocation.nodes[primary].node_id)
+                && status.service_endpoint.as_deref() == fault["primary_endpoint"].as_str()
+                && service
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.selector.as_ref())
+                    .and_then(|selector| selector.get(kuberic_operator::resources::POD_UID))
+                    == Some(&cohort.bindings[primary].pod_uid),
+            "copy-held repair changed admitted Primary routing"
+        );
+        let fresh = &report["status"];
+        ensure!(
+            fresh["replica_id"]
+                .as_i64()
+                .context("fresh copy identity")?
+                > fault["report"]["replica_id"]
+                    .as_i64()
+                    .context("predecessor identity")?
+                && fresh["replica_role"] == 2
+                && fresh["local_configuration_complete"] == false,
+            "copy-held fresh replica was admitted before native build: {report}"
+        );
+        eprintln!(
+            "{}",
+            json!({
+                "event": "copy_held_nonvoting", "set_uid": cohort.allocation.resource_uid,
+                "pod_uid": cohort.bindings[victim].pod_uid, "status": fresh,
+            })
+        );
+        self.copy_barrier(namespace, &cohort, victim, false, true)?;
+        Ok(true)
     }
 
     fn verify_restoration(&self, namespace: &str, event: &Value, fault: &Value) -> Result<bool> {
@@ -783,6 +931,7 @@ fn scenario_resources(
         Scenario::StaggeredShutdown => vec!["run", "--staggered-shutdown"],
         Scenario::PrimaryAppFailover => vec!["run", "--primary-app-failover"],
         Scenario::SecondaryAppRepair => vec!["run", "--secondary-app-repair"],
+        Scenario::CopyHeldSecondaryRepair => vec!["run", "--secondary-app-repair", "--hold-copy"],
     };
     let scripted = scenario == Scenario::StaggeredShutdown;
     let rules = if scripted {
@@ -922,6 +1071,22 @@ pub fn prepare_image(cluster: &Cluster) -> Result<String> {
             .context("missing sample application")?,
         package.join("hosting-local-app"),
     )?;
+    let gated = context.path().join("gated-package/LocalService/Code");
+    fs::create_dir_all(gated.join("native"))?;
+    fs::copy(
+        artifacts
+            .get("hosting-local-app")
+            .context("missing gated sample application")?,
+        gated.join("native/hosting-local-app"),
+    )?;
+    fs::write(
+        gated.join("hosting-local-app"),
+        include_bytes!("../../kuberic-tests/src/process/gated-app.sh"),
+    )?;
+    fs::set_permissions(
+        gated.join("hosting-local-app"),
+        fs::Permissions::from_mode(0o755),
+    )?;
     for relative in [
         "ApplicationManifest.xml",
         "LocalService/ServiceManifest.xml",
@@ -931,6 +1096,12 @@ pub fn prepare_image(cluster: &Cluster) -> Result<String> {
                 .join("fube/crates/samples/hosting-local-app/pkg-stateful")
                 .join(relative),
             context.path().join("package").join(relative),
+        )?;
+        fs::copy(
+            root()
+                .join("fube/crates/samples/hosting-local-app/pkg-stateful")
+                .join(relative),
+            context.path().join("gated-package").join(relative),
         )?;
     }
     let tag = uuid::Uuid::new_v4().simple().to_string();

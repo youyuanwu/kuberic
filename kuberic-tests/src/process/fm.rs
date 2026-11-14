@@ -1,8 +1,8 @@
-use std::{fs, net::Ipv4Addr, time::Duration};
+use std::{fs, net::Ipv4Addr, path::PathBuf, time::Duration};
 
 use crate::{
     fm as support,
-    process::{binaries, reserve, stage_package, start},
+    process::{binaries, reap, reserve, stage_gated_package, start, terminate},
 };
 use fube_local_host::process::OwnedApp;
 use serde_json::Value;
@@ -12,20 +12,29 @@ pub struct Cluster {
     pub fm: OwnedApp,
     pub nodes: Vec<OwnedApp>,
     pub configs: Vec<fube_node_runner::Config>,
+    controls: tempfile::TempDir,
     _root: tempfile::TempDir,
 }
 
 impl Cluster {
     pub fn start() -> Self {
+        Self::start_with_timeout(Duration::from_secs(30))
+    }
+
+    pub fn start_with_timeout(timeout: Duration) -> Self {
         let binaries = binaries();
         let root = tempfile::tempdir().unwrap();
-        let package = stage_package(root.path(), &binaries.app);
+        let package = stage_gated_package(root.path(), &binaries.app);
+        let controls = tempfile::Builder::new()
+            .prefix("kuberic-qualification-")
+            .tempdir_in("/tmp")
+            .unwrap();
 
         let mut config = support::config();
         config.deployment = uuid::Uuid::new_v4().to_string();
         config.partition = uuid::Uuid::new_v4().to_string();
         config.fm.address = reserve(Ipv4Addr::LOCALHOST);
-        config.operation_timeout_ms = 30_000;
+        config.operation_timeout_ms = timeout.as_millis().try_into().unwrap();
         config.shutdown_timeout_ms = 30_000;
         config.retry_interval_ms = 1_000;
         for node in &mut config.nodes {
@@ -54,8 +63,8 @@ impl Cluster {
                     ("TargetReplicaSetSize".into(), "3".into()),
                     ("MinReplicaSetSize".into(), "2".into()),
                     ("Arguments".into(), format!(
-                        "--stateful-lifecycle --data-replicator --replication-listen {}:0 --service-listen {}:0",
-                        placement.address.ip(), placement.address.ip()
+                        "--kuberic-test-control-root {} --stateful-lifecycle --data-replicator --replication-listen {}:0 --service-listen {}:0",
+                        controls.path().display(), placement.address.ip(), placement.address.ip()
                     )),
                 ],
                 run_directory: root.path().join(format!("node{}", index + 1)),
@@ -74,7 +83,125 @@ impl Cluster {
             fm,
             nodes,
             configs,
+            controls,
             _root: root,
+        }
+    }
+
+    pub fn node_status(&self, node: usize) -> Value {
+        serde_json::from_slice(
+            &fs::read(self.configs[node].run_directory.join("status.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    pub fn work(&self, node: usize) -> PathBuf {
+        let status = self.node_status(node);
+        let root = PathBuf::from(status["runtime_root"].as_str().unwrap());
+        assert!(root.starts_with(self.configs[node].run_directory.join("hosting")));
+        root.join("deployment/HostingLocalStatefulApp_App1/work")
+    }
+
+    pub fn hold_next_copy(&self, node: usize) {
+        fs::write(
+            self.controls
+                .path()
+                .join(format!("copy-{}", self.configs[node].node.address.ip())),
+            b"hold actual fresh-host copy",
+        )
+        .unwrap();
+    }
+
+    pub async fn until_node(
+        &mut self,
+        node: usize,
+        description: &str,
+        ready: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let config = self.configs[node].clone();
+        self.until_status(description, |_| {
+            let status = serde_json::from_slice(
+                &fs::read(config.run_directory.join("status.json")).unwrap(),
+            )
+            .unwrap();
+            ready(&status)
+        })
+        .await;
+        self.node_status(node)
+    }
+
+    pub async fn until_failed(&mut self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.status() {
+                if status["phase"] == "control_unknown" {
+                    assert!(status["error"].is_string(), "{}", self.diagnostics());
+                    return status;
+                }
+                assert!(status["error"].is_null(), "{}", self.diagnostics());
+            }
+            if let Some(exit) = self.fm.observed_exit().unwrap() {
+                assert!(
+                    !exit.success(),
+                    "FM unexpectedly succeeded: {}",
+                    self.diagnostics()
+                );
+                assert_eq!(self.fm.cleanup().unwrap()["forced"], false);
+                let status = self.status().expect("exited FM omitted status");
+                assert_eq!(status["phase"], "control_unknown", "{}", self.diagnostics());
+                assert!(status["error"].is_string(), "{}", self.diagnostics());
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "FM refusal deadline: {}",
+                self.diagnostics()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    pub async fn cleanup_failed(&mut self) {
+        assert_eq!(self.status().unwrap()["phase"], "control_unknown");
+        assert!(!reap(&mut self.fm).await.success());
+        for node in &self.nodes {
+            terminate(node);
+        }
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            let exit = reap(node).await;
+            let status: Value = serde_json::from_slice(
+                &fs::read(self.configs[index].run_directory.join("status.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status["stage"], "stopped", "{status}");
+            assert_eq!(
+                exit.success(),
+                status["cleanup"]["clean"].as_bool().unwrap(),
+                "{status}"
+            );
+            for field in ["store_closed", "channels_closed"] {
+                assert_eq!(status["cleanup"][field], true, "{status}");
+            }
+            if status["cleanup"]["clean"] == true {
+                assert_eq!(status["cleanup"]["application_cleaned"], true, "{status}");
+                assert_eq!(status["cleanup"]["executor_closed"], true, "{status}");
+            } else {
+                assert!(status["cleanup"]["error"].is_string(), "{status}");
+                eprintln!(
+                    "blocked native shutdown did not certify lifecycle completion: {}",
+                    status["cleanup"]
+                );
+            }
+            assert_eq!(status["control_unknown"], true, "{status}");
+            assert!(status["cleanup"]["control_error"].is_string(), "{status}");
+            eprintln!(
+                "owned local shutdown with unacknowledged failed-session reports: node={index}, pending={}",
+                status["cleanup"]["pending_work"]
+            );
+            assert!(!std::path::Path::new("/proc")
+                .join(status["application_pid"].as_u64().unwrap().to_string())
+                .exists());
+            assert!(!PathBuf::from(status["runtime_root"].as_str().unwrap()).exists());
         }
     }
 

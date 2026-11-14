@@ -13,6 +13,7 @@ pub enum Scenario {
     StaggeredShutdown,
     PrimaryAppFailover,
     SecondaryAppRepair,
+    CopyHeldSecondaryRepair,
 }
 
 impl Scenario {
@@ -23,6 +24,7 @@ impl Scenario {
             Self::StaggeredShutdown => "staggered-shutdown",
             Self::PrimaryAppFailover => "primary-app-failover",
             Self::SecondaryAppRepair => "secondary-app-repair",
+            Self::CopyHeldSecondaryRepair => "copy-held-secondary-repair",
         }
     }
 }

@@ -111,6 +111,15 @@ and native full membership before the next fault. Host inspection gates progress
 with the same test-only acknowledgement; ordinary driver workload RBAC remains
 read-only.
 
+The copy-held Secondary repair variant uses a separate qualification package:
+a startup wrapper enables the sample's existing copy barrier before the fresh
+host opens, then execs the unchanged sample binary. The host matches exact
+cohort/Pod UIDs, verifies the actual unacknowledged-copy marker, fresh Idle role,
+incomplete native configuration and `restoring` status with unchanged Primary
+routing. Only then does it release copy and require full native restoration.
+The control marker is test-owned scheduling, not FM admission authority; the
+ordinary application package, driver RBAC and production operator are unchanged.
+
 The fixture derives from the operator runtime image and installs its shared
 owned-node supervisor at `/opt/fube/fube-node`, with the
 real runner at `/opt/fube/fube-node-real`. The wrapper owns the actual node child,

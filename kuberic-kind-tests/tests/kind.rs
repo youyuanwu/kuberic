@@ -46,3 +46,12 @@ fn secondary_application_crash_restores_redundancy_without_changing_deployed_pri
         .scenario(Scenario::SecondaryAppRepair)
         .unwrap();
 }
+
+#[test]
+#[ignore = "requires an explicitly owned KinD cluster; run just kind-test"]
+fn copy_held_fresh_replica_cannot_restore_serving_or_voting_before_native_completion() {
+    Cluster::from_env()
+        .unwrap()
+        .scenario(Scenario::CopyHeldSecondaryRepair)
+        .unwrap();
+}
