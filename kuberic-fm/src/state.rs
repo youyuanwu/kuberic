@@ -16,6 +16,7 @@ pub enum Phase {
     Building,
     Configuring,
     Reconfiguring,
+    Restoring,
     Serving,
     Deleting,
     AwaitingNodeShutdown,
@@ -33,6 +34,7 @@ pub struct Status {
     pub service_endpoint: Option<String>,
     pub replication_endpoint: Option<String>,
     pub error: Option<String>,
+    pub restoring_node_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +49,9 @@ enum Operation {
     Build(usize),
     Configure,
     Delete(usize),
+    RepairDelete(usize),
+    RepairBuild(usize),
+    RepairConfigure,
 }
 
 struct Pending {
@@ -62,6 +67,13 @@ struct Completion {
     body: Vec<u8>,
 }
 
+struct Repair {
+    node: usize,
+    target: Replica,
+    deleted: bool,
+    built: Option<AddReplicaReply>,
+}
+
 pub struct State {
     config: Config,
     primary: usize,
@@ -74,6 +86,9 @@ pub struct State {
     configured: Option<ConfigurationReply>,
     promotion: Option<usize>,
     losses: Vec<Option<ReplicaUp>>,
+    retired_losses: Vec<(usize, ReplicaUp)>,
+    identities: Vec<(i64, i64)>,
+    repair: Option<Repair>,
     pending: Option<Pending>,
     completed: Vec<Completion>,
     deleting: [bool; 3],
@@ -117,6 +132,11 @@ impl State {
             },
             service,
         };
+        let identities = config
+            .nodes
+            .iter()
+            .map(|node| (node.replica_id, node.replica_instance))
+            .collect();
         Ok(Self {
             config,
             primary,
@@ -129,6 +149,9 @@ impl State {
             configured: None,
             promotion: None,
             losses: vec![None; 3],
+            retired_losses: Vec::new(),
+            identities,
+            repair: None,
             pending: None,
             completed: Vec::new(),
             deleting: [false; 3],
@@ -153,6 +176,8 @@ impl State {
             }
         } else if self.promotion.is_some() {
             Phase::Reconfiguring
+        } else if self.repair.is_some() {
+            Phase::Restoring
         } else if !self.bootstrapped.iter().all(|ready| *ready) {
             Phase::Bootstrap
         } else if self.primary_reply.is_none() {
@@ -168,13 +193,15 @@ impl State {
 
     pub fn status(&self) -> Status {
         let primary = self.configured.as_ref().and_then(|configuration| {
-            configuration
-                .replicas
-                .0
-                .iter()
-                .find(|replica| replica.id == self.config.nodes[self.primary].replica_id)
+            configuration.replicas.0.iter().find(|replica| {
+                replica.node
+                    == self.config.nodes[self.primary]
+                        .identity
+                        .native()
+                        .expect("validated node identity")
+            })
         });
-        let serving = self.phase() == Phase::Serving;
+        let serving = matches!(self.phase(), Phase::Serving | Phase::Restoring);
         Status {
             deployment: self.config.deployment.clone(),
             phase: self.phase(),
@@ -188,6 +215,10 @@ impl State {
                 .filter(|_| serving)
                 .map(|replica| replica.replication_endpoint.clone()),
             error: self.error.clone(),
+            restoring_node_id: self
+                .repair
+                .as_ref()
+                .map(|repair| self.config.nodes[repair.node].identity.id.clone()),
         }
     }
 
@@ -297,6 +328,81 @@ impl State {
                     &generation,
                 )?,
             )
+        } else if let Some(repair) = &self.repair {
+            if !repair.deleted {
+                let (unit, replica) = self.deletion_target(repair.node)?;
+                (
+                    Operation::RepairDelete(repair.node),
+                    repair.node,
+                    delete_replica_message(
+                        &DeleteReplica::new(
+                            AddInstance {
+                                unit,
+                                replica,
+                                service: self.initial.service.clone(),
+                            },
+                            false,
+                        ),
+                        &generation,
+                    )?,
+                )
+            } else if repair.built.is_none() {
+                (
+                    Operation::RepairBuild(repair.node),
+                    self.primary,
+                    add_replica_message(
+                        &AddReplica {
+                            unit: self
+                                .configured
+                                .as_ref()
+                                .context("missing repair base")?
+                                .unit
+                                .clone(),
+                            service: self.initial.service.clone(),
+                            replica: repair.target.clone(),
+                        },
+                        &generation,
+                    )?,
+                )
+            } else {
+                let completed = self.configured.as_ref().context("missing repair base")?;
+                let mut unit = completed.unit.clone();
+                unit.previous = unit.current;
+                unit.current.configuration = unit
+                    .current
+                    .configuration
+                    .checked_add(1)
+                    .context("repair epoch overflow")?;
+                ensure!(
+                    unit.previous.configuration & !0xffff_ffff
+                        == unit.current.configuration & !0xffff_ffff,
+                    "same-primary repair epoch exhausted"
+                );
+                let mut replicas = completed.replicas.clone();
+                for replica in &mut replicas.0 {
+                    replica.previous_role = replica.current_role;
+                }
+                let mut built = repair
+                    .built
+                    .as_ref()
+                    .context("missing repair build")?
+                    .replica
+                    .clone();
+                built.previous_role = 2;
+                built.current_role = 3;
+                replicas.0.push(built);
+                let request = DoReconfiguration {
+                    configuration: Configuration {
+                        unit,
+                        replicas,
+                        service: self.initial.service.clone(),
+                    },
+                    phase0_duration: i64::MAX,
+                };
+                let message = do_reconfiguration_message(&request, &generation)?;
+                self.configuration = Some(request);
+                (Operation::RepairConfigure, self.primary, message)
+            }
         } else if self.primary_reply.is_none() {
             (
                 Operation::Primary,
@@ -429,6 +535,13 @@ impl State {
                     self.node_up[node].is_some(),
                     "ReplicaUp arrived before NodeUp"
                 );
+                if self
+                    .retired_losses
+                    .iter()
+                    .any(|(source, original)| *source == node && original == &body)
+                {
+                    return Ok(Some(replica_up_reply_message(&body, &generation)?));
+                }
                 if body.replicas.0.is_empty() && body.dropped.0.is_empty() && body.last {
                     self.bootstrapped[node] = true;
                 } else {
@@ -447,7 +560,12 @@ impl State {
                             && report.replicas.0[0].description == self.dropped(node)?,
                         "dropped inventory does not match the exact original replica"
                     );
-                    if self.deleting[node] {
+                    if self.deleting[node]
+                        || self
+                            .repair
+                            .as_ref()
+                            .is_some_and(|repair| repair.node == node)
+                    {
                         ensure!(
                             report.unit == self.deletion_target(node)?.0,
                             "dropped inventory changed the retained deletion epoch"
@@ -560,6 +678,33 @@ impl State {
             "completion came from the wrong original channel"
         );
         match (pending.operation, action) {
+            (Operation::RepairBuild(target), "AddReplicaReply") => {
+                let (reply, owner) = decode_add_replica_reply(message)?;
+                let repair = self.repair.as_mut().context("missing retained repair")?;
+                ensure!(
+                    owner == Owner::Fm
+                        && reply.error == 0
+                        && repair.node == target
+                        && reply.unit
+                            == self
+                                .configured
+                                .as_ref()
+                                .context("missing repair base")?
+                                .unit
+                        && reply.replica.node == repair.target.node
+                        && reply.replica.id == repair.target.id
+                        && reply.replica.instance == repair.target.instance
+                        && reply.replica.version == repair.target.version
+                        && reply.replica.previous_role == 1
+                        && reply.replica.current_role == 2
+                        && reply.replica.state == 2
+                        && reply.replica.up
+                        && reply.replica.service_endpoint.is_empty()
+                        && !reply.replica.replication_endpoint.is_empty(),
+                    "repair build did not complete the exact fresh Ready Idle"
+                );
+                repair.built = Some(reply);
+            }
             (Operation::Primary, "AddPrimaryReply") | (Operation::Build(_), "AddReplicaReply") => {
                 let (reply, owner) = if action == "AddPrimaryReply" {
                     decode_add_primary_reply(message)?
@@ -598,7 +743,7 @@ impl State {
                     self.builds.push(reply);
                 }
             }
-            (Operation::Configure, "DoReconfigurationReply") => {
+            (Operation::Configure | Operation::RepairConfigure, "DoReconfigurationReply") => {
                 let (reply, owner) = decode_do_reconfiguration_reply(message)?;
                 ensure!(
                     owner == Owner::Fm && reply.error == 0,
@@ -645,6 +790,40 @@ impl State {
                     );
                     self.primary = candidate;
                     self.promotion = None;
+                    let lost = self
+                        .losses
+                        .iter()
+                        .position(Option::is_some)
+                        .context("missing failed replica")?;
+                    let next = self
+                        .identities
+                        .iter()
+                        .flat_map(|(id, instance)| [*id, *instance])
+                        .max()
+                        .context("missing replica identities")?
+                        .checked_add(1)
+                        .context("repair identity overflow")?;
+                    self.repair = Some(Repair {
+                        node: lost,
+                        target: Replica {
+                            node: self.config.nodes[lost]
+                                .identity
+                                .native()
+                                .map_err(anyhow::Error::msg)?,
+                            id: next,
+                            instance: next,
+                            previous_role: 1,
+                            current_role: 2,
+                            state: 1,
+                            up: true,
+                            first_lsn: -1,
+                            last_lsn: -1,
+                            version: self.initial.service.version.clone(),
+                            ..Replica::default()
+                        },
+                        deleted: false,
+                        built: None,
+                    });
                 } else {
                     ensure!(
                         reply.unit == expected.unit
@@ -661,9 +840,20 @@ impl State {
                         "configuration completion differs from the exact frozen native membership"
                     );
                 }
+                if matches!(pending.operation, Operation::RepairConfigure) {
+                    let repair = self.repair.take().context("missing retained repair")?;
+                    self.identities[repair.node] = (repair.target.id, repair.target.instance);
+                    self.retired_losses.push((
+                        repair.node,
+                        self.losses[repair.node]
+                            .take()
+                            .context("missing predecessor loss")?,
+                    ));
+                    self.deleting[repair.node] = false;
+                }
                 self.configured = Some(reply);
             }
-            (Operation::Delete(target), "DeleteReplicaReply") => {
+            (Operation::Delete(target) | Operation::RepairDelete(target), "DeleteReplicaReply") => {
                 let (reply, owner) = decode_delete_replica_reply(message)?;
                 ensure!(
                     owner == Owner::Fm && reply.error == 0,
@@ -675,7 +865,14 @@ impl State {
                         && reply.replica == self.dropped(target)?,
                     "deletion completion differs from the exact original replica"
                 );
-                self.deleted[target] = true;
+                if matches!(pending.operation, Operation::RepairDelete(_)) {
+                    self.repair
+                        .as_mut()
+                        .context("missing retained repair")?
+                        .deleted = true;
+                } else {
+                    self.deleted[target] = true;
+                }
             }
             _ => bail!("unexpected {action} for the retained native operation"),
         }
@@ -684,10 +881,14 @@ impl State {
 
     fn validate_replica(&self, node: usize, replica: &Replica) -> Result<()> {
         let placement = &self.config.nodes[node];
+        let identity = (replica.id, replica.instance);
+        let current = self.identities[node];
+        let repairing = self.repair.as_ref().is_some_and(|repair| {
+            repair.node == node && identity == (repair.target.id, repair.target.instance)
+        });
         ensure!(
             replica.node == placement.identity.native().map_err(anyhow::Error::msg)?
-                && replica.id == placement.replica_id
-                && replica.instance == placement.replica_instance
+                && (identity == current || repairing)
                 && replica.version == self.initial.service.version,
             "foreign node, replica instance or package version"
         );
@@ -712,6 +913,10 @@ impl State {
                 })
                 && self.losses.iter().all(Option::is_none),
             "application loss has stale history or insufficient original quorum"
+        );
+        ensure!(
+            self.retired_losses.len() < 32,
+            "owned restoration history budget exhausted"
         );
         let candidate = (0..3)
             .find(|index| *index != node)
@@ -772,7 +977,13 @@ impl State {
             .replicas
             .0
             .iter()
-            .find(|replica| replica.id == self.config.nodes[node].replica_id)
+            .find(|replica| {
+                replica.node
+                    == self.config.nodes[node]
+                        .identity
+                        .native()
+                        .expect("validated node identity")
+            })
             .context("completed configuration omitted an original live node")?;
         Ok((completed.unit.clone(), replica.clone()))
     }
@@ -781,8 +992,8 @@ impl State {
         let placement = &self.config.nodes[node];
         Ok(Replica {
             node: placement.identity.native().map_err(anyhow::Error::msg)?,
-            id: placement.replica_id,
-            instance: placement.replica_instance,
+            id: self.identities[node].0,
+            instance: self.identities[node].1,
             up: false,
             state: 3,
             ..Replica::default()

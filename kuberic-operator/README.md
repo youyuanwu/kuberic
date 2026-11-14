@@ -106,7 +106,7 @@ Delete and positively clean all KubericSets before intentionally replacing or
 uninstalling a healthy operator. After unsupported owner loss, intervention
 must establish actual original-node/application shutdown before removing
 retained finalizers or deploying a fresh lifetime. There is no automatic
-restart recovery, reconnect, Node/Pod-loss failover, replacement, persistence or upgrade
+restart recovery, reconnect, Node/Pod-loss failover, Node replacement, persistence or upgrade
 workflow.
 
 ## Primary application-crash failover
@@ -121,9 +121,30 @@ completion it selects the new Primary's exact original Pod UID and records
 
 This is unplanned application-process failover, not graceful switchover or
 Node/Pod/network-partition recovery. Further loss in the reduced cohort remains
-blocked. The failed application can remain an owned zombie until Node teardown;
+blocked until native restoration finishes. The failed application can remain an
+owned zombie until original-host retirement;
 normal native deletion and validated physical cleanup are still required for
 every original Node before finalizer release.
+
+## Restoring redundancy
+
+After failover the FM normally deletes the exact predecessor, then builds a
+fresh replica on that same original Node. The fube runner admits replacement
+only from a validated native `CreateReplica` with newer IDs/instances and
+correct history, after positive old-host reaping/group/root cleanup. It retains
+the original Node/RA, Pod UID and control channels, uses a fresh host/IPC gate,
+and rejects forced predecessor cleanup as restoration authority.
+
+The set reports `restoring` while the admitted Primary stays routed. Native
+copy/build produces a Ready Idle; a subsequent same-Primary configuration
+change restores the fixed 3/2 membership before `serving` resumes. Another
+application failure is supported only after this completion. Deletion during
+repair disables publication, finishes the accepted native restore and then
+tears down the current replica incarnations and every owned application.
+
+This follows SF's volatile drop/rebuild semantics, not persisted Reopen. Native
+repair lineage and retired-host receipts remain in the original in-memory owner;
+restarting the operator still cannot recover or adopt them.
 
 ## Qualification
 

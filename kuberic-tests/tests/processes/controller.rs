@@ -111,52 +111,68 @@ async fn lifecycle(delete_during_bootstrap: bool, failover: bool) {
             Some(&cohort.bindings[1].pod_uid)
         );
         if failover {
-            wait_replicated(endpoint).await;
-            let lost = crash_application(&supervisor.configs[&cohort.bindings[1].pod_uid]);
-            let deadline = Instant::now() + operation_budget;
-            started = loop {
-                let outcome = reconcile(&controller, NAME).await.unwrap();
-                assert!(
-                    outcome.blocked.is_none(),
-                    "{outcome:?}; FM={:?}",
-                    fm.observe().await.unwrap()
-                );
-                supervisor.tick(&set.uid().unwrap()).await;
-                let current = sets.get(NAME).await.unwrap();
-                let status = current.status.as_ref().unwrap();
-                assert_eq!(status.cohort().as_ref(), Some(&cohort));
-                if status.phase == ControllerPhase::Serving
-                    && status.primary_node_id.as_ref() == Some(&cohort.allocation.nodes[0].node_id)
-                {
-                    let next = status.service_endpoint.as_ref().unwrap();
-                    assert!(application(next, "read")
-                        .await
-                        .contains("value=acknowledged"));
-                    assert!(application(next, "write-more").await.starts_with("OK"));
-                    assert!(application(next, "read").await.contains("value=continued"));
-                    let selector = services
-                        .get(&resources::write_service_name(NAME))
-                        .await
-                        .unwrap()
-                        .spec
-                        .unwrap()
-                        .selector
-                        .unwrap();
-                    assert_eq!(
-                        selector.get(resources::POD_UID),
-                        Some(&cohort.bindings[0].pod_uid)
+            for (victim, primary, before, command, after) in [
+                (1, 0, "acknowledged", "write-more", "continued"),
+                (0, 1, "continued", "write-final", "final"),
+            ] {
+                let endpoint = started
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .service_endpoint
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                wait_replicated(&endpoint).await;
+                let lost = crash_application(&supervisor.configs[&cohort.bindings[victim].pod_uid]);
+                let deadline = Instant::now() + operation_budget;
+                started = loop {
+                    let outcome = reconcile(&controller, NAME).await.unwrap();
+                    assert!(
+                        outcome.blocked.is_none(),
+                        "{outcome:?}; FM={:?}",
+                        fm.observe().await.unwrap()
                     );
-                    assert_application_stopped(lost);
-                    break current;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "controller failover timed out: {status:?}; FM={:?}; nodes={}",
-                    fm.observe().await.unwrap(),
-                    supervisor.diagnostics()
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            };
+                    supervisor.tick(&set.uid().unwrap()).await;
+                    let current = sets.get(NAME).await.unwrap();
+                    let status = current.status.as_ref().unwrap();
+                    assert_eq!(status.cohort().as_ref(), Some(&cohort));
+                    if status.phase == ControllerPhase::Serving
+                        && status.primary_node_id.as_ref()
+                            == Some(&cohort.allocation.nodes[primary].node_id)
+                    {
+                        let next = status.service_endpoint.as_ref().unwrap();
+                        assert!(application(next, "read")
+                            .await
+                            .contains(&format!("value={before}")));
+                        assert!(application(next, command).await.starts_with("OK"));
+                        assert!(application(next, "read")
+                            .await
+                            .contains(&format!("value={after}")));
+                        let selector = services
+                            .get(&resources::write_service_name(NAME))
+                            .await
+                            .unwrap()
+                            .spec
+                            .unwrap()
+                            .selector
+                            .unwrap();
+                        assert_eq!(
+                            selector.get(resources::POD_UID),
+                            Some(&cohort.bindings[primary].pod_uid)
+                        );
+                        assert_application_stopped(lost);
+                        break current;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "controller failover timed out: {status:?}; FM={:?}; nodes={}",
+                        fm.observe().await.unwrap(),
+                        supervisor.diagnostics()
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+            }
         }
     }
 

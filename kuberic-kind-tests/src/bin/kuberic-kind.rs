@@ -29,6 +29,14 @@ enum Operation {
     CrashPrimaryApp {
         #[arg(long)]
         cohort: String,
+        #[arg(long)]
+        node_index: usize,
+    },
+    InspectNode {
+        #[arg(long)]
+        cohort: String,
+        #[arg(long)]
+        node_index: usize,
     },
 }
 
@@ -66,8 +74,14 @@ async fn main() -> Result<()> {
             };
             driver::run(scenario).await?;
         }
-        Operation::CrashPrimaryApp { cohort } => {
-            driver::crash_primary_app(&serde_json::from_str(&cohort)?)?;
+        Operation::CrashPrimaryApp { cohort, node_index } => {
+            driver::crash_primary_app(&serde_json::from_str(&cohort)?, node_index)?;
+        }
+        Operation::InspectNode { cohort, node_index } => {
+            println!(
+                "{}",
+                driver::inspect_node(&serde_json::from_str(&cohort)?, node_index)?
+            );
         }
     }
     Ok(())

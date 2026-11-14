@@ -272,11 +272,32 @@ fn verified_primary_loss_reconfigures_original_quorum_and_deletes_each_retained_
         vec![command.clone()]
     );
     state.observe(0, &completion(&command.message)).unwrap();
-    assert_eq!(state.phase(), Phase::Serving);
+    assert_eq!(state.phase(), Phase::Restoring);
     assert_eq!(state.status().primary_node_id, config.nodes[0].identity.id);
     assert_eq!(
         state.status().service_endpoint.as_deref(),
         Some("client://node-10/opaque")
+    );
+    state.observe(1, &loss).unwrap();
+    let replies = restore(&mut state, Duration::from_millis(100));
+    let retired = decode_delete_replica_reply(&replies[0].1).unwrap().0;
+    assert_eq!(retired.unit, committed.unit);
+    let fresh = decode_add_replica_reply(&replies[1].1).unwrap().0;
+    assert!(
+        fresh.replica.id
+            > config
+                .nodes
+                .iter()
+                .map(|node| node.replica_id)
+                .max()
+                .unwrap()
+    );
+    assert!(fresh.replica.instance > config.nodes[1].replica_instance);
+    let restored = decode_do_reconfiguration_reply(&replies[2].1).unwrap().0;
+    assert_eq!(restored.replicas.0.len(), config.nodes.len());
+    assert_eq!(
+        restored.unit.current.configuration,
+        request.configuration.unit.current.configuration + 1
     );
     state.observe(1, &loss).unwrap();
     assert!(state
@@ -293,14 +314,7 @@ fn verified_primary_loss_reconfigures_original_quorum_and_deletes_each_retained_
         assert_eq!(deletion.node, target);
         let body = decode_delete_replica(&deletion.message).unwrap().0;
         assert!(!body.deletion.0.force);
-        assert_eq!(
-            body.replica.0.unit.current,
-            if target == 1 {
-                committed.unit.current
-            } else {
-                request.configuration.unit.current
-            }
-        );
+        assert_eq!(body.replica.0.unit.current, restored.unit.current);
         state
             .observe(target, &completion(&deletion.message))
             .unwrap();
@@ -309,6 +323,97 @@ fn verified_primary_loss_reconfigures_original_quorum_and_deletes_each_retained_
         state.disconnected(node).unwrap();
     }
     assert_eq!(state.phase(), Phase::Stopped);
+}
+
+#[test]
+fn restored_original_node_can_fail_over_again_without_reusing_a_retired_replica() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    let replies = serving(&mut state);
+    let mut committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+    for node in [1, 0, 1] {
+        let mut report = app_host_loss(&config, &committed.unit, node);
+        let replica = committed
+            .replicas
+            .0
+            .iter()
+            .find(|replica| replica.node == config.nodes[node].identity.native().unwrap())
+            .unwrap()
+            .clone();
+        report.dropped.0[0].replicas.0[0].description.id = replica.id;
+        report.dropped.0[0].replicas.0[0].description.instance = replica.instance;
+        state
+            .observe(node, &replica_up_message(&report, Owner::Fm).unwrap())
+            .unwrap();
+        let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        state
+            .observe(command.node, &completion(&command.message))
+            .unwrap();
+        let replies = restore(&mut state, Duration::ZERO);
+        committed = decode_do_reconfiguration_reply(&replies[2].1).unwrap().0;
+        let fresh = committed
+            .replicas
+            .0
+            .iter()
+            .find(|replica| replica.node == config.nodes[node].identity.native().unwrap())
+            .unwrap();
+        assert!(fresh.id > replica.id && fresh.instance > replica.instance);
+        assert_eq!(
+            committed.unit.current.data_loss,
+            report.dropped.0[0].unit.current.data_loss
+        );
+    }
+}
+
+#[test]
+fn repair_requires_old_deletion_fresh_build_and_exact_final_configuration() {
+    for invalid in 0..3 {
+        let config = config();
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let replies = serving(&mut state);
+        let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+        state
+            .observe(
+                1,
+                &replica_up_message(&app_host_loss(&config, &committed.unit, 1), Owner::Fm)
+                    .unwrap(),
+            )
+            .unwrap();
+        let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        state
+            .observe(command.node, &completion(&command.message))
+            .unwrap();
+        for stage in 0..=invalid {
+            let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            let mut reply = completion(&command.message);
+            if stage == invalid {
+                reply = match stage {
+                    0 => {
+                        let mut body = decode_delete_replica_reply(&reply).unwrap().0;
+                        body.error = -1;
+                        delete_replica_reply_message(&body, Owner::Fm).unwrap()
+                    }
+                    1 => {
+                        let mut body = decode_add_replica_reply(&reply).unwrap().0;
+                        body.replica.id = config.nodes[1].replica_id;
+                        add_replica_reply_message(&body, Owner::Fm).unwrap()
+                    }
+                    _ => {
+                        let mut body = decode_do_reconfiguration_reply(&reply).unwrap().0;
+                        body.unit.current.configuration += 1;
+                        do_reconfiguration_reply_message(&body, Owner::Fm).unwrap()
+                    }
+                };
+                assert!(state.observe(command.node, &reply).is_err());
+            } else {
+                state.observe(command.node, &reply).unwrap();
+            }
+        }
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+    }
 }
 
 #[test]

@@ -95,6 +95,14 @@ original Pod UID and container lifetime unchanged. The host checks that the
 original operator Pod did not restart and correlates final native/physical
 cleanup with the same cohort and promoted Primary.
 
+The journey now restores the failed original Node, then crashes the new Primary
+and verifies another failover/restoration with a distinct acknowledged write.
+At each restoration boundary the host inspects every UID-validated live runner,
+requires native full membership and fresh replica IDs/instances, and checks the
+retired application's actual reaping/group/root evidence without forced cleanup.
+Test-only host ConfigMap acknowledgements gate the next fault; they are not
+operator cleanup authority or a production shutdown barrier.
+
 The fixture derives from the operator runtime image and installs its shared
 owned-node supervisor at `/opt/fube/fube-node`, with the
 real runner at `/opt/fube/fube-node-real`. The wrapper owns the actual node child,

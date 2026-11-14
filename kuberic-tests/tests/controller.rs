@@ -54,7 +54,7 @@ async fn primary_application_failover_withdraws_then_routes_only_native_complete
     fixture.fm.complete(&command).await;
     fixture.drive().await;
     let status = fixture.set().await.status.unwrap();
-    assert_eq!(status.phase, ControllerPhase::Serving);
+    assert_eq!(status.phase, ControllerPhase::Restoring);
     assert_eq!(status.cohort().unwrap(), original);
     assert_eq!(
         status.primary_node_id.as_ref(),
@@ -65,6 +65,12 @@ async fn primary_application_failover_withdraws_then_routes_only_native_complete
         Some(&original.bindings[0].pod_uid)
     );
     assert_eq!(fixture.fm.starts.load(Ordering::SeqCst), 1);
+    fixture.fm.restore().await;
+    fixture.drive().await;
+    assert_eq!(
+        fixture.set().await.status.unwrap().phase,
+        ControllerPhase::Serving
+    );
     fixture.api.check();
 }
 

@@ -184,5 +184,19 @@ pub fn serving(state: &mut State) -> Vec<(usize, Message)> {
         state.observe(outgoing.node, &reply).unwrap();
         replies.push((outgoing.node, reply));
     }
+
+    replies
+}
+
+pub fn restore(state: &mut State, now: Duration) -> Vec<(usize, Message)> {
+    let mut replies = Vec::new();
+    for _ in 0..3 {
+        assert_eq!(state.phase(), kuberic_fm::Phase::Restoring);
+        let command = state.reconcile(now).unwrap().pop().unwrap();
+        let reply = completion(&command.message);
+        state.observe(command.node, &reply).unwrap();
+        replies.push((command.node, reply));
+    }
+    assert_eq!(state.phase(), kuberic_fm::Phase::Serving);
     replies
 }

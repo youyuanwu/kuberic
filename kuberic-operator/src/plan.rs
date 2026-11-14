@@ -554,7 +554,7 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         );
         return Ok(Plan::ConfigureNode(index));
     }
-    let serving = report.status.phase == Phase::Serving;
+    let serving = matches!(report.status.phase, Phase::Serving | Phase::Restoring);
     ensure!(
         !serving
             || report
@@ -592,6 +592,7 @@ pub(crate) fn bootstrap(observation: &Observation, settings: &Settings) -> Resul
         match report.status.phase {
             Phase::Serving => ControllerPhase::Serving,
             Phase::Reconfiguring => ControllerPhase::Reconfiguring,
+            Phase::Restoring => ControllerPhase::Restoring,
             Phase::Deleting | Phase::AwaitingNodeShutdown => ControllerPhase::Stopping,
             Phase::Stopped => ControllerPhase::Stopped,
             _ => ControllerPhase::Starting,

@@ -11,8 +11,9 @@ builds, native 3/2 admission, endpoint publication, exact retries and normal
 replica deletion. After matched native Primary application-host loss in a
 fully admitted cohort, it can reconfigure the surviving original replicas and
 publish their new Primary after final native completion. Its deterministic
-reconciliation core and native-channel
-adapter use the same fube codecs as the real nodes.
+reconciliation core and native-channel adapter use the same fube codecs as the
+real nodes. It then restores the failed original node through a fresh replica
+build and native 3/2 re-admission.
 
 Each KubericSet supports one fresh volatile partition with three immutable
 original nodes. The Kubernetes-facing library and experimental
@@ -21,7 +22,7 @@ API, local processes and an isolated KinD cluster. The operator provides a
 namespace-scoped watch/requeue loop, image build and installation manifests;
 it is not production-ready or restart-recoverable. The supported failover is
 an application-process crash, not Node/Pod loss or a network partition.
-There is no replica persistence/recovery, switchover, replacement, reconnect,
+There is no replica persistence/restart recovery, switchover, Node replacement, reconnect,
 resize or rolling upgrade. FM state is in-memory; restarting the FM does not
 recover the deployment. A lost original
 channel or invalid completion produces explicit control uncertainty and withdraws
@@ -43,7 +44,7 @@ reconciliation through a mock-backed `kube::Client`.
 Shared helpers live in `kuberic-tests/src` and are imported through the crate.
 On Linux, it also builds and launches the real FM, node and sample
 application binaries automatically. Its process journeys verify application
-write/readback, application-crash failover and lifecycle cleanup, not Node-loss
+write/readback, application-crash failover/restoration and lifecycle cleanup, not Node-loss
 failover or restart recovery.
 Use `cargo test --workspace -- --list` for the live inventory.
 
@@ -53,7 +54,8 @@ primary Service, and finalizer-driven physical cleanup. It also deletes during
 bootstrap without publishing client access and qualifies a node completing
 cleanup before the remaining Pods receive deletion requests, without a shutdown
 barrier. Its deployed application-crash journey verifies preserved data, continued
-writes and changed-primary Service routing without replacing the original Pods.
+writes, restored redundancy and repeated changed-primary Service routing without
+replacing the original Pods.
 These tests require an explicitly owned KinD cluster and run with
 `just kind-test`, not ordinary workspace tests.
 
@@ -97,21 +99,56 @@ Deactivate/Activate; the FM does not invent LSNs, replication acknowledgements
 or data-loss authority. It withdraws endpoint publication while reconfiguring.
 The operator disables routing when it observes that phase and selects the exact
 new original Primary Pod UID only after validated final native completion.
-`status.primaryNodeId` describes the observed Serving Primary; the accepted
+`status.primaryNodeId` describes the native-admitted current Primary; the accepted
 allocation and node configurations remain immutable.
 
 This supports a primary application crash from fully admitted original 3/2
-membership, not further failures of the resulting reduced cohort. Secondary
+membership, not another loss while reconfiguration/restoration is in progress. Secondary
 loss, interrupted reconfiguration, missing/invalid completion and original
 channel loss block rather than granting a new writer. Operator restart, whole
-Node/Pod loss, reconnection, replacement and network-partition failover remain
+Node/Pod loss, reconnection, Node replacement and network-partition failover remain
 unsupported. Routing withdrawal is not itself writer fencing.
 
 Teardown retains the failed replica's original epoch separately from the
 survivors' completed configuration. Every original replica still requires its
 actual normal deletion acknowledgement, and every original Node/application
 requires positive physical cleanup. A crashed application may remain an owned
-zombie until Node teardown; successful failover is not a reaping receipt.
+zombie until owned-host retirement; successful failover is not a reaping receipt.
+
+### Replica restoration
+
+SF treats volatile app-host loss as terminal, not a persisted-replica Reopen.
+After final failover completion, the FM normally deletes the exact failed
+predecessor and retains its original epoch/identity. It allocates a replica ID
+and instance strictly above every current ID/instance, retaining the original
+Node instance, Pod UID and control sessions.
+
+Native `AddReplica` drives `CreateReplica` on the failed original Node. Fube
+validates committed predecessor deletion, source/generation, service, epoch and
+deactivation history before acquiring anything. Only then does the original
+owner drain its old IPC/native work, reap the exited application, drain its
+owned group and remove its hosting root. Forced predecessor cleanup cannot
+authorize restoration. The replacement receives a fresh host identity and
+consumer gate; old IPC sessions are never revived.
+
+Shared RA/RAP performs real copy/build to a Ready Idle. The FM then requests
+same-Primary P/P, S/S and I/S admission with a configuration-epoch increment and
+unchanged data-loss epoch/sizes. Only matched final native membership completion
+returns the set to `serving`. During `restoring`, the already admitted Primary
+remains selected; the new Idle does not become a voter merely because it opened.
+After full 3/2 restoration, another primary application failure can repeat this
+workflow. Restoration history is bounded; exhaustion blocks explicitly.
+
+Active replica identities and retired native/host lineage remain in the original
+in-memory backend, not restart-adoptable CRD authority. The frozen allocation and
+ConfigMaps retain their original identities. Deletion during an accepted restore
+waits for its native completion with client publication disabled, then deletes
+the current replicas and verifies all original Node/application cleanup.
+
+Native grounding: Service Fabric baseline `3988b451`,
+`ra/ReconfigurationAgent.cpp::AppHostClosedProcessor`,
+`ra/FailoverUnit.cpp::CanReopenDownReplica`, and
+`fm/FailoverUnit.cpp::CreateReplica` / `fm/Replica.cpp::Reuse`.
 
 ### Bootstrap authority
 
