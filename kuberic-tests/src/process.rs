@@ -4,7 +4,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::OnceLock,
     time::Duration,
 };
@@ -159,6 +159,28 @@ pub fn stage_package(root: &Path, app: &Path) -> PathBuf {
     package
 }
 
+pub fn stage_gated_package(root: &Path, app: &Path) -> PathBuf {
+    let package = stage_package(root, app);
+    let code = package.join("LocalService/Code");
+    fs::create_dir(code.join("native")).unwrap();
+    fs::rename(
+        code.join("hosting-local-app"),
+        code.join("native/hosting-local-app"),
+    )
+    .unwrap();
+    fs::write(
+        code.join("hosting-local-app"),
+        include_bytes!("process/gated-app.sh"),
+    )
+    .unwrap();
+    fs::set_permissions(
+        code.join("hosting-local-app"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    package
+}
+
 pub fn reserve(ip: Ipv4Addr) -> SocketAddrV4 {
     let listener = std::net::TcpListener::bind((ip, 0)).unwrap();
     match listener.local_addr().unwrap() {
@@ -236,12 +258,16 @@ pub async fn wait_replicated(endpoint: &str) {
 }
 
 pub async fn finish(child: &mut OwnedApp) {
+    let status = reap(child).await;
+    assert!(status.success(), "process failed: {:?}", child.logs());
+}
+
+pub async fn reap(child: &mut OwnedApp) -> ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.observed_exit().unwrap() {
-            assert!(status.success(), "process failed: {:?}", child.logs());
             assert_eq!(child.cleanup().unwrap()["forced"], false);
-            return;
+            return status;
         }
         assert!(
             Instant::now() < deadline,

@@ -4,3 +4,5 @@
 mod controller;
 #[path = "processes/fm.rs"]
 mod fm;
+#[path = "processes/safety.rs"]
+mod safety;

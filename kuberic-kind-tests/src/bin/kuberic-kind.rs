@@ -27,6 +27,8 @@ enum Operation {
         primary_app_failover: bool,
         #[arg(long)]
         secondary_app_repair: bool,
+        #[arg(long, requires = "secondary_app_repair")]
+        hold_copy: bool,
     },
     CrashPrimaryApp {
         #[arg(long)]
@@ -45,6 +47,16 @@ enum Operation {
         cohort: String,
         #[arg(long)]
         node_index: usize,
+    },
+    CopyBarrier {
+        #[arg(long)]
+        cohort: String,
+        #[arg(long)]
+        node_index: usize,
+        #[arg(long, conflicts_with = "release")]
+        hold: bool,
+        #[arg(long)]
+        release: bool,
     },
 }
 
@@ -71,6 +83,7 @@ async fn main() -> Result<()> {
             staggered_shutdown,
             primary_app_failover,
             secondary_app_repair,
+            hold_copy,
         } => {
             let scenario = if early_delete {
                 Scenario::DeleteDuringBootstrap
@@ -78,6 +91,8 @@ async fn main() -> Result<()> {
                 Scenario::StaggeredShutdown
             } else if primary_app_failover {
                 Scenario::PrimaryAppFailover
+            } else if hold_copy {
+                Scenario::CopyHeldSecondaryRepair
             } else if secondary_app_repair {
                 Scenario::SecondaryAppRepair
             } else {
@@ -95,6 +110,17 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 driver::inspect_node(&serde_json::from_str(&cohort)?, node_index)?
+            );
+        }
+        Operation::CopyBarrier {
+            cohort,
+            node_index,
+            hold,
+            release,
+        } => {
+            println!(
+                "{}",
+                driver::copy_barrier(&serde_json::from_str(&cohort)?, node_index, hold, release)?
             );
         }
     }

@@ -19,6 +19,7 @@ use tokio::{
 use crate::Scenario;
 
 const BUDGET: Duration = Duration::from_secs(180);
+pub const COPY_CONTROL_ROOT: &str = "/run/fube/qualification";
 
 pub fn inspect_node(cohort: &FrozenCohort, node_index: usize) -> Result<serde_json::Value> {
     cohort.fm_config()?;
@@ -47,6 +48,53 @@ pub fn inspect_node(cohort: &FrozenCohort, node_index: usize) -> Result<serde_js
         "original node is not running: {status}"
     );
     Ok(status)
+}
+
+pub fn copy_barrier(
+    cohort: &FrozenCohort,
+    node_index: usize,
+    hold: bool,
+    release: bool,
+) -> Result<serde_json::Value> {
+    ensure!(!(hold && release), "conflicting copy barrier actions");
+    let status = inspect_node(cohort, node_index)?;
+    let config = resources::runner_config(cohort, node_index)?;
+    let root = std::path::PathBuf::from(
+        status["runtime_root"]
+            .as_str()
+            .context("owned Hosting root")?,
+    );
+    ensure!(
+        root.starts_with(config.run_directory.join("hosting")),
+        "copy barrier changed original Hosting ownership"
+    );
+    let work = root.join(format!(
+        "deployment/{}_App{}/work",
+        cohort.allocation.spec.service.application_type,
+        cohort.allocation.spec.service.application_number,
+    ));
+    let controls = std::path::Path::new(COPY_CONTROL_ROOT);
+    let flag = controls.join(format!("copy-{}", config.node.address.ip()));
+    if hold {
+        ensure!(
+            status["replica_role"] == 3,
+            "copy fault target is not a Secondary"
+        );
+        std::fs::create_dir_all(controls)?;
+        std::fs::write(&flag, b"hold exact fresh-host copy")?;
+    } else if release {
+        ensure!(
+            status["replica_role"] == 2 && work.join("local-copy.held").exists(),
+            "fresh Idle has not reached the actual copy barrier"
+        );
+        std::fs::write(work.join("local-copy.release"), b"finish exact copy")?;
+        std::fs::remove_file(&flag)?;
+    }
+    Ok(serde_json::json!({
+        "event": "copy_barrier", "set_uid": cohort.allocation.resource_uid,
+        "pod_uid": cohort.bindings[node_index].pod_uid, "node_index": node_index,
+        "held": work.join("local-copy.held").exists(), "status": status,
+    }))
 }
 
 pub fn crash_primary_app(cohort: &FrozenCohort, node_index: usize) -> Result<()> {
