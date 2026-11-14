@@ -1,5 +1,5 @@
-//! Namespace-bound bootstrap and owned teardown, qualified with mock Kubernetes
-//! objects and local processes. Not a Kubernetes deployment or recovery tier.
+//! Namespace-bound bootstrap and owned teardown, qualified with mock Kubernetes,
+//! local processes and an isolated KinD test driver. Not a restart-recovery tier.
 
 mod admission;
 mod crd;

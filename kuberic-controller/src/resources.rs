@@ -79,6 +79,7 @@ pub fn pod(set: &KubericSet, allocation: &Allocation, node: usize) -> Result<Pod
     Ok(Pod {
         metadata,
         spec: Some(PodSpec {
+            automount_service_account_token: Some(false),
             restart_policy: Some("Never".into()),
             containers: vec![Container {
                 name: "node".into(),

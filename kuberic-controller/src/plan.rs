@@ -132,12 +132,14 @@ pub(crate) fn validate_allocation(
         "allocation changed its Kubernetes resource identity"
     );
     if check_desired {
+        // API deletion advances generation without changing the accepted spec.
         ensure!(
-            allocation.generation
-                == set
-                    .metadata
-                    .generation
-                    .context("KubericSet has no generation")?
+            (set.metadata.deletion_timestamp.is_some()
+                || allocation.generation
+                    == set
+                        .metadata
+                        .generation
+                        .context("KubericSet has no generation")?)
                 && allocation.spec == set.spec
                 && allocation.fm == settings.fm,
             "resource spec/generation or native FM authority changed; replacement and rolling upgrade are unsupported"

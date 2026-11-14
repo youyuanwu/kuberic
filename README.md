@@ -13,7 +13,8 @@ adapter use the same fube codecs as the real nodes.
 
 Only one fresh volatile partition with three immutable original nodes is
 supported. A Kubernetes-facing bootstrap library is qualified against a mock
-API and local processes; real-cluster deployment is not supported. There is no
+API, local processes and an isolated KinD test driver. There is no production
+operator installation or restart recovery. There is no
 replica persistence/recovery, failover, switchover, replacement, reconnect,
 resize or rolling upgrade. FM state is in-memory; restarting the FM does not
 recover the deployment. A lost original
@@ -38,6 +39,12 @@ On Linux, it also builds and launches the real FM, node and sample
 application binaries automatically. Its process journeys verify application
 write/readback and lifecycle cleanup, not failover or recovery.
 Use `cargo test --workspace -- --list` for the live inventory.
+
+The separate [`kuberic-kind-tests`](kuberic-kind-tests/README.md) crate qualifies
+real Kubernetes bootstrap, a quorum-acknowledged sample write/read through the
+primary Service, and finalizer-driven physical cleanup. It also deletes during
+bootstrap without publishing client access. These tests require an explicitly
+owned KinD cluster and run with `just kind-test`, not ordinary workspace tests.
 
 ## Kubernetes bootstrap controller
 
@@ -77,9 +84,9 @@ The initial volatile profile creates no PVCs. The desired client port is an
 application contract and must match its listener; opaque native endpoint
 strings are preserved, not reinterpreted as a universal Kubernetes port format.
 The Pod template requires an image containing `tini`, a POSIX shell, `sleep`,
-the fube runner and the declared application package. No such image, RBAC,
-installation, real-cluster garbage-collection or Kubernetes networking
-qualification is provided yet.
+the fube runner and the declared application package. No production image,
+RBAC or installation is provided. The KinD test crate builds a
+compatible image and supplies namespace-scoped test-driver RBAC.
 
 Tests use a narrow in-memory HTTP API behind a real `kube::Client`, including
 namespaces, ownership, UID/resourceVersion fencing, immutable ConfigMaps and
@@ -150,6 +157,9 @@ handles, including successful node exit, application reaping, resource joins
 and whether cleanup was forced. The local process tests publish those facts
 only after checking the real fube exits, final cleanup status and owned joins.
 Kubernetes annotations and object absence cannot substitute for that backend.
+The KinD adapter collects exact container termination messages produced by a
+wrapper owning the original node handle. A test-only Pod finalizer retains
+the message until validated cleanup evidence has been cached by that backend.
 
 Reconciliation may resume after lost API replies or controller-facade recreation
 with the same retained backend admission. Creating fresh backends is not recovery.
@@ -167,8 +177,9 @@ the finalizer and requires intervention rather than attempting an unsafe abort.
 Unhealthy cohorts, premature Pod loss, changed original resource UIDs, or an
 expired cleanup deadline also remain explicitly blocked. There is no
 forced-deletion or automatic adoption path. The finalizer workflow is qualified
-only against the mock API and local processes, not a real-cluster garbage
-collector or remote process backend.
+against the mock API, local processes and the isolated KinD backend. The latter
+qualifies kubelet termination and real API garbage collection, not a production
+remote supervisor or restart-recoverable cleanup authority.
 
 ## Process mode
 

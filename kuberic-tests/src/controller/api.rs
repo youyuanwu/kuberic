@@ -326,6 +326,10 @@ fn execute(
         if route.kind == Kind::Pod {
             deleted["metadata"]["deletionGracePeriodSeconds"] = json!(grace.unwrap_or(30));
         }
+        if route.kind == Kind::Set {
+            deleted["metadata"]["generation"] =
+                json!(old["metadata"]["generation"].as_i64().unwrap() + 1);
+        }
         deleted["metadata"]["resourceVersion"] = store.revision();
         store.deletes.push((
             route.kind,
