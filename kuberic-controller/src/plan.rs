@@ -8,7 +8,7 @@ use kuberic_fm::Phase;
 use crate::{
     resources::{self, DEPLOYMENT, NODE_ID, POD_UID, SET_UID, SPEC},
     Allocation, Binding, ControllerPhase, FmObservation, FrozenCohort, KubericSet,
-    KubericSetStatus, NodeAllocation, Settings,
+    KubericSetStatus, NodeAllocation, ProcessObservation, Settings, TeardownStage,
 };
 
 #[derive(Clone, Debug)]
@@ -18,10 +18,16 @@ pub struct Observation {
     pub config_maps: Vec<Option<ConfigMap>>,
     pub service: Option<Service>,
     pub fm: Option<FmObservation>,
+    pub processes: Option<ProcessObservation>,
+    pub fm_allocation: Option<Allocation>,
+    pub process_allocation: Option<Allocation>,
+    pub now_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Plan {
+    AddFinalizer,
+    RemoveFinalizer,
     Allocate,
     CreateConfigMap(usize),
     CreateService,
@@ -31,12 +37,22 @@ pub enum Plan {
     StartFm(FrozenCohort),
     ConfigureNode(usize),
     Route(BTreeMap<String, String>),
-    Status(KubericSetStatus),
+    Status(Box<KubericSetStatus>),
+    BeginTeardown {
+        cohort: FrozenCohort,
+        service_uid: String,
+    },
+    AdvanceTeardown(TeardownStage),
+    ShutdownFm(FrozenCohort),
+    JoinFm(FrozenCohort),
+    DeletePod(usize),
+    DeleteConfigMap(usize),
+    DeleteService,
     Wait,
     Blocked(String),
 }
 
-fn component(value: &str) -> bool {
+pub(crate) fn component(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && !matches!(value, "." | "..")
@@ -45,7 +61,7 @@ fn component(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
 }
 
-fn allocation_template(set: &KubericSet, settings: &Settings, owner: &str) -> Result<Allocation> {
+fn allocation_template(set: &KubericSet, settings: &Settings) -> Result<Allocation> {
     let name = set.name_any();
     ensure!(
         !name.is_empty() && name.len() <= 40,
@@ -57,14 +73,14 @@ fn allocation_template(set: &KubericSet, settings: &Settings, owner: &str) -> Re
     let allocation = Allocation {
         resource_uid: set.uid().context("KubericSet has no UID")?,
         resource_name: name.clone(),
+        namespace: settings.namespace.clone(),
         generation: set
             .metadata
             .generation
             .context("KubericSet has no generation")?,
         deployment: uuid::Uuid::from_u128(1).to_string(),
         partition: uuid::Uuid::from_u128(2).to_string(),
-        fm_owner: owner.into(),
-        settings: settings.clone(),
+        fm: settings.fm.clone(),
         spec: set.spec.clone(),
         nodes: (1..=3)
             .map(|id| {
@@ -81,30 +97,26 @@ fn allocation_template(set: &KubericSet, settings: &Settings, owner: &str) -> Re
             })
             .collect(),
     };
-    validate_allocation(set, &allocation, settings, owner)?;
+    validate_allocation(set, &allocation, settings, true)?;
     Ok(allocation)
 }
 
-pub(crate) fn new_allocation(
-    set: &KubericSet,
-    settings: &Settings,
-    owner: &str,
-) -> Result<Allocation> {
-    let mut allocation = allocation_template(set, settings, owner)?;
+pub(crate) fn new_allocation(set: &KubericSet, settings: &Settings) -> Result<Allocation> {
+    let mut allocation = allocation_template(set, settings)?;
     allocation.deployment = uuid::Uuid::new_v4().to_string();
     allocation.partition = uuid::Uuid::new_v4().to_string();
     for node in &mut allocation.nodes {
         node.node_id = uuid::Uuid::new_v4().simple().to_string();
     }
-    validate_allocation(set, &allocation, settings, owner)?;
+    validate_allocation(set, &allocation, settings, true)?;
     Ok(allocation)
 }
 
-fn validate_allocation(
+pub(crate) fn validate_allocation(
     set: &KubericSet,
     allocation: &Allocation,
     settings: &Settings,
-    owner: &str,
+    check_desired: bool,
 ) -> Result<()> {
     ensure!(
         set.namespace().as_deref() == Some(settings.namespace.as_str())
@@ -115,25 +127,32 @@ fn validate_allocation(
         allocation.resource_uid == set.uid().context("KubericSet has no UID")?
             && component(&allocation.resource_uid)
             && allocation.resource_name == set.name_any()
-            && allocation.generation
+            && allocation.namespace == settings.namespace,
+        "allocation changed its Kubernetes resource identity"
+    );
+    if check_desired {
+        ensure!(
+            allocation.generation
                 == set
                     .metadata
                     .generation
                     .context("KubericSet has no generation")?
-            && allocation.spec == set.spec
-            && allocation.settings == *settings
-            && allocation.fm_owner == owner
-            && !owner.is_empty(),
-        "resource/spec/settings or live FM owner changed; recovery and adoption are unsupported"
-    );
+                && allocation.spec == set.spec
+                && allocation.fm == settings.fm,
+            "resource spec/generation or native FM authority changed; replacement and rolling upgrade are unsupported"
+        );
+    }
     ensure!(
         allocation.spec.replicas == 3
             && !allocation.spec.image.is_empty()
             && allocation.spec.image.len() <= 1024
             && allocation.spec.client_port != 0
-            && Path::new(&allocation.spec.package_path).is_absolute()
-            && Path::new(&settings.run_root).is_absolute(),
+            && Path::new(&allocation.spec.package_path).is_absolute(),
         "only a fresh volatile 3/2 service with explicit image, package and ports is supported"
+    );
+    ensure!(
+        (100..=600_000).contains(&settings.teardown_timeout_ms),
+        "invalid teardown timeout"
     );
     for (name, value) in [("TargetReplicaSetSize", "3"), ("MinReplicaSetSize", "2")] {
         ensure!(
@@ -164,6 +183,7 @@ fn validate_allocation(
                 pod_uid: format!("validation-{index}"),
                 config_map_uid: format!("validation-{index}"),
                 ip: format!("127.0.0.{}", index + 2),
+                control_port: settings.node_port,
             })
             .collect(),
     };
@@ -171,6 +191,18 @@ fn validate_allocation(
     for index in 0..3 {
         resources::runner_config(&cohort, index)?;
     }
+    Ok(())
+}
+
+pub(crate) fn admitted(observation: &Observation, allocation: &Allocation) -> Result<()> {
+    ensure!(
+        observation.fm_allocation.as_ref() == Some(allocation),
+        "native FM backend has no original allocation admission; status cannot restore it"
+    );
+    ensure!(
+        observation.process_allocation.as_ref() == Some(allocation),
+        "process backend has no original allocation admission; cleanup ownership is unknown"
+    );
     Ok(())
 }
 
@@ -194,7 +226,7 @@ pub(crate) fn owned(metadata: &ObjectMeta, set: &KubericSet) -> bool {
     })
 }
 
-fn pod_spec_matches(actual: &PodSpec, expected: &PodSpec) -> bool {
+pub(crate) fn pod_spec_matches(actual: &PodSpec, expected: &PodSpec) -> bool {
     actual.restart_policy == expected.restart_policy
         && actual.containers.len() == expected.containers.len()
         && actual
@@ -237,13 +269,18 @@ fn pod_spec_matches(actual: &PodSpec, expected: &PodSpec) -> bool {
         }
 }
 
-fn metadata(metadata: &ObjectMeta, set: &KubericSet, allocation: &Allocation) -> Result<()> {
+pub(crate) fn metadata(
+    metadata: &ObjectMeta,
+    set: &KubericSet,
+    allocation: &Allocation,
+    allow_deleting: bool,
+) -> Result<()> {
     ensure!(
         owned(metadata, set),
         "resource name collides with foreign ownership"
     );
     ensure!(
-        metadata.deletion_timestamp.is_none()
+        (allow_deleting || metadata.deletion_timestamp.is_none())
             && metadata.labels.as_ref().is_some_and(|labels| {
                 labels.get(SET_UID) == Some(&allocation.resource_uid)
                     && labels.get(DEPLOYMENT) == Some(&allocation.deployment)
@@ -258,23 +295,22 @@ fn metadata(metadata: &ObjectMeta, set: &KubericSet, allocation: &Allocation) ->
     Ok(())
 }
 
-pub fn evaluate(observation: &Observation, settings: &Settings, owner: &str) -> Plan {
-    match evaluate_inner(observation, settings, owner) {
+pub fn evaluate(observation: &Observation, settings: &Settings) -> Plan {
+    match evaluate_inner(observation, settings) {
         Ok(plan) => plan,
         Err(error) => Plan::Blocked(format!("{error:#}")),
     }
 }
 
-fn evaluate_inner(observation: &Observation, settings: &Settings, owner: &str) -> Result<Plan> {
+fn evaluate_inner(observation: &Observation, settings: &Settings) -> Result<Plan> {
     let set = &observation.set;
     ensure!(
         observation.pods.len() == 3 && observation.config_maps.len() == 3,
         "incomplete resource observation"
     );
-    ensure!(
-        set.metadata.deletion_timestamp.is_none(),
-        "KubericSet deletion requires external cohort teardown"
-    );
+    if set.metadata.deletion_timestamp.is_some() {
+        return crate::teardown::evaluate(observation, settings);
+    }
     if let Some(status) = &set.status {
         if status.phase == ControllerPhase::Blocked {
             return Ok(Plan::Blocked(
@@ -284,6 +320,25 @@ fn evaluate_inner(observation: &Observation, settings: &Settings, owner: &str) -
                     .context("blocked status has no reason")?,
             ));
         }
+        ensure!(
+            status.teardown.is_none(),
+            "retained teardown cannot return to bootstrap"
+        );
+    }
+    if !set
+        .finalizers()
+        .iter()
+        .any(|finalizer| finalizer == resources::FINALIZER)
+    {
+        ensure!(
+            set.status
+                .as_ref()
+                .and_then(|status| status.allocation.as_ref())
+                .is_none(),
+            "owned finalizer disappeared after allocation"
+        );
+        allocation_template(set, settings)?;
+        return Ok(Plan::AddFinalizer);
     }
     let Some(allocation) = set
         .status
@@ -297,12 +352,38 @@ fn evaluate_inner(observation: &Observation, settings: &Settings, owner: &str) -
                 && observation.fm.is_none(),
             "existing resources or FM session have no accepted allocation; adoption is unsupported"
         );
-        allocation_template(set, settings, owner)?;
+        if let Some(draft) = &observation.fm_allocation {
+            validate_allocation(set, draft, settings, true)?;
+            ensure!(
+                observation
+                    .process_allocation
+                    .as_ref()
+                    .is_none_or(|allocation| allocation == draft),
+                "backends retained different fresh allocation drafts"
+            );
+        } else {
+            ensure!(
+                observation.process_allocation.is_none(),
+                "native FM draft is unavailable; a process backend cannot restore it"
+            );
+            allocation_template(set, settings)?;
+        }
         return Ok(Plan::Allocate);
     };
-    validate_allocation(set, allocation, settings, owner)?;
+    validate_allocation(set, allocation, settings, true)?;
+    admitted(observation, allocation)?;
     let status = set.status.as_ref().context("missing accepted status")?;
     let cohort = status.cohort();
+    if let Some(cohort) = &cohort {
+        if let Some(nodes) = crate::teardown::process_nodes(observation, cohort)? {
+            ensure!(
+                nodes
+                    .iter()
+                    .all(|node| matches!(node.outcome, crate::CleanupState::Pending)),
+                "owned process exited outside retained teardown"
+            );
+        }
+    }
     if let Some(report) = &observation.fm {
         ensure!(
             cohort.as_ref() == Some(&report.cohort),
@@ -325,7 +406,7 @@ fn evaluate_inner(observation: &Observation, settings: &Settings, owner: &str) -
     }
     for (index, pod) in observation.pods.iter().enumerate() {
         if let Some(pod) = pod {
-            metadata(&pod.metadata, set, allocation)?;
+            metadata(&pod.metadata, set, allocation, false)?;
             let desired = resources::pod(set, allocation, index)?;
             let actual = pod.spec.as_ref().context("owned Pod has no spec")?;
             let expected = desired.spec.as_ref().context("missing desired Pod spec")?;
@@ -345,14 +426,14 @@ fn evaluate_inner(observation: &Observation, settings: &Settings, owner: &str) -
         }
     }
     for map in observation.config_maps.iter().flatten() {
-        metadata(&map.metadata, set, allocation)?;
+        metadata(&map.metadata, set, allocation, false)?;
         ensure!(
             map.binary_data.as_ref().is_none_or(BTreeMap::is_empty),
             "unexpected binary node configuration"
         );
     }
     if let Some(service) = &observation.service {
-        metadata(&service.metadata, set, allocation)?;
+        metadata(&service.metadata, set, allocation, false)?;
         let expected = resources::service(set, allocation)?;
         ensure!(
             service
@@ -440,6 +521,7 @@ fn evaluate_inner(observation: &Observation, settings: &Settings, owner: &str) -
                     .uid()
                     .context("ConfigMap has no UID")?,
                 ip: ip.clone(),
+                control_port: settings.node_port,
             });
         }
         FrozenCohort {
@@ -506,7 +588,7 @@ fn evaluate_inner(observation: &Observation, settings: &Settings, owner: &str) -
     next.service_endpoint = report.status.service_endpoint.clone().filter(|_| serving);
     next.reason = None;
     if &next != status {
-        return Ok(Plan::Status(next));
+        return Ok(Plan::Status(Box::new(next)));
     }
     Ok(Plan::Wait)
 }

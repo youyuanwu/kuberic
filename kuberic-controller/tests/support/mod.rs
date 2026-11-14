@@ -5,7 +5,7 @@ pub mod api;
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -20,8 +20,9 @@ use kube::{
     Api, Client, ResourceExt,
 };
 use kuberic_controller::{
-    resources, ControllerPhase, FmApi, FmAuthority, FmObservation, FrozenCohort, KubericSet,
-    KubericSetSpec, Reconciler, ServiceTemplate, Settings,
+    resources, Allocation, BackendAdmission, CleanupState, ControllerPhase, FmApi, FmAuthority,
+    FmObservation, FrozenCohort, KubericSet, KubericSetSpec, NodeCleanup, ProcessApi,
+    ProcessObservation, Reconciler, ServiceTemplate, Settings,
 };
 use kuberic_fm::{Outbound, State};
 use tokio::sync::Mutex;
@@ -60,28 +61,34 @@ pub fn settings() -> Settings {
             generation: 1,
         },
         node_port: 19002,
-        run_root: "/run/fube".into(),
+        teardown_timeout_ms: 60_000,
     }
+}
+
+struct ScriptedSession {
+    cohort: FrozenCohort,
+    state: State,
+    joined: bool,
+    now: Duration,
 }
 
 #[derive(Default)]
 pub struct ScriptedFm {
-    owner: String,
-    session: Mutex<Option<(FrozenCohort, State)>>,
+    admission: BackendAdmission,
+    session: Mutex<Option<ScriptedSession>>,
     pub starts: AtomicUsize,
+    pub shutdowns: AtomicUsize,
+    pub joins: AtomicUsize,
 }
 
 impl ScriptedFm {
     pub fn new() -> Self {
-        Self {
-            owner: uuid::Uuid::new_v4().to_string(),
-            ..Self::default()
-        }
+        Self::default()
     }
 
     pub async fn bootstrap(&self) {
         let mut session = self.session.lock().await;
-        let (cohort, state) = session.as_mut().expect("accepted FM session");
+        let ScriptedSession { cohort, state, .. } = session.as_mut().expect("accepted FM session");
         let config = cohort.fm_config().unwrap();
         for node in 0..3 {
             let up = NodeUp::fresh_stateless(
@@ -110,14 +117,15 @@ impl ScriptedFm {
 
     pub async fn command(&self) -> Outbound {
         let mut session = self.session.lock().await;
-        session
-            .as_mut()
-            .unwrap()
-            .1
-            .reconcile(Duration::ZERO)
-            .unwrap()
-            .pop()
-            .unwrap()
+        let session = session.as_mut().unwrap();
+        session.state.reconcile(session.now).unwrap().pop().unwrap()
+    }
+
+    pub async fn retry(&self) -> Outbound {
+        let mut session = self.session.lock().await;
+        let session = session.as_mut().unwrap();
+        session.now += Duration::from_millis(session.cohort.fm_config().unwrap().retry_interval_ms);
+        session.state.reconcile(session.now).unwrap().pop().unwrap()
     }
 
     pub async fn complete(&self, outbound: &Outbound) {
@@ -127,8 +135,19 @@ impl ScriptedFm {
             .await
             .as_mut()
             .unwrap()
-            .1
+            .state
             .observe(outbound.node, &reply)
+            .unwrap();
+    }
+
+    pub async fn disconnect(&self, node: usize) {
+        self.session
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .state
+            .disconnected(node)
             .unwrap();
     }
 
@@ -143,8 +162,11 @@ impl ScriptedFm {
 
 #[async_trait]
 impl FmApi for ScriptedFm {
-    fn owner_id(&self) -> &str {
-        &self.owner
+    async fn reserve(&self, allocation: &Allocation) -> Result<()> {
+        self.admission.reserve(allocation).await
+    }
+    async fn allocation(&self) -> Result<Option<Allocation>> {
+        Ok(self.admission.allocation().await)
     }
     async fn observe(&self) -> Result<Option<FmObservation>> {
         Ok(self
@@ -152,27 +174,126 @@ impl FmApi for ScriptedFm {
             .lock()
             .await
             .as_ref()
-            .map(|(cohort, state)| FmObservation {
-                cohort: cohort.clone(),
-                status: state.status(),
+            .map(|session| FmObservation {
+                cohort: session.cohort.clone(),
+                status: session.state.status(),
+                joined: session.joined,
             }))
     }
     async fn start(&self, cohort: &FrozenCohort) -> Result<()> {
+        self.admission.require(&cohort.allocation).await?;
         let mut session = self.session.lock().await;
-        if let Some((existing, _)) = session.as_ref() {
-            ensure!(existing == cohort, "different scripted cohort");
+        if let Some(existing) = session.as_ref() {
+            ensure!(&existing.cohort == cohort, "different scripted cohort");
             return Ok(());
         }
-        *session = Some((cohort.clone(), State::new(cohort.fm_config()?)?));
+        *session = Some(ScriptedSession {
+            cohort: cohort.clone(),
+            state: State::new(cohort.fm_config()?)?,
+            joined: false,
+            now: Duration::ZERO,
+        });
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    async fn invalidate(&self, cohort: &FrozenCohort, reason: &str) -> Result<()> {
-        if let Some((existing, state)) = self.session.lock().await.as_mut() {
-            ensure!(existing == cohort, "different scripted invalidation");
-            state.fail(reason);
+    async fn shutdown(&self, cohort: &FrozenCohort) -> Result<()> {
+        let mut session = self.session.lock().await;
+        let session = session.as_mut().context("missing scripted FM")?;
+        ensure!(session.cohort == *cohort, "different scripted shutdown");
+        match session.state.phase() {
+            kuberic_fm::Phase::Serving => {
+                session.state.request_shutdown(session.now)?;
+                self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            }
+            kuberic_fm::Phase::Deleting
+            | kuberic_fm::Phase::AwaitingNodeShutdown
+            | kuberic_fm::Phase::Stopped => {}
+            _ => anyhow::bail!("scripted native create has not completed"),
         }
         Ok(())
+    }
+    async fn join(&self, cohort: &FrozenCohort) -> Result<()> {
+        let mut session = self.session.lock().await;
+        let session = session.as_mut().context("missing scripted FM")?;
+        ensure!(
+            session.cohort == *cohort && session.state.phase() == kuberic_fm::Phase::Stopped,
+            "scripted native shutdown is incomplete"
+        );
+        if !session.joined {
+            session.joined = true;
+            self.joins.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    async fn invalidate(&self, cohort: &FrozenCohort, reason: &str) -> Result<()> {
+        if let Some(session) = self.session.lock().await.as_mut() {
+            ensure!(session.cohort == *cohort, "different scripted invalidation");
+            session.state.fail(reason);
+        }
+        Ok(())
+    }
+}
+
+pub struct ProcessEvidence {
+    admission: BackendAdmission,
+    observation: Mutex<Option<ProcessObservation>>,
+}
+
+impl ProcessEvidence {
+    pub fn new() -> Self {
+        Self {
+            admission: BackendAdmission::default(),
+            observation: Mutex::new(None),
+        }
+    }
+
+    pub async fn publish(&self, cohort: &FrozenCohort, node: usize, outcome: CleanupState) {
+        self.observe(cohort).await.unwrap();
+        let mut observation = self.observation.lock().await;
+        let observation = observation.as_mut().unwrap();
+        assert_eq!(&observation.cohort, cohort);
+        assert!(
+            matches!(observation.nodes[node].outcome, CleanupState::Pending)
+                || observation.nodes[node].outcome == outcome,
+            "terminal cleanup evidence cannot change"
+        );
+        observation.nodes[node].outcome = outcome;
+    }
+}
+
+#[async_trait]
+impl ProcessApi for ProcessEvidence {
+    async fn reserve(&self, allocation: &Allocation) -> Result<()> {
+        self.admission.reserve(allocation).await
+    }
+    async fn allocation(&self) -> Result<Option<Allocation>> {
+        Ok(self.admission.allocation().await)
+    }
+    async fn observe(&self, cohort: &FrozenCohort) -> Result<Option<ProcessObservation>> {
+        if self.admission.allocation().await.as_ref() != Some(&cohort.allocation) {
+            return Ok(None);
+        }
+        let mut observation = self.observation.lock().await;
+        if observation.is_none() {
+            *observation = Some(ProcessObservation {
+                cohort: cohort.clone(),
+                nodes: cohort
+                    .bindings
+                    .iter()
+                    .map(|binding| NodeCleanup {
+                        pod_uid: binding.pod_uid.clone(),
+                        outcome: CleanupState::Pending,
+                    })
+                    .collect(),
+            });
+        }
+        ensure!(
+            observation
+                .as_ref()
+                .is_some_and(|observation| observation.cohort == *cohort),
+            "process owner cannot adopt another cohort"
+        );
+        Ok(observation.clone())
     }
 }
 
@@ -180,6 +301,25 @@ pub fn native_completion(
     message: &fube_transport::message::Message,
 ) -> fube_transport::message::Message {
     let action = message.properties().unwrap().action;
+    if action == "DeleteReplica" {
+        let request = decode_delete_replica(message).unwrap().0.replica.0;
+        return delete_replica_reply_message(
+            &AddInstanceReply {
+                unit: request.unit,
+                replica: Replica {
+                    node: request.replica.node,
+                    id: request.replica.id,
+                    instance: request.replica.instance,
+                    up: false,
+                    state: 3,
+                    ..Replica::default()
+                },
+                error: 0,
+            },
+            Owner::Fm,
+        )
+        .unwrap();
+    }
     if action == "DoReconfiguration" {
         let mut configuration = decode_do_reconfiguration(message).unwrap().0.configuration;
         configuration.unit.previous = Epoch::default();
@@ -223,6 +363,8 @@ pub struct Fixture {
     pub api: api::MockApi,
     pub client: Client,
     pub fm: Arc<ScriptedFm>,
+    pub processes: Arc<ProcessEvidence>,
+    pub clock: Arc<AtomicU64>,
     pub controller: Reconciler,
 }
 
@@ -238,13 +380,32 @@ impl Fixture {
             .await
             .unwrap();
         let fm = Arc::new(ScriptedFm::new());
-        let controller = Reconciler::new(client.clone(), settings(), fm.clone()).unwrap();
+        let processes = Arc::new(ProcessEvidence::new());
+        let clock = Arc::new(AtomicU64::new(1_000));
+        let now = clock.clone();
+        let controller = Reconciler::new(client.clone(), settings(), fm.clone(), processes.clone())
+            .unwrap()
+            .with_clock(move || Ok(now.load(Ordering::SeqCst)));
         Self {
             api,
             client,
             fm,
+            processes,
+            clock,
             controller,
         }
+    }
+
+    pub fn recreate(&self) -> Reconciler {
+        let clock = self.clock.clone();
+        Reconciler::new(
+            self.client.clone(),
+            settings(),
+            self.fm.clone(),
+            self.processes.clone(),
+        )
+        .unwrap()
+        .with_clock(move || Ok(clock.load(Ordering::SeqCst)))
     }
 
     pub async fn set(&self) -> KubericSet {

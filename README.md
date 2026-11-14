@@ -47,7 +47,8 @@ package, not an available image or installation.
 
 Bootstrap proceeds through separately observed facts:
 
-- Persist fresh allocation authority before creating owned objects.
+- Install the owned-teardown finalizer and persist fresh allocation authority
+  before creating owned objects.
 - Create empty per-node ConfigMaps, a disabled client Service and all original
   Pods. Pods use `restartPolicy: Never`; their startup gate waits for `node.json`.
 - Observe all Pod IPs and bind exact Pod/ConfigMap UIDs before freezing topology.
@@ -61,8 +62,8 @@ Bootstrap proceeds through separately observed facts:
 Owned-resource writes retain UID/resourceVersion checks and effects revalidate
 their observation. Lost API replies do not roll back persisted authority.
 Changed or missing original Pods/configurations, container restarts, unsupported
-spec changes, lost allocation status or a different live FM owner block the
-cohort. Blocking invalidates further locally owned FM intent and restores a
+spec changes, lost allocation status or unavailable original backend admission
+block the cohort. Blocking invalidates further locally owned FM intent and restores a
 nonmatching Service selector; it does not prove a remote writer stopped.
 Foreign-owned resources are not mutated.
 
@@ -71,7 +72,7 @@ application contract and must match its listener; opaque native endpoint
 strings are preserved, not reinterpreted as a universal Kubernetes port format.
 The Pod template requires an image containing `tini`, a POSIX shell, `sleep`,
 the fube runner and the declared application package. No such image, RBAC,
-installation, finalizer/garbage-collection workflow or Kubernetes networking
+installation, real-cluster garbage-collection or Kubernetes networking
 qualification is provided yet.
 
 Tests use a narrow in-memory HTTP API behind a real `kube::Client`, including
@@ -79,8 +80,80 @@ namespaces, ownership, UID/resourceVersion fencing, immutable ConfigMaps and
 explicit conflict/lost-response injection. A mock-Pod supervisor supplies only
 infrastructure facts and launches local fube processes from the published
 configurations. Native bootstrap/build/configuration still uses the real FM.
-Controller-facade recreation can reuse the same retained live FM owner; a new
-FM process cannot adopt status or reconnect to the old cohort.
+Controller-facade recreation can reuse retained backend admission; a fresh
+backend cannot adopt API status, reconnect or reconstruct process cleanup.
+
+### Persisted authority versus backend state
+
+The CRD stores Kubernetes/native intent, not local supervisor internals:
+
+| Persisted fields | Purpose |
+|---|---|
+| Parent namespace/name/UID, accepted generation and spec | Exact Kubernetes ownership and frozen desired intent |
+| Deployment/partition, native FM identity/instance/generation/address, node/replica IDs | Original native protocol authority |
+| Pod/ConfigMap names and UIDs, Pod IPs and control ports | Exact object incarnations and native listener bindings |
+| Phase, native endpoint, reason, teardown cohort/Service UID/stage/start/deadline | Observed progress and retained operation scope |
+
+`fmOwner`, `processOwner`, runtime `Settings`, host run directories and raw
+process-reaping receipts are not CRD fields. `Settings` is a controller input;
+native FM authority and concrete control ports are captured explicitly rather
+than persisting the whole runtime configuration.
+Older experimental status shapes are rejected, not converted into backend
+admission or cleanup evidence.
+
+FM/process backends privately reserve a fresh allocation before its first
+status write. No resources or native effects start until that write is observed.
+Failed or lost writes reuse the same retained draft. For an existing allocation,
+the controller requires original backend admission; it never calls `reserve`
+to import API status. Admission permits acquiring that fresh cohort, but is not
+itself evidence that any process was joined.
+
+`packagePath` is the package's in-container path, and node configurations use
+the Pod's `/run/fube` volume. The local process supervisor translates these to
+host fixture paths only in its private launch configuration; those paths are not
+written into Kubernetes objects.
+
+### Controller-owned deletion
+
+The controller retains `operator.kuberic.io/owned-teardown` until the original
+cohort is positively cleaned up. Deleting a healthy, fully created KubericSet
+drives these separately observed stages:
+
+- Persist teardown intent for the exact frozen cohort and original Service UID,
+  with a bounded deadline. Later spec edits cannot retarget that accepted intent.
+- Restore the nonmatching client Service selector, then request native FM
+  shutdown. Wait for actual deletion replies for every original replica.
+- Request normal UID/resourceVersion-fenced Pod deletion with a positive grace
+  period. The mock supervisor forwards SIGTERM to its owned node processes.
+- Wait independently for original node/application reaping and resource joins,
+  Pod disappearance, and actual FM task joining. A Pod deletion, native reply,
+  signal or closed channel is not a physical-cleanup receipt.
+- Delete the exact original ConfigMaps and Service, persist completion, then
+  remove only this controller's finalizer. Foreign finalizers are preserved.
+
+`Reconciler::new` requires an `FmApi` and a separate `ProcessApi`. The process
+backend must retain exact cohort/Pod-UID receipts from actual owned child
+handles, including successful node exit, application reaping, resource joins
+and whether cleanup was forced. The local process tests publish those facts
+only after checking the real fube exits, final cleanup status and owned joins.
+Kubernetes annotations and object absence cannot substitute for that backend.
+
+Reconciliation may resume after lost API replies or controller-facade recreation
+with the same retained backend admission. Creating fresh backends is not recovery.
+Cleanup receipts remain backend observations, not CRD data; persisted teardown
+progress cannot substitute for them. Every resource-release/finalizer step still
+requires live original cleanup evidence. API conflicts do not advance cleanup.
+Missing, failed, forced, partial or changed evidence retains the finalizer and
+surfaces uncertainty instead of successful teardown.
+
+`Settings::teardown_timeout_ms` supplies the bound when teardown is accepted.
+Only the resulting start/deadline persist; later runtime policy changes cannot
+rewrite that accepted deadline.
+Deletion before native create completes, unhealthy cohorts, premature Pod loss,
+changed original resource UIDs, or an expired cleanup deadline remain explicitly
+blocked and require intervention. There is no forced-deletion or automatic
+adoption path. The finalizer workflow is qualified only against the mock API and
+local processes, not a real-cluster garbage collector or remote process backend.
 
 ## Process mode
 
@@ -124,8 +197,9 @@ cargo test --workspace -- --include-ignored
 
 The process tiers exercise the standalone FM binary and the mock-backed
 controller/native-FM bridge with real node binaries and sample application
-children. They check write/readback, native-controlled client routing and owned
-teardown. They need no Docker, Kubernetes or native Service Fabric.
+children. They check write/readback, native-controlled client routing and
+controller-driven finalizer teardown with independent process-cleanup receipts.
+They need no Docker, Kubernetes or native Service Fabric.
 `FUBE_NODE_EXE` and `FUBE_NODE_APP` can override the prebuilt binary paths.
 
 The fixture follows fube's temporary bind-to-port-zero allocation for node

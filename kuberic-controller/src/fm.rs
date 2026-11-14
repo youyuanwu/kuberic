@@ -9,20 +9,24 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::FrozenCohort;
+use crate::{Allocation, BackendAdmission, FrozenCohort};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FmObservation {
     pub cohort: FrozenCohort,
     pub status: Status,
+    pub joined: bool,
 }
 
 #[async_trait]
 pub trait FmApi: Send + Sync {
-    /// One live process owner, never reconstructed from Kubernetes status.
-    fn owner_id(&self) -> &str;
+    /// Reserve only before first allocation persistence and resource creation.
+    async fn reserve(&self, allocation: &Allocation) -> Result<()>;
+    async fn allocation(&self) -> Result<Option<Allocation>>;
     async fn observe(&self) -> Result<Option<FmObservation>>;
     async fn start(&self, cohort: &FrozenCohort) -> Result<()>;
+    async fn shutdown(&self, cohort: &FrozenCohort) -> Result<()>;
+    async fn join(&self, cohort: &FrozenCohort) -> Result<()>;
     async fn invalidate(&self, cohort: &FrozenCohort, reason: &str) -> Result<()>;
 }
 
@@ -39,7 +43,7 @@ struct Session {
 /// join this owner; dropping an observer is not a physical cleanup receipt.
 #[must_use]
 pub struct ProcessFm {
-    owner: String,
+    admission: BackendAdmission,
     session: Mutex<Option<Session>>,
 }
 
@@ -52,7 +56,7 @@ impl Default for ProcessFm {
 impl ProcessFm {
     pub fn new() -> Self {
         Self {
-            owner: uuid::Uuid::new_v4().to_string(),
+            admission: BackendAdmission::default(),
             session: Mutex::new(None),
         }
     }
@@ -107,8 +111,12 @@ impl ProcessFm {
 
 #[async_trait]
 impl FmApi for ProcessFm {
-    fn owner_id(&self) -> &str {
-        &self.owner
+    async fn reserve(&self, allocation: &Allocation) -> Result<()> {
+        self.admission.reserve(allocation).await
+    }
+
+    async fn allocation(&self) -> Result<Option<Allocation>> {
+        Ok(self.admission.allocation().await)
     }
 
     async fn observe(&self) -> Result<Option<FmObservation>> {
@@ -137,14 +145,29 @@ impl FmApi for ProcessFm {
         Ok(Some(FmObservation {
             cohort: session.cohort.clone(),
             status,
+            joined: session.task.is_none(),
         }))
     }
 
+    async fn shutdown(&self, cohort: &FrozenCohort) -> Result<()> {
+        ProcessFm::shutdown(self, cohort).await
+    }
+
+    async fn join(&self, cohort: &FrozenCohort) -> Result<()> {
+        {
+            let session = self.session.lock().await;
+            ensure!(
+                session
+                    .as_ref()
+                    .is_some_and(|session| session.cohort == *cohort),
+                "FM join targets a different or absent original cohort"
+            );
+        }
+        ProcessFm::join(self).await
+    }
+
     async fn start(&self, cohort: &FrozenCohort) -> Result<()> {
-        ensure!(
-            cohort.allocation.fm_owner == self.owner,
-            "cohort has a different live FM owner"
-        );
+        self.admission.require(&cohort.allocation).await?;
         let mut session = self.session.lock().await;
         if let Some(existing) = session.as_ref() {
             ensure!(
