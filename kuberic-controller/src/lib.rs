@@ -19,5 +19,5 @@ pub use crd::{
 pub use fm::{FmApi, FmObservation, ProcessFm};
 pub use plan::{evaluate, Observation, Plan};
 pub use process::{CleanupReceipt, CleanupState, NodeCleanup, ProcessApi, ProcessObservation};
-pub use reconciler::{ReconcileOutcome, Reconciler};
+pub use reconciler::{ReconcileOutcome, Reconciler, StaleObservation};
 pub use settings::Settings;

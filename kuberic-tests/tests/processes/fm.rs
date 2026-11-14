@@ -1,39 +1,12 @@
-mod support;
-
-use std::{
-    fs,
-    net::{Ipv4Addr, SocketAddrV4},
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
+use std::{fs, net::Ipv4Addr, path::Path, process::Command, time::Duration};
 
 use fube_local_host::process::OwnedApp;
-use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
-    time::Instant,
+use kuberic_tests::{
+    fm as support,
+    process::{application, binaries, reserve, stage_package},
 };
-
-fn reserve(ip: Ipv4Addr) -> SocketAddrV4 {
-    let listener = std::net::TcpListener::bind((ip, 0)).unwrap();
-    match listener.local_addr().unwrap() {
-        std::net::SocketAddr::V4(address) => address,
-        _ => unreachable!(),
-    }
-}
-
-fn binary(name: &str, variable: &str) -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    std::env::var_os(variable)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target/debug").join(name))
-        .canonicalize()
-        .unwrap_or_else(|error| {
-            panic!("missing prebuilt {name}: {error}; see README process-test commands")
-        })
-}
+use serde_json::Value;
+use tokio::time::Instant;
 
 fn start(executable: &Path, config: &Path) -> OwnedApp {
     let mut command = Command::new(executable);
@@ -60,27 +33,9 @@ struct Cluster {
 
 impl Cluster {
     fn new() -> Self {
-        let node_executable = binary("fube-node", "FUBE_NODE_EXE");
-        let app_executable = binary("hosting-local-app", "FUBE_NODE_APP");
+        let binaries = binaries();
         let root = tempfile::tempdir().unwrap();
-        let package = root.path().join("package");
-        fs::create_dir_all(package.join("LocalService/Code")).unwrap();
-        fs::write(
-            package.join("ApplicationManifest.xml"),
-            include_bytes!(
-                "../../fube/crates/samples/hosting-local-app/pkg-stateful/ApplicationManifest.xml"
-            ),
-        )
-        .unwrap();
-        fs::write(
-            package.join("LocalService/ServiceManifest.xml"),
-            include_bytes!("../../fube/crates/samples/hosting-local-app/pkg-stateful/LocalService/ServiceManifest.xml"),
-        ).unwrap();
-        fs::copy(
-            app_executable,
-            package.join("LocalService/Code/hosting-local-app"),
-        )
-        .unwrap();
+        let package = stage_package(root.path(), &binaries.app);
 
         let mut config = support::config();
         config.deployment = uuid::Uuid::new_v4().to_string();
@@ -95,7 +50,7 @@ impl Cluster {
         config.validate().unwrap();
         let path = root.path().join("fm.json");
         fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-        let fm = start(Path::new(env!("CARGO_BIN_EXE_kuberic-fm")), &path);
+        let fm = start(&binaries.fm, &path);
         let configs: Vec<_> = config.nodes.iter().enumerate().map(|(index, placement)| {
             fube_node_runner::Config {
                 schema_version: 1,
@@ -129,7 +84,7 @@ impl Cluster {
             node.validate().unwrap();
             let path = root.path().join(format!("node{index}.json"));
             fs::write(&path, serde_json::to_vec(node).unwrap()).unwrap();
-            nodes.push(start(&node_executable, &path));
+            nodes.push(start(&binaries.node, &path));
         }
         Self {
             fm,
@@ -184,24 +139,6 @@ impl Cluster {
     }
 }
 
-async fn application(endpoint: &str, command: &str) -> String {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let mut stream = TcpStream::connect(endpoint).await.unwrap();
-        stream
-            .write_all(format!("{command}\n").as_bytes())
-            .await
-            .unwrap();
-        let mut response = String::new();
-        BufReader::new(stream)
-            .read_line(&mut response)
-            .await
-            .unwrap();
-        response
-    })
-    .await
-    .unwrap()
-}
-
 async fn finish(child: &mut OwnedApp) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -220,7 +157,6 @@ async fn finish(child: &mut OwnedApp) {
 }
 
 #[tokio::test]
-#[ignore = "requires prebuilt fube-node and hosting-local-app; see root README"]
 async fn real_fm_and_fube_nodes_create_serve_delete_and_join_owned_processes() {
     let mut cluster = Cluster::new();
     let status = cluster.until("serving").await;

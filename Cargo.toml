@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kuberic-fm", "kuberic-controller"]
+members = ["kuberic-fm", "kuberic-controller", "kuberic-tests"]
 exclude = ["archive", "fube"]
 
 [workspace.package]
@@ -23,6 +23,7 @@ fube-node-runner = { path = "fube/crates/tools/fube-node-runner" }
 fube-ra = { path = "fube/crates/libs/fube-ra" }
 fube-transport = { path = "fube/crates/libs/fube-transport" }
 kuberic-fm = { path = "kuberic-fm" }
+kuberic-controller = { path = "kuberic-controller" }
 k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"] }
 kube = { version = "4", default-features = false, features = ["client", "derive", "rustls-tls"] }
 schemars = "1"

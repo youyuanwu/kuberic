@@ -42,10 +42,5 @@ jobs:
       - name: Build workspace documentation
         run: cargo doc --locked --workspace --no-deps
 
-      - name: Build fube process fixtures
-        run: |
-          cargo build --locked --manifest-path fube/Cargo.toml \
-            -p fube-node-runner -p hosting-local-app --bins --target-dir target
-
       - name: Test workspace including process journeys
-        run: cargo test --locked --workspace -- --include-ignored
+        run: cargo test --locked --workspace

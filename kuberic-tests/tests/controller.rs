@@ -1,4 +1,4 @@
-mod support;
+use kuberic_tests::controller as support;
 
 use std::{
     collections::BTreeMap,
@@ -13,7 +13,7 @@ use kube::{
 use kuberic_controller::{
     evaluate,
     resources::{self, POD_UID},
-    ControllerPhase, FmApi, KubericSet, Plan, ProcessFm, Reconciler,
+    ControllerPhase, FmApi, KubericSet, Plan, ProcessFm, Reconciler, StaleObservation,
 };
 
 use support::{api::Kind, Fixture, NAME, NAMESPACE};
@@ -411,7 +411,15 @@ async fn stale_pod_snapshot_cannot_start_a_native_fm_session() {
     assert!(matches!(plan, Plan::StartFm(_)));
     let pod = observation.pods[0].as_ref().unwrap();
     support::publish_ip(&fixture.client, pod, "127.0.0.9", true).await;
-    assert!(fixture.controller.apply(&observation, plan).await.is_err());
+    let error = fixture
+        .controller
+        .apply(&observation, plan)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StaleObservation>(),
+        Some(&StaleObservation::Resources)
+    );
     assert_eq!(fixture.fm.starts.load(Ordering::SeqCst), 0);
     assert!(fixture
         .controller
@@ -420,6 +428,29 @@ async fn stale_pod_snapshot_cannot_start_a_native_fm_session() {
         .unwrap()
         .blocked
         .is_some());
+    fixture.api.check();
+}
+
+#[tokio::test]
+async fn native_transition_rejects_stale_routing_as_retryable_without_publishing() {
+    let fixture = Fixture::new().await;
+    fixture.provision().await;
+    fixture.fm.create().await;
+    let observation = fixture.controller.observe(NAME).await.unwrap();
+    let plan = evaluate(&observation, &support::settings());
+    assert!(matches!(plan, Plan::Route(_)));
+    let cohort = observation.set.status.as_ref().unwrap().cohort().unwrap();
+    fixture.fm.shutdown(&cohort).await.unwrap();
+    let error = fixture
+        .controller
+        .apply(&observation, plan)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StaleObservation>(),
+        Some(&StaleObservation::Premise)
+    );
+    assert_disabled(&fixture).await;
     fixture.api.check();
 }
 

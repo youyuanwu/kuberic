@@ -1,9 +1,7 @@
-mod support;
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -21,36 +19,13 @@ use kuberic_controller::{
     resources, CleanupReceipt, CleanupState, ControllerPhase, FmApi, KubericSet, ProcessFm,
     Reconciler, TeardownStage,
 };
-use serde_json::Value;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
-    time::Instant,
+use kuberic_tests::{
+    controller as support,
+    process::{application, binaries, reconcile, reserve, stage_package},
 };
-
+use serde_json::Value;
 use support::{NAME, NAMESPACE};
-
-fn reserve(ip: Ipv4Addr) -> SocketAddrV4 {
-    let listener = std::net::TcpListener::bind((ip, 0)).unwrap();
-    match listener.local_addr().unwrap() {
-        std::net::SocketAddr::V4(address) => address,
-        _ => unreachable!(),
-    }
-}
-
-fn binary(name: &str, variable: &str) -> PathBuf {
-    std::env::var_os(variable)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .join("target/debug")
-                .join(name)
-        })
-        .canonicalize()
-        .unwrap_or_else(|error| panic!("missing prebuilt {name}: {error}; see root README"))
-}
+use tokio::time::Instant;
 
 struct Supervisor {
     client: Client,
@@ -66,6 +41,16 @@ struct Supervisor {
 }
 
 impl Supervisor {
+    fn diagnostics(&self) -> String {
+        format!(
+            "{:?}",
+            self.nodes
+                .iter()
+                .map(|(uid, node)| (uid, node.logs()))
+                .collect::<Vec<_>>()
+        )
+    }
+
     async fn tick(&mut self, resource_uid: &str) {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), NAMESPACE);
         let maps: Api<ConfigMap> = Api::namespaced(self.client.clone(), NAMESPACE);
@@ -222,54 +207,20 @@ fn cleanup_receipt(
     Ok(receipt)
 }
 
-async fn application(endpoint: &str, command: &str) -> String {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        let mut stream = TcpStream::connect(endpoint).await.unwrap();
-        stream
-            .write_all(format!("{command}\n").as_bytes())
-            .await
-            .unwrap();
-        let mut response = String::new();
-        BufReader::new(stream)
-            .read_line(&mut response)
-            .await
-            .unwrap();
-        response
-    })
-    .await
-    .unwrap()
-}
-
 #[tokio::test]
-#[ignore = "requires prebuilt fube-node and hosting-local-app; see root README"]
 async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
     lifecycle(false).await;
 }
 
 #[tokio::test]
-#[ignore = "requires prebuilt fube-node and hosting-local-app; see root README"]
 async fn deleting_during_node_startup_finishes_real_bootstrap_without_publishing_clients() {
     lifecycle(true).await;
 }
 
 async fn lifecycle(delete_during_bootstrap: bool) {
+    let binaries = binaries();
     let root = tempfile::tempdir().unwrap();
-    let package = root.path().join("package");
-    fs::create_dir_all(package.join("LocalService/Code")).unwrap();
-    fs::write(
-        package.join("ApplicationManifest.xml"),
-        include_bytes!(
-            "../../fube/crates/samples/hosting-local-app/pkg-stateful/ApplicationManifest.xml"
-        ),
-    )
-    .unwrap();
-    fs::write(package.join("LocalService/ServiceManifest.xml"),
-        include_bytes!("../../fube/crates/samples/hosting-local-app/pkg-stateful/LocalService/ServiceManifest.xml")).unwrap();
-    fs::copy(
-        binary("hosting-local-app", "FUBE_NODE_APP"),
-        package.join("LocalService/Code/hosting-local-app"),
-    )
-    .unwrap();
+    let package = stage_package(root.path(), &binaries.app);
     let api = support::api::MockApi::default();
     let client = api.client(NAMESPACE);
     let fm = Arc::new(ProcessFm::new());
@@ -277,6 +228,7 @@ async fn lifecycle(delete_during_bootstrap: bool) {
     let mut settings = support::settings();
     settings.fm.address = reserve(Ipv4Addr::LOCALHOST).to_string();
     settings.node_port = reserve(Ipv4Addr::new(127, 0, 0, 12)).port();
+    let operation_budget = Duration::from_millis(settings.teardown_timeout_ms);
     let client_port = reserve(Ipv4Addr::new(127, 0, 0, 12)).port();
     let sets: Api<KubericSet> = Api::namespaced(client.clone(), NAMESPACE);
     let set = sets
@@ -290,7 +242,7 @@ async fn lifecycle(delete_during_bootstrap: bool) {
         Reconciler::new(client.clone(), settings, fm.clone(), evidence.clone()).unwrap();
     let mut supervisor = Supervisor {
         client: client.clone(),
-        executable: binary("fube-node", "FUBE_NODE_EXE"),
+        executable: binaries.node.clone(),
         package,
         nodes: BTreeMap::new(),
         configs: BTreeMap::new(),
@@ -300,9 +252,9 @@ async fn lifecycle(delete_during_bootstrap: bool) {
         api: api.clone(),
         root,
     };
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + operation_budget;
     let started = loop {
-        let result = controller.reconcile(NAME).await.unwrap();
+        let result = reconcile(&controller, NAME).await.unwrap();
         assert!(
             result.blocked.is_none(),
             "{result:?}; FM={:?}",
@@ -326,7 +278,9 @@ async fn lifecycle(delete_during_bootstrap: bool) {
         }
         assert!(
             Instant::now() < deadline,
-            "controller bootstrap deadline: {current:?}"
+            "controller bootstrap deadline: {current:?}; FM={:?}; nodes={}",
+            fm.observe().await.unwrap(),
+            supervisor.diagnostics()
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
@@ -370,10 +324,11 @@ async fn lifecycle(delete_during_bootstrap: bool) {
     )
     .await
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deletion_budget = operation_budget * if delete_during_bootstrap { 2 } else { 1 };
+    let deadline = Instant::now() + deletion_budget + Duration::from_secs(5);
     let mut saw_bootstrap_wait = false;
     loop {
-        let outcome = controller.reconcile(NAME).await.unwrap();
+        let outcome = reconcile(&controller, NAME).await.unwrap();
         assert!(outcome.blocked.is_none(), "{outcome:?}");
         if outcome.resource_absent || sets.get_opt(NAME).await.unwrap().is_none() {
             break;
@@ -398,7 +353,10 @@ async fn lifecycle(delete_during_bootstrap: bool) {
         supervisor.tick(&set.uid().unwrap()).await;
         assert!(
             Instant::now() < deadline,
-            "controller-owned teardown deadline"
+            "controller-owned teardown deadline; set={:?}; FM={:?}; nodes={}",
+            sets.get_opt(NAME).await.unwrap(),
+            fm.observe().await.unwrap(),
+            supervisor.diagnostics()
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

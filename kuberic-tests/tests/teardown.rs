@@ -1,4 +1,4 @@
-mod support;
+use kuberic_tests::controller as support;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

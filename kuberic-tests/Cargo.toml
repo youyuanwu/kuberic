@@ -1,0 +1,36 @@
+[package]
+name = "kuberic-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Integration tests for Kuberic and fube"
+publish = false
+
+[[test]]
+name = "processes"
+path = "tests/processes.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+fube-ra.workspace = true
+fube-transport.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+kuberic-controller.workspace = true
+kuberic-fm.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+http = "1"
+form_urlencoded = "1"
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+fube-local-host = { path = "../fube/crates/libs/fube-local-host" }
+fube-node.workspace = true
+fube-node-runner.workspace = true
+serde.workspace = true
+tempfile = "3"

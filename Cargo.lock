@@ -957,21 +957,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "form_urlencoded",
- "fube-local-host",
  "fube-node-runner",
- "fube-ra",
- "fube-transport",
- "http",
  "k8s-openapi",
  "kube",
  "kuberic-fm",
  "schemars",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
- "tower",
  "uuid",
 ]
 
@@ -981,15 +974,38 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "fube-local-host",
  "fube-node",
  "fube-node-runner",
  "fube-ra",
  "fube-transport",
  "serde",
  "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "kuberic-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "form_urlencoded",
+ "fube-local-host",
+ "fube-node",
+ "fube-node-runner",
+ "fube-ra",
+ "fube-transport",
+ "http",
+ "k8s-openapi",
+ "kube",
+ "kuberic-controller",
+ "kuberic-fm",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "tower",
  "uuid",
 ]
 

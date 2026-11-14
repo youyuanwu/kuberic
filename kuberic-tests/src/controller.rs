@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod api;
 
 use std::{
@@ -234,6 +232,7 @@ impl FmApi for ScriptedFm {
     }
 }
 
+#[derive(Default)]
 pub struct ProcessEvidence {
     admission: BackendAdmission,
     observation: Mutex<Option<ProcessObservation>>,
@@ -241,10 +240,7 @@ pub struct ProcessEvidence {
 
 impl ProcessEvidence {
     pub fn new() -> Self {
-        Self {
-            admission: BackendAdmission::default(),
-            observation: Mutex::new(None),
-        }
+        Self::default()
     }
 
     pub async fn publish(&self, cohort: &FrozenCohort, node: usize, outcome: CleanupState) {

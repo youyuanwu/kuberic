@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +26,26 @@ pub struct ReconcileOutcome {
     /// Kubernetes object absence only; never a process-cleanup receipt.
     pub resource_absent: bool,
 }
+
+/// No effect was applied; callers may retry with a fresh observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleObservation {
+    Resources,
+    Premise,
+}
+
+impl fmt::Display for StaleObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Resources => {
+                "observation changed before effect; reobserve instead of applying stale authority"
+            }
+            Self::Premise => "reconciliation premise changed before effect",
+        })
+    }
+}
+
+impl std::error::Error for StaleObservation {}
 
 pub struct Reconciler {
     settings: Settings,
@@ -142,7 +163,7 @@ impl Reconciler {
                         .service
                         .as_ref()
                         .map(|object| (object.uid(), object.resource_version())),
-            "observation changed before effect; reobserve instead of applying stale authority"
+            StaleObservation::Resources
         );
         Ok(current)
     }
@@ -183,7 +204,7 @@ impl Reconciler {
         let current = self.current(observation).await?;
         ensure!(
             crate::evaluate(&current, &self.settings) == plan,
-            "reconciliation premise changed before effect"
+            StaleObservation::Premise
         );
         let set = &current.set;
         let accepted = set.status.as_ref().cloned().unwrap_or_default();

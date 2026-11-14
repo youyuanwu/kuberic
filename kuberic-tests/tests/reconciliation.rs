@@ -1,4 +1,4 @@
-mod support;
+use kuberic_tests::fm as support;
 
 use std::time::Duration;
 

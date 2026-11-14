@@ -30,9 +30,13 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 
-Default tests exercise FM decisions with scripted native replies, real loopback
-channels, and Kubernetes reconciliation through a mock-backed `kube::Client`.
-They do not launch node/application processes or prove replication correctness.
+The `kuberic-tests` crate owns the integration suites and their shared support:
+FM decisions with scripted native replies, real loopback channels, and Kubernetes
+reconciliation through a mock-backed `kube::Client`.
+Shared helpers live in `kuberic-tests/src` and are imported through the crate.
+On Linux, it also builds and launches the real FM, node and sample
+application binaries automatically. Its process journeys verify application
+write/readback and lifecycle cleanup, not failover or recovery.
 Use `cargo test --workspace -- --list` for the live inventory.
 
 ## Kubernetes bootstrap controller
@@ -60,7 +64,9 @@ Bootstrap proceeds through separately observed facts:
   only after final native configuration completion.
 
 Owned-resource writes retain UID/resourceVersion checks and effects revalidate
-their observation. Lost API replies do not roll back persisted authority.
+their observation. A `StaleObservation` error means the planned effect was
+refused; callers reobserve and retry. Lost API replies do not roll back
+persisted authority.
 Changed or missing original Pods/configurations, container restarts, unsupported
 spec changes, lost allocation status or unavailable original backend admission
 block the cohort. Blocking invalidates further locally owned FM intent and restores a
@@ -194,24 +200,30 @@ separately. Early shutdown before create completes fails explicitly and requires
 external node teardown. Before a fresh deployment, verify every old node and
 application stopped and use fresh lifetime identities/run directories.
 
-### Real-process smoke test
+### Real-process tests
 
-On Linux, build the pinned fube binaries, then explicitly run the process tier:
+On Linux, the process tier runs as part of normal workspace tests. To run it alone:
 
 ```sh
-cargo build --locked --manifest-path fube/Cargo.toml \
-  -p fube-node-runner -p hosting-local-app --bins --target-dir target
-cargo test --workspace -- --include-ignored
+cargo test --locked -p kuberic-tests --test processes
 ```
 
-The process tiers exercise the standalone FM binary and the mock-backed
+The binary-dependent journeys share one test executable, separate from the mock
+and native-channel suites. A shared `OnceLock` builds `fube-node`,
+`hosting-local-app` and `kuberic-fm` before their first use. Cargo checks freshness
+on each test run;
+build failures fail the tests rather than skipping them. Nested builds use the
+separate `target/process-fixtures` directory to avoid the outer test build's lock.
+
+The process tests exercise the standalone FM binary and the mock-backed
 controller/native-FM bridge with real node binaries and sample application
 children. They check write/readback, native-controlled client routing and
 controller-driven finalizer teardown with independent process-cleanup receipts.
 Deletion during node startup also qualifies bootstrap completion without client
 publication, followed by the same native deletion and physical cleanup.
 They need no Docker, Kubernetes or native Service Fabric.
-`FUBE_NODE_EXE` and `FUBE_NODE_APP` can override the prebuilt binary paths.
+`FUBE_NODE_EXE`, `FUBE_NODE_APP` and `KUBERIC_FM_EXE` override individual
+executables; overridden binaries are validated and are not built by the helper.
 
 The fixture follows fube's temporary bind-to-port-zero allocation for node
 control addresses. Releasing those sockets before child startup leaves a port
