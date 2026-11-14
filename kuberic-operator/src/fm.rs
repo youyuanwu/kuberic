@@ -18,6 +18,21 @@ pub struct FmObservation {
     pub joined: bool,
 }
 
+impl FmObservation {
+    pub(crate) fn primary_index(&self) -> Result<usize> {
+        ensure!(
+            self.status.deployment == self.cohort.allocation.deployment,
+            "native status changed the original deployment"
+        );
+        self.cohort
+            .allocation
+            .nodes
+            .iter()
+            .position(|node| node.node_id == self.status.primary_node_id)
+            .context("native status selected a foreign primary")
+    }
+}
+
 #[async_trait]
 pub trait FmApi: Send + Sync {
     /// Reserve only before first allocation persistence and resource creation.

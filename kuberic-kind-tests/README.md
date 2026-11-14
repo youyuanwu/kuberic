@@ -52,7 +52,7 @@ always attempts owned-cluster deletion.
 ## What is exercised
 
 The host test process prepares and observes the isolated cluster. Ordinary
-bootstrap and early-deletion journeys install the generated namespace-scoped
+bootstrap, early-deletion and primary application-crash journeys install the generated namespace-scoped
 operator Deployment/RBAC. Their Job only creates/deletes KubericSets, sends
 application requests and observes results; its Role cannot mutate workload
 resources or parent status. The operator owns reconciliation and native FM
@@ -84,6 +84,17 @@ resume and delete the remaining Pods. This proves an original node can finish
 before the others receive kubelet termination, rather than relying on signal
 timing or simultaneous shutdown.
 
+The application-crash journey first writes and waits for the original peers to
+apply. The host then validates the accepted cohort and exact Primary Pod UID,
+and executes a test-only fault injector in that Pod. The injector verifies its
+downward-API identity, frozen configuration and original application PID before
+SIGKILL; it does not signal the Node or supervisor. Driver RBAC remains read-only
+for workload resources. The driver requires a changed native-completed Primary,
+updated Service selection, preserved data and continuing writes, with every
+original Pod UID and container lifetime unchanged. The host checks that the
+original operator Pod did not restart and correlates final native/physical
+cleanup with the same cohort and promoted Primary.
+
 The fixture derives from the operator runtime image and installs its shared
 owned-node supervisor at `/opt/fube/fube-node`, with the
 real runner at `/opt/fube/fube-node-real`. The wrapper owns the actual node child,
@@ -103,6 +114,6 @@ driver and host independently check that owned resources disappeared.
 
 This is qualification of the experimental operator, not production readiness.
 Original backend authority lasts only for the lifecycle owner's process. It
-does not add failover, persistence, reconnect, restart adoption or upgrades.
+does not add Node/Pod-loss failover, persistence, reconnect, restart adoption or upgrades.
 Control traffic remains unauthenticated and unencrypted; use only the isolated,
 trusted test cluster.

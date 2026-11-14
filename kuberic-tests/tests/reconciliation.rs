@@ -237,6 +237,181 @@ fn lost_original_channel_withdraws_publication_without_promotion() {
 }
 
 #[test]
+fn verified_primary_loss_reconfigures_original_quorum_and_deletes_each_retained_epoch() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    let replies = serving(&mut state);
+    let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+    let report = app_host_loss(&config, &committed.unit, 1);
+    let loss = replica_up_message(&report, Owner::Fm).unwrap();
+    assert!(state.observe(1, &loss).unwrap().is_some());
+    assert_eq!(state.phase(), Phase::Reconfiguring);
+    assert!(state.status().service_endpoint.is_none());
+    let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+    assert_eq!(command.node, 0);
+    let request = decode_do_reconfiguration(&command.message).unwrap().0;
+    assert_eq!(request.configuration.unit.previous, committed.unit.current);
+    assert_eq!(
+        request.configuration.unit.current.data_loss,
+        committed.unit.current.data_loss
+    );
+    assert_eq!(
+        request.configuration.unit.current.configuration,
+        committed.unit.current.configuration + 0x1_0000_0001
+    );
+    assert!(request
+        .configuration
+        .replicas
+        .0
+        .iter()
+        .all(|replica| replica.first_lsn == -1 && replica.last_lsn == -1));
+    state.observe(1, &loss).unwrap();
+    assert_eq!(
+        state.reconcile(Duration::from_millis(100)).unwrap(),
+        vec![command.clone()]
+    );
+    state.observe(0, &completion(&command.message)).unwrap();
+    assert_eq!(state.phase(), Phase::Serving);
+    assert_eq!(state.status().primary_node_id, config.nodes[0].identity.id);
+    assert_eq!(
+        state.status().service_endpoint.as_deref(),
+        Some("client://node-10/opaque")
+    );
+    state.observe(1, &loss).unwrap();
+    assert!(state
+        .reconcile(Duration::from_millis(100))
+        .unwrap()
+        .is_empty());
+    state.request_shutdown(Duration::from_millis(100)).unwrap();
+    for target in [1, 2, 0] {
+        let deletion = state
+            .reconcile(Duration::from_millis(100))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(deletion.node, target);
+        let body = decode_delete_replica(&deletion.message).unwrap().0;
+        assert!(!body.deletion.0.force);
+        assert_eq!(
+            body.replica.0.unit.current,
+            if target == 1 {
+                committed.unit.current
+            } else {
+                request.configuration.unit.current
+            }
+        );
+        state
+            .observe(target, &completion(&deletion.message))
+            .unwrap();
+    }
+    for node in 0..3 {
+        state.disconnected(node).unwrap();
+    }
+    assert_eq!(state.phase(), Phase::Stopped);
+}
+
+#[test]
+fn invalid_loss_history_secondary_loss_and_lost_survivor_never_grant_promotion() {
+    for invalid in 0..6 {
+        let config = config();
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let replies = serving(&mut state);
+        let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+        let node = if invalid == 0 { 0 } else { 1 };
+        let mut report = app_host_loss(&config, &committed.unit, node);
+        match invalid {
+            1 => report.dropped.0[0].unit.current.configuration += 1,
+            2 => report.dropped.0[0].replicas.0[0].description.instance += 1,
+            3 => report.dropped.0[0].replicas.0[0].description.up = true,
+            _ => {}
+        }
+        let result = state.observe(node, &replica_up_message(&report, Owner::Fm).unwrap());
+        if invalid == 4 {
+            result.unwrap();
+            assert!(state.disconnected(2).is_err());
+        } else if invalid == 5 {
+            result.unwrap();
+            let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+            let reply = completion(&command.message);
+            state.observe(command.node, &reply).unwrap();
+            let committed = decode_do_reconfiguration_reply(&reply).unwrap().0;
+            let report = app_host_loss(&config, &committed.unit, command.node);
+            assert!(state
+                .observe(
+                    command.node,
+                    &replica_up_message(&report, Owner::Fm).unwrap()
+                )
+                .is_err());
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+        assert!(state.reconcile(Duration::ZERO).is_err());
+    }
+}
+
+#[test]
+fn repeated_loss_reports_do_not_extend_a_missing_failover_completion_deadline() {
+    let config = config();
+    let mut state = State::new(config.clone()).unwrap();
+    bootstrap(&mut state, &config);
+    let replies = serving(&mut state);
+    let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+    let report =
+        replica_up_message(&app_host_loss(&config, &committed.unit, 1), Owner::Fm).unwrap();
+    state.observe(1, &report).unwrap();
+    state.reconcile(Duration::ZERO).unwrap();
+    state.observe(1, &report).unwrap();
+    assert!(state
+        .reconcile(Duration::from_millis(config.operation_timeout_ms))
+        .is_err());
+    assert_eq!(state.phase(), Phase::ControlUnknown);
+    assert!(state.status().service_endpoint.is_none());
+}
+
+#[test]
+fn failover_completion_requires_exact_epoch_membership_quorum_and_success() {
+    for invalid in 0..5 {
+        let config = config();
+        let mut state = State::new(config.clone()).unwrap();
+        bootstrap(&mut state, &config);
+        let replies = serving(&mut state);
+        let committed = decode_do_reconfiguration_reply(&replies[3].1).unwrap().0;
+        state
+            .observe(
+                1,
+                &replica_up_message(&app_host_loss(&config, &committed.unit, 1), Owner::Fm)
+                    .unwrap(),
+            )
+            .unwrap();
+        let command = state.reconcile(Duration::ZERO).unwrap().pop().unwrap();
+        let mut reply =
+            completed_configuration(&decode_do_reconfiguration(&command.message).unwrap().0);
+        match invalid {
+            0 => reply.unit.current.configuration += 1,
+            1 => {
+                reply.replicas.0.pop();
+            }
+            2 => reply.replicas.0[1] = reply.replicas.0[0].clone(),
+            3 => reply.replicas.0[0].instance += 1,
+            4 => reply.error = -1,
+            _ => unreachable!(),
+        }
+        assert!(state
+            .observe(
+                command.node,
+                &do_reconfiguration_reply_message(&reply, Owner::Fm).unwrap()
+            )
+            .is_err());
+        assert_eq!(state.phase(), Phase::ControlUnknown);
+        assert!(state.status().service_endpoint.is_none());
+    }
+}
+
+#[test]
 fn missing_reply_and_early_shutdown_fail_explicitly() {
     let config = config();
     let mut state = State::new(config.clone()).unwrap();

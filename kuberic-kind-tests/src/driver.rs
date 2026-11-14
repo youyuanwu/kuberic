@@ -20,6 +20,57 @@ use crate::Scenario;
 
 const BUDGET: Duration = Duration::from_secs(180);
 
+pub fn crash_primary_app(cohort: &FrozenCohort) -> Result<()> {
+    let config = resources::runner_config(cohort, 1)?;
+    ensure!(
+        std::env::var("POD_UID")? == cohort.bindings[1].pod_uid
+            && std::env::var("KUBERIC_SET_UID")? == cohort.allocation.resource_uid,
+        "fault injection does not own this original primary Pod"
+    );
+    let projected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read("/etc/fube/node.json")?)?;
+    ensure!(
+        projected == serde_json::to_value(&config)?,
+        "fault injection configuration differs from the accepted original cohort"
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.run_directory.join("status.json"))?)?;
+    ensure!(
+        status["deployment"] == config.deployment
+            && status["node"]["id"] == config.node.identity.id
+            && status["stage"] == "running"
+            && status["replica_role"] == 4,
+        "original node is not running: {status}"
+    );
+    let pid = status["application_pid"]
+        .as_u64()
+        .context("original application PID")?;
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+    ensure!(
+        pid > 1
+            && executable.starts_with(config.run_directory.join("hosting"))
+            && executable
+                .file_name()
+                .is_some_and(|name| name == "hosting-local-app"),
+        "fault target is not the original sample application"
+    );
+    ensure!(
+        std::process::Command::new("/bin/kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()?
+            .success(),
+        "crashing the exact original application failed"
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "primary_app_crashed", "set_uid": cohort.allocation.resource_uid,
+            "pod_uid": cohort.bindings[1].pod_uid, "application_pid": pid
+        })
+    );
+    Ok(())
+}
+
 pub async fn run(scenario: Scenario) -> Result<()> {
     if scenario != Scenario::StaggeredShutdown {
         return crate::deployed::run(scenario).await;

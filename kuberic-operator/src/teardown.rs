@@ -51,11 +51,10 @@ fn native<'a>(observation: &'a Observation, cohort: &FrozenCohort) -> Result<&'a
         .as_ref()
         .context("original native FM session is unavailable")?;
     ensure!(
-        report.cohort == *cohort
-            && report.status.deployment == cohort.allocation.deployment
-            && report.status.primary_node_id == cohort.allocation.nodes[1].node_id,
+        report.cohort == *cohort,
         "native teardown evidence changed original authority"
     );
+    report.primary_index()?;
     ensure!(
         report.status.phase != Phase::ControlUnknown && report.status.error.is_none(),
         "native teardown uncertainty: {}",

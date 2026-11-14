@@ -15,6 +15,7 @@ pub enum Phase {
     Creating,
     Building,
     Configuring,
+    Reconfiguring,
     Serving,
     Deleting,
     AwaitingNodeShutdown,
@@ -71,6 +72,8 @@ pub struct State {
     builds: Vec<AddReplicaReply>,
     configuration: Option<DoReconfiguration>,
     configured: Option<ConfigurationReply>,
+    promotion: Option<usize>,
+    losses: Vec<Option<ReplicaUp>>,
     pending: Option<Pending>,
     completed: Vec<Completion>,
     deleting: [bool; 3],
@@ -124,6 +127,8 @@ impl State {
             builds: Vec::new(),
             configuration: None,
             configured: None,
+            promotion: None,
+            losses: vec![None; 3],
             pending: None,
             completed: Vec::new(),
             deleting: [false; 3],
@@ -146,6 +151,8 @@ impl State {
             } else {
                 Phase::Deleting
             }
+        } else if self.promotion.is_some() {
+            Phase::Reconfiguring
         } else if !self.bootstrapped.iter().all(|ready| *ready) {
             Phase::Bootstrap
         } else if self.primary_reply.is_none() {
@@ -173,7 +180,7 @@ impl State {
             phase: self.phase(),
             bootstrapped_nodes: self.bootstrapped.iter().filter(|ready| **ready).count(),
             deleted_nodes: self.deleted.iter().filter(|deleted| **deleted).count(),
-            primary_node_id: self.config.primary_node_id.clone(),
+            primary_node_id: self.config.nodes[self.primary].identity.id.clone(),
             service_endpoint: primary
                 .filter(|_| serving)
                 .map(|replica| replica.service_endpoint.clone()),
@@ -264,21 +271,12 @@ impl State {
             else {
                 return Ok(None);
             };
-            let configuration = self
-                .configured
-                .as_ref()
-                .context("missing completed configuration")?;
-            let replica = configuration
-                .replicas
-                .0
-                .iter()
-                .find(|replica| replica.id == self.config.nodes[node].replica_id)
-                .context("completed configuration omitted a node")?;
+            let (unit, replica) = self.deletion_target(node)?;
             let request = DeleteReplica::new(
                 AddInstance {
-                    unit: configuration.unit.clone(),
+                    unit,
                     service: self.initial.service.clone(),
-                    replica: replica.clone(),
+                    replica,
                 },
                 false,
             );
@@ -287,6 +285,17 @@ impl State {
                 Operation::Delete(node),
                 node,
                 delete_replica_message(&request, &generation)?,
+            )
+        } else if let Some(candidate) = self.promotion {
+            (
+                Operation::Configure,
+                candidate,
+                do_reconfiguration_message(
+                    self.configuration
+                        .as_ref()
+                        .context("missing failover intent")?,
+                    &generation,
+                )?,
             )
         } else if self.primary_reply.is_none() {
             (
@@ -424,25 +433,33 @@ impl State {
                     self.bootstrapped[node] = true;
                 } else {
                     ensure!(
-                        self.deleting[node],
-                        "nonempty replica inventory is not recovery authority"
-                    );
-                    ensure!(
-                        body.replicas.0.is_empty() && body.dropped.0.len() == 1,
+                        !body.last && body.replicas.0.is_empty() && body.dropped.0.len() == 1,
                         "unsupported replica inventory"
                     );
                     let report = &body.dropped.0[0];
-                    let configured = self
-                        .configured
-                        .as_ref()
-                        .context("missing completed configuration")?;
                     ensure!(
-                        report.unit == configured.unit
-                            && report.service == self.initial.service
+                        report.service == self.initial.service
+                            && report.intermediate == Epoch::default()
+                            && !report.report_from_primary
+                            && !report.local_deleted
                             && report.replicas.0.len() == 1
+                            && report.replicas.0[0].intermediate_role == 1
                             && report.replicas.0[0].description == self.dropped(node)?,
-                        "dropped inventory does not match the exact deleted replica"
+                        "dropped inventory does not match the exact original replica"
                     );
+                    if self.deleting[node] {
+                        ensure!(
+                            report.unit == self.deletion_target(node)?.0,
+                            "dropped inventory changed the retained deletion epoch"
+                        );
+                    } else if let Some(original) = &self.losses[node] {
+                        ensure!(
+                            original == &body,
+                            "changed original application-loss report"
+                        );
+                    } else {
+                        self.app_host_lost(node, &body)?;
+                    }
                 }
                 Some(replica_up_reply_message(&body, &generation)?)
             }
@@ -598,20 +615,52 @@ impl State {
                 for replica in &mut expected.replicas.0 {
                     replica.previous_role = 1;
                 }
-                ensure!(
-                    reply.unit == expected.unit
-                        && reply.replicas.0.len() == 3
-                        && expected.replicas.0.iter().all(|replica| {
-                            reply
-                                .replicas
-                                .0
-                                .iter()
-                                .filter(|actual| *actual == replica)
-                                .count()
-                                == 1
-                        }),
-                    "configuration completion differs from the exact frozen native membership"
-                );
+                if let Some(candidate) = self.promotion {
+                    expected
+                        .replicas
+                        .0
+                        .retain(|replica| replica.current_role >= 3);
+                    ensure!(
+                        reply.unit == expected.unit
+                            && reply.replicas.0.len() == 2
+                            && expected.replicas.0.iter().all(|replica| {
+                                reply.replicas.0.iter().filter(|actual| {
+                                    actual.node == replica.node
+                                        && actual.id == replica.id
+                                        && actual.instance == replica.instance
+                                        && actual.version == replica.version
+                                        && actual.previous_role == 1
+                                        && actual.current_role == replica.current_role
+                                        && actual.state == 2
+                                        && actual.up
+                                        && !actual.replication_endpoint.is_empty()
+                                        && if actual.current_role == 4 {
+                                            !actual.service_endpoint.is_empty()
+                                        } else {
+                                            actual.service_endpoint.is_empty()
+                                        }
+                                }).count() == 1
+                            }),
+                        "failover completion differs from the retained epoch, quorum or original membership"
+                    );
+                    self.primary = candidate;
+                    self.promotion = None;
+                } else {
+                    ensure!(
+                        reply.unit == expected.unit
+                            && reply.replicas.0.len() == 3
+                            && expected.replicas.0.iter().all(|replica| {
+                                reply
+                                    .replicas
+                                    .0
+                                    .iter()
+                                    .filter(|actual| *actual == replica)
+                                    .count()
+                                    == 1
+                            }),
+                        "configuration completion differs from the exact frozen native membership"
+                    );
+                }
                 self.configured = Some(reply);
             }
             (Operation::Delete(target), "DeleteReplicaReply") => {
@@ -622,12 +671,7 @@ impl State {
                     reply.error
                 );
                 ensure!(
-                    reply.unit
-                        == self
-                            .configured
-                            .as_ref()
-                            .context("missing completed configuration")?
-                            .unit
+                    reply.unit == self.deletion_target(target)?.0
                         && reply.replica == self.dropped(target)?,
                     "deletion completion differs from the exact original replica"
                 );
@@ -648,6 +692,89 @@ impl State {
             "foreign node, replica instance or package version"
         );
         Ok(())
+    }
+
+    fn app_host_lost(&mut self, node: usize, report: &ReplicaUp) -> Result<()> {
+        ensure!(
+            self.phase() == Phase::Serving && self.pending.is_none() && node == self.primary,
+            "only verified Serving primary application loss admits failover; bootstrap, secondary loss and interrupted reconfiguration are unsupported"
+        );
+        let completed = self
+            .configured
+            .as_ref()
+            .context("missing committed history")?;
+        ensure!(
+            report.dropped.0[0].unit == completed.unit
+                && completed.unit.previous == Epoch::default()
+                && completed.replicas.0.len() == 3
+                && completed.replicas.0.iter().all(|replica| {
+                    replica.up && replica.state == 2 && replica.current_role >= 3
+                })
+                && self.losses.iter().all(Option::is_none),
+            "application loss has stale history or insufficient original quorum"
+        );
+        let candidate = (0..3)
+            .find(|index| *index != node)
+            .context("no original failover candidate")?;
+        let mut configuration = Configuration {
+            unit: completed.unit.clone(),
+            replicas: completed.replicas.clone(),
+            service: self.initial.service.clone(),
+        };
+        configuration.unit.previous = configuration.unit.current;
+        configuration.unit.current.configuration = configuration
+            .unit
+            .current
+            .configuration
+            .checked_add(0x1_0000_0001)
+            .context("failover configuration epoch overflow")?;
+        for replica in &mut configuration.replicas.0 {
+            replica.previous_role = replica.current_role;
+            if replica.node
+                == self.config.nodes[node]
+                    .identity
+                    .native()
+                    .map_err(anyhow::Error::msg)?
+            {
+                replica.current_role = 1;
+                replica.up = false;
+                replica.state = 3;
+            } else if replica.node
+                == self.config.nodes[candidate]
+                    .identity
+                    .native()
+                    .map_err(anyhow::Error::msg)?
+            {
+                replica.current_role = 4;
+            }
+            // GetLSN and PC/CC quorum selection belong to native RA, not FM guesses.
+            replica.first_lsn = -1;
+            replica.last_lsn = -1;
+        }
+        self.configuration = Some(DoReconfiguration {
+            configuration,
+            phase0_duration: i64::MAX,
+        });
+        self.losses[node] = Some(report.clone());
+        self.promotion = Some(candidate);
+        Ok(())
+    }
+
+    fn deletion_target(&self, node: usize) -> Result<(FailoverUnit, Replica)> {
+        if let Some(report) = &self.losses[node] {
+            return Ok((report.dropped.0[0].unit.clone(), self.dropped(node)?));
+        }
+        let completed = self
+            .configured
+            .as_ref()
+            .context("missing completed configuration")?;
+        let replica = completed
+            .replicas
+            .0
+            .iter()
+            .find(|replica| replica.id == self.config.nodes[node].replica_id)
+            .context("completed configuration omitted an original live node")?;
+        Ok((completed.unit.clone(), replica.clone()))
     }
 
     fn dropped(&self, node: usize) -> Result<Replica> {

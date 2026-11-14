@@ -183,6 +183,56 @@ pub fn terminate(child: &OwnedApp) {
         .success());
 }
 
+pub fn crash_application(config: &fube_node_runner::Config) -> u64 {
+    let status: Value =
+        serde_json::from_slice(&fs::read(config.run_directory.join("status.json")).unwrap())
+            .unwrap();
+    assert_eq!(status["deployment"], config.deployment);
+    let pid = status["application_pid"].as_u64().unwrap();
+    assert!(Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    pid
+}
+
+pub fn assert_application_stopped(pid: u64) {
+    let stat = match fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("observing original application {pid}: {error}"),
+    };
+    let state = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .next()
+        .unwrap();
+    assert!(
+        matches!(state, "Z" | "X"),
+        "original application {pid} is still running: {stat}"
+    );
+}
+
+pub async fn wait_replicated(endpoint: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state: Value = serde_json::from_str(&application(endpoint, "state").await).unwrap();
+        let peers = state["peers"].as_array().unwrap();
+        if peers.len() == 2
+            && peers
+                .iter()
+                .all(|peer| peer["applied"].as_i64().unwrap() >= 1)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "original replicas did not apply: {state}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 pub async fn finish(child: &mut OwnedApp) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

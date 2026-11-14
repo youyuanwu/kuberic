@@ -19,10 +19,16 @@ enum Operation {
     Diagnostics,
     Crd,
     Run {
-        #[arg(long, conflicts_with = "staggered_shutdown")]
+        #[arg(long, conflicts_with_all = ["staggered_shutdown", "primary_app_failover"])]
         early_delete: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "primary_app_failover")]
         staggered_shutdown: bool,
+        #[arg(long)]
+        primary_app_failover: bool,
+    },
+    CrashPrimaryApp {
+        #[arg(long)]
+        cohort: String,
     },
 }
 
@@ -47,15 +53,21 @@ async fn main() -> Result<()> {
         Operation::Run {
             early_delete,
             staggered_shutdown,
+            primary_app_failover,
         } => {
             let scenario = if early_delete {
                 Scenario::DeleteDuringBootstrap
             } else if staggered_shutdown {
                 Scenario::StaggeredShutdown
+            } else if primary_app_failover {
+                Scenario::PrimaryAppFailover
             } else {
                 Scenario::Bootstrap
             };
             driver::run(scenario).await?;
+        }
+        Operation::CrashPrimaryApp { cohort } => {
+            driver::crash_primary_app(&serde_json::from_str(&cohort)?)?;
         }
     }
     Ok(())

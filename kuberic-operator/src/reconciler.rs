@@ -347,6 +347,7 @@ impl Reconciler {
                 let mut next = accepted;
                 next.phase = ControllerPhase::Stopping;
                 next.service_endpoint = None;
+                next.primary_node_id = None;
                 next.reason = None;
                 next.bootstrap_wait = Some(BootstrapWait {
                     started_unix_ms: current.now_unix_ms,
@@ -364,6 +365,7 @@ impl Reconciler {
                 let mut next = accepted;
                 next.phase = ControllerPhase::Stopping;
                 next.service_endpoint = None;
+                next.primary_node_id = None;
                 next.reason = None;
                 next.teardown = Some(Teardown {
                     cohort,
@@ -481,6 +483,7 @@ impl Reconciler {
         let mut next = current.set.status.clone().unwrap_or_default();
         next.phase = ControllerPhase::Blocked;
         next.service_endpoint = None;
+        next.primary_node_id = None;
         next.reason = Some(reason.clone());
         if current.set.status.as_ref() != Some(&next) {
             match self.status(&current.set, next).await {

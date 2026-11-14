@@ -35,6 +35,39 @@ async fn assert_disabled(fixture: &Fixture) {
     );
 }
 
+#[tokio::test]
+async fn primary_application_failover_withdraws_then_routes_only_native_completed_original_primary()
+{
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let original = fixture.set().await.status.unwrap().cohort().unwrap();
+    fixture.fm.lose_primary().await;
+    fixture.drive().await;
+    assert_disabled(&fixture).await;
+    let status = fixture.set().await.status.unwrap();
+    assert_eq!(status.phase, ControllerPhase::Reconfiguring);
+    assert!(status.primary_node_id.is_none());
+    assert!(status.service_endpoint.is_none());
+    let command = fixture.fm.command().await;
+    fixture.drive().await;
+    assert_disabled(&fixture).await;
+    fixture.fm.complete(&command).await;
+    fixture.drive().await;
+    let status = fixture.set().await.status.unwrap();
+    assert_eq!(status.phase, ControllerPhase::Serving);
+    assert_eq!(status.cohort().unwrap(), original);
+    assert_eq!(
+        status.primary_node_id.as_ref(),
+        Some(&original.allocation.nodes[0].node_id)
+    );
+    assert_eq!(
+        selector(&fixture).await.unwrap().get(POD_UID),
+        Some(&original.bindings[0].pod_uid)
+    );
+    assert_eq!(fixture.fm.starts.load(Ordering::SeqCst), 1);
+    fixture.api.check();
+}
+
 async fn delete<K>(api: &Api<K>, object: &K)
 where
     K: kube::Resource<DynamicType = ()> + Clone + std::fmt::Debug + serde::de::DeserializeOwned,

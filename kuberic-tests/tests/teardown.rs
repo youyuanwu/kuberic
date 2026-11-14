@@ -70,6 +70,40 @@ async fn drive_unrouted(fixture: &Fixture) {
     panic!("deleting bootstrap did not reach a waiting state");
 }
 
+#[tokio::test]
+async fn deleting_during_primary_reconfiguration_finishes_it_without_client_publication() {
+    let fixture = Fixture::new().await;
+    fixture.serving().await;
+    let cohort = fixture.set().await.status.unwrap().cohort().unwrap();
+    fixture.fm.lose_primary().await;
+    request_delete(&fixture).await;
+    fixture.drive().await;
+    drive_unrouted(&fixture).await;
+    let status = fixture.set().await.status.unwrap();
+    assert!(status.bootstrap_wait.is_some());
+    assert!(status.teardown.is_none());
+    let command = fixture.fm.command().await;
+    fixture.fm.complete(&command).await;
+    drive_unrouted(&fixture).await;
+    let status = fixture.set().await.status.unwrap();
+    assert_eq!(status.cohort().as_ref(), Some(&cohort));
+    assert_eq!(
+        status.teardown.unwrap().stage,
+        TeardownStage::NativeDeletion
+    );
+    pod_deletions(&fixture).await;
+    joined_processes(&fixture, &cohort).await;
+    fixture.drive().await;
+    assert!(
+        Api::<KubericSet>::namespaced(fixture.client.clone(), NAMESPACE)
+            .get_opt(NAME)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture.api.check();
+}
+
 async fn begin(fixture: &Fixture) -> FrozenCohort {
     fixture.serving().await;
     let cohort = fixture.set().await.status.unwrap().cohort().unwrap();

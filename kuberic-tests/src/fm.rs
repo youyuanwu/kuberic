@@ -99,11 +99,38 @@ pub fn completed_configuration(request: &DoReconfiguration) -> ConfigurationRepl
     let mut replicas = request.configuration.replicas.0.clone();
     for replica in &mut replicas {
         replica.previous_role = 1;
+        if replica.current_role == 4 && replica.service_endpoint.is_empty() {
+            replica.service_endpoint = format!("client://node-{}/opaque", replica.id);
+        }
     }
+    replicas.retain(|replica| replica.current_role >= 3);
     ConfigurationReply {
         unit,
         replicas: ObjectArray(replicas),
         error: 0,
+    }
+}
+
+pub fn app_host_loss(config: &Config, unit: &FailoverUnit, node: usize) -> ReplicaUp {
+    let placement = &config.nodes[node];
+    ReplicaUp {
+        dropped: ObjectArray(vec![FailoverUnitInfo {
+            service: config.service.native(),
+            unit: unit.clone(),
+            replicas: ObjectArray(vec![ReplicaInfo {
+                description: Replica {
+                    node: placement.identity.native().unwrap(),
+                    id: placement.replica_id,
+                    instance: placement.replica_instance,
+                    up: false,
+                    state: 3,
+                    ..Replica::default()
+                },
+                intermediate_role: 1,
+            }]),
+            ..FailoverUnitInfo::default()
+        }]),
+        ..ReplicaUp::default()
     }
 }
 
