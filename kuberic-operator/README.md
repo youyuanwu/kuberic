@@ -129,11 +129,12 @@ every original Node before finalizer release.
 ## Restoring redundancy
 
 After failover the FM normally deletes the exact predecessor, then builds a
-fresh replica on that same original Node. The fube runner admits replacement
-only from a validated native `CreateReplica` with newer IDs/instances and
-correct history, after positive old-host reaping/group/root cleanup. It retains
-the original Node/RA, Pod UID and control channels, uses a fresh host/IPC gate,
-and rejects forced predecessor cleanup as restoration authority.
+fresh replica on that same original Node. Shared fube Node/Hosting activates a
+successor through the committed fresh Open's registration lookup after native
+creation admission and positive old-host reaping/group/root cleanup. It retains
+the original Node/RA, Pod UID and control channels and uses a fresh host/IPC gate.
+Successful forced predecessor cleanup is recorded but does not veto restoration;
+failed or incomplete cleanup still blocks acquisition.
 
 The set reports `restoring` while the admitted Primary stays routed. Native
 copy/build produces a Ready Idle; a subsequent same-Primary configuration
@@ -146,11 +147,24 @@ This follows SF's volatile drop/rebuild semantics, not persisted Reopen. Native
 repair lineage and retired-host receipts remain in the original in-memory owner;
 restarting the operator still cannot recover or adopt them.
 
+## Secondary application-crash repair
+
+A matched current Secondary loss in fully admitted Serving membership first
+drives a same-Primary native configuration removing that exact failed replica.
+The operator reports `restoring` and retains the same Primary endpoint and
+original Pod UID selector. Native reduced-membership completion precedes normal
+predecessor deletion, fresh copy/build and full 3/2 re-admission. Both membership
+changes increment the configuration epoch without changing its Primary lineage
+or data-loss epoch. Further loss during repair blocks instead of granting
+promotion. Bounded replay history does not impose a lifetime repair limit;
+out-of-window messages fail exact admission rather than enabling adoption.
+
 ## Qualification
 
 Mock-backed runtime tests cover independent original owners, reserved
 listeners, stale parent UIDs, restart refusal and cleanup evidence. Real
-KinD bootstrap, early-deletion and application-crash failover journeys run against the deployed operator;
+KinD bootstrap, early-deletion, application-crash failover and Secondary repair
+journeys run against the deployed operator;
 their driver has only read access to workload resources. The separate
 staggered-shutdown qualification retains explicit deterministic reconciliation
 scheduling. See the live inventory with `cargo test --workspace -- --list`.

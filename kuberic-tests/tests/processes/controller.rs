@@ -19,20 +19,32 @@ use tokio::time::Instant;
 
 #[tokio::test]
 async fn mock_pods_drive_real_controller_fm_nodes_and_application_lifecycle() {
-    lifecycle(false, false).await;
+    lifecycle(false, Fault::None).await;
 }
 
 #[tokio::test]
 async fn deleting_during_node_startup_finishes_real_bootstrap_without_publishing_clients() {
-    lifecycle(true, false).await;
+    lifecycle(true, Fault::None).await;
 }
 
 #[tokio::test]
 async fn real_primary_app_crash_updates_controller_routing_without_replacing_original_cohort() {
-    lifecycle(false, true).await;
+    lifecycle(false, Fault::Primary).await;
 }
 
-async fn lifecycle(delete_during_bootstrap: bool, failover: bool) {
+#[tokio::test]
+async fn real_secondary_app_crashes_preserve_controller_primary_routing_and_original_cohort() {
+    lifecycle(false, Fault::Secondary).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    None,
+    Primary,
+    Secondary,
+}
+
+async fn lifecycle(delete_during_bootstrap: bool, fault: Fault) {
     let api = support::api::MockApi::default();
     let client = api.client(NAMESPACE);
     let fm = Arc::new(ProcessFm::new());
@@ -110,11 +122,16 @@ async fn lifecycle(delete_during_bootstrap: bool, failover: bool) {
             selector.get(resources::POD_UID),
             Some(&cohort.bindings[1].pod_uid)
         );
-        if failover {
-            for (victim, primary, before, command, after) in [
-                (1, 0, "acknowledged", "write-more", "continued"),
-                (0, 1, "continued", "write-final", "final"),
-            ] {
+        if fault != Fault::None {
+            let cycles = if fault == Fault::Primary {
+                [(1, 0), (0, 1)]
+            } else {
+                [(0, 1), (2, 1)]
+            };
+            for ((victim, primary), (before, command, after)) in cycles.into_iter().zip([
+                ("acknowledged", "write-more", "continued"),
+                ("continued", "write-final", "final"),
+            ]) {
                 let endpoint = started
                     .status
                     .as_ref()
@@ -124,7 +141,12 @@ async fn lifecycle(delete_during_bootstrap: bool, failover: bool) {
                     .unwrap()
                     .clone();
                 wait_replicated(&endpoint).await;
-                let lost = crash_application(&supervisor.configs[&cohort.bindings[victim].pod_uid]);
+                let config = &supervisor.configs[&cohort.bindings[victim].pod_uid];
+                let predecessor: Value = serde_json::from_slice(
+                    &fs::read(config.run_directory.join("status.json")).unwrap(),
+                )
+                .unwrap();
+                let lost = crash_application(config);
                 let deadline = Instant::now() + operation_budget;
                 started = loop {
                     let outcome = reconcile(&controller, NAME).await.unwrap();
@@ -137,11 +159,25 @@ async fn lifecycle(delete_during_bootstrap: bool, failover: bool) {
                     let current = sets.get(NAME).await.unwrap();
                     let status = current.status.as_ref().unwrap();
                     assert_eq!(status.cohort().as_ref(), Some(&cohort));
+                    let native: Value = serde_json::from_slice(
+                        &fs::read(
+                            supervisor.configs[&cohort.bindings[victim].pod_uid]
+                                .run_directory
+                                .join("status.json"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
                     if status.phase == ControllerPhase::Serving
                         && status.primary_node_id.as_ref()
                             == Some(&cohort.allocation.nodes[primary].node_id)
+                        && native["replica_id"].as_i64() > predecessor["replica_id"].as_i64()
+                        && native["local_configuration_complete"] == true
                     {
                         let next = status.service_endpoint.as_ref().unwrap();
+                        if fault == Fault::Secondary {
+                            assert_eq!(next, &endpoint);
+                        }
                         assert!(application(next, "read")
                             .await
                             .contains(&format!("value={before}")));

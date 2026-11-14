@@ -113,15 +113,28 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                 "event": "application_write_read", "write": written, "read": read
             })
         );
-        if scenario == Scenario::PrimaryAppFailover {
+        if matches!(
+            scenario,
+            Scenario::PrimaryAppFailover | Scenario::SecondaryAppRepair
+        ) {
+            let secondary = scenario == Scenario::SecondaryAppRepair;
             let mut previous_endpoint = started
                 .status
                 .as_ref()
                 .and_then(|status| status.service_endpoint.clone());
-            for (cycle, victim, primary, before, command, after) in [
-                (0, 1, 0, "acknowledged", "write-more", "continued"),
-                (1, 0, 1, "continued", "write-final", "final"),
-            ] {
+            let cycles = if secondary {
+                [(0, 1), (2, 1)]
+            } else {
+                [(1, 0), (0, 1)]
+            };
+            for (cycle, ((victim, primary), (before, command, after))) in cycles
+                .into_iter()
+                .zip([
+                    ("acknowledged", "write-more", "continued"),
+                    ("continued", "write-final", "final"),
+                ])
+                .enumerate()
+            {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 loop {
                     let state: serde_json::Value =
@@ -145,10 +158,20 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "event": "failover_ready", "set_uid": uid, "cohort": cohort,
+                        "event": "application_fault_ready", "set_uid": uid, "cohort": cohort,
                         "cycle": cycle, "victim": victim
                     })
                 );
+                if secondary {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "repair_inspection_ready", "set_uid": uid, "cohort": cohort,
+                            "cycle": cycle, "victim": victim
+                        })
+                    );
+                    await_host_restoration(&client, &namespace, cycle, &uid).await?;
+                }
                 let deadline = Instant::now() + Duration::from_secs(180);
                 let promoted = loop {
                     let current = sets.get(&name).await?;
@@ -179,12 +202,13 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                         .and_then(|spec| spec.selector.as_ref())
                         .and_then(|selector| selector.get(resources::POD_UID))
                         == Some(&cohort.bindings[primary].pod_uid)
-                        && promoted
+                        && (promoted
                             .status
                             .as_ref()
                             .and_then(|status| status.service_endpoint.as_ref())
-                            != previous_endpoint.as_ref(),
-                    "failover did not publish the new original primary"
+                            == previous_endpoint.as_ref())
+                            == secondary,
+                    "repair selected the wrong original primary or endpoint"
                 );
                 wait_for_service(&endpoint).await?;
                 let preserved = application(&endpoint, "read").await?;
@@ -222,7 +246,8 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "event": "primary_app_failover", "set_uid": uid, "cohort": cohort,
+                        "event": if secondary { "secondary_app_repair" } else { "primary_app_failover" },
+                        "set_uid": uid, "cohort": cohort,
                         "primary_node_id": cohort.allocation.nodes[primary].node_id,
                         "cycle": cycle,
                         "data_preserved": true, "writes_continued": true, "original_nodes_unchanged": true
@@ -239,21 +264,8 @@ pub async fn run(scenario: Scenario) -> Result<()> {
                         "cycle": cycle, "victim": victim
                     })
                 );
-                let maps: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
-                let deadline = Instant::now() + Duration::from_secs(60);
-                loop {
-                    if let Some(receipt) = maps.get_opt(&format!("host-restored-{cycle}")).await? {
-                        ensure!(
-                            receipt.data.as_ref().and_then(|data| data.get("setUid")) == Some(&uid),
-                            "host restoration evidence changed cohort"
-                        );
-                        break;
-                    }
-                    ensure!(
-                        Instant::now() < deadline,
-                        "host did not verify physical restoration"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                if !secondary {
+                    await_host_restoration(&client, &namespace, cycle, &uid).await?;
                 }
             }
         }
@@ -337,4 +349,33 @@ pub async fn run(scenario: Scenario) -> Result<()> {
         })
     );
     Ok(())
+}
+
+async fn await_host_restoration(
+    client: &Client,
+    namespace: &str,
+    cycle: usize,
+    uid: &str,
+) -> Result<()> {
+    let maps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(receipt) = maps.get_opt(&format!("host-restored-{cycle}")).await? {
+            ensure!(
+                receipt
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("setUid"))
+                    .map(String::as_str)
+                    == Some(uid),
+                "host restoration evidence changed cohort"
+            );
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "host did not verify physical restoration"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

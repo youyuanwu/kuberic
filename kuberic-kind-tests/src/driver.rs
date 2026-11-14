@@ -30,7 +30,7 @@ pub fn inspect_node(cohort: &FrozenCohort, node_index: usize) -> Result<serde_js
     ensure!(
         std::env::var("POD_UID")? == cohort.bindings[node_index].pod_uid
             && std::env::var("KUBERIC_SET_UID")? == cohort.allocation.resource_uid,
-        "fault injection does not own this original primary Pod"
+        "inspection does not own this original Pod"
     );
     let projected: serde_json::Value =
         serde_json::from_slice(&std::fs::read("/etc/fube/node.json")?)?;
@@ -50,10 +50,23 @@ pub fn inspect_node(cohort: &FrozenCohort, node_index: usize) -> Result<serde_js
 }
 
 pub fn crash_primary_app(cohort: &FrozenCohort, node_index: usize) -> Result<()> {
+    crash_application(cohort, node_index, 4, "primary_app_crashed")
+}
+
+pub fn crash_secondary_app(cohort: &FrozenCohort, node_index: usize) -> Result<()> {
+    crash_application(cohort, node_index, 3, "secondary_app_crashed")
+}
+
+fn crash_application(
+    cohort: &FrozenCohort,
+    node_index: usize,
+    role: i32,
+    event: &str,
+) -> Result<()> {
     let status = inspect_node(cohort, node_index)?;
     ensure!(
-        status["replica_role"] == 4,
-        "fault target is not the current primary"
+        status["replica_role"] == role,
+        "fault target does not have the expected native role"
     );
     let config = resources::runner_config(cohort, node_index)?;
     let pid = status["application_pid"]
@@ -78,7 +91,7 @@ pub fn crash_primary_app(cohort: &FrozenCohort, node_index: usize) -> Result<()>
     println!(
         "{}",
         serde_json::json!({
-            "event": "primary_app_crashed", "set_uid": cohort.allocation.resource_uid,
+            "event": event, "set_uid": cohort.allocation.resource_uid,
             "pod_uid": cohort.bindings[node_index].pod_uid, "application_pid": pid,
             "node_index": node_index, "replica_id": status["replica_id"],
             "replica_instance": status["replica_instance"]

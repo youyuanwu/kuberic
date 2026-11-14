@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use anyhow::{bail, ensure, Context, Result};
 use fube_node::control::wire;
@@ -7,6 +7,8 @@ use fube_transport::{message::Message, serialization::serde::ObjectArray};
 use serde::Serialize;
 
 use crate::Config;
+
+const REPLAY_HISTORY: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +56,12 @@ enum Operation {
     RepairConfigure,
 }
 
+#[derive(Clone, Copy)]
+enum Reconfiguration {
+    Failover(usize),
+    RemoveSecondary(usize),
+}
+
 struct Pending {
     operation: Operation,
     outbound: Outbound,
@@ -84,13 +92,13 @@ pub struct State {
     builds: Vec<AddReplicaReply>,
     configuration: Option<DoReconfiguration>,
     configured: Option<ConfigurationReply>,
-    promotion: Option<usize>,
+    reconfiguration: Option<Reconfiguration>,
     losses: Vec<Option<ReplicaUp>>,
-    retired_losses: Vec<(usize, ReplicaUp)>,
+    retired_losses: VecDeque<(usize, ReplicaUp)>,
     identities: Vec<(i64, i64)>,
     repair: Option<Repair>,
     pending: Option<Pending>,
-    completed: Vec<Completion>,
+    completed: VecDeque<Completion>,
     deleting: [bool; 3],
     deleted: [bool; 3],
     disconnected: [bool; 3],
@@ -147,13 +155,13 @@ impl State {
             builds: Vec::new(),
             configuration: None,
             configured: None,
-            promotion: None,
+            reconfiguration: None,
             losses: vec![None; 3],
-            retired_losses: Vec::new(),
+            retired_losses: VecDeque::new(),
             identities,
             repair: None,
             pending: None,
-            completed: Vec::new(),
+            completed: VecDeque::new(),
             deleting: [false; 3],
             deleted: [false; 3],
             disconnected: [false; 3],
@@ -174,9 +182,9 @@ impl State {
             } else {
                 Phase::Deleting
             }
-        } else if self.promotion.is_some() {
+        } else if matches!(self.reconfiguration, Some(Reconfiguration::Failover(_))) {
             Phase::Reconfiguring
-        } else if self.repair.is_some() {
+        } else if self.reconfiguration.is_some() || self.repair.is_some() {
             Phase::Restoring
         } else if !self.bootstrapped.iter().all(|ready| *ready) {
             Phase::Bootstrap
@@ -218,7 +226,12 @@ impl State {
             restoring_node_id: self
                 .repair
                 .as_ref()
-                .map(|repair| self.config.nodes[repair.node].identity.id.clone()),
+                .map(|repair| repair.node)
+                .or(match self.reconfiguration {
+                    Some(Reconfiguration::RemoveSecondary(node)) => Some(node),
+                    _ => None,
+                })
+                .map(|node| self.config.nodes[node].identity.id.clone()),
         }
     }
 
@@ -317,14 +330,18 @@ impl State {
                 node,
                 delete_replica_message(&request, &generation)?,
             )
-        } else if let Some(candidate) = self.promotion {
+        } else if let Some(reconfiguration) = self.reconfiguration {
+            let destination = match reconfiguration {
+                Reconfiguration::Failover(candidate) => candidate,
+                Reconfiguration::RemoveSecondary(_) => self.primary,
+            };
             (
                 Operation::Configure,
-                candidate,
+                destination,
                 do_reconfiguration_message(
                     self.configuration
                         .as_ref()
-                        .context("missing failover intent")?,
+                        .context("missing loss reconfiguration intent")?,
                     &generation,
                 )?,
             )
@@ -367,17 +384,7 @@ impl State {
             } else {
                 let completed = self.configured.as_ref().context("missing repair base")?;
                 let mut unit = completed.unit.clone();
-                unit.previous = unit.current;
-                unit.current.configuration = unit
-                    .current
-                    .configuration
-                    .checked_add(1)
-                    .context("repair epoch overflow")?;
-                ensure!(
-                    unit.previous.configuration & !0xffff_ffff
-                        == unit.current.configuration & !0xffff_ffff,
-                    "same-primary repair epoch exhausted"
-                );
+                Self::advance_same_primary_epoch(&mut unit)?;
                 let mut replicas = completed.replicas.clone();
                 for replica in &mut replicas.0 {
                     replica.previous_role = replica.current_role;
@@ -655,7 +662,10 @@ impl State {
                     return Ok(None);
                 }
                 self.complete(node, action, message)?;
-                self.completed.push(Completion {
+                if self.completed.len() == REPLAY_HISTORY {
+                    self.completed.pop_front();
+                }
+                self.completed.push_back(Completion {
                     node,
                     action: action.to_owned(),
                     body: message.body.clone(),
@@ -760,7 +770,7 @@ impl State {
                 for replica in &mut expected.replicas.0 {
                     replica.previous_role = 1;
                 }
-                if let Some(candidate) = self.promotion {
+                if let Some(reconfiguration) = self.reconfiguration {
                     expected
                         .replicas
                         .0
@@ -786,44 +796,24 @@ impl State {
                                         }
                                 }).count() == 1
                             }),
-                        "failover completion differs from the retained epoch, quorum or original membership"
+                        "loss reconfiguration completion differs from the retained epoch, quorum or original membership"
                     );
-                    self.primary = candidate;
-                    self.promotion = None;
+                    match reconfiguration {
+                        Reconfiguration::Failover(candidate) => self.primary = candidate,
+                        Reconfiguration::RemoveSecondary(_) => ensure!(
+                            expected.replicas.0.iter().all(|replica| {
+                                reply.replicas.0.iter().any(|actual| actual == replica)
+                            }),
+                            "secondary removal changed the admitted primary or survivor endpoints"
+                        ),
+                    }
+                    self.reconfiguration = None;
                     let lost = self
                         .losses
                         .iter()
                         .position(Option::is_some)
                         .context("missing failed replica")?;
-                    let next = self
-                        .identities
-                        .iter()
-                        .flat_map(|(id, instance)| [*id, *instance])
-                        .max()
-                        .context("missing replica identities")?
-                        .checked_add(1)
-                        .context("repair identity overflow")?;
-                    self.repair = Some(Repair {
-                        node: lost,
-                        target: Replica {
-                            node: self.config.nodes[lost]
-                                .identity
-                                .native()
-                                .map_err(anyhow::Error::msg)?,
-                            id: next,
-                            instance: next,
-                            previous_role: 1,
-                            current_role: 2,
-                            state: 1,
-                            up: true,
-                            first_lsn: -1,
-                            last_lsn: -1,
-                            version: self.initial.service.version.clone(),
-                            ..Replica::default()
-                        },
-                        deleted: false,
-                        built: None,
-                    });
+                    self.repair = Some(self.fresh_repair(lost)?);
                 } else {
                     ensure!(
                         reply.unit == expected.unit
@@ -843,7 +833,10 @@ impl State {
                 if matches!(pending.operation, Operation::RepairConfigure) {
                     let repair = self.repair.take().context("missing retained repair")?;
                     self.identities[repair.node] = (repair.target.id, repair.target.instance);
-                    self.retired_losses.push((
+                    if self.retired_losses.len() == REPLAY_HISTORY {
+                        self.retired_losses.pop_front();
+                    }
+                    self.retired_losses.push_back((
                         repair.node,
                         self.losses[repair.node]
                             .take()
@@ -897,8 +890,8 @@ impl State {
 
     fn app_host_lost(&mut self, node: usize, report: &ReplicaUp) -> Result<()> {
         ensure!(
-            self.phase() == Phase::Serving && self.pending.is_none() && node == self.primary,
-            "only verified Serving primary application loss admits failover; bootstrap, secondary loss and interrupted reconfiguration are unsupported"
+            self.phase() == Phase::Serving && self.pending.is_none(),
+            "only verified Serving application loss admits repair; bootstrap and interrupted reconfiguration are unsupported"
         );
         let completed = self
             .configured
@@ -914,25 +907,34 @@ impl State {
                 && self.losses.iter().all(Option::is_none),
             "application loss has stale history or insufficient original quorum"
         );
-        ensure!(
-            self.retired_losses.len() < 32,
-            "owned restoration history budget exhausted"
-        );
-        let candidate = (0..3)
-            .find(|index| *index != node)
-            .context("no original failover candidate")?;
+        let reconfiguration = if node == self.primary {
+            Reconfiguration::Failover(
+                (0..3)
+                    .find(|index| *index != node)
+                    .context("no original failover candidate")?,
+            )
+        } else {
+            Reconfiguration::RemoveSecondary(node)
+        };
         let mut configuration = Configuration {
             unit: completed.unit.clone(),
             replicas: completed.replicas.clone(),
             service: self.initial.service.clone(),
         };
-        configuration.unit.previous = configuration.unit.current;
-        configuration.unit.current.configuration = configuration
-            .unit
-            .current
-            .configuration
-            .checked_add(0x1_0000_0001)
-            .context("failover configuration epoch overflow")?;
+        match reconfiguration {
+            Reconfiguration::Failover(_) => {
+                configuration.unit.previous = configuration.unit.current;
+                configuration.unit.current.configuration = configuration
+                    .unit
+                    .current
+                    .configuration
+                    .checked_add(0x1_0000_0001)
+                    .context("failover configuration epoch overflow")?;
+            }
+            Reconfiguration::RemoveSecondary(_) => {
+                Self::advance_same_primary_epoch(&mut configuration.unit)?;
+            }
+        }
         for replica in &mut configuration.replicas.0 {
             replica.previous_role = replica.current_role;
             if replica.node
@@ -944,25 +946,75 @@ impl State {
                 replica.current_role = 1;
                 replica.up = false;
                 replica.state = 3;
-            } else if replica.node
-                == self.config.nodes[candidate]
-                    .identity
-                    .native()
-                    .map_err(anyhow::Error::msg)?
-            {
-                replica.current_role = 4;
+            } else if let Reconfiguration::Failover(candidate) = reconfiguration {
+                if replica.node
+                    == self.config.nodes[candidate]
+                        .identity
+                        .native()
+                        .map_err(anyhow::Error::msg)?
+                {
+                    replica.current_role = 4;
+                }
             }
-            // GetLSN and PC/CC quorum selection belong to native RA, not FM guesses.
-            replica.first_lsn = -1;
-            replica.last_lsn = -1;
+            if matches!(reconfiguration, Reconfiguration::Failover(_)) {
+                // GetLSN and PC/CC quorum selection belong to native RA, not FM guesses.
+                replica.first_lsn = -1;
+                replica.last_lsn = -1;
+            }
         }
         self.configuration = Some(DoReconfiguration {
             configuration,
             phase0_duration: i64::MAX,
         });
         self.losses[node] = Some(report.clone());
-        self.promotion = Some(candidate);
+        self.reconfiguration = Some(reconfiguration);
         Ok(())
+    }
+
+    fn advance_same_primary_epoch(unit: &mut FailoverUnit) -> Result<()> {
+        unit.previous = unit.current;
+        unit.current.configuration = unit
+            .current
+            .configuration
+            .checked_add(1)
+            .context("same-primary configuration epoch overflow")?;
+        ensure!(
+            unit.previous.configuration & !0xffff_ffff == unit.current.configuration & !0xffff_ffff,
+            "same-primary configuration epoch exhausted"
+        );
+        Ok(())
+    }
+
+    fn fresh_repair(&self, node: usize) -> Result<Repair> {
+        let next = self
+            .identities
+            .iter()
+            .flat_map(|(id, instance)| [*id, *instance])
+            .max()
+            .context("missing replica identities")?
+            .checked_add(1)
+            .context("repair identity overflow")?;
+        Ok(Repair {
+            node,
+            target: Replica {
+                node: self.config.nodes[node]
+                    .identity
+                    .native()
+                    .map_err(anyhow::Error::msg)?,
+                id: next,
+                instance: next,
+                previous_role: 1,
+                current_role: 2,
+                state: 1,
+                up: true,
+                first_lsn: -1,
+                last_lsn: -1,
+                version: self.initial.service.version.clone(),
+                ..Replica::default()
+            },
+            deleted: false,
+            built: None,
+        })
     }
 
     fn deletion_target(&self, node: usize) -> Result<(FailoverUnit, Replica)> {

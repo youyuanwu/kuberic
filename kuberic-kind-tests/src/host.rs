@@ -332,6 +332,10 @@ impl Cluster {
     }
 
     fn wait_for_scenario(&self, namespace: &str, scenario: Scenario) -> Result<()> {
+        let application_fault = matches!(
+            scenario,
+            Scenario::PrimaryAppFailover | Scenario::SecondaryAppRepair
+        );
         let deadline = Instant::now() + Duration::from_secs(600);
         let mut original_operator = None;
         let mut faults = BTreeMap::<u64, Value>::new();
@@ -345,7 +349,7 @@ impl Cluster {
                 "in-cluster driver failed: {}",
                 job["status"]
             );
-            if scenario == Scenario::PrimaryAppFailover {
+            if application_fault {
                 let pods: Value = serde_json::from_str(&self.kubectl(&[
                     "-n",
                     namespace,
@@ -373,7 +377,7 @@ impl Cluster {
                     let logs = self.kubectl(&["-n", namespace, "logs", "job/driver"])?;
                     for line in logs.lines().filter(|line| line.starts_with('{')) {
                         let event: Value = serde_json::from_str(line)?;
-                        if event["event"] == "failover_ready" {
+                        if event["event"] == "application_fault_ready" {
                             let cycle = event["cycle"].as_u64().context("fault cycle")?;
                             if !faults.contains_key(&cycle) {
                                 ensure!(
@@ -381,7 +385,7 @@ impl Cluster {
                                     "unexpected fault cycle"
                                 );
                                 let (operator, report) =
-                                    self.crash_primary_app(namespace, &event)?;
+                                    self.crash_application(namespace, &event, scenario)?;
                                 ensure!(
                                     original_operator
                                         .as_ref()
@@ -394,7 +398,9 @@ impl Cluster {
                                     json!({"cohort": event["cohort"], "report": report}),
                                 );
                             }
-                        } else if event["event"] == "repair_complete" {
+                        } else if event["event"] == "repair_complete"
+                            || event["event"] == "repair_inspection_ready"
+                        {
                             let cycle = event["cycle"].as_u64().context("repair cycle")?;
                             if !restored.contains(&cycle) {
                                 ensure!(
@@ -402,12 +408,13 @@ impl Cluster {
                                         == Some(&self.operator_uid(namespace)?),
                                     "repair changed the original operator"
                                 );
-                                self.verify_restoration(
+                                if self.verify_restoration(
                                     namespace,
                                     &event,
                                     faults.get(&cycle).context("repair has no original fault")?,
-                                )?;
-                                restored.insert(cycle);
+                                )? {
+                                    restored.insert(cycle);
+                                }
                             }
                         }
                     }
@@ -438,26 +445,29 @@ impl Cluster {
                     && event["resources_absent"] == true
             })
             .context("successful driver omitted final lifecycle verification")?;
-        if scenario == Scenario::PrimaryAppFailover {
+        if application_fault {
             ensure!(
                 faults.keys().copied().collect::<Vec<_>>() == [0, 1]
                     && restored.iter().copied().collect::<Vec<_>>() == [0, 1],
-                "repeated failover omitted verified native restoration"
+                "application fault journey omitted verified native restoration"
             );
             ensure!(
                 original_operator.as_ref() == Some(&self.operator_uid(namespace)?),
                 "failover lost or restarted the original operator"
             );
             ensure!(
-                events
-                    .iter()
-                    .any(|event| event["event"] == "primary_app_failover"
-                        && event["set_uid"] == completed["set_uid"]
-                        && event["cohort"] == completed["cohort"]
-                        && event["data_preserved"] == true
-                        && event["writes_continued"] == true
-                        && event["original_nodes_unchanged"] == true),
-                "successful driver omitted actual application-crash failover evidence"
+                events.iter().any(|event| event["event"]
+                    == if scenario == Scenario::SecondaryAppRepair {
+                        "secondary_app_repair"
+                    } else {
+                        "primary_app_failover"
+                    }
+                    && event["set_uid"] == completed["set_uid"]
+                    && event["cohort"] == completed["cohort"]
+                    && event["data_preserved"] == true
+                    && event["writes_continued"] == true
+                    && event["original_nodes_unchanged"] == true),
+                "successful driver omitted actual application-crash repair evidence"
             );
         }
         ensure!(
@@ -488,12 +498,15 @@ impl Cluster {
                 .map(serde_json::from_str)
                 .collect::<std::result::Result<_, _>>()?;
             verify_operator_cleanup(completed, &operator_events)?;
-            if scenario == Scenario::PrimaryAppFailover {
+            if application_fault {
                 let promoted = events
                     .iter()
                     .rev()
-                    .find(|event| event["event"] == "primary_app_failover")
-                    .context("missing promoted primary")?;
+                    .find(|event| {
+                        event["event"] == "primary_app_failover"
+                            || event["event"] == "secondary_app_repair"
+                    })
+                    .context("missing repaired primary")?;
                 ensure!(
                     operator_events
                         .iter()
@@ -566,7 +579,13 @@ impl Cluster {
             .into())
     }
 
-    fn crash_primary_app(&self, namespace: &str, event: &Value) -> Result<(String, Value)> {
+    fn crash_application(
+        &self,
+        namespace: &str,
+        event: &Value,
+        scenario: Scenario,
+    ) -> Result<(String, Value)> {
+        let secondary = scenario == Scenario::SecondaryAppRepair;
         let cohort: kuberic_operator::FrozenCohort =
             serde_json::from_value(event["cohort"].clone())?;
         cohort.fm_config()?;
@@ -590,8 +609,9 @@ impl Cluster {
                     .as_ref()
                     .is_some_and(|status| status.cohort().as_ref() == Some(&cohort)
                         && status.phase == kuberic_operator::ControllerPhase::Serving
-                        && status.primary_node_id.as_ref()
-                            == Some(&cohort.allocation.nodes[index].node_id)),
+                        && (status.primary_node_id.as_ref()
+                            == Some(&cohort.allocation.nodes[index].node_id))
+                            != secondary),
             "fault request changed original Serving authority"
         );
         self.original_pod(namespace, &cohort, index)?;
@@ -606,7 +626,11 @@ impl Cluster {
             "node",
             "--",
             "/opt/fube/kuberic-kind",
-            "crash-primary-app",
+            if secondary {
+                "crash-secondary-app"
+            } else {
+                "crash-primary-app"
+            },
             "--cohort",
             &serde_json::to_string(&cohort)?,
             "--node-index",
@@ -614,7 +638,12 @@ impl Cluster {
         ])?;
         let report: Value = serde_json::from_str(logs.trim())?;
         ensure!(
-            report["event"] == "primary_app_crashed"
+            report["event"]
+                == if secondary {
+                    "secondary_app_crashed"
+                } else {
+                    "primary_app_crashed"
+                }
                 && report["set_uid"] == cohort.allocation.resource_uid
                 && report["pod_uid"] == cohort.bindings[index].pod_uid
                 && report["application_pid"]
@@ -659,12 +688,12 @@ impl Cluster {
                             .state
                             .as_ref()
                             .is_some_and(|state| state.running.is_some()))),
-            "fault target is not the running original primary Pod"
+            "fault target is not the running original Pod"
         );
         Ok(())
     }
 
-    fn verify_restoration(&self, namespace: &str, event: &Value, fault: &Value) -> Result<()> {
+    fn verify_restoration(&self, namespace: &str, event: &Value, fault: &Value) -> Result<bool> {
         ensure!(
             event["cohort"] == fault["cohort"],
             "restoration changed original cohort"
@@ -698,14 +727,20 @@ impl Cluster {
             ensure!(
                 status["control_unknown"] == false
                     && status["fm_connected"] == true
-                    && status["peers_connected"] == 2
-                    && status["replica_phase"] == "Ready"
-                    && status["local_configuration_complete"] == true
-                    && status["configuration_members"] == 3,
-                "native original membership was not restored: {status}"
+                    && status["peers_connected"] == 2,
+                "repair lost original native control: {status}"
             );
+            if status["replica_phase"] != "Ready"
+                || status["local_configuration_complete"] != true
+                || status["configuration_members"] != 3
+            {
+                return Ok(false);
+            }
             if index == victim {
                 let old = &fault["report"];
+                if status["replica_id"] == old["replica_id"] {
+                    return Ok(false);
+                }
                 ensure!(
                     status["replica_id"].as_i64().context("restored replica")?
                         > old["replica_id"].as_i64().context("predecessor replica")?
@@ -724,14 +759,15 @@ impl Cluster {
                                 && retired["reaped"] == true
                                 && retired["group_drained"] == true
                                 && retired["root_removed"] == true
-                                && retired["forced"] == false),
+                                && retired["forced"].is_boolean()),
                     "fresh replica lacks positive original-host cleanup: {status}"
                 );
             }
         }
         self.apply(&json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {
             "namespace": namespace, "name": format!("host-restored-{}", event["cycle"].as_u64().context("repair cycle")?)
-        }, "data": {"setUid": cohort.allocation.resource_uid}}))
+        }, "data": {"setUid": cohort.allocation.resource_uid}}))?;
+        Ok(true)
     }
 }
 
@@ -746,6 +782,7 @@ fn scenario_resources(
         Scenario::DeleteDuringBootstrap => vec!["run", "--early-delete"],
         Scenario::StaggeredShutdown => vec!["run", "--staggered-shutdown"],
         Scenario::PrimaryAppFailover => vec!["run", "--primary-app-failover"],
+        Scenario::SecondaryAppRepair => vec!["run", "--secondary-app-repair"],
     };
     let scripted = scenario == Scenario::StaggeredShutdown;
     let rules = if scripted {

@@ -14,6 +14,9 @@ publish their new Primary after final native completion. Its deterministic
 reconciliation core and native-channel adapter use the same fube codecs as the
 real nodes. It then restores the failed original node through a fresh replica
 build and native 3/2 re-admission.
+Matched Secondary application-host loss removes that exact replica through a
+same-Primary configuration, then uses the same fresh-replica restoration path
+without changing the Primary or withdrawing its routing.
 
 Each KubericSet supports one fresh volatile partition with three immutable
 original nodes. The Kubernetes-facing library and experimental
@@ -56,6 +59,8 @@ cleanup before the remaining Pods receive deletion requests, without a shutdown
 barrier. Its deployed application-crash journey verifies preserved data, continued
 writes, restored redundancy and repeated changed-primary Service routing without
 replacing the original Pods.
+Secondary application-crash qualification verifies unchanged Primary routing,
+fresh native replica identities and restored redundancy on the original Pods.
 These tests require an explicitly owned KinD cluster and run with
 `just kind-test`, not ordinary workspace tests.
 
@@ -103,8 +108,8 @@ new original Primary Pod UID only after validated final native completion.
 allocation and node configurations remain immutable.
 
 This supports a primary application crash from fully admitted original 3/2
-membership, not another loss while reconfiguration/restoration is in progress. Secondary
-loss, interrupted reconfiguration, missing/invalid completion and original
+membership, not another loss while reconfiguration/restoration is in progress.
+Interrupted reconfiguration, missing/invalid completion and original
 channel loss block rather than granting a new writer. Operator restart, whole
 Node/Pod loss, reconnection, Node replacement and network-partition failover remain
 unsupported. Routing withdrawal is not itself writer fencing.
@@ -124,12 +129,13 @@ and instance strictly above every current ID/instance, retaining the original
 Node instance, Pod UID and control sessions.
 
 Native `AddReplica` drives `CreateReplica` on the failed original Node. Fube
-validates committed predecessor deletion, source/generation, service, epoch and
-deactivation history before acquiring anything. Only then does the original
-owner drain its old IPC/native work, reap the exited application, drain its
-owned group and remove its hosting root. Forced predecessor cleanup cannot
-authorize restoration. The replacement receives a fresh host identity and
-consumer gate; old IPC sessions are never revived.
+validates committed predecessor deletion and the fresh native creation intent.
+The committed Open's registration lookup drives shared Node/Hosting activation:
+the original owner drains old IPC/native work, reaps the exited application,
+drains its owned group and removes its hosting root before acquiring a successor.
+Successful forced predecessor cleanup remains recorded but does not veto
+restoration; failed or incomplete cleanup still blocks it. The replacement
+receives a fresh host identity and consumer gate; old IPC sessions are never revived.
 
 Shared RA/RAP performs real copy/build to a Ready Idle. The FM then requests
 same-Primary P/P, S/S and I/S admission with a configuration-epoch increment and
@@ -137,7 +143,24 @@ unchanged data-loss epoch/sizes. Only matched final native membership completion
 returns the set to `serving`. During `restoring`, the already admitted Primary
 remains selected; the new Idle does not become a voter merely because it opened.
 After full 3/2 restoration, another primary application failure can repeat this
-workflow. Restoration history is bounded; exhaustion blocks explicitly.
+workflow. Diagnostic and exact-replay histories are bounded, not the number of
+restorations. A report or completion older than the retained exact-replay window
+is rejected rather than adopted as new authority.
+
+### Secondary application-crash repair
+
+From fully admitted Serving membership, the FM accepts only the exact current
+Secondary's native dropped-replica report at the committed epoch. It advances
+the configuration epoch by one, preserving the Primary and data-loss epoch,
+and requests native removal of that failed Secondary. Final completion must
+retain the exact surviving Primary/Secondary identities and endpoints before
+normal predecessor deletion and fresh replica copy/build can begin.
+
+The set stays `restoring` with the admitted Primary routed throughout removal
+and rebuild. A further same-Primary epoch increment admits the fresh Idle as a
+Secondary only after native final configuration completion. Another application
+loss during any repair stage blocks; no second writer, data-loss authority or
+Node/Pod replacement is inferred.
 
 Active replica identities and retired native/host lineage remain in the original
 in-memory backend, not restart-adoptable CRD authority. The frozen allocation and

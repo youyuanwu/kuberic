@@ -147,19 +147,20 @@ impl ScriptedFm {
             .iter()
             .position(|node| node.identity.id == primary)
             .unwrap();
-        let mut report =
-            crate::fm::app_host_loss(&config, &session.configured.as_ref().unwrap().unit, node);
-        let replica = session
-            .configured
-            .as_ref()
-            .unwrap()
-            .replicas
-            .0
-            .iter()
-            .find(|replica| replica.node == config.nodes[node].identity.native().unwrap())
+        let report =
+            crate::fm::current_app_host_loss(&config, session.configured.as_ref().unwrap(), node);
+        session
+            .state
+            .observe(node, &replica_up_message(&report, Owner::Fm).unwrap())
             .unwrap();
-        report.dropped.0[0].replicas.0[0].description.id = replica.id;
-        report.dropped.0[0].replicas.0[0].description.instance = replica.instance;
+    }
+
+    pub async fn lose_application(&self, node: usize) {
+        let mut session = self.session.lock().await;
+        let session = session.as_mut().unwrap();
+        let config = session.cohort.fm_config().unwrap();
+        let report =
+            crate::fm::current_app_host_loss(&config, session.configured.as_ref().unwrap(), node);
         session
             .state
             .observe(node, &replica_up_message(&report, Owner::Fm).unwrap())

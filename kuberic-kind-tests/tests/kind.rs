@@ -37,3 +37,12 @@ fn primary_application_crash_preserves_data_and_updates_deployed_operator_routin
         .scenario(Scenario::PrimaryAppFailover)
         .unwrap();
 }
+
+#[test]
+#[ignore = "requires an explicitly owned KinD cluster; run just kind-test"]
+fn secondary_application_crash_restores_redundancy_without_changing_deployed_primary() {
+    Cluster::from_env()
+        .unwrap()
+        .scenario(Scenario::SecondaryAppRepair)
+        .unwrap();
+}

@@ -12,6 +12,7 @@ pub enum Scenario {
     DeleteDuringBootstrap,
     StaggeredShutdown,
     PrimaryAppFailover,
+    SecondaryAppRepair,
 }
 
 impl Scenario {
@@ -21,6 +22,7 @@ impl Scenario {
             Self::DeleteDuringBootstrap => "delete-during-bootstrap",
             Self::StaggeredShutdown => "staggered-shutdown",
             Self::PrimaryAppFailover => "primary-app-failover",
+            Self::SecondaryAppRepair => "secondary-app-repair",
         }
     }
 }

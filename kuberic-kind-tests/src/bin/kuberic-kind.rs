@@ -19,14 +19,22 @@ enum Operation {
     Diagnostics,
     Crd,
     Run {
-        #[arg(long, conflicts_with_all = ["staggered_shutdown", "primary_app_failover"])]
+        #[arg(long, conflicts_with_all = ["staggered_shutdown", "primary_app_failover", "secondary_app_repair"])]
         early_delete: bool,
-        #[arg(long, conflicts_with = "primary_app_failover")]
+        #[arg(long, conflicts_with_all = ["primary_app_failover", "secondary_app_repair"])]
         staggered_shutdown: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "secondary_app_repair")]
         primary_app_failover: bool,
+        #[arg(long)]
+        secondary_app_repair: bool,
     },
     CrashPrimaryApp {
+        #[arg(long)]
+        cohort: String,
+        #[arg(long)]
+        node_index: usize,
+    },
+    CrashSecondaryApp {
         #[arg(long)]
         cohort: String,
         #[arg(long)]
@@ -62,6 +70,7 @@ async fn main() -> Result<()> {
             early_delete,
             staggered_shutdown,
             primary_app_failover,
+            secondary_app_repair,
         } => {
             let scenario = if early_delete {
                 Scenario::DeleteDuringBootstrap
@@ -69,6 +78,8 @@ async fn main() -> Result<()> {
                 Scenario::StaggeredShutdown
             } else if primary_app_failover {
                 Scenario::PrimaryAppFailover
+            } else if secondary_app_repair {
+                Scenario::SecondaryAppRepair
             } else {
                 Scenario::Bootstrap
             };
@@ -76,6 +87,9 @@ async fn main() -> Result<()> {
         }
         Operation::CrashPrimaryApp { cohort, node_index } => {
             driver::crash_primary_app(&serde_json::from_str(&cohort)?, node_index)?;
+        }
+        Operation::CrashSecondaryApp { cohort, node_index } => {
+            driver::crash_secondary_app(&serde_json::from_str(&cohort)?, node_index)?;
         }
         Operation::InspectNode { cohort, node_index } => {
             println!(
