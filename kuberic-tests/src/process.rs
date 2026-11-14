@@ -10,12 +10,17 @@ use std::{
 };
 
 use anyhow::{ensure, Context, Result};
+use fube_local_host::process::OwnedApp;
 use kuberic_controller::{ReconcileOutcome, Reconciler, StaleObservation};
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
+    time::Instant,
 };
+
+pub mod controller;
+pub mod fm;
 
 pub struct Binaries {
     pub node: PathBuf,
@@ -159,6 +164,39 @@ pub fn reserve(ip: Ipv4Addr) -> SocketAddrV4 {
     match listener.local_addr().unwrap() {
         std::net::SocketAddr::V4(address) => address,
         _ => unreachable!(),
+    }
+}
+
+pub fn start(executable: &Path, config: &Path) -> OwnedApp {
+    let mut command = Command::new(executable);
+    command.arg("--config").arg(config);
+    let mut owner = None;
+    OwnedApp::start(&mut owner, command).unwrap();
+    owner.unwrap()
+}
+
+pub fn terminate(child: &OwnedApp) {
+    assert!(Command::new("kill")
+        .args(["-TERM", &child.pid().to_string()])
+        .status()
+        .unwrap()
+        .success());
+}
+
+pub async fn finish(child: &mut OwnedApp) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.observed_exit().unwrap() {
+            assert!(status.success(), "process failed: {:?}", child.logs());
+            assert_eq!(child.cleanup().unwrap()["forced"], false);
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process exit deadline: {:?}",
+            child.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

@@ -15,6 +15,8 @@ path = "tests/processes.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+fube-local-host = { path = "../fube/crates/libs/fube-local-host" }
+fube-node-runner.workspace = true
 fube-ra.workspace = true
 fube-transport.workspace = true
 k8s-openapi.workspace = true
@@ -26,11 +28,9 @@ tokio.workspace = true
 uuid.workspace = true
 http = "1"
 form_urlencoded = "1"
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
-fube-local-host = { path = "../fube/crates/libs/fube-local-host" }
 fube-node.workspace = true
-fube-node-runner.workspace = true
 serde.workspace = true
-tempfile = "3"
