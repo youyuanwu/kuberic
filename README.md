@@ -27,7 +27,6 @@ Control TCP is unauthenticated and unencrypted; use a trusted, isolated network.
 git submodule update --init --recursive
 cargo build -p kuberic-fm
 cargo test --workspace
-cargo fmt -p kuberic-fm -p kuberic-controller -- --check
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 

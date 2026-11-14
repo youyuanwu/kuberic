@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check-test:
+    name: Check and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install pinned Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: rustfmt, clippy
+          build-warnings: ""
+
+      - name: Format workspace
+        run: cargo fmt -- --check
+
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets --no-deps -- -D warnings
+
+      - name: Build workspace documentation
+        run: cargo doc --locked --workspace --no-deps
+
+      - name: Build fube process fixtures
+        run: |
+          cargo build --locked --manifest-path fube/Cargo.toml \
+            -p fube-node-runner -p hosting-local-app --bins --target-dir target
+
+      - name: Test workspace including process journeys
+        run: cargo test --locked --workspace -- --include-ignored
